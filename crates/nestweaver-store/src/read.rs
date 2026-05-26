@@ -1008,6 +1008,55 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Returns the set of Note UIDs that are tagged with any of the given tag names.
+    pub fn list_note_uids_with_tags(
+        &self,
+        tag_names: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = std::collections::HashSet::new();
+        for tag_name in tag_names {
+            let q = "MATCH (n:Note)-[:NOTE_TAGGED_WITH]->(t:Tag {name: $name}) RETURN n.uid";
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            let result = conn
+                .execute(&mut stmt, vec![("name", Value::String(tag_name.clone()))])
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in result {
+                if let Some(Value::String(uid)) = row.first() {
+                    uids.insert(uid.clone());
+                }
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Returns the set of Section UIDs that are tagged with any of the given tag names.
+    pub fn list_section_uids_with_tags(
+        &self,
+        tag_names: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = std::collections::HashSet::new();
+        for tag_name in tag_names {
+            let q =
+                "MATCH (s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag {name: $name}) RETURN s.uid";
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            let result = conn
+                .execute(&mut stmt, vec![("name", Value::String(tag_name.clone()))])
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in result {
+                if let Some(Value::String(uid)) = row.first() {
+                    uids.insert(uid.clone());
+                }
+            }
+        }
+        Ok(uids)
+    }
+
     /// Returns the set of all symbol UIDs that are the target of at least one
     /// CALLS edge. Single bulk query instead of per-symbol lookups.
     pub fn all_callee_uids(&self) -> Result<std::collections::HashSet<String>, StoreError> {
