@@ -1110,7 +1110,10 @@ impl GraphStore {
                 return Ok(vec![]);
             }
         };
-        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("uid", Value::String(project_uid.to_string()))],
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!("list_project_note_uids: query skipped (table may not exist): {e}");
@@ -1138,7 +1141,10 @@ impl GraphStore {
                 return Ok(vec![]);
             }
         };
-        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("uid", Value::String(project_uid.to_string()))],
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!(
@@ -1171,7 +1177,10 @@ impl GraphStore {
                 return Ok(vec![]);
             }
         };
-        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("uid", Value::String(project_uid.to_string()))],
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!(
