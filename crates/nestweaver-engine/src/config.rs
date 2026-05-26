@@ -54,6 +54,10 @@ pub struct InstanceConfig {
     pub features: Option<Vec<FeatureConfig>>,
     #[serde(default)]
     pub cross_domain: CrossDomainConfig,
+    #[serde(default)]
+    pub projects: Vec<ProjectConfig>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -93,6 +97,58 @@ pub struct RepoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SchemaExtensions {
     pub extra_node_properties: Option<HashMap<String, HashMap<String, String>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub vault_folder: Option<String>,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub components: Vec<String>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub wiki_sources: Vec<WikiSourceConfig>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRefConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiSourceConfig {
+    pub label: String,
+    pub mcp_server: String,
+    pub tool: String,
+    #[serde(default)]
+    pub args: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalRefConfig {
+    pub label: String,
+    pub url: String,
+    #[serde(default)]
+    pub ref_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl InstanceConfig {
