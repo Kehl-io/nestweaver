@@ -137,6 +137,16 @@ fn tool_schema_brain_context() -> Value {
                     "type": "string",
                     "description": "Include only nodes whose location (file path) starts with this prefix."
                 },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Include only nodes tagged with any of these tags (applies to Note and Section nodes; Symbol nodes are always kept)."
+                },
+                "exclude_tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes)."
+                },
                 "weight_ppr": {
                     "type": "number",
                     "description": "PPR ranking weight for hybrid RRF fusion. Default 0.7."
@@ -275,6 +285,57 @@ fn tool_brain_context(
     };
     apply_filters(&mut result.seeds);
     apply_filters(&mut result.connected);
+
+    // tags filter: keep only note/section nodes tagged with any of these tags.
+    // Symbol nodes are always kept (no tag concept for code).
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let tagged_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let tagged_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    if item.kind.to_lowercase().contains("symbol") {
+                        return true;
+                    }
+                    tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
+                });
+            };
+            filter_tagged(&mut result.seeds);
+            filter_tagged(&mut result.connected);
+        }
+    }
+
+    // exclude_tags filter: remove note/section nodes tagged with any of these tags.
+    if let Some(exclude_tags) = args.get("exclude_tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = exclude_tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let excluded_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let excluded_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_excluded = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    !excluded_notes.contains(&item.uid)
+                        && !excluded_sections.contains(&item.uid)
+                });
+            };
+            filter_excluded(&mut result.seeds);
+            filter_excluded(&mut result.connected);
+        }
+    }
 
     let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
 
