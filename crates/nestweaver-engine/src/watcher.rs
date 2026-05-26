@@ -325,8 +325,7 @@ impl BrainWatcher {
                 match crate::manifest::load_manifest_cache(manifests_path) {
                     Ok(mut cache) => {
                         cache.insert(repo_key.clone(), manifest);
-                        if let Err(e) =
-                            crate::manifest::save_manifest_cache(&cache, manifests_path)
+                        if let Err(e) = crate::manifest::save_manifest_cache(&cache, manifests_path)
                         {
                             tracing::warn!(
                                 "watcher: failed to save manifest cache after {}: {e}",
@@ -341,9 +340,7 @@ impl BrainWatcher {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "watcher: failed to load manifest cache for update: {e}"
-                        );
+                        tracing::warn!("watcher: failed to load manifest cache for update: {e}");
                     }
                 }
                 return Ok(UpdateOutcome::Skipped {
