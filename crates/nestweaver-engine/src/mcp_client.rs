@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
 pub struct McpClient {
+    stdin: std::process::ChildStdin,
+    reader: std::io::BufReader<std::process::ChildStdout>,
     child: Child,
     next_id: u64,
 }
@@ -21,8 +23,11 @@ impl McpClient {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn()?;
-        let mut client = Self { child, next_id: 1 };
+        let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("stdin unavailable"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("stdout unavailable"))?;
+        let reader = BufReader::new(stdout);
+        let mut client = Self { stdin, reader, child, next_id: 1 };
         client.initialize()?;
         Ok(client)
     }
@@ -73,27 +78,27 @@ impl McpClient {
     }
 
     fn send(&mut self, value: &serde_json::Value) -> Result<(), anyhow::Error> {
-        let stdin = self
-            .child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("stdin unavailable"))?;
-        serde_json::to_writer(&mut *stdin, value)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+        serde_json::to_writer(&mut self.stdin, value)?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
         Ok(())
     }
 
     fn recv(&mut self) -> Result<serde_json::Value, anyhow::Error> {
-        let stdout = self
-            .child
-            .stdout
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("stdout unavailable"))?;
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        Ok(serde_json::from_str(&line)?)
+        loop {
+            let mut line = String::new();
+            self.reader.read_line(&mut line)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(&line)?;
+            // Skip notifications (no "id" field)
+            if value.get("id").is_some() {
+                return Ok(value);
+            }
+            // Notification — log and skip
+            tracing::trace!("MCP notification: {}", line.trim());
+        }
     }
 }
 
