@@ -58,7 +58,7 @@ jobs:
           tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" nestweaver
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
       - name: Upload release artifact
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: ${{ env.ARCHIVE }}
