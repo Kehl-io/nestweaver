@@ -331,10 +331,11 @@ mod tests {
                     "set_extension",
                     "query_extensions",
                     "brain_diff",
+                    "project_context",
                 ] {
                     assert!(names.contains(&expected), "missing tool: {expected}");
                 }
-                assert_eq!(tools.len(), 16, "expected 16 tools, got {}", tools.len());
+                assert_eq!(tools.len(), 17, "expected 17 tools, got {}", tools.len());
                 // Every tool has a description leading with usage guidance.
                 for tool in tools {
                     let desc = tool["description"].as_str().expect("description");
