@@ -119,6 +119,22 @@ impl GraphScope {
             "MATCH (a:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
                 .to_string(),
         );
+        // Project nodes and edges — allows PPR to traverse project membership.
+        scope
+            .node_queries
+            .push("MATCH (p:Project) RETURN p.uid".to_string());
+        scope.edge_queries.push(
+            "MATCH (p:Project)-[r:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN p.uid, n.uid, r.confidence"
+                .to_string(),
+        );
+        scope.edge_queries.push(
+            "MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence"
+                .to_string(),
+        );
+        scope.edge_queries.push(
+            "MATCH (p:Project)-[r:PROJECT_HAS_COMPONENT]->(q:Project) RETURN p.uid, q.uid, r.confidence"
+                .to_string(),
+        );
         scope
     }
 }
@@ -285,8 +301,7 @@ impl GraphStore {
 
         // Combine forward + reverse for undirected neighbourhood propagation.
         // Each forward edge (u→v, w) also contributes a reverse edge (v→u, w).
-        let mut all_edges: Vec<(usize, usize, f64)> =
-            Vec::with_capacity(forward_edges.len() * 2);
+        let mut all_edges: Vec<(usize, usize, f64)> = Vec::with_capacity(forward_edges.len() * 2);
         for &(u, v, w) in &forward_edges {
             all_edges.push((u, v, w));
             all_edges.push((v, u, w));
