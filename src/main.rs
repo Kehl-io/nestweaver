@@ -6,11 +6,10 @@ use clap::{Parser, Subcommand};
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
     LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    compute_clusters,
-    discover_cross_domain_links, embedding::generate_embedding, generate_guide, generate_repo_map,
-    incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
-    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
-    lookup_symbol, save_clusters, search_symbols, suggest_links,
+    compute_clusters, discover_cross_domain_links, embedding::generate_embedding, generate_guide,
+    generate_repo_map, incremental_index, index_directory, index_markdown_directory,
+    index_markdown_directory_since, list_repos, list_services, load_alias_sidecar, load_clusters,
+    load_manifest_cache, lookup_symbol, save_clusters, search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -388,6 +387,42 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// List all projects from the store
+    #[command(
+        after_help = "Examples:\n  nestweaver list-projects\n  nestweaver list-projects --json"
+    )]
+    ListProjects {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Get context for a project: all notes and symbols, ranked by PPR
+    #[command(
+        after_help = "Examples:\n  nestweaver project-context my-project\n  nestweaver project-context my-project --token-budget 4000 --json"
+    )]
+    ProjectContext {
+        /// Project name, alias, or UID
+        name: String,
+        #[arg(
+            long,
+            default_value = "3000",
+            help = "Approximate token budget for the output"
+        )]
+        token_budget: usize,
+        #[arg(long, help = "Also include notes/symbols from component sub-projects")]
+        include_components: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Generate embeddings for all symbols in the database using an external API.
     ///
     /// Calls an OpenAI-compatible embedding endpoint for each symbol's signature
@@ -555,31 +590,55 @@ enum BrainCommands {
         db: Option<PathBuf>,
         /// Filter results to nodes whose kind starts with one of these values
         /// (e.g. Symbol, Note, Section, Tag, Heading).
-        #[arg(long = "kinds", help = "Keep only nodes with these kind prefixes (e.g. Symbol, Note)")]
+        #[arg(
+            long = "kinds",
+            help = "Keep only nodes with these kind prefixes (e.g. Symbol, Note)"
+        )]
         kinds: Vec<String>,
         /// Filter results to nodes associated with these repo UIDs or names.
         #[arg(long = "repos", help = "Keep only nodes from these repo UIDs or names")]
         repos: Vec<String>,
         /// Filter results to nodes associated with these vault UIDs or names.
-        #[arg(long = "vaults", help = "Keep only nodes from these vault UIDs or names")]
+        #[arg(
+            long = "vaults",
+            help = "Keep only nodes from these vault UIDs or names"
+        )]
         vaults: Vec<String>,
         /// Keep only nodes whose location (file path) starts with this prefix.
-        #[arg(long = "path-prefix", help = "Keep only nodes whose location starts with this prefix")]
+        #[arg(
+            long = "path-prefix",
+            help = "Keep only nodes whose location starts with this prefix"
+        )]
         path_prefix: Option<String>,
         /// Include only nodes tagged with any of these tags (note/section nodes only).
-        #[arg(long = "tags", help = "Keep only note/section nodes tagged with any of these tags")]
+        #[arg(
+            long = "tags",
+            help = "Keep only note/section nodes tagged with any of these tags"
+        )]
         tags: Vec<String>,
         /// Exclude nodes tagged with any of these tags (note/section nodes only).
-        #[arg(long = "exclude-tags", help = "Exclude note/section nodes tagged with any of these tags")]
+        #[arg(
+            long = "exclude-tags",
+            help = "Exclude note/section nodes tagged with any of these tags"
+        )]
         exclude_tags: Vec<String>,
         /// PPR ranking weight for hybrid RRF fusion (default 0.7).
-        #[arg(long = "weight-ppr", help = "PPR weight for hybrid retrieval (default 0.7)")]
+        #[arg(
+            long = "weight-ppr",
+            help = "PPR weight for hybrid retrieval (default 0.7)"
+        )]
         weight_ppr: Option<f64>,
         /// BM25 text search weight for hybrid RRF fusion (default 0.3).
-        #[arg(long = "weight-bm25", help = "BM25 weight for hybrid retrieval (default 0.3)")]
+        #[arg(
+            long = "weight-bm25",
+            help = "BM25 weight for hybrid retrieval (default 0.3)"
+        )]
         weight_bm25: Option<f64>,
         /// Semantic embedding weight for hybrid RRF fusion (default 0.0).
-        #[arg(long = "weight-semantic", help = "Semantic embedding weight for hybrid retrieval (default 0.0)")]
+        #[arg(
+            long = "weight-semantic",
+            help = "Semantic embedding weight for hybrid retrieval (default 0.0)"
+        )]
         weight_semantic: Option<f64>,
     },
 }
@@ -1563,6 +1622,138 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
         }
 
+        Commands::ListProjects { json, db } => {
+            let store = open_store(db.as_deref())?;
+            let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&projects)?);
+            } else if projects.is_empty() {
+                println!(
+                    "No projects found. Use an instance config with [[projects]] to define them."
+                );
+            } else {
+                for p in &projects {
+                    println!("{}", p.name);
+                    println!("  UID:      {}", p.uid);
+                    println!("  Instance: {}", p.instance_id);
+                    if let Some(ref summary) = p.summary {
+                        println!("  Summary:  {summary}");
+                    }
+                    println!();
+                }
+            }
+            Ok(EXIT_SUCCESS)
+        }
+
+        Commands::ProjectContext {
+            name,
+            token_budget,
+            include_components,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
+
+            // Resolve the project.
+            let project = if name.starts_with("proj:") {
+                let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+                all.into_iter()
+                    .find(|p| p.uid == name || p.uid.contains(&name))
+                    .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?
+            } else {
+                match store
+                    .lookup_project_by_name(&name)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                {
+                    Some(p) => p,
+                    None => {
+                        eprintln!(
+                            "Project '{}' not found. Try: nestweaver list-projects",
+                            name
+                        );
+                        return Ok(EXIT_NOT_FOUND);
+                    }
+                }
+            };
+
+            // Collect seed UIDs from this project (and optionally its components).
+            let mut seed_uids: Vec<String> = Vec::new();
+            let note_uids = store
+                .list_project_note_uids(&project.uid)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            seed_uids.extend(note_uids);
+            let sym_uids = store
+                .list_project_symbol_uids(&project.uid)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            seed_uids.extend(sym_uids);
+
+            if include_components {
+                let comp_uids = store
+                    .list_project_component_uids(&project.uid)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                for comp_uid in &comp_uids {
+                    seed_uids.extend(store.list_project_note_uids(comp_uid).unwrap_or_default());
+                    seed_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
+                }
+            }
+
+            // Deduplicate seeds.
+            let mut seen = std::collections::HashSet::new();
+            seed_uids.retain(|u| seen.insert(u.clone()));
+
+            if seed_uids.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "project": project.name,
+                            "seeds": [],
+                            "connected": [],
+                            "note": "No notes or symbols associated with this project.",
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Project '{}' has no associated notes or symbols.",
+                        project.name
+                    );
+                }
+                return Ok(EXIT_SUCCESS);
+            }
+
+            let defaults = HybridSearchConfig::default();
+            let aliases = load_alias_sidecar(&db_path);
+            match build_brain_context_hybrid_with_aliases(
+                &store,
+                &seed_uids,
+                tantivy.as_ref(),
+                &defaults,
+                &aliases,
+            ) {
+                Ok(result) => {
+                    let cut = token_budgeted_truncate(&result.connected, token_budget);
+                    if json {
+                        print_brain_context_json(&result, cut)?;
+                    } else {
+                        println!("Project: {}  ({})", project.name, project.uid);
+                        if let Some(ref summary) = project.summary {
+                            println!("  {summary}");
+                        }
+                        println!();
+                        print_brain_context_text(&result, cut, Some(token_budget));
+                    }
+                    Ok(EXIT_SUCCESS)
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    Ok(EXIT_ERROR)
+                }
+            }
+        }
+
         Commands::Index {
             repo,
             instance,
@@ -2313,7 +2504,13 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             };
 
             let aliases = load_alias_sidecar(&db_path);
-            match build_brain_context_hybrid_with_aliases(&store, &seeds, tantivy.as_ref(), &config, &aliases) {
+            match build_brain_context_hybrid_with_aliases(
+                &store,
+                &seeds,
+                tantivy.as_ref(),
+                &config,
+                &aliases,
+            ) {
                 Ok(mut result) => {
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =

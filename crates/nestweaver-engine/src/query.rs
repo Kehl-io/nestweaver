@@ -696,6 +696,26 @@ pub fn build_brain_context_hybrid_with_aliases(
             continue;
         }
 
+        // Try project name lookup.
+        if let Ok(Some(project)) = store.lookup_project_by_name(trimmed) {
+            let mut project_resolved = false;
+            if let Ok(note_uids) = store.list_project_note_uids(&project.uid)
+                && !note_uids.is_empty()
+            {
+                seed_uids.extend(note_uids);
+                project_resolved = true;
+            }
+            if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid)
+                && !sym_uids.is_empty()
+            {
+                seed_uids.extend(sym_uids);
+                project_resolved = true;
+            }
+            if project_resolved {
+                continue;
+            }
+        }
+
         // Taxonomy alias lookup: if the seed is a known alias, try the
         // canonical name(s) in its place.
         if !alias_to_canonical.is_empty() {

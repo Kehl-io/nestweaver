@@ -43,6 +43,7 @@ pub fn tool_list() -> Value {
             tool_schema_set_extension(),
             tool_schema_query_extensions(),
             tool_schema_brain_diff(),
+            tool_schema_project_context(),
         ]
     })
 }
@@ -73,6 +74,7 @@ pub fn dispatch(
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
+        "project_context" => tool_project_context(store, tantivy, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -187,26 +189,20 @@ fn tool_brain_context(
         .unwrap_or(2000);
 
     // RFC #2: optional post-PPR filter parameters.
-    let filter_kinds: Option<Vec<String>> = args
-        .get("kinds")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
+    let filter_kinds: Option<Vec<String>> =
+        args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect()
         });
-    let filter_repos: Option<Vec<String>> = args
-        .get("repos")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
+    let filter_repos: Option<Vec<String>> =
+        args.get("repos").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         });
-    let filter_vaults: Option<Vec<String>> = args
-        .get("vaults")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
+    let filter_vaults: Option<Vec<String>> =
+        args.get("vaults").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
@@ -236,7 +232,11 @@ fn tool_brain_context(
     // If all weights are zero fall back to the defaults so PPR still fires.
     let (weight_ppr, weight_bm25, weight_semantic) =
         if weight_ppr == 0.0 && weight_bm25 == 0.0 && weight_semantic == 0.0 {
-            (defaults.weight_ppr, defaults.weight_bm25, defaults.weight_semantic)
+            (
+                defaults.weight_ppr,
+                defaults.weight_bm25,
+                defaults.weight_semantic,
+            )
         } else {
             (weight_ppr, weight_bm25, weight_semantic)
         };
@@ -328,8 +328,7 @@ fn tool_brain_context(
                 .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
             let filter_excluded = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
                 nodes.retain(|item| {
-                    !excluded_notes.contains(&item.uid)
-                        && !excluded_sections.contains(&item.uid)
+                    !excluded_notes.contains(&item.uid) && !excluded_sections.contains(&item.uid)
                 });
             };
             filter_excluded(&mut result.seeds);
@@ -484,9 +483,7 @@ fn tool_brain_search(
 
     // Heading text matches (if budget remains).
     if results.len() < limit {
-        let headings = store
-            .list_all_headings()
-            .context("list_all_headings")?;
+        let headings = store.list_all_headings().context("list_all_headings")?;
         let remaining = limit - results.len();
         let heading_hits: Vec<Value> = headings
             .iter()
@@ -507,9 +504,7 @@ fn tool_brain_search(
 
     // Section body matches (if budget remains).
     if results.len() < limit {
-        let sections = store
-            .list_all_sections()
-            .context("list_all_sections")?;
+        let sections = store.list_all_sections().context("list_all_sections")?;
         let remaining = limit - results.len();
         let section_hits: Vec<Value> = sections
             .iter()
@@ -570,10 +565,8 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         .unwrap_or(true);
 
     // Parse optional section filter.
-    let section_filter: Option<Vec<String>> = args
-        .get("sections")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
+    let section_filter: Option<Vec<String>> =
+        args.get("sections").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
@@ -603,10 +596,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         // heading matches one of the requested names (case-insensitive).
         let mut parts: Vec<String> = Vec::new();
         for heading in &headings_raw {
-            if names
-                .iter()
-                .any(|n| heading.text.eq_ignore_ascii_case(n))
-            {
+            if names.iter().any(|n| heading.text.eq_ignore_ascii_case(n)) {
                 // Find the section that belongs to this heading.
                 if let Some(sec) = sections_raw
                     .iter()
@@ -1442,7 +1432,8 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
         .cloned()
         .ok_or_else(|| anyhow!("'value' is required"))?;
 
-    let db_path = CURRENT_DB_PATH.with(|c| c.borrow().clone())
+    let db_path = CURRENT_DB_PATH
+        .with(|c| c.borrow().clone())
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
     let mut store = load_extensions(&db_path);
@@ -1483,7 +1474,8 @@ fn tool_schema_query_extensions() -> Value {
 }
 
 fn tool_query_extensions(args: Value) -> Result<Value, anyhow::Error> {
-    let db_path = CURRENT_DB_PATH.with(|c| c.borrow().clone())
+    let db_path = CURRENT_DB_PATH
+        .with(|c| c.borrow().clone())
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
     let store = load_extensions(&db_path);
@@ -1564,9 +1556,11 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     let repos = store.list_repos(None)?;
     let repo = repos
         .iter()
-        .find(|r| r.url.contains(repo_name) || {
-            let name_part = r.url.split('/').next_back().unwrap_or("");
-            name_part == repo_name
+        .find(|r| {
+            r.url.contains(repo_name) || {
+                let name_part = r.url.split('/').next_back().unwrap_or("");
+                name_part == repo_name
+            }
         })
         .ok_or_else(|| anyhow!("repo '{}' not found in graph", repo_name))?;
 
@@ -1577,10 +1571,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
             repo.url
         );
     }
-    let repo_path = repo
-        .url
-        .strip_prefix("file://")
-        .unwrap_or(&repo.url);
+    let repo_path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
 
     let base_sha = since_sha_arg.unwrap_or(&repo.indexed_sha);
 
@@ -1603,9 +1594,8 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         }));
     }
 
-    let changes =
-        git_diff::detect_changes(std::path::Path::new(repo_path), base_sha, &head_sha)
-            .context("git diff")?;
+    let changes = git_diff::detect_changes(std::path::Path::new(repo_path), base_sha, &head_sha)
+        .context("git diff")?;
 
     let mut added: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
@@ -1663,6 +1653,209 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         "changed_files": all_changed,
         "affected_symbols": affected_symbols,
         "affected_symbol_count": affected_symbols.len(),
+    }))
+}
+
+// ── 17. project_context ────────────────────────────────────────────────────
+
+fn tool_schema_project_context() -> Value {
+    json!({
+        "name": "project_context",
+        "description": "Return all Notes, Symbols, and Sections associated with a Project, ranked by PPR within the project's subgraph. Use when you need to understand or work on a specific project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project name, alias, or UID"
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "default": 3000,
+                    "description": "Approximate token cap for the result (chars / 4)"
+                },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Filter result kinds (e.g. Symbol, Note, Section)"
+                },
+                "include_components": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "For composite projects, also include notes/symbols from component sub-projects"
+                }
+            },
+            "required": ["project"]
+        }
+    })
+}
+
+fn tool_project_context(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    let project_str = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'project' must be a string"))?;
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(3000);
+    let include_components = args
+        .get("include_components")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let filter_kinds: Option<Vec<String>> =
+        args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                .collect()
+        });
+
+    // 1. Resolve the project: name/alias/UID.
+    let project = if let Some(uid) = project_str.strip_prefix("proj:") {
+        // Direct UID — list all projects and find by uid.
+        let all = store
+            .list_projects()
+            .map_err(|e| anyhow!("list_projects: {e}"))?;
+        all.into_iter()
+            .find(|p| p.uid == uid || p.uid == project_str)
+            .ok_or_else(|| anyhow!("project UID '{}' not found", project_str))?
+    } else {
+        // Try name match first.
+        match store
+            .lookup_project_by_name(project_str)
+            .map_err(|e| anyhow!("lookup_project_by_name: {e}"))?
+        {
+            Some(p) => p,
+            None => {
+                // Try aliases: load all projects, check aliases field via extension sidecar.
+                // For now fall back to checking if the string is a UID substring.
+                let all = store
+                    .list_projects()
+                    .map_err(|e| anyhow!("list_projects: {e}"))?;
+                all.into_iter()
+                    .find(|p| p.uid.contains(project_str))
+                    .ok_or_else(|| anyhow!("project '{}' not found", project_str))?
+            }
+        }
+    };
+
+    // 2. Collect target UIDs: notes + symbols for this project.
+    let mut seed_uids: Vec<String> = Vec::new();
+    let note_uids = store
+        .list_project_note_uids(&project.uid)
+        .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
+    seed_uids.extend(note_uids);
+    let sym_uids = store
+        .list_project_symbol_uids(&project.uid)
+        .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
+    seed_uids.extend(sym_uids);
+
+    // 3. If include_components, also collect note/symbol UIDs from each component project.
+    if include_components {
+        let component_uids = store
+            .list_project_component_uids(&project.uid)
+            .map_err(|e| anyhow!("list_project_component_uids: {e}"))?;
+        for comp_uid in &component_uids {
+            let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+            seed_uids.extend(comp_notes);
+            let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
+            seed_uids.extend(comp_syms);
+        }
+    }
+
+    // Deduplicate seeds.
+    let mut seen = std::collections::HashSet::new();
+    seed_uids.retain(|u| seen.insert(u.clone()));
+
+    if seed_uids.is_empty() {
+        return Ok(json!({
+            "project": project.name,
+            "project_uid": project.uid,
+            "seeds": [],
+            "connected": [],
+            "unresolved_seeds": [],
+            "tokens_used": 0,
+            "token_budget": token_budget,
+            "truncated": false,
+            "total_connected": 0,
+            "note": "No notes or symbols are associated with this project yet.",
+        }));
+    }
+
+    // 4. Run hybrid PPR from seeds.
+    let db_path = current_db_path(store).unwrap_or_default();
+    let aliases = load_alias_sidecar(&db_path);
+    let config = HybridSearchConfig::default();
+    let mut result =
+        build_brain_context_hybrid_with_aliases(store, &seed_uids, tantivy, &config, &aliases)?;
+
+    // 5. Apply optional kinds filter.
+    if let Some(ref kinds) = filter_kinds {
+        let apply_kinds = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+            nodes.retain(|n| {
+                let kind_lower = n.kind.to_lowercase();
+                kinds.iter().any(|k| kind_lower.starts_with(k.as_str()))
+            });
+        };
+        apply_kinds(&mut result.seeds);
+        apply_kinds(&mut result.connected);
+    }
+
+    // 6. Apply token budget.
+    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
+
+    // 7. Load external_refs from extension sidecar.
+    let ext_store = load_extensions(&db_path);
+    let external_refs = get_all_properties(&ext_store, &project.uid)
+        .get("external_refs")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let connected_json: Vec<Value> = result
+        .connected
+        .iter()
+        .take(cut)
+        .map(|n| {
+            json!({
+                "uid": n.uid,
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+                "relevance": n.relevance,
+            })
+        })
+        .collect();
+
+    let seeds_json: Vec<Value> = result
+        .seeds
+        .iter()
+        .map(|n| {
+            json!({
+                "uid": n.uid,
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+                "relevance": n.relevance,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "project": project.name,
+        "project_uid": project.uid,
+        "seeds": seeds_json,
+        "connected": connected_json,
+        "unresolved_seeds": result.unresolved_seeds,
+        "tokens_used": used_tokens,
+        "token_budget": token_budget,
+        "truncated": cut < result.connected.len(),
+        "total_connected": result.connected.len(),
+        "external_refs": external_refs,
     }))
 }
 
