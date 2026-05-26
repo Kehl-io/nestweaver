@@ -1101,10 +1101,16 @@ impl GraphStore {
 
     /// List Note UIDs that belong to a project via PROJECT_INCLUDES_NOTE edges.
     pub fn list_project_note_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
-        let result = match self.conn()?.query(&format!(
-            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid",
-            project_uid.replace('\'', "''")
-        )) {
+        let conn = self.conn()?;
+        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!("list_project_note_uids: query skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!("list_project_note_uids: query skipped (table may not exist): {e}");
@@ -1121,10 +1127,18 @@ impl GraphStore {
 
     /// List Symbol UIDs that belong to a project via PROJECT_INCLUDES_SYMBOL edges.
     pub fn list_project_symbol_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
-        let result = match self.conn()?.query(&format!(
-            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN s.uid",
-            project_uid.replace('\'', "''")
-        )) {
+        let conn = self.conn()?;
+        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN s.uid";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_symbol_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!(
@@ -1146,10 +1160,18 @@ impl GraphStore {
         &self,
         project_uid: &str,
     ) -> Result<Vec<String>, StoreError> {
-        let result = match self.conn()?.query(&format!(
-            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_HAS_COMPONENT]->(c:Project) RETURN c.uid",
-            project_uid.replace('\'', "''")
-        )) {
+        let conn = self.conn()?;
+        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_HAS_COMPONENT]->(c:Project) RETURN c.uid";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_component_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.to_string()))]) {
             Ok(r) => r,
             Err(e) => {
                 tracing::trace!(

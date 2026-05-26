@@ -1437,7 +1437,7 @@ impl GraphStore {
         let mut stmt = conn
             .prepare(
                 "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
-                 CREATE (p)-[:PROJECT_INCLUDES_NOTE]->(n)",
+                 CREATE (p)-[:PROJECT_INCLUDES_NOTE {confidence: 1.0}]->(n)",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for (project_uid, note_uid) in edges {
@@ -1516,5 +1516,26 @@ impl GraphStore {
                 ("conf", lbug::Value::Double(confidence as f64)),
             ],
         )
+    }
+
+    /// Delete all outgoing project edges for the given project UID.
+    /// Idempotent — silently ignores errors (table may not exist on first run).
+    pub fn delete_project_edges(&self, project_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        for edge_type in &[
+            "PROJECT_INCLUDES_NOTE",
+            "PROJECT_INCLUDES_SYMBOL",
+            "PROJECT_HAS_COMPONENT",
+            "PROJECT_HAS_PARENT",
+        ] {
+            let q = format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() DELETE r");
+            if let Ok(mut stmt) = conn.prepare(&q) {
+                let _ = conn.execute(
+                    &mut stmt,
+                    vec![("uid", lbug::Value::String(project_uid.to_string()))],
+                );
+            }
+        }
+        Ok(())
     }
 }
