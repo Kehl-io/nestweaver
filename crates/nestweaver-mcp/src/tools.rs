@@ -207,19 +207,32 @@ fn tool_brain_context(
 
     // RFC #6: optional hybrid search weight overrides.
     let defaults = HybridSearchConfig::default();
+    let weight_ppr = args
+        .get("weight_ppr")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(defaults.weight_ppr)
+        .max(0.0);
+    let weight_bm25 = args
+        .get("weight_bm25")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(defaults.weight_bm25)
+        .max(0.0);
+    let weight_semantic = args
+        .get("weight_semantic")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(defaults.weight_semantic)
+        .max(0.0);
+    // If all weights are zero fall back to the defaults so PPR still fires.
+    let (weight_ppr, weight_bm25, weight_semantic) =
+        if weight_ppr == 0.0 && weight_bm25 == 0.0 && weight_semantic == 0.0 {
+            (defaults.weight_ppr, defaults.weight_bm25, defaults.weight_semantic)
+        } else {
+            (weight_ppr, weight_bm25, weight_semantic)
+        };
     let config = HybridSearchConfig {
-        weight_ppr: args
-            .get("weight_ppr")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(defaults.weight_ppr),
-        weight_bm25: args
-            .get("weight_bm25")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(defaults.weight_bm25),
-        weight_semantic: args
-            .get("weight_semantic")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(defaults.weight_semantic),
+        weight_ppr,
+        weight_bm25,
+        weight_semantic,
         ..defaults
     };
 
@@ -1305,9 +1318,14 @@ fn get_git_head(repo_path: &str) -> Option<String> {
 
 /// Get the current HEAD sha for a remote git repo via `git ls-remote`.
 /// Works for SSH (`git@github.com:...`) and HTTPS (`https://...`) URLs.
+///
+/// Stderr is suppressed so SSH key errors or other diagnostics don't leak
+/// into MCP responses.
 fn get_remote_head(url: &str) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["ls-remote", url, "HEAD"])
+        .args(["ls-remote", "--exit-code", url, "HEAD"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1486,6 +1504,13 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         })
         .ok_or_else(|| anyhow!("repo '{}' not found in graph", repo_name))?;
 
+    if !repo.url.starts_with("file://") {
+        anyhow::bail!(
+            "brain_diff only works with locally-indexed repositories (file:// URLs); \
+             '{}' is not a local repo",
+            repo.url
+        );
+    }
     let repo_path = repo
         .url
         .strip_prefix("file://")
