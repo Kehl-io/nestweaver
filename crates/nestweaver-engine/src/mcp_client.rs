@@ -24,10 +24,21 @@ impl McpClient {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("stdin unavailable"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("stdout unavailable"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stdout unavailable"))?;
         let reader = BufReader::new(stdout);
-        let mut client = Self { stdin, reader, child, next_id: 1 };
+        let mut client = Self {
+            stdin,
+            reader,
+            child,
+            next_id: 1,
+        };
         client.initialize()?;
         Ok(client)
     }
