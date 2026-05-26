@@ -1,0 +1,103 @@
+# Example NestWeaver instance config
+#
+# This file declares the repos in your project, how they relate to each
+# other, and what cross-cutting features span them.
+#
+# Usage:
+#   nestweaver index --repo ./web-client --db ./project.lbug
+#   nestweaver index --repo ./api-service --db ./project.lbug
+#   nestweaver index --repo ./mobile-app --db ./project.lbug
+#   nestweaver index --repo ./device-firmware --db ./project.lbug
+#
+#   nestweaver suggest-links --db ./project.lbug
+#   nestweaver list-links --config ./nestweaver-instance.toml
+#   nestweaver context --feature device-onboarding --config ./nestweaver-instance.toml --db ./project.lbug
+
+instance_id = "acme-platform"
+
+[snapshot_storage]
+backend = "local"
+path = "~/.local/share/nestweaver/acme/snapshots"
+
+[workspace]
+backend = "local"
+path = "~/.local/share/nestweaver/acme/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+# ── Repositories ──────────────────────────────────────────────────────────
+
+[[repos]]
+url = "https://github.com/acme/web-client"
+
+[[repos]]
+url = "https://github.com/acme/api-service"
+
+[[repos]]
+url = "https://github.com/acme/mobile-app"
+
+[[repos]]
+url = "https://github.com/acme/device-firmware"
+
+# ── Cross-repo links ─────────────────────────────────────────────────────
+#
+# Declare how repos communicate. NestWeaver auto-detects package-level
+# dependencies from manifests (package.json, go.mod, etc.). Use [[links]]
+# for protocol-level relationships that can't be auto-detected.
+
+[[links]]
+from = "web-client"
+to = "api-service"
+type = "http-api"
+description = "React web app calls REST API"
+endpoints = ["/api/users", "/api/devices", "/api/sessions"]
+
+[[links]]
+from = "mobile-app"
+to = "api-service"
+type = "http-api"
+description = "React Native app calls REST API"
+endpoints = ["/api/users", "/api/devices", "/api/sessions"]
+
+[[links]]
+from = "mobile-app"
+to = "device-firmware"
+type = "ble"
+description = "App connects to device via BLE"
+identifiers = ["6E400001-B5A3-F393-E0A9-E50E24DCCA9E"]
+
+[[links]]
+from = "api-service"
+to = "device-firmware"
+type = "http-api"
+description = "Backend pushes OTA firmware updates"
+endpoints = ["/api/firmware/update"]
+
+# ── Feature bundles ───────────────────────────────────────────────────────
+#
+# Group entry points across repos into named features. An agent says
+# "I'm working on device onboarding" and gets context from all repos.
+
+[[features]]
+name = "device-onboarding"
+description = "Device discovery, BLE pairing, cloud registration, initial config"
+repos = ["mobile-app", "device-firmware", "api-service"]
+entry_points = ["BLEScanner", "pairDevice", "registerDevice", "initConfig"]
+
+[[features]]
+name = "user-auth"
+description = "Login, signup, OAuth, session management"
+repos = ["web-client", "mobile-app", "api-service"]
+entry_points = ["LoginForm", "useAuth", "authMiddleware", "refreshToken"]
+
+[[features]]
+name = "data-sync"
+description = "Real-time data sync from device through backend to clients"
+repos = ["device-firmware", "api-service", "web-client", "mobile-app"]
+entry_points = ["sendReading", "ingestData", "useRealtimeData", "DataStream"]

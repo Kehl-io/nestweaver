@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "command": ["bash", "integrations/claude-code/hooks/pre-read-enrich.sh"]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "command": ["bash", "integrations/claude-code/hooks/post-commit-stale-check.sh"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+[allowlist]
+description = "Global allowlist"
+paths = [
+    '''target/''',
+    '''.git/''',
+]

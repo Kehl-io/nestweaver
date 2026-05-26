@@ -1,0 +1,33 @@
+- name: bug
+  color: "d73a4a"
+  description: "Something isn't working"
+- name: enhancement
+  color: "a2eeef"
+  description: "New feature or improvement"
+- name: good-first-issue
+  color: "7057ff"
+  description: "Good for newcomers to the project"
+- name: help-wanted
+  color: "008672"
+  description: "Extra attention is needed"
+- name: grammar
+  color: "f9d0c4"
+  description: "Language grammar/parser contributions"
+- name: web-ui
+  color: "1d76db"
+  description: "Frontend/React web UI changes"
+- name: mcp
+  color: "5319e7"
+  description: "MCP server and tool changes"
+- name: performance
+  color: "fbca04"
+  description: "Performance and benchmarking"
+- name: documentation
+  color: "0075ca"
+  description: "Documentation improvements"
+- name: breaking-change
+  color: "b60205"
+  description: "Introduces a breaking change"
+- name: dependencies
+  color: "0366d6"
+  description: "Dependency updates"

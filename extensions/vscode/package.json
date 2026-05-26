@@ -1,0 +1,38 @@
+{
+  "name": "nestweaver",
+  "displayName": "NestWeaver",
+  "description": "Code knowledge graph visualization for NestWeaver",
+  "version": "0.1.0",
+  "publisher": "nestweaver",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Visualization"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "nestweaver.showGraph", "title": "NestWeaver: Show Graph" },
+      { "command": "nestweaver.showInGraph", "title": "NestWeaver: Show in Graph" }
+    ],
+    "configuration": {
+      "title": "NestWeaver",
+      "properties": {
+        "nestweaver.port": { "type": "number", "default": 3000, "description": "NestWeaver UI server port" },
+        "nestweaver.autoStart": { "type": "boolean", "default": true, "description": "Auto-start server if not running" }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        { "command": "nestweaver.showInGraph", "group": "navigation" }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.7.0"
+  }
+}

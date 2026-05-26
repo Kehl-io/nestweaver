@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+@theme {
+  --color-fn: #3B82F6;
+  --color-cls: #8B5CF6;
+  --color-ifc: #14B8A6;
+  --color-method: #6366F1;
+  --color-module: #F59E0B;
+  --color-note: #78716C;
+  --color-section: #A8A29E;
+  --color-tag: #22C55E;
+  --color-edge-calls: #9CA3AF;
+  --color-edge-imports: #22C55E;
+  --color-edge-extends: #F97316;
+  --color-edge-implements: #06B6D4;
+  --color-edge-crossdomain: #F43F5E;
+  --color-surface: #ffffff;
+  --color-surface-alt: #f9fafb;
+  --color-border: #e5e7eb;
+  --color-text: #111827;
+  --color-text-muted: #6b7280;
+  --color-graph-bg: #fafbfc;
+  --color-graph-label: #374151;
+  --color-graph-label-hover: #111827;
+  --color-graph-edge: rgba(107, 114, 128, 0.15);
+  --color-graph-dim: #d0d0d0;
+  --color-graph-selection: #2563eb;
+}
+
+:root.dark {
+  --color-surface: #0f172a;
+  --color-surface-alt: #1e293b;
+  --color-border: #334155;
+  --color-text: #f1f5f9;
+  --color-text-muted: #94a3b8;
+  --color-graph-bg: #0c0f1a;
+  --color-graph-label: #94a3b8;
+  --color-graph-label-hover: #e2e8f0;
+  --color-graph-edge: rgba(148, 163, 184, 0.12);
+  --color-graph-dim: #3a3a3a;
+  --color-graph-selection: #3b82f6;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+::selection {
+  background: #3B82F640;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Focus indicators */
+:focus-visible {
+  outline: 2px solid var(--color-graph-selection);
+  outline-offset: 2px;
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Screen reader only utility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Responsive: filter bar pills wrap on narrow viewports */
+@media (max-width: 900px) {
+  .filter-pills {
+    flex-wrap: wrap;
+  }
+}

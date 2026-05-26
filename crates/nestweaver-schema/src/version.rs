@@ -1,0 +1,143 @@
+use sha2::{Digest, Sha256};
+
+/// The canonical set of node labels, their properties, edge labels, and their properties.
+/// These are sorted to ensure a stable hash regardless of insertion order.
+const NODE_LABELS: &[&str] = &[
+    "File", "Heading", "Note", "Project", "Repo", "Section", "Service", "Symbol", "Tag", "Vault",
+];
+
+const NODE_PROPERTIES: &[&str] = &[
+    "content_hash",
+    "created_at",
+    "embedding",
+    "end_line",
+    "entry_point_kind",
+    "file_path",
+    "frontmatter",
+    "heading_uid",
+    "indexed_sha",
+    "instance_id",
+    "is_entry_point",
+    "kind",
+    "level",
+    "modified_at",
+    "name",
+    "note_kind",
+    "note_uid",
+    "pagerank_score",
+    "path",
+    "repo_uid",
+    "root_path",
+    "signature",
+    "slug",
+    "staleness_commits_behind",
+    "start_line",
+    "summary",
+    "summary_hash",
+    "text",
+    "text_content",
+    "text_hash",
+    "title",
+    "uid",
+    "url",
+    "vault_uid",
+    "word_count",
+];
+
+const EDGE_LABELS: &[&str] = &[
+    "CALLS",
+    "CONTAINS",
+    "CROSS_REPO_LINK",
+    "EXTENDS",
+    "HEADING_HAS_SECTION",
+    "HEADING_PARENT",
+    "IMPLEMENTS",
+    "IMPORTS",
+    "MEMBER_OF",
+    "NOTE_HAS_HEADING",
+    "NOTE_HAS_SECTION",
+    "NOTE_TAGGED_WITH",
+    "PROJECT_INCLUDES_NOTE",
+    "REFERENCES_CODE_NOTE_TO_SYMBOL",
+    "REFERENCES_CODE_SECTION_TO_SYMBOL",
+    "SECTION_TAGGED_WITH",
+    "VAULT_HAS_NOTE",
+    "WIKILINK_TO_HEADING",
+    "WIKILINK_TO_NOTE",
+];
+
+const EDGE_PROPERTIES: &[&str] = &[
+    "confidence",
+    "edge_type",
+    "link_type",
+    "source_uid",
+    "target_uid",
+];
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Returns the SHA-256 of all sorted node labels + properties + edge labels + properties.
+/// This hash changes whenever the schema structure changes, allowing dependent systems
+/// to detect when re-indexing is needed.
+pub fn core_schema_hash() -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    parts.extend_from_slice(NODE_LABELS);
+    parts.extend_from_slice(NODE_PROPERTIES);
+    parts.extend_from_slice(EDGE_LABELS);
+    parts.extend_from_slice(EDGE_PROPERTIES);
+    // Already sorted (defined as sorted constants), but sort again to be safe.
+    parts.sort_unstable();
+    sha256_hex(&parts.join("\n"))
+}
+
+/// Returns the SHA-256 of the core hash concatenated with an extension hash.
+/// Use this when vendor or application-specific schema extensions exist.
+pub fn effective_schema_hash(core_hash: &str, extension_hash: &str) -> String {
+    sha256_hex(&format!("{core_hash}{extension_hash}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_schema_hash_is_deterministic() {
+        let a = core_schema_hash();
+        let b = core_schema_hash();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn core_schema_hash_is_64_hex_chars() {
+        let h = core_schema_hash();
+        assert_eq!(h.len(), 64, "expected 64-char hex SHA-256, got: {h}");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn effective_hash_changes_with_extension() {
+        let core = core_schema_hash();
+        let h1 = effective_schema_hash(&core, "ext_v1");
+        let h2 = effective_schema_hash(&core, "ext_v2");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn effective_hash_changes_with_core() {
+        let h1 = effective_schema_hash("core_a", "same_ext");
+        let h2 = effective_schema_hash("core_b", "same_ext");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn effective_hash_is_deterministic() {
+        let core = core_schema_hash();
+        let a = effective_schema_hash(&core, "ext");
+        let b = effective_schema_hash(&core, "ext");
+        assert_eq!(a, b);
+    }
+}

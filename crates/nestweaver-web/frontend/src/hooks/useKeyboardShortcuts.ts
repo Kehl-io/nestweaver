@@ -1,0 +1,61 @@
+import { useHotkeys } from "react-hotkeys-hook";
+import { useStore } from "../stores";
+import type { GraphMode } from "../api/types";
+
+const MODES: GraphMode[] = ["context", "impact", "repos", "features", "inspector"];
+
+export function useKeyboardShortcuts() {
+  const setMode = useStore((s) => s.setGraphMode);
+  const toggleLeft = useStore((s) => s.toggleLeftPanel);
+  const toggleRight = useStore((s) => s.toggleRightPanel);
+  const toggleCommunity = useStore((s) => s.toggleCommunityOverlay);
+  const toggleMinimap = useStore((s) => s.toggleMinimap);
+  const toggleTags = useStore((s) => s.toggleTags);
+  const selectNode = useStore((s) => s.selectNode);
+
+  useHotkeys("1", () => setMode(MODES[0]));
+  useHotkeys("2", () => setMode(MODES[1]));
+  useHotkeys("3", () => setMode(MODES[2]));
+  useHotkeys("4", () => setMode(MODES[3]));
+  useHotkeys("5", () => setMode(MODES[4]));
+
+  useHotkeys("[", () => toggleLeft());
+  useHotkeys("]", () => toggleRight());
+
+  useHotkeys("c", () => toggleCommunity());
+  useHotkeys("m", () => toggleMinimap());
+  useHotkeys("t", () => toggleTags());
+
+  useHotkeys("escape", () => selectNode(null));
+
+  // i — impact analysis for selected node
+  useHotkeys("i", () => {
+    const id = useStore.getState().selectedNodeId;
+    if (id) {
+      useStore.getState().selectNode(id, null);
+      useStore.getState().setGraphMode("impact");
+    }
+  });
+
+  // p — find path from selected node
+  useHotkeys("p", () => {
+    const id = useStore.getState().selectedNodeId;
+    if (id) useStore.getState().startPathfinding(id);
+  });
+
+  // mod+k — open LLM query bar
+  useHotkeys(
+    "mod+k",
+    (e) => {
+      e.preventDefault();
+      useStore.getState().openLlmBar();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
+
+  // e — export (no-op; export menu is UI-driven via toolbar button)
+  // f — fit to viewport (requires sigma ref, not available here;
+  //     implement via store action that GraphPanel reads)
+  // r — reset layout (requires ForceAtlas2 restart via sigma ref;
+  //     implement via store action that GraphPanel reads)
+}

@@ -1,0 +1,27 @@
+import { useCallback, useEffect } from "react";
+import { useLoadGraph } from "@react-sigma/core";
+import { useStore } from "../../../stores";
+import { api } from "../../../api/client";
+import { buildGraphFromContext } from "../utils/buildGraphFromContext";
+
+export function useFeaturesMode() {
+  const loadGraph = useLoadGraph();
+  const graphMode = useStore((s) => s.graphMode);
+  const seeds = useStore((s) => s.seeds);
+
+  const loadFeaturesData = useCallback(async () => {
+    if (graphMode !== "features" || seeds.length === 0) return;
+
+    try {
+      const result = await api.brainContext(seeds, 4000, "all");
+      const graph = buildGraphFromContext(result);
+      loadGraph(graph);
+    } catch (err) {
+      console.error("Failed to load features:", err);
+    }
+  }, [graphMode, seeds, loadGraph]);
+
+  useEffect(() => {
+    loadFeaturesData();
+  }, [loadFeaturesData]);
+}

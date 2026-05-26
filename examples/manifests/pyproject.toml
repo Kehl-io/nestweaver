@@ -1,0 +1,15 @@
+[project]
+name = "my-data-pipeline"
+version = "0.1.0"
+dependencies = [
+    "myorg-shared-models>=1.0.0",
+    "fastapi>=0.104.0",
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "myorg-test-fixtures>=1.0.0",
+]

@@ -1,0 +1,17 @@
+[package]
+name = "nestweaver-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+nestweaver-engine = { workspace = true }
+nestweaver-store = { workspace = true }
+nestweaver-schema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

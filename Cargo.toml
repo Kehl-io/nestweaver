@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nestweaver-schema",
+    "crates/nestweaver-parser",
+    "crates/nestweaver-resolver",
+    "crates/nestweaver-store",
+    "crates/nestweaver-storage",
+    "crates/nestweaver-engine",
+    "crates/nestweaver-mcp",
+    "crates/nestweaver-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ci-build/nestweaver"
+description = "Code knowledge graph for AI agents"
+keywords = ["code-graph", "tree-sitter", "code-analysis", "knowledge-graph", "mcp"]
+categories = ["development-tools", "command-line-utilities"]
+
+[workspace.dependencies]
+nestweaver-schema = { path = "crates/nestweaver-schema" }
+nestweaver-parser = { path = "crates/nestweaver-parser" }
+nestweaver-resolver = { path = "crates/nestweaver-resolver" }
+nestweaver-store = { path = "crates/nestweaver-store" }
+nestweaver-storage = { path = "crates/nestweaver-storage" }
+nestweaver-engine = { path = "crates/nestweaver-engine" }
+nestweaver-mcp = { path = "crates/nestweaver-mcp" }
+nestweaver-web = { path = "crates/nestweaver-web" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+axum = "0.8"
+axum-embed = "0.1"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = "0.1"
+open = "5"
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+
+[package]
+name = "nestweaver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nestweaver-engine = { workspace = true }
+nestweaver-store = { workspace = true }
+nestweaver-storage = { workspace = true }
+nestweaver-schema = { workspace = true }
+nestweaver-mcp = { workspace = true }
+nestweaver-web = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+dirs = "6"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+serde_json = { workspace = true }
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "brain_benchmarks"
+harness = false
