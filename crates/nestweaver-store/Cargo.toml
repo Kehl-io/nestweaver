@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 nestweaver-schema = { workspace = true }
 lbug = "0.16.1"
-tantivy = "0.22"
+tantivy = "0.26"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
