@@ -5,12 +5,12 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
-    LookupResult, build_brain_context_hybrid, build_context, build_feature_context,
+    LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
     compute_clusters,
     discover_cross_domain_links, embedding::generate_embedding, generate_guide, generate_repo_map,
     incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
-    list_repos, list_services, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
-    search_symbols, suggest_links,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
+    lookup_symbol, save_clusters, search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -2304,7 +2304,8 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                 ..defaults
             };
 
-            match build_brain_context_hybrid(&store, &seeds, tantivy.as_ref(), &config) {
+            let aliases = load_alias_sidecar(&db_path);
+            match build_brain_context_hybrid_with_aliases(&store, &seeds, tantivy.as_ref(), &config, &aliases) {
                 Ok(mut result) => {
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =

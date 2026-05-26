@@ -12,9 +12,10 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, HybridSearchConfig, build_brain_context_hybrid, compute_clusters,
-    detect_changes_impact, generate_guide, get_all_properties, index_directory,
-    index_markdown_directory, load_extensions, query_by_property, save_extensions, set_property,
+    BrainContextResult, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
+    compute_clusters, detect_changes_impact, generate_guide, get_all_properties, index_directory,
+    index_markdown_directory, load_alias_sidecar, load_extensions, query_by_property,
+    save_extensions, set_property,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -236,11 +237,15 @@ fn tool_brain_context(
         ..defaults
     };
 
+    // Load taxonomy aliases so vault-defined name variants resolve correctly.
+    let db_path = current_db_path(store).unwrap_or_default();
+    let aliases = load_alias_sidecar(&db_path);
+
     // Hybrid retrieval whenever the Tantivy index is open. When absent
     // (cold start, index missing), falls through to pure-PPR — still
     // correct, just less recall on text-only relevance.
     let mut result: BrainContextResult =
-        build_brain_context_hybrid(store, &seeds, tantivy, &config)?;
+        build_brain_context_hybrid_with_aliases(store, &seeds, tantivy, &config, &aliases)?;
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
     let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
