@@ -1,6 +1,7 @@
 // nestweaver-engine: orchestrates parsing, resolution, and graph construction
 
 pub mod agent_guide;
+pub mod mcp_client;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
@@ -26,8 +27,9 @@ pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
 pub use config::{
-    CrossDomainConfig, FeatureConfig, GitConfig, InferenceConfig, InstanceConfig, LinkConfig,
-    RepoConfig, SchemaExtensions, StorageConfig, WorkspaceConfig,
+    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, InferenceConfig, InstanceConfig,
+    LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, SchemaExtensions, StorageConfig,
+    WikiSourceConfig, WorkspaceConfig,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
