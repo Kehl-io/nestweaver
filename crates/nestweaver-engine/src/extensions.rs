@@ -36,10 +36,14 @@ pub fn load_extensions(db_path: &Path) -> ExtensionStore {
 }
 
 /// Persist the extension store as the sidecar file for `db_path`.
+///
+/// Uses a write-then-rename pattern so readers never observe a partial file.
 pub fn save_extensions(db_path: &Path, store: &ExtensionStore) -> Result<(), anyhow::Error> {
     let path = sidecar_path(db_path);
+    let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(store)?;
-    std::fs::write(path, json)?;
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
