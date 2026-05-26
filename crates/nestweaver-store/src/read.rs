@@ -1,7 +1,7 @@
 use lbug::Value;
 use nestweaver_schema::{
-    EntryPointKind, Heading, Note, NoteKind, Repo, Section, Service, Symbol, SymbolKind, Tag,
-    Vault, Visibility,
+    EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol, SymbolKind,
+    Tag, Vault, Visibility,
 };
 use serde::Serialize;
 
@@ -1072,5 +1072,100 @@ impl GraphStore {
             }
         }
         Ok(uids)
+    }
+
+    /// List all Project nodes.
+    pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (p:Project) RETURN p.uid, p.name, p.summary, p.instance_id";
+        let result = conn
+            .query(q)
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        result
+            .map(|row| {
+                Ok(Project {
+                    uid: extract_string(&row, 0)?,
+                    name: extract_string(&row, 1)?,
+                    summary: extract_opt_string(&row, 2)?,
+                    instance_id: extract_string(&row, 3)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Look up a Project by name (case-insensitive).
+    pub fn lookup_project_by_name(&self, name: &str) -> Result<Option<Project>, StoreError> {
+        let all = self.list_projects()?;
+        let needle = name.to_lowercase();
+        Ok(all.into_iter().find(|p| p.name.to_lowercase() == needle))
+    }
+
+    /// List Note UIDs that belong to a project via PROJECT_INCLUDES_NOTE edges.
+    pub fn list_project_note_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+        let result = match self.conn()?.query(&format!(
+            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN n.uid",
+            project_uid.replace('\'', "''")
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_note_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        Ok(result
+            .filter_map(|row| match row.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// List Symbol UIDs that belong to a project via PROJECT_INCLUDES_SYMBOL edges.
+    pub fn list_project_symbol_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+        let result = match self.conn()?.query(&format!(
+            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN s.uid",
+            project_uid.replace('\'', "''")
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_symbol_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        Ok(result
+            .filter_map(|row| match row.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// List component Project UIDs that belong to a project via PROJECT_HAS_COMPONENT edges.
+    pub fn list_project_component_uids(
+        &self,
+        project_uid: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let result = match self.conn()?.query(&format!(
+            "MATCH (p:Project {{uid: '{}'}})-[:PROJECT_HAS_COMPONENT]->(c:Project) RETURN c.uid",
+            project_uid.replace('\'', "''")
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_component_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        Ok(result
+            .filter_map(|row| match row.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect())
     }
 }

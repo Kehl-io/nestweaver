@@ -420,6 +420,13 @@ impl GraphStore {
                     ],
                 )
             }
+            EdgeType::ProjectIncludesSymbol
+            | EdgeType::ProjectHasComponent
+            | EdgeType::ProjectHasParent => Err(StoreError::Query(
+                "Use batch_insert_project_symbol_edges / insert_project_component_edge / \
+                 insert_project_parent_edge for Project edges"
+                    .to_string(),
+            )),
         }
     }
 
@@ -516,6 +523,15 @@ impl GraphStore {
                         ("conf", lbug::Value::Double(conf)),
                         ("lt", lbug::Value::String(link_type)),
                     ]);
+                }
+                EdgeType::ProjectIncludesSymbol
+                | EdgeType::ProjectHasComponent
+                | EdgeType::ProjectHasParent => {
+                    return Err(StoreError::Query(
+                        "Use batch_insert_project_symbol_edges / insert_project_component_edge / \
+                         insert_project_parent_edge for Project edges"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -1435,5 +1451,70 @@ impl GraphStore {
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         }
         Ok(())
+    }
+
+    pub fn batch_insert_project_symbol_edges(
+        &self,
+        project_uid: &str,
+        symbol_uids: &[String],
+        confidence: f32,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "MATCH (p:Project {uid: $pid}), (s:Symbol {uid: $sid}) \
+                 CREATE (p)-[:PROJECT_INCLUDES_SYMBOL {confidence: $conf}]->(s)",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        for sym_uid in symbol_uids {
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("pid", lbug::Value::String(project_uid.to_string())),
+                    ("sid", lbug::Value::String(sym_uid.clone())),
+                    ("conf", lbug::Value::Double(confidence as f64)),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn insert_project_component_edge(
+        &self,
+        parent_uid: &str,
+        child_uid: &str,
+        confidence: f32,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (p:Project {uid: $pid}), (c:Project {uid: $cid}) \
+             CREATE (p)-[:PROJECT_HAS_COMPONENT {confidence: $conf}]->(c)",
+            vec![
+                ("pid", lbug::Value::String(parent_uid.to_string())),
+                ("cid", lbug::Value::String(child_uid.to_string())),
+                ("conf", lbug::Value::Double(confidence as f64)),
+            ],
+        )
+    }
+
+    pub fn insert_project_parent_edge(
+        &self,
+        child_uid: &str,
+        parent_uid: &str,
+        confidence: f32,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (c:Project {uid: $cid}), (p:Project {uid: $pid}) \
+             CREATE (c)-[:PROJECT_HAS_PARENT {confidence: $conf}]->(p)",
+            vec![
+                ("cid", lbug::Value::String(child_uid.to_string())),
+                ("pid", lbug::Value::String(parent_uid.to_string())),
+                ("conf", lbug::Value::Double(confidence as f64)),
+            ],
+        )
     }
 }
