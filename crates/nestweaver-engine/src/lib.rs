@@ -13,6 +13,7 @@ pub mod index;
 pub mod index_md;
 pub mod manifest;
 pub mod process;
+pub mod project;
 pub mod pull;
 pub mod query;
 pub mod registry;
@@ -51,6 +52,9 @@ pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manif
 pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,
+};
+pub use project::{
+    ProjectMaterializationResult, detect_implicit_projects, materialize_projects,
 };
 pub use pull::*;
 pub use query::{
