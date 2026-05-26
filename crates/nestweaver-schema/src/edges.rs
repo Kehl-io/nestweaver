@@ -11,6 +11,9 @@ pub enum EdgeType {
     MemberOf,
     Contains,
     CrossRepoLink,
+    ProjectIncludesSymbol,
+    ProjectHasComponent,
+    ProjectHasParent,
 }
 
 impl fmt::Display for EdgeType {
@@ -24,6 +27,9 @@ impl fmt::Display for EdgeType {
             EdgeType::MemberOf => write!(f, "MEMBER_OF"),
             EdgeType::Contains => write!(f, "CONTAINS"),
             EdgeType::CrossRepoLink => write!(f, "CROSS_REPO_LINK"),
+            EdgeType::ProjectIncludesSymbol => write!(f, "PROJECT_INCLUDES_SYMBOL"),
+            EdgeType::ProjectHasComponent => write!(f, "PROJECT_HAS_COMPONENT"),
+            EdgeType::ProjectHasParent => write!(f, "PROJECT_HAS_PARENT"),
         }
     }
 }
