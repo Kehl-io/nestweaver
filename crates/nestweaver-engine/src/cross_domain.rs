@@ -296,9 +296,7 @@ impl SymbolIndex {
             set
         };
 
-        let min_len = config
-            .min_symbol_name_length
-            .unwrap_or(MIN_SYMBOL_NAME_LEN);
+        let min_len = config.min_symbol_name_length.unwrap_or(MIN_SYMBOL_NAME_LEN);
 
         let mut by_name: HashMap<String, Vec<(String, f32)>> = HashMap::new();
         for (uid, name, kind) in symbols {

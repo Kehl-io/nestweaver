@@ -1,7 +1,6 @@
 // nestweaver-engine: orchestrates parsing, resolution, and graph construction
 
 pub mod agent_guide;
-pub mod mcp_client;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
@@ -12,6 +11,7 @@ pub mod git_diff;
 pub mod index;
 pub mod index_md;
 pub mod manifest;
+pub mod mcp_client;
 pub mod process;
 pub mod project;
 pub mod pull;
@@ -28,9 +28,9 @@ pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
 pub use config::{
-    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, InferenceConfig, InstanceConfig,
-    LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, SchemaExtensions, StorageConfig,
-    WikiSourceConfig, WorkspaceConfig,
+    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, InferenceConfig,
+    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, SchemaExtensions,
+    StorageConfig, WikiSourceConfig, WorkspaceConfig,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
@@ -53,9 +53,7 @@ pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,
 };
-pub use project::{
-    ProjectMaterializationResult, detect_implicit_projects, materialize_projects,
-};
+pub use project::{ProjectMaterializationResult, detect_implicit_projects, materialize_projects};
 pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, FeatureContextResult,

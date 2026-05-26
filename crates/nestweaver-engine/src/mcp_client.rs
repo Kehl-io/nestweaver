@@ -38,8 +38,7 @@ impl McpClient {
         });
         self.send(&req)?;
         let _resp = self.recv()?;
-        let notif =
-            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let notif = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         self.send(&notif)?;
         Ok(())
     }

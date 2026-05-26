@@ -129,8 +129,11 @@ pub fn materialize_projects(
             };
 
             // Spawn MCP client and call tool.
-            match McpClient::spawn(&server_config.command, &server_config.args, &server_config.env)
-            {
+            match McpClient::spawn(
+                &server_config.command,
+                &server_config.args,
+                &server_config.env,
+            ) {
                 Ok(mut client) => {
                     match client.call_tool(&ws.tool, serde_json::json!(ws.args)) {
                         Ok(content) => {

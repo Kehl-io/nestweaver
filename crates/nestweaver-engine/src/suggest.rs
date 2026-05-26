@@ -676,7 +676,10 @@ pub fn materialize_declared_links(
         // Build a name → [(uid)] map for the target repo.
         let mut to_by_name: HashMap<String, Vec<String>> = HashMap::new();
         for (uid, name, _kind) in &syms_to {
-            to_by_name.entry(name.clone()).or_default().push(uid.clone());
+            to_by_name
+                .entry(name.clone())
+                .or_default()
+                .push(uid.clone());
         }
 
         // Insert an edge for every (from-symbol, to-symbol) with a shared name.

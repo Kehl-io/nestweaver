@@ -67,8 +67,8 @@ fn compute_checksum(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(dst)
         .map_err(|e| anyhow::anyhow!("create_dir_all {}: {e}", dst.display()))?;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| anyhow::anyhow!("read_dir {}: {e}", src.display()))?
+    for entry in
+        std::fs::read_dir(src).map_err(|e| anyhow::anyhow!("read_dir {}: {e}", src.display()))?
     {
         let entry = entry.map_err(|e| anyhow::anyhow!("read_dir entry: {e}"))?;
         let ty = entry
@@ -129,9 +129,7 @@ pub fn build_snapshot(
     // pagerank sidecar
     let pagerank_src = db_path.with_extension(SIDECAR_PAGERANK);
     if pagerank_src.exists() {
-        if let Err(e) =
-            std::fs::copy(&pagerank_src, output_dir.join(SIDECAR_PAGERANK))
-        {
+        if let Err(e) = std::fs::copy(&pagerank_src, output_dir.join(SIDECAR_PAGERANK)) {
             tracing::warn!(
                 src = %pagerank_src.display(),
                 "build_snapshot: failed to copy pagerank sidecar: {e}"
@@ -147,9 +145,7 @@ pub fn build_snapshot(
     // manifests sidecar
     let manifests_src = db_path.with_extension(SIDECAR_MANIFESTS);
     if manifests_src.exists() {
-        if let Err(e) =
-            std::fs::copy(&manifests_src, output_dir.join(SIDECAR_MANIFESTS))
-        {
+        if let Err(e) = std::fs::copy(&manifests_src, output_dir.join(SIDECAR_MANIFESTS)) {
             tracing::warn!(
                 src = %manifests_src.display(),
                 "build_snapshot: failed to copy manifests sidecar: {e}"

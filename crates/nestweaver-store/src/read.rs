@@ -1040,8 +1040,7 @@ impl GraphStore {
         let conn = self.conn()?;
         let mut uids = std::collections::HashSet::new();
         for tag_name in tag_names {
-            let q =
-                "MATCH (s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag {name: $name}) RETURN s.uid";
+            let q = "MATCH (s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag {name: $name}) RETURN s.uid";
             let mut stmt = conn
                 .prepare(q)
                 .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -1108,9 +1107,7 @@ impl GraphStore {
         )) {
             Ok(r) => r,
             Err(e) => {
-                tracing::trace!(
-                    "list_project_note_uids: query skipped (table may not exist): {e}"
-                );
+                tracing::trace!("list_project_note_uids: query skipped (table may not exist): {e}");
                 return Ok(vec![]);
             }
         };

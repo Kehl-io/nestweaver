@@ -79,10 +79,7 @@ pub fn query_by_property<'a>(
 }
 
 /// Return all properties stored for a node, or an empty map.
-pub fn get_all_properties(
-    store: &ExtensionStore,
-    uid: &str,
-) -> HashMap<String, serde_json::Value> {
+pub fn get_all_properties(store: &ExtensionStore, uid: &str) -> HashMap<String, serde_json::Value> {
     store.get(uid).cloned().unwrap_or_default()
 }
 
