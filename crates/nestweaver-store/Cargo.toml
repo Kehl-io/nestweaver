@@ -1,0 +1,23 @@
+[package]
+name = "nestweaver-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+nestweaver-schema = { workspace = true }
+lbug = "0.16.1"
+tantivy = "0.22"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"

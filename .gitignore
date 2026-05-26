@@ -1,0 +1,44 @@
+# Build artifacts
+/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.der
+*.jks
+id_rsa
+id_ed25519
+
+# Database files
+*.lbug
+*.sqlite
+*.db
+
+# OS files
+Thumbs.db
+
+# Workspace output
+/workspace/
+
+# Rust backup files
+**/*.rs.bk
+.playwright-cli/
+
+# Internal planning docs (not for release)
+docs/superpowers/
+docs/plans/
+docs/specs/

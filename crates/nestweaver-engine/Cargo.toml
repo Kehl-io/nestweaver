@@ -1,0 +1,33 @@
+[package]
+name = "nestweaver-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+nestweaver-schema = { workspace = true }
+nestweaver-parser = { workspace = true }
+nestweaver-resolver = { workspace = true }
+nestweaver-store = { workspace = true }
+nestweaver-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+toml = "0.8"
+serde_yaml = "0.9"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+walkdir = "2"
+notify = "6"
+notify-debouncer-mini = { version = "0.4", default-features = false }
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"

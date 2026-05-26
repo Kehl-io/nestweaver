@@ -1,0 +1,33 @@
+[package]
+name = "nestweaver-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+nestweaver-schema = { workspace = true }
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-cpp = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-c = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", branch = "main" }
+tree-sitter-php = "0.24"
+tree-sitter-ruby = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-dart = "0.2"
+regex = "1"
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+comrak = { version = "0.30", default-features = false }
+serde_yaml = "0.9"

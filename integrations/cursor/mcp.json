@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nestweaver": {
+      "command": "nestweaver",
+      "args": ["mcp", "--db", "./nestweaver.lbug", "--allow-mcp-add-sources"]
+    }
+  }
+}

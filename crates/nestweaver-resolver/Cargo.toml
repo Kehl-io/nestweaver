@@ -1,0 +1,13 @@
+[package]
+name = "nestweaver-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+nestweaver-schema = { workspace = true }
+nestweaver-parser = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
