@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" fill="none" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="64" fill="#000"/>
+  <defs>
+    <linearGradient id="g1" x1="128" y1="128" x2="384" y2="384" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5ed0fe"/>
+      <stop offset=".5" stop-color="#0862a7"/>
+      <stop offset="1" stop-color="#6b119a"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="384" y1="128" x2="128" y2="384" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4dff00"/>
+      <stop offset="1" stop-color="#5ed0fe"/>
+    </linearGradient>
+    <linearGradient id="g3" x1="256" y1="96" x2="256" y2="416" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5ed0fe"/>
+      <stop offset="1" stop-color="#6b119a"/>
+    </linearGradient>
+  </defs>
+  <!-- Weaving connections -->
+  <path d="M176 176 C256 216, 256 296, 336 336" stroke="url(#g1)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  <path d="M336 176 C256 216, 256 296, 176 336" stroke="url(#g1)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  <path d="M256 136 C256 216, 176 256, 176 336" stroke="url(#g3)" stroke-width="4" fill="none" stroke-linecap="round" opacity=".6"/>
+  <path d="M256 136 C256 216, 336 256, 336 336" stroke="url(#g3)" stroke-width="4" fill="none" stroke-linecap="round" opacity=".6"/>
+  <path d="M176 176 C216 256, 296 256, 336 176" stroke="url(#g1)" stroke-width="4" fill="none" stroke-linecap="round" opacity=".5"/>
+  <path d="M176 336 C216 256, 296 256, 336 336" stroke="url(#g1)" stroke-width="4" fill="none" stroke-linecap="round" opacity=".5"/>
+  <!-- Center weave knot -->
+  <circle cx="256" cy="256" r="16" fill="url(#g1)" opacity=".3"/>
+  <circle cx="256" cy="256" r="8" fill="url(#g2)"/>
+  <!-- Primary nodes (outer) -->
+  <circle cx="176" cy="176" r="20" fill="url(#g1)"/>
+  <circle cx="336" cy="176" r="20" fill="url(#g1)"/>
+  <circle cx="176" cy="336" r="20" fill="url(#g1)"/>
+  <circle cx="336" cy="336" r="20" fill="url(#g1)"/>
+  <!-- Top/bottom nodes -->
+  <circle cx="256" cy="136" r="14" fill="url(#g3)"/>
+  <circle cx="256" cy="376" r="14" fill="url(#g3)"/>
+  <!-- Inner node highlights -->
+  <circle cx="176" cy="176" r="8" fill="#fff" opacity=".3"/>
+  <circle cx="336" cy="176" r="8" fill="#fff" opacity=".3"/>
+  <circle cx="176" cy="336" r="8" fill="#fff" opacity=".3"/>
+  <circle cx="336" cy="336" r="8" fill="#fff" opacity=".3"/>
+  <!-- Accent dots on connections -->
+  <circle cx="216" cy="206" r="5" fill="url(#g2)" opacity=".8"/>
+  <circle cx="296" cy="206" r="5" fill="url(#g2)" opacity=".8"/>
+  <circle cx="216" cy="306" r="5" fill="url(#g2)" opacity=".8"/>
+  <circle cx="296" cy="306" r="5" fill="url(#g2)" opacity=".8"/>
+</svg>

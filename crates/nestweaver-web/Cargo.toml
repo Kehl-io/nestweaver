@@ -1,0 +1,27 @@
+[package]
+name = "nestweaver-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nestweaver-engine = { workspace = true }
+nestweaver-store = { workspace = true }
+nestweaver-schema = { workspace = true }
+axum = { workspace = true }
+axum-embed = { workspace = true }
+rust-embed = { workspace = true }
+tower-http = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+open = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

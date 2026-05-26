@@ -1,0 +1,44 @@
+pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+    let _ = from_file;
+
+    if specifier.ends_with(".*") {
+        return None;
+    }
+
+    for ext in &[".kt", ".java"] {
+        let candidate = format!("{}{ext}", specifier.replace('.', "/"));
+        for &file in known_files {
+            if file == candidate || file.ends_with(&format!("/{candidate}")) {
+                return Some(file.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_kotlin_package_import() {
+        let known = ["src/main/kotlin/com/example/utils/Helper.kt"];
+        let result = resolve_import(
+            "src/main/kotlin/com/example/Main.kt",
+            "com.example.utils.Helper",
+            &known,
+        );
+        assert_eq!(
+            result,
+            Some("src/main/kotlin/com/example/utils/Helper.kt".to_string())
+        );
+    }
+
+    #[test]
+    fn wildcard_import_returns_none() {
+        let known = ["src/com/example/Foo.kt"];
+        let result = resolve_import("src/Main.kt", "com.example.*", &known);
+        assert_eq!(result, None);
+    }
+}

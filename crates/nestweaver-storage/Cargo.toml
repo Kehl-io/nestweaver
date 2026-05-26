@@ -1,0 +1,26 @@
+[package]
+name = "nestweaver-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# Optional: S3 backend
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+
+[features]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tokio"]
+gitlab = []
+
+[dev-dependencies]
+tempfile = "3"

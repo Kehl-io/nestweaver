@@ -1,0 +1,946 @@
+use std::collections::{HashMap, HashSet};
+
+use lbug::Value;
+use nestweaver_schema::Symbol;
+
+use crate::db::GraphStore;
+use crate::error::StoreError;
+use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
+
+/// Internal adjacency data returned by `load_ppr_graph`.
+///
+/// Fields: (uids, uid_to_idx, incoming adjacency, out_degree)
+type PprGraph = (
+    Vec<String>,
+    HashMap<String, usize>,
+    Vec<Vec<usize>>,
+    Vec<usize>,
+);
+
+/// Describes which slice of the graph PageRank / PPR runs over.
+///
+/// The algorithm itself is node-type-agnostic — `GraphScope` is what turns
+/// it into "rank the code graph", "rank the notes graph", or "rank the
+/// unified graph". Each scope is a set of Cypher queries:
+///
+/// - `node_queries` — each must `RETURN` a single column of UIDs. Results
+///   are unioned to produce the full set of nodes in scope.
+/// - `edge_queries` — each must `RETURN` two columns `(source_uid,
+///   target_uid)`. Results are unioned and treated as undirected edges
+///   for PPR propagation (matching the existing code-only behaviour).
+///
+/// Preset constructors `code_only`, `notes_only`, and `unified` cover the
+/// common cases. Custom scopes can be constructed directly for one-off
+/// queries (e.g. "PPR only within one project").
+#[derive(Debug, Clone)]
+pub struct GraphScope {
+    pub node_queries: Vec<String>,
+    pub edge_queries: Vec<String>,
+}
+
+impl GraphScope {
+    /// The original PPR scope: Symbol nodes + the five code edge types
+    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF). Preserves
+    /// the pre-GraphScope behaviour exactly.
+    pub fn code_only() -> Self {
+        Self {
+            node_queries: vec!["MATCH (s:Symbol) RETURN s.uid".to_string()],
+            edge_queries: vec![
+                "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Symbol)-[:IMPORTS]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Symbol)-[:EXTENDS_SYM]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Symbol)-[:IMPLEMENTS_SYM]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Symbol)-[:MEMBER_OF]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Symbol)-[:INCLUDES_SYM]->(b:Symbol) RETURN a.uid, b.uid".to_string(),
+            ],
+        }
+    }
+
+    /// Notes-domain scope: Note + Heading + Section + Tag nodes; containment
+    /// edges (NOTE_HAS_HEADING, NOTE_HAS_SECTION, HEADING_HAS_SECTION,
+    /// HEADING_PARENT), cross-reference edges (WIKILINK_TO_NOTE,
+    /// WIKILINK_TO_HEADING), and tag edges (NOTE_TAGGED_WITH,
+    /// SECTION_TAGGED_WITH).
+    pub fn notes_only() -> Self {
+        Self {
+            node_queries: vec![
+                "MATCH (n:Note) RETURN n.uid".to_string(),
+                "MATCH (h:Heading) RETURN h.uid".to_string(),
+                "MATCH (s:Section) RETURN s.uid".to_string(),
+                "MATCH (t:Tag) RETURN t.uid".to_string(),
+            ],
+            edge_queries: vec![
+                "MATCH (a:Note)-[:NOTE_HAS_HEADING]->(b:Heading) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Note)-[:NOTE_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Heading)-[:HEADING_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid"
+                    .to_string(),
+                "MATCH (a:Heading)-[:HEADING_PARENT]->(b:Heading) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Section)-[:WIKILINK_TO_NOTE]->(b:Note) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Section)-[:WIKILINK_TO_HEADING]->(b:Heading) RETURN a.uid, b.uid"
+                    .to_string(),
+                "MATCH (a:Note)-[:NOTE_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(),
+                "MATCH (a:Section)-[:SECTION_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(),
+            ],
+        }
+    }
+
+    /// Unified scope spanning code + notes + the cross-domain bridges
+    /// that PPR traverses to rank a Symbol and a Note on the same axis.
+    /// This is the single graph the brain answers queries from.
+    pub fn unified() -> Self {
+        let mut scope = Self::code_only();
+        let notes = Self::notes_only();
+        scope.node_queries.extend(notes.node_queries);
+        scope.edge_queries.extend(notes.edge_queries);
+        // Cross-domain bridges — the architectural keystone.
+        scope.edge_queries.push(
+            "MATCH (a:Note)-[:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid"
+                .to_string(),
+        );
+        scope.edge_queries.push(
+            "MATCH (a:Section)-[:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid"
+                .to_string(),
+        );
+        scope
+    }
+}
+
+impl GraphStore {
+    /// Compute PageRank over the nodes and edges in `scope`.
+    ///
+    /// - `damping`: damping factor (typically 0.85)
+    /// - `iterations`: number of iterations to run
+    /// - `scope`: which slice of the graph to rank
+    ///
+    /// After completion the in-memory `pagerank_cache` is replaced with
+    /// scores keyed by node UID. Use `GraphScope::code_only()` to preserve
+    /// the original Symbol-only behaviour; `GraphScope::unified()` ranks
+    /// code + notes on the same axis (this is what the brain queries use).
+    pub fn compute_pagerank(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+    ) -> Result<(), StoreError> {
+        let (uids, _uid_to_idx, incoming, out_degree) = self.load_ppr_graph(scope)?;
+        let n = uids.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let init = 1.0f64 / n as f64;
+        let mut scores: Vec<f64> = vec![init; n];
+        let teleport = (1.0 - damping) / n as f64;
+
+        for _ in 0..iterations {
+            let mut new_scores: Vec<f64> = vec![teleport; n];
+
+            let dangling_sum: f64 = scores
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| out_degree[i] == 0)
+                .map(|(_, &s)| s)
+                .sum::<f64>();
+            let dangling_contrib = damping * dangling_sum / n as f64;
+
+            for v in 0..n {
+                new_scores[v] += dangling_contrib;
+                for &u in &incoming[v] {
+                    if out_degree[u] > 0 {
+                        new_scores[v] += damping * scores[u] / out_degree[u] as f64;
+                    }
+                }
+            }
+
+            let delta: f64 = new_scores
+                .iter()
+                .zip(scores.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+
+            scores = new_scores;
+
+            if delta < 1e-6 {
+                break;
+            }
+        }
+
+        // 5. Store scores in the in-memory cache (no DB write-back needed).
+        let score_map: HashMap<String, f64> = uids
+            .into_iter()
+            .enumerate()
+            .map(|(i, uid)| (uid, scores[i]))
+            .collect();
+        *self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(score_map);
+
+        // Bump the generation so cache-holders know to refresh.
+        self.bump_pagerank_generation();
+
+        Ok(())
+    }
+
+    /// Load all node UIDs and directed edges in `scope` into adjacency
+    /// structures.
+    ///
+    /// Returns `(uids, uid_to_idx, incoming, out_degree)` where:
+    /// - `uids`       — ordered list of all node UIDs in scope
+    /// - `uid_to_idx` — maps uid → index
+    /// - `incoming`   — for each node v, the list of node indices u with an edge u→v
+    /// - `out_degree` — number of outgoing edges per node (combined forward + reverse)
+    ///
+    /// Both forward and reverse directions are included so that PPR propagates
+    /// relevance through the full neighbourhood.
+    fn load_ppr_graph(&self, scope: &GraphScope) -> Result<PprGraph, StoreError> {
+        let conn = self.conn()?;
+
+        // 1. Load all node UIDs in scope (deduplicated across queries).
+        let mut uid_set: HashSet<String> = HashSet::new();
+        let mut uids: Vec<String> = Vec::new();
+        for q in &scope.node_queries {
+            let rows = conn
+                .query(q)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in rows {
+                if let Some(Value::String(s)) = row.first()
+                    && uid_set.insert(s.clone())
+                {
+                    uids.push(s.clone());
+                }
+            }
+        }
+        drop(uid_set);
+
+        let n = uids.len();
+        let uid_to_idx: HashMap<String, usize> = uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| (uid.clone(), i))
+            .collect();
+
+        // 2. Load directed edges from each scope query.
+        let mut forward_edges: Vec<(usize, usize)> = Vec::new();
+        for q in &scope.edge_queries {
+            let rows = match conn.query(q) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Edge table may not exist yet (e.g. no INCLUDES_SYM edges
+                    // have been inserted). Warn and skip rather than aborting.
+                    tracing::warn!(
+                        "load_ppr_graph: edge query failed (table may not exist yet): {e}"
+                    );
+                    continue;
+                }
+            };
+            for row in rows {
+                let src = match row.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let tgt = match row.get(1) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                if let (Some(&si), Some(&ti)) = (uid_to_idx.get(&src), uid_to_idx.get(&tgt)) {
+                    forward_edges.push((si, ti));
+                }
+            }
+        }
+
+        // Combine forward + reverse for undirected neighbourhood propagation.
+        // Each forward edge (u→v) also contributes a reverse edge (v→u).
+        let mut all_edges: Vec<(usize, usize)> = Vec::with_capacity(forward_edges.len() * 2);
+        for &(u, v) in &forward_edges {
+            all_edges.push((u, v));
+            all_edges.push((v, u));
+        }
+
+        // Compute out-degree and incoming adjacency from the combined edge set.
+        let mut out_degree: Vec<usize> = vec![0usize; n];
+        let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(u, v) in &all_edges {
+            out_degree[u] += 1;
+            incoming[v].push(u);
+        }
+
+        Ok((uids, uid_to_idx, incoming, out_degree))
+    }
+
+    /// Run Personalized PageRank seeded from `seed_uids`.
+    ///
+    /// The personalization vector assigns `1/|seeds|` to each seed node and `0`
+    /// to all others.  Convergence is declared when the maximum absolute change
+    /// across all nodes falls below `1e-6`.
+    ///
+    /// Returns `(uid, score)` pairs sorted descending, filtered to `score > 1e-4`.
+    /// Seed nodes are always included regardless of score.
+    pub fn personalized_pagerank(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        let (uids, uid_to_idx, incoming, out_degree) = self.load_ppr_graph(scope)?;
+
+        let n = uids.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        // Build seed index set for O(1) lookup.
+        let seed_set: std::collections::HashSet<usize> = seed_uids
+            .iter()
+            .filter_map(|uid| uid_to_idx.get(uid).copied())
+            .collect();
+
+        let seed_count = seed_set.len();
+        if seed_count == 0 {
+            // No seeds present in the graph — return empty.
+            return Ok(vec![]);
+        }
+
+        let personalization_val = 1.0 / seed_count as f64;
+
+        // Personalization vector: 1/|seeds| for seeds, 0 otherwise.
+        let personalization: Vec<f64> = (0..n)
+            .map(|i| {
+                if seed_set.contains(&i) {
+                    personalization_val
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // Initialize scores to the personalization vector.
+        let mut scores: Vec<f64> = personalization.clone();
+
+        for _ in 0..max_iterations {
+            let mut new_scores: Vec<f64> = vec![0.0; n];
+
+            // Dangling-node handling: redistribute mass from nodes with no
+            // outgoing edges through the personalization vector.
+            let dangling_sum: f64 = scores
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| out_degree[i] == 0)
+                .map(|(_, &s)| s)
+                .sum::<f64>();
+
+            for v in 0..n {
+                new_scores[v] = (1.0 - damping) * personalization[v]
+                    + damping * dangling_sum * personalization[v];
+
+                for &u in &incoming[v] {
+                    if out_degree[u] > 0 {
+                        new_scores[v] += damping * scores[u] / out_degree[u] as f64;
+                    }
+                }
+            }
+
+            // Check convergence.
+            let delta: f64 = new_scores
+                .iter()
+                .zip(scores.iter())
+                .map(|(n, o)| (n - o).abs())
+                .fold(0.0_f64, f64::max);
+
+            scores = new_scores;
+
+            if delta < 1e-6 {
+                break;
+            }
+        }
+
+        let min_score = 1e-4;
+
+        // Collect results: always include seeds, filter others by min_score.
+        let mut results: Vec<(String, f64)> = uids
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| seed_set.contains(&i) || scores[i] > min_score)
+            .map(|(i, uid)| (uid.clone(), scores[i]))
+            .collect();
+
+        // Sort descending by score.
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(results)
+    }
+
+    /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
+    ///
+    /// Scores are read from the in-memory cache populated by `compute_pagerank`.
+    /// If `limit` is `None`, all symbols are returned.
+    pub fn symbols_by_pagerank(&self, limit: Option<usize>) -> Result<Vec<Symbol>, StoreError> {
+        let cache = self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?;
+        let scores = match cache.as_ref() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+
+        // Get all symbols, attach scores from cache, sort descending.
+        let conn = self.conn()?;
+        let q = format!("MATCH (s:Symbol) RETURN {}", SYMBOL_COLUMNS);
+        let result = conn
+            .query(&q)
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        let mut symbols: Vec<Symbol> = result
+            .filter_map(|row| row_to_symbol(&row).ok())
+            .filter_map(|mut sym| {
+                scores.get(&sym.uid).copied().map(|score| {
+                    sym.pagerank_score = Some(score);
+                    sym
+                })
+            })
+            .collect();
+
+        symbols.sort_by(|a, b| {
+            b.pagerank_score
+                .unwrap_or(0.0)
+                .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if let Some(lim) = limit {
+            symbols.truncate(lim);
+        }
+
+        Ok(symbols)
+    }
+
+    /// Persist the in-memory PageRank cache to a JSON sidecar file at `path`.
+    ///
+    /// If the cache is empty (PageRank has not been computed yet), this is a no-op.
+    pub fn save_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        let cache = self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?;
+        if let Some(scores) = cache.as_ref() {
+            let json = serde_json::to_string(scores)
+                .map_err(|e| StoreError::Query(format!("serialize: {e}")))?;
+            std::fs::write(path, json).map_err(|e| StoreError::Query(format!("write: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Load the PageRank cache from a JSON sidecar file at `path`.
+    ///
+    /// If the file does not exist, this is a no-op.
+    pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        if path.exists() {
+            let json = std::fs::read_to_string(path)
+                .map_err(|e| StoreError::Query(format!("read: {e}")))?;
+            let scores: HashMap<String, f64> = serde_json::from_str(&json)
+                .map_err(|e| StoreError::Query(format!("deserialize: {e}")))?;
+            *self
+                .pagerank_cache
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(scores);
+        }
+        Ok(())
+    }
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    use super::GraphScope;
+    use crate::db::GraphStore;
+
+    fn make_symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo-1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+        }
+    }
+
+    fn make_calls_edge(src: &str, tgt: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: tgt.to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+        }
+    }
+
+    fn test_store() -> GraphStore {
+        GraphStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn pagerank_assigns_nonzero_scores() {
+        // Graph: A->B, A->C, B->C  (C has most incoming, should rank highest)
+        let store = test_store();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        store.insert_symbol(&make_symbol("B", "fn_b")).unwrap();
+        store.insert_symbol(&make_symbol("C", "fn_c")).unwrap();
+
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("A", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        // Scores are stored in the cache; read them via symbols_by_pagerank.
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        let c = ranked.iter().find(|s| s.uid == "C").unwrap();
+        let score = c.pagerank_score.unwrap_or(0.0);
+        assert!(
+            score > 0.0,
+            "C should have a nonzero pagerank score, got {score}"
+        );
+    }
+
+    #[test]
+    fn highly_called_symbol_ranks_higher() {
+        // A->C, B->C, D->C — C has three incoming, should rank highest.
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        // Scores are stored in the cache; read them via symbols_by_pagerank.
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        let score_of = |uid: &str| -> f64 {
+            ranked
+                .iter()
+                .find(|s| s.uid == uid)
+                .and_then(|s| s.pagerank_score)
+                .unwrap_or(0.0)
+        };
+        let c_score = score_of("C");
+        let a_score = score_of("A");
+        let b_score = score_of("B");
+        let d_score = score_of("D");
+
+        assert!(
+            c_score > a_score && c_score > b_score && c_score > d_score,
+            "C ({c_score:.4}) should rank higher than A ({a_score:.4}), B ({b_score:.4}), D ({d_score:.4})"
+        );
+    }
+
+    #[test]
+    fn personalized_pagerank_seeds_rank_highest() {
+        // Graph: A->B->C, D->C
+        // Seed from A — A should have highest score, B next, C next.
+        // D should have a low score because it is not in A's neighbourhood.
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+
+        let results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        let score_of = |uid: &str| -> f64 {
+            results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let a_score = score_of("A");
+        let d_score = score_of("D");
+
+        assert!(
+            a_score > d_score,
+            "seed A ({a_score:.6}) should rank higher than non-seed D ({d_score:.6})"
+        );
+        assert!(a_score > 0.0, "A should have a nonzero PPR score");
+    }
+
+    #[test]
+    fn personalized_pagerank_multiple_seeds() {
+        // Graph: A->B->C, D->C
+        // Seed from both A and D — both should rank high, C should rank high
+        // because it is reachable from both seeds' neighbourhoods.
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+
+        let results = store
+            .personalized_pagerank(
+                &["A".to_string(), "D".to_string()],
+                0.85,
+                20,
+                &GraphScope::code_only(),
+            )
+            .unwrap();
+
+        let score_of = |uid: &str| -> f64 {
+            results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let a_score = score_of("A");
+        let d_score = score_of("D");
+        let c_score = score_of("C");
+        let b_score = score_of("B");
+
+        // Both seeds must appear with nonzero scores.
+        assert!(a_score > 0.0, "seed A should have nonzero PPR score");
+        assert!(d_score > 0.0, "seed D should have nonzero PPR score");
+        // C is connected to both seeds' neighbourhoods and should outrank isolated nodes.
+        assert!(
+            c_score > 0.0 || b_score > 0.0,
+            "connected nodes B/C should appear in results"
+        );
+    }
+
+    #[test]
+    fn unified_scope_includes_notes_and_symbols() {
+        use nestweaver_schema::{Note, NoteKind};
+
+        let store = test_store();
+        // Symbols: A, B
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        store.insert_symbol(&make_symbol("B", "fn_b")).unwrap();
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+
+        // Notes: N1, N2 (just two flat nodes — enough to verify PPR can
+        // load them via the unified scope without errors).
+        for (uid, title) in [("note:n1", "One"), ("note:n2", "Two")] {
+            store
+                .insert_note(&Note {
+                    uid: uid.to_string(),
+                    vault_uid: "vlt:test".to_string(),
+                    file_path: format!("{title}.md"),
+                    title: title.to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "h".to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+
+        // Code-only scope: 2 nodes (Symbol A + B).
+        let code = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let code_uids: std::collections::HashSet<&str> =
+            code.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(code_uids.contains("A"));
+        assert!(!code_uids.contains("note:n1"));
+
+        // Notes-only scope seeded by a note: should not surface symbols.
+        let notes = store
+            .personalized_pagerank(
+                &["note:n1".to_string()],
+                0.85,
+                20,
+                &GraphScope::notes_only(),
+            )
+            .unwrap();
+        let notes_uids: std::collections::HashSet<&str> =
+            notes.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(notes_uids.contains("note:n1"));
+        assert!(!notes_uids.contains("A"));
+
+        // Unified scope: both kinds visible. Seeding from a symbol still
+        // includes the symbol; seeding from a note still includes the note.
+        let unified_sym = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::unified())
+            .unwrap();
+        let unified_sym_uids: std::collections::HashSet<&str> =
+            unified_sym.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(unified_sym_uids.contains("A"));
+
+        // Unified compute_pagerank produces scores across both domains.
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
+            .unwrap();
+        // Both kinds present in the cache.
+        let cache = store.pagerank_cache.lock().unwrap();
+        let scores = cache.as_ref().unwrap();
+        assert!(scores.contains_key("A"));
+        assert!(scores.contains_key("note:n1"));
+    }
+
+    #[test]
+    fn notes_only_scope_ranks_wikilink_hub_higher() {
+        // Build a 3-note vault where note B is wikilinked by both A and C
+        // (one section in each note linking to B). PPR seeded from A should
+        // rank B above C.
+        use nestweaver_schema::{Heading, Note, NoteKind, Section};
+
+        let store = test_store();
+
+        // Notes: A, B, C.
+        for (uid, title) in [("note:a", "A"), ("note:b", "B"), ("note:c", "C")] {
+            store
+                .insert_note(&Note {
+                    uid: uid.to_string(),
+                    vault_uid: "vlt:v".to_string(),
+                    file_path: format!("{title}.md"),
+                    title: title.to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 10,
+                    content_hash: "h".to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+
+        // One heading per note (level 1).
+        for (n, name) in [("note:a", "A"), ("note:b", "B"), ("note:c", "C")] {
+            store
+                .insert_heading(&Heading {
+                    uid: format!("head:{n}"),
+                    note_uid: n.to_string(),
+                    level: 1,
+                    text: name.to_string(),
+                    slug: name.to_lowercase(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_hash: "h".to_string(),
+                })
+                .unwrap();
+        }
+
+        // One section per note, attached to its heading.
+        for n in ["note:a", "note:b", "note:c"] {
+            store
+                .insert_section(&Section {
+                    uid: format!("sec:{n}"),
+                    note_uid: n.to_string(),
+                    heading_uid: Some(format!("head:{n}")),
+                    start_line: 2,
+                    end_line: 5,
+                    text_hash: "t".to_string(),
+                    text_content: "body".to_string(),
+                    word_count: 5,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+
+        // Containment edges so notes_only scope picks them up as connected.
+        store
+            .batch_insert_note_section_edges(&[
+                ("note:a", "sec:note:a"),
+                ("note:b", "sec:note:b"),
+                ("note:c", "sec:note:c"),
+            ])
+            .unwrap();
+
+        // Wikilinks: A→B and C→B. B is the hub.
+        store
+            .batch_insert_wikilink_to_note_edges(&[
+                ("sec:note:a", "note:b", 1.0, "B"),
+                ("sec:note:c", "note:b", 1.0, "B"),
+            ])
+            .unwrap();
+
+        // Notes-only PPR seeded from A.
+        let results = store
+            .personalized_pagerank(&["note:a".to_string()], 0.85, 30, &GraphScope::notes_only())
+            .unwrap();
+
+        let score = |uid: &str| {
+            results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        // B is reachable from A (one hop: A's section → B via WIKILINK_TO_NOTE,
+        // then containment back to B) and is more central than C (which is
+        // only reachable via B→C reverse-wikilink path). B should outrank C.
+        let b = score("note:b");
+        let c = score("note:c");
+        assert!(b > 0.0, "B should have a nonzero PPR score");
+        assert!(
+            b > c,
+            "wikilink-hub note B ({b:.6}) should rank higher than peripheral note C ({c:.6})"
+        );
+    }
+
+    #[test]
+    fn unified_scope_returns_both_symbols_and_notes() {
+        use nestweaver_schema::{Note, NoteKind};
+
+        let store = test_store();
+
+        // Code side: A calls B.
+        store.insert_symbol(&make_symbol("sym:a", "fn_a")).unwrap();
+        store.insert_symbol(&make_symbol("sym:b", "fn_b")).unwrap();
+        store
+            .insert_edge(&make_calls_edge("sym:a", "sym:b"))
+            .unwrap();
+
+        // Notes side: two flat notes.
+        for (uid, title) in [("note:p", "P"), ("note:q", "Q")] {
+            store
+                .insert_note(&Note {
+                    uid: uid.to_string(),
+                    vault_uid: "vlt:v".to_string(),
+                    file_path: format!("{title}.md"),
+                    title: title.to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "h".to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+
+        // Unified PPR seeded with one symbol AND one note.
+        let results = store
+            .personalized_pagerank(
+                &["sym:a".to_string(), "note:p".to_string()],
+                0.85,
+                20,
+                &GraphScope::unified(),
+            )
+            .unwrap();
+
+        let uids: std::collections::HashSet<&str> =
+            results.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(uids.contains("sym:a"), "symbol seed should appear");
+        assert!(uids.contains("note:p"), "note seed should appear");
+
+        // Verify the kind mix: results contain at least one sym:* and one note:*.
+        let any_sym = uids.iter().any(|u| u.starts_with("sym:"));
+        let any_note = uids.iter().any(|u| u.starts_with("note:"));
+        assert!(any_sym, "unified PPR should surface at least one Symbol");
+        assert!(any_note, "unified PPR should surface at least one Note");
+    }
+
+    #[test]
+    fn ppr_conserves_score_mass() {
+        // A->B, C is isolated. After dangling-node fix, total PPR score
+        // should sum to ~1.0 even with dangling nodes present.
+        let store = test_store();
+        for uid in ["A", "B", "C"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+
+        let results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 100, &GraphScope::code_only())
+            .unwrap();
+        let total: f64 = results.iter().map(|(_, s)| s).sum();
+        assert!(
+            (total - 1.0).abs() < 0.01,
+            "PPR scores should sum to ~1.0, got {total:.4}"
+        );
+    }
+
+    #[test]
+    fn compute_pagerank_converges_early() {
+        let store = test_store();
+        for uid in ["A", "B", "C"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+
+        // 1000 iterations — should converge well before that.
+        store
+            .compute_pagerank(0.85, 1000, &GraphScope::code_only())
+            .unwrap();
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        assert!(!ranked.is_empty());
+    }
+
+    #[test]
+    fn symbols_by_pagerank_returns_sorted() {
+        // Build a small graph, compute pagerank, verify results are descending by score.
+        let store = test_store();
+        store.insert_symbol(&make_symbol("X", "fn_x")).unwrap();
+        store.insert_symbol(&make_symbol("Y", "fn_y")).unwrap();
+        store.insert_symbol(&make_symbol("Z", "fn_z")).unwrap();
+
+        // Z has most incoming.
+        store.insert_edge(&make_calls_edge("X", "Z")).unwrap();
+        store.insert_edge(&make_calls_edge("Y", "Z")).unwrap();
+
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        assert!(!ranked.is_empty(), "expected at least one ranked symbol");
+
+        let scores: Vec<f64> = ranked
+            .iter()
+            .map(|s| s.pagerank_score.unwrap_or(0.0))
+            .collect();
+
+        for window in scores.windows(2) {
+            assert!(
+                window[0] >= window[1],
+                "scores should be non-increasing: {scores:?}"
+            );
+        }
+    }
+}

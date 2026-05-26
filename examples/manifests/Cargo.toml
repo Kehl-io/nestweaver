@@ -1,0 +1,14 @@
+[package]
+name = "my-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+my-shared-types = { path = "../shared-types" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+
+[dev-dependencies]
+my-test-utils = { path = "../test-utils" }
+tempfile = "3"
