@@ -1,16 +1,18 @@
 use std::path::Path;
 
-use nestweaver_schema::{Project, project_uid};
+use nestweaver_schema::{Note, NoteKind, Project, note_uid, project_uid, truncated_hash};
 use nestweaver_store::GraphStore;
 
 use crate::config::InstanceConfig;
 use crate::extensions::{load_extensions, save_extensions, set_property};
+use crate::mcp_client::McpClient;
 
 pub struct ProjectMaterializationResult {
     pub projects_created: usize,
     pub note_edges: usize,
     pub symbol_edges: usize,
     pub component_edges: usize,
+    pub wiki_notes_ingested: usize,
 }
 
 /// Materialize explicit `[[projects]]` declared in an `InstanceConfig`.
@@ -34,6 +36,7 @@ pub fn materialize_projects(
     let mut total_note_edges = 0usize;
     let mut total_symbol_edges = 0usize;
     let mut total_component_edges = 0usize;
+    let mut total_wiki_notes_ingested = 0usize;
 
     for project_cfg in &config.projects {
         let uid = project_uid(instance_id, &project_cfg.name);
@@ -110,6 +113,97 @@ pub fn materialize_projects(
                 serde_json::json!(&project_cfg.external_refs),
             );
         }
+
+        // 6. Process wiki sources via MCP client calls.
+        for ws in &project_cfg.wiki_sources {
+            // Find matching MCP server config.
+            let server_config = config.mcp_servers.iter().find(|s| s.name == ws.mcp_server);
+
+            let Some(server_config) = server_config else {
+                tracing::warn!(
+                    project = project_cfg.name,
+                    mcp_server = ws.mcp_server,
+                    "MCP server not found in config, skipping wiki source"
+                );
+                continue;
+            };
+
+            // Spawn MCP client and call tool.
+            match McpClient::spawn(&server_config.command, &server_config.args, &server_config.env)
+            {
+                Ok(mut client) => {
+                    match client.call_tool(&ws.tool, serde_json::json!(ws.args)) {
+                        Ok(content) => {
+                            if content.is_empty() {
+                                tracing::warn!(label = ws.label, "MCP tool returned empty content");
+                                continue;
+                            }
+
+                            // Create a Note from the wiki content.
+                            let wiki_note_uid = note_uid(
+                                &format!("wiki:{}", ws.mcp_server),
+                                &format!("{}/{}", ws.tool, ws.label),
+                            );
+
+                            let note = Note {
+                                uid: wiki_note_uid.clone(),
+                                vault_uid: format!("wiki:{}", ws.mcp_server),
+                                file_path: format!("{}/{}", ws.tool, ws.label),
+                                title: ws.label.clone(),
+                                note_kind: NoteKind::General,
+                                word_count: content.split_whitespace().count() as u32,
+                                content_hash: truncated_hash(&content),
+                                frontmatter: None,
+                                created_at: None,
+                                modified_at: None,
+                                pagerank_score: None,
+                            };
+
+                            if let Err(e) = store.insert_note(&note) {
+                                tracing::warn!(
+                                    label = ws.label,
+                                    error = %e,
+                                    "failed to insert wiki note"
+                                );
+                                continue;
+                            }
+
+                            let edge = (uid.as_str(), wiki_note_uid.as_str());
+                            if let Err(e) = store.batch_insert_project_note_edges(&[edge]) {
+                                tracing::warn!(
+                                    label = ws.label,
+                                    error = %e,
+                                    "failed to link wiki note to project"
+                                );
+                            }
+
+                            total_wiki_notes_ingested += 1;
+                            tracing::info!(
+                                label = ws.label,
+                                project = project_cfg.name,
+                                "ingested wiki source"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                label = ws.label,
+                                tool = ws.tool,
+                                error = %e,
+                                "MCP tool call failed, skipping wiki source"
+                            );
+                        }
+                    }
+                    // Client is dropped here, killing the subprocess.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mcp_server = ws.mcp_server,
+                        error = %e,
+                        "failed to spawn MCP server, skipping wiki sources for this server"
+                    );
+                }
+            }
+        }
     }
 
     // Persist the extension sidecar once after all projects are processed.
@@ -120,6 +214,7 @@ pub fn materialize_projects(
         note_edges: total_note_edges,
         symbol_edges: total_symbol_edges,
         component_edges: total_component_edges,
+        wiki_notes_ingested: total_wiki_notes_ingested,
     })
 }
 
@@ -202,7 +297,6 @@ pub fn detect_implicit_projects(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn detect_implicit_projects_returns_empty_when_no_projects_dir() {
