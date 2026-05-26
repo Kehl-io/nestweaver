@@ -146,7 +146,109 @@ pub fn generate_guide(
         }
     }
 
-    // Section 6: Knowledge vaults
+    // Section 6: Projects
+    let projects = store.list_projects().unwrap_or_default();
+    let empty_projects: Vec<crate::config::ProjectConfig> = Vec::new();
+    let config_projects: &[crate::config::ProjectConfig] = config
+        .map(|c| c.projects.as_slice())
+        .unwrap_or(&empty_projects);
+    // Merge: start from store projects, then add any config entries not already present.
+    let mut all_project_names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+    for cp in config_projects {
+        if !all_project_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&cp.name))
+        {
+            all_project_names.push(cp.name.clone());
+        }
+    }
+    if !all_project_names.is_empty() {
+        out.push_str("## Projects\n\n");
+        for project_name in &all_project_names {
+            // Find the store project (may be None if only in config).
+            let store_project = projects
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(project_name));
+            // Find the config project entry (if any).
+            let cfg_project = config_projects
+                .iter()
+                .find(|cp| cp.name.eq_ignore_ascii_case(project_name));
+
+            out.push_str(&format!("### {project_name}\n\n"));
+
+            // Description from config.
+            if let Some(desc) = cfg_project.and_then(|cp| cp.description.as_deref()) {
+                out.push_str(&format!("- **Description:** {desc}\n"));
+            } else if let Some(desc) = store_project.and_then(|p| p.summary.as_deref()) {
+                out.push_str(&format!("- **Description:** {desc}\n"));
+            }
+
+            // Aliases from config.
+            if let Some(cp) = cfg_project
+                && !cp.aliases.is_empty()
+            {
+                out.push_str(&format!("- **Aliases:** {}\n", cp.aliases.join(", ")));
+            }
+
+            // Vault folder from config.
+            if let Some(folder) = cfg_project.and_then(|cp| cp.vault_folder.as_deref()) {
+                out.push_str(&format!("- **Vault folder:** {folder}\n"));
+            }
+
+            // Repos from config.
+            if let Some(cp) = cfg_project
+                && !cp.repos.is_empty()
+            {
+                out.push_str(&format!("- **Repos:** {}\n", cp.repos.join(", ")));
+            }
+
+            // Component count from store.
+            if let Some(p) = store_project {
+                let component_count = store
+                    .list_project_component_uids(&p.uid)
+                    .unwrap_or_default()
+                    .len();
+                if component_count > 0 {
+                    out.push_str(&format!("- **Components:** {component_count}\n"));
+                }
+            }
+
+            // External refs from config.
+            if let Some(cp) = cfg_project
+                && !cp.external_refs.is_empty()
+            {
+                let refs_str: Vec<String> = cp
+                    .external_refs
+                    .iter()
+                    .map(|r| {
+                        if let Some(ref_type) = &r.ref_type {
+                            format!("{} ({})", r.label, ref_type)
+                        } else {
+                            r.label.clone()
+                        }
+                    })
+                    .collect();
+                out.push_str(&format!("- **External refs:** {}\n", refs_str.join(", ")));
+            }
+
+            // Recent activity: max(note.modified_at) from project notes.
+            if let Some(p) = store_project {
+                let note_uids = store.list_project_note_uids(&p.uid).unwrap_or_default();
+                let recent: Option<String> = note_uids
+                    .iter()
+                    .filter_map(|uid| store.lookup_note(uid).ok())
+                    .filter_map(|n| n.modified_at)
+                    .max();
+                if let Some(ts) = recent {
+                    out.push_str(&format!("- **Recent activity:** {ts}\n"));
+                }
+            }
+
+            out.push('\n');
+        }
+    }
+
+    // Section 7: Knowledge vaults
     let vaults = store.list_vaults(None).unwrap_or_default();
     if !vaults.is_empty() {
         out.push_str("## Knowledge Vaults\n\n");
