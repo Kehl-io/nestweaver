@@ -380,4 +380,70 @@ mod tests {
             "should skip reference with no enclosing symbol"
         );
     }
+
+    mod snapshot_tests {
+        use super::*;
+        use insta::assert_yaml_snapshot;
+
+        fn sorted_edges(
+            files: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)>,
+            language: Language,
+        ) -> Vec<ResolvedEdge> {
+            let mut edges = resolve_references(&files, language, "repo:test:snapshot");
+            edges.sort_by(|a, b| {
+                a.source_uid
+                    .cmp(&b.source_uid)
+                    .then_with(|| a.target_uid.cmp(&b.target_uid))
+            });
+            edges
+        }
+
+        #[test]
+        fn snapshot_same_file_resolution() {
+            let files = vec![(
+                "src/main.js".to_string(),
+                vec![
+                    make_symbol("helper", 1),
+                    make_symbol("caller", 10),
+                    make_symbol("utils", 20),
+                ],
+                vec![
+                    make_ref("helper", ReferenceKind::Call, 12),
+                    make_ref("utils", ReferenceKind::Call, 15),
+                ],
+            )];
+            assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
+        }
+
+        #[test]
+        fn snapshot_cross_file_resolution() {
+            let files = vec![
+                (
+                    "src/main.js".to_string(),
+                    vec![make_symbol("main", 5)],
+                    vec![
+                        make_ref("./helper", ReferenceKind::Import, 1),
+                        make_ref("helperFn", ReferenceKind::Call, 10),
+                        make_ref("missingFn", ReferenceKind::Call, 15),
+                    ],
+                ),
+                (
+                    "src/helper.js".to_string(),
+                    vec![make_symbol("helperFn", 1)],
+                    vec![],
+                ),
+            ];
+            assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
+        }
+
+        #[test]
+        fn snapshot_inheritance_resolution() {
+            let files = vec![(
+                "src/models.js".to_string(),
+                vec![make_symbol("BaseModel", 1), make_symbol("UserModel", 20)],
+                vec![make_ref("BaseModel", ReferenceKind::Extends, 21)],
+            )];
+            assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
+        }
+    }
 }

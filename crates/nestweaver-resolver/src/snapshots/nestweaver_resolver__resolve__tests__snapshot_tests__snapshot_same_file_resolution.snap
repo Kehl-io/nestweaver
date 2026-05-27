@@ -1,0 +1,15 @@
+---
+source: crates/nestweaver-resolver/src/resolve.rs
+assertion_line: 415
+expression: "sorted_edges(files, Language::JavaScript)"
+---
+- source_uid: "sym:repo:test:snapshot:27653c212e1c:61de55ba3388:10"
+  target_uid: "sym:repo:test:snapshot:27653c212e1c:6fd8973412ca:20"
+  edge_type: Calls
+  confidence: 0.95
+  link_type: ~
+- source_uid: "sym:repo:test:snapshot:27653c212e1c:61de55ba3388:10"
+  target_uid: "sym:repo:test:snapshot:27653c212e1c:e81d3b0e9d82:1"
+  edge_type: Calls
+  confidence: 0.95
+  link_type: ~
