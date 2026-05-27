@@ -24,18 +24,37 @@ nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
 nestweaver repo-map --token-budget 2000
 
+# Markdown brain
+nestweaver brain add ~/Documents/Obsidian/MyVault
+nestweaver brain search "architecture"
+nestweaver brain context "MyProject"     # unified code + notes context
+nestweaver brain status                  # vault counts, per-vault staleness
+
+# Projects
+nestweaver list-projects --config ./nestweaver-instance.toml
+nestweaver project-context "my-project" --token-budget 5000
+
 # Multi-repo / instance config
-nestweaver suggest-links --db ./all.lbug                                    # manifest deps + IDF name matching
-nestweaver list-links --config ./nestweaver-instance.toml                   # declared [[links]]
-nestweaver list-features --config ./nestweaver-instance.toml                # declared [[features]]
+nestweaver suggest-links --db ./all.lbug
+nestweaver list-links --config ./nestweaver-instance.toml
+nestweaver list-features --config ./nestweaver-instance.toml
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
+
+# MCP server (17 tools)
+nestweaver mcp --db ./nestweaver.lbug
+
+# Web UI
+nestweaver ui --db ./nestweaver.lbug --port 8080
 ```
 
-Default database: `./nestweaver.lbug`. Override with `--db <path>`.
+Default database: `./nestweaver.lbug`. Override with `--db <path>` or `NESTWEAVER_DB` env var.
 
 Sidecar files written alongside the database:
 - `<db>.pagerank.json` — in-memory PageRank cache (written on `index`, loaded on open)
 - `<db>.manifests.json` — parsed manifest data (package.json, go.mod, Cargo.toml, pyproject.toml, requirements.txt, composer.json, Gemfile, pubspec.yaml, Package.swift, *.csproj, build.gradle.kts, CMakeLists.txt)
+- `<db>.tantivy/` — BM25 full-text search index for notes and sections
+- `<db>.extensions.json` — user-defined extension properties on nodes
+- `<db>.aliases.json` — taxonomy alias mappings from vault files
 
 ## Architecture
 

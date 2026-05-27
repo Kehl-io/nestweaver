@@ -40,15 +40,22 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
 When configured as an MCP server, NestWeaver exposes:
 
-- **brain_context** — Task-focused subgraph via Personalized PageRank
+- **brain_context** — Task-focused subgraph via Personalized PageRank (supports filters: repos, vaults, kinds, tags, path_prefix; tunable hybrid weights)
 - **brain_search** — Full-text BM25 search across code and notes
-- **brain_impact** — Blast radius analysis for any symbol
-- **flow_trace** — Forward execution flow from entry points
+- **brain_impact** — Blast radius analysis for any symbol (accepts name or UID)
+- **brain_status** — Database and vault status with per-vault staleness
+- **brain_guide** — Auto-generated codebase intelligence guide with repos, features, links, and projects
+- **brain_add_source** — Index new vaults or repos at runtime (enabled by default)
+- **brain_diff** — Show what changed in the graph since a given SHA
+- **flow_trace** — Forward execution flow from entry points (accepts name or UID)
 - **detect_changes** — Map file changes to affected processes and risk
 - **clusters** — Community detection results (Leiden algorithm)
-- **stale_check** — Check if the index needs refreshing
+- **stale_check** — Check if the index needs refreshing (supports SSH/HTTPS URLs)
 - **cross_repo_contracts** — Cross-repository symbol relationships
-- **note_get** / **backlinks** — Markdown vault queries
+- **project_context** — Project-scoped retrieval across notes, symbols, and components
+- **note_get** — Retrieve a note with optional section filtering
+- **backlinks** — Find notes that link to a target note
+- **set_extension** / **query_extensions** — Attach and query custom metadata on any node
 
 ## Environment Variables
 
