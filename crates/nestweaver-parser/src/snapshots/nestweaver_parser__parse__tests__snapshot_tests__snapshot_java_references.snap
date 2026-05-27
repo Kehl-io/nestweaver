@@ -1,0 +1,25 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1992
+expression: "parsed_references(\"Simple.java\", &source)"
+---
+- name: java.util.List
+  kind: Import
+  start_line: 1
+  context: import java.util.List;
+- name: java.util.ArrayList
+  kind: Import
+  start_line: 2
+  context: import java.util.List;
+- name: Greeter
+  kind: Implements
+  start_line: 9
+  context: "public class SimpleGreeter implements Greeter {"
+- name: greet
+  kind: Call
+  start_line: 28
+  context: "result = greeter.greet(\"world\")"
+- name: println
+  kind: Call
+  start_line: 29
+  context: System.out.println(result);

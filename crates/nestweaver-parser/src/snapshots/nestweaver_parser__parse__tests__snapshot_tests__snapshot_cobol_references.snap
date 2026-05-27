@@ -1,0 +1,25 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2062
+expression: "parsed_references(\"simple.cbl\", &source)"
+---
+- name: INITIALIZE-DATA
+  kind: Call
+  start_line: 13
+  context: PERFORM INITIALIZE-DATA
+- name: PROCESS-GREETING
+  kind: Call
+  start_line: 14
+  context: PERFORM PROCESS-GREETING
+- name: DISPLAY-RESULT
+  kind: Call
+  start_line: 15
+  context: PERFORM DISPLAY-RESULT
+- name: UTIL-PROGRAM
+  kind: Call
+  start_line: 31
+  context: "CALL 'UTIL-PROGRAM' USING WS-NAME."
+- name: COMMON-DEFS
+  kind: Includes
+  start_line: 34
+  context: COPY COMMON-DEFS.

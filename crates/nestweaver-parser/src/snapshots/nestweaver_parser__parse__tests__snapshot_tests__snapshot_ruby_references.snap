@@ -1,0 +1,33 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2034
+expression: "parsed_references(\"simple.rb\", &source)"
+---
+- name: require
+  kind: Call
+  start_line: 1
+  context: "require 'json'"
+- name: require_relative
+  kind: Call
+  start_line: 2
+  context: "require 'json'"
+- name: capitalize
+  kind: Call
+  start_line: 13
+  context: name.capitalize
+- name: Greeter
+  kind: Extends
+  start_line: 17
+  context: class Greeter
+- name: format_name
+  kind: Call
+  start_line: 19
+  context: "#{format_name(name)}"
+- name: new
+  kind: Call
+  start_line: 25
+  context: "greeter = Greetings::FormalGreeter.new"
+- name: greet
+  kind: Call
+  start_line: 26
+  context: "greeter = Greetings::FormalGreeter.new"

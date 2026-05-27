@@ -1,0 +1,25 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1936
+expression: "parsed_references(\"simple.c\", &source)"
+---
+- name: sensor.h
+  kind: Includes
+  start_line: 1
+  context: "#include \"sensor.h\""
+- name: "<stdio.h>"
+  kind: Includes
+  start_line: 2
+  context: "#include \"sensor.h\""
+- name: initialize
+  kind: Call
+  start_line: 30
+  context: initialize(&mgr);
+- name: calibrate
+  kind: Call
+  start_line: 31
+  context: val = calibrate(1)
+- name: printf
+  kind: Call
+  start_line: 32
+  context: "printf(\"Calibrated: %d\\n\", val);"

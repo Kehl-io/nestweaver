@@ -1,0 +1,77 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1930
+expression: "parsed_symbols(\"simple.c\", &source)"
+---
+- name: SensorConfig
+  kind: Class
+  start_line: 4
+  signature: "typedef struct {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorType
+  kind: Class
+  start_line: 9
+  signature: "enum SensorType {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorManager
+  kind: Class
+  start_line: 15
+  signature: "struct SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorManager
+  kind: Class
+  start_line: 20
+  signature: struct SensorManager
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: initialize
+  kind: Function
+  start_line: 20
+  signature: "void initialize(struct SensorManager* mgr) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: calibrate
+  kind: Function
+  start_line: 24
+  signature: "static int calibrate(int sensor_id) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 28
+  signature: "int main(int argc, char** argv) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~
+- name: SensorManager
+  kind: Class
+  start_line: 29
+  signature: struct SensorManager
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

@@ -1,0 +1,25 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2048
+expression: "parsed_references(\"simple.swift\", &source)"
+---
+- name: Foundation
+  kind: Import
+  start_line: 1
+  context: import Foundation
+- name: Greeter
+  kind: Extends
+  start_line: 7
+  context: "class SimpleGreeter: Greeter {"
+- name: SimpleGreeter
+  kind: Call
+  start_line: 28
+  context: let greeter = SimpleGreeter()
+- name: AppConfig
+  kind: Call
+  start_line: 29
+  context: let config = AppConfig()
+- name: print
+  kind: Call
+  start_line: 31
+  context: let greeter = SimpleGreeter()
