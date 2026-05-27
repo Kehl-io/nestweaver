@@ -136,7 +136,7 @@ fn bench_brain_context_query(c: &mut Criterion) {
     c.bench_function(&format!("brain_context_query/notes={n}/seeds=3"), |b| {
         b.iter(|| {
             // No Tantivy here — measures pure-PPR end-to-end query latency.
-            build_brain_context_hybrid(&store, &seeds, None, &HybridSearchConfig::default())
+            build_brain_context_hybrid(&store, &seeds, None, &HybridSearchConfig::default(), None)
                 .unwrap()
         });
     });
