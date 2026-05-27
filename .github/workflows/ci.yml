@@ -34,9 +34,19 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
-      - name: Trigger lbug prebuilt download (first build may fail, second uses cached lib)
-        run: cargo build 2>&1 || cargo build
-      - run: cargo clippy --all-targets -- -D warnings
+      - name: Download prebuilt liblbug
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LBUG_LIB_KIND: static
+          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
+          bash /tmp/download-liblbug.sh
+      - name: Run clippy
+        env:
+          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
+          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Tests
@@ -53,6 +63,65 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Trigger lbug prebuilt download (first build may fail, second uses cached lib)
-        run: cargo build --tests 2>&1 || cargo build --tests
-      - run: cargo test --no-fail-fast
+      - name: Download prebuilt liblbug
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LBUG_LIB_KIND: static
+          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
+          bash /tmp/download-liblbug.sh
+      - name: Run tests
+        env:
+          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
+          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: cargo test --no-fail-fast
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+      - name: Configure linker for lbug+tantivy zstd coexistence
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+      - name: Download prebuilt liblbug
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LBUG_LIB_KIND: static
+          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
+          bash /tmp/download-liblbug.sh
+      - name: Generate coverage
+        env:
+          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
+          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
+        run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run audit
+        run: cargo audit
