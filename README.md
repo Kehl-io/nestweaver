@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="assets/logo-icon-dark.svg" width="128" height="128" alt="NestWeaver">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-full-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-full-light.svg">
+    <img src="assets/logo-full-dark.svg" width="400" alt="NestWeaver">
+  </picture>
 </p>
-
-<h1 align="center">NestWeaver</h1>
 
 <p align="center">
   Code knowledge graph for AI agents
