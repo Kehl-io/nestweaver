@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Context;
+use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{RawReference, RawSymbol, SkippedFile, detect_language, parse_source};
 use nestweaver_resolver::resolve_references;
 use nestweaver_schema::{
@@ -101,6 +103,8 @@ fn index_into_store(
     repo_url: &str,
     indexed_sha: &str,
 ) -> Result<IndexResult, anyhow::Error> {
+    let started = Instant::now();
+
     // 1. Insert the Repo node.
     let r_uid = repo_uid(instance_id, repo_url);
     let repo = Repo {
@@ -112,26 +116,15 @@ fn index_into_store(
     };
     store.insert_repo(&repo).context("insert_repo")?;
 
-    // 2. Walk the directory, collecting ALL parsed data first.
+    // ── Phase 1: Scan files ───────────────────────────────────────────────
+    let scan_pb = ProgressBar::new_spinner();
+    scan_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    scan_pb.set_message("Scanning files...");
 
-    // Vectors for batch inserts.
-    let mut all_files: Vec<File> = Vec::new();
-    let mut all_symbols: Vec<Symbol> = Vec::new();
-    // (repo_uid, file_uid) pairs for REPO_HAS_FILE edges.
-    let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
-    // (file_uid, symbol_uid) pairs for FILE_HAS_SYMBOL edges.
-    let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
-
-    // Per-file raw data for the full cross-file resolver.
-    let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
-        Vec::new();
-
-    // Track the detected language per file for choosing the resolver language.
-    let mut detected_languages: Vec<Language> = Vec::new();
-
-    let mut files_count = 0usize;
-    let mut symbols_count = 0usize;
-    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    let mut file_entries: Vec<(PathBuf, Language)> = Vec::new();
 
     // SECURITY: do NOT follow symlinks (see index_md.rs for rationale).
     let walker = WalkDir::new(repo_path)
@@ -175,6 +168,52 @@ fn index_into_store(
             continue;
         }
 
+        file_entries.push((path.to_path_buf(), lang));
+        scan_pb.set_message(format!("Scanning files... {}", file_entries.len()));
+        scan_pb.tick();
+    }
+
+    scan_pb.finish_with_message(format!("Scanned {} files", file_entries.len()));
+
+    // ── Phase 2: Parse files ──────────────────────────────────────────────
+    let total_files = file_entries.len() as u64;
+    let parse_pb = ProgressBar::new(total_files);
+    parse_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} Parsing [{bar:30.cyan/dim}] {pos}/{len} {wide_msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("━╸─"),
+    );
+
+    // Vectors for batch inserts.
+    let mut all_files: Vec<File> = Vec::new();
+    let mut all_symbols: Vec<Symbol> = Vec::new();
+    // (repo_uid, file_uid) pairs for REPO_HAS_FILE edges.
+    let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
+    // (file_uid, symbol_uid) pairs for FILE_HAS_SYMBOL edges.
+    let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
+
+    // Per-file raw data for the full cross-file resolver.
+    let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
+        Vec::new();
+
+    // Track the detected language per file for choosing the resolver language.
+    let mut detected_languages: Vec<Language> = Vec::new();
+
+    let mut files_count = 0usize;
+    let mut symbols_count = 0usize;
+    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+
+    for (path, lang) in &file_entries {
+        // Show current file being parsed.
+        let display_name = path
+            .strip_prefix(repo_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        parse_pb.set_message(display_name.clone());
+
         // Read file content.
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -183,6 +222,7 @@ fn index_into_store(
                     path: path.to_string_lossy().into_owned(),
                     reason: format!("read error: {err}"),
                 });
+                parse_pb.inc(1);
                 continue;
             }
         };
@@ -195,16 +235,13 @@ fn index_into_store(
                     path: path.to_string_lossy().into_owned(),
                     reason: err.to_string(),
                 });
+                parse_pb.inc(1);
                 continue;
             }
         };
 
         // Compute relative path for stable file UIDs.
-        let rel_path = path
-            .strip_prefix(repo_path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let rel_path = display_name;
 
         let content_hash = sha2_hex(&source);
         let f_uid = file_uid(&r_uid, &rel_path);
@@ -221,10 +258,7 @@ fn index_into_store(
         repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
 
         files_count += 1;
-        if files_count > 0 && files_count.is_multiple_of(100) {
-            tracing::info!(files = files_count, "indexing progress");
-        }
-        detected_languages.push(lang);
+        detected_languages.push(*lang);
 
         // Collect Symbol nodes and FILE_HAS_SYMBOL edges.
         for raw_sym in &parsed.symbols {
@@ -259,7 +293,11 @@ fn index_into_store(
             parsed.symbols.clone(),
             parsed.references.clone(),
         ));
+
+        parse_pb.inc(1);
     }
+
+    parse_pb.finish_and_clear();
 
     // 3. Batch insert all File nodes.
     store
@@ -331,6 +369,15 @@ fn index_into_store(
         .batch_insert_service_symbol_edges(&svc_sym_refs)
         .context("batch_insert_service_symbol_edges")?;
 
+    // ── Phase 3: Resolve cross-file references ────────────────────────────
+    let resolve_pb = ProgressBar::new_spinner();
+    resolve_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    resolve_pb.set_message("Resolving cross-file references...");
+    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
     // 8. Run full cross-file resolution via the resolver.
     //    Use the most common language detected across files; fall back to JavaScript.
     let language = {
@@ -357,6 +404,18 @@ fn index_into_store(
     store
         .batch_insert_edges(&insertable_edges)
         .context("batch_insert_edges (resolved)")?;
+
+    resolve_pb.finish_and_clear();
+
+    // ── Summary ───────────────────────────────────────────────────────────
+    let elapsed = started.elapsed();
+    eprintln!(
+        "Done: {} files, {} symbols, {} edges ({:.1}s)",
+        files_count,
+        symbols_count,
+        edges_count,
+        elapsed.as_secs_f64(),
+    );
 
     tracing::info!(
         total_files = files_count,
