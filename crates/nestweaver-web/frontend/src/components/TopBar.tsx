@@ -102,7 +102,7 @@ export function TopBar() {
   );
 
   return (
-    <header className="flex h-12 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-4">
+    <header data-testid="top-bar" className="flex h-12 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-4">
       <img
         src={theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches)
           ? "/logo-horizontal-dark.svg"
@@ -113,6 +113,7 @@ export function TopBar() {
 
       <div className="relative flex-1 max-w-md">
         <input
+          data-testid="search-input"
           ref={inputRef}
           type="text"
           value={searchQuery}

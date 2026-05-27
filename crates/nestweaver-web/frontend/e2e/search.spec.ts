@@ -11,11 +11,9 @@ test.describe("Search Flow", () => {
 
   test("search via UI shows results", async ({ page }) => {
     await page.goto("/");
-    const searchInput = page.locator(
-      'input[type="search"], input[placeholder*="earch"], [data-testid="search-input"]'
-    );
-    await searchInput.first().waitFor({ timeout: 10_000 });
-    await searchInput.first().fill("greet");
+    const searchInput = page.locator('[data-testid="search-input"]');
+    await searchInput.waitFor({ timeout: 10_000 });
+    await searchInput.fill("greet");
     await expect(page.locator("text=greet").first()).toBeVisible({ timeout: 10_000 });
   });
 
@@ -28,16 +26,14 @@ test.describe("Search Flow", () => {
 
   test("symbol detail loads when clicking a result", async ({ page }) => {
     await page.goto("/");
-    const searchInput = page.locator(
-      'input[type="search"], input[placeholder*="earch"], [data-testid="search-input"]'
-    );
-    await searchInput.first().waitFor({ timeout: 10_000 });
-    await searchInput.first().fill("greet");
+    const searchInput = page.locator('[data-testid="search-input"]');
+    await searchInput.waitFor({ timeout: 10_000 });
+    await searchInput.fill("greet");
     const firstResult = page.locator("text=greet").first();
     await firstResult.waitFor({ timeout: 10_000 });
     await firstResult.click();
     await expect(
-      page.locator('[data-testid="detail-panel"], [data-testid="symbol-detail"], .detail-panel').first()
+      page.locator('[data-testid="detail-panel"]')
     ).toBeVisible({ timeout: 10_000 });
   });
 });
