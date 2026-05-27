@@ -130,6 +130,9 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+      - name: Install frontend dependencies
+        working-directory: crates/nestweaver-web/frontend
+        run: npm ci
       - name: Build (triggers lbug prebuilt download on first run)
         run: |
           cargo build -p nestweaver-store 2>/dev/null || true
@@ -137,9 +140,6 @@ jobs:
           cargo build
       - name: Index test data
         run: ./target/debug/nestweaver index --repo testdata/js --db /tmp/test.lbug
-      - name: Install frontend dependencies
-        working-directory: crates/nestweaver-web/frontend
-        run: npm ci
       - name: Install Playwright browsers
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright install --with-deps chromium
