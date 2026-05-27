@@ -111,7 +111,7 @@ storage         (zero internal deps)
 
 ## CI
 
-- `ci.yml` — cargo fmt, clippy, test, gitleaks (on every PR and push to main)
+- `ci.yml` — cargo fmt, clippy, test, coverage (`cargo-llvm-cov`), security audit (`cargo-audit`) (on every PR and push to main)
 - `release-please.yml` — automated releases, binary builds for x86_64/aarch64 x linux/darwin
 
 ## Exit codes
