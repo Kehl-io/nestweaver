@@ -56,15 +56,11 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Warm lbug prebuilt cache
-        run: |
-          cargo build -p nestweaver-store --target ${{ matrix.target }} 2>/dev/null || true
-          sleep 3
-          cargo build -p nestweaver-store --target ${{ matrix.target }} 2>/dev/null || true
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          LBUG_BUILD_FROM_SOURCE: "1"
       - name: Package binary
         run: |
           BIN="target/${{ matrix.target }}/release/nestweaver"
