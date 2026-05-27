@@ -31,14 +31,18 @@ impl GraphStore {
         Ok(store)
     }
 
-    /// Open an existing persistent database at `path` (schema must already exist).
+    /// Open an existing persistent database at `path`.
+    /// Runs schema migrations to ensure any new tables/columns from newer
+    /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let db = lbug::Database::new(path, lbug::SystemConfig::default())?;
-        Ok(GraphStore {
+        let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
-        })
+        };
+        store.init_schema()?;
+        Ok(store)
     }
 
     /// Open an existing database in read-only mode. Allows concurrent access
