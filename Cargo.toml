@@ -73,6 +73,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "6"
+signal-hook = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2"

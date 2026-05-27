@@ -83,9 +83,64 @@ pub fn get_all_properties(store: &ExtensionStore, uid: &str) -> HashMap<String, 
     store.get(uid).cloned().unwrap_or_default()
 }
 
+/// Record the current UTC time as `last_indexed_at` for a vault.
+///
+/// Loads the extension sidecar, sets the property, and writes it back.
+/// Best-effort: returns `Ok(timestamp)` on success, or an error on I/O
+/// failure. The returned string is RFC 3339-ish UTC (e.g.
+/// `2026-05-27T12:34:56Z`).
+pub fn record_last_indexed_at(db_path: &Path, vault_uid: &str) -> Result<String, anyhow::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts = format_epoch_secs(now.as_secs() as i64);
+    let mut store = load_extensions(db_path);
+    set_property(
+        &mut store,
+        vault_uid,
+        "last_indexed_at",
+        serde_json::Value::String(ts.clone()),
+    );
+    save_extensions(db_path, &store)?;
+    Ok(ts)
+}
+
+/// Read the `last_indexed_at` timestamp for a vault from the extension
+/// sidecar. Returns `None` when the sidecar is missing or the vault has
+/// no recorded timestamp.
+pub fn get_last_indexed_at(db_path: &Path, vault_uid: &str) -> Option<String> {
+    let store = load_extensions(db_path);
+    get_property(&store, vault_uid, "last_indexed_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Render Unix epoch seconds as RFC 3339-ish UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+/// Mirrors `secs_to_ymd_hms` from `index_md.rs`.
+fn format_epoch_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let hour = (secs_of_day / 3600) as u32;
+    let minute = ((secs_of_day % 3600) / 60) as u32;
+    let second = (secs_of_day % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y } as i32;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Canonical sidecar path: `<db>.extensions.json`.
 fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
-    crate::sidecar_path(db_path, ".extensions.json")
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(".extensions.json");
+    std::path::PathBuf::from(s)
 }
 
 #[cfg(test)]

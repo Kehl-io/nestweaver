@@ -84,8 +84,8 @@ pub use cross_domain::{
 pub use dead_code::{DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code};
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use extensions::{
-    ExtensionStore, get_all_properties, get_property, load_extensions, query_by_property,
-    save_extensions, set_property,
+    ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
+    query_by_property, record_last_indexed_at, save_extensions, set_property,
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
