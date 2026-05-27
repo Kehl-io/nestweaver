@@ -12,10 +12,10 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, HybridSearchConfig, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    find_bridge_nodes, find_hub_nodes, generate_guide, get_all_properties, index_directory,
-    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
+    BrainContextResult, HybridSearchConfig, analyze_blast_radius, attach_cluster_ids,
+    attach_communities, build_brain_context_hybrid_with_aliases, compute_clusters,
+    detect_changes_impact, find_bridge_nodes, find_hub_nodes, generate_guide, get_all_properties,
+    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
     parse_iso8601_to_epoch, query_by_property, save_extensions, set_property,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
@@ -55,6 +55,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_project_context(),
         tool_schema_hub_nodes(),
         tool_schema_bridge_nodes(),
+        tool_schema_blast_radius(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -91,6 +92,7 @@ pub fn dispatch(
         "project_context" => tool_project_context(store, tantivy, args),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
+        "blast_radius" => tool_blast_radius(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -2296,6 +2298,117 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "top_n": top_n,
         "count": nodes_json.len(),
         "bridges": nodes_json,
+    }))
+}
+
+// ── 20. blast_radius ─────────────────────────────────────────────────────
+
+fn tool_schema_blast_radius() -> Value {
+    json!({
+        "name": "blast_radius",
+        "description": "Use BEFORE merging a PR or after staging changes to understand the full blast radius across the code graph. Takes a list of changed file paths, maps them to all symbols defined in those files, runs transitive reverse-dependency analysis up to a configurable depth, groups affected symbols by cluster/community, and returns a risk assessment (Low/Medium/High) based on affected symbol count, PageRank centrality of changed symbols, and number of clusters touched.\n\nDo NOT use for single-symbol impact — use brain_impact instead. Do NOT use for cross-repo impact — use cross_repo_contracts. This tool gives a holistic PR-level view including cluster grouping and risk scoring.\n\nThe `changed_files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\", \"src/utils/validate.ts\"]). The optional `max_depth` parameter controls transitive traversal depth (default 3). Returns changed symbols (with PageRank scores), affected symbols (with depth and edge type), affected clusters, risk level, and a human-readable summary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "changed_files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum transitive traversal depth. Default 3. Higher values find more distant dependents.",
+                    "default": 3
+                }
+            },
+            "required": ["changed_files"]
+        }
+    })
+}
+
+fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let files: Vec<std::path::PathBuf> = args
+        .get("changed_files")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("'changed_files' must be an array of strings"))?
+        .iter()
+        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+        .collect();
+
+    if files.is_empty() {
+        return Err(anyhow!("'changed_files' must contain at least one path"));
+    }
+
+    let max_depth = args
+        .get("max_depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(3);
+
+    let db_path = current_db_path(store).ok();
+    let result = analyze_blast_radius(store, &files, max_depth, db_path.as_deref())
+        .context("analyze_blast_radius")?;
+
+    let risk_str = match result.risk_level {
+        nestweaver_engine::RiskLevel::Low => "low",
+        nestweaver_engine::RiskLevel::Medium => "medium",
+        nestweaver_engine::RiskLevel::High => "high",
+    };
+
+    let changed_json: Vec<Value> = result
+        .changed_symbols
+        .iter()
+        .map(|s| {
+            json!({
+                "uid": s.uid,
+                "name": s.name,
+                "file_path": s.file_path,
+                "kind": s.kind,
+                "pagerank_score": s.pagerank_score,
+            })
+        })
+        .collect();
+
+    let affected_json: Vec<Value> = result
+        .affected_symbols
+        .iter()
+        .map(|s| {
+            json!({
+                "uid": s.uid,
+                "name": s.name,
+                "file_path": s.file_path,
+                "depth": s.depth,
+                "edge_type": s.edge_type,
+                "confidence": s.confidence,
+            })
+        })
+        .collect();
+
+    let clusters_json: Vec<Value> = result
+        .affected_clusters
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "name": c.name,
+                "affected_count": c.affected_count,
+                "total_count": c.total_count,
+                "cohesion": c.cohesion,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "changed_files": files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "max_depth": max_depth,
+        "risk": risk_str,
+        "summary": result.summary,
+        "changed_symbols": changed_json,
+        "changed_symbol_count": changed_json.len(),
+        "affected_symbols": affected_json,
+        "affected_symbol_count": affected_json.len(),
+        "affected_clusters": clusters_json,
+        "affected_cluster_count": clusters_json.len(),
     }))
 }
 
