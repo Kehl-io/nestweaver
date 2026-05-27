@@ -472,3 +472,86 @@ description = "Over-the-air firmware update pipeline"
 repos = ["api-service", "device-firmware"]
 entry_points = ["publishFirmware", "checkForUpdate", "applyUpdate"]
 ```
+
+## Projects
+
+Projects aggregate notes, symbols, and components into named units that span
+repos and vaults. They enable unified retrieval via `project_context`.
+
+```toml
+[[projects]]
+name = "device-onboarding"
+description = "End-to-end device onboarding flow"
+aliases = ["onboarding", "DO"]
+vault_folder = "Projects/device-onboarding"
+repos = ["mobile-app", "device-firmware", "api-service"]
+features = ["device-onboarding"]
+components = ["ble-scanner", "device-registry"]
+
+[[projects]]
+name = "platform"
+description = "Top-level platform composite"
+components = ["device-onboarding", "user-auth"]
+```
+
+### Project fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Project name (used for lookup and UID generation) |
+| `description` | no | Human-readable description |
+| `aliases` | no | Alternative names for this project (e.g., `["DO", "Device Onboarding"]`) |
+| `vault_folder` | no | Vault folder whose notes belong to this project |
+| `repos` | no | Repos whose symbols belong to this project |
+| `features` | no | Feature bundles to include |
+| `components` | no | Sub-projects (for composites) |
+| `parent` | no | Parent project name |
+| `tags` | no | Tags associated with this project |
+| `wiki_sources` | no | External wiki content to ingest via MCP |
+| `external_refs` | no | Links to external tools (Jira, Figma, etc.) |
+
+### Implicit project detection
+
+If your vault has a `Projects/<slug>/` folder containing a `<slug>.md` entry
+note, NestWeaver detects it as an implicit project during vault indexing.
+
+## Cross-Domain Configuration
+
+Control how NestWeaver bridges notes to code symbols.
+
+```toml
+[cross_domain]
+stoplist_extend = ["Platform", "Service", "Manager"]
+min_symbol_name_length = 4
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `stoplist_extend` | `[]` | Words to add to the built-in stoplist |
+| `stoplist_replace` | `null` | If set, replaces the built-in stoplist entirely |
+| `min_symbol_name_length` | `4` | Minimum symbol name length for bridging |
+
+## MCP Servers (for wiki ingestion)
+
+Declare external MCP servers that NestWeaver can call to fetch wiki content.
+
+```toml
+[[mcp_servers]]
+name = "confluence"
+command = "npx"
+args = ["-y", "@anthropic/confluence-mcp"]
+
+[mcp_servers.env]
+CONFLUENCE_URL = "https://yoursite.atlassian.net"
+CONFLUENCE_API_TOKEN = "your-token"
+```
+
+Projects reference MCP servers in their `wiki_sources`:
+
+```toml
+[[projects.wiki_sources]]
+label = "Architecture Doc"
+mcp_server = "confluence"
+tool = "get_page_content"
+args = { pageId = "12345" }
+```
