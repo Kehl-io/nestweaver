@@ -34,19 +34,12 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
-      - name: Download prebuilt liblbug
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LBUG_LIB_KIND: static
-          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+      - name: Build (triggers lbug prebuilt download on first run)
         run: |
-          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
-          bash /tmp/download-liblbug.sh
-      - name: Run clippy
-        env:
-          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
-          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
-        run: cargo clippy --all-targets -- -D warnings
+          cargo build -p nestweaver-store 2>/dev/null || true
+          sleep 2
+          cargo build
+      - run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Tests
@@ -63,19 +56,12 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Download prebuilt liblbug
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LBUG_LIB_KIND: static
-          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+      - name: Build (triggers lbug prebuilt download on first run)
         run: |
-          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
-          bash /tmp/download-liblbug.sh
-      - name: Run tests
-        env:
-          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
-          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
-        run: cargo test --no-fail-fast
+          cargo build -p nestweaver-store 2>/dev/null || true
+          sleep 2
+          cargo build --tests
+      - run: cargo test --no-fail-fast
 
   coverage:
     name: Coverage
@@ -96,18 +82,12 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Download prebuilt liblbug
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LBUG_LIB_KIND: static
-          LBUG_TARGET_DIR: ${{ github.workspace }}/.lbug-prebuilt
+      - name: Build (triggers lbug prebuilt download on first run)
         run: |
-          curl -fsSL https://raw.githubusercontent.com/LadybugDB/ladybug/refs/heads/main/scripts/download-liblbug.sh -o /tmp/download-liblbug.sh
-          bash /tmp/download-liblbug.sh
+          cargo build -p nestweaver-store 2>/dev/null || true
+          sleep 2
+          cargo build --tests
       - name: Generate coverage
-        env:
-          LBUG_LIBRARY_DIR: ${{ github.workspace }}/.lbug-prebuilt
-          LBUG_INCLUDE_DIR: ${{ github.workspace }}/.lbug-prebuilt
         run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
