@@ -67,6 +67,28 @@ fn detect_js_ts(
         return Some(EntryPointKind::TestEntry);
     }
 
+    // ── Test files ──
+    //
+    // Any exported symbol in a test file is a test entry point. Covers:
+    //   - __tests__/ directories (Jest convention)
+    //   - *.test.{ts,js,tsx,jsx} and *.spec.{ts,js,tsx,jsx} files
+    if matches!(kind, "function" | "class" | "constant") {
+        let is_test_file = file_path.contains("/__tests__/")
+            || file_name.contains(".test.")
+            || file_name.contains(".spec.");
+        if is_test_file && !name.starts_with('_') {
+            return Some(EntryPointKind::TestEntry);
+        }
+    }
+
+    // ── Config files ──
+    //
+    // Config files are entry points for build tools, linters, etc.
+    // Covers: *.config.{ts,js,mjs,cjs}, vite.config.ts, next.config.js, etc.
+    if matches!(kind, "function" | "class" | "constant") && file_name.contains(".config.") {
+        return Some(EntryPointKind::Main);
+    }
+
     // ── React / Next.js / TanStack Router / Remix page & layout entry points ──
     //
     // Files under /pages/, /app/, or /routes/ are framework entry points.
@@ -147,6 +169,40 @@ fn detect_js_ts(
         && file_path.contains("/components/")
     {
         return Some(EntryPointKind::EventListener);
+    }
+
+    // ── Barrel / index files ──
+    //
+    // Files named index.{ts,js,tsx,jsx} serve as barrel re-export files or
+    // package entry points. Exported symbols from these files are entry points
+    // because they form the public API surface of their directory.
+    let is_index_file = file_name == "index.ts"
+        || file_name == "index.js"
+        || file_name == "index.tsx"
+        || file_name == "index.jsx"
+        || file_name == "index.mjs"
+        || file_name == "index.cjs";
+    if is_index_file && matches!(kind, "function" | "class" | "constant") && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::Main);
+    }
+
+    // ── Main / entry files ──
+    //
+    // Common entry file names at the root or src/ level: main.ts, app.ts, etc.
+    let is_entry_file = file_name == "main.ts"
+        || file_name == "main.js"
+        || file_name == "main.tsx"
+        || file_name == "main.jsx"
+        || file_name == "app.ts"
+        || file_name == "app.js"
+        || file_name == "app.tsx"
+        || file_name == "app.jsx"
+        || file_name == "server.ts"
+        || file_name == "server.js";
+    if is_entry_file && matches!(kind, "function" | "class" | "constant") && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::Main);
     }
 
     // HTTP handler by name
@@ -1040,6 +1096,122 @@ mod tests {
     #[test]
     fn kotlin_non_entry_returns_none() {
         let result = detect_entry_point("greet", "src/Greeter.kt", "function", None, "kotlin");
+        assert_eq!(result, None);
+    }
+
+    // ── New entry point pattern tests ──
+
+    #[test]
+    fn detects_test_file_in_tests_dir() {
+        let result = detect_entry_point(
+            "renderUserProfile",
+            "src/__tests__/UserProfile.test.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::TestEntry));
+    }
+
+    #[test]
+    fn detects_spec_file() {
+        let result = detect_entry_point(
+            "LoginForm",
+            "src/components/LoginForm.spec.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::TestEntry));
+    }
+
+    #[test]
+    fn detects_test_file_constant() {
+        let result = detect_entry_point(
+            "mockData",
+            "src/__tests__/fixtures.ts",
+            "constant",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::TestEntry));
+    }
+
+    #[test]
+    fn detects_config_file() {
+        let result = detect_entry_point(
+            "defineConfig",
+            "vite.config.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_next_config() {
+        let result = detect_entry_point(
+            "nextConfig",
+            "next.config.js",
+            "constant",
+            None,
+            "javascript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_barrel_index_file() {
+        let result = detect_entry_point(
+            "UserService",
+            "src/services/index.ts",
+            "class",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_barrel_index_constant() {
+        let result = detect_entry_point("api", "src/lib/index.ts", "constant", None, "typescript");
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_main_ts_entry_file() {
+        let result = detect_entry_point("createApp", "src/main.ts", "function", None, "typescript");
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_app_tsx_entry_file() {
+        let result = detect_entry_point("App", "src/app.tsx", "function", None, "typescript");
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_server_ts_entry_file() {
+        let result = detect_entry_point(
+            "startServer",
+            "src/server.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn private_in_test_file_not_entry() {
+        let result = detect_entry_point(
+            "_helper",
+            "src/__tests__/utils.ts",
+            "function",
+            None,
+            "typescript",
+        );
         assert_eq!(result, None);
     }
 }
