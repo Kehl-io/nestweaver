@@ -1,0 +1,89 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1958
+expression: "parsed_symbols(\"Simple.cs\", &source)"
+---
+- name: IGreeter
+  kind: Interface
+  start_line: 6
+  signature: public interface IGreeter
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Greet
+  kind: Method
+  start_line: 8
+  signature: string Greet(string name);
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: Priority
+  kind: Class
+  start_line: 11
+  signature: public enum Priority
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SimpleGreeter
+  kind: Class
+  start_line: 18
+  signature: "public class SimpleGreeter : IGreeter"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Greet
+  kind: Method
+  start_line: 20
+  signature: public string Greet(string name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: LogGreeting
+  kind: Method
+  start_line: 25
+  signature: private void LogGreeting(string message)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: void
+- name: Program
+  kind: Class
+  start_line: 31
+  signature: public static class Program
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Main
+  kind: Method
+  start_line: 33
+  signature: "public static void Main(string[] args)"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: void

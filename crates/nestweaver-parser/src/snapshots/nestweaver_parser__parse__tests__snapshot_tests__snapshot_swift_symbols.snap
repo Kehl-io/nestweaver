@@ -1,0 +1,74 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2042
+expression: "parsed_symbols(\"simple.swift\", &source)"
+---
+- name: Greeter
+  kind: Interface
+  start_line: 3
+  signature: "protocol Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: SimpleGreeter
+  kind: Class
+  start_line: 7
+  signature: "class SimpleGreeter: Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 8
+  signature: "func greet(name: String) -> String {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
+- name: formatName
+  kind: Method
+  start_line: 12
+  signature: "private func formatName(_ name: String) -> String {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
+- name: AppConfig
+  kind: Class
+  start_line: 17
+  signature: "struct AppConfig {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Priority
+  kind: Class
+  start_line: 21
+  signature: "enum Priority {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 27
+  signature: "func main() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Inferred
+  type_info: ~

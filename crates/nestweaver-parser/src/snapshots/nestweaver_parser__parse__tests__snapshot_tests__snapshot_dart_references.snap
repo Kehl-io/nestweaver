@@ -1,0 +1,49 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1978
+expression: "parsed_references(\"simple.dart\", &source)"
+---
+- name: "package:flutter/material.dart"
+  kind: Import
+  start_line: 1
+  context: "import 'package:flutter/material.dart';"
+- name: helper.dart
+  kind: Import
+  start_line: 2
+  context: "import 'helper.dart';"
+- name: print
+  kind: Call
+  start_line: 10
+  context: print(message);
+- name: Greeter
+  kind: Extends
+  start_line: 14
+  context: "class SimpleGreeter extends Greeter with Loggable {"
+- name: Loggable
+  kind: Implements
+  start_line: 14
+  context: extends Greeter with Loggable
+- name: log
+  kind: Call
+  start_line: 17
+  context: "log('Greeting $name');"
+- name: toUpperCase
+  kind: Call
+  start_line: 22
+  context: return name.toUpperCase();
+- name: SimpleGreeter
+  kind: Call
+  start_line: 29
+  context: final greeter = SimpleGreeter()
+- name: greet
+  kind: Call
+  start_line: 30
+  context: "final result = greeter.greet('World')"
+- name: print
+  kind: Call
+  start_line: 31
+  context: print(result);
+- name: assist
+  kind: Call
+  start_line: 32
+  context: assist();

@@ -1,0 +1,33 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2006
+expression: "parsed_references(\"Simple.kt\", &source)"
+---
+- name: com.example.utils.Helper
+  kind: Import
+  start_line: 3
+  context: import com.example.utils.Helper
+- name: Greeter
+  kind: Extends
+  start_line: 9
+  context: "class SimpleGreeter : Greeter {"
+- name: println
+  kind: Call
+  start_line: 15
+  context: println(message)
+- name: SimpleGreeter
+  kind: Call
+  start_line: 24
+  context: val greeter = SimpleGreeter()
+- name: greet
+  kind: Call
+  start_line: 25
+  context: val result = greeter.greet(AppConfig.defaultName)
+- name: println
+  kind: Call
+  start_line: 26
+  context: val greeter = SimpleGreeter()
+- name: assist
+  kind: Call
+  start_line: 27
+  context: val greeter = SimpleGreeter()

@@ -1,0 +1,86 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2014
+expression: "parsed_symbols(\"simple.php\", &source)"
+---
+- name: GreeterInterface
+  kind: Interface
+  start_line: 8
+  signature: interface GreeterInterface
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 10
+  signature: "public function greet(string $name): string;"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Loggable
+  kind: Trait
+  start_line: 13
+  signature: trait Loggable
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: log
+  kind: Method
+  start_line: 15
+  signature: "public function log(string $message): void"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SimpleGreeter
+  kind: Class
+  start_line: 21
+  signature: class SimpleGreeter implements GreeterInterface
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 25
+  signature: "public function greet(string $name): string"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: formatName
+  kind: Method
+  start_line: 31
+  signature: "private function formatName(string $name): string"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: Priority
+  kind: Class
+  start_line: 37
+  signature: enum Priority
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: standalone
+  kind: Function
+  start_line: 44
+  signature: "function standalone(string $input): string"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~

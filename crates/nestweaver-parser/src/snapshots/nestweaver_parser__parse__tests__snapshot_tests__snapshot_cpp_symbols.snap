@@ -1,0 +1,77 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1944
+expression: "parsed_symbols(\"simple.cpp\", &source)"
+---
+- name: SensorManager
+  kind: Class
+  start_line: 4
+  signature: "class SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: initialize
+  kind: Method
+  start_line: 6
+  signature: initialize()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: readTemperature
+  kind: Method
+  start_line: 7
+  signature: readTemperature()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: initialize
+  kind: Method
+  start_line: 12
+  signature: "SensorManager::initialize()"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: readTemperature
+  kind: Method
+  start_line: 16
+  signature: "SensorManager::readTemperature()"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorConfig
+  kind: Class
+  start_line: 20
+  signature: "struct SensorConfig {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorType
+  kind: Class
+  start_line: 25
+  signature: "enum SensorType {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: setup
+  kind: Function
+  start_line: 31
+  signature: setup()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

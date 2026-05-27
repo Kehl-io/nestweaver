@@ -1,0 +1,68 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2028
+expression: "parsed_symbols(\"simple.rb\", &source)"
+---
+- name: Greetings
+  kind: Module
+  start_line: 4
+  signature: module Greetings
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Greeter
+  kind: Class
+  start_line: 5
+  signature: class Greeter
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 6
+  signature: def greet(name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: format_name
+  kind: Method
+  start_line: 12
+  signature: def format_name(name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: FormalGreeter
+  kind: Class
+  start_line: 17
+  signature: class FormalGreeter < Greeter
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 18
+  signature: def greet(name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: standalone_function
+  kind: Method
+  start_line: 24
+  signature: def standalone_function(input)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~

@@ -1,0 +1,29 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1964
+expression: "parsed_references(\"Simple.cs\", &source)"
+---
+- name: System
+  kind: Uses
+  start_line: 1
+  context: using System;
+- name: System.Collections.Generic
+  kind: Uses
+  start_line: 2
+  context: using System;
+- name: IGreeter
+  kind: Extends
+  start_line: 18
+  context: "public class SimpleGreeter : IGreeter"
+- name: WriteLine
+  kind: Call
+  start_line: 27
+  context: Console.WriteLine(message);
+- name: Greet
+  kind: Call
+  start_line: 36
+  context: "result = greeter.Greet(\"World\")"
+- name: WriteLine
+  kind: Call
+  start_line: 37
+  context: Console.WriteLine(result);

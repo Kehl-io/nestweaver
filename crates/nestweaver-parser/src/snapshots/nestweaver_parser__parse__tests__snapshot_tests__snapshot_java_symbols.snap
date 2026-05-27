@@ -1,0 +1,77 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1986
+expression: "parsed_symbols(\"Simple.java\", &source)"
+---
+- name: Greeter
+  kind: Interface
+  start_line: 4
+  signature: "public interface Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 5
+  signature: String greet(String name);
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
+- name: farewell
+  kind: Method
+  start_line: 6
+  signature: String farewell(String name);
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
+- name: SimpleGreeter
+  kind: Class
+  start_line: 9
+  signature: "public class SimpleGreeter implements Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 16
+  signature: "@Override"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: farewell
+  kind: Method
+  start_line: 21
+  signature: "@Override"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: main
+  kind: Method
+  start_line: 26
+  signature: "public static void main(String[] args) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: void

@@ -1,0 +1,59 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2056
+expression: "parsed_symbols(\"simple.cbl\", &source)"
+---
+- name: MAIN-LOGIC
+  kind: Module
+  start_line: 12
+  signature: MAIN-LOGIC SECTION.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Inferred
+  type_info: ~
+- name: INITIALIZE-DATA
+  kind: Function
+  start_line: 18
+  signature: INITIALIZE-DATA.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: PROCESS-GREETING
+  kind: Function
+  start_line: 21
+  signature: PROCESS-GREETING.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: DISPLAY-RESULT
+  kind: Function
+  start_line: 27
+  signature: DISPLAY-RESULT.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: CALL-EXTERNAL
+  kind: Module
+  start_line: 30
+  signature: CALL-EXTERNAL SECTION.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: COPY-SECTION
+  kind: Module
+  start_line: 33
+  signature: COPY-SECTION SECTION.
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~

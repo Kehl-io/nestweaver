@@ -1,0 +1,33 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1950
+expression: "parsed_references(\"simple.cpp\", &source)"
+---
+- name: "<iostream>"
+  kind: Import
+  start_line: 1
+  context: "#include <iostream>"
+- name: sensor.h
+  kind: Import
+  start_line: 2
+  context: "#include <iostream>"
+- name: calibrate
+  kind: Call
+  start_line: 13
+  context: calibrate();
+- name: getReading
+  kind: Call
+  start_line: 17
+  context: return getReading(sensorId);
+- name: initialize
+  kind: Call
+  start_line: 33
+  context: mgr.initialize();
+- name: readTemperature
+  kind: Call
+  start_line: 34
+  context: temp = mgr.readTemperature()
+- name: logValue
+  kind: Call
+  start_line: 35
+  context: logValue(temp);

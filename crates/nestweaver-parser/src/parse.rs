@@ -1921,5 +1921,145 @@ mod tests {
             let source = fixture("go/simple.go");
             assert_yaml_snapshot!(parsed_references("simple.go", &source));
         }
+
+        // ── C ───────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_c_symbols() {
+            let source = fixture("c/simple.c");
+            assert_yaml_snapshot!(parsed_symbols("simple.c", &source));
+        }
+
+        #[test]
+        fn snapshot_c_references() {
+            let source = fixture("c/simple.c");
+            assert_yaml_snapshot!(parsed_references("simple.c", &source));
+        }
+
+        // ── C++ ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_cpp_symbols() {
+            let source = fixture("cpp/simple.cpp");
+            assert_yaml_snapshot!(parsed_symbols("simple.cpp", &source));
+        }
+
+        #[test]
+        fn snapshot_cpp_references() {
+            let source = fixture("cpp/simple.cpp");
+            assert_yaml_snapshot!(parsed_references("simple.cpp", &source));
+        }
+
+        // ── C# ──────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_csharp_symbols() {
+            let source = fixture("csharp/Simple.cs");
+            assert_yaml_snapshot!(parsed_symbols("Simple.cs", &source));
+        }
+
+        #[test]
+        fn snapshot_csharp_references() {
+            let source = fixture("csharp/Simple.cs");
+            assert_yaml_snapshot!(parsed_references("Simple.cs", &source));
+        }
+
+        // ── Dart ────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_dart_symbols() {
+            let source = fixture("dart/simple.dart");
+            assert_yaml_snapshot!(parsed_symbols("simple.dart", &source));
+        }
+
+        #[test]
+        fn snapshot_dart_references() {
+            let source = fixture("dart/simple.dart");
+            assert_yaml_snapshot!(parsed_references("simple.dart", &source));
+        }
+
+        // ── Java ────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_java_symbols() {
+            let source = fixture("java/Simple.java");
+            assert_yaml_snapshot!(parsed_symbols("Simple.java", &source));
+        }
+
+        #[test]
+        fn snapshot_java_references() {
+            let source = fixture("java/Simple.java");
+            assert_yaml_snapshot!(parsed_references("Simple.java", &source));
+        }
+
+        // ── Kotlin ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_kotlin_symbols() {
+            let source = fixture("kotlin/Simple.kt");
+            assert_yaml_snapshot!(parsed_symbols("Simple.kt", &source));
+        }
+
+        #[test]
+        fn snapshot_kotlin_references() {
+            let source = fixture("kotlin/Simple.kt");
+            assert_yaml_snapshot!(parsed_references("Simple.kt", &source));
+        }
+
+        // ── PHP ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_php_symbols() {
+            let source = fixture("php/simple.php");
+            assert_yaml_snapshot!(parsed_symbols("simple.php", &source));
+        }
+
+        #[test]
+        fn snapshot_php_references() {
+            let source = fixture("php/simple.php");
+            assert_yaml_snapshot!(parsed_references("simple.php", &source));
+        }
+
+        // ── Ruby ────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_ruby_symbols() {
+            let source = fixture("ruby/simple.rb");
+            assert_yaml_snapshot!(parsed_symbols("simple.rb", &source));
+        }
+
+        #[test]
+        fn snapshot_ruby_references() {
+            let source = fixture("ruby/simple.rb");
+            assert_yaml_snapshot!(parsed_references("simple.rb", &source));
+        }
+
+        // ── Swift ───────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_swift_symbols() {
+            let source = fixture("swift/simple.swift");
+            assert_yaml_snapshot!(parsed_symbols("simple.swift", &source));
+        }
+
+        #[test]
+        fn snapshot_swift_references() {
+            let source = fixture("swift/simple.swift");
+            assert_yaml_snapshot!(parsed_references("simple.swift", &source));
+        }
+
+        // ── COBOL ───────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_cobol_symbols() {
+            let source = fixture("cobol/simple.cbl");
+            assert_yaml_snapshot!(parsed_symbols("simple.cbl", &source));
+        }
+
+        #[test]
+        fn snapshot_cobol_references() {
+            let source = fixture("cobol/simple.cbl");
+            assert_yaml_snapshot!(parsed_references("simple.cbl", &source));
+        }
     }
 }
