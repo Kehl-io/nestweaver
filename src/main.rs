@@ -1,5 +1,6 @@
 mod setup;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -135,6 +136,68 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Print timing and statistics after operations
+    #[arg(long, global = true)]
+    stats: bool,
+
+    /// Suppress non-essential output
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+
+    /// Show additional detail (e.g. UIDs)
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+
+    /// Disable colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Alias for --no-color (plain text output)
+    #[arg(long, global = true)]
+    plain: bool,
+}
+
+// ── Output configuration ─────────────────────────────────────────────────────
+
+struct OutputConfig {
+    quiet: bool,
+    verbose: bool,
+    /// Whether colored output is enabled. Reserved for future use by
+    /// owo-colors formatting paths.
+    #[allow(dead_code)]
+    color: bool,
+}
+
+impl OutputConfig {
+    fn from_cli(cli: &Cli) -> Self {
+        let color = if cli.no_color || cli.plain || std::env::var("NO_COLOR").is_ok() {
+            false
+        } else {
+            std::io::stderr().is_terminal()
+        };
+        Self {
+            quiet: cli.quiet,
+            verbose: cli.verbose,
+            color,
+        }
+    }
+
+    /// Print a progress/status message to stderr, unless `--quiet` is set.
+    fn status(&self, msg: &str) {
+        if !self.quiet {
+            eprintln!("{msg}");
+        }
+    }
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs >= 1.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    }
 }
 
 #[derive(Subcommand)]
@@ -1062,9 +1125,16 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+    let out = OutputConfig::from_cli(&cli);
+    let show_stats = cli.stats;
 
-    let exit_code = match run(cli) {
-        Ok(code) => code,
+    let exit_code = match run(cli, &out) {
+        Ok((code, summary)) => {
+            if let (true, Some(s)) = (show_stats, summary) {
+                eprintln!("stats: {s}");
+            }
+            code
+        }
         Err(e) => {
             let report = into_diagnostic(e);
             eprintln!("{report:?}");
@@ -1075,7 +1145,9 @@ fn main() {
     process::exit(exit_code);
 }
 
-fn run(cli: Cli) -> anyhow::Result<i32> {
+fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
+    let t0 = std::time::Instant::now();
+    let _ = &t0; // suppress unused warning for arms that don't use it
     match cli.command {
         Commands::ListRepos { instance, json, db } => {
             let store = open_store(db.as_deref())?;
@@ -1094,7 +1166,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::ListServices { instance, json, db } => {
@@ -1116,7 +1188,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::ServiceSummary {
@@ -1138,11 +1210,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             println!("Summary: {summary}");
                         }
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 None => {
                     eprintln!("Service not found: {name}");
-                    Ok(EXIT_NOT_FOUND)
+                    Ok((EXIT_NOT_FOUND, None))
                 }
             }
         }
@@ -1172,7 +1244,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             } else {
                 print!("{map}");
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::CrossRepoRefs {
@@ -1203,11 +1275,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             );
                         }
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 ResolveResult::NotFound => {
                     eprintln!("Symbol '{name_or_uid}' not found.");
-                    Ok(EXIT_NOT_FOUND)
+                    Ok((EXIT_NOT_FOUND, None))
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
@@ -1222,7 +1294,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             eprintln!("  {} [{}] {}:{}", c.uid, c.kind, c.file_path, c.start_line);
                         }
                     }
-                    Ok(EXIT_AMBIGUOUS)
+                    Ok((EXIT_AMBIGUOUS, None))
                 }
             }
         }
@@ -1299,11 +1371,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                         nestweaver_engine::cleanup_repo(&workspace_root, &repo)?;
                         println!("Ephemeral: cleaned up");
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 Err(e) => {
                     eprintln!("Pull failed: {e}");
-                    Ok(e.exit_code())
+                    Ok((e.exit_code(), None))
                 }
             }
         }
@@ -1335,21 +1407,27 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
 
                 match build_feature_context(&store, feature_config, links) {
                     Ok(result) => {
+                        let stats = format!(
+                            "{} seeds, {} connected nodes in {}",
+                            result.seeds.len(),
+                            result.connected.len(),
+                            format_elapsed(t0.elapsed())
+                        );
                         if json {
                             println!("{}", serde_json::to_string_pretty(&result)?);
                         } else {
                             print_feature_context_text(&result);
                         }
-                        Ok(EXIT_SUCCESS)
+                        Ok((EXIT_SUCCESS, Some(stats)))
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("No symbols found") {
                             eprintln!("{msg}");
-                            Ok(EXIT_NOT_FOUND)
+                            Ok((EXIT_NOT_FOUND, None))
                         } else {
                             eprintln!("Error: {msg}");
-                            Ok(EXIT_ERROR)
+                            Ok((EXIT_ERROR, None))
                         }
                     }
                 }
@@ -1357,24 +1435,30 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 // Normal seed-based context.
                 match build_context(&store, &seeds) {
                     Ok(result) => {
+                        let stats = format!(
+                            "{} seeds, {} connected nodes in {}",
+                            result.seeds.len(),
+                            result.connected.len(),
+                            format_elapsed(t0.elapsed())
+                        );
                         if json {
                             println!("{}", serde_json::to_string_pretty(&result)?);
                         } else {
                             print_context_text(&result);
                         }
-                        Ok(EXIT_SUCCESS)
+                        Ok((EXIT_SUCCESS, Some(stats)))
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("No matching symbols") {
                             eprintln!("{msg}");
-                            Ok(EXIT_NOT_FOUND)
+                            Ok((EXIT_NOT_FOUND, None))
                         } else if msg.contains("Ambiguous") {
                             eprintln!("{msg}");
-                            Ok(EXIT_AMBIGUOUS)
+                            Ok((EXIT_AMBIGUOUS, None))
                         } else {
                             eprintln!("Error: {msg}");
-                            Ok(EXIT_ERROR)
+                            Ok((EXIT_ERROR, None))
                         }
                     }
                 }
@@ -1405,7 +1489,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::ListFeatures { config, json } => {
@@ -1427,7 +1511,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::SuggestLinks { db, json } => {
@@ -1455,7 +1539,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 if suggestions.links.is_empty() && suggestions.features.is_empty() {
                     println!("No cross-repo connections detected.");
                     println!("Tip: Index multiple repos into the same database first.");
-                    return Ok(EXIT_SUCCESS);
+                    return Ok((EXIT_SUCCESS, None));
                 }
 
                 if !suggestions.links.is_empty() {
@@ -1500,7 +1584,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     }
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::GenerateGuide {
@@ -1524,11 +1608,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             match output {
                 Some(path) => {
                     std::fs::write(&path, &output_str)?;
-                    eprintln!("Guide written to {}", path.display());
+                    out.status(&format!("Guide written to {}", path.display()));
                 }
                 None => print!("{output_str}"),
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Clusters {
@@ -1539,14 +1623,14 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
 
-            eprintln!("Computing clusters (resolution={resolution})...");
+            out.status(&format!("Computing clusters (resolution={resolution})..."));
             let output = compute_clusters(&store, resolution)?;
             save_clusters(&db_path, &output)?;
-            eprintln!(
+            out.status(&format!(
                 "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
                 output.communities.len(),
                 output.modularity
-            );
+            ));
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1568,7 +1652,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     }
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Cluster {
@@ -1582,7 +1666,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             let output = match load_clusters(&db_path)? {
                 Some(cached) => cached,
                 None => {
-                    eprintln!("No cached clusters found; computing with default resolution...");
+                    out.status("No cached clusters found; computing with default resolution...");
                     let store = open_store(Some(&db_path))?;
                     let computed = compute_clusters(&store, 1.0)?;
                     save_clusters(&db_path, &computed)?;
@@ -1619,7 +1703,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             println!("    {} ({}) {}", m.name, m.kind, m.file_path);
                         }
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 None => {
                     eprintln!("Cluster '{}' not found.", id_or_name);
@@ -1632,7 +1716,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    Ok(EXIT_NOT_FOUND)
+                    Ok((EXIT_NOT_FOUND, None))
                 }
             }
         }
@@ -1640,23 +1724,23 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Commands::Setup { tool, all, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
             setup::run_setup(tool.as_deref(), &db_path, all)?;
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::Snapshot { command } => run_snapshot(command),
-        Commands::Instance { command } => run_instance(command),
-        Commands::Brain { command } => run_brain(*command),
+        Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
+        Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
+        Commands::Brain { command } => run_brain(*command, out, t0),
         Commands::Embed {
             db,
             endpoint,
             model,
             batch_size,
-        } => run_embed(db.as_deref(), &endpoint, &model, batch_size),
+        } => run_embed(db.as_deref(), &endpoint, &model, batch_size).map(|c| (c, None)),
 
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Mcp {
@@ -1669,7 +1753,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             // up as an EXIT_ERROR; clean EOF exits 0.
             nestweaver_mcp::run_stdio_server(&db_path, allow_mcp_add_sources, lite)
                 .context("mcp server")?;
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Ui {
@@ -1688,7 +1772,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
 
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Search {
@@ -1710,7 +1794,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!("  {} ({}) {}:{}", c.name, c.kind, c.file_path, c.start_line);
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Symbol {
@@ -1728,26 +1812,48 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                         println!("{}", serde_json::to_string_pretty(&*detail)?);
                     } else {
                         let s = &detail.symbol;
-                        println!("Symbol: {}", s.name);
+                        if out.verbose {
+                            println!("Symbol: {} [{}]", s.name, s.uid);
+                        } else {
+                            println!("Symbol: {}", s.name);
+                        }
                         println!("Kind: {}", s.kind);
                         println!("File: {}:{}", s.file_path, s.start_line);
                         println!("Signature: {}", s.signature);
 
                         if !detail.callers.is_empty() {
-                            println!("\nCallers ({}):", detail.callers.len());
+                            if !out.quiet {
+                                println!("\nCallers ({}):", detail.callers.len());
+                            }
                             for c in &detail.callers {
-                                println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                if out.verbose {
+                                    println!(
+                                        "  {} ({}:{}) [{}]",
+                                        c.name, c.file_path, c.start_line, c.uid
+                                    );
+                                } else {
+                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                }
                             }
                         }
 
                         if !detail.callees.is_empty() {
-                            println!("\nCallees ({}):", detail.callees.len());
+                            if !out.quiet {
+                                println!("\nCallees ({}):", detail.callees.len());
+                            }
                             for c in &detail.callees {
-                                println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                if out.verbose {
+                                    println!(
+                                        "  {} ({}:{}) [{}]",
+                                        c.name, c.file_path, c.start_line, c.uid
+                                    );
+                                } else {
+                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                }
                             }
                         }
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 LookupResult::NotFound => {
                     if json {
@@ -1758,7 +1864,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     } else {
                         eprintln!("Symbol '{name_or_uid}' not found.");
                     }
-                    Ok(EXIT_NOT_FOUND)
+                    Ok((EXIT_NOT_FOUND, None))
                 }
                 LookupResult::Ambiguous(candidates) => {
                     if json {
@@ -1773,7 +1879,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             eprintln!("  {} [{}] {}:{}", c.uid, c.kind, c.file_path, c.start_line);
                         }
                     }
-                    Ok(EXIT_AMBIGUOUS)
+                    Ok((EXIT_AMBIGUOUS, None))
                 }
             }
         }
@@ -1792,6 +1898,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             match resolve_uid(&store, &name_or_uid)? {
                 ResolveResult::Found(uid) => {
                     let nodes = store.impact(&uid, depth, confidence)?;
+                    let count = nodes.len();
 
                     if json {
                         // Serialize as JSON array
@@ -1819,26 +1926,48 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&json_nodes)?);
                     } else if nodes.is_empty() {
-                        println!("No impact found for '{name_or_uid}'.");
+                        if !out.quiet {
+                            println!("No impact found for '{name_or_uid}'.");
+                        }
                     } else {
-                        println!("Impact of '{name_or_uid}' ({} nodes):", nodes.len());
+                        if !out.quiet {
+                            println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                        }
                         for n in &nodes {
-                            println!(
-                                "  [depth {}] {} via {} ({:.2}) — {}:{}",
-                                n.depth,
-                                n.name,
-                                n.edge_type,
-                                n.confidence,
-                                n.file_path,
-                                n.start_line,
-                            );
+                            if out.verbose {
+                                println!(
+                                    "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
+                                    n.depth,
+                                    n.name,
+                                    n.edge_type,
+                                    n.confidence,
+                                    n.file_path,
+                                    n.start_line,
+                                    n.uid,
+                                );
+                            } else {
+                                println!(
+                                    "  [depth {}] {} via {} ({:.2}) — {}:{}",
+                                    n.depth,
+                                    n.name,
+                                    n.edge_type,
+                                    n.confidence,
+                                    n.file_path,
+                                    n.start_line,
+                                );
+                            }
                         }
                     }
-                    Ok(EXIT_SUCCESS)
+                    let stats = format!(
+                        "{} affected symbols in {}",
+                        count,
+                        format_elapsed(t0.elapsed())
+                    );
+                    Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
                     eprintln!("Symbol '{name_or_uid}' not found.");
-                    Ok(EXIT_NOT_FOUND)
+                    Ok((EXIT_NOT_FOUND, None))
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
@@ -1853,7 +1982,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             eprintln!("  {} [{}] {}:{}", c.uid, c.kind, c.file_path, c.start_line);
                         }
                     }
-                    Ok(EXIT_AMBIGUOUS)
+                    Ok((EXIT_AMBIGUOUS, None))
                 }
             }
         }
@@ -1878,7 +2007,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::ProjectContext {
@@ -1913,7 +2042,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                             "Project '{}' not found. Try: nestweaver list-projects",
                             name
                         );
-                        return Ok(EXIT_NOT_FOUND);
+                        return Ok((EXIT_NOT_FOUND, None));
                     }
                 }
             };
@@ -1960,7 +2089,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                         project.name
                     );
                 }
-                return Ok(EXIT_SUCCESS);
+                return Ok((EXIT_SUCCESS, None));
             }
 
             let defaults = HybridSearchConfig::default();
@@ -2022,11 +2151,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                         println!();
                         print_brain_context_text(&result, cut, Some(token_budget));
                     }
-                    Ok(EXIT_SUCCESS)
+                    Ok((EXIT_SUCCESS, None))
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
-                    Ok(EXIT_ERROR)
+                    Ok((EXIT_ERROR, None))
                 }
             }
         }
@@ -2046,22 +2175,28 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
 
             let repo_url = format!("file://{}", repo_path.display());
 
-            eprintln!("Indexing {}", repo_path.display());
+            out.status(&format!("Indexing {}", repo_path.display()));
+
+            let (files_count, symbols_count, edges_count);
 
             if force {
                 // Full re-index requested explicitly.
                 let result = index_directory(&repo_path, &db_path, instance_id, &repo_url, "local")
                     .context("index_directory")?;
 
+                files_count = result.files_count;
+                symbols_count = result.symbols_count;
+                edges_count = result.edges_count;
+
                 println!(
                     "Indexed {} file(s), {} symbol(s), {} edge(s).",
-                    result.files_count, result.symbols_count, result.edges_count
+                    files_count, symbols_count, edges_count
                 );
 
                 if !result.skipped_files.is_empty() {
-                    eprintln!("Skipped {} file(s):", result.skipped_files.len());
+                    out.status(&format!("Skipped {} file(s):", result.skipped_files.len()));
                     for sf in &result.skipped_files {
-                        eprintln!("  {} — {}", sf.path, sf.reason);
+                        out.status(&format!("  {} — {}", sf.path, sf.reason));
                     }
                 }
             } else {
@@ -2069,28 +2204,32 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 let inc = incremental_index(&repo_path, &db_path, instance_id, &repo_url)
                     .context("incremental_index")?;
 
+                files_count = inc.files_added + inc.files_modified;
+                symbols_count = inc.symbols_added;
+                edges_count = 0; // not tracked separately in incremental
+
                 if inc.fell_back_to_full {
-                    eprintln!("Incremental: no prior index found, performed full index.");
+                    out.status("Incremental: no prior index found, performed full index.");
                 } else {
-                    eprintln!(
+                    out.status(&format!(
                         "Incremental: {} added, {} modified, {} deleted, {} renamed, {} skipped.",
                         inc.files_added,
                         inc.files_modified,
                         inc.files_deleted,
                         inc.files_renamed,
                         inc.files_skipped,
-                    );
-                    eprintln!(
+                    ));
+                    out.status(&format!(
                         "Incremental: {} symbol(s) added, {} symbol(s) removed.",
                         inc.symbols_added, inc.symbols_removed,
-                    );
+                    ));
                 }
             }
 
             // Compute PageRank after indexing so the repo-map is immediately usable.
             // (incremental_index already computes PageRank internally, but recomputing
             // here is cheap and ensures the sidecar is always up to date for the full path.)
-            eprintln!("Computing PageRank...");
+            out.status("Computing PageRank...");
             let store = GraphStore::open(&db_path)
                 .with_context(|| format!("failed to open database at {}", db_path.display()))?;
             store
@@ -2102,9 +2241,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             store
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
-            eprintln!("PageRank complete.");
+            out.status("PageRank complete.");
 
-            Ok(EXIT_SUCCESS)
+            let stats = format!(
+                "{} files, {} symbols, {} edges in {}",
+                files_count,
+                symbols_count,
+                edges_count,
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
     }
 }
@@ -2232,7 +2378,11 @@ where
 }
 
 /// Dispatch a `brain` subcommand.
-fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
+fn run_brain(
+    command: BrainCommands,
+    out: &OutputConfig,
+    t0: std::time::Instant,
+) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         BrainCommands::Add {
             path,
@@ -2251,11 +2401,11 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
 
             if !path.exists() {
                 eprintln!("Error: path does not exist: {}", path.display());
-                return Ok(EXIT_ERROR);
+                return Ok((EXIT_ERROR, None));
             }
             if !path.is_dir() {
                 eprintln!("Error: path is not a directory: {}", path.display());
-                return Ok(EXIT_ERROR);
+                return Ok((EXIT_ERROR, None));
             }
 
             // Auto-detect: report what we think the source is.
@@ -2265,15 +2415,17 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             } else {
                 "markdown folder"
             };
-            eprintln!(
+            out.status(&format!(
                 "Detected {} at {} -> {}",
                 kind_hint,
                 path.display(),
                 db_path.display()
-            );
+            ));
 
             let result = index_markdown_directory(&path, &db_path, instance_id, &vault_name)
                 .context("index_markdown_directory")?;
+
+            let notes_count = result.notes_count;
 
             if result.notes_count == 0 {
                 // The Vault node was created, but no markdown files were
@@ -2316,13 +2468,14 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             }
 
             if !result.skipped.is_empty() {
-                eprintln!("Skipped {} file(s):", result.skipped.len());
+                out.status(&format!("Skipped {} file(s):", result.skipped.len()));
                 for sf in &result.skipped {
-                    eprintln!("  {} - {}", sf.path, sf.reason);
+                    out.status(&format!("  {} - {}", sf.path, sf.reason));
                 }
             }
 
-            Ok(EXIT_SUCCESS)
+            let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         BrainCommands::List { json, db } => {
@@ -2374,7 +2527,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                     println!();
                 }
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::Status { json, db } => {
@@ -2477,7 +2630,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::Watch {
@@ -2489,7 +2642,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             let db_path = db.unwrap_or_else(default_db_path);
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
-                return Ok(EXIT_ERROR);
+                return Ok((EXIT_ERROR, None));
             }
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -2521,17 +2674,17 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             let stop_signal = stop.clone();
             let _ = ctrlc_handler(move || stop_signal.stop());
 
-            eprintln!(
+            out.status(&format!(
                 "Watching {} -> {} (Ctrl-C to stop)",
                 path.display(),
                 db_path.display()
-            );
+            ));
             watcher.run().context("watcher")?;
 
             // Clean up the lock file on orderly shutdown.
             let _ = std::fs::remove_file(&lock_path);
-            eprintln!("Watcher stopped.");
-            Ok(EXIT_SUCCESS)
+            out.status("Watcher stopped.");
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::Refresh {
@@ -2544,7 +2697,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             let db_path = db.unwrap_or_else(default_db_path);
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
-                return Ok(EXIT_ERROR);
+                return Ok((EXIT_ERROR, None));
             }
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -2615,7 +2768,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                     result.wikilinks_unresolved,
                 );
             }
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::Remove { path, instance, db } => {
@@ -2646,7 +2799,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                  to clear them too.",
                 vault_name, dropped
             );
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::ReindexSearch { db } => {
@@ -2662,7 +2815,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                 "Tantivy reindex complete: {count} document(s) at {}",
                 sidecar.display()
             );
-            Ok(EXIT_SUCCESS)
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::Search {
@@ -2676,10 +2829,12 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
 
+            let result_count;
             if let Some(ref idx) = tantivy {
                 let hits = idx
                     .search(&query, limit)
                     .with_context(|| "tantivy search")?;
+                result_count = hits.len();
                 if json {
                     let results: Vec<serde_json::Value> = hits
                         .iter()
@@ -2718,6 +2873,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                     .filter(|n| n.title.to_lowercase().contains(&needle))
                     .take(limit)
                     .collect();
+                result_count = matches.len();
                 if json {
                     let results: Vec<serde_json::Value> = matches
                         .iter()
@@ -2752,7 +2908,12 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                     }
                 }
             }
-            Ok(EXIT_SUCCESS)
+            let stats = format!(
+                "{} results in {}",
+                result_count,
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         BrainCommands::Context {
@@ -2912,12 +3073,14 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                         Some(budget) => token_budgeted_truncate(&result.connected, budget),
                         None => limit.min(result.connected.len()),
                     };
+                    let node_count = result.seeds.len() + cut;
                     if json {
                         print_brain_context_json(&result, cut)?;
                     } else {
                         print_brain_context_text(&result, cut, token_budget);
                     }
-                    Ok(EXIT_SUCCESS)
+                    let stats = format!("{} nodes in {}", node_count, format_elapsed(t0.elapsed()));
+                    Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -2934,10 +3097,10 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                         } else {
                             eprintln!("{msg}");
                         }
-                        Ok(EXIT_NOT_FOUND)
+                        Ok((EXIT_NOT_FOUND, None))
                     } else {
                         eprintln!("Error: {msg}");
-                        Ok(EXIT_ERROR)
+                        Ok((EXIT_ERROR, None))
                     }
                 }
             }
