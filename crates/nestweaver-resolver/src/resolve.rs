@@ -1,14 +1,14 @@
 use nestweaver_parser::{RawReference, RawSymbol, ReferenceKind};
 use nestweaver_schema::{
-    EdgeType, Language, MatchType, ResolvedEdge, confidence_score, symbol_uid,
+    EdgeType, Language, MatchType, ResolvedEdge, Visibility, confidence_score, symbol_uid,
 };
 
 use crate::imports::build_import_graph;
 use crate::util::parent_dir;
 
-/// Resolve all non-import references across files into `ResolvedEdge`s.
+/// Resolve all references across files into `ResolvedEdge`s.
 ///
-/// Two-pass approach:
+/// Three-pass approach:
 /// 1. Build the import graph (what each file imports/exports)
 /// 2. For each non-import reference, find the target symbol using priority:
 ///    - Same file → SameFileExact confidence
@@ -16,6 +16,8 @@ use crate::util::parent_dir;
 ///    - Re-exports (one level deep) → ReExportResolved confidence
 ///    - Same package/directory → SamePackageFallback confidence
 ///    - No match → confidence 0.0, target_uid = "unresolved:{name}"
+/// 3. Create IMPORTS edges from the import graph: for each resolved import,
+///    link the importing symbol to all exported symbols in the target file
 pub fn resolve_references(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
@@ -180,6 +182,99 @@ pub fn resolve_references(
                 confidence: 0.0,
                 link_type: None,
             });
+        }
+    }
+
+    // ── Pass 3: Create IMPORTS edges from the import graph ──────────────
+    //
+    // For each file, iterate its resolved imports and create IMPORTS edges
+    // from the importing symbol to each exported symbol in the target file.
+    // This is purely additive — it doesn't affect the call/extends/implements
+    // edges created above.
+    //
+    // Build a file → symbols lookup for target file symbol access.
+    let file_symbols: std::collections::HashMap<&str, &Vec<RawSymbol>> = files
+        .iter()
+        .map(|(path, syms, _)| (path.as_str(), syms))
+        .collect();
+
+    // Build a file → references lookup for import reference line matching.
+    let file_refs: std::collections::HashMap<&str, &Vec<RawReference>> = files
+        .iter()
+        .map(|(path, _, refs)| (path.as_str(), refs))
+        .collect();
+
+    for (file_path, _symbols, _references) in files {
+        let imports = graph.imports_of(file_path);
+        if imports.is_empty() {
+            continue;
+        }
+
+        let source_symbols = match file_symbols.get(file_path.as_str()) {
+            Some(syms) if !syms.is_empty() => *syms,
+            _ => continue,
+        };
+
+        let empty_refs = Vec::new();
+        let source_refs = file_refs
+            .get(file_path.as_str())
+            .copied()
+            .unwrap_or(&empty_refs);
+
+        for (specifier, target_file) in &imports {
+            // Find the import reference line to determine the enclosing source symbol.
+            let import_line = source_refs
+                .iter()
+                .find(|r| {
+                    matches!(
+                        r.kind,
+                        ReferenceKind::Import | ReferenceKind::Includes | ReferenceKind::Uses
+                    ) && r.name == *specifier
+                })
+                .map(|r| r.start_line);
+
+            // Use enclosing symbol at import line, or fall back to first symbol in file.
+            let source_sym = import_line
+                .and_then(|line| find_enclosing_symbol(source_symbols, line))
+                .or_else(|| source_symbols.first());
+
+            let source_uid = match source_sym {
+                Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
+                None => continue,
+            };
+
+            // Get all non-private symbols in the target file.
+            let target_symbols = match file_symbols.get(target_file.as_str()) {
+                Some(syms) => *syms,
+                None => continue,
+            };
+
+            let exported: Vec<&RawSymbol> = target_symbols
+                .iter()
+                .filter(|s| !matches!(s.visibility, Visibility::Private))
+                .collect();
+
+            if exported.is_empty() {
+                continue;
+            }
+
+            let confidence = confidence_score(MatchType::ImportResolved, language);
+
+            for target_sym in &exported {
+                let target_uid = symbol_uid(
+                    repo_uid,
+                    target_file,
+                    &target_sym.name,
+                    target_sym.start_line,
+                );
+                edges.push(ResolvedEdge {
+                    source_uid: source_uid.clone(),
+                    target_uid,
+                    edge_type: EdgeType::Imports,
+                    confidence,
+                    link_type: None,
+                });
+            }
         }
     }
 
@@ -378,6 +473,167 @@ mod tests {
         assert!(
             edges.is_empty(),
             "should skip reference with no enclosing symbol"
+        );
+    }
+
+    #[test]
+    fn creates_imports_edges_from_import_graph() {
+        // main.js imports helper.js — should create IMPORTS edges
+        // to all exported symbols in helper.js
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 5)],
+                vec![make_ref("./helper", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1), make_symbol("utilFn", 10)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert_eq!(
+            import_edges.len(),
+            2,
+            "should create IMPORTS edges to both exported symbols; got: {import_edges:?}"
+        );
+
+        let expected_confidence = confidence_score(MatchType::ImportResolved, Language::JavaScript);
+        for edge in &import_edges {
+            assert!(
+                (edge.confidence - expected_confidence).abs() < f32::EPSILON,
+                "IMPORTS edge should have ImportResolved confidence"
+            );
+            assert!(
+                !edge.target_uid.starts_with("unresolved:"),
+                "IMPORTS target should be resolved"
+            );
+        }
+    }
+
+    #[test]
+    fn imports_edges_skip_private_symbols() {
+        // helper.js has a private symbol — should not get an IMPORTS edge
+        let mut private_sym = make_symbol("_internal", 20);
+        private_sym.visibility = Visibility::Private;
+
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 5)],
+                vec![make_ref("./helper", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1), private_sym],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert_eq!(
+            import_edges.len(),
+            1,
+            "should only create IMPORTS edge to non-private symbol; got: {import_edges:?}"
+        );
+    }
+
+    #[test]
+    fn imports_edges_coexist_with_call_edges() {
+        // main.js imports helper.js AND calls helperFn — both edge types should exist
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 5)],
+                vec![
+                    make_ref("./helper", ReferenceKind::Import, 1),
+                    make_ref("helperFn", ReferenceKind::Call, 10),
+                ],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert!(!call_edges.is_empty(), "should still produce CALLS edges");
+        assert!(
+            !import_edges.is_empty(),
+            "should also produce IMPORTS edges"
+        );
+    }
+
+    #[test]
+    fn imports_edges_skip_empty_target_file() {
+        // target file has no symbols — no IMPORTS edges should be created
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 5)],
+                vec![make_ref("./empty", ReferenceKind::Import, 1)],
+            ),
+            ("src/empty.js".to_string(), vec![], vec![]),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert!(
+            import_edges.is_empty(),
+            "should not create IMPORTS edges to file with no symbols"
+        );
+    }
+
+    #[test]
+    fn imports_edges_use_enclosing_symbol_at_import_line() {
+        // Import at line 15 — enclosing symbol should be "setup" (line 10), not "init" (line 1)
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("init", 1), make_symbol("setup", 10)],
+                vec![make_ref("./helper", ReferenceKind::Import, 15)],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        assert_eq!(import_edges.len(), 1);
+
+        // The source should be "setup" (line 10), not "init" (line 1)
+        let expected_source = symbol_uid("repo:test:abc", "src/main.js", "setup", 10);
+        assert_eq!(
+            import_edges[0].source_uid, expected_source,
+            "should use enclosing symbol at import line as source"
         );
     }
 
