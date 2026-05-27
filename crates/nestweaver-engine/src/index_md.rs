@@ -6,9 +6,11 @@
 //! later phases.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Context;
+use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
@@ -571,6 +573,8 @@ fn index_into_store(
     instance_id: &str,
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    let started = Instant::now();
+
     // Canonicalize the root so vault_uid and note rel_paths agree with the
     // watcher (which sees canonical paths from FSEvents on macOS).
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
@@ -593,22 +597,22 @@ fn index_into_store(
     };
     store.insert_vault(&vault).context("insert_vault")?;
 
-    // ── Pass 1: walk, parse, accumulate nodes ───────────────────────────────
-    // We accumulate every node's data into batches plus a per-note context
-    // so pass 2 (wikilink + tag resolution) can do its work without
-    // re-parsing or re-walking.
-    let mut all_notes: Vec<Note> = Vec::new();
-    let mut all_headings: Vec<Heading> = Vec::new();
-    let mut all_sections: Vec<Section> = Vec::new();
-    let mut edge_pairs: Vec<(String, String)> = Vec::new();
-    let mut note_heading_edges: Vec<(String, String)> = Vec::new();
-    let mut note_section_edges: Vec<(String, String)> = Vec::new();
-    let mut heading_section_edges: Vec<(String, String)> = Vec::new();
-    let mut heading_parent_edges: Vec<(String, String)> = Vec::new();
+    // ── Phase 1: Scan notes ───────────────────────────────────────────────
+    let scan_pb = ProgressBar::new_spinner();
+    scan_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    scan_pb.set_message("Scanning notes...");
+
+    /// Per-file data collected during the scan phase.
+    struct ScannedNote {
+        path: PathBuf,
+        metadata: Option<std::fs::Metadata>,
+    }
+
+    let mut scanned_notes: Vec<ScannedNote> = Vec::new();
     let mut skipped: Vec<SkippedFile> = Vec::new();
-    // Per-note context for pass-2 cross-reference resolution.
-    let mut note_contexts: Vec<NoteContext> = Vec::new();
-    let mut note_count = 0usize;
 
     // Track visited directory inodes to detect symlink loops.
     #[cfg(unix)]
@@ -681,7 +685,8 @@ fn index_into_store(
         }
 
         // Size guard.
-        if let Ok(meta) = entry.metadata()
+        let metadata = entry.metadata().ok();
+        if let Some(ref meta) = metadata
             && meta.len() > MAX_FILE_SIZE_BYTES
         {
             skipped.push(SkippedFile {
@@ -691,6 +696,52 @@ fn index_into_store(
             continue;
         }
 
+        scanned_notes.push(ScannedNote {
+            path: path.to_path_buf(),
+            metadata,
+        });
+        scan_pb.set_message(format!("Scanning notes... {}", scanned_notes.len()));
+        scan_pb.tick();
+    }
+
+    scan_pb.finish_with_message(format!("Scanned {} notes", scanned_notes.len()));
+
+    // ── Phase 2: Parse markdown ───────────────────────────────────────────
+    let total_notes = scanned_notes.len() as u64;
+    let parse_pb = ProgressBar::new(total_notes);
+    parse_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} Parsing [{bar:30.cyan/dim}] {pos}/{len} {wide_msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("━╸─"),
+    );
+
+    // We accumulate every node's data into batches plus a per-note context
+    // so pass 2 (wikilink + tag resolution) can do its work without
+    // re-parsing or re-walking.
+    let mut all_notes: Vec<Note> = Vec::new();
+    let mut all_headings: Vec<Heading> = Vec::new();
+    let mut all_sections: Vec<Section> = Vec::new();
+    let mut edge_pairs: Vec<(String, String)> = Vec::new();
+    let mut note_heading_edges: Vec<(String, String)> = Vec::new();
+    let mut note_section_edges: Vec<(String, String)> = Vec::new();
+    let mut heading_section_edges: Vec<(String, String)> = Vec::new();
+    let mut heading_parent_edges: Vec<(String, String)> = Vec::new();
+    // Per-note context for pass-2 cross-reference resolution.
+    let mut note_contexts: Vec<NoteContext> = Vec::new();
+
+    for scanned in &scanned_notes {
+        let path = &scanned.path;
+
+        // Show current note being parsed.
+        let display_name = path
+            .strip_prefix(vault_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        parse_pb.set_message(display_name.clone());
+
         // Read.
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -699,16 +750,13 @@ fn index_into_store(
                     path: path.to_string_lossy().into_owned(),
                     reason: format!("read error: {err}"),
                 });
+                parse_pb.inc(1);
                 continue;
             }
         };
 
         // Compute relative path from vault root for stable UIDs.
-        let rel_path = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let rel_path = display_name;
 
         let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
             Ok(p) => p,
@@ -717,6 +765,7 @@ fn index_into_store(
                     path: rel_path.clone(),
                     reason: err.to_string(),
                 });
+                parse_pb.inc(1);
                 continue;
             }
         };
@@ -737,13 +786,13 @@ fn index_into_store(
         };
 
         // File timestamps — best-effort, never fatal.
-        let (created_at, modified_at) = match entry.metadata() {
-            Ok(meta) => {
+        let (created_at, modified_at) = match &scanned.metadata {
+            Some(meta) => {
                 let created = meta.created().ok().and_then(format_system_time);
                 let modified = meta.modified().ok().and_then(format_system_time);
                 (created, modified)
             }
-            Err(_) => (None, None),
+            None => (None, None),
         };
 
         all_notes.push(Note {
@@ -760,10 +809,6 @@ fn index_into_store(
             pagerank_score: None,
         });
         edge_pairs.push((v_uid.clone(), n_uid.clone()));
-        note_count += 1;
-        if note_count > 0 && note_count.is_multiple_of(50) {
-            tracing::info!(notes = note_count, "vault indexing progress");
-        }
 
         // Derive Heading UIDs and Heading nodes from the parsed outline.
         let heading_uids: Vec<String> = parsed
@@ -842,7 +887,11 @@ fn index_into_store(
             wikilinks: parsed.wikilinks.clone(),
             tags: parsed.tags.clone(),
         });
+
+        parse_pb.inc(1);
     }
+
+    parse_pb.finish_and_clear();
 
     let notes_count = all_notes.len();
     let headings_count = all_headings.len();
@@ -907,6 +956,14 @@ fn index_into_store(
         .context("batch_insert_heading_parent_edges")?;
 
     // ── Pass 2: cross-reference resolution (tags + wikilinks) ───────────────
+    let resolve_pb = ProgressBar::new_spinner();
+    resolve_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    resolve_pb.set_message("Resolving wikilinks and tags...");
+    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let mut all_tags: Vec<Tag> = Vec::new();
     let mut note_tag_edges: Vec<(String, String)> = Vec::new();
     let mut section_tag_edges: Vec<(String, String)> = Vec::new();
@@ -1040,6 +1097,20 @@ fn index_into_store(
     store
         .batch_insert_wikilink_to_heading_edges(&wl_head_refs)
         .context("batch_insert_wikilink_to_heading_edges")?;
+
+    resolve_pb.finish_and_clear();
+
+    // ── Summary ───────────────────────────────────────────────────────────
+    let elapsed = started.elapsed();
+    eprintln!(
+        "Done: {} notes, {} headings, {} sections, {} tags, {} wikilinks ({:.1}s)",
+        notes_count,
+        headings_count,
+        sections_count,
+        tags_count,
+        wikilinks_resolved,
+        elapsed.as_secs_f64(),
+    );
 
     Ok(MarkdownIndexResult {
         vault_uid: v_uid,

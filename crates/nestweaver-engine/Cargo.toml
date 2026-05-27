@@ -23,6 +23,7 @@ serde_yaml = "0.9"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 walkdir = "2"
+indicatif = "0.17"
 notify = "8"
 notify-debouncer-mini = { version = "0.7", default-features = false }
 rand = "0.10"
