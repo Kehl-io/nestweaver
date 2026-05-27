@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
     LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
@@ -23,6 +24,91 @@ const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 
+// ── Rich diagnostics ─────────────────────────────────────────────────────────
+
+/// CLI-layer diagnostic that wraps common `anyhow` errors with actionable help
+/// text. Only used at the CLI boundary; library crates still use `thiserror`.
+#[derive(Debug, Diagnostic, thiserror::Error)]
+enum CliDiagnostic {
+    #[error("Database not found: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_not_found),
+        help("Run `nestweaver index --repo <path>` to create a database")
+    )]
+    DatabaseNotFound { path: String },
+
+    #[error("Repository path does not exist: {path}")]
+    #[diagnostic(
+        code(nestweaver::repo_not_found),
+        help("Check that the path exists: {path}")
+    )]
+    RepoPathNotFound { path: String },
+
+    #[error("No symbols found in the database")]
+    #[diagnostic(
+        code(nestweaver::empty_graph),
+        help("Try indexing first with `nestweaver index --repo .`")
+    )]
+    NoSymbolsFound,
+
+    #[error("Database is empty")]
+    #[diagnostic(
+        code(nestweaver::empty_db),
+        help("Index a repository first: `nestweaver index --repo <path>`")
+    )]
+    EmptyDatabase,
+
+    #[error("{message}")]
+    #[diagnostic(code(nestweaver::error))]
+    General { message: String },
+}
+
+/// Inspect an `anyhow::Error` and, when it matches a known pattern, convert it
+/// into a `miette::Report` with rich diagnostic information (help text, error
+/// code). Falls back to a plain `miette::Report` for unrecognised errors.
+fn into_diagnostic(err: anyhow::Error) -> miette::Report {
+    let message = format!("{err:#}");
+    let lower = message.to_lowercase();
+
+    if lower.contains("no such file")
+        || lower.contains("not found") && (lower.contains("database") || lower.contains(".lbug"))
+    {
+        // Extract the path from common anyhow context patterns like
+        // "failed to open database at ./foo.lbug: No such file ..."
+        let path = message
+            .split("at ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("./nestweaver.lbug")
+            .trim()
+            .to_string();
+        return CliDiagnostic::DatabaseNotFound { path }.into();
+    }
+
+    if lower.contains("path") && lower.contains("does not exist")
+        || lower.contains("not a directory")
+        || (lower.contains("no such file") && lower.contains("repo"))
+    {
+        let path = message
+            .split(": ")
+            .last()
+            .unwrap_or(&message)
+            .trim()
+            .to_string();
+        return CliDiagnostic::RepoPathNotFound { path }.into();
+    }
+
+    if lower.contains("no symbols found") || lower.contains("no matching symbols") {
+        return CliDiagnostic::NoSymbolsFound.into();
+    }
+
+    if lower.contains("database is empty") || (lower.contains("empty") && lower.contains("graph")) {
+        return CliDiagnostic::EmptyDatabase.into();
+    }
+
+    CliDiagnostic::General { message }.into()
+}
+
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -40,7 +126,11 @@ const EXIT_AMBIGUOUS: i32 = 3;
                   nestweaver symbol \"processPayment\"\n  \
                   nestweaver repo-map --token-budget 2000",
     after_help = "Supported languages: JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Dart, Swift, COBOL\n\
-                  Default database: ./nestweaver.lbug"
+                  Default database: ./nestweaver.lbug\n\n\
+                  Shell completions:\n  \
+                  nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
+                  nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
+                  nestweaver completions fish > ~/.config/fish/completions/nestweaver.fish"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -500,6 +590,20 @@ enum Commands {
         #[arg(long, default_value = "32", help = "Batch size for API calls")]
         batch_size: usize,
     },
+
+    /// Generate shell completions for the given shell
+    ///
+    /// Prints completion scripts to stdout. Redirect to a file or source
+    /// directly to enable tab completions for all nestweaver commands.
+    #[command(after_help = "Examples:\n  \
+          nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
+          nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
+          nestweaver completions fish > ~/.config/fish/completions/nestweaver.fish\n  \
+          nestweaver completions powershell > nestweaver.ps1")]
+    Completions {
+        /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -770,6 +874,30 @@ fn default_db_path() -> PathBuf {
     }
 }
 
+fn detect_repo_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir = cwd.as_path();
+    loop {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return cwd,
+        }
+    }
+}
+
+fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
+    if let Some(explicit) = db {
+        return explicit;
+    }
+    if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
+        return PathBuf::from(env_db);
+    }
+    repo_root.join("nestweaver.lbug")
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
@@ -918,6 +1046,13 @@ fn parse_iso8601_to_system_time(s: &str) -> Result<std::time::SystemTime, anyhow
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // Install miette as the global error/panic report handler for rich
+    // diagnostics (colours, help text, error codes) on supported terminals.
+    miette::set_hook(Box::new(|_| {
+        Box::new(miette::MietteHandlerOpts::new().build())
+    }))
+    .ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -931,7 +1066,8 @@ fn main() {
     let exit_code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("Error: {e:#}");
+            let report = into_diagnostic(e);
+            eprintln!("{report:?}");
             EXIT_ERROR
         }
     };
@@ -1517,6 +1653,12 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             batch_size,
         } => run_embed(db.as_deref(), &endpoint, &model, batch_size),
 
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
+            Ok(EXIT_SUCCESS)
+        }
+
         Commands::Mcp {
             db,
             allow_mcp_add_sources,
@@ -1895,13 +2037,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             db,
             force,
         } => {
-            let repo_path = repo.clone().unwrap_or_else(|| PathBuf::from("."));
-            let db_path = db.unwrap_or_else(default_db_path);
+            let repo_path = match repo {
+                Some(p) => p,
+                None => detect_repo_root(),
+            };
+            let db_path = resolve_index_db_path(db, &repo_path);
             let instance_id = instance.as_deref().unwrap_or("default");
 
             let repo_url = format!("file://{}", repo_path.display());
 
-            eprintln!("Indexing {} → {}", repo_path.display(), db_path.display());
+            eprintln!("Indexing {}", repo_path.display());
 
             if force {
                 // Full re-index requested explicitly.
