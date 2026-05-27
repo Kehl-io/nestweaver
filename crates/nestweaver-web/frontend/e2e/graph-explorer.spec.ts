@@ -17,11 +17,13 @@ test.describe("Graph Explorer", () => {
 
   test("context API returns ranked symbols", async ({ request }) => {
     const response = await request.post("/api/v1/context", {
-      data: { seeds: ["greet"], token_budget: 2000 },
+      data: { seeds: ["greet"], limit: 50 },
     });
     expect(response.ok()).toBeTruthy();
     const body = await response.json();
-    expect(body.length).toBeGreaterThan(0);
+    expect(body).toHaveProperty("seeds");
+    expect(body).toHaveProperty("connected");
+    expect(body.seeds.length + body.connected.length).toBeGreaterThan(0);
   });
 
   test("impact analysis API works", async ({ request }) => {

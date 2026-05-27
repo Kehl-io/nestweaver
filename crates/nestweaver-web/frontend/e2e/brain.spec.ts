@@ -5,7 +5,7 @@ test.describe("Brain / Notes", () => {
     const response = await request.get("/api/v1/brain/status");
     expect(response.ok()).toBeTruthy();
     const body = await response.json();
-    expect(body).toHaveProperty("vaults");
+    expect(body).toHaveProperty("vault_count");
   });
 
   test("brain search API handles empty query", async ({ request }) => {
