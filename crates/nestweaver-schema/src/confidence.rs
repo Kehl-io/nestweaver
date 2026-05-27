@@ -30,6 +30,10 @@ pub enum Language {
     Hcl,
     Fortran,
     Pascal,
+    Vue,
+    Svelte,
+    Astro,
+    SystemVerilog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,7 +82,14 @@ pub fn confidence_score(match_type: MatchType, language: Language) -> f32 {
         (MatchType::ImportResolved, Language::Python | Language::Ruby) => -0.10,
         (MatchType::ImportResolved, Language::Php) => -0.05,
         (MatchType::ImportResolved, Language::Cobol) => -0.15,
-        (MatchType::ReExportResolved, Language::JavaScript | Language::TypeScript) => -0.05,
+        (
+            MatchType::ReExportResolved,
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro,
+        ) => -0.05,
         (MatchType::SamePackageFallback, Language::Python) => -0.15,
         (MatchType::SamePackageFallback, Language::Ruby) => -0.15,
         _ => 0.0,
@@ -128,6 +139,10 @@ mod tests {
             Language::Hcl,
             Language::Fortran,
             Language::Pascal,
+            Language::Vue,
+            Language::Svelte,
+            Language::Astro,
+            Language::SystemVerilog,
         ] {
             let score = confidence_score(MatchType::Unresolved, lang);
             assert!((score - 0.0).abs() < f32::EPSILON, "got: {score}");
@@ -201,6 +216,10 @@ mod tests {
             Language::Hcl,
             Language::Fortran,
             Language::Pascal,
+            Language::Vue,
+            Language::Svelte,
+            Language::Astro,
+            Language::SystemVerilog,
         ];
         let matches = [
             MatchType::SameFileExact,
@@ -292,6 +311,10 @@ mod tests {
             Language::Hcl,
             Language::Fortran,
             Language::Pascal,
+            Language::Vue,
+            Language::Svelte,
+            Language::Astro,
+            Language::SystemVerilog,
         ];
         let matches = [
             MatchType::SameFileExact,
