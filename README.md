@@ -256,7 +256,9 @@ Launch an interactive graph visualization to explore your codebase visually. The
 nestweaver ui --db ./nestweaver.lbug --port 8080
 ```
 
-<!-- Screenshot will be added once the web UI is running against a larger dataset -->
+<p align="center">
+  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI">
+</p>
 
 ## Architecture
 
