@@ -9,15 +9,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
-    FeatureContextResult, HybridSearchConfig, LookupResult, analyze_blast_radius,
-    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases, build_context,
-    build_feature_context, changed_files_from_git, compute_clusters, detect_dead_code,
-    discover_cross_domain_links, embedding::generate_embedding, export_cypher, export_graphml,
-    export_mermaid, find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule,
-    generate_guide, generate_repo_map, generate_skill, incremental_index, index_directory,
+    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
+    analyze_blast_radius, attach_cluster_ids, attach_communities,
+    build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
+    changed_files_from_git, compute_clusters, detect_dead_code, discover_cross_domain_links,
+    embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
+    generate_repo_map, generate_skill, generate_summaries, incremental_index, index_directory,
     index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
-    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
-    search_symbols, suggest_links,
+    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, render_text,
+    save_clusters, save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -572,6 +573,37 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Generate hierarchical code summaries for token-efficient retrieval
+    ///
+    /// Creates deterministic, compact summaries at three levels: symbol
+    /// (function/class details), file (exports and imports), and cluster
+    /// (community architecture). No LLM needed -- summaries are derived
+    /// entirely from graph data.
+    #[command(
+        after_help = "Examples:\n  nestweaver summary --level symbol\n  nestweaver summary --level file --json\n  nestweaver summary --level cluster --token-budget 2000"
+    )]
+    Summary {
+        #[arg(
+            long,
+            default_value = "file",
+            help = "Summary level: symbol, file, or cluster"
+        )]
+        level: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Approximate token limit for output")]
+        token_budget: Option<usize>,
+        #[arg(
+            long,
+            help = "Filter to a specific target (file path, symbol name, or cluster name)"
+        )]
+        target: Option<String>,
     },
     /// Show details for a specific cluster
     ///
@@ -1833,6 +1865,65 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "{} bridges in {}",
                 bridges.len(),
                 format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::Summary {
+            level,
+            json,
+            db,
+            token_budget,
+            target,
+        } => {
+            let parsed_level: SummaryLevel =
+                level.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            out.status(&format!("Generating {} summaries...", parsed_level));
+            let summaries = generate_summaries(&store, parsed_level)?;
+
+            // Save to sidecar for later use.
+            save_summaries(&db_path, &summaries)?;
+
+            // Optional target filter, then token budget truncation.
+            let after_filter: Vec<Summary> = if let Some(ref t) = target {
+                filter_by_target(&summaries, t)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            } else {
+                summaries
+            };
+
+            let display: Vec<Summary> = if let Some(budget) = token_budget {
+                truncate_to_budget(&after_filter, budget)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            } else {
+                after_filter
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&display)?);
+            } else if display.is_empty() {
+                println!("No summaries generated (graph may be empty).");
+            } else {
+                let text = render_text(&display);
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+
+            let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
+            let stats = format!(
+                "{} summaries ({} tokens) in {}",
+                display.len(),
+                total_tokens,
+                format_elapsed(t0.elapsed()),
             );
             Ok((EXIT_SUCCESS, Some(stats)))
         }
