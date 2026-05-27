@@ -62,3 +62,5 @@ AGENTS.md
 crates/nestweaver-web/frontend/test-results/
 crates/nestweaver-web/frontend/playwright-report/
 crates/nestweaver-web/frontend/e2e/fixtures/*.lbug*
+graphify-out/
+nestweaver.filemeta.json
