@@ -3785,7 +3785,7 @@ fn run_brain(
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
-                                    "seeds": [],
+                                    "seeds_expanded": 0,
                                     "connected": [],
                                     "unresolved_seeds": seeds,
                                 }))?
@@ -3942,18 +3942,16 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
-    #[derive(serde::Serialize)]
-    struct Truncated<'a> {
-        seeds: &'a [nestweaver_engine::BrainNode],
-        connected: Vec<&'a nestweaver_engine::BrainNode>,
-        unresolved_seeds: &'a [String],
+    let mut resp = serde_json::json!({
+        "seeds_expanded": result.seeds.len(),
+        "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+    });
+
+    if !result.unresolved_seeds.is_empty() {
+        resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
     }
-    let truncated = Truncated {
-        seeds: &result.seeds,
-        connected: result.connected.iter().take(limit).collect(),
-        unresolved_seeds: &result.unresolved_seeds,
-    };
-    println!("{}", serde_json::to_string_pretty(&truncated)?);
+
+    println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 
