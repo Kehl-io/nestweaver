@@ -2,6 +2,9 @@ import * as vscode from "vscode";
 import * as child_process from "child_process";
 import { NestWeaverApi } from "./api";
 import { GraphWebviewProvider } from "./panels/GraphWebviewProvider";
+import { NestWeaverCodeLensProvider } from "./codeLens";
+import { registerChatParticipant } from "./chatParticipant";
+import { NestWeaverStatusBar } from "./statusBar";
 
 let serverProcess: child_process.ChildProcess | undefined;
 
@@ -40,19 +43,55 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.executeCommand("nestweaver.graphView.focus")));
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("nestweaver.showInGraph", async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
-      const word = editor.document.getText(
-        editor.document.getWordRangeAtPosition(editor.selection.active));
+    vscode.commands.registerCommand("nestweaver.showInGraph", async (nameArg?: string) => {
+      let word = nameArg;
+      if (!word) {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { return; }
+        word = editor.document.getText(
+          editor.document.getWordRangeAtPosition(editor.selection.active));
+      }
       if (word) {
         try {
           const results = await api.search(word, 5);
-          if (results.length > 0) graphProvider.focusOnNode(results[0].uid);
-          else vscode.window.showInformationMessage(`No symbols for "${word}"`);
+          if (results.length > 0) { graphProvider.focusOnNode(results[0].uid); }
+          else { vscode.window.showInformationMessage(`No symbols for "${word}"`); }
         } catch { vscode.window.showErrorMessage("NestWeaver search failed"); }
       }
     }));
+
+  // CodeLens
+  const codeLensProvider = new NestWeaverCodeLensProvider(api);
+  context.subscriptions.push(
+    vscode.languages.registerCodeLensProvider(
+      ['javascript', 'typescript', 'python', 'rust', 'go', 'java', 'c', 'cpp', 'csharp', 'kotlin', 'php', 'ruby', 'dart', 'swift'],
+      codeLensProvider
+    )
+  );
+
+  // Chat participant
+  registerChatParticipant(context, api);
+
+  // Status bar
+  const statusBar = new NestWeaverStatusBar(api);
+  context.subscriptions.push(statusBar);
+
+  // Status action command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('nestweaver.statusAction', async () => {
+      const choice = await vscode.window.showQuickPick(
+        ['Re-index repository', 'Run setup', 'Open graph'],
+        { placeHolder: 'NestWeaver Actions' }
+      );
+      if (choice === 'Re-index repository') {
+        vscode.window.createTerminal('NestWeaver').sendText('nestweaver index --repo .');
+      } else if (choice === 'Run setup') {
+        vscode.window.createTerminal('NestWeaver').sendText('nestweaver setup');
+      } else if (choice === 'Open graph') {
+        vscode.commands.executeCommand('nestweaver.showGraph');
+      }
+    })
+  );
 }
 
 export function deactivate() {

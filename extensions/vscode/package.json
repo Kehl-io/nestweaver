@@ -9,9 +9,18 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "nestweaver",
+        "name": "nestweaver",
+        "description": "Code knowledge graph — ask about architecture, dependencies, and blast radius",
+        "isSticky": false
+      }
+    ],
     "commands": [
       { "command": "nestweaver.showGraph", "title": "NestWeaver: Show Graph" },
-      { "command": "nestweaver.showInGraph", "title": "NestWeaver: Show in Graph" }
+      { "command": "nestweaver.showInGraph", "title": "NestWeaver: Show in Graph" },
+      { "command": "nestweaver.statusAction", "title": "NestWeaver: Actions" }
     ],
     "configuration": {
       "title": "NestWeaver",
