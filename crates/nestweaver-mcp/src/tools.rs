@@ -81,7 +81,7 @@ pub fn dispatch(
         "brain_search" => tool_brain_search(store, tantivy, args),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
-        "brain_status" => tool_brain_status(store),
+        "brain_status" => tool_brain_status(store, tantivy),
         "brain_add_source" => tool_brain_add_source(store, args),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
         "brain_impact" => tool_brain_impact(store, args),
@@ -759,6 +759,7 @@ fn tool_brain_search(
     Ok(json!({
         "query": query,
         "engine": "substring",
+        "engine_warning": "tantivy_unavailable: BM25 index could not be opened (another process may hold the writer lock, or it has not been built yet). Results are substring matches only. Run `nestweaver brain reindex-search` to build the index.",
         "results": results,
         "total_matches": total,
     }))
@@ -983,7 +984,10 @@ fn tool_schema_brain_status() -> Value {
     })
 }
 
-fn tool_brain_status(store: &GraphStore) -> Result<Value, anyhow::Error> {
+fn tool_brain_status(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+) -> Result<Value, anyhow::Error> {
     let vaults = store.list_vaults(None).unwrap_or_default();
     let notes = store.count_notes().unwrap_or(0);
     let headings = store.count_headings().unwrap_or(0);
@@ -1024,6 +1028,21 @@ fn tool_brain_status(store: &GraphStore) -> Result<Value, anyhow::Error> {
         .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
         .collect();
 
+    // Report Tantivy availability so clients can tell whether brain_search
+    // will use BM25 or fall back to substring matching.
+    let tantivy_available = tantivy.is_some();
+    let tantivy_doc_count = tantivy.map(|t| t.doc_count()).unwrap_or(0);
+
+    // Check whether a watcher process holds the lock file.
+    let watcher_pid: Option<u32> = db_path.as_deref().and_then(|p| {
+        let mut lock = p.as_os_str().to_owned();
+        lock.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock);
+        std::fs::read_to_string(lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    });
+
     Ok(json!({
         "vaults": vaults_json,
         "vault_count": vaults.len(),
@@ -1034,6 +1053,9 @@ fn tool_brain_status(store: &GraphStore) -> Result<Value, anyhow::Error> {
         "wikilinks": wikilinks,
         "repos": repos_json,
         "repo_count": repos.len(),
+        "tantivy_available": tantivy_available,
+        "tantivy_doc_count": tantivy_doc_count,
+        "watcher_pid": watcher_pid,
     }))
 }
 
