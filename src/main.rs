@@ -614,13 +614,14 @@ enum Commands {
     },
     /// Auto-detect and configure NestWeaver for installed AI coding tools
     ///
-    /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, and VS Code,
+    /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code, Gemini CLI,
+    /// GitHub Copilot, Aider, Kiro, Continue.dev, Cline, OpenCode, Trae, Devin, and Hermes,
     /// then writes the correct MCP server config and instruction files for each.
     #[command(
-        after_help = "Examples:\n  nestweaver setup\n  nestweaver setup --all\n  nestweaver setup claude-code"
+        after_help = "Examples:\n  nestweaver setup\n  nestweaver setup --all\n  nestweaver setup claude-code\n  nestweaver setup gemini\n  nestweaver setup copilot"
     )]
     Setup {
-        /// Configure a specific tool (claude-code, cursor, codex, windsurf, jetbrains, vscode)
+        /// Configure a specific tool (claude-code, cursor, codex, windsurf, jetbrains, vscode, gemini, copilot, aider, kiro, continue, cline, opencode, trae, devin, hermes)
         tool: Option<String>,
         /// Force-configure all tools even if not detected
         #[arg(long)]
