@@ -55,69 +55,102 @@
     </filter>
   </defs>
 
-  <rect width="512" height="512" rx="48" fill="#080c14"/>
+  <!-- Background (transparent) -->
 
+  <!-- Ambient glows -->
   <circle cx="256" cy="260" r="180" fill="url(#centerGlow)"/>
   <circle cx="256" cy="70" r="70" fill="url(#headGlow)"/>
 
-  <!-- Filled facets -->
+  <!-- === FILLED FACETS (bird silhouette) === -->
+  <!-- Left wing upper -->
   <polygon points="256,45 165,170 20,90" fill="#0862a7" opacity=".2"/>
   <polygon points="165,170 20,90 50,200" fill="#0862a7" opacity=".15"/>
+  <!-- Left wing lower -->
   <polygon points="165,170 50,200 256,270" fill="#0a4a80" opacity=".12"/>
+  <!-- Right wing upper -->
   <polygon points="256,45 347,170 492,90" fill="#0862a7" opacity=".2"/>
   <polygon points="347,170 492,90 462,200" fill="#0862a7" opacity=".15"/>
+  <!-- Right wing lower -->
   <polygon points="347,170 462,200 256,270" fill="#0a4a80" opacity=".12"/>
+  <!-- Body upper -->
   <polygon points="256,45 165,170 256,270" fill="#0862a7" opacity=".18"/>
   <polygon points="256,45 347,170 256,270" fill="#451f96" opacity=".18"/>
+  <!-- Body lower -->
   <polygon points="256,270 185,345 256,450" fill="#451f96" opacity=".14"/>
   <polygon points="256,270 327,345 256,450" fill="#6b119a" opacity=".14"/>
+  <!-- Tail flares -->
   <polygon points="185,345 140,435 256,450" fill="#6b119a" opacity=".1"/>
   <polygon points="327,345 372,435 256,450" fill="#6b119a" opacity=".1"/>
 
-  <!-- Edges -->
+  <!-- === EDGES (graph connections) === -->
+  <!-- Outer wing edges -->
   <line x1="256" y1="45" x2="20" y2="90" stroke="url(#wingGradL)" stroke-width="1.5" opacity=".5"/>
   <line x1="256" y1="45" x2="492" y2="90" stroke="url(#wingGradR)" stroke-width="1.5" opacity=".5"/>
+  <!-- Secondary wing spikes -->
   <line x1="60" y1="72" x2="20" y2="90" stroke="#5ed0fe" stroke-width="1.2" opacity=".4"/>
   <line x1="452" y1="72" x2="492" y2="90" stroke="#5ed0fe" stroke-width="1.2" opacity=".4"/>
   <line x1="60" y1="72" x2="100" y2="125" stroke="#5ed0fe" stroke-width="1" opacity=".3"/>
   <line x1="452" y1="72" x2="412" y2="125" stroke="#5ed0fe" stroke-width="1" opacity=".3"/>
+
+  <!-- Head to shoulders -->
   <line x1="256" y1="45" x2="165" y2="170" stroke="url(#bodyGrad)" stroke-width="2.5" filter="url(#glow)"/>
   <line x1="256" y1="45" x2="347" y2="170" stroke="url(#bodyGrad)" stroke-width="2.5" filter="url(#glow)"/>
+
+  <!-- Wing structure -->
   <line x1="20" y1="90" x2="165" y2="170" stroke="url(#mainGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="492" y1="90" x2="347" y2="170" stroke="url(#mainGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="20" y1="90" x2="50" y2="200" stroke="url(#mainGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="492" y1="90" x2="462" y2="200" stroke="url(#mainGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="50" y1="200" x2="165" y2="170" stroke="url(#mainGrad)" stroke-width="1.8" filter="url(#glow)"/>
   <line x1="462" y1="200" x2="347" y2="170" stroke="url(#mainGrad)" stroke-width="1.8" filter="url(#glow)"/>
+
+  <!-- Cross weave through body (the "weaver" pattern) -->
   <line x1="20" y1="90" x2="347" y2="170" stroke="url(#mainGrad)" stroke-width="1" opacity=".2"/>
   <line x1="492" y1="90" x2="165" y2="170" stroke="url(#mainGrad)" stroke-width="1" opacity=".2"/>
   <line x1="165" y1="170" x2="347" y2="170" stroke="url(#accentGrad)" stroke-width="1.5" opacity=".35"/>
+
+  <!-- Shoulders to center -->
   <line x1="165" y1="170" x2="256" y2="270" stroke="url(#bodyGrad)" stroke-width="2.5" filter="url(#glow)"/>
   <line x1="347" y1="170" x2="256" y2="270" stroke="url(#bodyGrad)" stroke-width="2.5" filter="url(#glow)"/>
+
+  <!-- Wing lowers to center -->
   <line x1="50" y1="200" x2="256" y2="270" stroke="url(#mainGrad)" stroke-width="1.2" opacity=".35"/>
   <line x1="462" y1="200" x2="256" y2="270" stroke="url(#mainGrad)" stroke-width="1.2" opacity=".35"/>
+
+  <!-- Body spine -->
   <line x1="256" y1="45" x2="256" y2="270" stroke="url(#bodyGrad)" stroke-width="3" filter="url(#glow)"/>
   <line x1="256" y1="270" x2="256" y2="450" stroke="url(#bodyGrad)" stroke-width="2.5" filter="url(#glow)"/>
+
+  <!-- Head brow lines (fierce expression) -->
   <line x1="220" y1="78" x2="235" y2="95" stroke="#4dff00" stroke-width="2" opacity=".7" filter="url(#glow)"/>
   <line x1="292" y1="78" x2="277" y2="95" stroke="#4dff00" stroke-width="2" opacity=".7" filter="url(#glow)"/>
+
+  <!-- Beak lines -->
   <line x1="235" y1="98" x2="256" y2="130" stroke="url(#bodyGrad)" stroke-width="2" opacity=".8"/>
   <line x1="277" y1="98" x2="256" y2="130" stroke="url(#bodyGrad)" stroke-width="2" opacity=".8"/>
+
+  <!-- Lower body -->
   <line x1="256" y1="270" x2="185" y2="345" stroke="url(#bodyGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="256" y1="270" x2="327" y2="345" stroke="url(#bodyGrad)" stroke-width="2" filter="url(#glow)"/>
   <line x1="185" y1="345" x2="256" y2="450" stroke="url(#bodyGrad)" stroke-width="1.8" filter="url(#glow)"/>
   <line x1="327" y1="345" x2="256" y2="450" stroke="url(#bodyGrad)" stroke-width="1.8" filter="url(#glow)"/>
   <line x1="185" y1="345" x2="327" y2="345" stroke="url(#mainGrad)" stroke-width="1.2" opacity=".35"/>
+
+  <!-- Tail flare edges -->
   <line x1="185" y1="345" x2="140" y2="435" stroke="url(#mainGrad)" stroke-width="1.5" opacity=".45" filter="url(#glow)"/>
   <line x1="327" y1="345" x2="372" y2="435" stroke="url(#mainGrad)" stroke-width="1.5" opacity=".45" filter="url(#glow)"/>
   <line x1="140" y1="435" x2="256" y2="450" stroke="url(#mainGrad)" stroke-width="1.2" opacity=".35"/>
   <line x1="372" y1="435" x2="256" y2="450" stroke="url(#mainGrad)" stroke-width="1.2" opacity=".35"/>
+
+  <!-- Talon hints -->
   <line x1="185" y1="345" x2="160" y2="385" stroke="#5ed0fe" stroke-width="1.5" opacity=".4"/>
   <line x1="160" y1="385" x2="148" y2="370" stroke="#5ed0fe" stroke-width="1.2" opacity=".35"/>
   <line x1="327" y1="345" x2="352" y2="385" stroke="#5ed0fe" stroke-width="1.5" opacity=".4"/>
   <line x1="352" y1="385" x2="364" y2="370" stroke="#5ed0fe" stroke-width="1.2" opacity=".35"/>
 
-  <!-- Binary digits -->
+  <!-- === BINARY DIGITS === -->
   <g font-family="'Courier New',monospace" fill="#5ed0fe">
+    <!-- Along wings -->
     <text x="88" y="108" font-size="12" opacity=".55">1</text>
     <text x="118" y="132" font-size="10" opacity=".45">0</text>
     <text x="68" y="148" font-size="11" opacity=".5">1</text>
@@ -126,12 +159,14 @@
     <text x="390" y="132" font-size="10" opacity=".45">1</text>
     <text x="435" y="148" font-size="11" opacity=".5">0</text>
     <text x="405" y="170" font-size="9" opacity=".4">1</text>
+    <!-- Along body -->
     <text x="208" y="210" font-size="11" opacity=".45">1</text>
     <text x="296" y="210" font-size="11" opacity=".45">0</text>
     <text x="222" y="300" font-size="10" opacity=".4">0</text>
     <text x="280" y="300" font-size="10" opacity=".4">1</text>
     <text x="206" y="375" font-size="9" opacity=".35">1</text>
     <text x="300" y="375" font-size="9" opacity=".35">0</text>
+    <!-- Streaming binary along wing edges -->
     <text font-size="7" opacity=".25">
       <tspan x="35" y="105">01101</tspan>
       <tspan x="440" y="105">10010</tspan>
@@ -140,56 +175,86 @@
       <tspan x="55" y="190">110</tspan>
       <tspan x="445" y="190">001</tspan>
     </text>
+    <!-- Near tail -->
     <text font-size="8" opacity=".3">
       <tspan x="155" y="445">101</tspan>
       <tspan x="350" y="445">010</tspan>
     </text>
   </g>
 
-  <!-- Nodes -->
+  <!-- === NODES === -->
+  <!-- Crown / Head apex - brightest -->
   <circle cx="256" cy="45" r="13" fill="url(#bodyGrad)" filter="url(#strongGlow)"/>
   <circle cx="256" cy="45" r="6" fill="#fff" opacity=".9"/>
+
+  <!-- Eyes - fierce green glow -->
   <circle cx="235" cy="98" r="18" fill="url(#eyeGlowL)"/>
   <circle cx="277" cy="98" r="18" fill="url(#eyeGlowR)"/>
   <circle cx="235" cy="98" r="7" fill="#4dff00" filter="url(#eyeBloom)"/>
   <circle cx="235" cy="98" r="3" fill="#fff" opacity=".95"/>
   <circle cx="277" cy="98" r="7" fill="#4dff00" filter="url(#eyeBloom)"/>
   <circle cx="277" cy="98" r="3" fill="#fff" opacity=".95"/>
+
+  <!-- Brow nodes -->
   <circle cx="220" cy="78" r="4" fill="#5ed0fe" opacity=".7"/>
   <circle cx="292" cy="78" r="4" fill="#5ed0fe" opacity=".7"/>
+
+  <!-- Beak -->
   <circle cx="256" cy="130" r="5" fill="url(#bodyGrad)" filter="url(#glow)"/>
   <circle cx="256" cy="130" r="2.5" fill="#5ed0fe" opacity=".8"/>
+
+  <!-- Wing tips -->
   <circle cx="20" cy="90" r="9" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="20" cy="90" r="4" fill="#5ed0fe" opacity=".8"/>
   <circle cx="492" cy="90" r="9" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="492" cy="90" r="4" fill="#5ed0fe" opacity=".8"/>
+
+  <!-- Wing claw nodes -->
   <circle cx="60" cy="72" r="4" fill="#5ed0fe" opacity=".5"/>
   <circle cx="452" cy="72" r="4" fill="#5ed0fe" opacity=".5"/>
+
+  <!-- Mid-wing nodes -->
   <circle cx="100" cy="125" r="5" fill="url(#mainGrad)" opacity=".6"/>
   <circle cx="412" cy="125" r="5" fill="url(#mainGrad)" opacity=".6"/>
+
+  <!-- Shoulders -->
   <circle cx="165" cy="170" r="11" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="165" cy="170" r="5" fill="#fff" opacity=".5"/>
   <circle cx="347" cy="170" r="11" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="347" cy="170" r="5" fill="#fff" opacity=".5"/>
+
+  <!-- Wing lowers -->
   <circle cx="50" cy="200" r="7" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="50" cy="200" r="3.5" fill="#5ed0fe" opacity=".7"/>
   <circle cx="462" cy="200" r="7" fill="url(#mainGrad)" filter="url(#glow)"/>
   <circle cx="462" cy="200" r="3.5" fill="#5ed0fe" opacity=".7"/>
+
+  <!-- Center body nexus - large, important -->
   <circle cx="256" cy="270" r="15" fill="url(#mainGrad)" filter="url(#strongGlow)"/>
   <circle cx="256" cy="270" r="8" fill="url(#accentGrad)"/>
   <circle cx="256" cy="270" r="3.5" fill="#fff" opacity=".85"/>
+
+  <!-- Lower body nodes -->
   <circle cx="185" cy="345" r="9" fill="url(#bodyGrad)" filter="url(#glow)"/>
   <circle cx="185" cy="345" r="4" fill="#5ed0fe" opacity=".6"/>
   <circle cx="327" cy="345" r="9" fill="url(#bodyGrad)" filter="url(#glow)"/>
   <circle cx="327" cy="345" r="4" fill="#5ed0fe" opacity=".6"/>
+
+  <!-- Tail center -->
   <circle cx="256" cy="450" r="10" fill="url(#bodyGrad)" filter="url(#glow)"/>
   <circle cx="256" cy="450" r="5" fill="#6b119a" opacity=".8"/>
+
+  <!-- Tail flare nodes -->
   <circle cx="140" cy="435" r="5" fill="url(#mainGrad)" opacity=".5"/>
   <circle cx="372" cy="435" r="5" fill="url(#mainGrad)" opacity=".5"/>
+
+  <!-- Talon nodes -->
   <circle cx="160" cy="385" r="4" fill="#5ed0fe" opacity=".45"/>
   <circle cx="148" cy="370" r="3" fill="#5ed0fe" opacity=".35"/>
   <circle cx="352" cy="385" r="4" fill="#5ed0fe" opacity=".45"/>
   <circle cx="364" cy="370" r="3" fill="#5ed0fe" opacity=".35"/>
+
+  <!-- Small accent nodes along edges -->
   <circle cx="138" cy="130" r="2.5" fill="#4dff00" opacity=".5"/>
   <circle cx="374" cy="130" r="2.5" fill="#4dff00" opacity=".5"/>
   <circle cx="210" cy="215" r="2.5" fill="#5ed0fe" opacity=".4"/>

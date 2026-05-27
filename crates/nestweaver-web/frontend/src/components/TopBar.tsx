@@ -102,7 +102,8 @@ export function TopBar() {
 
   return (
     <header className="flex h-12 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-4">
-      <span className="text-sm font-semibold">NestWeaver</span>
+      <img src="/logo-horizontal-dark.svg" alt="NestWeaver" className="h-8 dark:block hidden" />
+      <img src="/logo-horizontal-light.svg" alt="NestWeaver" className="h-8 dark:hidden block" />
 
       <div className="relative flex-1 max-w-md">
         <input
