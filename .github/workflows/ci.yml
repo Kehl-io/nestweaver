@@ -53,6 +53,6 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (including test targets) to trigger lbug prebuilt download
-        run: cargo build --tests 2>&1 | tail -5
-      - run: cargo test
+      - name: Build to trigger lbug prebuilt download
+        run: cargo build --tests
+      - run: cargo test --no-fail-fast
