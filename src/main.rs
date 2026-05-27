@@ -16,10 +16,10 @@ use nestweaver_engine::{
     embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
     generate_repo_map, generate_skill, generate_summaries, get_last_indexed_at, incremental_index,
-    index_directory, index_markdown_directory, index_markdown_directory_since, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
-    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    index_directory, index_markdown_directory_since_with_ignore,
+    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
+    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, record_last_indexed_at,
+    render_text, save_clusters, save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex};
@@ -863,6 +863,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
+        ignore: Option<String>,
     },
     /// List all indexed vaults with their note counts.
     List {
@@ -900,6 +902,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
+        ignore: Option<String>,
     },
     /// Force a full re-index of a vault. Drops the vault's existing notes
     /// from the graph (via cascade-delete) then re-runs the indexer from
@@ -922,6 +926,8 @@ enum BrainCommands {
             help = "Only re-index files modified since this timestamp (ISO 8601, e.g. 2026-05-26T00:00:00Z)"
         )]
         since: Option<String>,
+        #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
+        ignore: Option<String>,
     },
     /// Remove a vault from the brain. Drops the Vault node and
     /// cascade-deletes every Note/Heading/Section/edge belonging to it.
@@ -1174,6 +1180,19 @@ fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push(".tantivy");
     PathBuf::from(s)
+}
+
+/// Parse the `--ignore` CLI flag (comma-separated glob patterns) into a
+/// `Vec<String>`. Returns an empty vec when the flag is `None`.
+fn parse_ignore_flag(flag: &Option<String>) -> Vec<String> {
+    match flag {
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn default_registry_path() -> PathBuf {
@@ -3071,6 +3090,7 @@ fn run_brain(
             name,
             instance,
             db,
+            ignore,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let instance_id = instance.as_deref().unwrap_or("default");
@@ -3104,8 +3124,15 @@ fn run_brain(
                 db_path.display()
             ));
 
-            let result = index_markdown_directory(&path, &db_path, instance_id, &vault_name)
-                .context("index_markdown_directory")?;
+            let extra_patterns = parse_ignore_flag(&ignore);
+            let result = index_markdown_directory_with_ignore(
+                &path,
+                &db_path,
+                instance_id,
+                &vault_name,
+                &extra_patterns,
+            )
+            .context("index_markdown_directory")?;
 
             // Record the indexer run timestamp for this vault.
             if let Err(e) = record_last_indexed_at(&db_path, &result.vault_uid) {
@@ -3335,6 +3362,7 @@ fn run_brain(
             name,
             instance,
             db,
+            ignore,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if !path.exists() || !path.is_dir() {
@@ -3349,11 +3377,13 @@ fn run_brain(
             });
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
 
+            let extra_patterns = parse_ignore_flag(&ignore);
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = db_path.with_extension("manifests.json");
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
-                .with_manifests_path(&manifests_path);
+                .with_manifests_path(&manifests_path)
+                .with_extra_ignore_patterns(&extra_patterns);
             let stop = watcher.shutdown_handle();
 
             // Write a PID lock file so MCP servers and other readers know a
@@ -3390,6 +3420,7 @@ fn run_brain(
             instance,
             db,
             since,
+            ignore,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if !path.exists() || !path.is_dir() {
@@ -3403,6 +3434,7 @@ fn run_brain(
                     .to_string()
             });
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -3417,12 +3449,13 @@ fn run_brain(
                         since_str
                     )
                 })?;
-                let result = index_markdown_directory_since(
+                let result = index_markdown_directory_since_with_ignore(
                     &path,
                     &db_path,
                     &instance_id,
                     &vault_name,
                     since_time,
+                    &extra_patterns,
                 )
                 .context("index_markdown_directory_since")?;
 
@@ -3456,8 +3489,14 @@ fn run_brain(
                 }
                 drop(store);
 
-                let result = index_markdown_directory(&path, &db_path, &instance_id, &vault_name)
-                    .context("index_markdown_directory")?;
+                let result = index_markdown_directory_with_ignore(
+                    &path,
+                    &db_path,
+                    &instance_id,
+                    &vault_name,
+                    &extra_patterns,
+                )
+                .context("index_markdown_directory")?;
 
                 // Record the indexer run timestamp.
                 if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {

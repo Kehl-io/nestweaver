@@ -27,6 +27,7 @@ indicatif = "0.17"
 notify = "8"
 notify-debouncer-mini = { version = "0.7", default-features = false }
 rand = "0.10"
+globset = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

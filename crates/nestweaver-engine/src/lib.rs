@@ -33,6 +33,7 @@ pub fn migrate_sidecar(db_path: &Path, old_extension: &str, new_suffix: &str) ->
 
 pub mod agent_guide;
 pub mod blast_radius;
+pub mod brainignore;
 pub mod bridges;
 pub mod cluster_dispatch;
 pub mod clustering;
@@ -67,6 +68,7 @@ pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,
 };
+pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
@@ -95,7 +97,9 @@ pub use index::{
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
-    index_markdown_directory_in_memory, index_markdown_directory_since, load_alias_sidecar,
+    index_markdown_directory_in_memory, index_markdown_directory_since,
+    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
+    load_alias_sidecar,
 };
 pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
 pub use process::{

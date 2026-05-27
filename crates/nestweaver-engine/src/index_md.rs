@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Context;
+use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
@@ -61,15 +62,31 @@ const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
 /// After indexing, if a taxonomy file (`_taxonomy.md`, `taxonomy.md`, or
 /// `_brain/taxonomy.md`) is found in the vault, its alias mappings are parsed
 /// and saved to `<db_path>.aliases.json` for use by seed resolution at query time.
+///
+/// `extra_ignore_patterns` are additional glob patterns (on top of
+/// `.brainignore` or the built-in defaults) that exclude files from indexing.
 pub fn index_markdown_directory(
     vault_root: &Path,
     db_path: &Path,
     instance_id: &str,
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore(vault_root, db_path, instance_id, vault_name, &[])
+}
+
+/// Like [`index_markdown_directory`] but with additional ignore patterns from
+/// the `--ignore` CLI flag.
+pub fn index_markdown_directory_with_ignore(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownIndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    let result = index_into_store(vault_root, &store, instance_id, vault_name)?;
+    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
+    let result = index_into_store(vault_root, &store, instance_id, vault_name, &ignore_set)?;
 
     // Write taxonomy alias sidecar if a taxonomy file exists.
     let aliases = load_taxonomy_aliases(vault_root);
@@ -115,7 +132,8 @@ pub fn index_markdown_directory_in_memory(
     vault_name: &str,
 ) -> Result<(MarkdownIndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("create in-memory GraphStore")?;
-    let result = index_into_store(vault_root, &store, instance_id, vault_name)?;
+    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, &[]);
+    let result = index_into_store(vault_root, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result, store))
 }
 
@@ -145,6 +163,25 @@ pub fn index_markdown_directory_since(
     vault_name: &str,
     since: std::time::SystemTime,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
+    index_markdown_directory_since_with_ignore(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        since,
+        &[],
+    )
+}
+
+/// Like [`index_markdown_directory_since`] but with additional ignore patterns.
+pub fn index_markdown_directory_since_with_ignore(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownSinceResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
 
@@ -152,6 +189,7 @@ pub fn index_markdown_directory_since(
     let root_str = canonical.to_string_lossy().into_owned();
     let vault_root: &Path = &canonical;
     let v_uid = vault_uid(instance_id, &root_str);
+    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
 
     // Ensure the vault node exists; create it if this is the first run.
     if store.lookup_vault(&v_uid).is_err() {
@@ -229,6 +267,16 @@ pub fn index_markdown_directory_since(
                 }
                 Ok(_) => {}
             }
+        }
+
+        // Apply .brainignore patterns.
+        let rel_for_ignore = path
+            .strip_prefix(vault_root)
+            .unwrap_or(path)
+            .to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_for_ignore, &ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+            continue;
         }
 
         files_checked += 1;
@@ -573,6 +621,7 @@ fn index_into_store(
     store: &GraphStore,
     instance_id: &str,
     vault_name: &str,
+    ignore_set: &GlobSet,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let started = Instant::now();
 
@@ -683,6 +732,20 @@ fn index_into_store(
                 }
                 Ok(_) => {}
             }
+        }
+
+        // Apply .brainignore patterns.
+        let rel_for_ignore = path
+            .strip_prefix(vault_root)
+            .unwrap_or(path)
+            .to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_for_ignore, ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+            skipped.push(SkippedFile {
+                path: path.to_string_lossy().into_owned(),
+                reason: "matched .brainignore pattern".to_string(),
+            });
+            continue;
         }
 
         // Size guard.
@@ -1838,5 +1901,83 @@ sub b body
         // Only _taxonomy.md should be processed.
         assert!(aliases.contains_key("CanonicalA"));
         assert!(!aliases.contains_key("CanonicalB"));
+    }
+
+    // ── .brainignore tests ────────────────────────────────────────────────
+
+    #[test]
+    fn brainignore_excludes_backup_directory() {
+        let (_dir, root) = make_vault(&[
+            ("notes/real.md", "# Real Note\n\nContent.\n"),
+            (
+                "notes.backup.20260527/real.md",
+                "# Backup Copy\n\nOld content.\n",
+            ),
+            (
+                ".brainignore",
+                "# Ignore backup directories\n*.backup.*/**\n",
+            ),
+        ]);
+
+        let (result, store) =
+            index_markdown_directory_in_memory(&root, "default", "test-vault").unwrap();
+        assert_eq!(
+            result.notes_count, 1,
+            "only notes/real.md should be indexed"
+        );
+        let titles: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.title)
+            .collect();
+        assert!(
+            titles.contains(&"Real Note".to_string()),
+            "expected 'Real Note' in {titles:?}"
+        );
+        assert!(
+            !titles.iter().any(|t| t == "Backup Copy"),
+            "backup copy must not be indexed"
+        );
+    }
+
+    #[test]
+    fn brainignore_default_patterns_skip_obsidian_and_git() {
+        // No .brainignore file — defaults should kick in.
+        let (_dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            (".obsidian/workspace.md", "# Obsidian internal\n"),
+            (".git/notes.md", "# Git internal\n"),
+            ("node_modules/pkg/readme.md", "# Package readme\n"),
+        ]);
+
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.notes_count, 1, "only real.md should be indexed");
+    }
+
+    #[test]
+    fn brainignore_custom_file_overrides_defaults() {
+        // A .brainignore file with only "drafts/**" means .obsidian is NOT
+        // excluded by the brainignore layer (the SKIP_DIRS walker filter
+        // still blocks it, but brainignore itself doesn't).
+        let (_dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            ("drafts/wip.md", "# WIP\n"),
+            (".brainignore", "drafts/**\n"),
+        ]);
+
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let titles: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.title)
+            .collect();
+        assert!(titles.contains(&"Real".to_string()));
+        assert!(
+            !titles.contains(&"WIP".to_string()),
+            "drafts/wip.md should be excluded by .brainignore"
+        );
+        assert_eq!(result.notes_count, 1);
     }
 }
