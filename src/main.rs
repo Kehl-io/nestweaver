@@ -8,11 +8,11 @@ use clap::{Parser, Subcommand};
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
     LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    compute_clusters, discover_cross_domain_links, embedding::generate_embedding, generate_agents_md,
-    generate_cursor_rule, generate_guide, generate_skill,
-    generate_repo_map, incremental_index, index_directory, index_markdown_directory,
-    index_markdown_directory_since, list_repos, list_services, load_alias_sidecar, load_clusters,
-    load_manifest_cache, lookup_symbol, save_clusters, search_symbols, suggest_links,
+    compute_clusters, discover_cross_domain_links, embedding::generate_embedding,
+    generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map, generate_skill,
+    incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
+    lookup_symbol, save_clusters, search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -311,7 +311,10 @@ enum Commands {
             help = "Allow the brain_add_source MCP tool to index new paths at runtime"
         )]
         allow_mcp_add_sources: bool,
-        #[arg(long, help = "Expose only 6 core tools (for tools with limited tool slots like Cursor)")]
+        #[arg(
+            long,
+            help = "Expose only 6 core tools (for tools with limited tool slots like Cursor)"
+        )]
         lite: bool,
     },
     /// Start the web UI server with interactive graph visualization

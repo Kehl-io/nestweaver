@@ -313,10 +313,14 @@ pub fn generate_skill(
 
     out.push_str("## When to use NestWeaver\n\n");
     out.push_str("- **Starting a task**: Call `brain_context` with task keywords to get structural context\n");
-    out.push_str("- **Before modifying code**: Call `brain_impact` on the function you're changing\n");
+    out.push_str(
+        "- **Before modifying code**: Call `brain_impact` on the function you're changing\n",
+    );
     out.push_str("- **Exploring unfamiliar code**: Call `brain_search` to find symbols or notes\n");
     out.push_str("- **Working on a project**: Call `project_context` with the project name\n");
-    out.push_str("- **Checking staleness**: Call `stale_check` to see if the index needs refreshing\n\n");
+    out.push_str(
+        "- **Checking staleness**: Call `stale_check` to see if the index needs refreshing\n\n",
+    );
 
     out.push_str("## Tools\n\n");
     out.push_str("| Tool | Use when |\n");

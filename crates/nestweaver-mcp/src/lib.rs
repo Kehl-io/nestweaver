@@ -33,7 +33,11 @@ pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 /// no more lines. Returns Ok on clean shutdown; errors only on truly
 /// unrecoverable conditions (the database failing to open, etc.). Per-call
 /// errors are wrapped as MCP tool errors and the loop continues.
-pub fn run_stdio_server(db_path: &Path, allow_add_sources: bool, lite: bool) -> Result<(), anyhow::Error> {
+pub fn run_stdio_server(
+    db_path: &Path,
+    allow_add_sources: bool,
+    lite: bool,
+) -> Result<(), anyhow::Error> {
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.

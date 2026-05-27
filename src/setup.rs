@@ -146,7 +146,10 @@ fn setup_cursor(db_path: &Path) -> Result<(), anyhow::Error> {
     let merged = merge_json_mcp(Path::new(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".cursor/rules")?;
-    std::fs::write(".cursor/rules/nestweaver.mdc", generate_cursor_rule_content())?;
+    std::fs::write(
+        ".cursor/rules/nestweaver.mdc",
+        generate_cursor_rule_content(),
+    )?;
 
     print_result(
         "Cursor",
