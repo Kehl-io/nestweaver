@@ -1,0 +1,86 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2384
+expression: "parsed_symbols(\"Simple.scala\", &source)"
+---
+- name: Greeter
+  kind: Trait
+  start_line: 3
+  signature: "trait Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SimpleGreeter
+  kind: Class
+  start_line: 7
+  signature: "class SimpleGreeter extends Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Function
+  start_line: 8
+  signature: "override def greet(name: String): String = {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: formatName
+  kind: Function
+  start_line: 12
+  signature: "private def formatName(name: String): String = {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: AppConfig
+  kind: Class
+  start_line: 17
+  signature: "object AppConfig {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: defaultGreeting
+  kind: Function
+  start_line: 18
+  signature: "val defaultGreeting: String = \"Hello\""
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: createGreeter
+  kind: Function
+  start_line: 20
+  signature: "def createGreeter(): Greeter = {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 25
+  signature: "def main(args: Array[String]): Unit = {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~
+- name: greeter
+  kind: Function
+  start_line: 26
+  signature: val greeter = AppConfig.createGreeter()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
