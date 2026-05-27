@@ -1,0 +1,77 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2544
+expression: "parsed_symbols(\"simple.jl\", &source)"
+---
+- name: Greetings
+  kind: Module
+  start_line: 1
+  signature: module Greetings
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: LivingThing
+  kind: Interface
+  start_line: 5
+  signature: abstract type LivingThing end
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Animal
+  kind: Class
+  start_line: 7
+  signature: "struct Animal <: LivingThing"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Counter
+  kind: Class
+  start_line: 12
+  signature: mutable struct Counter
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Function
+  start_line: 16
+  signature: "function greet(name::String)::String"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: process
+  kind: Function
+  start_line: 20
+  signature: "function process(items::Vector{Int})"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: log_call
+  kind: Function
+  start_line: 26
+  signature: macro log_call(expr)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 33
+  signature: function main()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

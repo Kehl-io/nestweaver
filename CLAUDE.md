@@ -79,7 +79,7 @@ Cargo workspace with 8 crates + root binary:
 nestweaver/                     # CLI entry point (src/main.rs)
 crates/
   nestweaver-schema/            # node/edge types, UIDs, confidence scoring, schema versioning
-  nestweaver-parser/            # Tree-sitter + regex parsing for 20 languages
+  nestweaver-parser/            # Tree-sitter + regex parsing for 25 languages
   nestweaver-resolver/          # cross-file import resolution with confidence scoring
   nestweaver-store/             # LadybugDB graph store, PageRank, hybrid search (BM25 + vector)
   nestweaver-storage/           # pluggable snapshot storage backends (local, S3, GitLab)

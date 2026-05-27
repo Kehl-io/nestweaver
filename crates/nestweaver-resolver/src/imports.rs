@@ -136,7 +136,12 @@ fn resolve_specifier(
         | Language::Zig
         | Language::ObjectiveC
         | Language::Groovy
-        | Language::PowerShell => None,
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Sql
+        | Language::Hcl
+        | Language::Fortran
+        | Language::Pascal => None,
     }
 }
 

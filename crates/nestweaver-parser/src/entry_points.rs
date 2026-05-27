@@ -35,6 +35,11 @@ pub fn detect_entry_point(
         "objc" => detect_objc(name, file_path, kind, signature),
         "groovy" => detect_groovy(name, file_path, kind, signature),
         "powershell" => detect_powershell(name, file_path, kind, signature),
+        "julia" => detect_julia(name, file_path, kind, signature),
+        "sql" => None,
+        "hcl" => None,
+        "fortran" => detect_fortran(name, file_path, kind, signature),
+        "pascal" => detect_pascal(name, file_path, kind, signature),
         _ => None,
     }
 }
@@ -380,6 +385,47 @@ fn detect_rust(
         if sig.contains("#[tokio::main]") || sig.contains("#[actix_web::main]") {
             return Some(EntryPointKind::Main);
         }
+    }
+    None
+}
+
+fn detect_julia(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    if name.starts_with("test_") {
+        return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_fortran(
+    name: &str,
+    _file_path: &str,
+    kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    // program blocks are entry points
+    if name.eq_ignore_ascii_case("main") && kind == "module" {
+        return Some(EntryPointKind::Main);
+    }
+    None
+}
+
+fn detect_pascal(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    // program declarations are entry points
+    if name.eq_ignore_ascii_case("main") {
+        return Some(EntryPointKind::Main);
     }
     None
 }

@@ -1,0 +1,21 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2606
+expression: "parsed_references(\"simple.pas\", &source)"
+---
+- name: Classes
+  kind: Import
+  start_line: 5
+  context: "uses SysUtils, Classes;"
+- name: SysUtils
+  kind: Import
+  start_line: 5
+  context: "uses SysUtils, Classes;"
+- name: TAnimal
+  kind: Extends
+  start_line: 18
+  context: TDog = class(TAnimal)
+- name: Create
+  kind: Call
+  start_line: 41
+  context: "inherited Create(AName, 'Woof');"

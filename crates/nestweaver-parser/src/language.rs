@@ -34,6 +34,11 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "m" | "mm" => Some(Language::ObjectiveC),
         "groovy" | "gradle" => Some(Language::Groovy),
         "ps1" | "psm1" => Some(Language::PowerShell),
+        "jl" => Some(Language::Julia),
+        "sql" => Some(Language::Sql),
+        "tf" | "hcl" => Some(Language::Hcl),
+        "f90" | "f95" | "f03" | "f08" => Some(Language::Fortran),
+        "pas" | "pp" => Some(Language::Pascal),
         _ => None,
     }
 }
@@ -285,6 +290,80 @@ mod tests {
         assert_eq!(
             detect_language(Path::new("test.exs")),
             Some(Language::Elixir)
+        );
+    }
+
+    #[test]
+    fn detect_language_julia() {
+        assert_eq!(detect_language(Path::new("main.jl")), Some(Language::Julia));
+    }
+
+    #[test]
+    fn detect_language_sql() {
+        assert_eq!(
+            detect_language(Path::new("schema.sql")),
+            Some(Language::Sql)
+        );
+    }
+
+    #[test]
+    fn detect_language_hcl_tf() {
+        assert_eq!(detect_language(Path::new("main.tf")), Some(Language::Hcl));
+    }
+
+    #[test]
+    fn detect_language_hcl_ext() {
+        assert_eq!(
+            detect_language(Path::new("config.hcl")),
+            Some(Language::Hcl)
+        );
+    }
+
+    #[test]
+    fn detect_language_fortran_f90() {
+        assert_eq!(
+            detect_language(Path::new("module.f90")),
+            Some(Language::Fortran)
+        );
+    }
+
+    #[test]
+    fn detect_language_fortran_f95() {
+        assert_eq!(
+            detect_language(Path::new("module.f95")),
+            Some(Language::Fortran)
+        );
+    }
+
+    #[test]
+    fn detect_language_fortran_f03() {
+        assert_eq!(
+            detect_language(Path::new("module.f03")),
+            Some(Language::Fortran)
+        );
+    }
+
+    #[test]
+    fn detect_language_fortran_f08() {
+        assert_eq!(
+            detect_language(Path::new("module.f08")),
+            Some(Language::Fortran)
+        );
+    }
+
+    #[test]
+    fn detect_language_pascal_pas() {
+        assert_eq!(
+            detect_language(Path::new("unit.pas")),
+            Some(Language::Pascal)
+        );
+    }
+
+    #[test]
+    fn detect_language_pascal_pp() {
+        assert_eq!(
+            detect_language(Path::new("unit.pp")),
+            Some(Language::Pascal)
         );
     }
 }
