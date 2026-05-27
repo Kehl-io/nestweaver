@@ -1784,6 +1784,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 tantivy.as_ref(),
                 &defaults,
                 &aliases,
+                Some(&db_path),
             ) {
                 Ok(result) => {
                     let cut = token_budgeted_truncate(&result.connected, token_budget);
@@ -2272,8 +2273,10 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
+            let manifests_path = db_path.with_extension("manifests.json");
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
-                .with_tantivy_index(&tantivy_sidecar);
+                .with_tantivy_index(&tantivy_sidecar)
+                .with_manifests_path(&manifests_path);
             let stop = watcher.shutdown_handle();
 
             // Write a PID lock file so MCP servers and other readers know a
@@ -2562,6 +2565,7 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                 tantivy.as_ref(),
                 &config,
                 &aliases,
+                Some(&db_path),
             ) {
                 Ok(mut result) => {
                     // RFC #2: apply post-PPR filters when any filter flag was set.
