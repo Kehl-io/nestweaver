@@ -216,9 +216,9 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
 /// Walk the comrak AST and emit every heading in document order. Line numbers
 /// are 1-based and relative to the body (the source we hand to comrak).
 fn extract_headings(body: &str) -> Vec<RawHeading> {
-    use comrak::{Arena, ComrakOptions, nodes::NodeValue, parse_document};
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &ComrakOptions::default());
+    let root = parse_document(&arena, body, &Options::default());
 
     let mut headings = Vec::new();
     let mut slug_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -231,9 +231,11 @@ fn extract_headings(body: &str) -> Vec<RawHeading> {
             for child in node.descendants() {
                 let cdata = child.data.borrow();
                 match &cdata.value {
-                    NodeValue::Text(t)
-                    | NodeValue::Code(comrak::nodes::NodeCode { literal: t, .. }) => {
+                    NodeValue::Text(t) => {
                         text.push_str(t);
+                    }
+                    NodeValue::Code(c) => {
+                        text.push_str(&c.literal);
                     }
                     _ => {}
                 }
@@ -386,7 +388,7 @@ pub fn slugify(text: &str) -> String {
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Split YAML frontmatter (delimited by lines containing exactly `---`) from the
@@ -472,10 +474,10 @@ fn yaml_to_json(value: &serde_yaml::Value) -> Result<serde_json::Value, String> 
 /// Extract the first H1 (`# Heading`) from the body, falling back to an
 /// ATX-style match. Returns `None` if no H1 is found.
 fn extract_first_h1(body: &str) -> Option<String> {
-    use comrak::{Arena, ComrakOptions, nodes::NodeValue, parse_document};
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
 
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &ComrakOptions::default());
+    let root = parse_document(&arena, body, &Options::default());
 
     for node in root.descendants() {
         if let NodeValue::Heading(h) = &node.data.borrow().value
@@ -774,9 +776,9 @@ fn extract_aliases(frontmatter: &serde_json::Value) -> Vec<String> {
 /// string (e.g. `"python"` for ` ```python `); we take the first whitespace-
 /// delimited token (some editors append extra options after a space).
 fn extract_code_languages(body: &str) -> Vec<String> {
-    use comrak::{Arena, ComrakOptions, nodes::NodeValue, parse_document};
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &ComrakOptions::default());
+    let root = parse_document(&arena, body, &Options::default());
 
     let mut out = Vec::new();
     for node in root.descendants() {
@@ -802,9 +804,9 @@ fn extract_code_languages(body: &str) -> Vec<String> {
 /// `section_idx` is set to the section whose line range contains the link;
 /// falls back to 0 (preamble / first section) when no match is found.
 fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
-    use comrak::{Arena, ComrakOptions, nodes::NodeValue, parse_document};
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &ComrakOptions::default());
+    let root = parse_document(&arena, body, &Options::default());
 
     let mut out = Vec::new();
     for node in root.descendants() {

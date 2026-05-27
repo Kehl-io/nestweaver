@@ -807,7 +807,7 @@ fn reinsert_note(
 fn sha256_full(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 fn sha256_short(text: &str) -> String {
