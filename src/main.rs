@@ -705,6 +705,9 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        /// Include --allow-mcp-add-sources in MCP server args (enables set_extension writes)
+        #[arg(long)]
+        allow_writes: bool,
     },
 
     /// Generate embeddings for all symbols in the database using an external API.
@@ -2044,9 +2047,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::Setup { tool, all, db } => {
+        Commands::Setup {
+            tool,
+            all,
+            db,
+            allow_writes,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all)?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes)?;
             Ok((EXIT_SUCCESS, None))
         }
 
