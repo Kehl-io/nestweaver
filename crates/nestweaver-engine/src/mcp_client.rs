@@ -47,7 +47,7 @@ impl McpClient {
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": self.next_id(), "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": { "name": "nestweaver", "version": "0.1.0" }
             }
