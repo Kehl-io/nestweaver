@@ -2381,7 +2381,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             let state = nestweaver_web::state::AppState::new(store, tantivy, db_path);
 
@@ -2639,7 +2639,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             // Resolve the project: name -> alias -> UID substring.
             let project = if name.starts_with("proj:") {
@@ -3522,7 +3522,7 @@ fn run_brain(
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             let result_count;
             if let Some(ref idx) = tantivy {
@@ -3633,7 +3633,7 @@ fn run_brain(
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
             let defaults = HybridSearchConfig::default();
