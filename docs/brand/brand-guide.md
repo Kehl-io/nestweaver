@@ -17,7 +17,6 @@ Fierce geometric raptor built from graph nodes, edges, and binary digits. The si
 |------|-------------|
 | `assets/logo-icon-dark.svg` | Icon only, dark `#080c14` background |
 | `assets/logo-icon-light.svg` | Icon only, transparent (light-mode colors) |
-| `assets/logo-fierce.svg` | Icon only, transparent (dark-mode colors) |
 | `assets/logo-full-dark.svg` | Vertical wordmark (icon + "NestWeaver"), dark background |
 | `assets/logo-full-light.svg` | Vertical wordmark, transparent (light-mode colors) |
 | `assets/logo-horizontal-dark.svg` | Horizontal wordmark (icon + text side-by-side), dark background |
