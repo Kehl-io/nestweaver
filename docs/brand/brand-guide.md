@@ -9,12 +9,31 @@ and documentation should use the colors, fonts, and icon library defined here.
 
 ## Logo
 
-- **Icon:** `assets/logo-icon-dark.svg` (dark background), `assets/logo-icon-light.svg` (light background)
-- **Concept:** Interconnected graph nodes with weaving bezier paths — representing code structure being woven into a knowledge graph
+Fierce geometric raptor built from graph nodes, edges, and binary digits. The silhouette reads as a bird of prey viewed head-on with spread wings, constructed entirely from the visual language of code graphs.
+
+### Asset inventory
+
+| File | Description |
+|------|-------------|
+| `assets/logo-icon-dark.svg` | Icon only, dark `#080c14` background |
+| `assets/logo-icon-light.svg` | Icon only, transparent (light-mode colors) |
+| `assets/logo-fierce.svg` | Icon only, transparent (dark-mode colors) |
+| `assets/logo-full-dark.svg` | Vertical wordmark (icon + "NestWeaver"), dark background |
+| `assets/logo-full-light.svg` | Vertical wordmark, transparent (light-mode colors) |
+| `assets/logo-horizontal-dark.svg` | Horizontal wordmark (icon + text side-by-side), dark background |
+| `assets/logo-horizontal-light.svg` | Horizontal wordmark, transparent (light-mode colors) |
+| `assets/favicon.svg` | Favicon, dark background |
+| `assets/favicon-light.svg` | Favicon, transparent (light-mode colors) |
+
+- **Wordmark font:** Michroma (converted to SVG paths — no font dependency)
 - **Parent branding:** kehl.io logos at `assets/kehl-io/`
 
 ### Usage rules
 
+- Use `logo-full-*` for README, marketing, and hero placements
+- Use `logo-horizontal-*` for nav bars and inline branding (e.g. TopBar)
+- Use `logo-icon-*` for compact contexts (sidebar, app icon, social)
+- Use `favicon*` for browser tabs
 - Minimum size: 32px for icon mark
 - Always use on solid backgrounds (dark or light), never on photos or gradients
 - Do not rotate, stretch, or recolor the logo
