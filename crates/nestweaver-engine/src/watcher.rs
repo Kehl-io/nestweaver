@@ -292,6 +292,12 @@ impl BrainWatcher {
                     }
                     Err(e) => tracing::warn!("post-batch PPR recompute failed: {e}"),
                 }
+
+                // Record the watcher commit timestamp so `brain status`
+                // shows the actual last-indexed time, not max(modified_at).
+                if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, &v_uid) {
+                    tracing::warn!("failed to record last_indexed_at: {e}");
+                }
             }
         }
     }

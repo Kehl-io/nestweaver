@@ -12,13 +12,13 @@ use nestweaver_engine::{
     FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, detect_dead_code, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embedding, export_cypher, export_graphml,
-    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md,
-    generate_cursor_rule, generate_guide, generate_repo_map, generate_skill, generate_summaries,
-    incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
-    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
-    lookup_symbol, materialize_projects, render_text, save_clusters, save_summaries,
+    changed_files_from_git, compute_clusters, detect_dead_code, discover_cross_domain_links,
+    embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
+    generate_repo_map, generate_skill, generate_summaries, get_last_indexed_at, incremental_index,
+    index_directory, index_markdown_directory, index_markdown_directory_since, list_repos,
+    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
+    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_summaries,
     search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
@@ -706,9 +706,6 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
-        /// Include --allow-mcp-add-sources in MCP server args (enables set_extension writes)
-        #[arg(long)]
-        allow_writes: bool,
     },
 
     /// Generate embeddings for all symbols in the database using an external API.
@@ -844,44 +841,6 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Instance ID (for multi-instance setups)")]
         instance: Option<String>,
-    },
-
-    /// Materialize declared projects, wiki sources, and cross-repo links
-    ///
-    /// Reads [[projects]] from an instance config and creates Project nodes,
-    /// attaches notes by vault folder, symbols by repo, component edges, and
-    /// ingests wiki sources via MCP tool calls.
-    #[command(
-        after_help = "Examples:\n  nestweaver materialize-projects --config ./instance.toml\n  nestweaver materialize-projects --config ./instance.toml --db ./custom.lbug"
-    )]
-    MaterializeProjects {
-        #[arg(long, help = "Path to instance config (TOML)")]
-        config: PathBuf,
-        #[arg(
-            long,
-            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
-        )]
-        db: Option<PathBuf>,
-    },
-
-    /// Detect implicit projects from vault Projects/ folder structure
-    ///
-    /// Walks `<vault>/Projects/` and auto-detects project folders whose entry
-    /// note exists at `Projects/<slug>/<slug>.md`. Creates Project nodes and
-    /// links all notes under each project folder.
-    #[command(
-        after_help = "Examples:\n  nestweaver detect-implicit-projects --vault ~/Documents/Obsidian/MyVault\n  nestweaver detect-implicit-projects --vault ./notes --instance my-instance"
-    )]
-    DetectImplicitProjects {
-        #[arg(long, help = "Path to vault directory")]
-        vault: PathBuf,
-        #[arg(long, help = "Instance ID [default: default]")]
-        instance: Option<String>,
-        #[arg(
-            long,
-            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
-        )]
-        db: Option<PathBuf>,
     },
 }
 
@@ -1201,15 +1160,17 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
             }
         }
     };
-    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
-    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
+    let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
     Ok(store)
 }
 
-/// Tantivy index sidecar location: `<db_path>.tantivy/`.
+/// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
+/// `.pagerank.json` sidecar convention.
 fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
-    nestweaver_engine::sidecar_path(db_path, ".tantivy")
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(".tantivy");
+    PathBuf::from(s)
 }
 
 fn default_registry_path() -> PathBuf {
@@ -1739,7 +1700,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
-            let cache_path = nestweaver_engine::sidecar_path(db_path, ".manifests.json");
+            let cache_path = db_path.with_extension("manifests.json");
             let manifests = load_manifest_cache(&cache_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
@@ -1986,16 +1947,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
 
-            out.status(&format!("Computing clusters (resolution={resolution})..."));
-            let output = compute_clusters(&store, resolution)?;
-            save_clusters(&db_path, &output)?;
-            out.status(&format!(
-                "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
-                output.communities.len(),
-                output.modularity
-            ));
+            // Compute and save inside a block so the store is dropped
+            // before any output. LadybugDB's connection finaliser can
+            // trigger a panic during WAL checkpoint; dropping early
+            // converts that into a catchable error scope and keeps the
+            // process exit clean.
+            let output = {
+                let store = open_store(Some(&db_path))?;
+                out.status(&format!("Computing clusters (resolution={resolution})..."));
+                let o = compute_clusters(&store, resolution)?;
+                save_clusters(&db_path, &o)?;
+                out.status(&format!(
+                    "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
+                    o.communities.len(),
+                    o.modularity
+                ));
+                // Drop `store` here, before output begins.
+                o
+            };
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2086,14 +2056,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::Setup {
-            tool,
-            all,
-            db,
-            allow_writes,
-        } => {
+        Commands::Setup { tool, all, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes)?;
+            setup::run_setup(tool.as_deref(), &db_path, all)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -2364,7 +2329,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
 
-            let lock_path = nestweaver_engine::sidecar_path(&db_path, ".lock");
+            let lock_path = {
+                let mut s = db_path.as_os_str().to_owned();
+                s.push(".lock");
+                PathBuf::from(s)
+            };
             let _ = std::fs::write(&lock_path, process::id().to_string());
 
             let stop_signal = stop.clone();
@@ -2664,7 +2633,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_or_create(&tantivy_path).ok();
 
-            // Resolve the project.
+            // Resolve the project: name -> alias -> UID substring.
             let project = if name.starts_with("proj:") {
                 let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
                 all.into_iter()
@@ -2677,11 +2646,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 {
                     Some(p) => p,
                     None => {
-                        eprintln!(
-                            "Project '{}' not found. Try: nestweaver list-projects",
-                            name
-                        );
-                        return Ok((EXIT_NOT_FOUND, None));
+                        // Try alias match via extension sidecar, then UID substring.
+                        let all = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+                        let ext_store = load_extensions(&db_path);
+                        let needle = name.to_lowercase();
+                        let alias_match = all.iter().find(|p| {
+                            if let Some(serde_json::Value::Array(aliases)) =
+                                ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
+                            {
+                                aliases
+                                    .iter()
+                                    .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
+                            } else {
+                                false
+                            }
+                        });
+                        if let Some(p) = alias_match {
+                            p.clone()
+                        } else {
+                            match all.into_iter().find(|p| p.uid.contains(&name)) {
+                                Some(p) => p,
+                                None => {
+                                    eprintln!(
+                                        "Project '{}' not found. Try: nestweaver list-projects",
+                                        name
+                                    );
+                                    return Ok((EXIT_NOT_FOUND, None));
+                                }
+                            }
+                        }
                     }
                 }
             };
@@ -2740,6 +2733,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &defaults,
                 &aliases,
                 Some(&db_path),
+                None,
             ) {
                 Ok(mut result) => {
                     // since filter: hard filter Note/Section nodes by modified_at.
@@ -2797,83 +2791,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_ERROR, None))
                 }
             }
-        }
-
-        Commands::MaterializeProjects { config, db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
-            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
-            let instance_id = &instance_config.instance_id;
-
-            out.status(&format!(
-                "Materializing {} project(s) from {}...",
-                instance_config.projects.len(),
-                config.display()
-            ));
-
-            let result = materialize_projects(&store, &instance_config, instance_id, &db_path)?;
-
-            println!(
-                "Materialized {} project(s): {} note edge(s), {} symbol edge(s), \
-                 {} component edge(s), {} wiki note(s) ingested.",
-                result.projects_created,
-                result.note_edges,
-                result.symbol_edges,
-                result.component_edges,
-                result.wiki_notes_ingested,
-            );
-
-            let stats = format!(
-                "{} projects in {}",
-                result.projects_created,
-                format_elapsed(t0.elapsed())
-            );
-            Ok((EXIT_SUCCESS, Some(stats)))
-        }
-
-        Commands::DetectImplicitProjects {
-            vault,
-            instance,
-            db,
-        } => {
-            let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
-            let instance_id = instance.as_deref().unwrap_or("default");
-
-            if !vault.exists() || !vault.is_dir() {
-                eprintln!("Error: vault path is not a directory: {}", vault.display());
-                return Ok((EXIT_ERROR, None));
-            }
-
-            // Resolve the vault UID the same way the brain indexer does.
-            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
-            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
-
-            out.status(&format!(
-                "Scanning {}/Projects/ for implicit projects...",
-                vault.display()
-            ));
-
-            let detected = detect_implicit_projects(&store, &vault, &vault_uid, instance_id)?;
-
-            if detected.is_empty() {
-                println!(
-                    "No implicit projects found in {}/Projects/.",
-                    vault.display()
-                );
-            } else {
-                println!("Detected {} implicit project(s):", detected.len());
-                for slug in &detected {
-                    println!("  {slug}");
-                }
-            }
-
-            let stats = format!(
-                "{} projects in {}",
-                detected.len(),
-                format_elapsed(t0.elapsed())
-            );
-            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::Index {
@@ -2953,7 +2870,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .with_context(|| "compute_pagerank")?;
 
             // Save PageRank cache alongside the DB for use by subsequent commands.
-            let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+            let pr_path = db_path.with_extension("pagerank.json");
             store
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
@@ -3080,16 +2997,43 @@ fn print_feature_context_text(result: &FeatureContextResult) {
     }
 }
 
-/// Best-effort Ctrl-C handler. We don't pull in a signal-handling crate
-/// (`ctrlc`, `signal-hook`) for v1 — process-kill is good enough since
-/// our writes are transactional. This function is a stub so callers can
-/// optionally upgrade later without changing call sites.
-fn ctrlc_handler<F>(_on_signal: F) -> Result<(), ()>
+/// Register a handler for SIGINT (Ctrl-C) and SIGTERM so watcher loops
+/// can shut down gracefully, flush the WAL, and remove lock files.
+///
+/// The callback `on_signal` is invoked from a signal-safe context; it
+/// should only flip an `AtomicBool` (as `ShutdownHandle::stop` does).
+fn ctrlc_handler<F>(mut on_signal: F) -> Result<(), ()>
 where
     F: FnMut() + Send + 'static,
 {
-    // Intentionally a no-op. SIGINT terminates the process; lbug's WAL
-    // ensures the on-disk graph stays consistent.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fired = Arc::new(AtomicBool::new(false));
+
+    // Register for both SIGINT and SIGTERM. The flag prevents calling
+    // the closure more than once (idempotent, but saves work).
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let fired = fired.clone();
+        // SAFETY: `signal_hook::flag::register` is signal-safe; it sets
+        // the AtomicBool from the signal handler context.
+        if signal_hook::flag::register(sig, fired.clone()).is_err() {
+            tracing::warn!("failed to register signal handler for {sig}");
+        }
+    }
+
+    // Spawn a background thread that polls the flag. When set, call the
+    // user-provided closure (which flips the watcher's shutdown handle).
+    std::thread::Builder::new()
+        .name("signal-handler".into())
+        .spawn(move || {
+            while !fired.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            on_signal();
+        })
+        .map_err(|_| ())?;
+
     Ok(())
 }
 
@@ -3140,6 +3084,11 @@ fn run_brain(
 
             let result = index_markdown_directory(&path, &db_path, instance_id, &vault_name)
                 .context("index_markdown_directory")?;
+
+            // Record the indexer run timestamp for this vault.
+            if let Err(e) = record_last_indexed_at(&db_path, &result.vault_uid) {
+                tracing::warn!("failed to record last_indexed_at: {e}");
+            }
 
             let notes_count = result.notes_count;
 
@@ -3195,17 +3144,20 @@ fn run_brain(
         }
 
         BrainCommands::List { json, db } => {
-            let store = open_store(db.as_deref())?;
+            let db_default = default_db_path();
+            let db_path = db.as_deref().unwrap_or(&db_default);
+            let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
 
-            // Compute (note_count, last_indexed) per vault once. last_indexed
-            // is max(modified_at) across the vault's notes — captures the most
-            // recent file mtime the indexer/watcher saw.
+            // Compute (note_count, last_indexed) per vault. Prefer the
+            // extension-store timestamp (actual indexer run) with fallback
+            // to max(note.modified_at).
             let per_vault: Vec<(String, usize, Option<String>)> = vaults
                 .iter()
                 .map(|v| {
                     let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
-                    let last = notes.iter().filter_map(|n| n.modified_at.clone()).max();
+                    let last = get_last_indexed_at(db_path, &v.uid)
+                        .or_else(|| notes.iter().filter_map(|n| n.modified_at.clone()).max());
                     (v.uid.clone(), notes.len(), last)
                 })
                 .collect();
@@ -3247,7 +3199,9 @@ fn run_brain(
         }
 
         BrainCommands::Status { json, db } => {
-            let store = open_store(db.as_deref())?;
+            let db_default = default_db_path();
+            let db_path = db.as_deref().unwrap_or(&db_default);
+            let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
             let note_count = store.count_notes().map_err(|e| anyhow::anyhow!(e))?;
             let heading_count = store.count_headings().map_err(|e| anyhow::anyhow!(e))?;
@@ -3257,6 +3211,26 @@ fn run_brain(
                 .count_wikilink_edges()
                 .map_err(|e| anyhow::anyhow!(e))?;
             let repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
+
+            /// Resolve last_indexed_at for a vault: prefer the extension-store
+            /// timestamp (actual indexer run), fall back to max(note.modified_at)
+            /// for databases indexed before this feature was added.
+            fn resolve_last_indexed(
+                db_path: &Path,
+                vault_uid: &str,
+                store: &GraphStore,
+            ) -> Option<String> {
+                if let Some(ts) = get_last_indexed_at(db_path, vault_uid) {
+                    return Some(ts);
+                }
+                // Fallback: max(note.modified_at).
+                store
+                    .list_notes(Some(vault_uid))
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|n| n.modified_at.clone())
+                    .max()
+            }
 
             if json {
                 #[derive(serde::Serialize)]
@@ -3282,13 +3256,9 @@ fn run_brain(
                 let vault_details: Vec<VaultDetail> = vaults
                     .iter()
                     .map(|v| {
-                        let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
-                        let vault_note_count = notes.len();
-                        let last_indexed = notes
-                            .iter()
-                            .filter_map(|n| n.modified_at.as_deref())
-                            .max()
-                            .map(|s| s.to_string());
+                        let vault_note_count =
+                            store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                        let last_indexed = resolve_last_indexed(db_path, &v.uid, &store);
                         VaultDetail {
                             name: v.name.clone(),
                             root_path: v.root_path.clone(),
@@ -3300,12 +3270,10 @@ fn run_brain(
                 let mut instance_ids: std::collections::BTreeSet<&str> =
                     vaults.iter().map(|v| v.instance_id.as_str()).collect();
                 instance_ids.extend(repos.iter().map(|r| r.instance_id.as_str()));
-                let db_default = default_db_path();
-                let db_path = db.as_deref().unwrap_or(&db_default).display().to_string();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&Status {
-                        db: db_path,
+                        db: db_path.display().to_string(),
                         vaults: vaults.len(),
                         vault_details,
                         notes: note_count,
@@ -3319,20 +3287,11 @@ fn run_brain(
                 );
             } else {
                 println!("Brain status:");
-                let db_default = default_db_path();
-                println!(
-                    "  Database:  {}",
-                    db.as_deref().unwrap_or(&db_default).display()
-                );
+                println!("  Database:  {}", db_path.display());
                 println!("  Vaults:    {}", vaults.len());
                 for v in &vaults {
-                    let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
-                    let vault_note_count = notes.len();
-                    let last_indexed = notes
-                        .iter()
-                        .filter_map(|n| n.modified_at.as_deref())
-                        .max()
-                        .map(|s| s.to_string())
+                    let vault_note_count = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                    let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
                     println!(
                         "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
@@ -3369,7 +3328,7 @@ fn run_brain(
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
-            let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+            let manifests_path = db_path.with_extension("manifests.json");
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path);
@@ -3377,7 +3336,11 @@ fn run_brain(
 
             // Write a PID lock file so MCP servers and other readers know a
             // watcher is active and should open the database read-only.
-            let lock_path = nestweaver_engine::sidecar_path(&db_path, ".lock");
+            let lock_path = {
+                let mut s = db_path.as_os_str().to_owned();
+                s.push(".lock");
+                std::path::PathBuf::from(s)
+            };
             let _ = std::fs::write(&lock_path, std::process::id().to_string());
 
             // Wire Ctrl-C → shutdown_handle.stop(). Best-effort; if the
@@ -3419,6 +3382,10 @@ fn run_brain(
             });
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
 
+            // Compute vault UID for recording last_indexed_at.
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
+
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
                 // given timestamp.
@@ -3436,6 +3403,12 @@ fn run_brain(
                     since_time,
                 )
                 .context("index_markdown_directory_since")?;
+
+                // Record the indexer run timestamp.
+                if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {
+                    tracing::warn!("failed to record last_indexed_at: {e}");
+                }
+
                 println!(
                     "Incremental refresh of vault '{}' (since {}): \
                      checked {} file(s), updated {} note(s), \
@@ -3451,10 +3424,6 @@ fn run_brain(
                 );
             } else {
                 // Full refresh: cascade-delete all notes then re-index from scratch.
-                let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                let v_uid =
-                    nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
-
                 let store = open_store(Some(&db_path))?;
                 let existing = store.list_notes(Some(&v_uid)).unwrap_or_default();
                 let drop_count = existing.len();
@@ -3467,6 +3436,12 @@ fn run_brain(
 
                 let result = index_markdown_directory(&path, &db_path, &instance_id, &vault_name)
                     .context("index_markdown_directory")?;
+
+                // Record the indexer run timestamp.
+                if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {
+                    tracing::warn!("failed to record last_indexed_at: {e}");
+                }
+
                 println!(
                     "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
                      {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
@@ -3669,6 +3644,7 @@ fn run_brain(
                 &config,
                 &aliases,
                 Some(&db_path),
+                None,
             ) {
                 Ok(mut result) => {
                     // RFC #2: apply post-PPR filters when any filter flag was set.

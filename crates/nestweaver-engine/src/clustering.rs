@@ -175,7 +175,10 @@ pub fn leiden(graph: &Graph, resolution: f64, max_iterations: u32) -> Clustering
     ClusteringResult {
         assignment: compacted,
         communities,
-        modularity: q,
+        // Guard against NaN/Infinity leaking into the result (can happen
+        // when total_weight is 0 with isolated nodes). JSON serialisation
+        // rejects non-finite f64 so this prevents a downstream error.
+        modularity: if q.is_finite() { q } else { 0.0 },
     }
 }
 
@@ -202,10 +205,10 @@ fn compute_cohesion(graph: &Graph, members: &[usize]) -> f64 {
     }
 
     if total_weight == 0.0 {
-        0.0
-    } else {
-        internal_weight / total_weight
+        return 0.0;
     }
+    let c = internal_weight / total_weight;
+    if c.is_finite() { c } else { 0.0 }
 }
 
 #[cfg(test)]
