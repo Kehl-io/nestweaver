@@ -499,6 +499,19 @@ impl GraphStore {
         }
         Ok(())
     }
+
+    /// Return a clone of the in-memory PageRank scores map.
+    ///
+    /// Returns an empty map if PageRank has not been computed yet or the
+    /// cache is not loaded. Used by downstream crates (engine) that need
+    /// per-UID score lookups without loading full Symbol objects.
+    pub fn pagerank_scores(&self) -> HashMap<String, f64> {
+        self.pagerank_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_default()
+    }
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────

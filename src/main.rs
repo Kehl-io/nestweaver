@@ -9,9 +9,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, FeatureContextResult,
-    HybridSearchConfig, LookupResult, build_brain_context_hybrid_with_aliases, build_context,
-    build_feature_context, compute_clusters, discover_cross_domain_links,
-    embedding::generate_embedding, generate_agents_md, generate_cursor_rule, generate_guide,
+    HybridSearchConfig, LookupResult, attach_cluster_ids, attach_communities,
+    build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
+    compute_clusters, discover_cross_domain_links, embedding::generate_embedding,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
     generate_repo_map, generate_skill, incremental_index, index_directory,
     index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
     load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
@@ -513,6 +514,40 @@ enum Commands {
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommands,
+    },
+    /// Show the most connected hub nodes in the code graph
+    ///
+    /// Hub nodes have the highest degree centrality (most incoming + outgoing
+    /// edges) and tend to be central abstractions that many parts of the
+    /// codebase depend on. Useful for understanding the architectural core.
+    #[command(after_help = "Examples:\n  nestweaver hubs\n  nestweaver hubs --top 20 --json")]
+    Hubs {
+        #[arg(long, default_value = "10", help = "Number of top hubs to show")]
+        top: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Show architectural bridge/chokepoint nodes in the code graph
+    ///
+    /// Bridge nodes have high betweenness centrality: many shortest paths
+    /// between other nodes pass through them. Changing a bridge node has
+    /// outsized blast radius. Useful for identifying fragile connectors.
+    #[command(after_help = "Examples:\n  nestweaver bridges\n  nestweaver bridges --top 20 --json")]
+    Bridges {
+        #[arg(long, default_value = "10", help = "Number of top bridges to show")]
+        top: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
     /// List detected code communities (Leiden clustering)
     ///
@@ -1635,6 +1670,91 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => print!("{output_str}"),
             }
             Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Hubs { top, json, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            let mut hubs = find_hub_nodes(&store, top)?;
+
+            // Attach cluster IDs if clustering sidecar exists.
+            if let Ok(Some(clustering)) = load_clusters(&db_path) {
+                attach_cluster_ids(&mut hubs, &clustering);
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hubs)?);
+            } else if hubs.is_empty() {
+                println!("No hub nodes found (graph may be empty).");
+            } else {
+                println!("Top {} hub nodes (by total degree):\n", hubs.len());
+                for h in &hubs {
+                    let cluster = h
+                        .cluster_id
+                        .map(|id| format!(" cluster={id}"))
+                        .unwrap_or_default();
+                    println!(
+                        "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                        h.name,
+                        h.file_path,
+                        h.in_degree,
+                        h.out_degree,
+                        h.total_degree,
+                        h.pagerank_score,
+                    );
+                }
+            }
+            let stats = format!("{} hubs in {}", hubs.len(), format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::Bridges { top, json, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            out.status("Computing betweenness centrality...");
+            let mut bridges = find_bridge_nodes(&store, top)?;
+
+            // Attach community connection info if clustering sidecar exists.
+            if let Ok(Some(clustering)) = load_clusters(&db_path) {
+                attach_communities(&mut bridges, &clustering, &store);
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&bridges)?);
+            } else if bridges.is_empty() {
+                println!("No bridge nodes found (graph may be empty).");
+            } else {
+                println!(
+                    "Top {} bridge nodes (by betweenness centrality):\n",
+                    bridges.len()
+                );
+                for b in &bridges {
+                    let communities = if b.communities_connected.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " connects=[{}]",
+                            b.communities_connected
+                                .iter()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    };
+                    println!(
+                        "  {} ({}) betweenness={:.2}{communities}",
+                        b.name, b.file_path, b.betweenness_score,
+                    );
+                }
+            }
+            let stats = format!(
+                "{} bridges in {}",
+                bridges.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::Clusters {

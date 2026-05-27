@@ -12,10 +12,11 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, generate_guide, get_all_properties, index_directory,
-    index_markdown_directory, load_alias_sidecar, load_extensions, parse_iso8601_to_epoch,
-    query_by_property, save_extensions, set_property,
+    BrainContextResult, HybridSearchConfig, attach_cluster_ids, attach_communities,
+    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    find_bridge_nodes, find_hub_nodes, generate_guide, get_all_properties, index_directory,
+    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
+    parse_iso8601_to_epoch, query_by_property, save_extensions, set_property,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -52,6 +53,8 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_query_extensions(),
         tool_schema_brain_diff(),
         tool_schema_project_context(),
+        tool_schema_hub_nodes(),
+        tool_schema_bridge_nodes(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -86,6 +89,8 @@ pub fn dispatch(
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
         "project_context" => tool_project_context(store, tantivy, args),
+        "hub_nodes" => tool_hub_nodes(store, args),
+        "bridge_nodes" => tool_bridge_nodes(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -2180,6 +2185,117 @@ fn tool_project_context(
         "truncated": cut < result.connected.len(),
         "total_connected": result.connected.len(),
         "external_refs": external_refs,
+    }))
+}
+
+// ── 18. hub_nodes ─────────────────────────────────────────────────────────
+
+fn tool_schema_hub_nodes() -> Value {
+    json!({
+        "name": "hub_nodes",
+        "description": "Find the most connected hub nodes in the code graph. Returns nodes ranked by total degree (incoming + outgoing edges). Hub nodes are central abstractions that many parts of the codebase depend on. Use to understand the architectural core.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top_n": {
+                    "type": "integer",
+                    "description": "Number of top hubs to return. Default 10.",
+                    "default": 10
+                }
+            }
+        }
+    })
+}
+
+fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let top_n = args
+        .get("top_n")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    let mut hubs = find_hub_nodes(store, top_n).context("find_hub_nodes")?;
+
+    // Attach cluster IDs if clustering sidecar exists.
+    let db_path = current_db_path(store).unwrap_or_default();
+    if let Ok(Some(clustering)) = load_clusters(&db_path) {
+        attach_cluster_ids(&mut hubs, &clustering);
+    }
+
+    let nodes_json: Vec<Value> = hubs
+        .iter()
+        .map(|h| {
+            json!({
+                "uid": h.uid,
+                "name": h.name,
+                "file_path": h.file_path,
+                "in_degree": h.in_degree,
+                "out_degree": h.out_degree,
+                "total_degree": h.total_degree,
+                "pagerank_score": h.pagerank_score,
+                "cluster_id": h.cluster_id,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "top_n": top_n,
+        "count": nodes_json.len(),
+        "hubs": nodes_json,
+    }))
+}
+
+// ── 19. bridge_nodes ──────────────────────────────────────────────────────
+
+fn tool_schema_bridge_nodes() -> Value {
+    json!({
+        "name": "bridge_nodes",
+        "description": "Find architectural chokepoint nodes with high betweenness centrality. Bridge nodes sit on many shortest paths between other nodes — changing them has outsized blast radius. Use to identify fragile connectors between different parts of the codebase.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top_n": {
+                    "type": "integer",
+                    "description": "Number of top bridges to return. Default 10.",
+                    "default": 10
+                }
+            }
+        }
+    })
+}
+
+fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let top_n = args
+        .get("top_n")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    let mut bridges = find_bridge_nodes(store, top_n).context("find_bridge_nodes")?;
+
+    // Attach community connection info if clustering sidecar exists.
+    let db_path = current_db_path(store).unwrap_or_default();
+    if let Ok(Some(clustering)) = load_clusters(&db_path) {
+        attach_communities(&mut bridges, &clustering, store);
+    }
+
+    let nodes_json: Vec<Value> = bridges
+        .iter()
+        .map(|b| {
+            json!({
+                "uid": b.uid,
+                "name": b.name,
+                "file_path": b.file_path,
+                "betweenness_score": b.betweenness_score,
+                "communities_connected": b.communities_connected,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "top_n": top_n,
+        "count": nodes_json.len(),
+        "bridges": nodes_json,
     }))
 }
 

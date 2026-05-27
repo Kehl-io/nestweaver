@@ -1,6 +1,7 @@
 // nestweaver-engine: orchestrates parsing, resolution, and graph construction
 
 pub mod agent_guide;
+pub mod bridges;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod cross_domain;
 pub mod embedding;
 pub mod extensions;
 pub mod git_diff;
+pub mod hubs;
 pub mod index;
 pub mod index_md;
 pub mod manifest;
@@ -26,6 +28,7 @@ pub mod watch_code;
 pub mod watcher;
 
 pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
+pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
@@ -43,6 +46,7 @@ pub use extensions::{
     ExtensionStore, get_all_properties, get_property, load_extensions, query_by_property,
     save_extensions, set_property,
 };
+pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
     CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
     index_directory, index_directory_in_memory, index_directory_with_options, load_filemeta_cache,
