@@ -15,10 +15,10 @@ const key = `${process.platform}-${process.arch}`;
 const target = PLATFORM_MAP[key];
 
 if (!target) {
-  console.error(`Unsupported platform: ${key}`);
-  console.error("Supported: darwin-x64, darwin-arm64, linux-x64, linux-arm64");
-  console.error("Install from source: cargo install nestweaver");
-  process.exit(1);
+  console.warn(`Unsupported platform: ${key}`);
+  console.warn("Supported: darwin-x64, darwin-arm64, linux-x64, linux-arm64");
+  console.warn("Unsupported platform. Install from source: cargo install nestweaver");
+  process.exit(0); // Don't break npm install
 }
 
 const version = require("./package.json").version;
@@ -39,7 +39,7 @@ try {
   fs.chmodSync(path.join(binDir, "nestweaver"), 0o755);
   console.log("NestWeaver installed successfully.");
 } catch (err) {
-  console.error(`Failed to download binary from ${url}`);
-  console.error("Install from source instead: cargo install nestweaver");
-  process.exit(1);
+  console.warn(`Failed to download binary from ${url}`);
+  console.warn("Install from source instead: cargo install nestweaver");
+  process.exit(0); // Don't break npm install
 }

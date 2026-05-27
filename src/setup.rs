@@ -178,7 +178,13 @@ fn setup_codex(db_path: &Path) -> Result<(), anyhow::Error> {
     );
     let merged = append_toml_if_missing(config_path, "mcp_servers.nestweaver", &toml_section)?;
 
-    std::fs::write("AGENTS.md", generate_agents_md_content())?;
+    let agents_path = Path::new("AGENTS.md");
+    let agents_status = if agents_path.exists() {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(agents_path, generate_agents_md_content())?;
+        "codebase guide written"
+    };
 
     print_result(
         "Codex",
@@ -191,7 +197,7 @@ fn setup_codex(db_path: &Path) -> Result<(), anyhow::Error> {
                     "already configured"
                 },
             ),
-            ("AGENTS.md", "codebase guide written"),
+            ("AGENTS.md", agents_status),
         ],
     );
     Ok(())
@@ -283,7 +289,16 @@ fn merge_json_mcp(
 ) -> Result<bool, anyhow::Error> {
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                anyhow::bail!(
+                    "{} contains invalid JSON: {}. Fix it manually or delete it.",
+                    path.display(),
+                    e
+                );
+            }
+        }
     } else {
         serde_json::json!({})
     };
