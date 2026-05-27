@@ -42,6 +42,16 @@ pub fn run_setup(tool: Option<&str>, db_path: &Path, force_all: bool) -> Result<
             "windsurf" => setup_windsurf(db_path)?,
             "jetbrains" => setup_jetbrains(db_path)?,
             "vscode" => setup_vscode(db_path)?,
+            "gemini" => setup_gemini(db_path)?,
+            "copilot" => setup_copilot(db_path)?,
+            "aider" => setup_aider(db_path)?,
+            "kiro" => setup_kiro(db_path)?,
+            "continue" => setup_continue(db_path)?,
+            "cline" => setup_cline(db_path)?,
+            "opencode" => setup_opencode(db_path)?,
+            "trae" => setup_trae(db_path)?,
+            "devin" => setup_devin(db_path)?,
+            "hermes" => setup_hermes(db_path)?,
             _ => {}
         }
     }
@@ -50,7 +60,7 @@ pub fn run_setup(tool: Option<&str>, db_path: &Path, force_all: bool) -> Result<
         && !any_configured
     {
         anyhow::bail!(
-            "tool '{}' not found; valid options: claude-code, cursor, codex, windsurf, jetbrains, vscode",
+            "tool '{}' not found; valid options: claude-code, cursor, codex, windsurf, jetbrains, vscode, gemini, copilot, aider, kiro, continue, cline, opencode, trae, devin, hermes",
             specific
         );
     }
@@ -88,6 +98,46 @@ fn detect_tools() -> Vec<ToolSetup> {
         ToolSetup {
             name: "vscode",
             detected: Path::new(".vscode").exists(),
+        },
+        ToolSetup {
+            name: "gemini",
+            detected: Path::new(".gemini").exists() || which_exists("gemini"),
+        },
+        ToolSetup {
+            name: "copilot",
+            detected: Path::new(".github").exists() || which_exists("gh"),
+        },
+        ToolSetup {
+            name: "aider",
+            detected: Path::new(".aider.conf.yml").exists() || which_exists("aider"),
+        },
+        ToolSetup {
+            name: "kiro",
+            detected: Path::new(".kiro").exists() || which_exists("kiro"),
+        },
+        ToolSetup {
+            name: "continue",
+            detected: Path::new(".continue").exists(),
+        },
+        ToolSetup {
+            name: "cline",
+            detected: Path::new(".cline").exists(),
+        },
+        ToolSetup {
+            name: "opencode",
+            detected: Path::new(".opencode").exists() || which_exists("opencode"),
+        },
+        ToolSetup {
+            name: "trae",
+            detected: Path::new(".trae").exists(),
+        },
+        ToolSetup {
+            name: "devin",
+            detected: Path::new("devin.json").exists() || which_exists("devin"),
+        },
+        ToolSetup {
+            name: "hermes",
+            detected: Path::new(".hermes").exists() || which_exists("hermes"),
         },
     ]
 }
@@ -278,6 +328,274 @@ fn setup_vscode(db_path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn setup_gemini(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".gemini")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(
+        Path::new(".gemini/settings.json"),
+        "nestweaver",
+        &mcp_config,
+    )?;
+
+    print_result(
+        "Gemini CLI",
+        &[(
+            ".gemini/settings.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_copilot(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".github")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(
+        Path::new(".github/copilot-mcp.json"),
+        "nestweaver",
+        &mcp_config,
+    )?;
+
+    let instructions_path = Path::new(".github/copilot-instructions.md");
+    let instructions_status = if instructions_path.exists() {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(instructions_path, generate_copilot_instructions())?;
+        "instructions written"
+    };
+
+    print_result(
+        "GitHub Copilot",
+        &[
+            (
+                ".github/copilot-mcp.json",
+                if merged {
+                    "MCP server configured"
+                } else {
+                    "already configured"
+                },
+            ),
+            (".github/copilot-instructions.md", instructions_status),
+        ],
+    );
+    Ok(())
+}
+
+fn setup_aider(db_path: &Path) -> Result<(), anyhow::Error> {
+    let db_str = db_path.to_string_lossy();
+    let config_path = Path::new(".aider.conf.yml");
+    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
+    let merged = if existing.contains("nestweaver") {
+        false
+    } else {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(config_path)?;
+        file.write_all(
+            format!(
+                "\n# NestWeaver code intelligence\nrepo-map: nestweaver mcp --db {}\n",
+                db_str
+            )
+            .as_bytes(),
+        )?;
+        true
+    };
+
+    print_result(
+        "Aider",
+        &[(
+            ".aider.conf.yml",
+            if merged {
+                "repo-map reference configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_kiro(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".kiro")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(Path::new(".kiro/settings.json"), "nestweaver", &mcp_config)?;
+
+    print_result(
+        "Kiro",
+        &[(
+            ".kiro/settings.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_continue(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".continue")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(
+        Path::new(".continue/config.json"),
+        "nestweaver",
+        &mcp_config,
+    )?;
+
+    print_result(
+        "Continue.dev",
+        &[(
+            ".continue/config.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_cline(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".cline")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(Path::new(".cline/settings.json"), "nestweaver", &mcp_config)?;
+
+    print_result(
+        "Cline",
+        &[(
+            ".cline/settings.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_opencode(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".opencode")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(
+        Path::new(".opencode/config.json"),
+        "nestweaver",
+        &mcp_config,
+    )?;
+
+    print_result(
+        "OpenCode",
+        &[(
+            ".opencode/config.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_trae(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".trae")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(Path::new(".trae/config.json"), "nestweaver", &mcp_config)?;
+
+    print_result(
+        "Trae",
+        &[(
+            ".trae/config.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_devin(db_path: &Path) -> Result<(), anyhow::Error> {
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(Path::new("devin.json"), "nestweaver", &mcp_config)?;
+
+    print_result(
+        "Devin",
+        &[(
+            "devin.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
+fn setup_hermes(db_path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(".hermes")?;
+    let db_str = db_path.to_string_lossy();
+    let mcp_config = serde_json::json!({
+        "command": "nestweaver",
+        "args": ["mcp", "--db", db_str.as_ref()]
+    });
+    let merged = merge_json_mcp(Path::new(".hermes/config.json"), "nestweaver", &mcp_config)?;
+
+    print_result(
+        "Hermes",
+        &[(
+            ".hermes/config.json",
+            if merged {
+                "MCP server configured"
+            } else {
+                "already configured"
+            },
+        )],
+    );
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Merge an MCP server entry into a JSON config file under the `mcpServers` key.
@@ -440,6 +758,24 @@ When working on a named project, use `project_context`.\n\n\
 After making changes, use `detect_changes` to assess risk.\n".to_string()
 }
 
+fn generate_copilot_instructions() -> String {
+    "# Copilot Instructions — NestWeaver\n\n\
+    > Auto-generated by NestWeaver. Provides codebase intelligence via MCP.\n\n\
+    ## Available MCP Tools\n\n\
+    Use the NestWeaver MCP server for code intelligence:\n\n\
+    - **brain_context** — PPR-ranked context for a task\n\
+    - **brain_search** — Full-text search across code and notes\n\
+    - **brain_impact** — Blast radius analysis before changes\n\
+    - **brain_guide** — Architecture overview\n\
+    - **project_context** — Project-scoped retrieval\n\
+    - **detect_changes** — Risk assessment for changes\n\n\
+    ## When to Use\n\n\
+    - Starting a task: call `brain_context` with task keywords\n\
+    - Before modifying code: call `brain_impact` on the function\n\
+    - Exploring unfamiliar code: call `brain_search`\n"
+        .to_string()
+}
+
 fn generate_agents_md_content() -> String {
     "# AGENTS.md — Codebase Intelligence Guide\n\n\
 > Auto-generated by NestWeaver. This file helps AI agents understand the codebase structure.\n\
@@ -484,6 +820,16 @@ fn format_name(name: &str) -> &str {
         "windsurf" => "Windsurf",
         "jetbrains" => "JetBrains",
         "vscode" => "VS Code",
+        "gemini" => "Gemini CLI",
+        "copilot" => "GitHub Copilot",
+        "aider" => "Aider",
+        "kiro" => "Kiro",
+        "continue" => "Continue.dev",
+        "cline" => "Cline",
+        "opencode" => "OpenCode",
+        "trae" => "Trae",
+        "devin" => "Devin",
+        "hermes" => "Hermes",
         _ => name,
     }
 }
