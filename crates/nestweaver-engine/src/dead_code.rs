@@ -390,6 +390,109 @@ mod tests {
     }
 
     #[test]
+    fn imports_chain_reaches_transitive_deps_and_detects_dead_private() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // Build a realistic multi-module graph:
+        //   entry (entry point) --IMPORTS--> moduleB_pub
+        //   moduleB_pub --CALLS--> moduleC_util
+        //   moduleC_dead (private, no incoming edges) <- truly dead
+        let mut entry = make_symbol("entry", "App", true);
+        entry.file_path = "src/app.tsx".to_string();
+        store.insert_symbol(&entry).unwrap();
+
+        let mut module_b = make_symbol("moduleB_pub", "formatDate", false);
+        module_b.file_path = "src/utils/date.ts".to_string();
+        store.insert_symbol(&module_b).unwrap();
+
+        let mut module_c = make_symbol("moduleC_util", "parseISO", false);
+        module_c.file_path = "src/utils/parse.ts".to_string();
+        store.insert_symbol(&module_c).unwrap();
+
+        let mut dead_fn = make_symbol("moduleC_dead", "_unusedHelper", false);
+        dead_fn.file_path = "src/utils/parse.ts".to_string();
+        dead_fn.visibility = Visibility::Private;
+        store.insert_symbol(&dead_fn).unwrap();
+
+        // entry --IMPORTS--> moduleB_pub
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "moduleB_pub".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        // moduleB_pub --CALLS--> moduleC_util
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "moduleB_pub".to_string(),
+                target_uid: "moduleC_util".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+
+        // entry, moduleB_pub, moduleC_util should all be reachable
+        assert_eq!(result.total_symbols, 4);
+        assert_eq!(result.reachable_symbols, 3);
+
+        // Only the private unused helper is dead
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "_unusedHelper");
+        assert_eq!(
+            result.unreachable_symbols[0].confidence,
+            DeadCodeConfidence::High
+        );
+    }
+
+    #[test]
+    fn member_of_reverse_traversal_reaches_class_members() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --IMPORTS--> MyClass
+        // method --MEMBER_OF--> MyClass  (BFS should reverse this to reach method)
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("cls", "MyClass", false))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("method", "doWork", false))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "method".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::MemberOf,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.total_symbols, 3);
+        assert_eq!(result.reachable_symbols, 3);
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    #[test]
     fn confidence_scoring_private_names() {
         // Leading underscore -> High
         assert_eq!(
