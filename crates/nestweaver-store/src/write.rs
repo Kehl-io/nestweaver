@@ -1133,6 +1133,81 @@ impl GraphStore {
         Ok(())
     }
 
+    // ── Upsert helpers (delete-then-create) ──────────────────────────────
+    //
+    // LadybugDB/Kuzu doesn't support MERGE or SET for most node types.
+    // The established pattern (see `update_repo_sha`) is: read → DETACH
+    // DELETE → re-CREATE. These helpers formalize this for node types
+    // that need idempotent re-insertion (e.g. project materialization).
+
+    /// Upsert a Note node. Deletes the existing Note (cascading headings,
+    /// sections, and all incident edges) then re-inserts it.
+    pub fn upsert_note(&self, note: &Note) -> Result<(), StoreError> {
+        // delete_note_cascade is a no-op when the UID does not exist.
+        self.delete_note_cascade(&note.uid)?;
+        self.insert_note(note)
+    }
+
+    /// Upsert a Project node. DETACH DELETEs any existing node with the
+    /// same UID (removing all incident edges) then re-creates it.
+    pub fn upsert_project(&self, project: &Project) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+            vec![("uid", lbug::Value::String(project.uid.clone()))],
+        )?;
+        self.insert_project(project)
+    }
+
+    /// Upsert a batch of sections. For each section, deletes it by UID
+    /// (DETACH DELETE to remove incident edges) then re-inserts.
+    pub fn batch_upsert_sections(&self, sections: &[Section]) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+
+        // Delete existing sections.
+        let mut del_stmt = conn
+            .prepare("MATCH (s:Section {uid: $uid}) DETACH DELETE s")
+            .map_err(|e| StoreError::Query(format!("prepare delete: {e}")))?;
+        for s in sections {
+            conn.execute(
+                &mut del_stmt,
+                vec![("uid", lbug::Value::String(s.uid.clone()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute delete: {e}")))?;
+        }
+
+        // Re-insert.
+        let mut ins_stmt = conn
+            .prepare(
+                "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
+                 start_line: $sl, end_line: $el, text_hash: $th, text_content: $tc, \
+                 word_count: $wc, pagerank_score: $pr})",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare insert: {e}")))?;
+        for s in sections {
+            conn.execute(
+                &mut ins_stmt,
+                vec![
+                    ("uid", lbug::Value::String(s.uid.clone())),
+                    ("nid", lbug::Value::String(s.note_uid.clone())),
+                    (
+                        "hid",
+                        lbug::Value::String(s.heading_uid.clone().unwrap_or_default()),
+                    ),
+                    ("sl", lbug::Value::Int64(s.start_line as i64)),
+                    ("el", lbug::Value::Int64(s.end_line as i64)),
+                    ("th", lbug::Value::String(s.text_hash.clone())),
+                    ("tc", lbug::Value::String(s.text_content.clone())),
+                    ("wc", lbug::Value::Int64(s.word_count as i64)),
+                    ("pr", lbug::Value::Double(s.pagerank_score.unwrap_or(0.0))),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute insert: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Delete a Note and everything that belongs to it: all Headings, all
     /// Sections, and every edge involving any of those nodes (both
     /// containment and cross-reference).

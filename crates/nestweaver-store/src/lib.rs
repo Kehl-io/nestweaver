@@ -686,6 +686,163 @@ mod tests {
             .unwrap();
     }
 
+    // ── Upsert idempotency tests ─────────────────────────────────────
+
+    #[test]
+    fn upsert_project_is_idempotent() {
+        use nestweaver_schema::Project;
+        let store = test_store();
+
+        let project = Project {
+            uid: "proj:test:1".to_string(),
+            name: "TestProject".to_string(),
+            summary: Some("first pass".to_string()),
+            instance_id: "inst-1".to_string(),
+        };
+
+        // First insert.
+        store.upsert_project(&project).unwrap();
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].summary.as_deref(), Some("first pass"));
+
+        // Second upsert with updated summary — should replace, not error.
+        let project_v2 = Project {
+            uid: "proj:test:1".to_string(),
+            name: "TestProject".to_string(),
+            summary: Some("second pass".to_string()),
+            instance_id: "inst-1".to_string(),
+        };
+        store.upsert_project(&project_v2).unwrap();
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].summary.as_deref(), Some("second pass"));
+    }
+
+    #[test]
+    fn upsert_note_is_idempotent() {
+        use nestweaver_schema::{Note, NoteKind, Section};
+        let store = test_store();
+
+        let note = Note {
+            uid: "note:up:1".to_string(),
+            vault_uid: "vlt:up".to_string(),
+            file_path: "up.md".to_string(),
+            title: "Upsert".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 10,
+            content_hash: "h1".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+
+        // First insert.
+        store.upsert_note(&note).unwrap();
+        assert_eq!(store.count_notes().unwrap(), 1);
+
+        // Add a child section so the cascade has something to clean up.
+        store
+            .insert_section(&Section {
+                uid: "sec:up:1:abc".to_string(),
+                note_uid: "note:up:1".to_string(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 3,
+                text_hash: "th1".to_string(),
+                text_content: "hello".to_string(),
+                word_count: 1,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[("note:up:1", "sec:up:1:abc")])
+            .unwrap();
+        assert_eq!(store.count_sections().unwrap(), 1);
+
+        // Second upsert — should cascade-delete the old note + section, then
+        // re-insert the note. No duplicate-PK error.
+        let note_v2 = Note {
+            uid: "note:up:1".to_string(),
+            vault_uid: "vlt:up".to_string(),
+            file_path: "up.md".to_string(),
+            title: "Upsert v2".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 20,
+            content_hash: "h2".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.upsert_note(&note_v2).unwrap();
+
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Upsert v2");
+        assert_eq!(notes[0].word_count, 20);
+        // Old section was cascade-deleted.
+        assert_eq!(store.count_sections().unwrap(), 0);
+    }
+
+    #[test]
+    fn batch_upsert_sections_is_idempotent() {
+        use nestweaver_schema::{Note, NoteKind, Section};
+        let store = test_store();
+
+        store
+            .insert_note(&Note {
+                uid: "note:bus:1".to_string(),
+                vault_uid: "vlt:bus".to_string(),
+                file_path: "bus.md".to_string(),
+                title: "Bus".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let sections = vec![Section {
+            uid: "sec:bus:1:xyz".to_string(),
+            note_uid: "note:bus:1".to_string(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 5,
+            text_hash: "t1".to_string(),
+            text_content: "first".to_string(),
+            word_count: 1,
+            pagerank_score: None,
+        }];
+
+        store.batch_upsert_sections(&sections).unwrap();
+        assert_eq!(store.count_sections().unwrap(), 1);
+
+        // Upsert again with different content.
+        let sections_v2 = vec![Section {
+            uid: "sec:bus:1:xyz".to_string(),
+            note_uid: "note:bus:1".to_string(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 5,
+            text_hash: "t2".to_string(),
+            text_content: "second".to_string(),
+            word_count: 1,
+            pagerank_score: None,
+        }];
+
+        store.batch_upsert_sections(&sections_v2).unwrap();
+        assert_eq!(store.count_sections().unwrap(), 1);
+
+        let secs = store.sections_in_note("note:bus:1").unwrap();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].text_content, "second");
+    }
+
     #[test]
     fn batch_insert_edges_works() {
         let store = test_store();
