@@ -1,0 +1,31 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.astro\", &source)"
+---
+- name: simple
+  kind: Class
+  start_line: 1
+  signature: "<astro:component name=\"simple\">"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: getStaticPaths
+  kind: Function
+  start_line: 5
+  signature: "export function getStaticPaths() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: formatTitle
+  kind: Function
+  start_line: 12
+  signature: "function formatTitle(title) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

@@ -141,8 +141,12 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Private
             }
         }
-        // JavaScript/TypeScript: export keyword = public
-        Language::JavaScript | Language::TypeScript => {
+        // JavaScript/TypeScript/Vue/Svelte/Astro: export keyword = public
+        Language::JavaScript
+        | Language::TypeScript
+        | Language::Vue
+        | Language::Svelte
+        | Language::Astro => {
             let sig = first_line(node_text);
             if sig.contains("export ") {
                 Visibility::Public
@@ -215,7 +219,7 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
             }
         }
         // Objective-C, Groovy, PowerShell: handled in their regex parsers
-        // Ruby, Cobol, and other regex-parsed languages: inferred
+        // Ruby, Cobol, SystemVerilog, and other regex-parsed languages: inferred
         Language::Ruby
         | Language::Cobol
         | Language::ObjectiveC
@@ -225,7 +229,8 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         | Language::Sql
         | Language::Hcl
         | Language::Fortran
-        | Language::Pascal => Visibility::Inferred,
+        | Language::Pascal
+        | Language::SystemVerilog => Visibility::Inferred,
     }
 }
 
@@ -258,7 +263,11 @@ fn build_ts_language(lang: Language) -> tree_sitter::Language {
         | Language::Sql
         | Language::Hcl
         | Language::Fortran
-        | Language::Pascal => {
+        | Language::Pascal
+        | Language::Vue
+        | Language::Svelte
+        | Language::Astro
+        | Language::SystemVerilog => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     }
@@ -293,7 +302,11 @@ fn query_source(lang: Language) -> &'static str {
         | Language::Sql
         | Language::Hcl
         | Language::Fortran
-        | Language::Pascal => {
+        | Language::Pascal
+        | Language::Vue
+        | Language::Svelte
+        | Language::Astro
+        | Language::SystemVerilog => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     }
@@ -471,6 +484,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     if lang == Language::PowerShell {
         return Ok(crate::powershell::parse_powershell(path, source));
     }
+    if lang == Language::Vue {
+        return Ok(crate::vue::parse_vue(path, source));
+    }
+    if lang == Language::Svelte {
+        return Ok(crate::svelte::parse_svelte(path, source));
+    }
+    if lang == Language::Astro {
+        return Ok(crate::astro::parse_astro(path, source));
+    }
+    if lang == Language::SystemVerilog {
+        return Ok(crate::systemverilog::parse_systemverilog(path, source));
+    }
 
     let ts_lang = build_ts_language(lang);
 
@@ -516,7 +541,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         | Language::Sql
         | Language::Hcl
         | Language::Fortran
-        | Language::Pascal => {
+        | Language::Pascal
+        | Language::Vue
+        | Language::Svelte
+        | Language::Astro
+        | Language::SystemVerilog => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -1929,6 +1958,412 @@ mod tests {
             public_fn.unwrap().visibility,
             Visibility::Inferred,
             "'standalone_function' has no underscore prefix so should be Inferred"
+        );
+    }
+
+    // ── Vue tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_vue_extracts_component() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "simple"),
+            "should find component 'simple'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_vue_extracts_exported_function() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "formatName"),
+            "should find exported function 'formatName'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_vue_extracts_import_references() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "vue"),
+            "should find import 'vue'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "./utils/helper"),
+            "should find import './utils/helper'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_vue_extracts_call_references() {
+        let source = fixture("vue/simple.vue");
+        let parsed = parse_source(Path::new("simple.vue"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "should find call references; all refs: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Svelte tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_svelte_extracts_component() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "simple"),
+            "should find component 'simple'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_svelte_extracts_exported_function() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "greet"),
+            "should find exported function 'greet'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_svelte_extracts_private_function() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+
+        let handle_click = parsed.symbols.iter().find(|s| s.name == "handleClick");
+        assert!(handle_click.is_some(), "should find function 'handleClick'");
+        assert_eq!(
+            handle_click.unwrap().visibility,
+            Visibility::Private,
+            "'handleClick' is not exported so should be Private"
+        );
+    }
+
+    #[test]
+    fn parse_svelte_extracts_import_references() {
+        let source = fixture("svelte/simple.svelte");
+        let parsed = parse_source(Path::new("simple.svelte"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "svelte"),
+            "should find import 'svelte'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "./Counter.svelte"),
+            "should find import './Counter.svelte'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Astro tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_astro_extracts_component() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "simple"),
+            "should find component 'simple'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_astro_extracts_exported_function() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "getStaticPaths"),
+            "should find exported function 'getStaticPaths'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_astro_extracts_private_function() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+
+        let format_title = parsed.symbols.iter().find(|s| s.name == "formatTitle");
+        assert!(format_title.is_some(), "should find function 'formatTitle'");
+        assert_eq!(
+            format_title.unwrap().visibility,
+            Visibility::Private,
+            "'formatTitle' is not exported so should be Private"
+        );
+    }
+
+    #[test]
+    fn parse_astro_extracts_import_references() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "../layouts/Layout.astro"),
+            "should find import '../layouts/Layout.astro'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "../components/Card.astro"),
+            "should find import '../components/Card.astro'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_astro_extracts_call_references() {
+        let source = fixture("astro/simple.astro");
+        let parsed = parse_source(Path::new("simple.astro"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name == "formatTitle"),
+            "should find call to 'formatTitle'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── SystemVerilog tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_sv_extracts_modules() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "top_module"),
+            "should find module 'top_module'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            modules.iter().any(|s| s.name == "sub_module"),
+            "should find module 'sub_module'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_interface() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let interfaces: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "axi_if"),
+            "should find interface 'axi_if'; got: {:?}",
+            interfaces.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_class() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "packet"),
+            "should find class 'packet'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_functions_and_tasks() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        // Methods inside class
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "build"),
+            "should find method 'build' inside class; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            methods.iter().any(|s| s.name == "send"),
+            "should find task 'send' as method inside class; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // Top-level function
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "compute_checksum"),
+            "should find top-level function 'compute_checksum'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_import_references() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "uvm_pkg"),
+            "should find import 'uvm_pkg'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "bus_pkg"),
+            "should find import 'bus_pkg'; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_include_references() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let includes: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Includes)
+            .collect();
+        assert!(
+            includes.iter().any(|r| r.name == "common_defs.svh"),
+            "should find include 'common_defs.svh'; got: {:?}",
+            includes.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_extends_reference() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let extends: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Extends)
+            .collect();
+        assert!(
+            extends.iter().any(|r| r.name == "base_packet"),
+            "should find extends 'base_packet'; got: {:?}",
+            extends.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sv_extracts_instantiation_references() {
+        let source = fixture("systemverilog/simple.sv");
+        let parsed = parse_source(Path::new("simple.sv"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name == "sub_module"),
+            "should find instantiation of 'sub_module'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
 
@@ -3433,6 +3868,62 @@ mod tests {
         fn snapshot_pascal_references() {
             let source = fixture("pascal/simple.pas");
             assert_yaml_snapshot!(parsed_references("simple.pas", &source));
+        }
+
+        // ── Vue ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_vue_symbols() {
+            let source = fixture("vue/simple.vue");
+            assert_yaml_snapshot!(parsed_symbols("simple.vue", &source));
+        }
+
+        #[test]
+        fn snapshot_vue_references() {
+            let source = fixture("vue/simple.vue");
+            assert_yaml_snapshot!(parsed_references("simple.vue", &source));
+        }
+
+        // ── Svelte ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_svelte_symbols() {
+            let source = fixture("svelte/simple.svelte");
+            assert_yaml_snapshot!(parsed_symbols("simple.svelte", &source));
+        }
+
+        #[test]
+        fn snapshot_svelte_references() {
+            let source = fixture("svelte/simple.svelte");
+            assert_yaml_snapshot!(parsed_references("simple.svelte", &source));
+        }
+
+        // ── Astro ───────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_astro_symbols() {
+            let source = fixture("astro/simple.astro");
+            assert_yaml_snapshot!(parsed_symbols("simple.astro", &source));
+        }
+
+        #[test]
+        fn snapshot_astro_references() {
+            let source = fixture("astro/simple.astro");
+            assert_yaml_snapshot!(parsed_references("simple.astro", &source));
+        }
+
+        // ── SystemVerilog ───────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_sv_symbols() {
+            let source = fixture("systemverilog/simple.sv");
+            assert_yaml_snapshot!(parsed_symbols("simple.sv", &source));
+        }
+
+        #[test]
+        fn snapshot_sv_references() {
+            let source = fixture("systemverilog/simple.sv");
+            assert_yaml_snapshot!(parsed_references("simple.sv", &source));
         }
     }
 }

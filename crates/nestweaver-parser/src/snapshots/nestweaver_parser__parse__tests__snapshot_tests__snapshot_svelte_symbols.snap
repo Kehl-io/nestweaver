@@ -1,0 +1,40 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.svelte\", &source)"
+---
+- name: simple
+  kind: Class
+  start_line: 1
+  signature: "<svelte:component name=\"simple\">"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Function
+  start_line: 5
+  signature: "export function greet(name) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: count
+  kind: Function
+  start_line: 9
+  signature: export let count = 0
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: handleClick
+  kind: Function
+  start_line: 11
+  signature: "function handleClick() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

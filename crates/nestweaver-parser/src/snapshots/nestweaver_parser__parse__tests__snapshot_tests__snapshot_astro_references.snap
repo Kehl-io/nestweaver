@@ -1,0 +1,32 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_references(\"simple.astro\", &source)"
+---
+- name: "../layouts/Layout.astro"
+  kind: Import
+  start_line: 2
+  context: "import Layout from '../layouts/Layout.astro'"
+- name: "../components/Card.astro"
+  kind: Import
+  start_line: 3
+  context: "import Card from '../components/Card.astro'"
+- name: getStaticPaths
+  kind: Call
+  start_line: 5
+  context: "export function getStaticPaths() {"
+- name: formatTitle
+  kind: Call
+  start_line: 12
+  context: "function formatTitle(title) {"
+- name: toUpperCase
+  kind: Call
+  start_line: 13
+  context: return title.toUpperCase()
+- name: formatTitle
+  kind: Call
+  start_line: 16
+  context: "const pageTitle = formatTitle('Welcome')"
+- name: fetchItems
+  kind: Call
+  start_line: 17
+  context: const items = await fetchItems()

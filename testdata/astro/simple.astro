@@ -1,0 +1,34 @@
+---
+import Layout from '../layouts/Layout.astro'
+import Card from '../components/Card.astro'
+
+export function getStaticPaths() {
+  return [
+    { params: { id: '1' } },
+    { params: { id: '2' } },
+  ]
+}
+
+function formatTitle(title) {
+  return title.toUpperCase()
+}
+
+const pageTitle = formatTitle('Welcome')
+const items = await fetchItems()
+---
+
+<Layout title={pageTitle}>
+  <main>
+    <h1>{pageTitle}</h1>
+    {items.map((item) => (
+      <Card title={item.name} />
+    ))}
+  </main>
+</Layout>
+
+<style>
+  main {
+    margin: auto;
+    padding: 1rem;
+  }
+</style>

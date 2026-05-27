@@ -1,0 +1,22 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.vue\", &source)"
+---
+- name: formatName
+  kind: Function
+  start_line: 12
+  signature: "export function formatName(name) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: simple
+  kind: Class
+  start_line: 16
+  signature: "export default defineComponent({"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

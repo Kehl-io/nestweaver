@@ -141,7 +141,11 @@ fn resolve_specifier(
         | Language::Sql
         | Language::Hcl
         | Language::Fortran
-        | Language::Pascal => None,
+        | Language::Pascal
+        | Language::SystemVerilog => None,
+        Language::Vue | Language::Svelte | Language::Astro => {
+            lang::javascript::resolve_import(from_file, specifier, known_files)
+        }
     }
 }
 
