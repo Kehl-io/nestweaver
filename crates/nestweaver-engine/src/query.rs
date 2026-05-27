@@ -607,7 +607,7 @@ pub fn build_brain_context(
     store: &GraphStore,
     inputs: &[String],
 ) -> Result<BrainContextResult, anyhow::Error> {
-    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default())
+    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default(), None)
 }
 
 /// Hybrid PPR + BM25 retrieval.
@@ -627,6 +627,7 @@ pub fn build_brain_context_hybrid(
     inputs: &[String],
     tantivy: Option<&TantivyIndex>,
     config: &HybridSearchConfig,
+    intent: Option<QueryIntent>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     build_brain_context_hybrid_with_aliases(
         store,
@@ -635,6 +636,7 @@ pub fn build_brain_context_hybrid(
         config,
         &std::collections::HashMap::new(),
         None,
+        intent,
     )
 }
 
@@ -646,6 +648,9 @@ pub fn build_brain_context_hybrid(
 /// canonical name is tried in its place. This allows users to write natural-
 /// language seeds (e.g. `"Auth"`) even when the note is titled
 /// `"Authentication Service"`.
+///
+/// The optional `intent` parameter tunes PPR's damping factor and edge
+/// weights. When `None`, the standard damping (0.85) is used.
 pub fn build_brain_context_hybrid_with_aliases(
     store: &GraphStore,
     inputs: &[String],
@@ -653,6 +658,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     config: &HybridSearchConfig,
     aliases: &std::collections::HashMap<String, Vec<String>>,
     db_path: Option<&std::path::Path>,
+    intent: Option<QueryIntent>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -824,9 +830,10 @@ pub fn build_brain_context_hybrid_with_aliases(
         );
     }
 
-    // Run unified PPR.
+    // Run unified PPR with optional intent tuning.
+    let damping = intent.map_or(0.85, |i| i.damping());
     let ppr = store
-        .personalized_pagerank(&seed_uids, 0.85, 20, &GraphScope::unified())
+        .personalized_pagerank_with_intent(&seed_uids, damping, 20, &GraphScope::unified(), intent)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // ── Hybrid retrieval: fuse PPR + BM25 via Reciprocal Rank Fusion ───
