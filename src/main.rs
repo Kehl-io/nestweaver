@@ -8,13 +8,14 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
-    BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
-    LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    compute_clusters, discover_cross_domain_links, embedding::generate_embedding,
-    generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map, generate_skill,
-    incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
-    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
-    lookup_symbol, save_clusters, search_symbols, suggest_links,
+    BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, FeatureContextResult,
+    HybridSearchConfig, LookupResult, build_brain_context_hybrid_with_aliases, build_context,
+    build_feature_context, compute_clusters, discover_cross_domain_links,
+    embedding::generate_embedding, generate_agents_md, generate_cursor_rule, generate_guide,
+    generate_repo_map, generate_skill, incremental_index, index_directory,
+    index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
+    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
+    search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -666,6 +667,26 @@ enum Commands {
     Completions {
         /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
         shell: clap_complete::Shell,
+    },
+
+    /// Watch a repository for source file changes and re-index incrementally
+    ///
+    /// Monitors the repo directory for creates, modifies, and deletes of
+    /// supported source files. Changes are debounced into 2-second windows
+    /// and each batch triggers an incremental re-index. Ctrl-C stops cleanly.
+    #[command(
+        after_help = "Examples:\n  nestweaver watch\n  nestweaver watch --repo ./my-project\n  nestweaver watch --repo ./my-project --db ./custom.lbug"
+    )]
+    Watch {
+        #[arg(long, help = "Path to the local repository to watch")]
+        repo: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Instance ID (for multi-instance setups)")]
+        instance: Option<String>,
     },
 }
 
@@ -1740,6 +1761,46 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Watch { repo, db, instance } => {
+            let repo_path = match repo {
+                Some(p) => p,
+                None => detect_repo_root(),
+            };
+            if !repo_path.exists() || !repo_path.is_dir() {
+                eprintln!(
+                    "Error: repo path is not a directory: {}",
+                    repo_path.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
+            let db_path = resolve_index_db_path(db, &repo_path);
+            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+
+            let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
+            let stop = watcher.shutdown_handle();
+
+            let lock_path = {
+                let mut s = db_path.as_os_str().to_owned();
+                s.push(".lock");
+                PathBuf::from(s)
+            };
+            let _ = std::fs::write(&lock_path, process::id().to_string());
+
+            let stop_signal = stop.clone();
+            let _ = ctrlc_handler(move || stop_signal.stop());
+
+            eprintln!(
+                "Watching {} -> {} (Ctrl-C to stop)",
+                repo_path.display(),
+                db_path.display()
+            );
+            watcher.run().context("code watcher")?;
+
+            let _ = std::fs::remove_file(&lock_path);
+            eprintln!("Watcher stopped.");
             Ok((EXIT_SUCCESS, None))
         }
 
