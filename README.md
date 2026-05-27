@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  NestWeaver parses 16 languages, resolves cross-file references with confidence scoring,<br>
+  NestWeaver parses 32 languages, resolves cross-file references with confidence scoring,<br>
   and gives agents precomputed answers about symbols, dependencies, and call graphs —<br>
   no source reading required.
 </p>
@@ -37,8 +37,8 @@
 <tr>
 <td width="50%" valign="top">
 
-**16 Languages**<br>
-Tree-sitter parsing for JavaScript, TypeScript, Go, Python, Rust, Java, C/C++, and 8 more.
+**32 Languages**<br>
+Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more.
 
 </td>
 <td width="50%" valign="top">
@@ -51,28 +51,28 @@ Index Obsidian vaults alongside code. Unified knowledge graph across notes and s
 <tr>
 <td width="50%" valign="top">
 
-**Task-Focused Context**<br>
-Personalized PageRank surfaces only the symbols relevant to your current work.
+**Intent-Aware Context**<br>
+Personalized PageRank with `--intent` tuning surfaces exactly the symbols relevant to your task.
 
 </td>
 <td width="50%" valign="top">
 
-**MCP Server**<br>
-17 tools for AI agents via the Model Context Protocol. Drop-in for any MCP client.
+**22-Tool MCP Server**<br>
+Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor.
 
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
 
-**Blast-Radius Analysis**<br>
-Trace the impact of a change through the full dependency graph before you ship.
+**PR Impact & Dead Code**<br>
+PR blast radius with risk scoring, dead code detection, hub/bridge analysis, and graph export.
 
 </td>
 <td width="50%" valign="top">
 
-**Interactive Web UI**<br>
-Graph visualization with force physics, community detection, and semantic zoom.
+**16 AI Tool Integrations**<br>
+One-command setup for Claude Code, Cursor, Codex, Gemini CLI, Copilot CLI, Aider, Kiro, and more.
 
 </td>
 </tr>
@@ -84,15 +84,18 @@ Graph visualization with force physics, community detection, and semantic zoom.
 # Install (requires Rust 1.85+)
 cargo install --path .
 
-# Index a repository
-nestweaver index --repo ./my-project
+# Index a repository (auto-detects repo root from .git)
+nestweaver index
 
 # Get task-focused context for a symbol
 nestweaver context processPayment
+
+# Live re-indexing as you code
+nestweaver watch
 ```
 
 ```sh
-# Configure for your AI tool (Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code)
+# Configure for your AI tool (16 supported: Claude Code, Cursor, Codex, Gemini CLI, and more)
 nestweaver setup
 ```
 
@@ -134,12 +137,14 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository into the graph database |
-| `context` | Get task-focused context for a symbol or file via Personalized PageRank |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`) |
+| `watch` | Live re-indexing via filesystem watcher with debouncing |
+| `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
 | `impact` | Trace the blast radius of a symbol through the dependency graph |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
+| `summary` | Hierarchical code summaries at symbol, file, or cluster level |
 
 </details>
 
@@ -155,6 +160,19 @@ cargo build --release
 | `brain status` | Show vault counts, per-vault staleness, and index health |
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
+
+</details>
+
+<details>
+<summary>Analysis Commands</summary>
+
+| Command | Description |
+|---------|-------------|
+| `hubs` | Find most connected hub nodes (degree centrality + PageRank) |
+| `bridges` | Find architectural chokepoints (betweenness centrality) |
+| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
+| `dead-code` | Detect unreachable symbols via entry point reachability |
+| `export` | Export the graph in Cypher, GraphML, or Mermaid format |
 
 </details>
 
@@ -178,9 +196,11 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server for AI agent integration |
+| `mcp` | Start the MCP server (22 tools, or 6 in lite mode) |
 | `ui` | Launch the interactive web UI |
-| `generate-guide` | Generate a guide document for the indexed codebase |
+| `setup` | Auto-detect and configure AI tools (16 supported) |
+| `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md) |
+| `completions` | Generate shell completions (bash, zsh, fish, powershell) |
 | `embed` | Generate vector embeddings for indexed symbols |
 | `pull` | Pull a snapshot from a remote storage backend |
 | `instance` | Manage instance configuration |
@@ -249,7 +269,7 @@ nestweaver context --feature device-pairing --config ./nestweaver-instance.toml 
 
 ## MCP Server
 
-NestWeaver exposes 17 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes 22 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
@@ -277,7 +297,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080
 | Crate | Description |
 |-------|-------------|
 | `nestweaver-schema` | Node/edge types, UIDs, confidence scoring, schema versioning |
-| `nestweaver-parser` | Tree-sitter + regex parsing for 16 languages |
+| `nestweaver-parser` | Tree-sitter + regex parsing for 32 languages |
 | `nestweaver-resolver` | Cross-file symbol resolution with import graphs |
 | `nestweaver-store` | LadybugDB graph store, PageRank, hybrid search |
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
