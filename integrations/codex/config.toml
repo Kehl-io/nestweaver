@@ -1,0 +1,3 @@
+[mcp_servers.nestweaver]
+command = "nestweaver"
+args = ["mcp", "--db", "./nestweaver.lbug"]
