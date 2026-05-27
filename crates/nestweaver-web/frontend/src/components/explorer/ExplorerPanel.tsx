@@ -15,7 +15,7 @@ export function ExplorerPanel() {
   const setExplorerTab = useStore((s) => s.setExplorerTab);
 
   return (
-    <div className="flex h-full flex-col border-r border-[var(--color-border)] bg-[var(--color-surface)]">
+    <div data-testid="explorer-panel" className="flex h-full flex-col border-r border-[var(--color-border)] bg-[var(--color-surface)]">
       <div className="flex border-b border-[var(--color-border)]">
         {tabs.map((t) => (
           <button
