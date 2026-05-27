@@ -442,11 +442,10 @@ enum Commands {
     /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, and VS Code,
     /// then writes the correct MCP server config and instruction files for each.
     #[command(
-        after_help = "Examples:\n  nestweaver setup\n  nestweaver setup --all\n  nestweaver setup --tool claude-code"
+        after_help = "Examples:\n  nestweaver setup\n  nestweaver setup --all\n  nestweaver setup claude-code"
     )]
     Setup {
         /// Configure a specific tool (claude-code, cursor, codex, windsurf, jetbrains, vscode)
-        #[arg(long)]
         tool: Option<String>,
         /// Force-configure all tools even if not detected
         #[arg(long)]

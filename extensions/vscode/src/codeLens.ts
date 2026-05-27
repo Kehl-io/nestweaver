@@ -3,12 +3,18 @@ import { NestWeaverApi } from './api';
 
 export class NestWeaverCodeLensProvider implements vscode.CodeLensProvider {
   private api: NestWeaverApi;
+  private cache = new Map<string, vscode.CodeLens[]>();
 
   constructor(api: NestWeaverApi) {
     this.api = api;
   }
 
-  async provideCodeLenses(document: vscode.TextDocument): Promise<vscode.CodeLens[]> {
+  async provideCodeLenses(document: vscode.TextDocument, token: vscode.CancellationToken): Promise<vscode.CodeLens[]> {
+    const key = `${document.uri.toString()}:${document.version}`;
+    if (this.cache.has(key)) {
+      return this.cache.get(key)!;
+    }
+
     const lenses: vscode.CodeLens[] = [];
     const text = document.getText();
 
@@ -20,8 +26,14 @@ export class NestWeaverCodeLensProvider implements vscode.CodeLensProvider {
     ];
 
     for (const pattern of patterns) {
+      if (token.isCancellationRequested) {
+        break;
+      }
       let match;
       while ((match = pattern.exec(text)) !== null) {
+        if (token.isCancellationRequested) {
+          break;
+        }
         const name = match[1];
         const pos = document.positionAt(match.index);
         const range = new vscode.Range(pos, pos);
@@ -43,6 +55,14 @@ export class NestWeaverCodeLensProvider implements vscode.CodeLensProvider {
       }
     }
 
+    this.cache.set(key, lenses);
+    // Evict old entries
+    if (this.cache.size > 50) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest) {
+        this.cache.delete(oldest);
+      }
+    }
     return lenses;
   }
 }

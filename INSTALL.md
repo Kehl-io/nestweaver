@@ -20,27 +20,12 @@ nestweaver --version
 
 ## Option 3: Pre-built binary
 
-### macOS (Apple Silicon)
-```bash
-curl -fsSL https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv nestweaver /usr/local/bin/
-```
+Download the latest release for your platform from
+[GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest).
 
-### macOS (Intel)
+Extract and install:
 ```bash
-curl -fsSL https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv nestweaver /usr/local/bin/
-```
-
-### Linux (x86_64)
-```bash
-curl -fsSL https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv nestweaver /usr/local/bin/
-```
-
-### Linux (ARM64)
-```bash
-curl -fsSL https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-aarch64-unknown-linux-gnu.tar.gz | tar xz
+tar xzf nestweaver-*.tar.gz
 sudo mv nestweaver /usr/local/bin/
 ```
 

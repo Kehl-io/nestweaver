@@ -9,7 +9,7 @@
     "SessionStart": [{
       "hooks": [{
         "type": "command",
-        "command": "nestweaver brain status --db ./nestweaver.lbug 2>/dev/null; echo '---'; nestweaver stale-check --db ./nestweaver.lbug 2>/dev/null"
+        "command": "nestweaver brain status --db ./nestweaver.lbug 2>/dev/null"
       }]
     }],
     "PreToolUse": [
