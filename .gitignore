@@ -39,6 +39,7 @@ Thumbs.db
 .playwright-cli/
 
 # Internal planning docs (not for release)
+_docs/
 docs/superpowers/
 docs/plans/
 docs/specs/
@@ -56,3 +57,8 @@ AGENTS.md
 *.extensions.json
 *.aliases.json
 *.tantivy/
+
+# Playwright
+crates/nestweaver-web/frontend/test-results/
+crates/nestweaver-web/frontend/playwright-report/
+crates/nestweaver-web/frontend/e2e/fixtures/*.lbug*
