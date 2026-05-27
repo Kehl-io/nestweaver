@@ -93,7 +93,7 @@ pub struct ParseResult {
 pub(crate) fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Extract the first line of a node's text as its signature.

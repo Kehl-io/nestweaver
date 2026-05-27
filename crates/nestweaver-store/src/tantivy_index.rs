@@ -224,7 +224,7 @@ impl TantivyIndex {
                     .map_err(|e| TantivyError::Tantivy(e.to_string()))?
             }
         };
-        let top = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
+        let top = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top.len());
         for (score, address) in top {
             let doc: TantivyDocument = searcher.doc(address)?;
