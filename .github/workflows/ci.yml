@@ -30,8 +30,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+      - name: Build first to trigger lbug prebuilt download
+        run: cargo build 2>&1 | tail -5
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -41,6 +45,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
       - name: Configure linker for lbug+tantivy zstd coexistence
