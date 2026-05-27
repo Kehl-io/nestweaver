@@ -34,8 +34,8 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
-      - name: Build first to trigger lbug prebuilt download
-        run: cargo build 2>&1 | tail -5
+      - name: Trigger lbug prebuilt download (first build may fail, second uses cached lib)
+        run: cargo build 2>&1 || cargo build
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -53,6 +53,6 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build to trigger lbug prebuilt download
-        run: cargo build --tests
+      - name: Trigger lbug prebuilt download (first build may fail, second uses cached lib)
+        run: cargo build --tests 2>&1 || cargo build --tests
       - run: cargo test --no-fail-fast
