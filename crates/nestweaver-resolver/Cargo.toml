@@ -11,3 +11,6 @@ nestweaver-schema = { workspace = true }
 nestweaver-parser = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
