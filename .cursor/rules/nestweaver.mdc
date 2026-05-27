@@ -1,0 +1,15 @@
+---
+description: Use NestWeaver for structural codebase understanding
+globs:
+alwaysApply: true
+---
+
+When exploring unfamiliar code, use the `brain_context` MCP tool with relevant symbol names as seeds.
+
+Before modifying functions with many callers, use `brain_impact` to check blast radius.
+
+For architecture questions, use `brain_guide`.
+
+When working on a named project, use `project_context`.
+
+After making changes, use `detect_changes` to assess risk.

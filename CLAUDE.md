@@ -40,8 +40,22 @@ nestweaver list-links --config ./nestweaver-instance.toml
 nestweaver list-features --config ./nestweaver-instance.toml
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
 
-# MCP server (17 tools)
+# Recency-aware retrieval
+nestweaver brain context "status" --since 2026-05-20T00:00:00Z       # only recent notes
+nestweaver brain context "project" --recency-weight 0.7               # boost recent content
+
+# Auto-setup for AI tools (Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code)
+nestweaver setup                                                      # auto-detect and configure all
+nestweaver setup claude-code                                           # configure specific tool
+
+# Generate tool-specific instruction files
+nestweaver generate-guide --format skill                              # Claude Code skill
+nestweaver generate-guide --format cursor-rule                        # Cursor .mdc rule
+nestweaver generate-guide --format agents-md                          # Codex AGENTS.md
+
+# MCP server (17 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
+nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080

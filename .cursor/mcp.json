@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "nestweaver": {
+      "args": [
+        "mcp",
+        "--lite",
+        "--db",
+        "./nestweaver.lbug"
+      ],
+      "command": "nestweaver"
+    }
+  }
+}
