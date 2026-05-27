@@ -20,7 +20,7 @@ fn cli_shows_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(contains("0.1.0"));
+        .stdout(contains("0.8.0"));
 }
 
 #[test]
