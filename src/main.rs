@@ -8,15 +8,16 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
-    BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, FeatureContextResult,
-    HybridSearchConfig, LookupResult, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    changed_files_from_git, compute_clusters, discover_cross_domain_links,
-    embedding::generate_embedding, find_bridge_nodes, find_hub_nodes, generate_agents_md,
-    generate_cursor_rule, generate_guide, generate_repo_map, generate_skill, incremental_index,
-    index_directory, index_markdown_directory, index_markdown_directory_since, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol,
-    save_clusters, search_symbols, suggest_links,
+    BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
+    FeatureContextResult, HybridSearchConfig, LookupResult, analyze_blast_radius,
+    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases, build_context,
+    build_feature_context, changed_files_from_git, compute_clusters, detect_dead_code,
+    discover_cross_domain_links, embedding::generate_embedding, export_cypher, export_graphml,
+    export_mermaid, find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule,
+    generate_guide, generate_repo_map, generate_skill, incremental_index, index_directory,
+    index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
+    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
+    search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -689,6 +690,60 @@ enum Commands {
         model: String,
         #[arg(long, default_value = "32", help = "Batch size for API calls")]
         batch_size: usize,
+    },
+
+    /// Detect potentially dead code via entry point reachability
+    ///
+    /// Walks forward from every entry point following CALLS, IMPORTS,
+    /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
+    /// are reported as potentially dead, with confidence scoring based
+    /// on visibility.
+    #[command(
+        after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
+    )]
+    DeadCode {
+        #[arg(
+            long,
+            default_value = "low",
+            help = "Minimum confidence to report (low, medium, high)"
+        )]
+        min_confidence: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// Export the code graph to an external format
+    ///
+    /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), and Mermaid flowchart
+    /// formats. Writes to stdout by default; use --output to write to a file.
+    #[command(
+        after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30"
+    )]
+    Export {
+        #[arg(
+            long,
+            default_value = "cypher",
+            help = "Output format: cypher, graphml, mermaid"
+        )]
+        format: String,
+        #[arg(long, help = "Write to file instead of stdout")]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "50",
+            help = "Number of top symbols for mermaid format (by PageRank)"
+        )]
+        top: usize,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 
     /// Generate shell completions for the given shell
@@ -1903,6 +1958,139 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             model,
             batch_size,
         } => run_embed(db.as_deref(), &endpoint, &model, batch_size).map(|c| (c, None)),
+
+        Commands::DeadCode {
+            min_confidence,
+            json,
+            db,
+        } => {
+            let min_conf =
+                DeadCodeConfidence::from_str_loose(&min_confidence).unwrap_or_else(|| {
+                    eprintln!(
+                        "Warning: unknown confidence level '{}', defaulting to 'low'",
+                        min_confidence
+                    );
+                    DeadCodeConfidence::Low
+                });
+            let store = open_store(db.as_deref())?;
+            let result = detect_dead_code(&store)?;
+
+            // Filter by minimum confidence.
+            let filtered: Vec<_> = result
+                .unreachable_symbols
+                .iter()
+                .filter(|s| s.confidence >= min_conf)
+                .collect();
+            let filtered_count = filtered.len();
+
+            if json {
+                #[derive(serde::Serialize)]
+                struct DeadCodeJson<'a> {
+                    total_symbols: usize,
+                    reachable_symbols: usize,
+                    unreachable_count: usize,
+                    dead_percentage: f64,
+                    min_confidence: String,
+                    unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&DeadCodeJson {
+                        total_symbols: result.total_symbols,
+                        reachable_symbols: result.reachable_symbols,
+                        unreachable_count: filtered_count,
+                        dead_percentage: result.dead_percentage,
+                        min_confidence: min_conf.to_string(),
+                        unreachable_symbols: filtered,
+                    })?
+                );
+            } else if filtered.is_empty() {
+                println!(
+                    "No dead code detected ({} symbols, all reachable from entry points).",
+                    result.total_symbols
+                );
+            } else {
+                println!(
+                    "Dead code analysis: {} of {} symbols ({:.1}%) unreachable from entry points\n",
+                    result.unreachable_symbols.len(),
+                    result.total_symbols,
+                    result.dead_percentage,
+                );
+                if min_conf != DeadCodeConfidence::Low {
+                    println!(
+                        "Showing {} symbol(s) with confidence >= {}\n",
+                        filtered.len(),
+                        min_conf
+                    );
+                }
+
+                // Group by file path.
+                let mut by_file: std::collections::BTreeMap<
+                    &str,
+                    Vec<&nestweaver_engine::UnreachableSymbol>,
+                > = std::collections::BTreeMap::new();
+                for sym in &filtered {
+                    by_file.entry(&sym.file_path).or_default().push(sym);
+                }
+
+                for (file, syms) in &by_file {
+                    println!("{}:", file);
+                    for sym in syms {
+                        println!(
+                            "  {} ({}) [{}] confidence={}",
+                            sym.name, sym.kind, sym.visibility, sym.confidence,
+                        );
+                    }
+                    println!();
+                }
+            }
+
+            let stats = format!(
+                "{} unreachable of {} symbols in {}",
+                filtered_count,
+                result.total_symbols,
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::Export {
+            format,
+            output,
+            top,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+
+            let write_to: Box<dyn std::io::Write> = match &output {
+                Some(path) => Box::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("failed to create {}", path.display()))?,
+                ),
+                None => Box::new(std::io::stdout().lock()),
+            };
+            let mut writer = std::io::BufWriter::new(write_to);
+
+            match format.as_str() {
+                "cypher" => export_cypher(&store, &mut writer)?,
+                "graphml" => export_graphml(&store, &mut writer)?,
+                "mermaid" => export_mermaid(&store, top, &mut writer)?,
+                other => {
+                    eprintln!(
+                        "Unknown format '{}'. Supported: cypher, graphml, mermaid",
+                        other
+                    );
+                    return Ok((EXIT_ERROR, None));
+                }
+            }
+
+            if let Some(path) = &output {
+                out.status(&format!("Exported graph to {}", path.display()));
+            }
+
+            let stats = format!("exported {} in {}", format, format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
 
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
