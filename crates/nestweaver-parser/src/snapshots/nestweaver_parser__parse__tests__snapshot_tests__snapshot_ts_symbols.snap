@@ -1,0 +1,137 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1874
+expression: "parsed_symbols(\"simple.ts\", &source)"
+---
+- name: Greeter
+  kind: Interface
+  start_line: 3
+  signature: "interface Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 4
+  signature: "greet(name: string): string"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: farewell
+  kind: Method
+  start_line: 5
+  signature: "farewell(name: string): string"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: Logger
+  kind: Interface
+  start_line: 8
+  signature: "interface Logger {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: log
+  kind: Method
+  start_line: 9
+  signature: "log(message: string): void"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: void
+- name: ConsoleGreeter
+  kind: Class
+  start_line: 12
+  signature: "class ConsoleGreeter implements Greeter, Logger {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 13
+  signature: "greet(name: string): string {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: farewell
+  kind: Method
+  start_line: 17
+  signature: "farewell(name: string): string {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: log
+  kind: Method
+  start_line: 21
+  signature: "log(message: string): void {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: void
+- name: VerboseGreeter
+  kind: Class
+  start_line: 26
+  signature: "class VerboseGreeter extends ConsoleGreeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 27
+  signature: "greet(name: string): string {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: createGreeter
+  kind: Function
+  start_line: 33
+  signature: "function createGreeter(): Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: Greeter

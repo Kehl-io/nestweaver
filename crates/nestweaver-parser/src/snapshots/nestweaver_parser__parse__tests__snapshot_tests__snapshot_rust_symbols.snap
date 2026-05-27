@@ -1,0 +1,89 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1902
+expression: "parsed_symbols(\"simple.rs\", &source)"
+---
+- name: SensorManager
+  kind: Class
+  start_line: 4
+  signature: "pub struct SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorKind
+  kind: Class
+  start_line: 8
+  signature: "pub enum SensorKind {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Readable
+  kind: Interface
+  start_line: 13
+  signature: "pub trait Readable {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: read
+  kind: Method
+  start_line: 19
+  signature: "fn read(&self) -> f64 {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: f64
+- name: calibrate
+  kind: Method
+  start_line: 23
+  signature: "fn calibrate(&mut self) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: new
+  kind: Method
+  start_line: 29
+  signature: "pub fn new() -> Self {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: Self
+- name: get_primary
+  kind: Method
+  start_line: 35
+  signature: "fn get_primary(&self) -> &Sensor {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: "&Sensor"
+- name: initialize
+  kind: Function
+  start_line: 40
+  signature: "pub fn initialize(config: &Settings) -> SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: SensorManager

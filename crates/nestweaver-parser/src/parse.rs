@@ -1825,4 +1825,101 @@ mod tests {
             "expected UnsupportedLanguage, got: {err:?}"
         );
     }
+
+    // ── Snapshot tests ────────────────────────────────────────────────────
+
+    mod snapshot_tests {
+        use super::*;
+        use insta::assert_yaml_snapshot;
+
+        /// Parse a fixture file and return symbols sorted by (start_line, name)
+        /// with content_hash zeroed out for determinism.
+        fn parsed_symbols(filename: &str, source: &str) -> Vec<RawSymbol> {
+            let parsed = parse_source(Path::new(filename), source).unwrap();
+            let mut symbols = parsed.symbols;
+            symbols.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.name.cmp(&b.name)));
+            for s in &mut symbols {
+                s.content_hash = "0".repeat(64);
+            }
+            symbols
+        }
+
+        /// Parse a fixture file and return references sorted by (start_line, name).
+        fn parsed_references(filename: &str, source: &str) -> Vec<RawReference> {
+            let parsed = parse_source(Path::new(filename), source).unwrap();
+            let mut refs = parsed.references;
+            refs.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.name.cmp(&b.name)));
+            refs
+        }
+
+        // ── JS ──────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_js_symbols() {
+            let source = fixture("js/simple.js");
+            assert_yaml_snapshot!(parsed_symbols("simple.js", &source));
+        }
+
+        #[test]
+        fn snapshot_js_references() {
+            let source = fixture("js/simple.js");
+            assert_yaml_snapshot!(parsed_references("simple.js", &source));
+        }
+
+        // ── TypeScript ──────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_ts_symbols() {
+            let source = fixture("ts/simple.ts");
+            assert_yaml_snapshot!(parsed_symbols("simple.ts", &source));
+        }
+
+        #[test]
+        fn snapshot_ts_references() {
+            let source = fixture("ts/simple.ts");
+            assert_yaml_snapshot!(parsed_references("simple.ts", &source));
+        }
+
+        // ── Python ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_python_symbols() {
+            let source = fixture("python/simple.py");
+            assert_yaml_snapshot!(parsed_symbols("simple.py", &source));
+        }
+
+        #[test]
+        fn snapshot_python_references() {
+            let source = fixture("python/simple.py");
+            assert_yaml_snapshot!(parsed_references("simple.py", &source));
+        }
+
+        // ── Rust ────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_rust_symbols() {
+            let source = fixture("rust/simple.rs");
+            assert_yaml_snapshot!(parsed_symbols("simple.rs", &source));
+        }
+
+        #[test]
+        fn snapshot_rust_references() {
+            let source = fixture("rust/simple.rs");
+            assert_yaml_snapshot!(parsed_references("simple.rs", &source));
+        }
+
+        // ── Go ──────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_go_symbols() {
+            let source = fixture("go/simple.go");
+            assert_yaml_snapshot!(parsed_symbols("simple.go", &source));
+        }
+
+        #[test]
+        fn snapshot_go_references() {
+            let source = fixture("go/simple.go");
+            assert_yaml_snapshot!(parsed_references("simple.go", &source));
+        }
+    }
 }

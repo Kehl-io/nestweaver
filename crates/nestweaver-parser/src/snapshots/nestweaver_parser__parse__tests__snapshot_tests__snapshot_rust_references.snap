@@ -1,0 +1,57 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1908
+expression: "parsed_references(\"simple.rs\", &source)"
+---
+- name: "std::collections::HashMap"
+  kind: Import
+  start_line: 1
+  context: "use std::collections::HashMap;"
+- name: "crate::config::Settings"
+  kind: Import
+  start_line: 2
+  context: "use std::collections::HashMap;"
+- name: Readable
+  kind: Extends
+  start_line: 18
+  context: "use std::collections::HashMap;"
+- name: get_primary
+  kind: Call
+  start_line: 20
+  context: self.get_primary().value
+- name: value
+  kind: Call
+  start_line: 20
+  context: "{"
+- name: for_each
+  kind: Call
+  start_line: 24
+  context: self.sensors.values_mut().for_each(|s| s.reset());
+- name: reset
+  kind: Call
+  start_line: 24
+  context: "|s| s.reset()"
+- name: values_mut
+  kind: Call
+  start_line: 24
+  context: self.sensors.values_mut().for_each
+- name: new
+  kind: Call
+  start_line: 31
+  context: "sensors: HashMap::new()"
+- name: get
+  kind: Call
+  start_line: 36
+  context: "self.sensors.get(\"primary\").unwrap"
+- name: unwrap
+  kind: Call
+  start_line: 36
+  context: "{"
+- name: new
+  kind: Call
+  start_line: 41
+  context: "let mgr = SensorManager::new();"
+- name: println
+  kind: Call
+  start_line: 42
+  context: "println!(\"Initialized with {:?}\", config);"

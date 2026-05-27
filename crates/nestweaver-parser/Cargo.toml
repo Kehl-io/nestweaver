@@ -32,3 +32,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 comrak = { version = "0.52", default-features = false }
 serde_yaml = "0.9"
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }

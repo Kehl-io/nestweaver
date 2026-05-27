@@ -1,0 +1,41 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1880
+expression: "parsed_references(\"simple.ts\", &source)"
+---
+- name: events
+  kind: Import
+  start_line: 1
+  context: "import { EventEmitter } from 'events';"
+- name: Greeter
+  kind: Implements
+  start_line: 12
+  context: "implements Greeter, Logger"
+- name: Logger
+  kind: Implements
+  start_line: 12
+  context: "implements Greeter, Logger"
+- name: log
+  kind: Call
+  start_line: 22
+  context: console.log(message);
+- name: ConsoleGreeter
+  kind: Extends
+  start_line: 26
+  context: "class VerboseGreeter extends ConsoleGreeter {"
+- name: log
+  kind: Call
+  start_line: 28
+  context: "this.log(`Greeting ${name}`);"
+- name: greet
+  kind: Call
+  start_line: 29
+  context: return super.greet(name);
+- name: createGreeter
+  kind: Call
+  start_line: 37
+  context: greeter = createGreeter()
+- name: greet
+  kind: Call
+  start_line: 38
+  context: "greeter.greet('world');"
