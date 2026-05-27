@@ -28,32 +28,31 @@ pub struct BridgeNode {
     pub communities_connected: Vec<u32>,
 }
 
-/// Find the top-N bridge nodes in the code graph, ranked by betweenness centrality.
-///
-/// Uses Brandes' algorithm with sampling: for each of up to `SAMPLE_LIMIT`
-/// randomly-selected source nodes, runs BFS to compute shortest-path counts
-/// and accumulates betweenness contributions. The result is normalized by
-/// the number of sources sampled.
-pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeNode>> {
+/// Loaded graph data reusable across bridge detection and community attachment.
+pub(crate) struct LoadedGraph {
+    pub symbols: Vec<nestweaver_store::SymbolBasic>,
+    pub adj: Vec<Vec<usize>>,
+    pub uid_to_idx: HashMap<String, usize>,
+}
+
+/// Load the code graph and build undirected adjacency data.
+fn load_graph(store: &GraphStore) -> Result<Option<LoadedGraph>> {
     let (symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to load graph data for bridge detection")?;
 
     if symbols.is_empty() {
-        return Ok(vec![]);
+        return Ok(None);
     }
 
-    // Build UID -> index mapping.
-    let uid_to_idx: HashMap<&str, usize> = symbols
+    let uid_to_idx: HashMap<String, usize> = symbols
         .iter()
         .enumerate()
-        .map(|(i, s)| (s.uid.as_str(), i))
+        .map(|(i, s)| (s.uid.clone(), i))
         .collect();
 
     let n = symbols.len();
-
-    // Build undirected adjacency list (bridges care about reachability, not direction).
     let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
     for (src, dst, _confidence) in &edges {
         if let (Some(&si), Some(&di)) = (uid_to_idx.get(src.as_str()), uid_to_idx.get(dst.as_str()))
@@ -63,17 +62,38 @@ pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeN
         }
     }
 
-    // Deduplicate adjacency lists.
     for neighbors in &mut adj {
         neighbors.sort_unstable();
         neighbors.dedup();
     }
 
+    Ok(Some(LoadedGraph {
+        symbols,
+        adj,
+        uid_to_idx,
+    }))
+}
+
+/// Find the top-N bridge nodes in the code graph, ranked by betweenness centrality.
+///
+/// Uses Brandes' algorithm with sampling: for each of up to `SAMPLE_LIMIT`
+/// randomly-selected source nodes, runs BFS to compute shortest-path counts
+/// and accumulates betweenness contributions. The result is normalized by
+/// the number of sources sampled.
+pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeNode>> {
+    let graph = match load_graph(store)? {
+        Some(g) => g,
+        None => return Ok(vec![]),
+    };
+
+    let n = graph.symbols.len();
+
     // Compute betweenness centrality via Brandes' algorithm with sampling.
-    let betweenness = brandes_sampled(&adj, n);
+    let betweenness = brandes_sampled(&graph.adj, n);
 
     // Build bridge nodes.
-    let mut bridges: Vec<BridgeNode> = symbols
+    let mut bridges: Vec<BridgeNode> = graph
+        .symbols
         .iter()
         .enumerate()
         .map(|(i, sym)| BridgeNode {
@@ -100,11 +120,18 @@ pub fn find_bridge_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<BridgeN
 ///
 /// For each bridge node, determines which cluster IDs are reachable through
 /// its immediate neighbors, marking it as connecting those communities.
+/// Loads the graph once; if you already have a `LoadedGraph`, prefer
+/// the internal helper to avoid the extra load.
 pub fn attach_communities(
     bridges: &mut [BridgeNode],
     clustering: &crate::cluster_dispatch::ClusteringOutput,
     store: &GraphStore,
 ) {
+    let graph = match load_graph(store) {
+        Ok(Some(g)) => g,
+        _ => return,
+    };
+
     // Build uid -> cluster_id map.
     let mut uid_to_cluster: HashMap<String, u32> = HashMap::new();
     for community in &clustering.communities {
@@ -113,38 +140,16 @@ pub fn attach_communities(
         }
     }
 
-    // Load edges for neighbor lookup.
-    let (symbols, edges) = match store.load_code_symbols_and_edges() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let uid_to_idx: HashMap<&str, usize> = symbols
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.uid.as_str(), i))
-        .collect();
-
-    // Build adjacency (undirected).
-    let n = symbols.len();
-    let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
-    for (src, dst, _) in &edges {
-        if let (Some(&si), Some(&di)) = (uid_to_idx.get(src.as_str()), uid_to_idx.get(dst.as_str()))
-        {
-            adj[si].push(di);
-            adj[di].push(si);
-        }
-    }
-
     for bridge in bridges.iter_mut() {
-        if let Some(&idx) = uid_to_idx.get(bridge.uid.as_str()) {
+        if let Some(&idx) = graph.uid_to_idx.get(bridge.uid.as_str()) {
             let mut connected_clusters: HashSet<u32> = HashSet::new();
             // Include the bridge's own cluster.
             if let Some(&cid) = uid_to_cluster.get(&bridge.uid) {
                 connected_clusters.insert(cid);
             }
             // Add clusters of all neighbors.
-            for &neighbor_idx in &adj[idx] {
-                if let Some(&cid) = uid_to_cluster.get(&symbols[neighbor_idx].uid) {
+            for &neighbor_idx in &graph.adj[idx] {
+                if let Some(&cid) = uid_to_cluster.get(&graph.symbols[neighbor_idx].uid) {
                     connected_clusters.insert(cid);
                 }
             }

@@ -139,7 +139,7 @@ fn tiered_change_check(
 }
 
 /// Directory names to skip when walking the repository tree.
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
     "target",
@@ -646,7 +646,12 @@ fn index_into_store(
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
     if files_unchanged > 0 {
-        eprintln!(
+        tracing::info!(
+            files = files_count,
+            files_unchanged,
+            symbols = symbols_count,
+            edges = edges_count,
+            elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
             "Done: {} files ({} unchanged, skipped), {} symbols, {} edges ({:.1}s)",
             files_count,
             files_unchanged,
@@ -655,7 +660,11 @@ fn index_into_store(
             elapsed.as_secs_f64(),
         );
     } else {
-        eprintln!(
+        tracing::info!(
+            files = files_count,
+            symbols = symbols_count,
+            edges = edges_count,
+            elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
             "Done: {} files, {} symbols, {} edges ({:.1}s)",
             files_count,
             symbols_count,
@@ -687,7 +696,7 @@ fn is_parseable(path: &Path) -> bool {
 
 /// Returns true if the file looks like a minified bundle, webpack output,
 /// or other generated artifact that would produce noise in the graph.
-fn is_minified_or_bundled(path: &Path) -> bool {
+pub(crate) fn is_minified_or_bundled(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.ends_with(".min.js")
         || name.ends_with(".min.ts")
@@ -710,7 +719,7 @@ fn is_minified_or_bundled(path: &Path) -> bool {
 }
 
 /// Returns true if any component of `path` is in `SKIP_DIRS`.
-fn path_in_skip_dir(path: &Path) -> bool {
+pub(crate) fn path_in_skip_dir(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()
             .to_str()

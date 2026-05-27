@@ -462,7 +462,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let lang = detect_language(path)
         .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_string_lossy().into_owned()))?;
 
-    // Languages with regex-based parsers (no tree-sitter grammar)
+    // Languages with regex-based parsers (no tree-sitter grammar).
+    // All regex-dispatched languages are handled in this single match block.
     match lang {
         Language::Cobol => return Ok(crate::cobol::parse_cobol(path, source)),
         Language::Julia => return Ok(crate::julia::parse_julia(path, source)),
@@ -470,31 +471,17 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Hcl => return Ok(crate::hcl::parse_hcl(path, source)),
         Language::Fortran => return Ok(crate::fortran::parse_fortran(path, source)),
         Language::Pascal => return Ok(crate::pascal::parse_pascal(path, source)),
+        Language::Zig => return Ok(crate::zig::parse_zig(path, source)),
+        Language::ObjectiveC => return Ok(crate::objc::parse_objc(path, source)),
+        Language::Groovy => return Ok(crate::groovy::parse_groovy(path, source)),
+        Language::PowerShell => return Ok(crate::powershell::parse_powershell(path, source)),
+        Language::Vue => return Ok(crate::vue::parse_vue(path, source)),
+        Language::Svelte => return Ok(crate::svelte::parse_svelte(path, source)),
+        Language::Astro => return Ok(crate::astro::parse_astro(path, source)),
+        Language::SystemVerilog => {
+            return Ok(crate::systemverilog::parse_systemverilog(path, source));
+        }
         _ => {}
-    }
-    if lang == Language::Zig {
-        return Ok(crate::zig::parse_zig(path, source));
-    }
-    if lang == Language::ObjectiveC {
-        return Ok(crate::objc::parse_objc(path, source));
-    }
-    if lang == Language::Groovy {
-        return Ok(crate::groovy::parse_groovy(path, source));
-    }
-    if lang == Language::PowerShell {
-        return Ok(crate::powershell::parse_powershell(path, source));
-    }
-    if lang == Language::Vue {
-        return Ok(crate::vue::parse_vue(path, source));
-    }
-    if lang == Language::Svelte {
-        return Ok(crate::svelte::parse_svelte(path, source));
-    }
-    if lang == Language::Astro {
-        return Ok(crate::astro::parse_astro(path, source));
-    }
-    if lang == Language::SystemVerilog {
-        return Ok(crate::systemverilog::parse_systemverilog(path, source));
     }
 
     let ts_lang = build_ts_language(lang);

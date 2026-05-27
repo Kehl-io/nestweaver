@@ -107,11 +107,16 @@ pub fn analyze_blast_radius(
                 continue;
             }
             if affected_uids.insert(node.uid.clone()) {
+                // Look up the symbol's kind from the store.
+                let kind = store
+                    .lookup_symbol(&node.uid)
+                    .map(|s| s.kind.to_string())
+                    .unwrap_or_default();
                 affected_symbols.push(AffectedSymbol {
                     uid: node.uid,
                     name: node.name,
                     file_path: node.file_path,
-                    kind: String::new(), // ImpactNode doesn't carry kind
+                    kind,
                     depth: node.depth,
                     edge_type: node.edge_type,
                     confidence: node.confidence,

@@ -309,9 +309,9 @@ pub fn export_mermaid(
     // Sort by PageRank descending, take top N.
     let mut ranked = symbols;
     ranked.sort_by(|a, b| {
-        let pa = b.pagerank_score.unwrap_or(0.0);
-        let pb = a.pagerank_score.unwrap_or(0.0);
-        pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+        let pa = a.pagerank_score.unwrap_or(0.0);
+        let pb = b.pagerank_score.unwrap_or(0.0);
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked.truncate(top_n);
 
