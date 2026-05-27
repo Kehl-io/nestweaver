@@ -85,9 +85,7 @@ pub fn get_all_properties(store: &ExtensionStore, uid: &str) -> HashMap<String, 
 
 /// Canonical sidecar path: `<db>.extensions.json`.
 fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".extensions.json");
-    std::path::PathBuf::from(s)
+    crate::sidecar_path(db_path, ".extensions.json")
 }
 
 #[cfg(test)]

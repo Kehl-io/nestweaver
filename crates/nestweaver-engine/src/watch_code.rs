@@ -227,7 +227,7 @@ impl CodeWatcher {
                 if let Err(e) = store.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
                     tracing::warn!("post-batch PageRank recompute failed: {e}");
                 } else {
-                    let pr_path = self.db_path.with_extension("pagerank.json");
+                    let pr_path = crate::sidecar_path(&self.db_path, ".pagerank.json");
                     let _ = store.save_pagerank_cache(&pr_path);
                 }
 

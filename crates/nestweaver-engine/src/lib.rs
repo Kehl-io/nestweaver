@@ -1,5 +1,36 @@
 // nestweaver-engine: orchestrates parsing, resolution, and graph construction
 
+use std::path::{Path, PathBuf};
+
+/// Canonical sidecar path: appends `suffix` to the database path.
+///
+/// All sidecars live alongside the database file using the convention
+/// `<db><suffix>`, e.g. `data.lbug.pagerank.json` for suffix `.pagerank.json`.
+///
+/// This uses `OsStr::push` (append) rather than `Path::with_extension` (replace)
+/// so the `.lbug` stem is preserved and backup globs like `data.lbug*` capture
+/// every sidecar.
+pub fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Migrate a sidecar from the old `with_extension` naming convention to the
+/// new `push` convention. If the old-convention path exists and the
+/// new-convention path does not, renames the old file to the new location.
+///
+/// Returns `true` if a migration rename was performed.
+pub fn migrate_sidecar(db_path: &Path, old_extension: &str, new_suffix: &str) -> bool {
+    let old_path = db_path.with_extension(old_extension);
+    let new_path = sidecar_path(db_path, new_suffix);
+    if old_path.exists() && !new_path.exists() {
+        std::fs::rename(&old_path, &new_path).is_ok()
+    } else {
+        false
+    }
+}
+
 pub mod agent_guide;
 pub mod blast_radius;
 pub mod bridges;

@@ -91,8 +91,10 @@ Sidecar files written alongside the database:
 - `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index)
 - `<db>.summaries.json` — hierarchical code summaries cache (symbol/file/cluster levels)
 - `<db>.tantivy/` — BM25 full-text search index for notes and sections
+- `<db>.clusters.json` — community/cluster detection output
 - `<db>.extensions.json` — user-defined extension properties on nodes
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
+- `<db>.perspectives.json` — saved web UI perspectives (web crate only)
 
 ## Architecture
 

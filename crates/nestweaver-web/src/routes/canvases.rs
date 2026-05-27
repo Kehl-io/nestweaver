@@ -22,9 +22,7 @@ pub struct Canvas {
 }
 
 fn canvases_dir(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".canvases");
-    PathBuf::from(s)
+    nestweaver_engine::sidecar_path(db_path, ".canvases")
 }
 
 fn canvas_file(db_path: &Path, id: &str) -> PathBuf {

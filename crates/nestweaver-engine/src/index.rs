@@ -212,7 +212,8 @@ pub fn index_directory_with_options(
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
 
-    let filemeta_path = db_path.with_extension("filemeta.json");
+    let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
+    crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let mut new_filemeta = FileMetaCache::new();
 
     let result = if force {
@@ -247,7 +248,8 @@ pub fn index_directory_with_options(
 
     // Parse the manifest and update the sidecar cache alongside the DB.
     let manifest = crate::manifest::parse_manifest(repo_path);
-    let cache_path = db_path.with_extension("manifests.json");
+    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
+    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
     let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
@@ -896,7 +898,8 @@ pub fn incremental_index(
         .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
         .with_context(|| "compute_pagerank after incremental index")?;
 
-    let pr_path = db_path.with_extension("pagerank.json");
+    crate::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
+    let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
     if let Err(e) = store.save_pagerank_cache(&pr_path) {
         tracing::warn!("failed to save pagerank cache: {e}");
     }
@@ -1053,7 +1056,8 @@ fn full_index_fallback(
     new_sha: &str,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // Load filemeta sidecar for tiered change detection even in fallback.
-    let filemeta_path = db_path.with_extension("filemeta.json");
+    crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
+    let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let filemeta_cache = load_filemeta_cache(&filemeta_path);
     let mut new_filemeta = FileMetaCache::new();
 
@@ -1074,7 +1078,8 @@ fn full_index_fallback(
 
     // Update the manifest cache sidecar (same as index_directory does).
     let manifest = crate::manifest::parse_manifest(repo_path);
-    let cache_path = db_path.with_extension("manifests.json");
+    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
+    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
     let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
@@ -1364,7 +1369,7 @@ function hello(name) { return "Hello " + name; }
 
         index_directory(&src, &db_path, "test", "https://example.com/repo", "abc123").unwrap();
 
-        let filemeta_path = db_path.with_extension("filemeta.json");
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
         assert!(filemeta_path.exists(), "filemeta sidecar should be created");
         let cache = load_filemeta_cache(&filemeta_path);
         assert_eq!(cache.len(), 1, "one file should be in the cache");
