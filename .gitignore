@@ -42,3 +42,17 @@ Thumbs.db
 docs/superpowers/
 docs/plans/
 docs/specs/
+
+# Generated setup configs (created by `nestweaver setup`)
+.claude/
+.codex/
+.cursor/
+.junie/
+AGENTS.md
+
+# Sidecar files (generated at runtime)
+*.pagerank.json
+*.manifests.json
+*.extensions.json
+*.aliases.json
+*.tantivy/
