@@ -91,11 +91,20 @@ nestweaver index --repo ./my-project
 nestweaver context processPayment
 ```
 
+```sh
+# Configure for your AI tool (Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code)
+nestweaver setup
+```
+
 Run `nestweaver --help` for the full command list. All commands support `--json` for machine-readable output.
 
 ## Install
 
 ```sh
+# npm (recommended — no Rust needed)
+npm install -g @kehl-io/nestweaver
+
+# or Cargo
 cargo install --path .
 ```
 
