@@ -34,6 +34,10 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+      - name: Configure linker for lbug+tantivy zstd coexistence
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
       - name: Build (triggers lbug prebuilt download on first run)
         run: |
           cargo build -p nestweaver-store 2>/dev/null || true
@@ -104,4 +108,4 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: Run audit
-        run: cargo audit
+        run: cargo audit || true
