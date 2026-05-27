@@ -37,6 +37,7 @@ function ThemeToggle() {
 export function TopBar() {
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const theme = useStore((s) => s.theme);
   const searchQuery = useStore((s) => s.searchQuery);
   const searchOpen = useStore((s) => s.searchOpen);
   const scopeFilter = useStore((s) => s.scopeFilter);
@@ -102,8 +103,13 @@ export function TopBar() {
 
   return (
     <header className="flex h-12 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-4">
-      <img src="/logo-horizontal-dark.svg" alt="NestWeaver" className="h-8 dark:block hidden" />
-      <img src="/logo-horizontal-light.svg" alt="NestWeaver" className="h-8 dark:hidden block" />
+      <img
+        src={theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches)
+          ? "/logo-horizontal-dark.svg"
+          : "/logo-horizontal-light.svg"}
+        alt="NestWeaver"
+        className="h-8"
+      />
 
       <div className="relative flex-1 max-w-md">
         <input
