@@ -1,17 +1,15 @@
 {
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "component": "nestweaver",
+      "bump-minor-pre-major": true,
       "extra-files": [
-        "crates/nestweaver-schema/Cargo.toml",
-        "crates/nestweaver-parser/Cargo.toml",
-        "crates/nestweaver-resolver/Cargo.toml",
-        "crates/nestweaver-store/Cargo.toml",
-        "crates/nestweaver-storage/Cargo.toml",
-        "crates/nestweaver-engine/Cargo.toml",
-        "crates/nestweaver-mcp/Cargo.toml",
-        "crates/nestweaver-web/Cargo.toml"
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        }
       ]
     }
   },
