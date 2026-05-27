@@ -59,6 +59,18 @@ impl ImportGraph {
             .map(|v| v.iter().collect())
             .unwrap_or_default()
     }
+
+    /// Returns all resolved imports across all files as (source_file, specifier, target_file) triples.
+    pub fn all_resolved_imports(&self) -> Vec<(&str, &str, &str)> {
+        self.resolved_imports
+            .iter()
+            .flat_map(|(src, imports)| {
+                imports
+                    .iter()
+                    .map(move |(spec, tgt)| (src.as_str(), spec.as_str(), tgt.as_str()))
+            })
+            .collect()
+    }
 }
 
 /// Build an import graph from parsed file data.
