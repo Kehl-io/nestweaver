@@ -2,16 +2,25 @@
 
 ## Setup
 
-1. Index your repository:
-   ```bash
-   nestweaver index --repo .
-   ```
+Run the auto-setup command:
 
-2. Copy the MCP config to your project:
-   ```bash
-   cp integrations/windsurf/mcp.json .windsurf/mcp.json
-   ```
+```bash
+nestweaver setup windsurf
+```
 
-3. Restart Windsurf to detect the MCP server.
+Or manually add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "nestweaver": {
+      "command": "nestweaver",
+      "args": ["mcp", "--db", "./nestweaver.lbug"]
+    }
+  }
+}
+```
+
+Restart Windsurf to detect the MCP server.
 
 All NestWeaver MCP tools are available in Windsurf's AI features.
