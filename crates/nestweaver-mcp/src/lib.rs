@@ -33,7 +33,7 @@ pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 /// no more lines. Returns Ok on clean shutdown; errors only on truly
 /// unrecoverable conditions (the database failing to open, etc.). Per-call
 /// errors are wrapped as MCP tool errors and the loop continues.
-pub fn run_stdio_server(db_path: &Path, allow_add_sources: bool) -> Result<(), anyhow::Error> {
+pub fn run_stdio_server(db_path: &Path, allow_add_sources: bool, lite: bool) -> Result<(), anyhow::Error> {
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
@@ -66,6 +66,7 @@ pub fn run_stdio_server(db_path: &Path, allow_add_sources: bool) -> Result<(), a
     // additional indexer invocations against the same DB.
     tools::set_current_db_path(db_path.to_path_buf());
     tools::set_allow_add_sources(allow_add_sources);
+    tools::set_lite_mode(lite);
 
     tracing::info!(
         path = %db_path.display(),
@@ -228,7 +229,10 @@ fn dispatch_method(
             Frame::Success(success(id, Value::Null))
         }
 
-        "tools/list" => Frame::Success(success(id, tools::tool_list())),
+        "tools/list" => {
+            let lite = tools::is_lite_mode();
+            Frame::Success(success(id, tools::tool_list(lite)))
+        }
 
         "tools/call" => {
             let params = req.params.clone().unwrap_or(Value::Null);
