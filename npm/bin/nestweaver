@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BINARY="$DIR/.nestweaver-bin/nestweaver"
+
+if [ ! -x "$BINARY" ]; then
+  echo "NestWeaver binary not found. Run: npm install @kehl-io/nestweaver" >&2
+  exit 1
+fi
+
+exec "$BINARY" "$@"
