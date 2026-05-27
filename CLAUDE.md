@@ -16,13 +16,27 @@ cargo fmt --all                                             # format in place
 
 ```sh
 # Index a repo and query it
-nestweaver index --repo ./testdata/js
+nestweaver index                         # auto-detects repo root from .git
+nestweaver index --repo ./testdata/js    # explicit repo path
+nestweaver index --stats                 # show timing and statistics after indexing
+nestweaver watch                         # live re-indexing via filesystem watcher with debouncing
 nestweaver context greet                 # task-focused subgraph via PPR
+nestweaver context greet --intent find-definition          # intent-tuned PPR
 nestweaver context src/main.js           # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
 nestweaver repo-map --token-budget 2000
+nestweaver summary --level symbol        # hierarchical code summaries (symbol/file/cluster)
+
+# Graph analysis
+nestweaver hubs                          # most connected hub nodes (degree centrality + PageRank)
+nestweaver bridges                       # architectural chokepoints (betweenness centrality)
+nestweaver pr-impact                     # PR blast radius with risk scoring (Low/Medium/High/Critical)
+nestweaver dead-code                     # detect unreachable symbols via entry point reachability
+
+# Export
+nestweaver export --format cypher        # graph export (cypher, graphml, mermaid)
 
 # Markdown brain
 nestweaver brain add ~/Documents/Obsidian/MyVault
@@ -44,21 +58,29 @@ nestweaver context --feature device-pairing --config ./nestweaver-instance.toml 
 nestweaver brain context "status" --since 2026-05-20T00:00:00Z       # only recent notes
 nestweaver brain context "project" --recency-weight 0.7               # boost recent content
 
-# Auto-setup for AI tools (Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code)
+# Auto-setup for AI tools (16 supported)
+# Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code,
+# Gemini CLI, GitHub Copilot CLI, Aider, Kiro, Continue.dev,
+# Cline, OpenCode, Trae, Devin, Hermes
 nestweaver setup                                                      # auto-detect and configure all
 nestweaver setup claude-code                                           # configure specific tool
 
 # Generate tool-specific instruction files
-nestweaver generate-guide --format skill                              # Claude Code skill
+nestweaver generate-guide --format skill                              # Claude Code skill (SKILL.md)
 nestweaver generate-guide --format cursor-rule                        # Cursor .mdc rule
 nestweaver generate-guide --format agents-md                          # Codex AGENTS.md
 
-# MCP server (17 tools, or 6 in lite mode for Cursor)
+# Shell completions
+nestweaver completions bash              # also: zsh, fish, powershell
+
+# MCP server (22 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
+
+# Global flags: --stats, --quiet, --verbose, --no-color, --plain
 ```
 
 Default database: `./nestweaver.lbug`. Override with `--db <path>` or `NESTWEAVER_DB` env var.
@@ -67,6 +89,7 @@ Sidecar files written alongside the database:
 - `<db>.pagerank.json` — in-memory PageRank cache (written on `index`, loaded on open)
 - `<db>.manifests.json` — parsed manifest data (package.json, go.mod, Cargo.toml, pyproject.toml, requirements.txt, composer.json, Gemfile, pubspec.yaml, Package.swift, *.csproj, build.gradle.kts, CMakeLists.txt)
 - `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index)
+- `<db>.summaries.json` — hierarchical code summaries cache (symbol/file/cluster levels)
 - `<db>.tantivy/` — BM25 full-text search index for notes and sections
 - `<db>.extensions.json` — user-defined extension properties on nodes
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
