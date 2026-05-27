@@ -2817,70 +2817,10 @@ fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: u
     taken
 }
 
-/// Parse an ISO 8601 string (subset) to Unix epoch seconds (f64).
-/// Returns 0.0 on failure — the node will receive no recency boost.
+/// Parse an ISO 8601 string to Unix epoch seconds (f64).
+/// Delegates to the shared implementation in nestweaver-engine.
 fn cli_parse_iso8601_to_epoch(s: &str) -> f64 {
-    let s = s.trim();
-    let s = s
-        .strip_suffix('Z')
-        .or_else(|| s.strip_suffix("+00:00"))
-        .or_else(|| s.strip_suffix("-00:00"))
-        .unwrap_or(s);
-    let (date_part, time_part) = if let Some(pos) = s.find('T') {
-        (&s[..pos], Some(&s[pos + 1..]))
-    } else {
-        (s, None)
-    };
-    let dp: Vec<&str> = date_part.split('-').collect();
-    if dp.len() != 3 {
-        return 0.0;
-    }
-    let year: i64 = dp[0].parse().unwrap_or(0);
-    let month: u32 = dp[1].parse().unwrap_or(0);
-    let day: u32 = dp[2].parse().unwrap_or(0);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return 0.0;
-    }
-    let (hour, minute, second) = if let Some(t) = time_part {
-        let t = if let Some(pos) = t.rfind(['+', '-']) {
-            &t[..pos]
-        } else {
-            t
-        };
-        let tp: Vec<&str> = t.split(':').collect();
-        if tp.len() < 2 {
-            (0u32, 0u32, 0u32)
-        } else {
-            let h = tp[0].parse().unwrap_or(0);
-            let m = tp[1].parse().unwrap_or(0);
-            let sec: u32 = if tp.len() >= 3 {
-                tp[2]
-                    .split('.')
-                    .next()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            (h, m, sec)
-        }
-    } else {
-        (0, 0, 0)
-    };
-    let m_adj = if month <= 2 { month + 9 } else { month - 3 };
-    let y_adj = if month <= 2 { year - 1 } else { year };
-    let era = if y_adj >= 0 {
-        y_adj / 400
-    } else {
-        (y_adj - 399) / 400
-    };
-    let yoe = (y_adj - era * 400) as u64;
-    let doy = (153 * m_adj as u64 + 2) / 5 + day as u64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146_097 + doe as i64) - 719_468;
-    let secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
-    if secs < 0 { 0.0 } else { secs as f64 }
+    nestweaver_engine::parse_iso8601_to_epoch(s)
 }
 
 /// Apply age-decay score boost to non-Symbol nodes (CLI variant).

@@ -14,8 +14,8 @@ use anyhow::{Context, anyhow};
 use nestweaver_engine::{
     BrainContextResult, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
     compute_clusters, detect_changes_impact, generate_guide, get_all_properties, index_directory,
-    index_markdown_directory, load_alias_sidecar, load_extensions, query_by_property,
-    save_extensions, set_property,
+    index_markdown_directory, load_alias_sidecar, load_extensions, parse_iso8601_to_epoch,
+    query_by_property, save_extensions, set_property,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -171,6 +171,20 @@ fn tool_schema_brain_context() -> Value {
                 "weight_semantic": {
                     "type": "number",
                     "description": "Semantic embedding weight for hybrid RRF fusion. Default 0.0 (disabled until embeddings are generated)."
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO 8601 timestamp. Only return Note/Section nodes modified after this time. Symbol nodes always kept."
+                },
+                "recency_weight": {
+                    "type": "number",
+                    "default": 0.0,
+                    "description": "Multiplier for age-decay boost. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node."
+                },
+                "recency_half_life_days": {
+                    "type": "number",
+                    "default": 30.0,
+                    "description": "Half-life for age-decay in days."
                 }
             },
             "required": ["seeds"]
@@ -353,6 +367,50 @@ fn tool_brain_context(
         }
     }
 
+    // since filter: hard filter Note/Section nodes by modified_at.
+    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+        let recent_notes = store
+            .list_note_uids_modified_since(since)
+            .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
+        let recent_sections = store
+            .list_section_uids_modified_since(since)
+            .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
+        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+            nodes.retain(|item| {
+                if item.kind.to_lowercase().contains("symbol") {
+                    return true;
+                }
+                recent_notes.contains(&item.uid) || recent_sections.contains(&item.uid)
+            });
+        };
+        filter_since(&mut result.seeds);
+        filter_since(&mut result.connected);
+    }
+
+    // recency bias: soft boost based on note modified_at age.
+    let recency_weight = args
+        .get("recency_weight")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let recency_half_life_days = args
+        .get("recency_half_life_days")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(30.0);
+    if recency_weight > 0.0 {
+        apply_recency_bias(
+            store,
+            &mut result.connected,
+            recency_weight,
+            recency_half_life_days,
+        );
+        apply_recency_bias(
+            store,
+            &mut result.seeds,
+            recency_weight,
+            recency_half_life_days,
+        );
+    }
+
     let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
 
     let connected_json: Vec<Value> = result
@@ -393,72 +451,6 @@ fn tool_brain_context(
         "truncated": cut < result.connected.len(),
         "total_connected": result.connected.len(),
     }))
-}
-
-/// Parse an ISO 8601 string (subset: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD) to Unix seconds.
-/// Returns 0.0 on any parse failure so the node gets no boost (treated as epoch-old).
-fn parse_iso8601_to_epoch(s: &str) -> f64 {
-    let s = s.trim();
-    let s = s
-        .strip_suffix('Z')
-        .or_else(|| s.strip_suffix("+00:00"))
-        .or_else(|| s.strip_suffix("-00:00"))
-        .unwrap_or(s);
-    let (date_part, time_part) = if let Some(pos) = s.find('T') {
-        (&s[..pos], Some(&s[pos + 1..]))
-    } else {
-        (s, None)
-    };
-    let dp: Vec<&str> = date_part.split('-').collect();
-    if dp.len() != 3 {
-        return 0.0;
-    }
-    let year: i64 = dp[0].parse().unwrap_or(0);
-    let month: u32 = dp[1].parse().unwrap_or(0);
-    let day: u32 = dp[2].parse().unwrap_or(0);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return 0.0;
-    }
-    let (hour, minute, second) = if let Some(t) = time_part {
-        let t = if let Some(pos) = t.rfind(['+', '-']) {
-            &t[..pos]
-        } else {
-            t
-        };
-        let tp: Vec<&str> = t.split(':').collect();
-        if tp.len() < 2 {
-            (0u32, 0u32, 0u32)
-        } else {
-            let h = tp[0].parse().unwrap_or(0);
-            let m = tp[1].parse().unwrap_or(0);
-            let sec: u32 = if tp.len() >= 3 {
-                tp[2]
-                    .split('.')
-                    .next()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            (h, m, sec)
-        }
-    } else {
-        (0, 0, 0)
-    };
-    let m_adj = if month <= 2 { month + 9 } else { month - 3 };
-    let y_adj = if month <= 2 { year - 1 } else { year };
-    let era = if y_adj >= 0 {
-        y_adj / 400
-    } else {
-        (y_adj - 399) / 400
-    };
-    let yoe = (y_adj - era * 400) as u64;
-    let doy = (153 * m_adj as u64 + 2) / 5 + day as u64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146_097 + doe as i64) - 719_468;
-    let secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
-    if secs < 0 { 0.0 } else { secs as f64 }
 }
 
 /// Apply age-decay score boost to non-Symbol nodes.
@@ -1823,6 +1815,20 @@ fn tool_schema_project_context() -> Value {
                     "type": "boolean",
                     "default": true,
                     "description": "For composite projects, also include notes/symbols from component sub-projects"
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO 8601 timestamp. Only return Note/Section nodes modified after this time. Symbol nodes always kept."
+                },
+                "recency_weight": {
+                    "type": "number",
+                    "default": 0.0,
+                    "description": "Multiplier for age-decay boost. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node."
+                },
+                "recency_half_life_days": {
+                    "type": "number",
+                    "default": 30.0,
+                    "description": "Half-life for age-decay in days."
                 }
             },
             "required": ["project"]
