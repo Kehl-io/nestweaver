@@ -12,11 +12,12 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, HybridSearchConfig, analyze_blast_radius, attach_cluster_ids,
-    attach_communities, build_brain_context_hybrid_with_aliases, compute_clusters,
-    detect_changes_impact, find_bridge_nodes, find_hub_nodes, generate_guide, get_all_properties,
-    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
-    parse_iso8601_to_epoch, query_by_property, save_extensions, set_property,
+    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, analyze_blast_radius,
+    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
+    compute_clusters, detect_changes_impact, detect_dead_code, find_bridge_nodes, find_hub_nodes,
+    generate_guide, get_all_properties, index_directory, index_markdown_directory,
+    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch, query_by_property,
+    save_extensions, set_property,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_query_extensions(),
         tool_schema_brain_diff(),
         tool_schema_project_context(),
+        tool_schema_dead_code(),
         tool_schema_hub_nodes(),
         tool_schema_bridge_nodes(),
         tool_schema_blast_radius(),
@@ -90,6 +92,7 @@ pub fn dispatch(
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
         "project_context" => tool_project_context(store, tantivy, args),
+        "dead_code" => tool_dead_code(store, args),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
@@ -2190,7 +2193,63 @@ fn tool_project_context(
     }))
 }
 
-// ── 18. hub_nodes ─────────────────────────────────────────────────────────
+// ── 18. dead_code ─────────────────────────────────────────────────────────
+
+fn tool_schema_dead_code() -> Value {
+    json!({
+        "name": "dead_code",
+        "description": "Detect potentially dead code by walking forward from all entry points. Symbols not reachable via CALLS, IMPORTS, EXTENDS, IMPLEMENTS, or MEMBER_OF edges are flagged. Each hit includes a confidence level: High (private/internal), Medium (inferred visibility), Low (public — could be library API). Use to find cleanup opportunities or understand code coverage gaps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_confidence": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "default": "low",
+                    "description": "Minimum confidence to include in results. Default 'low' (show all)."
+                }
+            }
+        }
+    })
+}
+
+fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let min_conf_str = args
+        .get("min_confidence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("low");
+    let min_conf =
+        DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
+
+    let result = detect_dead_code(store).context("detect_dead_code")?;
+
+    let filtered: Vec<Value> = result
+        .unreachable_symbols
+        .iter()
+        .filter(|s| s.confidence >= min_conf)
+        .map(|s| {
+            json!({
+                "uid": s.uid,
+                "name": s.name,
+                "kind": s.kind,
+                "file_path": s.file_path,
+                "visibility": s.visibility,
+                "confidence": s.confidence.to_string(),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "total_symbols": result.total_symbols,
+        "reachable_symbols": result.reachable_symbols,
+        "unreachable_count": filtered.len(),
+        "dead_percentage": result.dead_percentage,
+        "min_confidence": min_conf_str,
+        "unreachable_symbols": filtered,
+    }))
+}
+
+// ── 19. hub_nodes ─────────────────────────────────────────────────────────
 
 fn tool_schema_hub_nodes() -> Value {
     json!({
@@ -2247,7 +2306,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
     }))
 }
 
-// ── 19. bridge_nodes ──────────────────────────────────────────────────────
+// ── 20. bridge_nodes ──────────────────────────────────────────────────────
 
 fn tool_schema_bridge_nodes() -> Value {
     json!({
@@ -2301,7 +2360,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     }))
 }
 
-// ── 20. blast_radius ─────────────────────────────────────────────────────
+// ── 21. blast_radius ─────────────────────────────────────────────────────
 
 fn tool_schema_blast_radius() -> Value {
     json!({
