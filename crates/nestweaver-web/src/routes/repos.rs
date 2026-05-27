@@ -1,5 +1,3 @@
-use std::ffi::OsString;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
@@ -48,9 +46,7 @@ pub async fn cross_repo_refs(
 
 pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     // Build manifest cache path: <db_path>.manifests.json
-    let mut manifest_path_os: OsString = state.db_path.as_os_str().to_owned();
-    manifest_path_os.push(".manifests.json");
-    let manifest_path = PathBuf::from(manifest_path_os);
+    let manifest_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
 
     let manifests = nestweaver_engine::load_manifest_cache(&manifest_path)?;
     let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)?;

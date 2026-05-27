@@ -22,11 +22,9 @@ const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Canonical sidecar location for the Tantivy index. Lives next to the
-/// LadybugDB file, mirroring the `.pagerank.json` convention.
+/// LadybugDB file: `<db>.tantivy/`.
 pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".tantivy");
-    std::path::PathBuf::from(s)
+    nestweaver_engine::sidecar_path(db_path, ".tantivy")
 }
 
 /// Run the brain server on stdio until the client closes stdin or sends
@@ -41,7 +39,8 @@ pub fn run_stdio_server(
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
-    let pr_path = db_path.with_extension("pagerank.json");
+    nestweaver_engine::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
+    let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
     // Open the Tantivy index sidecar. Best-effort: if it can't open

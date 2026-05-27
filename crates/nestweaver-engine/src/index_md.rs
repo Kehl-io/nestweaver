@@ -74,7 +74,7 @@ pub fn index_markdown_directory(
     // Write taxonomy alias sidecar if a taxonomy file exists.
     let aliases = load_taxonomy_aliases(vault_root);
     if !aliases.is_empty() {
-        let sidecar_path = db_path.with_extension("aliases.json");
+        let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
         match serde_json::to_string(&aliases) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&sidecar_path, json) {
@@ -100,7 +100,8 @@ pub fn index_markdown_directory(
 ///
 /// Map shape: `canonical_name → [alias1, alias2, ...]`.
 pub fn load_alias_sidecar(db_path: &Path) -> HashMap<String, Vec<String>> {
-    let sidecar_path = db_path.with_extension("aliases.json");
+    crate::migrate_sidecar(db_path, "aliases.json", ".aliases.json");
+    let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
     let Ok(content) = std::fs::read_to_string(&sidecar_path) else {
         return HashMap::new();
     };

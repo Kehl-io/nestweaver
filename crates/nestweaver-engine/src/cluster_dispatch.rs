@@ -186,9 +186,7 @@ fn common_path_prefix(paths: &[&str]) -> Option<String> {
 
 /// Compute the sidecar file path for cluster data: `<db>.clusters.json`.
 pub fn sidecar_path(db_path: &Path) -> PathBuf {
-    let mut p = db_path.as_os_str().to_owned();
-    p.push(".clusters.json");
-    PathBuf::from(p)
+    crate::sidecar_path(db_path, ".clusters.json")
 }
 
 /// Persist clustering output to the sidecar file.

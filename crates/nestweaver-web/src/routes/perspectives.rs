@@ -19,9 +19,7 @@ pub struct Perspective {
 }
 
 fn perspectives_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".perspectives.json");
-    PathBuf::from(s)
+    nestweaver_engine::sidecar_path(db_path, ".perspectives.json")
 }
 
 fn read_perspectives(db_path: &Path) -> Result<Vec<Perspective>, ApiError> {

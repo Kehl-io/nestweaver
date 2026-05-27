@@ -117,17 +117,13 @@ pub fn build_snapshot(
     std::fs::write(output_dir.join(CHECKSUM_FILE), &checksum)?;
 
     // ── Sidecars ────────────────────────────────────────────────────────────
-    // pagerank and manifests use `with_extension` (replaces the `.lbug`
-    // extension), matching the convention in index.rs and main.rs:
-    //   brain.lbug → brain.pagerank.json / brain.manifests.json
-    //
-    // Tantivy appends a suffix (no extension replacement):
-    //   brain.lbug → brain.lbug.tantivy/
+    // All sidecars append a suffix to the database path (preserving the
+    // `.lbug` extension), e.g. `brain.lbug.pagerank.json`.
     //
     // These are best-effort: log a debug message if absent, warn on copy error.
 
     // pagerank sidecar
-    let pagerank_src = db_path.with_extension(SIDECAR_PAGERANK);
+    let pagerank_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_PAGERANK}"));
     if pagerank_src.exists() {
         if let Err(e) = std::fs::copy(&pagerank_src, output_dir.join(SIDECAR_PAGERANK)) {
             tracing::warn!(
@@ -143,7 +139,7 @@ pub fn build_snapshot(
     }
 
     // manifests sidecar
-    let manifests_src = db_path.with_extension(SIDECAR_MANIFESTS);
+    let manifests_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_MANIFESTS}"));
     if manifests_src.exists() {
         if let Err(e) = std::fs::copy(&manifests_src, output_dir.join(SIDECAR_MANIFESTS)) {
             tracing::warn!(
@@ -158,10 +154,8 @@ pub fn build_snapshot(
         );
     }
 
-    // Tantivy index directory — appends suffix, does not replace extension.
-    let mut tantivy_os = db_path.as_os_str().to_owned();
-    tantivy_os.push(std::ffi::OsStr::new(".tantivy"));
-    let tantivy_src = PathBuf::from(tantivy_os);
+    // Tantivy index directory
+    let tantivy_src = crate::sidecar_path(db_path, ".tantivy");
     if tantivy_src.exists() && tantivy_src.is_dir() {
         if let Err(e) = copy_dir_all(&tantivy_src, &output_dir.join(SIDECAR_TANTIVY_DIR)) {
             tracing::warn!(

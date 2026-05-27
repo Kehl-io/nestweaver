@@ -20,9 +20,7 @@ pub struct Presentation {
 }
 
 fn presentations_dir(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".presentations");
-    PathBuf::from(s)
+    nestweaver_engine::sidecar_path(db_path, ".presentations")
 }
 
 fn presentation_file(db_path: &Path, id: &str) -> PathBuf {

@@ -1159,17 +1159,15 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
             }
         }
     };
-    let pr_path = path.with_extension("pagerank.json");
+    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
+    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
     Ok(store)
 }
 
-/// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
-/// `.pagerank.json` sidecar convention.
+/// Tantivy index sidecar location: `<db_path>.tantivy/`.
 fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push(".tantivy");
-    PathBuf::from(s)
+    nestweaver_engine::sidecar_path(db_path, ".tantivy")
 }
 
 fn default_registry_path() -> PathBuf {
@@ -1699,7 +1697,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
-            let cache_path = db_path.with_extension("manifests.json");
+            let cache_path = nestweaver_engine::sidecar_path(db_path, ".manifests.json");
             let manifests = load_manifest_cache(&cache_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
@@ -2319,11 +2317,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
 
-            let lock_path = {
-                let mut s = db_path.as_os_str().to_owned();
-                s.push(".lock");
-                PathBuf::from(s)
-            };
+            let lock_path = nestweaver_engine::sidecar_path(&db_path, ".lock");
             let _ = std::fs::write(&lock_path, process::id().to_string());
 
             let stop_signal = stop.clone();
@@ -2835,7 +2829,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .with_context(|| "compute_pagerank")?;
 
             // Save PageRank cache alongside the DB for use by subsequent commands.
-            let pr_path = db_path.with_extension("pagerank.json");
+            let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
             store
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
@@ -3251,7 +3245,7 @@ fn run_brain(
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
-            let manifests_path = db_path.with_extension("manifests.json");
+            let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path);
@@ -3259,11 +3253,7 @@ fn run_brain(
 
             // Write a PID lock file so MCP servers and other readers know a
             // watcher is active and should open the database read-only.
-            let lock_path = {
-                let mut s = db_path.as_os_str().to_owned();
-                s.push(".lock");
-                std::path::PathBuf::from(s)
-            };
+            let lock_path = nestweaver_engine::sidecar_path(&db_path, ".lock");
             let _ = std::fs::write(&lock_path, std::process::id().to_string());
 
             // Wire Ctrl-C → shutdown_handle.stop(). Best-effort; if the
