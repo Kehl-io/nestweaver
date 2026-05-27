@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use globset::GlobSet;
 use nestweaver_parser::{ParsedNote, is_markdown, parse_markdown};
 use nestweaver_schema::{
     Heading, Note, Section, Tag, Vault, heading_uid, note_uid, section_uid, tag_uid, vault_uid,
@@ -93,6 +94,9 @@ pub struct BrainWatcher {
     /// When set, manifest file changes (Cargo.toml, package.json, …) trigger
     /// a re-parse and sidecar update.
     manifests_path: Option<PathBuf>,
+    /// Compiled `.brainignore` glob patterns. Loaded once at construction
+    /// from the vault root's `.brainignore` file (or built-in defaults).
+    ignore_set: GlobSet,
 }
 
 impl BrainWatcher {
@@ -109,6 +113,7 @@ impl BrainWatcher {
         // (indexer, watcher) pairs.
         let vault_root: PathBuf = vault_root.into();
         let vault_root = std::fs::canonicalize(&vault_root).unwrap_or(vault_root);
+        let ignore_set = crate::brainignore::load_brain_ignore(&vault_root, &[]);
         Self {
             db_path: db_path.into(),
             vault_root,
@@ -117,6 +122,7 @@ impl BrainWatcher {
             stop_flag: Arc::new(AtomicBool::new(false)),
             tantivy_path: None,
             manifests_path: None,
+            ignore_set,
         }
     }
 
@@ -134,6 +140,16 @@ impl BrainWatcher {
     /// update the sidecar at this path.
     pub fn with_manifests_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifests_path = Some(path.into());
+        self
+    }
+
+    /// Replace the ignore set with one that includes additional patterns
+    /// (e.g. from the `--ignore` CLI flag). Reloads the `.brainignore`
+    /// file (or defaults) combined with `extra`.
+    pub fn with_extra_ignore_patterns(mut self, extra: &[String]) -> Self {
+        if !extra.is_empty() {
+            self.ignore_set = crate::brainignore::load_brain_ignore(&self.vault_root, extra);
+        }
         self
     }
 
@@ -375,6 +391,14 @@ impl BrainWatcher {
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
+
+        // Apply .brainignore patterns.
+        if crate::brainignore::is_ignored(&rel_path, &self.ignore_set) {
+            return Ok(UpdateOutcome::Skipped {
+                path,
+                reason: "matched .brainignore pattern",
+            });
+        }
         let n_uid = note_uid(v_uid, &rel_path);
 
         // Reject symlinks whose target is outside the vault root.
