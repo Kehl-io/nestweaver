@@ -2833,14 +2833,21 @@ fn apply_recency_bias_cli(
     if recency_weight <= 0.0 {
         return;
     }
-    let note_timestamps: std::collections::HashMap<String, f64> =
-        store.list_notes(None).unwrap_or_default().into_iter()
-            .filter_map(|n| n.modified_at.map(|t| (n.uid, cli_parse_iso8601_to_epoch(&t))))
-            .collect();
-    let section_note_map: std::collections::HashMap<String, String> =
-        store.list_all_sections().unwrap_or_default().into_iter()
-            .map(|s| (s.uid, s.note_uid))
-            .collect();
+    let note_timestamps: std::collections::HashMap<String, f64> = store
+        .list_notes(None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|n| {
+            n.modified_at
+                .map(|t| (n.uid, cli_parse_iso8601_to_epoch(&t)))
+        })
+        .collect();
+    let section_note_map: std::collections::HashMap<String, String> = store
+        .list_all_sections()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.uid, s.note_uid))
+        .collect();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

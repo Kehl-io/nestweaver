@@ -44,12 +44,7 @@ pub fn parse_iso8601_to_epoch(s: &str) -> f64 {
             let h = tp[0].parse().unwrap_or(0);
             let m = tp[1].parse().unwrap_or(0);
             let sec: u32 = if tp.len() >= 3 {
-                tp[2]
-                    .split('.')
-                    .next()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0)
+                tp[2].split('.').next().unwrap_or("0").parse().unwrap_or(0)
             } else {
                 0
             };
@@ -86,7 +81,10 @@ fn extract_tz(after_t: &str) -> (&str, i64) {
         return (base, 0);
     }
     // `+00:00` / `-00:00` → UTC.
-    if let Some(base) = after_t.strip_suffix("+00:00").or_else(|| after_t.strip_suffix("-00:00")) {
+    if let Some(base) = after_t
+        .strip_suffix("+00:00")
+        .or_else(|| after_t.strip_suffix("-00:00"))
+    {
         return (base, 0);
     }
     // Look for a sign character after position 5 (past "HH:MM") to find the

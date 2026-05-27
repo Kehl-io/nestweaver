@@ -1073,16 +1073,14 @@ impl GraphStore {
                 return Ok(std::collections::HashSet::new());
             }
         };
-        let result = match conn.execute(
-            &mut stmt,
-            vec![("since", Value::String(since.to_string()))],
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::trace!("list_note_uids_modified_since: execute error: {e}");
-                return Ok(std::collections::HashSet::new());
-            }
-        };
+        let result =
+            match conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))]) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("list_note_uids_modified_since: execute error: {e}");
+                    return Ok(std::collections::HashSet::new());
+                }
+            };
         let mut uids = std::collections::HashSet::new();
         for row in result {
             if let Some(Value::String(uid)) = row.first() {
@@ -1116,16 +1114,14 @@ impl GraphStore {
                     return Ok(uids);
                 }
             };
-            let result = match conn.execute(
-                &mut stmt,
-                vec![("nid", Value::String(note_uid.clone()))],
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::trace!("list_section_uids_modified_since: execute error: {e}");
-                    continue;
-                }
-            };
+            let result =
+                match conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::trace!("list_section_uids_modified_since: execute error: {e}");
+                        continue;
+                    }
+                };
             for row in result {
                 if let Some(Value::String(uid)) = row.first() {
                     uids.insert(uid.clone());

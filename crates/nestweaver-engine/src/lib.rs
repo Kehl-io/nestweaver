@@ -1,7 +1,6 @@
 // nestweaver-engine: orchestrates parsing, resolution, and graph construction
 
 pub mod agent_guide;
-pub mod recency;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
@@ -17,6 +16,7 @@ pub mod process;
 pub mod project;
 pub mod pull;
 pub mod query;
+pub mod recency;
 pub mod registry;
 pub mod snapshot;
 pub mod suggest;
@@ -63,11 +63,11 @@ pub use query::{
     build_context, build_feature_context, generate_repo_map, list_repos, list_services,
     lookup_symbol, search_symbols,
 };
+pub use recency::parse_iso8601_to_epoch;
 pub use registry::*;
 pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
     materialize_declared_links, persist_cross_repo_links, suggest_links,
 };
-pub use recency::parse_iso8601_to_epoch;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
