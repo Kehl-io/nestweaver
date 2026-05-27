@@ -53,6 +53,7 @@ pub async fn brain_context(
         &body.seeds,
         state.tantivy.as_ref(),
         &config,
+        None,
     )?;
     let json = serde_json::to_value(&result)?;
     Ok(Json(json).into_response())
