@@ -16,8 +16,11 @@ use crate::util::parent_dir;
 ///    - Re-exports (one level deep) → ReExportResolved confidence
 ///    - Same package/directory → SamePackageFallback confidence
 ///    - No match → confidence 0.0, target_uid = "unresolved:{name}"
-/// 3. Create IMPORTS edges from the import graph: for each resolved import,
-///    link the importing symbol to all exported symbols in the target file
+/// 3. Create IMPORTS edges from the import graph:
+///    a) File-level: one IMPORTS edge per resolved import (first symbol → first symbol)
+///    b) Named: link the enclosing source symbol to all exported target symbols
+///
+/// Edges are deduplicated by (source_uid, target_uid, edge_type).
 pub fn resolve_references(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
@@ -187,11 +190,17 @@ pub fn resolve_references(
 
     // ── Pass 3: Create IMPORTS edges from the import graph ──────────────
     //
-    // For each file, iterate its resolved imports and create IMPORTS edges
-    // from the importing symbol to each exported symbol in the target file.
-    // This is purely additive — it doesn't affect the call/extends/implements
-    // edges created above.
+    // Two sub-passes:
+    //   3a) File-level IMPORTS edges: for every resolved import, create one
+    //       IMPORTS edge from the first symbol in the source file to the first
+    //       symbol in the target file. This is a file-level proxy that ensures
+    //       connectivity even when named-binding data is unavailable.
+    //   3b) Named-import IMPORTS edges (original logic): for each resolved
+    //       import, link the enclosing source symbol to all non-private symbols
+    //       in the target file. These are more precise when available.
     //
+    // Both sub-passes are purely additive. Edges are deduplicated at the end.
+
     // Build a file → symbols lookup for target file symbol access.
     let file_symbols: std::collections::HashMap<&str, &Vec<RawSymbol>> = files
         .iter()
@@ -204,6 +213,26 @@ pub fn resolve_references(
         .map(|(path, _, refs)| (path.as_str(), refs))
         .collect();
 
+    // ── Pass 3a: File-level IMPORTS edges ─────────────────────────────
+    for (src_file, _specifier, tgt_file) in graph.all_resolved_imports() {
+        let src_sym = file_symbols.get(src_file).and_then(|syms| syms.first());
+        let tgt_sym = file_symbols.get(tgt_file).and_then(|syms| syms.first());
+
+        if let (Some(src), Some(tgt)) = (src_sym, tgt_sym) {
+            let source_uid = symbol_uid(repo_uid, src_file, &src.name, src.start_line);
+            let target_uid = symbol_uid(repo_uid, tgt_file, &tgt.name, tgt.start_line);
+            let confidence = confidence_score(MatchType::ImportResolved, language);
+            edges.push(ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type: EdgeType::Imports,
+                confidence,
+                link_type: None,
+            });
+        }
+    }
+
+    // ── Pass 3b: Named-import IMPORTS edges (original precision pass) ─
     for (file_path, _symbols, _references) in files {
         let imports = graph.imports_of(file_path);
         if imports.is_empty() {
@@ -276,6 +305,12 @@ pub fn resolve_references(
                 });
             }
         }
+    }
+
+    // ── Deduplicate edges by (source_uid, target_uid, edge_type) ──────
+    {
+        let mut seen = std::collections::HashSet::new();
+        edges.retain(|e| seen.insert((e.source_uid.clone(), e.target_uid.clone(), e.edge_type)));
     }
 
     edges
@@ -608,7 +643,8 @@ mod tests {
 
     #[test]
     fn imports_edges_use_enclosing_symbol_at_import_line() {
-        // Import at line 15 — enclosing symbol should be "setup" (line 10), not "init" (line 1)
+        // Import at line 15 — named-import pass should use enclosing "setup" (line 10),
+        // and file-level pass should use first symbol "init" (line 1).
         let files = vec![
             (
                 "src/main.js".to_string(),
@@ -627,13 +663,97 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::Imports)
             .collect();
-        assert_eq!(import_edges.len(), 1);
-
-        // The source should be "setup" (line 10), not "init" (line 1)
-        let expected_source = symbol_uid("repo:test:abc", "src/main.js", "setup", 10);
+        // Two IMPORTS edges: file-level (init -> helperFn) + named (setup -> helperFn)
         assert_eq!(
-            import_edges[0].source_uid, expected_source,
-            "should use enclosing symbol at import line as source"
+            import_edges.len(),
+            2,
+            "expected 2 IMPORTS edges; got: {import_edges:?}"
+        );
+
+        // The named-import edge should use "setup" (line 10) as source
+        let named_source = symbol_uid("repo:test:abc", "src/main.js", "setup", 10);
+        assert!(
+            import_edges.iter().any(|e| e.source_uid == named_source),
+            "should have an IMPORTS edge from the enclosing symbol at the import line"
+        );
+
+        // The file-level edge should use "init" (line 1) as source
+        let file_level_source = symbol_uid("repo:test:abc", "src/main.js", "init", 1);
+        assert!(
+            import_edges
+                .iter()
+                .any(|e| e.source_uid == file_level_source),
+            "should have a file-level IMPORTS edge from the first symbol in the file"
+        );
+    }
+
+    #[test]
+    fn file_level_imports_edges_deduplicate() {
+        // Two imports from the same source file to the same target file
+        // should produce only one file-level IMPORTS edge (after dedup).
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 1)],
+                vec![
+                    make_ref("./helper", ReferenceKind::Import, 1),
+                    make_ref("./helper", ReferenceKind::Import, 2),
+                ],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        // File-level and named-import both resolve to (main -> helperFn), deduped to 1
+        assert_eq!(
+            import_edges.len(),
+            1,
+            "duplicate imports should be deduplicated; got: {import_edges:?}"
+        );
+    }
+
+    #[test]
+    fn file_level_imports_edges_for_multiple_targets() {
+        // Imports to two different target files should produce edges to both
+        let files = vec![
+            (
+                "src/main.js".to_string(),
+                vec![make_symbol("main", 1)],
+                vec![
+                    make_ref("./helper", ReferenceKind::Import, 1),
+                    make_ref("./utils", ReferenceKind::Import, 2),
+                ],
+            ),
+            (
+                "src/helper.js".to_string(),
+                vec![make_symbol("helperFn", 1)],
+                vec![],
+            ),
+            (
+                "src/utils.js".to_string(),
+                vec![make_symbol("utilFn", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let import_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports)
+            .collect();
+        // Two targets: main->helperFn and main->utilFn (file-level + named dedup to 2)
+        assert_eq!(
+            import_edges.len(),
+            2,
+            "should have IMPORTS edges to both target files; got: {import_edges:?}"
         );
     }
 
