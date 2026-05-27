@@ -304,12 +304,12 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
 
 // ── Sidecar persistence ──────────────────────────────────────────────────────
 
-/// Compute the sidecar file path: `<db-stem>.summaries.json`.
+/// Compute the sidecar file path: `<db>.summaries.json`.
 ///
-/// Uses `with_extension` to match the convention used by other sidecars
-/// (e.g. `filemeta.json` in `index.rs`): `test.lbug` → `test.summaries.json`.
+/// Uses `OsStr::push` to preserve the `.lbug` extension, producing e.g.
+/// `test.lbug.summaries.json`.
 pub fn sidecar_path(db_path: &Path) -> PathBuf {
-    db_path.with_extension("summaries.json")
+    crate::sidecar_path(db_path, ".summaries.json")
 }
 
 /// Save summaries to the sidecar file.
@@ -326,6 +326,7 @@ pub fn save_summaries(db_path: &Path, summaries: &[Summary]) -> Result<()> {
 /// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar
 /// does not exist.
 pub fn load_summaries(db_path: &Path) -> Result<Option<Vec<Summary>>> {
+    crate::migrate_sidecar(db_path, "summaries.json", ".summaries.json");
     let path = sidecar_path(db_path);
     if !path.exists() {
         return Ok(None);
@@ -574,9 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_path_replaces_extension() {
+    fn sidecar_path_appends_suffix() {
         let db = Path::new("/tmp/test.lbug");
-        let expected = PathBuf::from("/tmp/test.summaries.json");
+        let expected = PathBuf::from("/tmp/test.lbug.summaries.json");
         assert_eq!(sidecar_path(db), expected);
     }
 
