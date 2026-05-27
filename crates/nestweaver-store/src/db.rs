@@ -117,6 +117,23 @@ impl GraphStore {
         Ok(lbug::Connection::new(&self.db)?)
     }
 
+    /// Begin an explicit write transaction. All subsequent writes on the
+    /// returned connection are grouped into a single transaction until
+    /// `commit_transaction` is called, avoiding per-statement WAL flushes.
+    pub fn begin_transaction(&self) -> Result<lbug::Connection<'_>, StoreError> {
+        let conn = self.conn()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| StoreError::Query(format!("begin transaction: {e}")))?;
+        Ok(conn)
+    }
+
+    /// Commit the explicit transaction opened by `begin_transaction`.
+    pub fn commit_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        conn.query("COMMIT")
+            .map_err(|e| StoreError::Query(format!("commit: {e}")))?;
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
@@ -196,6 +213,12 @@ impl GraphStore {
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS_SYM(\
+                FROM Symbol TO Symbol, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS INCLUDES_SYM(\
                 FROM Symbol TO Symbol, confidence FLOAT)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;

@@ -535,35 +535,7 @@ fn index_into_store(
         }
     }
 
-    // 3. Batch insert all File nodes.
-    store
-        .batch_insert_files(&all_files)
-        .context("batch_insert_files")?;
-
-    // 4. Batch insert all Symbol nodes.
-    store
-        .batch_insert_symbols(&all_symbols)
-        .context("batch_insert_symbols")?;
-
-    // 5. Batch insert all REPO_HAS_FILE edges.
-    let repo_file_refs: Vec<(&str, &str)> = repo_file_edge_pairs
-        .iter()
-        .map(|(r, f)| (r.as_str(), f.as_str()))
-        .collect();
-    store
-        .batch_insert_repo_file_edges(&repo_file_refs)
-        .context("batch_insert_repo_file_edges")?;
-
-    // 6. Batch insert all FILE_HAS_SYMBOL edges.
-    let file_sym_refs: Vec<(&str, &str)> = file_symbol_edge_pairs
-        .iter()
-        .map(|(f, s)| (f.as_str(), s.as_str()))
-        .collect();
-    store
-        .batch_insert_file_symbol_edges(&file_sym_refs)
-        .context("batch_insert_file_symbol_edges")?;
-
-    // 7. Group symbols into Services by directory.
+    // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
     let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
     for sym in &all_symbols {
         let dir = sym
@@ -593,17 +565,29 @@ fn index_into_store(
         }
     }
 
-    for svc in &all_services {
-        store.insert_service(svc).context("insert_service")?;
-    }
-
+    let repo_file_refs: Vec<(&str, &str)> = repo_file_edge_pairs
+        .iter()
+        .map(|(r, f)| (r.as_str(), f.as_str()))
+        .collect();
+    let file_sym_refs: Vec<(&str, &str)> = file_symbol_edge_pairs
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
     let svc_sym_refs: Vec<(&str, &str)> = service_symbol_pairs
         .iter()
         .map(|(s, sym)| (s.as_str(), sym.as_str()))
         .collect();
+
     store
-        .batch_insert_service_symbol_edges(&svc_sym_refs)
-        .context("batch_insert_service_symbol_edges")?;
+        .bulk_index_write(
+            &all_files,
+            &all_symbols,
+            &repo_file_refs,
+            &file_sym_refs,
+            &all_services,
+            &svc_sym_refs,
+        )
+        .context("bulk_index_write")?;
 
     // ── Phase 3: Resolve cross-file references ────────────────────────────
     let resolve_pb = ProgressBar::new_spinner();
