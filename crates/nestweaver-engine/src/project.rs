@@ -189,9 +189,7 @@ pub fn materialize_projects(
                                 let heading_uids: Vec<String> = parsed
                                     .headings
                                     .iter()
-                                    .map(|h| {
-                                        heading_uid(&wiki_note_uid, &h.slug, h.start_line)
-                                    })
+                                    .map(|h| heading_uid(&wiki_note_uid, &h.slug, h.start_line))
                                     .collect();
 
                                 let headings: Vec<Heading> = parsed
@@ -231,19 +229,15 @@ pub fn materialize_projects(
                                     .iter()
                                     .map(|sec| {
                                         let text_hash = truncated_hash(&sec.text);
-                                        let s_uid = section_uid(
-                                            &wiki_note_uid,
-                                            sec.start_line,
-                                            &text_hash,
-                                        );
+                                        let s_uid =
+                                            section_uid(&wiki_note_uid, sec.start_line, &text_hash);
                                         let heading_link = sec
                                             .heading_idx
                                             .and_then(|i| heading_uids.get(i))
                                             .cloned();
-                                        let word_count = u32::try_from(
-                                            sec.text.split_whitespace().count(),
-                                        )
-                                        .unwrap_or(u32::MAX);
+                                        let word_count =
+                                            u32::try_from(sec.text.split_whitespace().count())
+                                                .unwrap_or(u32::MAX);
                                         Section {
                                             uid: s_uid,
                                             note_uid: wiki_note_uid.clone(),
