@@ -12,6 +12,12 @@
 (class_definition
   name: (identifier) @name) @definition.class
 
+; Module-level variable assignments (NAME = value at top level)
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @name))) @definition.variable
+
 ; Call expressions
 (call
   function: (identifier) @name) @reference.call
@@ -35,3 +41,7 @@
 (class_definition
   superclasses: (argument_list
     (identifier) @name)) @reference.extends
+
+; Decorator references
+(decorator
+  (identifier) @name) @reference.call

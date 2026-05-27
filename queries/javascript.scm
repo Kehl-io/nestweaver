@@ -13,6 +13,13 @@
     name: (identifier) @name
     value: [(arrow_function) (function_expression)])) @definition.function
 
+; Export-wrapped arrow functions
+(export_statement
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (arrow_function)))) @definition.function
+
 ; Class declarations
 [
   (class_declaration
@@ -24,6 +31,18 @@
 ; Method definitions
 (method_definition
   name: (property_identifier) @name) @definition.method
+
+; Class properties (field definitions)
+(field_definition
+  property: (property_identifier) @name) @definition.property
+
+; Const declarations (non-function values)
+(lexical_declaration
+  kind: "const"
+  (variable_declarator
+    name: (identifier) @name
+    value: (_) @_val)
+  (#not-match? @_val "^(\\(|function|class)")) @definition.const
 
 ; Call expressions (function calls)
 (call_expression

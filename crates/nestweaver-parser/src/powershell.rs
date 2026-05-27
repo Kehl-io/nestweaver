@@ -102,7 +102,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
             let name = cap[1].to_string();
             symbols.push(RawSymbol {
                 name,
-                kind: SymbolKind::Class,
+                kind: SymbolKind::Enum,
                 start_line: line_no,
                 signature: trimmed.to_string(),
                 content_hash: sha256_hex(trimmed),

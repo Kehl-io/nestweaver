@@ -115,6 +115,10 @@ fn parse_symbol_kind(s: &str) -> SymbolKind {
         "Enum" => SymbolKind::Enum,
         "Module" => SymbolKind::Module,
         "Extension" => SymbolKind::Extension,
+        "Constant" => SymbolKind::Constant,
+        "Property" => SymbolKind::Property,
+        "TypeAlias" => SymbolKind::TypeAlias,
+        "Variable" => SymbolKind::Variable,
         other => {
             tracing::warn!("unknown SymbolKind '{}', falling back to Function", other);
             SymbolKind::Function

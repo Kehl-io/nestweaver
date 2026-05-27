@@ -28,6 +28,11 @@ static RE_UNION: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Matches `pub const name = value` — used after struct/enum/union regexes
+/// have been checked, so this only catches plain constants.
+static RE_CONST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(pub\s+)?const\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=").unwrap());
+
 /// Matches `@import("name")`.
 static RE_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"@import\(\s*"([^"]+)"\s*\)"#).unwrap());
@@ -145,6 +150,29 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 type_info: None,
             });
             continue;
+        }
+
+        if let Some(cap) = RE_CONST.captures(line) {
+            let is_pub = cap.get(1).is_some();
+            let name = cap[2].to_string();
+            let visibility = if is_pub {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            symbols.push(RawSymbol {
+                name,
+                kind: SymbolKind::Constant,
+                start_line: line_no,
+                signature: trimmed.to_string(),
+                content_hash: sha256_hex(trimmed),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility,
+                type_info: None,
+            });
+            // Don't continue — fall through to reference detection so
+            // `const std = @import("std")` also emits the import ref.
         }
 
         // ── reference detection ────────────────────────────────────────────

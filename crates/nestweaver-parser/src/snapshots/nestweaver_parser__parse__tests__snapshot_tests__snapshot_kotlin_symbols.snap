@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2000
 expression: "parsed_symbols(\"Simple.kt\", &source)"
 ---
 - name: Greeter
@@ -55,9 +54,18 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Private
   type_info: ~
 - name: AppConfig
-  kind: Class
+  kind: Module
   start_line: 19
   signature: "object AppConfig {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: defaultName
+  kind: Property
+  start_line: 20
+  signature: "val defaultName = \"World\""
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -70,5 +78,23 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
   entry_point_kind: Main
+  visibility: Inferred
+  type_info: ~
+- name: greeter
+  kind: Property
+  start_line: 24
+  signature: val greeter = SimpleGreeter()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: result
+  kind: Property
+  start_line: 25
+  signature: val result = greeter.greet(AppConfig.defaultName)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
   visibility: Inferred
   type_info: ~

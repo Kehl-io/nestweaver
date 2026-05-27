@@ -6,9 +6,9 @@
 (mixin_declaration
   name: (identifier) @name) @definition.trait
 
-; Enum declarations (mapped to class)
+; Enum declarations
 (enum_declaration
-  name: (identifier) @name) @definition.class
+  name: (identifier) @name) @definition.enum
 
 ; Top-level function declarations
 (function_declaration

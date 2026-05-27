@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1874
 expression: "parsed_symbols(\"simple.ts\", &source)"
 ---
 - name: Greeter
@@ -135,3 +134,12 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: Greeter
+- name: greeter
+  kind: Constant
+  start_line: 37
+  signature: const greeter = createGreeter();
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
