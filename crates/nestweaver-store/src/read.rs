@@ -994,6 +994,45 @@ impl GraphStore {
         Ok((symbols, edges))
     }
 
+    /// Returns all code-level edges with their type label and confidence.
+    ///
+    /// Each tuple is `(source_uid, target_uid, edge_type, confidence)`.
+    /// Used by graph-export functions that need the relationship type.
+    pub fn load_typed_edges(&self) -> Result<Vec<(String, String, String, f64)>, StoreError> {
+        let conn = self.conn()?;
+
+        let edge_types = [
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "MEMBER_OF",
+            "INCLUDES_SYM",
+        ];
+        let mut edges: Vec<(String, String, String, f64)> = Vec::new();
+        for et in &edge_types {
+            let q =
+                format!("MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence");
+            let result = match conn.query(&q) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!(
+                        "load_typed_edges: edge type {et} skipped (table may not exist): {e}"
+                    );
+                    continue;
+                }
+            };
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                let confidence = extract_f64(&row, 2)?;
+                edges.push((src, dst, et.to_string(), confidence));
+            }
+        }
+
+        Ok(edges)
+    }
+
     /// Returns all Symbol nodes that `uid` calls (outgoing CALLS edges).
     pub fn callees_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
