@@ -27,11 +27,15 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
    cat integrations/claude-code/settings.json
    ```
 
+> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config and hooks into your project's `.claude/settings.json`.
+
 ## Hooks
 
 | Hook | Trigger | Effect |
 |------|---------|--------|
+| `SessionStart` | Session begins | Prints brain status and staleness check |
 | `pre-read-enrich.sh` | Claude reads a file | Shows related symbols and their graph position |
+| `pre-write-impact` | Claude writes/edits a file | Shows blast radius of the file being modified |
 | `pre-search-enrich.sh` | Claude runs grep/rg | Adds PageRank-ordered graph results |
 | `post-commit-stale-check.sh` | After `git commit` | Warns if index is stale |
 | `post-edit-impact.sh` | After file edits | Shows blast radius of the change |
