@@ -27,6 +27,18 @@ static RE_PROCEDURE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+(?:(\w+)\.)?(\w+)").unwrap()
 });
 
+/// Matches `CREATE [OR REPLACE] TRIGGER name`.
+static RE_TRIGGER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+(?:(\w+)\.)?(\w+)",
+    )
+    .unwrap()
+});
+
+/// Matches `CREATE TYPE name`.
+static RE_TYPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*CREATE\s+TYPE\s+(?:(\w+)\.)?(\w+)").unwrap());
+
 /// Matches table references in FROM/JOIN clauses.
 static RE_TABLE_REF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:FROM|JOIN)\s+(?:(\w+)\.)?(\w+)").unwrap());
@@ -44,6 +56,8 @@ static RE_FK_REF: LazyLock<Regex> =
 /// - `CREATE VIEW` → [`SymbolKind::Class`]
 /// - `CREATE FUNCTION` → [`SymbolKind::Function`]
 /// - `CREATE PROCEDURE` → [`SymbolKind::Function`]
+/// - `CREATE TRIGGER` → [`SymbolKind::Function`]
+/// - `CREATE TYPE` → [`SymbolKind::Class`]
 /// - `FROM`/`JOIN` table refs → [`ReferenceKind::Call`]
 /// - `REFERENCES` (FK) → [`ReferenceKind::Call`]
 pub fn parse_sql(path: &Path, source: &str) -> ParsedFile {
@@ -127,6 +141,38 @@ pub fn parse_sql(path: &Path, source: &str) -> ParsedFile {
             continue;
         }
 
+        if let Some(cap) = RE_TRIGGER.captures(line) {
+            let name = cap.get(2).map_or("", |m| m.as_str()).to_string();
+            symbols.push(RawSymbol {
+                name,
+                kind: SymbolKind::Function,
+                start_line: line_no,
+                signature: trimmed.to_string(),
+                content_hash: sha256_hex(trimmed),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+            });
+            continue;
+        }
+
+        if let Some(cap) = RE_TYPE.captures(line) {
+            let name = cap.get(2).map_or("", |m| m.as_str()).to_string();
+            symbols.push(RawSymbol {
+                name,
+                kind: SymbolKind::Class,
+                start_line: line_no,
+                signature: trimmed.to_string(),
+                content_hash: sha256_hex(trimmed),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+            });
+            continue;
+        }
+
         // ── reference detection ────────────────────────────────────────────
 
         for cap in RE_TABLE_REF.captures_iter(line) {
@@ -180,5 +226,7 @@ fn is_sql_keyword(name: &str) -> bool {
             | "INDEX"
             | "FUNCTION"
             | "PROCEDURE"
+            | "TRIGGER"
+            | "TYPE"
     )
 }

@@ -69,11 +69,13 @@ pub fn parse_fortran(path: &Path, source: &str) -> ParsedFile {
     for (idx, line) in source.lines().enumerate() {
         let line_no = idx as u32 + 1;
 
-        // Skip comment lines (! is the standard free-form comment, C/* for fixed form)
+        // Skip comment lines: '!' is the standard free-form comment character.
+        // Fixed-form: column 1 'c', 'C', or '*' marks the line as a comment.
         let trimmed = line.trim();
-        if trimmed.starts_with('!')
-            || (trimmed.starts_with('c') && !line.is_empty() && line.as_bytes()[0] == b'c')
-        {
+        if trimmed.starts_with('!') {
+            continue;
+        }
+        if !line.is_empty() && matches!(line.as_bytes()[0], b'c' | b'C' | b'*') {
             continue;
         }
 

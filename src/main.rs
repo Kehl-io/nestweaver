@@ -3723,12 +3723,6 @@ fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: u
     taken
 }
 
-/// Parse an ISO 8601 string to Unix epoch seconds (f64).
-/// Delegates to the shared implementation in nestweaver-engine.
-fn cli_parse_iso8601_to_epoch(s: &str) -> f64 {
-    nestweaver_engine::parse_iso8601_to_epoch(s)
-}
-
 /// Apply age-decay score boost to non-Symbol nodes (CLI variant).
 fn apply_recency_bias_cli(
     store: &nestweaver_store::GraphStore,
@@ -3745,7 +3739,7 @@ fn apply_recency_bias_cli(
         .into_iter()
         .filter_map(|n| {
             n.modified_at
-                .map(|t| (n.uid, cli_parse_iso8601_to_epoch(&t)))
+                .map(|t| (n.uid, nestweaver_engine::parse_iso8601_to_epoch(&t)))
         })
         .collect();
     let section_note_map: std::collections::HashMap<String, String> = store

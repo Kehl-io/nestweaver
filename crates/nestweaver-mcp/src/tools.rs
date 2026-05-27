@@ -213,6 +213,11 @@ fn tool_schema_brain_context() -> Value {
                     "type": "number",
                     "default": 30.0,
                     "description": "Half-life for age-decay in days."
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
+                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
                 }
             },
             "required": ["seeds"]
@@ -2201,7 +2206,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Detect potentially dead code by walking forward from all entry points. Symbols not reachable via CALLS, IMPORTS, EXTENDS, IMPLEMENTS, or MEMBER_OF edges are flagged. Each hit includes a confidence level: High (private/internal), Medium (inferred visibility), Low (public — could be library API). Use to find cleanup opportunities or understand code coverage gaps.",
+        "description": "Use when you want to find cleanup opportunities or understand code coverage gaps. Walks forward from every entry point (main functions, HTTP handlers, event listeners, test runners) following CALLS, IMPORTS, EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached are flagged as potentially dead, with confidence scoring based on visibility: High (private/internal — very likely dead), Medium (inferred visibility), Low (public — may be a library API consumed externally).\n\nDo NOT use for understanding what depends on a specific symbol — use brain_impact instead. Do NOT use for finding hub nodes or architectural chokepoints — use hub_nodes or bridge_nodes instead.\n\nThe `min_confidence` parameter filters results (default 'low' = show all). Use `response_format` \"concise\" to get only names and confidence levels (good for quick scan), or \"detailed\" (default) for full metadata including UIDs, file paths, kinds, and visibility.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2210,6 +2215,12 @@ fn tool_schema_dead_code() -> Value {
                     "enum": ["low", "medium", "high"],
                     "default": "low",
                     "description": "Minimum confidence to include in results. Default 'low' (show all)."
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns name + confidence only; \"detailed\" (default) adds UIDs, file paths, kinds, and visibility."
                 }
             }
         }
@@ -2223,6 +2234,7 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         .unwrap_or("low");
     let min_conf =
         DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
+    let concise = is_concise(&args);
 
     let result = detect_dead_code(store).context("detect_dead_code")?;
 
@@ -2231,14 +2243,21 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         .iter()
         .filter(|s| s.confidence >= min_conf)
         .map(|s| {
-            json!({
-                "uid": s.uid,
-                "name": s.name,
-                "kind": s.kind,
-                "file_path": s.file_path,
-                "visibility": s.visibility,
-                "confidence": s.confidence.to_string(),
-            })
+            if concise {
+                json!({
+                    "name": s.name,
+                    "confidence": s.confidence.to_string(),
+                })
+            } else {
+                json!({
+                    "uid": s.uid,
+                    "name": s.name,
+                    "kind": s.kind,
+                    "file_path": s.file_path,
+                    "visibility": s.visibility,
+                    "confidence": s.confidence.to_string(),
+                })
+            }
         })
         .collect();
 
@@ -2257,7 +2276,7 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_hub_nodes() -> Value {
     json!({
         "name": "hub_nodes",
-        "description": "Find the most connected hub nodes in the code graph. Returns nodes ranked by total degree (incoming + outgoing edges). Hub nodes are central abstractions that many parts of the codebase depend on. Use to understand the architectural core.",
+        "description": "Use when you need to identify the most connected symbols in the codebase — the central abstractions that many other parts depend on. Returns nodes ranked by total degree (incoming + outgoing edges), with optional cluster membership. Hub nodes are the architectural core: changing them affects the most code paths.\n\nDo NOT use for finding chokepoints between communities — use bridge_nodes instead. Do NOT use for understanding a specific symbol's dependencies — use brain_impact or flow_trace instead.\n\nThe `top_n` parameter controls how many hubs are returned (default 10). Use `response_format` \"concise\" to get only names and degree counts (good for quick orientation), or \"detailed\" (default) for full metadata including UIDs, file paths, PageRank scores, and cluster IDs.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2265,6 +2284,12 @@ fn tool_schema_hub_nodes() -> Value {
                     "type": "integer",
                     "description": "Number of top hubs to return. Default 10.",
                     "default": 10
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns name + total degree only; \"detailed\" (default) adds UIDs, file paths, PageRank scores, and cluster IDs."
                 }
             }
         }
@@ -2277,6 +2302,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(10);
+    let concise = is_concise(&args);
 
     let mut hubs = find_hub_nodes(store, top_n).context("find_hub_nodes")?;
 
@@ -2289,16 +2315,23 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
     let nodes_json: Vec<Value> = hubs
         .iter()
         .map(|h| {
-            json!({
-                "uid": h.uid,
-                "name": h.name,
-                "file_path": h.file_path,
-                "in_degree": h.in_degree,
-                "out_degree": h.out_degree,
-                "total_degree": h.total_degree,
-                "pagerank_score": h.pagerank_score,
-                "cluster_id": h.cluster_id,
-            })
+            if concise {
+                json!({
+                    "name": h.name,
+                    "total_degree": h.total_degree,
+                })
+            } else {
+                json!({
+                    "uid": h.uid,
+                    "name": h.name,
+                    "file_path": h.file_path,
+                    "in_degree": h.in_degree,
+                    "out_degree": h.out_degree,
+                    "total_degree": h.total_degree,
+                    "pagerank_score": h.pagerank_score,
+                    "cluster_id": h.cluster_id,
+                })
+            }
         })
         .collect();
 
@@ -2314,7 +2347,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_bridge_nodes() -> Value {
     json!({
         "name": "bridge_nodes",
-        "description": "Find architectural chokepoint nodes with high betweenness centrality. Bridge nodes sit on many shortest paths between other nodes — changing them has outsized blast radius. Use to identify fragile connectors between different parts of the codebase.",
+        "description": "Use when you need to find architectural chokepoints — symbols that sit on many shortest paths between other nodes and have outsized blast radius if changed. Returns nodes ranked by betweenness centrality (Brandes' algorithm with sampling), plus which community clusters each bridge connects.\n\nDo NOT use for finding the most-connected nodes — use hub_nodes instead (degree centrality). Do NOT use for single-symbol impact analysis — use brain_impact instead.\n\nThe `top_n` parameter controls how many bridges are returned (default 10). Use `response_format` \"concise\" to get only names and betweenness scores (good for quick triage), or \"detailed\" (default) for full metadata including UIDs, file paths, and connected community IDs.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2322,6 +2355,12 @@ fn tool_schema_bridge_nodes() -> Value {
                     "type": "integer",
                     "description": "Number of top bridges to return. Default 10.",
                     "default": 10
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns name + betweenness score only; \"detailed\" (default) adds UIDs, file paths, and connected community IDs."
                 }
             }
         }
@@ -2334,6 +2373,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(10);
+    let concise = is_concise(&args);
 
     let mut bridges = find_bridge_nodes(store, top_n).context("find_bridge_nodes")?;
 
@@ -2346,13 +2386,20 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let nodes_json: Vec<Value> = bridges
         .iter()
         .map(|b| {
-            json!({
-                "uid": b.uid,
-                "name": b.name,
-                "file_path": b.file_path,
-                "betweenness_score": b.betweenness_score,
-                "communities_connected": b.communities_connected,
-            })
+            if concise {
+                json!({
+                    "name": b.name,
+                    "betweenness_score": b.betweenness_score,
+                })
+            } else {
+                json!({
+                    "uid": b.uid,
+                    "name": b.name,
+                    "file_path": b.file_path,
+                    "betweenness_score": b.betweenness_score,
+                    "communities_connected": b.communities_connected,
+                })
+            }
         })
         .collect();
 
@@ -2479,7 +2526,7 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_get_summary() -> Value {
     json!({
         "name": "get_summary",
-        "description": "Get hierarchical code summaries for token-efficient retrieval. Returns compact, deterministic summaries at three granularity levels: symbol (function/class with callers/callees), file (exports and import sources), or cluster (community architecture with dependencies). No LLM needed — derived entirely from graph data. Use to quickly understand architecture without reading raw code.",
+        "description": "Use when you need a compact architectural overview without reading raw code files. Returns hierarchical, deterministic summaries at three granularity levels: symbol (function/class with callers/callees and file location), file (exports and import sources per file), or cluster (community architecture with key types and cross-cluster dependencies). No LLM needed — summaries are derived entirely from graph data and are highly token-efficient.\n\nDo NOT use for specific symbol lookup — use brain_search or brain_context instead. Do NOT use for understanding a single symbol's call chain — use flow_trace or brain_impact instead.\n\nThe `level` parameter selects granularity: 'symbol' for per-function detail, 'file' for per-file exports, 'cluster' for community-level architecture. Use `target` to filter to a specific file path, symbol name, or cluster name. Use `token_budget` to cap output size for context windows.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2524,13 +2571,14 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         summaries
     };
 
+    let after_filter_len = after_filter.len();
     let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
         truncate_to_budget(&after_filter, budget)
             .into_iter()
             .cloned()
             .collect()
     } else {
-        after_filter.clone()
+        after_filter
     };
 
     let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
@@ -2543,7 +2591,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "total_available": total_available,
         "tokens_used": total_tokens,
         "token_budget": token_budget,
-        "truncated": display.len() < after_filter.len(),
+        "truncated": display.len() < after_filter_len,
         "summaries": text,
     }))
 }

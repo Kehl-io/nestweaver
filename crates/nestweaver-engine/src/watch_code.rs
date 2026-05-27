@@ -23,45 +23,8 @@ use nestweaver_store::{GraphScope, GraphStore};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEvent, new_debouncer};
 
+use crate::index::{is_minified_or_bundled, path_in_skip_dir};
 use crate::watcher::ShutdownHandle;
-
-/// Directory names the code watcher never descends into.
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    ".git",
-    "target",
-    "__pycache__",
-    "vendor",
-    "dist",
-    "build",
-    "coverage",
-    ".claude",
-    ".superpowers",
-    ".next",
-    ".nuxt",
-    ".astro",
-    ".wrangler",
-    "test-results",
-    "playwright-report",
-    ".expo",
-    ".venv",
-    "venv",
-    ".tox",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".pytest_cache",
-    "env",
-    ".env",
-    ".pio",
-    "Pods",
-    "ios",
-    "android",
-    ".gradle",
-    "public",
-    "out",
-    ".output",
-    "storybook-static",
-];
 
 /// Live file-watcher for a code repository. Construct via `new`, then
 /// call `run` — it blocks until `stop()` is signalled or the watcher
@@ -269,7 +232,9 @@ impl CodeWatcher {
                 }
 
                 let duration = start.elapsed();
-                eprintln!(
+                tracing::info!(
+                    files_processed,
+                    elapsed_secs = format!("{:.1}", duration.as_secs_f64()),
                     "Re-indexed {} file(s) ({:.1}s)",
                     files_processed,
                     duration.as_secs_f64()
@@ -285,37 +250,6 @@ type DebounceResult = Result<Vec<DebouncedEvent>, notify::Error>;
 /// Returns true if the file is a supported source language.
 fn is_supported_source(path: &Path) -> bool {
     detect_language(path).is_some()
-}
-
-/// Returns true if any component of `path` is in `SKIP_DIRS`.
-fn path_in_skip_dir(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| SKIP_DIRS.contains(&name))
-    })
-}
-
-/// Returns true if the file looks like a minified bundle or generated artifact.
-fn is_minified_or_bundled(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.ends_with(".min.js")
-        || name.ends_with(".min.ts")
-        || name.ends_with(".bundle.js")
-        || name.ends_with(".chunk.js")
-    {
-        return true;
-    }
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        let parts: Vec<&str> = stem.split('.').collect();
-        if parts.len() >= 2 {
-            let last = parts.last().unwrap_or(&"");
-            if last.len() >= 8 && last.chars().all(|c| c.is_ascii_hexdigit()) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Parse a single source file and insert its File node, Symbol nodes, and
