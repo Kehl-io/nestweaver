@@ -1,0 +1,76 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.m\", &source)"
+---
+- name: GreeterProtocol
+  kind: Interface
+  start_line: 5
+  signature: "@protocol GreeterProtocol"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Function
+  start_line: 6
+  signature: "- (NSString *)greet:(NSString *)name;"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SimpleGreeter
+  kind: Interface
+  start_line: 9
+  signature: "@interface SimpleGreeter : NSObject <GreeterProtocol>"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SimpleGreeter
+  kind: Class
+  start_line: 13
+  signature: "@implementation SimpleGreeter"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: initWithPrefix
+  kind: Method
+  start_line: 15
+  signature: "- (instancetype)initWithPrefix:(NSString *)prefix {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Method
+  start_line: 23
+  signature: "- (NSString *)greet:(NSString *)name {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: formatName
+  kind: Method
+  start_line: 28
+  signature: "- (NSString *)formatName:(NSString *)name {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 34
+  signature: "int main(int argc, const char *argv[]) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~

@@ -1,0 +1,32 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_references(\"simple.zig\", &source)"
+---
+- name: import
+  kind: Call
+  start_line: 1
+  context: "const std = @import(\"std\");"
+- name: std
+  kind: Import
+  start_line: 1
+  context: "const std = @import(\"std\");"
+- name: import
+  kind: Call
+  start_line: 2
+  context: "const math = @import(\"math.zig\");"
+- name: math.zig
+  kind: Import
+  start_line: 2
+  context: "const math = @import(\"math.zig\");"
+- name: print
+  kind: Call
+  start_line: 22
+  context: "std.debug.print(\"Initializing sensor: {s}\\n\", .{config.name});"
+- name: calibrate
+  kind: Call
+  start_line: 23
+  context: calibrate(config);
+- name: initialize
+  kind: Call
+  start_line: 36
+  context: initialize(config);

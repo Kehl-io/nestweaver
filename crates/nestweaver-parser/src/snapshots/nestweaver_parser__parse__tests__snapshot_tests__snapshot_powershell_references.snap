@@ -1,0 +1,40 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_references(\"simple.ps1\", &source)"
+---
+- name: ActiveDirectory
+  kind: Import
+  start_line: 1
+  context: Import-Module ActiveDirectory
+- name: helpers.ps1
+  kind: Includes
+  start_line: 2
+  context: ". .\\helpers.ps1"
+- name: Write-Host
+  kind: Call
+  start_line: 30
+  context: "Write-Host \"Initializing sensor: $($Config.Name)\""
+- name: Set-Threshold
+  kind: Call
+  start_line: 31
+  context: Set-Threshold -Value $Config.Threshold
+- name: Get-WmiObject
+  kind: Call
+  start_line: 39
+  context: $data = Get-WmiObject -Class Win32_Sensor
+- name: Where-Object
+  kind: Call
+  start_line: 40
+  context: "return $data | Where-Object { $_.Name -eq $SensorName }"
+- name: Initialize-Sensor
+  kind: Call
+  start_line: 51
+  context: Initialize-Sensor -Config $config
+- name: Get-SensorData
+  kind: Call
+  start_line: 52
+  context: "$data = Get-SensorData -SensorName \"temp-1\""
+- name: Write-Output
+  kind: Call
+  start_line: 53
+  context: Write-Output $data

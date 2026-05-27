@@ -30,6 +30,10 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "sh" | "bash" => Some(Language::Bash),
         "scala" | "sc" => Some(Language::Scala),
         "ex" | "exs" => Some(Language::Elixir),
+        "zig" => Some(Language::Zig),
+        "m" | "mm" => Some(Language::ObjectiveC),
+        "groovy" | "gradle" => Some(Language::Groovy),
+        "ps1" | "psm1" => Some(Language::PowerShell),
         _ => None,
     }
 }
@@ -88,7 +92,60 @@ mod tests {
 
     #[test]
     fn detect_language_unsupported() {
-        assert_eq!(detect_language(Path::new("foo.zig")), None);
+        assert_eq!(detect_language(Path::new("foo.wat")), None);
+    }
+
+    #[test]
+    fn detect_language_zig() {
+        assert_eq!(detect_language(Path::new("main.zig")), Some(Language::Zig));
+    }
+
+    #[test]
+    fn detect_language_objectivec() {
+        assert_eq!(
+            detect_language(Path::new("Foo.m")),
+            Some(Language::ObjectiveC)
+        );
+    }
+
+    #[test]
+    fn detect_language_objectivec_mm() {
+        assert_eq!(
+            detect_language(Path::new("Foo.mm")),
+            Some(Language::ObjectiveC)
+        );
+    }
+
+    #[test]
+    fn detect_language_groovy() {
+        assert_eq!(
+            detect_language(Path::new("Build.groovy")),
+            Some(Language::Groovy)
+        );
+    }
+
+    #[test]
+    fn detect_language_gradle() {
+        assert_eq!(
+            detect_language(Path::new("build.gradle")),
+            Some(Language::Groovy)
+        );
+    }
+
+    #[test]
+    fn detect_language_powershell() {
+        assert_eq!(
+            detect_language(Path::new("script.ps1")),
+            Some(Language::PowerShell)
+        );
+    }
+
+    #[test]
+    fn detect_language_powershell_module() {
+        assert_eq!(
+            detect_language(Path::new("module.psm1")),
+            Some(Language::PowerShell)
+        );
     }
 
     #[test]

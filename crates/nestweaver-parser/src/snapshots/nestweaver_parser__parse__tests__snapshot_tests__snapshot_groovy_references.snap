@@ -1,0 +1,56 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_references(\"simple.groovy\", &source)"
+---
+- name: groovy.transform.CompileStatic
+  kind: Import
+  start_line: 1
+  context: import groovy.transform.CompileStatic
+- name: java.util.logging.Logger
+  kind: Import
+  start_line: 2
+  context: import java.util.logging.Logger
+- name: println
+  kind: Call
+  start_line: 10
+  context: println(message)
+- name: Greeter
+  kind: Implements
+  start_line: 14
+  context: "class SimpleGreeter implements Greeter {"
+- name: SimpleGreeter
+  kind: Call
+  start_line: 17
+  context: "SimpleGreeter(String prefix) {"
+- name: formatName
+  kind: Call
+  start_line: 22
+  context: String formatted = formatName(name)
+- name: capitalize
+  kind: Call
+  start_line: 27
+  context: return name.capitalize()
+- name: SimpleGreeter
+  kind: Extends
+  start_line: 31
+  context: "class FormalGreeter extends SimpleGreeter {"
+- name: FormalGreeter
+  kind: Call
+  start_line: 32
+  context: "FormalGreeter() {"
+- name: super
+  kind: Call
+  start_line: 33
+  context: "super(\"Dear\")"
+- name: SimpleGreeter
+  kind: Call
+  start_line: 42
+  context: "def greeter = new SimpleGreeter(\"Hello\")"
+- name: greet
+  kind: Call
+  start_line: 43
+  context: "println(greeter.greet(\"world\"))"
+- name: println
+  kind: Call
+  start_line: 43
+  context: "println(greeter.greet(\"world\"))"
