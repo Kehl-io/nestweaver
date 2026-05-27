@@ -129,6 +129,7 @@ fn resolve_specifier(
         Language::Dart => lang::dart::resolve_import(from_file, specifier, known_files),
         Language::Swift => lang::swift::resolve_import(from_file, specifier, known_files),
         Language::Cobol => None,
+        Language::Lua | Language::Bash | Language::Scala | Language::Elixir => None,
     }
 }
 

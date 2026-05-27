@@ -1,0 +1,59 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2398
+expression: "parsed_symbols(\"simple.ex\", &source)"
+---
+- name: Greeter
+  kind: Module
+  start_line: 1
+  signature: defmodule Greeter do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: greet
+  kind: Function
+  start_line: 8
+  signature: def greet(name) do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: format_name
+  kind: Function
+  start_line: 12
+  signature: defp format_name(name) do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: greeting_macro
+  kind: Function
+  start_line: 16
+  signature: defmacro greeting_macro(name) do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Greeter.Formatter
+  kind: Module
+  start_line: 23
+  signature: defmodule Greeter.Formatter do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: format
+  kind: Function
+  start_line: 24
+  signature: def format(text) do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

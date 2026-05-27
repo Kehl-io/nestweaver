@@ -1,0 +1,37 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2376
+expression: "parsed_references(\"simple.sh\", &source)"
+---
+- name: source
+  kind: Call
+  start_line: 3
+  context: "#!/bin/bash"
+- name: source
+  kind: Import
+  start_line: 3
+  context: source ./utils.sh
+- name: echo
+  kind: Call
+  start_line: 8
+  context: "{"
+- name: echo
+  kind: Call
+  start_line: 13
+  context: "echo \"$1\" | tr '[:lower:]' '[:upper:]'"
+- name: tr
+  kind: Call
+  start_line: 13
+  context: "echo \"$1\" | tr '[:lower:]' '[:upper:]'"
+- name: format_name
+  kind: Call
+  start_line: 19
+  context: "$(format_name \"world\")"
+- name: greet
+  kind: Call
+  start_line: 20
+  context: "{"
+- name: main
+  kind: Call
+  start_line: 23
+  context: "#!/bin/bash"
