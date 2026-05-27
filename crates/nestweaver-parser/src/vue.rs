@@ -163,22 +163,22 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                 });
             }
 
-            // setup() function (Vue 2 Options API)
-            if let Some(cap) = RE_FUNCTION.captures(trimmed) {
+            // Named function declarations (non-exported)
+            if !trimmed.starts_with("export")
+                && let Some(cap) = RE_FUNCTION.captures(trimmed)
+            {
                 let name = cap[1].to_string();
-                if name == "setup" {
-                    symbols.push(RawSymbol {
-                        name,
-                        kind: SymbolKind::Function,
-                        start_line: line_no,
-                        signature: trimmed.to_string(),
-                        content_hash: sha256_hex(trimmed),
-                        is_entry_point: false,
-                        entry_point_kind: None,
-                        visibility: Visibility::Public,
-                        type_info: None,
-                    });
-                }
+                symbols.push(RawSymbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    start_line: line_no,
+                    signature: trimmed.to_string(),
+                    content_hash: sha256_hex(trimmed),
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Private,
+                    type_info: None,
+                });
             }
 
             // ── reference detection ────────────────────────────────────
