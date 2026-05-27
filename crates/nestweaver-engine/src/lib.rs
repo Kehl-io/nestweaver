@@ -43,7 +43,9 @@ pub use extensions::{
     save_extensions, set_property,
 };
 pub use index::{
-    IncrementalResult, IndexResult, incremental_index, index_directory, index_directory_in_memory,
+    CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
+    index_directory, index_directory_in_memory, index_directory_with_options, load_filemeta_cache,
+    save_filemeta_cache,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
