@@ -722,8 +722,10 @@ pub fn build_brain_context_hybrid_with_aliases(
         if let Some(db_path) = db_path {
             let ext_store = crate::extensions::load_extensions(db_path);
             let needle = trimmed.to_lowercase();
-            let alias_project = store.list_projects().ok().and_then(|projects| {
-                projects.into_iter().find(|p| {
+            let all_projects = store.list_projects().unwrap_or_default();
+            let alias_matches: Vec<_> = all_projects
+                .iter()
+                .filter(|p| {
                     if let Some(serde_json::Value::Array(aliases)) =
                         ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
                     {
@@ -734,7 +736,18 @@ pub fn build_brain_context_hybrid_with_aliases(
                         false
                     }
                 })
-            });
+                .collect();
+            if alias_matches.len() > 1 {
+                let names: Vec<&str> = alias_matches.iter().map(|p| p.name.as_str()).collect();
+                tracing::warn!(
+                    alias = trimmed,
+                    projects = %names.join(", "),
+                    "Multiple projects match alias '{}': {}",
+                    trimmed,
+                    names.join(", "),
+                );
+            }
+            let alias_project = alias_matches.into_iter().next().cloned();
             if let Some(project) = alias_project {
                 if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
                     seed_uids.extend(note_uids);
