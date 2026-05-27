@@ -47,6 +47,8 @@ nestweaver brain status                  # vault counts, per-vault staleness
 # Projects
 nestweaver list-projects --config ./nestweaver-instance.toml
 nestweaver project-context "my-project" --token-budget 5000
+nestweaver materialize-projects --config ./nestweaver-instance.toml
+nestweaver detect-implicit-projects --vault ~/Documents/Obsidian/MyVault
 
 # Multi-repo / instance config
 nestweaver suggest-links --db ./all.lbug
