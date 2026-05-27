@@ -234,10 +234,18 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
     }
 }
 
-fn build_ts_language(lang: Language) -> tree_sitter::Language {
+fn build_ts_language(lang: Language, path: &Path) -> tree_sitter::Language {
     match lang {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::TypeScript => {
+            // .tsx files contain JSX syntax and need the TSX grammar;
+            // .ts files use the plain TypeScript grammar.
+            if path.extension().and_then(|e| e.to_str()) == Some("tsx") {
+                tree_sitter_typescript::LANGUAGE_TSX.into()
+            } else {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            }
+        }
         Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
@@ -484,7 +492,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         _ => {}
     }
 
-    let ts_lang = build_ts_language(lang);
+    let ts_lang = build_ts_language(lang, path);
 
     let mut parser = tree_sitter::Parser::new();
     parser
