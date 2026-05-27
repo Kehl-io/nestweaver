@@ -1,0 +1,76 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.sv\", &source)"
+---
+- name: top_module
+  kind: Module
+  start_line: 6
+  signature: "module top_module #("
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: axi_if
+  kind: Interface
+  start_line: 32
+  signature: "interface axi_if #("
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: packet
+  kind: Class
+  start_line: 45
+  signature: class packet extends base_packet;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: new
+  kind: Method
+  start_line: 49
+  signature: "function new(string name = \"packet\");"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: build
+  kind: Method
+  start_line: 53
+  signature: function void build();
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: send
+  kind: Method
+  start_line: 57
+  signature: task send(input int port);
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: compute_checksum
+  kind: Function
+  start_line: 62
+  signature: "function automatic int compute_checksum(input bit [7:0] data[], input int len);"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: sub_module
+  kind: Module
+  start_line: 70
+  signature: "module sub_module #("
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~

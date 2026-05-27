@@ -1,0 +1,60 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_references(\"simple.vue\", &source)"
+---
+- name: vue
+  kind: Import
+  start_line: 9
+  context: "import { ref, computed } from 'vue'"
+- name: "./utils/helper"
+  kind: Import
+  start_line: 10
+  context: "import HelperUtil from './utils/helper'"
+- name: formatName
+  kind: Call
+  start_line: 12
+  context: "export function formatName(name) {"
+- name: toUpperCase
+  kind: Call
+  start_line: 13
+  context: return name.trim().toUpperCase()
+- name: trim
+  kind: Call
+  start_line: 13
+  context: return name.trim().toUpperCase()
+- name: setup
+  kind: Call
+  start_line: 21
+  context: "setup(props) {"
+- name: ref
+  kind: Call
+  start_line: 22
+  context: "const greeting = ref(`Hello, ${props.name}!`)"
+- name: computed
+  kind: Call
+  start_line: 23
+  context: "const reversed = computed(() => greeting.value.split('').reverse().join(''))"
+- name: join
+  kind: Call
+  start_line: 23
+  context: "const reversed = computed(() => greeting.value.split('').reverse().join(''))"
+- name: reverse
+  kind: Call
+  start_line: 23
+  context: "const reversed = computed(() => greeting.value.split('').reverse().join(''))"
+- name: split
+  kind: Call
+  start_line: 23
+  context: "const reversed = computed(() => greeting.value.split('').reverse().join(''))"
+- name: handleClick
+  kind: Call
+  start_line: 25
+  context: "function handleClick() {"
+- name: formatName
+  kind: Call
+  start_line: 26
+  context: console.log(formatName(props.name))
+- name: log
+  kind: Call
+  start_line: 26
+  context: console.log(formatName(props.name))

@@ -56,6 +56,10 @@ fn arb_language() -> impl Strategy<Value = Language> {
         Just(Language::C),
         Just(Language::Dart),
         Just(Language::Cobol),
+        Just(Language::Vue),
+        Just(Language::Svelte),
+        Just(Language::Astro),
+        Just(Language::SystemVerilog),
     ]
 }
 

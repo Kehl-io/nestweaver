@@ -39,6 +39,10 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "tf" | "hcl" => Some(Language::Hcl),
         "f90" | "f95" | "f03" | "f08" => Some(Language::Fortran),
         "pas" | "pp" => Some(Language::Pascal),
+        "vue" => Some(Language::Vue),
+        "svelte" => Some(Language::Svelte),
+        "astro" => Some(Language::Astro),
+        "sv" | "svh" => Some(Language::SystemVerilog),
         _ => None,
     }
 }
@@ -364,6 +368,43 @@ mod tests {
         assert_eq!(
             detect_language(Path::new("unit.pp")),
             Some(Language::Pascal)
+        );
+    }
+
+    #[test]
+    fn detect_language_vue() {
+        assert_eq!(detect_language(Path::new("App.vue")), Some(Language::Vue));
+    }
+
+    #[test]
+    fn detect_language_svelte() {
+        assert_eq!(
+            detect_language(Path::new("App.svelte")),
+            Some(Language::Svelte)
+        );
+    }
+
+    #[test]
+    fn detect_language_astro() {
+        assert_eq!(
+            detect_language(Path::new("Page.astro")),
+            Some(Language::Astro)
+        );
+    }
+
+    #[test]
+    fn detect_language_systemverilog() {
+        assert_eq!(
+            detect_language(Path::new("module.sv")),
+            Some(Language::SystemVerilog)
+        );
+    }
+
+    #[test]
+    fn detect_language_systemverilog_header() {
+        assert_eq!(
+            detect_language(Path::new("defs.svh")),
+            Some(Language::SystemVerilog)
         );
     }
 }
