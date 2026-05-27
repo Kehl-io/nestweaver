@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use lbug::Value;
-use nestweaver_schema::Symbol;
+use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
@@ -180,26 +180,29 @@ pub struct GraphScope {
 }
 
 impl GraphScope {
-    /// The original PPR scope: Symbol nodes + the five code edge types
-    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF). Edge
-    /// confidence is returned as the third column to weight PPR transitions.
+    /// The original PPR scope: Symbol nodes + the six code edge types
+    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF, INCLUDES_SYM).
+    /// Edge confidence is returned as the third column to weight PPR transitions.
     pub fn code_only() -> Self {
+        let code_edge_types = [
+            EdgeType::Calls,
+            EdgeType::Imports,
+            EdgeType::Extends,
+            EdgeType::Implements,
+            EdgeType::MemberOf,
+            EdgeType::Includes,
+        ];
         Self {
             node_queries: vec!["MATCH (s:Symbol) RETURN s.uid".to_string()],
-            edge_queries: vec![
-                "MATCH (a:Symbol)-[r:CALLS]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Symbol)-[r:IMPORTS]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Symbol)-[r:EXTENDS_SYM]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Symbol)-[r:IMPLEMENTS_SYM]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Symbol)-[r:MEMBER_OF]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Symbol)-[r:INCLUDES_SYM]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-            ],
+            edge_queries: code_edge_types
+                .iter()
+                .map(|et| {
+                    format!(
+                        "MATCH (a:Symbol)-[r:{}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence",
+                        et.rel_table_name()
+                    )
+                })
+                .collect(),
         }
     }
 
