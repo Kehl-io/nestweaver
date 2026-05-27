@@ -66,6 +66,7 @@ Default database: `./nestweaver.lbug`. Override with `--db <path>` or `NESTWEAVE
 Sidecar files written alongside the database:
 - `<db>.pagerank.json` — in-memory PageRank cache (written on `index`, loaded on open)
 - `<db>.manifests.json` — parsed manifest data (package.json, go.mod, Cargo.toml, pyproject.toml, requirements.txt, composer.json, Gemfile, pubspec.yaml, Package.swift, *.csproj, build.gradle.kts, CMakeLists.txt)
+- `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index)
 - `<db>.tantivy/` — BM25 full-text search index for notes and sections
 - `<db>.extensions.json` — user-defined extension properties on nodes
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
