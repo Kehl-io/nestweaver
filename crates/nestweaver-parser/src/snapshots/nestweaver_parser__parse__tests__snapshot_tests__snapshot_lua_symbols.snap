@@ -1,0 +1,41 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2356
+expression: "parsed_symbols(\"simple.lua\", &source)"
+---
+- name: "Greeter:new"
+  kind: Method
+  start_line: 7
+  signature: "function Greeter:new(name)"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: "Greeter:greet"
+  kind: Method
+  start_line: 13
+  signature: "function Greeter:greet()"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: format_name
+  kind: Function
+  start_line: 18
+  signature: function format_name(name)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: helper
+  kind: Function
+  start_line: 23
+  signature: local function helper(input)
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

@@ -26,6 +26,10 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "c" | "h" => Some(Language::C),
         "dart" => Some(Language::Dart),
         "cbl" | "cob" | "cpy" => Some(Language::Cobol),
+        "lua" => Some(Language::Lua),
+        "sh" | "bash" => Some(Language::Bash),
+        "scala" | "sc" => Some(Language::Scala),
+        "ex" | "exs" => Some(Language::Elixir),
         _ => None,
     }
 }
@@ -181,5 +185,49 @@ mod tests {
     #[test]
     fn detect_language_hpp_still_cpp() {
         assert_eq!(detect_language(Path::new("foo.hpp")), Some(Language::Cpp));
+    }
+
+    #[test]
+    fn detect_language_lua() {
+        assert_eq!(detect_language(Path::new("init.lua")), Some(Language::Lua));
+    }
+
+    #[test]
+    fn detect_language_bash_sh() {
+        assert_eq!(detect_language(Path::new("run.sh")), Some(Language::Bash));
+    }
+
+    #[test]
+    fn detect_language_bash_bash() {
+        assert_eq!(detect_language(Path::new("run.bash")), Some(Language::Bash));
+    }
+
+    #[test]
+    fn detect_language_scala() {
+        assert_eq!(
+            detect_language(Path::new("Main.scala")),
+            Some(Language::Scala)
+        );
+    }
+
+    #[test]
+    fn detect_language_scala_sc() {
+        assert_eq!(
+            detect_language(Path::new("script.sc")),
+            Some(Language::Scala)
+        );
+    }
+
+    #[test]
+    fn detect_language_elixir_ex() {
+        assert_eq!(detect_language(Path::new("lib.ex")), Some(Language::Elixir));
+    }
+
+    #[test]
+    fn detect_language_elixir_exs() {
+        assert_eq!(
+            detect_language(Path::new("test.exs")),
+            Some(Language::Elixir)
+        );
     }
 }

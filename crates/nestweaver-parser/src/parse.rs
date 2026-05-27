@@ -23,6 +23,10 @@ const PHP_QUERY: &str = include_str!("../../../queries/php.scm");
 const RUBY_QUERY: &str = include_str!("../../../queries/ruby.scm");
 const DART_QUERY: &str = include_str!("../../../queries/dart.scm");
 const SWIFT_QUERY: &str = include_str!("../../../queries/swift.scm");
+const LUA_QUERY: &str = include_str!("../../../queries/lua.scm");
+const BASH_QUERY: &str = include_str!("../../../queries/bash.scm");
+const SCALA_QUERY: &str = include_str!("../../../queries/scala.scm");
+const ELIXIR_QUERY: &str = include_str!("../../../queries/elixir.scm");
 
 // ── error ──────────────────────────────────────────────────────────────────
 
@@ -170,6 +174,37 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Public
             }
         }
+        // Lua: local keyword = private, else global/public
+        Language::Lua => {
+            let sig = first_line(node_text);
+            if sig.starts_with("local ") {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            }
+        }
+        // Bash: all functions have inferred visibility
+        Language::Bash => Visibility::Inferred,
+        // Scala: check for visibility keywords
+        Language::Scala => {
+            let sig = first_line(node_text);
+            if sig.contains("private ") || sig.contains("private[") {
+                Visibility::Private
+            } else if sig.contains("protected ") || sig.contains("protected[") {
+                Visibility::Protected
+            } else {
+                Visibility::Public
+            }
+        }
+        // Elixir: defp = private, def = public
+        Language::Elixir => {
+            let sig = first_line(node_text);
+            if sig.contains("defp ") || sig.contains("defmacrop ") {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            }
+        }
         // Ruby, Cobol: inferred (visibility detection is complex, defer)
         Language::Ruby | Language::Cobol => Visibility::Inferred,
     }
@@ -191,6 +226,10 @@ fn build_ts_language(lang: Language) -> tree_sitter::Language {
         Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Bash => tree_sitter_bash::LANGUAGE.into(),
+        Language::Scala => tree_sitter_scala::LANGUAGE.into(),
+        Language::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
     }
 }
@@ -211,6 +250,10 @@ fn query_source(lang: Language) -> &'static str {
         Language::Ruby => RUBY_QUERY,
         Language::Dart => DART_QUERY,
         Language::Swift => SWIFT_QUERY,
+        Language::Lua => LUA_QUERY,
+        Language::Bash => BASH_QUERY,
+        Language::Scala => SCALA_QUERY,
+        Language::Elixir => ELIXIR_QUERY,
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
     }
 }
@@ -400,6 +443,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Ruby => "ruby",
         Language::Dart => "dart",
         Language::Swift => "swift",
+        Language::Lua => "lua",
+        Language::Bash => "bash",
+        Language::Scala => "scala",
+        Language::Elixir => "elixir",
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
     };
     let file_path_str = path.to_string_lossy();
@@ -1814,6 +1861,239 @@ mod tests {
         );
     }
 
+    // ── Lua tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_lua_extracts_functions() {
+        let source = fixture("lua/simple.lua");
+        let parsed = parse_source(Path::new("simple.lua"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "format_name"),
+            "should find global function 'format_name'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_lua_extracts_methods() {
+        let source = fixture("lua/simple.lua");
+        let parsed = parse_source(Path::new("simple.lua"), &source).unwrap();
+
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            !methods.is_empty(),
+            "should find methods; got symbols: {:?}",
+            parsed
+                .symbols
+                .iter()
+                .map(|s| (&s.name, s.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_lua_extracts_call_references() {
+        let source = fixture("lua/simple.lua");
+        let parsed = parse_source(Path::new("simple.lua"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "should find call references; all refs: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Bash tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bash_extracts_functions() {
+        let source = fixture("bash/simple.sh");
+        let parsed = parse_source(Path::new("simple.sh"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "greet"),
+            "should find function 'greet'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "format_name"),
+            "should find function 'format_name'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "main"),
+            "should find function 'main'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_bash_extracts_call_references() {
+        let source = fixture("bash/simple.sh");
+        let parsed = parse_source(Path::new("simple.sh"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "should find call references; all refs: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Scala tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_scala_extracts_class_and_trait() {
+        let source = fixture("scala/Simple.scala");
+        let parsed = parse_source(Path::new("Simple.scala"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "SimpleGreeter"),
+            "should find class 'SimpleGreeter'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "AppConfig"),
+            "should find object 'AppConfig' as class; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let traits: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Trait)
+            .collect();
+        assert!(
+            traits.iter().any(|s| s.name == "Greeter"),
+            "should find trait 'Greeter'; got: {:?}",
+            traits.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_scala_extracts_functions() {
+        let source = fixture("scala/Simple.scala");
+        let parsed = parse_source(Path::new("Simple.scala"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            !functions.is_empty(),
+            "should find function definitions; got symbols: {:?}",
+            parsed
+                .symbols
+                .iter()
+                .map(|s| (&s.name, s.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_scala_extracts_references() {
+        let source = fixture("scala/Simple.scala");
+        let parsed = parse_source(Path::new("Simple.scala"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            !imports.is_empty(),
+            "should find import references; all refs: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Elixir tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_elixir_extracts_modules() {
+        let source = fixture("elixir/simple.ex");
+        let parsed = parse_source(Path::new("simple.ex"), &source).unwrap();
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "Greeter"),
+            "should find module 'Greeter'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_elixir_extracts_functions() {
+        let source = fixture("elixir/simple.ex");
+        let parsed = parse_source(Path::new("simple.ex"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "greet"),
+            "should find function 'greet'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_elixir_extracts_references() {
+        let source = fixture("elixir/simple.ex");
+        let parsed = parse_source(Path::new("simple.ex"), &source).unwrap();
+
+        let refs: Vec<_> = parsed.references.iter().collect();
+        assert!(!refs.is_empty(), "should find references; got none");
+    }
+
     // ── Unsupported language ───────────────────────────────────────────────
 
     #[test]
@@ -2060,6 +2340,62 @@ mod tests {
         fn snapshot_cobol_references() {
             let source = fixture("cobol/simple.cbl");
             assert_yaml_snapshot!(parsed_references("simple.cbl", &source));
+        }
+
+        // ── Lua ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_lua_symbols() {
+            let source = fixture("lua/simple.lua");
+            assert_yaml_snapshot!(parsed_symbols("simple.lua", &source));
+        }
+
+        #[test]
+        fn snapshot_lua_references() {
+            let source = fixture("lua/simple.lua");
+            assert_yaml_snapshot!(parsed_references("simple.lua", &source));
+        }
+
+        // ── Bash ────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_bash_symbols() {
+            let source = fixture("bash/simple.sh");
+            assert_yaml_snapshot!(parsed_symbols("simple.sh", &source));
+        }
+
+        #[test]
+        fn snapshot_bash_references() {
+            let source = fixture("bash/simple.sh");
+            assert_yaml_snapshot!(parsed_references("simple.sh", &source));
+        }
+
+        // ── Scala ───────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_scala_symbols() {
+            let source = fixture("scala/Simple.scala");
+            assert_yaml_snapshot!(parsed_symbols("Simple.scala", &source));
+        }
+
+        #[test]
+        fn snapshot_scala_references() {
+            let source = fixture("scala/Simple.scala");
+            assert_yaml_snapshot!(parsed_references("Simple.scala", &source));
+        }
+
+        // ── Elixir ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_elixir_symbols() {
+            let source = fixture("elixir/simple.ex");
+            assert_yaml_snapshot!(parsed_symbols("simple.ex", &source));
+        }
+
+        #[test]
+        fn snapshot_elixir_references() {
+            let source = fixture("elixir/simple.ex");
+            assert_yaml_snapshot!(parsed_references("simple.ex", &source));
         }
     }
 }

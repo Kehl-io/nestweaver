@@ -17,6 +17,10 @@ pub enum Language {
     C,
     Dart,
     Cobol,
+    Lua,
+    Bash,
+    Scala,
+    Elixir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,6 +62,10 @@ pub fn confidence_score(match_type: MatchType, language: Language) -> f32 {
             | Language::CSharp,
         ) => 0.05,
         (MatchType::ImportResolved, Language::Dart | Language::Swift) => 0.03,
+        (MatchType::ImportResolved, Language::Scala) => 0.05,
+        (MatchType::ImportResolved, Language::Elixir) => -0.05,
+        (MatchType::ImportResolved, Language::Lua) => -0.10,
+        (MatchType::ImportResolved, Language::Bash) => -0.15,
         (MatchType::ImportResolved, Language::Python | Language::Ruby) => -0.10,
         (MatchType::ImportResolved, Language::Php) => -0.05,
         (MatchType::ImportResolved, Language::Cobol) => -0.15,
@@ -98,6 +106,10 @@ mod tests {
             Language::C,
             Language::Dart,
             Language::Cobol,
+            Language::Lua,
+            Language::Bash,
+            Language::Scala,
+            Language::Elixir,
         ] {
             let score = confidence_score(MatchType::Unresolved, lang);
             assert!((score - 0.0).abs() < f32::EPSILON, "got: {score}");
@@ -158,6 +170,10 @@ mod tests {
             Language::C,
             Language::Dart,
             Language::Cobol,
+            Language::Lua,
+            Language::Bash,
+            Language::Scala,
+            Language::Elixir,
         ];
         let matches = [
             MatchType::SameFileExact,
@@ -236,6 +252,10 @@ mod tests {
             Language::C,
             Language::Dart,
             Language::Cobol,
+            Language::Lua,
+            Language::Bash,
+            Language::Scala,
+            Language::Elixir,
         ];
         let matches = [
             MatchType::SameFileExact,

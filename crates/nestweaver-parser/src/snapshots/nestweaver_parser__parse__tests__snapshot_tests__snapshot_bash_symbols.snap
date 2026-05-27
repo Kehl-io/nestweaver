@@ -1,0 +1,32 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2370
+expression: "parsed_symbols(\"simple.sh\", &source)"
+---
+- name: greet
+  kind: Function
+  start_line: 6
+  signature: "greet() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: format_name
+  kind: Function
+  start_line: 12
+  signature: "format_name() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 17
+  signature: "main() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Inferred
+  type_info: ~

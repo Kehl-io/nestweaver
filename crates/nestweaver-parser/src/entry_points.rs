@@ -27,6 +27,10 @@ pub fn detect_entry_point(
         "cobol" => detect_cobol(name, file_path, kind, signature),
         "rust" => detect_rust(name, file_path, kind, signature),
         "cpp" => detect_cpp(name, file_path, kind, signature),
+        "lua" => detect_lua(name, file_path, kind, signature),
+        "bash" => detect_bash(name, file_path, kind, signature),
+        "scala" => detect_scala(name, file_path, kind, signature),
+        "elixir" => detect_elixir(name, file_path, kind, signature),
         _ => None,
     }
 }
@@ -392,6 +396,72 @@ fn detect_cpp(
     }
     if name == "TEST" || name == "TEST_F" || name == "TEST_P" {
         return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_lua(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    None
+}
+
+fn detect_bash(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    None
+}
+
+fn detect_scala(
+    name: &str,
+    file_path: &str,
+    _kind: &str,
+    signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    if let Some(sig) = signature
+        && sig.contains("@main")
+    {
+        return Some(EntryPointKind::Main);
+    }
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if name.starts_with("test")
+        && (file_name.ends_with("Test.scala") || file_name.ends_with("Spec.scala"))
+    {
+        return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_elixir(
+    name: &str,
+    file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if name.starts_with("test") && file_name.ends_with("_test.exs") {
+        return Some(EntryPointKind::TestEntry);
+    }
+    if file_path.contains("/controllers/") {
+        return Some(EntryPointKind::HttpHandler);
     }
     None
 }
