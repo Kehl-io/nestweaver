@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use nestweaver_schema::{Note, NoteKind, Project, note_uid, project_uid, truncated_hash};
+use nestweaver_schema::{
+    Heading, Note, NoteKind, Project, Section, heading_uid, note_uid, project_uid, section_uid,
+    truncated_hash,
+};
 use nestweaver_store::GraphStore;
 
 use crate::config::InstanceConfig;
@@ -175,6 +178,101 @@ pub fn materialize_projects(
                                     "failed to insert wiki note"
                                 );
                                 continue;
+                            }
+
+                            // Decompose the wiki note into headings and sections.
+                            if let Ok(parsed) = nestweaver_parser::parse_markdown(
+                                &format!("{}/{}", ws.tool, ws.label),
+                                &content,
+                            ) {
+                                // Build heading UIDs so sections can reference them.
+                                let heading_uids: Vec<String> = parsed
+                                    .headings
+                                    .iter()
+                                    .map(|h| {
+                                        heading_uid(&wiki_note_uid, &h.slug, h.start_line)
+                                    })
+                                    .collect();
+
+                                let headings: Vec<Heading> = parsed
+                                    .headings
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, h)| Heading {
+                                        uid: heading_uids[idx].clone(),
+                                        note_uid: wiki_note_uid.clone(),
+                                        level: h.level,
+                                        text: h.text.clone(),
+                                        slug: h.slug.clone(),
+                                        start_line: h.start_line,
+                                        end_line: h.end_line,
+                                        content_hash: truncated_hash(&h.text),
+                                    })
+                                    .collect();
+
+                                if !headings.is_empty() {
+                                    if let Err(e) = store.batch_insert_headings(&headings) {
+                                        tracing::warn!(
+                                            label = ws.label,
+                                            error = %e,
+                                            "failed to insert wiki note headings"
+                                        );
+                                    } else {
+                                        let nh_edges: Vec<(&str, &str)> = heading_uids
+                                            .iter()
+                                            .map(|h| (wiki_note_uid.as_str(), h.as_str()))
+                                            .collect();
+                                        let _ = store.batch_insert_note_heading_edges(&nh_edges);
+                                    }
+                                }
+
+                                let sections: Vec<Section> = parsed
+                                    .sections
+                                    .iter()
+                                    .map(|sec| {
+                                        let text_hash = truncated_hash(&sec.text);
+                                        let s_uid = section_uid(
+                                            &wiki_note_uid,
+                                            sec.start_line,
+                                            &text_hash,
+                                        );
+                                        let heading_link = sec
+                                            .heading_idx
+                                            .and_then(|i| heading_uids.get(i))
+                                            .cloned();
+                                        let word_count = u32::try_from(
+                                            sec.text.split_whitespace().count(),
+                                        )
+                                        .unwrap_or(u32::MAX);
+                                        Section {
+                                            uid: s_uid,
+                                            note_uid: wiki_note_uid.clone(),
+                                            heading_uid: heading_link,
+                                            start_line: sec.start_line,
+                                            end_line: sec.end_line,
+                                            text_hash,
+                                            text_content: sec.text.clone(),
+                                            word_count,
+                                            pagerank_score: None,
+                                        }
+                                    })
+                                    .collect();
+
+                                if !sections.is_empty() {
+                                    if let Err(e) = store.batch_insert_sections(&sections) {
+                                        tracing::warn!(
+                                            label = ws.label,
+                                            error = %e,
+                                            "failed to insert wiki note sections"
+                                        );
+                                    } else {
+                                        let ns_edges: Vec<(&str, &str)> = sections
+                                            .iter()
+                                            .map(|s| (wiki_note_uid.as_str(), s.uid.as_str()))
+                                            .collect();
+                                        let _ = store.batch_insert_note_section_edges(&ns_edges);
+                                    }
+                                }
                             }
 
                             let edge = (uid.as_str(), wiki_note_uid.as_str());
