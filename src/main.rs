@@ -12,13 +12,14 @@ use nestweaver_engine::{
     FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, detect_dead_code, discover_cross_domain_links,
-    embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
-    generate_repo_map, generate_skill, generate_summaries, incremental_index, index_directory,
-    index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
-    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, render_text,
-    save_clusters, save_summaries, search_symbols, suggest_links, truncate_to_budget,
+    changed_files_from_git, compute_clusters, detect_dead_code, detect_implicit_projects,
+    discover_cross_domain_links, embedding::generate_embedding, export_cypher, export_graphml,
+    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md,
+    generate_cursor_rule, generate_guide, generate_repo_map, generate_skill, generate_summaries,
+    incremental_index, index_directory, index_markdown_directory, index_markdown_directory_since,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_manifest_cache,
+    lookup_symbol, materialize_projects, render_text, save_clusters, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex};
@@ -843,6 +844,44 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Instance ID (for multi-instance setups)")]
         instance: Option<String>,
+    },
+
+    /// Materialize declared projects, wiki sources, and cross-repo links
+    ///
+    /// Reads [[projects]] from an instance config and creates Project nodes,
+    /// attaches notes by vault folder, symbols by repo, component edges, and
+    /// ingests wiki sources via MCP tool calls.
+    #[command(
+        after_help = "Examples:\n  nestweaver materialize-projects --config ./instance.toml\n  nestweaver materialize-projects --config ./instance.toml --db ./custom.lbug"
+    )]
+    MaterializeProjects {
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// Detect implicit projects from vault Projects/ folder structure
+    ///
+    /// Walks `<vault>/Projects/` and auto-detects project folders whose entry
+    /// note exists at `Projects/<slug>/<slug>.md`. Creates Project nodes and
+    /// links all notes under each project folder.
+    #[command(
+        after_help = "Examples:\n  nestweaver detect-implicit-projects --vault ~/Documents/Obsidian/MyVault\n  nestweaver detect-implicit-projects --vault ./notes --instance my-instance"
+    )]
+    DetectImplicitProjects {
+        #[arg(long, help = "Path to vault directory")]
+        vault: PathBuf,
+        #[arg(long, help = "Instance ID [default: default]")]
+        instance: Option<String>,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -2758,6 +2797,83 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_ERROR, None))
                 }
             }
+        }
+
+        Commands::MaterializeProjects { config, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
+            let instance_id = &instance_config.instance_id;
+
+            out.status(&format!(
+                "Materializing {} project(s) from {}...",
+                instance_config.projects.len(),
+                config.display()
+            ));
+
+            let result = materialize_projects(&store, &instance_config, instance_id, &db_path)?;
+
+            println!(
+                "Materialized {} project(s): {} note edge(s), {} symbol edge(s), \
+                 {} component edge(s), {} wiki note(s) ingested.",
+                result.projects_created,
+                result.note_edges,
+                result.symbol_edges,
+                result.component_edges,
+                result.wiki_notes_ingested,
+            );
+
+            let stats = format!(
+                "{} projects in {}",
+                result.projects_created,
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::DetectImplicitProjects {
+            vault,
+            instance,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let instance_id = instance.as_deref().unwrap_or("default");
+
+            if !vault.exists() || !vault.is_dir() {
+                eprintln!("Error: vault path is not a directory: {}", vault.display());
+                return Ok((EXIT_ERROR, None));
+            }
+
+            // Resolve the vault UID the same way the brain indexer does.
+            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
+
+            out.status(&format!(
+                "Scanning {}/Projects/ for implicit projects...",
+                vault.display()
+            ));
+
+            let detected = detect_implicit_projects(&store, &vault, &vault_uid, instance_id)?;
+
+            if detected.is_empty() {
+                println!(
+                    "No implicit projects found in {}/Projects/.",
+                    vault.display()
+                );
+            } else {
+                println!("Detected {} implicit project(s):", detected.len());
+                for slug in &detected {
+                    println!("  {slug}");
+                }
+            }
+
+            let stats = format!(
+                "{} projects in {}",
+                detected.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::Index {
