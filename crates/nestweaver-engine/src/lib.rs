@@ -23,7 +23,7 @@ pub mod summary;
 pub mod vector_search;
 pub mod watcher;
 
-pub use agent_guide::generate_guide;
+pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
