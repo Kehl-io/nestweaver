@@ -21,6 +21,10 @@ pub enum Language {
     Bash,
     Scala,
     Elixir,
+    Zig,
+    ObjectiveC,
+    Groovy,
+    PowerShell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,6 +114,10 @@ mod tests {
             Language::Bash,
             Language::Scala,
             Language::Elixir,
+            Language::Zig,
+            Language::ObjectiveC,
+            Language::Groovy,
+            Language::PowerShell,
         ] {
             let score = confidence_score(MatchType::Unresolved, lang);
             assert!((score - 0.0).abs() < f32::EPSILON, "got: {score}");
@@ -174,6 +182,10 @@ mod tests {
             Language::Bash,
             Language::Scala,
             Language::Elixir,
+            Language::Zig,
+            Language::ObjectiveC,
+            Language::Groovy,
+            Language::PowerShell,
         ];
         let matches = [
             MatchType::SameFileExact,
@@ -256,6 +268,10 @@ mod tests {
             Language::Bash,
             Language::Scala,
             Language::Elixir,
+            Language::Zig,
+            Language::ObjectiveC,
+            Language::Groovy,
+            Language::PowerShell,
         ];
         let matches = [
             MatchType::SameFileExact,

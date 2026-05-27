@@ -1,0 +1,58 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.zig\", &source)"
+---
+- name: SensorKind
+  kind: Class
+  start_line: 4
+  signature: "pub const SensorKind = enum {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: SensorConfig
+  kind: Class
+  start_line: 10
+  signature: "pub const SensorConfig = struct {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: InternalState
+  kind: Class
+  start_line: 16
+  signature: "const InternalState = union {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: initialize
+  kind: Function
+  start_line: 21
+  signature: "pub fn initialize(config: SensorConfig) void {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: calibrate
+  kind: Function
+  start_line: 26
+  signature: "fn calibrate(config: SensorConfig) void {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 30
+  signature: "pub fn main() !void {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~

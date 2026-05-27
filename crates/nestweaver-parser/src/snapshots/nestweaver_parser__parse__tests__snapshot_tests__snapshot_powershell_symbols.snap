@@ -1,0 +1,67 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: "parsed_symbols(\"simple.ps1\", &source)"
+---
+- name: SensorConfig
+  kind: Class
+  start_line: 4
+  signature: "class SensorConfig {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: ToString
+  kind: Method
+  start_line: 13
+  signature: "[string] ToString() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Priority
+  kind: Class
+  start_line: 18
+  signature: "enum Priority {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Initialize-Sensor
+  kind: Function
+  start_line: 24
+  signature: "function Initialize-Sensor {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Get-SensorData
+  kind: Function
+  start_line: 34
+  signature: "function Get-SensorData {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Select-ActiveSensors
+  kind: Function
+  start_line: 43
+  signature: "filter Select-ActiveSensors {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Main
+  kind: Function
+  start_line: 49
+  signature: "function Main {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Public
+  type_info: ~

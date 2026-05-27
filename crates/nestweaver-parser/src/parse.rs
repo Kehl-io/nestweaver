@@ -205,8 +205,22 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Public
             }
         }
+        // Zig: pub keyword = public
+        Language::Zig => {
+            let sig = first_line(node_text);
+            if sig.starts_with("pub ") || sig.contains(" pub ") {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            }
+        }
+        // Objective-C, Groovy, PowerShell: handled in their regex parsers
         // Ruby, Cobol: inferred (visibility detection is complex, defer)
-        Language::Ruby | Language::Cobol => Visibility::Inferred,
+        Language::Ruby
+        | Language::Cobol
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell => Visibility::Inferred,
     }
 }
 
@@ -231,6 +245,10 @@ fn build_ts_language(lang: Language) -> tree_sitter::Language {
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
         Language::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
+        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
+        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
+        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
+        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
     }
 }
 
@@ -255,6 +273,10 @@ fn query_source(lang: Language) -> &'static str {
         Language::Scala => SCALA_QUERY,
         Language::Elixir => ELIXIR_QUERY,
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
+        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
+        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
+        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
+        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
     }
 }
 
@@ -411,6 +433,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     if lang == Language::Cobol {
         return Ok(crate::cobol::parse_cobol(path, source));
     }
+    if lang == Language::Zig {
+        return Ok(crate::zig::parse_zig(path, source));
+    }
+    if lang == Language::ObjectiveC {
+        return Ok(crate::objc::parse_objc(path, source));
+    }
+    if lang == Language::Groovy {
+        return Ok(crate::groovy::parse_groovy(path, source));
+    }
+    if lang == Language::PowerShell {
+        return Ok(crate::powershell::parse_powershell(path, source));
+    }
 
     let ts_lang = build_ts_language(lang);
 
@@ -448,6 +482,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Scala => "scala",
         Language::Elixir => "elixir",
         Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
+        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
+        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
+        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
+        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
     };
     let file_path_str = path.to_string_lossy();
 
@@ -1951,6 +1989,162 @@ mod tests {
         );
     }
 
+    // ── Zig tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_zig_extracts_functions() {
+        let source = fixture("zig/simple.zig");
+        let parsed = parse_source(Path::new("simple.zig"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "initialize"),
+            "should find function 'initialize'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "main"),
+            "should find function 'main'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_zig_extracts_struct_enum_union() {
+        let source = fixture("zig/simple.zig");
+        let parsed = parse_source(Path::new("simple.zig"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "SensorConfig"),
+            "should find struct 'SensorConfig'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "SensorKind"),
+            "should find enum 'SensorKind'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "InternalState"),
+            "should find union 'InternalState'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_zig_detects_visibility() {
+        let source = fixture("zig/simple.zig");
+        let parsed = parse_source(Path::new("simple.zig"), &source).unwrap();
+
+        let pub_fn = parsed.symbols.iter().find(|s| s.name == "initialize");
+        assert!(pub_fn.is_some());
+        assert_eq!(pub_fn.unwrap().visibility, Visibility::Public);
+
+        let priv_fn = parsed.symbols.iter().find(|s| s.name == "calibrate");
+        assert!(priv_fn.is_some());
+        assert_eq!(priv_fn.unwrap().visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn parse_zig_extracts_import_references() {
+        let source = fixture("zig/simple.zig");
+        let parsed = parse_source(Path::new("simple.zig"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "std"),
+            "should find @import(\"std\"); got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "math.zig"),
+            "should find @import(\"math.zig\"); got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Objective-C tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_objc_extracts_interface_and_implementation() {
+        let source = fixture("objc/simple.m");
+        let parsed = parse_source(Path::new("simple.m"), &source).unwrap();
+
+        let interfaces: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "SimpleGreeter"),
+            "should find @interface 'SimpleGreeter'; got: {:?}",
+            interfaces.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "SimpleGreeter"),
+            "should find @implementation 'SimpleGreeter'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_objc_extracts_protocol() {
+        let source = fixture("objc/simple.m");
+        let parsed = parse_source(Path::new("simple.m"), &source).unwrap();
+
+        let interfaces: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "GreeterProtocol"),
+            "should find @protocol 'GreeterProtocol'; got: {:?}",
+            interfaces.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_objc_extracts_methods() {
+        let source = fixture("objc/simple.m");
+        let parsed = parse_source(Path::new("simple.m"), &source).unwrap();
+
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "greet"),
+            "should find method 'greet'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            methods.iter().any(|s| s.name == "initWithPrefix"),
+            "should find method 'initWithPrefix'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn parse_bash_extracts_call_references() {
         let source = fixture("bash/simple.sh");
@@ -1969,6 +2163,23 @@ mod tests {
                 .iter()
                 .map(|r| (&r.name, r.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_objc_extracts_import_references() {
+        let source = fixture("objc/simple.m");
+        let parsed = parse_source(Path::new("simple.m"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "Foundation/Foundation.h"),
+            "should find #import Foundation; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
 
@@ -2094,12 +2305,221 @@ mod tests {
         assert!(!refs.is_empty(), "should find references; got none");
     }
 
+    // ── Groovy tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_groovy_extracts_class_and_interface() {
+        let source = fixture("groovy/simple.groovy");
+        let parsed = parse_source(Path::new("simple.groovy"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "SimpleGreeter"),
+            "should find class 'SimpleGreeter'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "FormalGreeter"),
+            "should find class 'FormalGreeter'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let interfaces: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "Greeter"),
+            "should find interface 'Greeter'; got: {:?}",
+            interfaces.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_groovy_extracts_trait() {
+        let source = fixture("groovy/simple.groovy");
+        let parsed = parse_source(Path::new("simple.groovy"), &source).unwrap();
+
+        let traits: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Trait)
+            .collect();
+        assert!(
+            traits.iter().any(|s| s.name == "Loggable"),
+            "should find trait 'Loggable'; got: {:?}",
+            traits.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_groovy_extracts_methods() {
+        let source = fixture("groovy/simple.groovy");
+        let parsed = parse_source(Path::new("simple.groovy"), &source).unwrap();
+
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "greet"),
+            "should find method 'greet'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_groovy_extracts_extends_reference() {
+        let source = fixture("groovy/simple.groovy");
+        let parsed = parse_source(Path::new("simple.groovy"), &source).unwrap();
+
+        let extends: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Extends)
+            .collect();
+        assert!(
+            extends.iter().any(|r| r.name == "SimpleGreeter"),
+            "should find extends 'SimpleGreeter'; got: {:?}",
+            extends.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_groovy_extracts_implements_reference() {
+        let source = fixture("groovy/simple.groovy");
+        let parsed = parse_source(Path::new("simple.groovy"), &source).unwrap();
+
+        let impls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Implements)
+            .collect();
+        assert!(
+            impls.iter().any(|r| r.name == "Greeter"),
+            "should find implements 'Greeter'; got: {:?}",
+            impls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── PowerShell tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_powershell_extracts_functions() {
+        let source = fixture("powershell/simple.ps1");
+        let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "Initialize-Sensor"),
+            "should find function 'Initialize-Sensor'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "Get-SensorData"),
+            "should find function 'Get-SensorData'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "Select-ActiveSensors"),
+            "should find filter 'Select-ActiveSensors'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_powershell_extracts_class() {
+        let source = fixture("powershell/simple.ps1");
+        let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "SensorConfig"),
+            "should find class 'SensorConfig'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "Priority"),
+            "should find enum 'Priority' as class; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_powershell_extracts_class_methods() {
+        let source = fixture("powershell/simple.ps1");
+        let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
+
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "ToString"),
+            "should find method 'ToString'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_powershell_extracts_import_references() {
+        let source = fixture("powershell/simple.ps1");
+        let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "ActiveDirectory"),
+            "should find Import-Module ActiveDirectory; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_powershell_extracts_cmdlet_calls() {
+        let source = fixture("powershell/simple.ps1");
+        let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "should find cmdlet call references; all refs: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Unsupported language ───────────────────────────────────────────────
 
     #[test]
     fn unsupported_language_returns_error() {
         let source = "const x = 42;";
-        let err = parse_source(Path::new("main.zig"), source).unwrap_err();
+        let err = parse_source(Path::new("main.wat"), source).unwrap_err();
         assert!(
             matches!(err, ParseError::UnsupportedLanguage(_)),
             "expected UnsupportedLanguage, got: {err:?}"
@@ -2396,6 +2816,62 @@ mod tests {
         fn snapshot_elixir_references() {
             let source = fixture("elixir/simple.ex");
             assert_yaml_snapshot!(parsed_references("simple.ex", &source));
+        }
+
+        // ── Zig ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_zig_symbols() {
+            let source = fixture("zig/simple.zig");
+            assert_yaml_snapshot!(parsed_symbols("simple.zig", &source));
+        }
+
+        #[test]
+        fn snapshot_zig_references() {
+            let source = fixture("zig/simple.zig");
+            assert_yaml_snapshot!(parsed_references("simple.zig", &source));
+        }
+
+        // ── Objective-C ─────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_objc_symbols() {
+            let source = fixture("objc/simple.m");
+            assert_yaml_snapshot!(parsed_symbols("simple.m", &source));
+        }
+
+        #[test]
+        fn snapshot_objc_references() {
+            let source = fixture("objc/simple.m");
+            assert_yaml_snapshot!(parsed_references("simple.m", &source));
+        }
+
+        // ── Groovy ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_groovy_symbols() {
+            let source = fixture("groovy/simple.groovy");
+            assert_yaml_snapshot!(parsed_symbols("simple.groovy", &source));
+        }
+
+        #[test]
+        fn snapshot_groovy_references() {
+            let source = fixture("groovy/simple.groovy");
+            assert_yaml_snapshot!(parsed_references("simple.groovy", &source));
+        }
+
+        // ── PowerShell ──────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_powershell_symbols() {
+            let source = fixture("powershell/simple.ps1");
+            assert_yaml_snapshot!(parsed_symbols("simple.ps1", &source));
+        }
+
+        #[test]
+        fn snapshot_powershell_references() {
+            let source = fixture("powershell/simple.ps1");
+            assert_yaml_snapshot!(parsed_references("simple.ps1", &source));
         }
     }
 }

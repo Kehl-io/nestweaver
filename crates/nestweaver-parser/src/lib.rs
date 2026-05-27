@@ -3,10 +3,14 @@
 pub mod cobol;
 pub mod entry_points;
 pub mod frameworks;
+pub mod groovy;
 pub mod language;
 pub mod markdown;
+pub mod objc;
 pub mod parse;
+pub mod powershell;
 pub mod registry;
+pub mod zig;
 
 pub use entry_points::detect_entry_point;
 pub use frameworks::detect_frameworks;

@@ -128,8 +128,15 @@ fn resolve_specifier(
         Language::Ruby => lang::ruby::resolve_import(from_file, specifier, known_files),
         Language::Dart => lang::dart::resolve_import(from_file, specifier, known_files),
         Language::Swift => lang::swift::resolve_import(from_file, specifier, known_files),
-        Language::Cobol => None,
-        Language::Lua | Language::Bash | Language::Scala | Language::Elixir => None,
+        Language::Cobol
+        | Language::Lua
+        | Language::Bash
+        | Language::Scala
+        | Language::Elixir
+        | Language::Zig
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell => None,
     }
 }
 
