@@ -1,11 +1,145 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use lbug::Value;
 use nestweaver_schema::Symbol;
+use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
 use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
+
+/// Describes the intent behind a PPR query, allowing the algorithm to
+/// adapt its damping factor (alpha) and edge weights to produce more
+/// relevant results for different use cases.
+///
+/// The damping factor (alpha) controls the probability that the random
+/// walk teleports back to a seed node at each step. Higher alpha means
+/// more local focus around the seeds; lower alpha means broader
+/// exploration of the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueryIntent {
+    /// Navigating to a specific definition. High alpha (0.5) keeps
+    /// results tightly focused around the seed symbol.
+    FindDefinition,
+    /// Understanding the overall architecture. Low alpha (0.15) lets
+    /// the walk explore distant graph regions to surface the structural
+    /// skeleton.
+    UnderstandArchitecture,
+    /// Analyzing blast radius / impact of a change. Alpha 0.3, with
+    /// CALLS edges weighted 2x to emphasize call-chain propagation.
+    AnalyzeImpact,
+    /// General-purpose context retrieval. Alpha 0.25 balances local
+    /// relevance with some exploration. This is the default behaviour
+    /// when no intent is specified.
+    GeneralContext,
+}
+
+impl QueryIntent {
+    /// Return the damping factor for this intent.
+    ///
+    /// The damping factor `d` is used in the PPR formula:
+    ///   score(v) = (1 - d) * personalization(v) + d * Σ(neighbours)
+    ///
+    /// Higher `d` means more propagation through the graph (wider
+    /// exploration). The "alpha" described in the enum doc comments
+    /// refers to `1 - d` (the teleport/restart probability).
+    pub fn damping(&self) -> f64 {
+        match self {
+            // alpha=0.5 → d=0.5 (high restart probability, local focus)
+            QueryIntent::FindDefinition => 0.5,
+            // alpha=0.15 → d=0.85 (standard, broad exploration)
+            QueryIntent::UnderstandArchitecture => 0.85,
+            // alpha=0.3 → d=0.7 (moderate exploration, impact chains)
+            QueryIntent::AnalyzeImpact => 0.7,
+            // alpha=0.25 → d=0.75 (balanced default)
+            QueryIntent::GeneralContext => 0.75,
+        }
+    }
+
+    /// Return a multiplier for CALLS edges under this intent.
+    /// Non-CALLS edges use a multiplier of 1.0.
+    pub fn calls_weight_multiplier(&self) -> f64 {
+        match self {
+            QueryIntent::AnalyzeImpact => 2.0,
+            _ => 1.0,
+        }
+    }
+}
+
+impl fmt::Display for QueryIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryIntent::FindDefinition => write!(f, "find-definition"),
+            QueryIntent::UnderstandArchitecture => write!(f, "understand-architecture"),
+            QueryIntent::AnalyzeImpact => write!(f, "analyze-impact"),
+            QueryIntent::GeneralContext => write!(f, "general-context"),
+        }
+    }
+}
+
+impl std::str::FromStr for QueryIntent {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "find-definition" | "definition" | "find" => Ok(QueryIntent::FindDefinition),
+            "understand-architecture" | "architecture" | "arch" => {
+                Ok(QueryIntent::UnderstandArchitecture)
+            }
+            "analyze-impact" | "impact" | "blast-radius" => Ok(QueryIntent::AnalyzeImpact),
+            "general-context" | "general" | "context" => Ok(QueryIntent::GeneralContext),
+            other => Err(format!(
+                "unknown intent '{}': expected one of find-definition, \
+                 understand-architecture, analyze-impact, general-context",
+                other
+            )),
+        }
+    }
+}
+
+/// Auto-detect the most likely `QueryIntent` from the resolved seed UIDs
+/// and the graph store.
+///
+/// Heuristics:
+/// - Single seed → `FindDefinition` (the user is zooming in on one symbol)
+/// - Multiple seeds from different files → `UnderstandArchitecture`
+/// - Any seed is an entry point → `AnalyzeImpact`
+/// - Otherwise → `GeneralContext`
+pub fn detect_intent(store: &GraphStore, seed_uids: &[String]) -> QueryIntent {
+    if seed_uids.is_empty() {
+        return QueryIntent::GeneralContext;
+    }
+
+    // Check for entry points first — this signals impact analysis.
+    let mut files_seen: HashSet<String> = HashSet::new();
+    let mut any_entry_point = false;
+
+    for uid in seed_uids {
+        if let Ok(sym) = store.lookup_symbol(uid) {
+            if sym.is_entry_point {
+                any_entry_point = true;
+            }
+            files_seen.insert(sym.file_path.clone());
+        }
+        // Non-symbol UIDs (notes, headings, etc.) are ignored for intent
+        // detection — they don't have file_path or entry_point semantics.
+    }
+
+    if any_entry_point {
+        return QueryIntent::AnalyzeImpact;
+    }
+
+    if seed_uids.len() == 1 {
+        return QueryIntent::FindDefinition;
+    }
+
+    if files_seen.len() > 1 {
+        return QueryIntent::UnderstandArchitecture;
+    }
+
+    QueryIntent::GeneralContext
+}
 
 /// Internal adjacency data returned by `load_ppr_graph`.
 ///
@@ -156,7 +290,7 @@ impl GraphStore {
         iterations: u32,
         scope: &GraphScope,
     ) -> Result<(), StoreError> {
-        let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope)?;
+        let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
             return Ok(());
@@ -230,9 +364,18 @@ impl GraphStore {
     /// Missing / null confidence defaults to 1.0. Edges with confidence ≤ 0.0
     /// are filtered out (unresolved imports should not influence ranking).
     ///
+    /// When `intent` is provided, edge weights are adjusted: for
+    /// `AnalyzeImpact`, CALLS edges receive a 2x multiplier. The intent
+    /// is identified from the edge query string (queries containing
+    /// `:CALLS]` are treated as CALLS edges).
+    ///
     /// Both forward and reverse directions are included so that PPR propagates
     /// relevance through the full neighbourhood.
-    fn load_ppr_graph(&self, scope: &GraphScope) -> Result<PprGraph, StoreError> {
+    fn load_ppr_graph(
+        &self,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+    ) -> Result<PprGraph, StoreError> {
         let conn = self.conn()?;
 
         // 1. Load all node UIDs in scope (deduplicated across queries).
@@ -262,8 +405,18 @@ impl GraphStore {
         // 2. Load directed edges from each scope query. Edges carry a confidence
         //    weight from the optional third column; missing/null → 1.0.
         //    Edges with confidence ≤ 0.0 are skipped (unresolved).
+        let calls_multiplier = intent.map_or(1.0, |i| i.calls_weight_multiplier());
         let mut forward_edges: Vec<(usize, usize, f64)> = Vec::new();
         for q in &scope.edge_queries {
+            // Detect whether this query fetches CALLS edges so we can
+            // apply the intent-aware weight multiplier.
+            let is_calls_query = q.contains(":CALLS]");
+            let edge_multiplier = if is_calls_query {
+                calls_multiplier
+            } else {
+                1.0
+            };
+
             let rows = match conn.query(q) {
                 Ok(r) => r,
                 Err(e) => {
@@ -294,7 +447,7 @@ impl GraphStore {
                     continue;
                 }
                 if let (Some(&si), Some(&ti)) = (uid_to_idx.get(&src), uid_to_idx.get(&tgt)) {
-                    forward_edges.push((si, ti, conf));
+                    forward_edges.push((si, ti, conf * edge_multiplier));
                 }
             }
         }
@@ -325,6 +478,11 @@ impl GraphStore {
     /// to all others.  Convergence is declared when the maximum absolute change
     /// across all nodes falls below `1e-6`.
     ///
+    /// When `intent` is `Some`, the damping factor is taken from the intent
+    /// (overriding `damping`) and CALLS edges may receive extra weight.
+    /// When `intent` is `None`, the caller-provided `damping` is used and
+    /// all edges keep their default weight — preserving backward compatibility.
+    ///
     /// Returns `(uid, score)` pairs sorted descending, filtered to `score > 1e-4`.
     /// Seed nodes are always included regardless of score.
     pub fn personalized_pagerank(
@@ -334,7 +492,21 @@ impl GraphStore {
         max_iterations: u32,
         scope: &GraphScope,
     ) -> Result<Vec<(String, f64)>, StoreError> {
-        let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope)?;
+        self.personalized_pagerank_with_intent(seed_uids, damping, max_iterations, scope, None)
+    }
+
+    /// Like [`personalized_pagerank`] but accepts an optional [`QueryIntent`]
+    /// that dynamically adjusts the damping factor and edge weights.
+    pub fn personalized_pagerank_with_intent(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        let effective_damping = intent.map_or(damping, |i| i.damping());
+        let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, intent)?;
 
         let n = uids.len();
         if n == 0 {
@@ -382,12 +554,12 @@ impl GraphStore {
                 .sum::<f64>();
 
             for v in 0..n {
-                new_scores[v] = (1.0 - damping) * personalization[v]
-                    + damping * dangling_sum * personalization[v];
+                new_scores[v] = (1.0 - effective_damping) * personalization[v]
+                    + effective_damping * dangling_sum * personalization[v];
 
                 for &(u, w) in &incoming[v] {
                     if out_weight[u] > 0.0 {
-                        new_scores[v] += damping * scores[u] * w / out_weight[u];
+                        new_scores[v] += effective_damping * scores[u] * w / out_weight[u];
                     }
                 }
             }
@@ -1004,6 +1176,329 @@ mod tests {
             assert!(
                 window[0] >= window[1],
                 "scores should be non-increasing: {scores:?}"
+            );
+        }
+    }
+
+    // ── QueryIntent tests ────────────────────────────────────────────────
+
+    #[test]
+    fn query_intent_roundtrip_parse() {
+        use super::QueryIntent;
+        assert_eq!(
+            "find-definition".parse::<QueryIntent>().unwrap(),
+            QueryIntent::FindDefinition,
+        );
+        assert_eq!(
+            "architecture".parse::<QueryIntent>().unwrap(),
+            QueryIntent::UnderstandArchitecture,
+        );
+        assert_eq!(
+            "impact".parse::<QueryIntent>().unwrap(),
+            QueryIntent::AnalyzeImpact,
+        );
+        assert_eq!(
+            "general".parse::<QueryIntent>().unwrap(),
+            QueryIntent::GeneralContext,
+        );
+        assert!("nonsense".parse::<QueryIntent>().is_err());
+    }
+
+    #[test]
+    fn query_intent_damping_values() {
+        use super::QueryIntent;
+        assert!((QueryIntent::FindDefinition.damping() - 0.5).abs() < f64::EPSILON);
+        assert!((QueryIntent::UnderstandArchitecture.damping() - 0.85).abs() < f64::EPSILON);
+        assert!((QueryIntent::AnalyzeImpact.damping() - 0.7).abs() < f64::EPSILON);
+        assert!((QueryIntent::GeneralContext.damping() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn query_intent_calls_weight_multiplier() {
+        use super::QueryIntent;
+        assert!((QueryIntent::AnalyzeImpact.calls_weight_multiplier() - 2.0).abs() < f64::EPSILON);
+        assert!((QueryIntent::FindDefinition.calls_weight_multiplier() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ppr_with_intent_none_matches_default() {
+        // Running PPR with intent=None and the same damping should produce
+        // identical results to the original personalized_pagerank.
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+
+        let original = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let with_none = store
+            .personalized_pagerank_with_intent(
+                &["A".to_string()],
+                0.85,
+                20,
+                &GraphScope::code_only(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            original.len(),
+            with_none.len(),
+            "intent=None should produce same result count"
+        );
+        for ((uid1, s1), (uid2, s2)) in original.iter().zip(with_none.iter()) {
+            assert_eq!(uid1, uid2);
+            assert!(
+                (s1 - s2).abs() < 1e-10,
+                "scores should be identical: {s1} vs {s2}"
+            );
+        }
+    }
+
+    #[test]
+    fn ppr_find_definition_focuses_on_seed() {
+        // FindDefinition (alpha=0.5, d=0.5) concentrates mass on the seed
+        // more than the default (d=0.85). The seed A should have a higher
+        // proportion of the total score under FindDefinition.
+        use super::QueryIntent;
+
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("C", "D")).unwrap();
+
+        let default_results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+        let focused_results = store
+            .personalized_pagerank_with_intent(
+                &["A".to_string()],
+                0.85,
+                40,
+                &GraphScope::code_only(),
+                Some(QueryIntent::FindDefinition),
+            )
+            .unwrap();
+
+        let score_of = |results: &[(String, f64)], uid: &str| -> f64 {
+            results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let default_a = score_of(&default_results, "A");
+        let focused_a = score_of(&focused_results, "A");
+
+        // Under FindDefinition (d=0.5), seed A retains a larger fraction
+        // of score mass than under the default (d=0.85).
+        assert!(
+            focused_a > default_a,
+            "FindDefinition should concentrate more mass on seed A: \
+             focused={focused_a:.6} vs default={default_a:.6}"
+        );
+    }
+
+    #[test]
+    fn ppr_analyze_impact_boosts_calls_edges() {
+        // AnalyzeImpact doubles CALLS edge weight. In a graph where A calls B
+        // and A imports C (both with confidence 1.0), B should receive more
+        // relative score under AnalyzeImpact than under the default.
+        use super::QueryIntent;
+
+        let store = test_store();
+        for uid in ["A", "B", "C"] {
+            let mut sym = make_symbol(uid, &format!("fn_{uid}"));
+            sym.file_path = format!("src/{uid}.rs");
+            store.insert_symbol(&sym).unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "A".to_string(),
+                target_uid: "C".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 1.0,
+                link_type: None,
+            })
+            .unwrap();
+
+        let default_results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+        let impact_results = store
+            .personalized_pagerank_with_intent(
+                &["A".to_string()],
+                0.85,
+                40,
+                &GraphScope::code_only(),
+                Some(QueryIntent::AnalyzeImpact),
+            )
+            .unwrap();
+
+        let score_of = |results: &[(String, f64)], uid: &str| -> f64 {
+            results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let default_b = score_of(&default_results, "B");
+        let default_c = score_of(&default_results, "C");
+        let impact_b = score_of(&impact_results, "B");
+        let impact_c = score_of(&impact_results, "C");
+
+        // Under default, CALLS and IMPORTS have equal weight, so B and C
+        // should be roughly equal. Under AnalyzeImpact, CALLS weight is
+        // 2x, so B should be boosted relative to C.
+        let default_ratio = if default_c > 0.0 {
+            default_b / default_c
+        } else {
+            f64::INFINITY
+        };
+        let impact_ratio = if impact_c > 0.0 {
+            impact_b / impact_c
+        } else {
+            f64::INFINITY
+        };
+
+        assert!(
+            impact_ratio > default_ratio,
+            "AnalyzeImpact should boost CALLS-reachable B relative to IMPORTS-reachable C: \
+             impact ratio={impact_ratio:.4} vs default ratio={default_ratio:.4}"
+        );
+    }
+
+    #[test]
+    fn detect_intent_single_seed() {
+        use super::detect_intent;
+
+        let store = test_store();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+
+        let intent = detect_intent(&store, &["A".to_string()]);
+        assert_eq!(
+            intent,
+            super::QueryIntent::FindDefinition,
+            "single seed should detect FindDefinition"
+        );
+    }
+
+    #[test]
+    fn detect_intent_multiple_files() {
+        use super::detect_intent;
+
+        let store = test_store();
+        let mut sym_a = make_symbol("A", "fn_a");
+        sym_a.file_path = "src/a.rs".to_string();
+        let mut sym_b = make_symbol("B", "fn_b");
+        sym_b.file_path = "src/b.rs".to_string();
+        store.insert_symbol(&sym_a).unwrap();
+        store.insert_symbol(&sym_b).unwrap();
+
+        let intent = detect_intent(&store, &["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            intent,
+            super::QueryIntent::UnderstandArchitecture,
+            "multiple seeds from different files should detect UnderstandArchitecture"
+        );
+    }
+
+    #[test]
+    fn detect_intent_entry_point() {
+        use super::detect_intent;
+
+        let store = test_store();
+        let mut sym_a = make_symbol("A", "fn_a");
+        sym_a.is_entry_point = true;
+        store.insert_symbol(&sym_a).unwrap();
+
+        let intent = detect_intent(&store, &["A".to_string()]);
+        assert_eq!(
+            intent,
+            super::QueryIntent::AnalyzeImpact,
+            "entry point seed should detect AnalyzeImpact"
+        );
+    }
+
+    #[test]
+    fn detect_intent_same_file_multiple_seeds() {
+        use super::detect_intent;
+
+        let store = test_store();
+        // Both seeds from the same file, not entry points.
+        let sym_a = make_symbol("A", "fn_a");
+        let sym_b = make_symbol("B", "fn_b");
+        store.insert_symbol(&sym_a).unwrap();
+        store.insert_symbol(&sym_b).unwrap();
+
+        let intent = detect_intent(&store, &["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            intent,
+            super::QueryIntent::GeneralContext,
+            "multiple seeds from same file should detect GeneralContext"
+        );
+    }
+
+    #[test]
+    fn detect_intent_empty_seeds() {
+        use super::detect_intent;
+
+        let store = test_store();
+        let intent = detect_intent(&store, &[]);
+        assert_eq!(
+            intent,
+            super::QueryIntent::GeneralContext,
+            "empty seeds should default to GeneralContext"
+        );
+    }
+
+    #[test]
+    fn ppr_with_intent_conserves_score_mass() {
+        // Verify that total PPR score sums to ~1.0 even with intent overrides.
+        use super::QueryIntent;
+
+        let store = test_store();
+        for uid in ["A", "B", "C"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+
+        for intent in [
+            QueryIntent::FindDefinition,
+            QueryIntent::UnderstandArchitecture,
+            QueryIntent::AnalyzeImpact,
+            QueryIntent::GeneralContext,
+        ] {
+            let results = store
+                .personalized_pagerank_with_intent(
+                    &["A".to_string()],
+                    0.85,
+                    100,
+                    &GraphScope::code_only(),
+                    Some(intent),
+                )
+                .unwrap();
+            let total: f64 = results.iter().map(|(_, s)| s).sum();
+            assert!(
+                (total - 1.0).abs() < 0.01,
+                "PPR with intent {:?} should conserve score mass, got {total:.4}",
+                intent
             );
         }
     }

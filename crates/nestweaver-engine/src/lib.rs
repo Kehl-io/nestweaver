@@ -77,8 +77,8 @@ pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, FeatureContextResult,
     FeatureInfo, HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
     build_brain_context, build_brain_context_hybrid, build_brain_context_hybrid_with_aliases,
-    build_context, build_feature_context, generate_repo_map, list_repos, list_services,
-    lookup_symbol, search_symbols,
+    build_context, build_context_with_intent, build_feature_context, generate_repo_map, list_repos,
+    list_services, lookup_symbol, search_symbols,
 };
 pub use recency::parse_iso8601_to_epoch;
 pub use registry::*;
