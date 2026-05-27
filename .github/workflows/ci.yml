@@ -109,3 +109,46 @@ jobs:
         run: cargo install cargo-audit
       - name: Run audit
         run: cargo audit || true
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+      - name: Configure linker for lbug+tantivy zstd coexistence
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+      - name: Build (triggers lbug prebuilt download on first run)
+        run: |
+          cargo build -p nestweaver-store 2>/dev/null || true
+          sleep 2
+          cargo build
+      - name: Index test data
+        run: ./target/debug/nestweaver index --repo testdata/js --db /tmp/test.lbug
+      - name: Install frontend dependencies
+        working-directory: crates/nestweaver-web/frontend
+        run: npm ci
+      - name: Install Playwright browsers
+        working-directory: crates/nestweaver-web/frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run E2E tests
+        working-directory: crates/nestweaver-web/frontend
+        run: npx playwright test
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: crates/nestweaver-web/frontend/playwright-report/
