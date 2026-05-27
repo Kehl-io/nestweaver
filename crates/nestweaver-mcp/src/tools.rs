@@ -2141,7 +2141,8 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Run hybrid PPR from seeds with an architecture-focused default intent.
+    // 4. Run hybrid PPR from seeds with project-context intent (5x boost on
+    //    PROJECT_INCLUDES_* edges so the project's declared content dominates).
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
     let config = HybridSearchConfig::default();
@@ -2152,8 +2153,23 @@ fn tool_project_context(
         &config,
         &aliases,
         Some(&db_path),
-        Some(nestweaver_store::QueryIntent::UnderstandArchitecture),
+        Some(nestweaver_store::QueryIntent::ProjectContext),
     )?;
+
+    // 4b. Post-PPR scope boost: multiply relevance for nodes that belong
+    //     to the project (seeds are the authoritative membership signal).
+    let seed_set_boost: std::collections::HashSet<&str> =
+        seed_uids.iter().map(|s| s.as_str()).collect();
+    for node in &mut result.connected {
+        if seed_set_boost.contains(node.uid.as_str()) {
+            node.relevance *= 5.0;
+        }
+    }
+    result.connected.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 5. Apply optional kinds filter.
     if let Some(ref kinds) = filter_kinds {

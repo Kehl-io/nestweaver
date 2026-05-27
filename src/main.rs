@@ -2741,9 +2741,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &defaults,
                 &aliases,
                 Some(&db_path),
-                None,
+                Some(nestweaver_store::QueryIntent::ProjectContext),
             ) {
                 Ok(mut result) => {
+                    // Post-PPR scope boost: multiply relevance for nodes that
+                    // belong to the project so declared content ranks highest.
+                    let seed_set_boost: std::collections::HashSet<&str> =
+                        seed_uids.iter().map(|s| s.as_str()).collect();
+                    for node in &mut result.connected {
+                        if seed_set_boost.contains(node.uid.as_str()) {
+                            node.relevance *= 5.0;
+                        }
+                    }
+                    result.connected.sort_by(|a, b| {
+                        b.relevance
+                            .partial_cmp(&a.relevance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
                     // since filter: hard filter Note/Section nodes by modified_at.
                     if let Some(ref since_ts) = since {
                         let recent_notes = store

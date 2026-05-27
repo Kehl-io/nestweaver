@@ -33,6 +33,11 @@ pub enum QueryIntent {
     /// relevance with some exploration. This is the default behaviour
     /// when no intent is specified.
     GeneralContext,
+    /// Project-scoped context retrieval. Alpha 0.3 (moderate exploration)
+    /// with 5x weight on PROJECT_INCLUDES_NOTE and PROJECT_INCLUDES_SYMBOL
+    /// edges so that a project's declared content dominates the ranking
+    /// over high-in-degree generic notes.
+    ProjectContext,
 }
 
 impl QueryIntent {
@@ -54,6 +59,8 @@ impl QueryIntent {
             QueryIntent::AnalyzeImpact => 0.7,
             // alpha=0.25 → d=0.75 (balanced default)
             QueryIntent::GeneralContext => 0.75,
+            // alpha=0.3 → d=0.7 (moderate exploration, project scope)
+            QueryIntent::ProjectContext => 0.7,
         }
     }
 
@@ -62,6 +69,16 @@ impl QueryIntent {
     pub fn calls_weight_multiplier(&self) -> f64 {
         match self {
             QueryIntent::AnalyzeImpact => 2.0,
+            _ => 1.0,
+        }
+    }
+
+    /// Return a multiplier for PROJECT_INCLUDES_NOTE and
+    /// PROJECT_INCLUDES_SYMBOL edges under this intent.
+    /// Non-project-includes edges use a multiplier of 1.0.
+    pub fn project_includes_weight_multiplier(&self) -> f64 {
+        match self {
+            QueryIntent::ProjectContext => 5.0,
             _ => 1.0,
         }
     }
@@ -74,6 +91,7 @@ impl fmt::Display for QueryIntent {
             QueryIntent::UnderstandArchitecture => write!(f, "understand-architecture"),
             QueryIntent::AnalyzeImpact => write!(f, "analyze-impact"),
             QueryIntent::GeneralContext => write!(f, "general-context"),
+            QueryIntent::ProjectContext => write!(f, "project-context"),
         }
     }
 }
@@ -89,9 +107,11 @@ impl std::str::FromStr for QueryIntent {
             }
             "analyze-impact" | "impact" | "blast-radius" => Ok(QueryIntent::AnalyzeImpact),
             "general-context" | "general" | "context" => Ok(QueryIntent::GeneralContext),
+            "project-context" | "project" => Ok(QueryIntent::ProjectContext),
             other => Err(format!(
                 "unknown intent '{}': expected one of find-definition, \
-                 understand-architecture, analyze-impact, general-context",
+                 understand-architecture, analyze-impact, general-context, \
+                 project-context",
                 other
             )),
         }
@@ -409,13 +429,19 @@ impl GraphStore {
         //    weight from the optional third column; missing/null → 1.0.
         //    Edges with confidence ≤ 0.0 are skipped (unresolved).
         let calls_multiplier = intent.map_or(1.0, |i| i.calls_weight_multiplier());
+        let project_includes_multiplier =
+            intent.map_or(1.0, |i| i.project_includes_weight_multiplier());
         let mut forward_edges: Vec<(usize, usize, f64)> = Vec::new();
         for q in &scope.edge_queries {
             // Detect whether this query fetches CALLS edges so we can
             // apply the intent-aware weight multiplier.
             let is_calls_query = q.contains(":CALLS]");
+            let is_project_includes_query =
+                q.contains(":PROJECT_INCLUDES_NOTE") || q.contains(":PROJECT_INCLUDES_SYMBOL");
             let edge_multiplier = if is_calls_query {
                 calls_multiplier
+            } else if is_project_includes_query {
+                project_includes_multiplier
             } else {
                 1.0
             };
@@ -1487,6 +1513,7 @@ mod tests {
             QueryIntent::UnderstandArchitecture,
             QueryIntent::AnalyzeImpact,
             QueryIntent::GeneralContext,
+            QueryIntent::ProjectContext,
         ] {
             let results = store
                 .personalized_pagerank_with_intent(
@@ -1504,5 +1531,237 @@ mod tests {
                 intent
             );
         }
+    }
+
+    /// Verify that PPR with `ProjectContext` intent ranks project-member notes
+    /// above high-in-degree unrelated notes.
+    ///
+    /// Setup:
+    /// - Project "P" with two member notes (low wikilink in-degree).
+    /// - Two unrelated notes with many inbound wikilinks (high in-degree).
+    /// - PPR seeded from the Project node.
+    ///
+    /// Without the 5x PROJECT_INCLUDES_* boost the unrelated notes would
+    /// dominate the ranking via their superior in-degree. With the boost,
+    /// the project's own notes must rank higher.
+    #[test]
+    fn project_context_intent_ranks_project_members_higher() {
+        use nestweaver_schema::{Note, NoteKind, Project, Section, Vault};
+
+        use super::QueryIntent;
+
+        let store = test_store();
+
+        // -- Vault
+        let vault = Vault {
+            uid: "vlt:test".to_string(),
+            name: "TestVault".to_string(),
+            root_path: "/tmp/vault".to_string(),
+            instance_id: "inst-1".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+
+        // -- Project
+        let project = Project {
+            uid: "proj:test:P".to_string(),
+            name: "ProjectP".to_string(),
+            summary: None,
+            instance_id: "inst-1".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+
+        // -- Project member notes (low in-degree: no wikilinks pointing at them)
+        let member_note_a = Note {
+            uid: "note:member_a".to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: "projects/member_a.md".to_string(),
+            title: "Member A".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 50,
+            content_hash: "ha".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        let member_note_b = Note {
+            uid: "note:member_b".to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: "projects/member_b.md".to_string(),
+            title: "Member B".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 50,
+            content_hash: "hb".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.upsert_note(&member_note_a).unwrap();
+        store.upsert_note(&member_note_b).unwrap();
+
+        // -- Unrelated notes (will have high in-degree from many wikilinks)
+        let popular_note_x = Note {
+            uid: "note:popular_x".to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: "general/popular_x.md".to_string(),
+            title: "Popular X".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 200,
+            content_hash: "hx".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        let popular_note_y = Note {
+            uid: "note:popular_y".to_string(),
+            vault_uid: "vlt:test".to_string(),
+            file_path: "general/popular_y.md".to_string(),
+            title: "Popular Y".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 200,
+            content_hash: "hy".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.upsert_note(&popular_note_x).unwrap();
+        store.upsert_note(&popular_note_y).unwrap();
+
+        // -- Create several "filler" notes that all wikilink to popular_x and
+        //    popular_y, giving them high in-degree.
+        for i in 0..8 {
+            let filler_uid = format!("note:filler_{i}");
+            let sec_uid = format!("sec:filler_{i}:body");
+            let filler = Note {
+                uid: filler_uid.clone(),
+                vault_uid: "vlt:test".to_string(),
+                file_path: format!("fillers/filler_{i}.md"),
+                title: format!("Filler {i}"),
+                note_kind: NoteKind::General,
+                word_count: 30,
+                content_hash: format!("hf{i}"),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            };
+            store.upsert_note(&filler).unwrap();
+
+            let section = Section {
+                uid: sec_uid.clone(),
+                note_uid: filler_uid.clone(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 5,
+                text_hash: format!("th{i}"),
+                text_content: format!("see [[Popular X]] and [[Popular Y]]"),
+                word_count: 6,
+                pagerank_score: None,
+            };
+            store.insert_section(&section).unwrap();
+            store
+                .batch_insert_note_section_edges(&[(&filler_uid, &sec_uid)])
+                .unwrap();
+
+            // Wikilink from filler section -> popular_x and popular_y
+            store
+                .batch_insert_wikilink_to_note_edges(&[
+                    (&sec_uid, "note:popular_x", 1.0, "Popular X"),
+                    (&sec_uid, "note:popular_y", 1.0, "Popular Y"),
+                ])
+                .unwrap();
+        }
+
+        // -- Link project to its member notes
+        store
+            .batch_insert_project_note_edges(&[
+                ("proj:test:P", "note:member_a"),
+                ("proj:test:P", "note:member_b"),
+            ])
+            .unwrap();
+
+        // -- PPR from project node with ProjectContext intent
+        let project_results = store
+            .personalized_pagerank_with_intent(
+                &["proj:test:P".to_string()],
+                0.85,
+                100,
+                &GraphScope::unified(),
+                Some(QueryIntent::ProjectContext),
+            )
+            .unwrap();
+
+        // Find scores for member notes vs popular notes.
+        let score_of = |uid: &str| -> f64 {
+            project_results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let member_a_score = score_of("note:member_a");
+        let member_b_score = score_of("note:member_b");
+        let popular_x_score = score_of("note:popular_x");
+        let popular_y_score = score_of("note:popular_y");
+
+        // With the 5x PROJECT_INCLUDES_* boost, project member notes should
+        // rank above the popular unrelated notes.
+        assert!(
+            member_a_score > popular_x_score,
+            "Project member A ({member_a_score:.6}) should rank above popular X ({popular_x_score:.6})"
+        );
+        assert!(
+            member_b_score > popular_y_score,
+            "Project member B ({member_b_score:.6}) should rank above popular Y ({popular_y_score:.6})"
+        );
+
+        // -- Verify the boost has a material effect: with GeneralContext the
+        //    member-to-popular score ratio should be worse (popular notes
+        //    benefit more from their in-degree without the project edge boost).
+        let general_results = store
+            .personalized_pagerank_with_intent(
+                &["proj:test:P".to_string()],
+                0.85,
+                100,
+                &GraphScope::unified(),
+                Some(QueryIntent::GeneralContext),
+            )
+            .unwrap();
+
+        let general_score_of = |uid: &str| -> f64 {
+            general_results
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let gen_popular_x = general_score_of("note:popular_x");
+        let gen_member_a = general_score_of("note:member_a");
+
+        // The ratio member/popular should be better with ProjectContext than
+        // with GeneralContext. Use safe division for the general case (popular
+        // might be zero if unreachable).
+        let project_ratio = if popular_x_score > 0.0 {
+            member_a_score / popular_x_score
+        } else {
+            f64::INFINITY
+        };
+        let general_ratio = if gen_popular_x > 0.0 {
+            gen_member_a / gen_popular_x
+        } else {
+            // If popular notes are unreachable in both intents, the boost still
+            // did its job (member notes are on top regardless).
+            f64::INFINITY
+        };
+        assert!(
+            project_ratio >= general_ratio,
+            "ProjectContext member/popular ratio ({project_ratio:.4}) should be >= \
+             GeneralContext ratio ({general_ratio:.4})"
+        );
     }
 }
