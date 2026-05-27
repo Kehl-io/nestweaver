@@ -356,8 +356,32 @@ impl GraphStore {
         conn.query("CREATE REL TABLE IF NOT EXISTS SECTION_TAGGED_WITH(FROM Section TO Tag)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
 
-        conn.query("CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_NOTE(FROM Project TO Note)")
-            .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_NOTE(\
+                FROM Project TO Note, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Migration: add confidence column for databases created before it existed.
+        let _ = conn.query("ALTER TABLE PROJECT_INCLUDES_NOTE ADD confidence FLOAT DEFAULT 1.0");
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_INCLUDES_SYMBOL(\
+                FROM Project TO Symbol, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_HAS_COMPONENT(\
+                FROM Project TO Project, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS PROJECT_HAS_PARENT(\
+                FROM Project TO Project, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
 
         // ── Brain extension: cross-domain (notes ↔ code) ────────────────────
         // The architectural keystone — bridges that make PPR rank a doc
