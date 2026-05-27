@@ -57,7 +57,7 @@ pub fn materialize_projects(
             summary: project_cfg.description.clone(),
             instance_id: instance_id.to_string(),
         };
-        store.insert_project(&project)?;
+        store.upsert_project(&project)?;
         projects_created += 1;
 
         // 2. Vault-folder → note edges.
@@ -181,11 +181,11 @@ pub fn materialize_projects(
                                 pagerank_score: None,
                             };
 
-                            if let Err(e) = store.insert_note(&note) {
+                            if let Err(e) = store.upsert_note(&note) {
                                 tracing::warn!(
                                     label = ws.label,
                                     error = %e,
-                                    "failed to insert wiki note"
+                                    "failed to upsert wiki note"
                                 );
                                 continue;
                             }
@@ -263,11 +263,11 @@ pub fn materialize_projects(
                                     .collect();
 
                                 if !sections.is_empty() {
-                                    if let Err(e) = store.batch_insert_sections(&sections) {
+                                    if let Err(e) = store.batch_upsert_sections(&sections) {
                                         tracing::warn!(
                                             label = ws.label,
                                             error = %e,
-                                            "failed to insert wiki note sections"
+                                            "failed to upsert wiki note sections"
                                         );
                                     } else {
                                         let ns_edges: Vec<(&str, &str)> = sections
@@ -379,12 +379,12 @@ pub fn detect_implicit_projects(
             summary: None,
             instance_id: instance_id.to_string(),
         };
-        if let Err(e) = store.insert_project(&project) {
+        if let Err(e) = store.upsert_project(&project) {
             tracing::debug!(
-                "detect_implicit_projects: skipping '{}' (insert_project failed: {e})",
+                "detect_implicit_projects: skipping '{}' (upsert_project failed: {e})",
                 slug
             );
-            // Still wire up edges even if the node exists already.
+            // Still wire up edges even if the upsert failed.
             let _ = e;
         }
 
