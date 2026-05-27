@@ -48,7 +48,7 @@ fn detect_js_ts(
     name: &str,
     file_path: &str,
     kind: &str,
-    _signature: Option<&str>,
+    signature: Option<&str>,
 ) -> Option<EntryPointKind> {
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
 
@@ -67,20 +67,86 @@ fn detect_js_ts(
         return Some(EntryPointKind::TestEntry);
     }
 
-    // HTTP handlers: only exported/top-level functions in route-like paths
-    if kind == "function"
-        && (file_path.contains("/routes/")
-            || file_path.contains("/handlers/")
-            || file_path.contains("/controllers/"))
+    // ── React / Next.js / TanStack Router / Remix page & layout entry points ──
+    //
+    // Files under /pages/, /app/, or /routes/ are framework entry points.
+    // Exported functions, classes, and constants (e.g. `export const Route = ...`)
+    // from these directories are treated as entry points.
+    let is_page_path = file_path.contains("/pages/")
+        || file_path.contains("/app/")
+        || file_path.contains("/routes/");
+
+    if is_page_path
+        && matches!(kind, "function" | "class" | "constant")
+        && !name.starts_with('_')
+        && !name.starts_with("validate")
+        && !name.starts_with("parse")
+        && !name.starts_with("format")
     {
-        // Skip obvious helpers: names starting with underscore or common utility prefixes
-        if !name.starts_with('_')
-            && !name.starts_with("validate")
-            && !name.starts_with("parse")
-            && !name.starts_with("format")
+        return Some(EntryPointKind::HttpHandler);
+    }
+
+    // HTTP handlers in explicit handler/controller directories
+    if matches!(kind, "function" | "class" | "constant")
+        && (file_path.contains("/handlers/") || file_path.contains("/controllers/"))
+        && !name.starts_with('_')
+        && !name.starts_with("validate")
+        && !name.starts_with("parse")
+        && !name.starts_with("format")
+    {
+        return Some(EntryPointKind::HttpHandler);
+    }
+
+    // ── API route / tRPC / server handler entry points ──
+    //
+    // Exported routers (tRPC, Express), API handlers, and middleware are
+    // framework entry points regardless of directory structure.
+    if let Some(sig) = signature {
+        // tRPC router definitions: `const fooRouter = router({`
+        if name.ends_with("Router") && sig.contains("router(") {
+            return Some(EntryPointKind::HttpHandler);
+        }
+        // Express / Koa / Hono route registration
+        if sig.contains("app.get(")
+            || sig.contains("app.post(")
+            || sig.contains("app.put(")
+            || sig.contains("app.delete(")
+            || sig.contains("app.patch(")
+            || sig.contains("app.use(")
+            || sig.contains("router.get(")
+            || sig.contains("router.post(")
+            || sig.contains("router.put(")
+            || sig.contains("router.delete(")
         {
             return Some(EntryPointKind::HttpHandler);
         }
+        // Next.js API route handlers
+        if (name == "GET" || name == "POST" || name == "PUT" || name == "DELETE" || name == "PATCH")
+            && is_page_path
+        {
+            return Some(EntryPointKind::HttpHandler);
+        }
+        // Next.js special exports: getServerSideProps, getStaticProps, loader, action
+        if name == "getServerSideProps"
+            || name == "getStaticProps"
+            || name == "getStaticPaths"
+            || name == "loader"
+            || name == "action"
+        {
+            return Some(EntryPointKind::HttpHandler);
+        }
+    }
+
+    // ── React component entry points ──
+    //
+    // Uppercase-starting functions/classes in component directories are React
+    // components and serve as UI entry points. This catches default and named
+    // component exports.
+    if matches!(kind, "function" | "class")
+        && name.starts_with(|c: char| c.is_uppercase())
+        && file_path.contains("/components/")
+    {
+        return Some(EntryPointKind::EventListener);
     }
 
     // HTTP handler by name
@@ -819,6 +885,90 @@ mod tests {
             "javascript",
         );
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detects_react_route_constant() {
+        let result = detect_entry_point(
+            "Route",
+            "src/routes/index.tsx",
+            "constant",
+            Some("const Route = createFileRoute"),
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_nextjs_page_function() {
+        let result = detect_entry_point(
+            "HomePage",
+            "src/pages/index.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_nextjs_app_constant() {
+        let result = detect_entry_point(
+            "Dashboard",
+            "src/app/dashboard/page.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_trpc_router() {
+        let result = detect_entry_point(
+            "accountRouter",
+            "src/trpc/routers/account.ts",
+            "constant",
+            Some("const accountRouter = router({"),
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_react_component_in_components_dir() {
+        let result = detect_entry_point(
+            "UserProfile",
+            "src/components/user/UserProfile.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::EventListener));
+    }
+
+    #[test]
+    fn lowercase_helper_in_components_not_entry() {
+        let result = detect_entry_point(
+            "formatDate",
+            "src/components/utils.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detects_get_server_side_props() {
+        let result = detect_entry_point(
+            "getServerSideProps",
+            "src/pages/users.tsx",
+            "function",
+            Some("export async function getServerSideProps("),
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
     }
 
     #[test]
