@@ -22,30 +22,41 @@ use serde_json::{Value, json};
 
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
+const LITE_TOOLS: &[&str] = &[
+    "brain_context",
+    "brain_search",
+    "brain_impact",
+    "brain_status",
+    "brain_guide",
+    "detect_changes",
+];
+
 /// Returns the `tools/list` payload — schemas + descriptions for every tool
-/// the brain exposes.
-pub fn tool_list() -> Value {
-    json!({
-        "tools": [
-            tool_schema_brain_context(),
-            tool_schema_brain_search(),
-            tool_schema_note_get(),
-            tool_schema_backlinks(),
-            tool_schema_brain_status(),
-            tool_schema_brain_add_source(),
-            tool_schema_cross_repo_contracts(),
-            tool_schema_brain_impact(),
-            tool_schema_brain_guide(),
-            tool_schema_flow_trace(),
-            tool_schema_detect_changes(),
-            tool_schema_clusters(),
-            tool_schema_stale_check(),
-            tool_schema_set_extension(),
-            tool_schema_query_extensions(),
-            tool_schema_brain_diff(),
-            tool_schema_project_context(),
-        ]
-    })
+/// the brain exposes. When `lite` is true only the 6 core tools are included.
+pub fn tool_list(lite: bool) -> Value {
+    let mut tools = vec![
+        tool_schema_brain_context(),
+        tool_schema_brain_search(),
+        tool_schema_note_get(),
+        tool_schema_backlinks(),
+        tool_schema_brain_status(),
+        tool_schema_brain_add_source(),
+        tool_schema_cross_repo_contracts(),
+        tool_schema_brain_impact(),
+        tool_schema_brain_guide(),
+        tool_schema_flow_trace(),
+        tool_schema_detect_changes(),
+        tool_schema_clusters(),
+        tool_schema_stale_check(),
+        tool_schema_set_extension(),
+        tool_schema_query_extensions(),
+        tool_schema_brain_diff(),
+        tool_schema_project_context(),
+    ];
+    if lite {
+        tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
+    }
+    json!({ "tools": tools })
 }
 
 /// Dispatch a `tools/call` to the named tool. The optional `tantivy`
@@ -1910,6 +1921,7 @@ thread_local! {
     static CURRENT_DB_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
     static ALLOW_ADD_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static LITE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
@@ -1918,6 +1930,14 @@ pub fn set_current_db_path(path: std::path::PathBuf) {
 
 pub fn set_allow_add_sources(allowed: bool) {
     ALLOW_ADD_SOURCES.with(|c| c.set(allowed));
+}
+
+pub fn set_lite_mode(lite: bool) {
+    LITE_MODE.with(|c| c.set(lite));
+}
+
+pub fn is_lite_mode() -> bool {
+    LITE_MODE.with(|c| c.get())
 }
 
 fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {

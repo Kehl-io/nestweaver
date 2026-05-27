@@ -308,6 +308,8 @@ enum Commands {
             help = "Allow the brain_add_source MCP tool to index new paths at runtime"
         )]
         allow_mcp_add_sources: bool,
+        #[arg(long, help = "Expose only 6 core tools (for tools with limited tool slots like Cursor)")]
+        lite: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -1427,11 +1429,12 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Commands::Mcp {
             db,
             allow_mcp_add_sources,
+            lite,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             // The server runs until the client closes stdin. Errors bubble
             // up as an EXIT_ERROR; clean EOF exits 0.
-            nestweaver_mcp::run_stdio_server(&db_path, allow_mcp_add_sources)
+            nestweaver_mcp::run_stdio_server(&db_path, allow_mcp_add_sources, lite)
                 .context("mcp server")?;
             Ok(EXIT_SUCCESS)
         }
