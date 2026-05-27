@@ -43,16 +43,16 @@ pub fn run_stdio_server(
     let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
-    // Open the Tantivy index sidecar. Best-effort: if it can't open
-    // (corrupt segments, version skew, etc.) we log and fall back to
-    // pure-PPR retrieval + substring search.
+    // Open the Tantivy index sidecar in read-only mode. The MCP server
+    // only searches — it never writes to the index. Reader-only mode
+    // avoids contending for the writer lock with a running brain watcher.
     let tantivy_path = tantivy_sidecar_path(db_path);
-    let tantivy = match TantivyIndex::open_or_create(&tantivy_path) {
+    let tantivy = match TantivyIndex::open_reader_only(&tantivy_path) {
         Ok(idx) => {
             tracing::info!(
                 docs = idx.doc_count(),
                 path = %tantivy_path.display(),
-                "Tantivy index open"
+                "Tantivy index open (reader-only)"
             );
             Some(idx)
         }
@@ -405,6 +405,9 @@ mod tests {
                 assert_eq!(structured["notes"], json!(0));
                 assert_eq!(structured["vault_count"], json!(0));
                 assert_eq!(resp.result["isError"], json!(false));
+                // Tantivy fields: no index passed → unavailable.
+                assert_eq!(structured["tantivy_available"], json!(false));
+                assert_eq!(structured["tantivy_doc_count"], json!(0));
             }
             Frame::Error(e) => panic!("brain_status should succeed: {}", e.error.message),
         }

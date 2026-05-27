@@ -43,6 +43,8 @@ pub enum TantivyError {
     Tantivy(String),
     #[error("io: {0}")]
     Io(String),
+    #[error("writer unavailable: index opened in read-only mode")]
+    WriterUnavailable,
 }
 
 impl From<tantivy::TantivyError> for TantivyError {
@@ -63,14 +65,23 @@ impl From<TantivyError> for StoreError {
     }
 }
 
-/// BM25 index over the brain's text content. Construct via
-/// `TantivyIndex::open_or_create`, then either rebuild from the graph
-/// (`reindex_from_store`) or apply incremental updates
-/// (`update_note` / `remove_note`).
+/// BM25 index over the brain's text content.
+///
+/// Two constructors:
+/// - `open_or_create` — opens both a reader and writer. Use this in
+///   processes that need to write (the brain watcher, `brain add`,
+///   `brain reindex-search`).
+/// - `open_reader_only` — opens only a reader. Use this in processes
+///   that only need to search (CLI search, MCP server, web UI). This
+///   avoids contending for the writer lock with a running watcher.
+///
+/// Write methods (`reindex_from_store`, `update_note`, `remove_note`)
+/// return `TantivyError::WriterUnavailable` when called on a
+/// reader-only instance.
 pub struct TantivyIndex {
     index: Index,
     reader: IndexReader,
-    writer: Mutex<tantivy::IndexWriter>,
+    writer: Option<Mutex<tantivy::IndexWriter>>,
     fields: Fields,
 }
 
@@ -113,7 +124,30 @@ impl TantivyIndex {
         Ok(Self {
             index,
             reader,
-            writer: Mutex::new(writer),
+            writer: Some(Mutex::new(writer)),
+            fields,
+        })
+    }
+
+    /// Open the on-disk index at `path` in read-only mode. No writer is
+    /// acquired, so this will succeed even when another process (e.g. the
+    /// brain watcher) holds the writer lock. Write operations on the
+    /// returned instance will return `TantivyError::WriterUnavailable`.
+    ///
+    /// Returns `Err` if the index directory does not exist or is corrupt.
+    pub fn open_reader_only(path: &Path) -> Result<Self, TantivyError> {
+        let index = Index::open_in_dir(path)?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let schema = index.schema();
+        let fields = lookup_fields(&schema);
+
+        Ok(Self {
+            index,
+            reader,
+            writer: None,
             fields,
         })
     }
@@ -122,7 +156,11 @@ impl TantivyIndex {
     /// Use after a fresh `index_markdown_directory` or as a manual escape
     /// hatch (`nestweaver brain reindex-search`).
     pub fn reindex_from_store(&self, store: &GraphStore) -> Result<usize, TantivyError> {
-        let mut writer = self.writer.lock().unwrap();
+        let writer_mutex = self
+            .writer
+            .as_ref()
+            .ok_or(TantivyError::WriterUnavailable)?;
+        let mut writer = writer_mutex.lock().unwrap();
         writer.delete_all_documents()?;
         let count = self.write_full_corpus(&mut writer, store)?;
         writer.commit()?;
@@ -147,7 +185,11 @@ impl TantivyIndex {
         sections: &[(String, String)],
         tags: &[String],
     ) -> Result<(), TantivyError> {
-        let mut writer = self.writer.lock().unwrap();
+        let writer_mutex = self
+            .writer
+            .as_ref()
+            .ok_or(TantivyError::WriterUnavailable)?;
+        let mut writer = writer_mutex.lock().unwrap();
         // Remove all docs with this note_uid first.
         writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
         // Add fresh.
@@ -195,7 +237,11 @@ impl TantivyIndex {
     /// Drop every Tantivy doc belonging to `note_uid`. Called by the
     /// watcher on file delete.
     pub fn remove_note(&self, note_uid: &str) -> Result<(), TantivyError> {
-        let mut writer = self.writer.lock().unwrap();
+        let writer_mutex = self
+            .writer
+            .as_ref()
+            .ok_or(TantivyError::WriterUnavailable)?;
+        let mut writer = writer_mutex.lock().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
         writer.commit()?;
         self.reader.reload()?;
@@ -242,6 +288,12 @@ impl TantivyIndex {
     /// Total doc count — useful for status / health checks.
     pub fn doc_count(&self) -> usize {
         self.reader.searcher().num_docs() as usize
+    }
+
+    /// Returns `true` if this instance has a writer (i.e. was opened via
+    /// `open_or_create`). Reader-only instances return `false`.
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
     }
 
     fn write_full_corpus(
@@ -592,5 +644,81 @@ mod tests {
         assert!(!idx.search("doomed", 5).unwrap().is_empty());
         idx.remove_note("note:y").unwrap();
         assert!(idx.search("doomed", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_only_can_search_while_writer_is_held() {
+        let dir = tempdir().unwrap();
+        // Open a full (writer) instance, write some data, and keep it alive.
+        let writer_idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        writer_idx
+            .update_note(
+                "note:rw",
+                "Concurrent Read Test",
+                "vlt:t",
+                &["body for concurrent read test".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(writer_idx.has_writer());
+
+        // Open a second, reader-only instance on the same directory.
+        let reader_idx = TantivyIndex::open_reader_only(dir.path()).unwrap();
+        assert!(!reader_idx.has_writer());
+
+        // The reader should be able to search the data committed by the writer.
+        let hits = reader_idx.search("concurrent", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "reader-only instance should find committed data"
+        );
+        assert_eq!(hits[0].title, "Concurrent Read Test");
+
+        // Doc count should also work.
+        assert!(reader_idx.doc_count() > 0);
+    }
+
+    #[test]
+    fn reader_only_rejects_write_operations() {
+        let dir = tempdir().unwrap();
+        // Create the index first so reader_only can open it.
+        let _writer = TantivyIndex::open_or_create(dir.path()).unwrap();
+        drop(_writer);
+
+        let reader = TantivyIndex::open_reader_only(dir.path()).unwrap();
+
+        // update_note should fail with WriterUnavailable.
+        let err = reader
+            .update_note("note:x", "X", "vlt:t", &[], &[], &[], &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TantivyError::WriterUnavailable),
+            "expected WriterUnavailable, got: {err}"
+        );
+
+        // remove_note should fail with WriterUnavailable.
+        let err = reader.remove_note("note:x").unwrap_err();
+        assert!(
+            matches!(err, TantivyError::WriterUnavailable),
+            "expected WriterUnavailable, got: {err}"
+        );
+
+        // reindex_from_store should fail with WriterUnavailable.
+        let store = GraphStore::in_memory().unwrap();
+        let err = reader.reindex_from_store(&store).unwrap_err();
+        assert!(
+            matches!(err, TantivyError::WriterUnavailable),
+            "expected WriterUnavailable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_reader_only_fails_on_nonexistent_dir() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let result = TantivyIndex::open_reader_only(&missing);
+        assert!(result.is_err(), "should fail on missing directory");
     }
 }
