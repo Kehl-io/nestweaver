@@ -112,24 +112,39 @@ pub fn wrap_tool_error(message: &str) -> Value {
     })
 }
 
+/// Check whether the caller requested concise output. Returns `true` when
+/// `response_format` is explicitly `"concise"`. Defaults to `false`
+/// (detailed) for backward compatibility.
+fn is_concise(args: &Value) -> bool {
+    args.get("response_format")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("concise"))
+}
+
 // ── 1. brain_context ────────────────────────────────────────────────────────
 
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Use FIRST when you need context to work on something. Runs Personalized PageRank over the unified code + notes graph from the given seeds and returns ranked, mixed-kind results (Symbol + Note + Section) within a token budget. Cheaper than reading files — get the structural picture before opening anything.\n\nSeeds may be: note titles, tag names (with or without #), symbol names, free text terms, or UIDs (sym:/note:/head:/sec:/tag:).",
+        "description": "Use FIRST when you need codebase or knowledge-base context around a symbol, note, tag, or topic. Runs Personalized PageRank over the unified code + notes graph from the given seeds and returns ranked, mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget. This is cheaper than reading files — get the structural picture before opening anything.\n\nDo NOT use for simple text search — use brain_search instead. Do NOT use when you already have a specific note UID and want its full body — use note_get instead.\n\nThe `seeds` parameter accepts note titles (e.g. \"Architecture\"), tag names (\"#status/active\"), symbol names (\"greet\"), free-text terms, or UIDs (sym:, note:, head:, sec:, tag:). Example: seeds=[\"AuthService\", \"#security\"] returns the authentication service symbol and all security-tagged notes, plus their graph neighbors ranked by relevance. Use `response_format` \"concise\" for a quick overview (names and relationships only) or \"detailed\" (default) for full metadata including file paths and relevance scores.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seeds": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "One or more seed strings to anchor the PPR walk."
+                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, free-text terms, or UIDs (sym:/note:/head:/sec:/tag:)."
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate cap on the connected list (chars / 4). Default 2000.",
+                    "description": "Approximate cap on the connected list (chars / 4). Default 2000. Increase for broader context, decrease for focused results.",
                     "default": 2000
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns names and relationships only; \"detailed\" (default) adds file paths, relevance scores, and UIDs."
                 },
                 "repos": {
                     "type": "array",
@@ -413,18 +428,27 @@ fn tool_brain_context(
 
     let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
 
+    let concise = is_concise(&args);
+
     let connected_json: Vec<Value> = result
         .connected
         .iter()
         .take(cut)
         .map(|n| {
-            json!({
-                "uid": n.uid,
-                "kind": n.kind,
-                "title": n.title,
-                "location": n.location,
-                "relevance": n.relevance,
-            })
+            if concise {
+                json!({
+                    "kind": n.kind,
+                    "title": n.title,
+                })
+            } else {
+                json!({
+                    "uid": n.uid,
+                    "kind": n.kind,
+                    "title": n.title,
+                    "location": n.location,
+                    "relevance": n.relevance,
+                })
+            }
         })
         .collect();
 
@@ -432,13 +456,20 @@ fn tool_brain_context(
         .seeds
         .iter()
         .map(|n| {
-            json!({
-                "uid": n.uid,
-                "kind": n.kind,
-                "title": n.title,
-                "location": n.location,
-                "relevance": n.relevance,
-            })
+            if concise {
+                json!({
+                    "kind": n.kind,
+                    "title": n.title,
+                })
+            } else {
+                json!({
+                    "uid": n.uid,
+                    "kind": n.kind,
+                    "title": n.title,
+                    "location": n.location,
+                    "relevance": n.relevance,
+                })
+            }
         })
         .collect();
 
@@ -538,15 +569,24 @@ fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Use when you need to find specific named things across the vault. BM25 full-text search across note titles, heading text, section bodies, and tag names. Returns ranked hits (best match first) with kind discriminator so you can tell apart note/heading/section/tag hits. For structural relevance (\"what's connected to X\") use brain_context instead.",
+        "description": "Use when you need to find specific notes, headings, sections, or tags by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, returning ranked hits (best match first) with a kind discriminator so you can tell note/heading/section/tag hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include BM25 scores and vault UIDs.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Free-text query — natural language works." },
+                "query": {
+                    "type": "string",
+                    "description": "Free-text query — natural language works. Example: \"database migration\" or \"AuthService\"."
+                },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results to return. Default 20.",
+                    "description": "Maximum results to return. Default 20. Set lower for focused lookups, higher for broad discovery.",
                     "default": 20
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns note titles and kinds only; \"detailed\" (default) adds section text excerpts, BM25 scores, and vault UIDs."
                 }
             },
             "required": ["query"]
@@ -569,6 +609,7 @@ fn tool_brain_search(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(20);
+    let concise = is_concise(&args);
 
     // Tantivy path (preferred). Falls back to substring scan if the index
     // isn't open — keeps the tool useful before the first
@@ -580,13 +621,20 @@ fn tool_brain_search(
         let results: Vec<Value> = hits
             .iter()
             .map(|h| {
-                json!({
-                    "uid": h.uid,
-                    "kind": h.kind,
-                    "title": h.title,
-                    "score": h.score,
-                    "vault_uid": h.vault_uid,
-                })
+                if concise {
+                    json!({
+                        "kind": h.kind,
+                        "title": h.title,
+                    })
+                } else {
+                    json!({
+                        "uid": h.uid,
+                        "kind": h.kind,
+                        "title": h.title,
+                        "score": h.score,
+                        "vault_uid": h.vault_uid,
+                    })
+                }
             })
             .collect();
         return Ok(json!({
@@ -606,14 +654,21 @@ fn tool_brain_search(
         .iter()
         .filter(|n| n.title.to_lowercase().contains(&needle))
         .map(|n| {
-            json!({
-                "uid": n.uid,
-                "kind": "note",
-                "title": n.title,
-                "path": n.file_path,
-                "note_kind": n.note_kind.to_string(),
-                "word_count": n.word_count,
-            })
+            if concise {
+                json!({
+                    "kind": "note",
+                    "title": n.title,
+                })
+            } else {
+                json!({
+                    "uid": n.uid,
+                    "kind": "note",
+                    "title": n.title,
+                    "path": n.file_path,
+                    "note_kind": n.note_kind.to_string(),
+                    "word_count": n.word_count,
+                })
+            }
         })
         .collect();
 
@@ -626,13 +681,20 @@ fn tool_brain_search(
             .filter(|h| h.text.to_lowercase().contains(&needle))
             .take(remaining)
             .map(|h| {
-                json!({
-                    "uid": h.uid,
-                    "kind": "heading",
-                    "title": h.text.clone(),
-                    "note_uid": h.note_uid,
-                    "level": h.level,
-                })
+                if concise {
+                    json!({
+                        "kind": "heading",
+                        "title": h.text.clone(),
+                    })
+                } else {
+                    json!({
+                        "uid": h.uid,
+                        "kind": "heading",
+                        "title": h.text.clone(),
+                        "note_uid": h.note_uid,
+                        "level": h.level,
+                    })
+                }
             })
             .collect();
         results.extend(heading_hits);
@@ -647,13 +709,20 @@ fn tool_brain_search(
             .filter(|s| s.text_content.to_lowercase().contains(&needle))
             .take(remaining)
             .map(|s| {
-                json!({
-                    "uid": s.uid,
-                    "kind": "section",
-                    "note_uid": s.note_uid,
-                    "heading_uid": s.heading_uid,
-                    "word_count": s.word_count,
-                })
+                if concise {
+                    json!({
+                        "kind": "section",
+                        "title": s.heading_uid.as_deref().unwrap_or("(untitled)"),
+                    })
+                } else {
+                    json!({
+                        "uid": s.uid,
+                        "kind": "section",
+                        "note_uid": s.note_uid,
+                        "heading_uid": s.heading_uid,
+                        "word_count": s.word_count,
+                    })
+                }
             })
             .collect();
         results.extend(section_hits);
@@ -673,21 +742,21 @@ fn tool_brain_search(
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Use after brain_context indicates a specific note is highly relevant and you want its full body. Loads the note's markdown from disk via vault.root_path + note.file_path, plus structural metadata (frontmatter, outline, tags, outgoing wikilink count). Pass either `uid` or `title` (title is case-insensitive and returns the first match). Use `sections` to retrieve only specific named sections instead of the full body.",
+        "description": "Use after brain_context or brain_search indicates a specific note is relevant and you need its full markdown body or specific sections. Loads the note content from disk plus structural metadata (frontmatter, heading outline, tags, outgoing wikilink count).\n\nDo NOT use to discover notes — use brain_search or brain_context first, then call note_get with the UID or title from those results. Do NOT use for code symbols — this is for markdown notes only.\n\nPass either `uid` (e.g. \"note:vlt:MyVault:abc123\") or `title` (case-insensitive, returns first match). Use the `sections` parameter to retrieve only specific named sections instead of the full body — this is much more token-efficient for large notes. Example: sections=[\"Architecture\", \"API Design\"] returns only those two heading sections.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uid": { "type": "string", "description": "Note UID (note:vlt:...:hash)" },
-                "title": { "type": "string", "description": "Note title (case-insensitive)" },
+                "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred over title for unambiguous lookup." },
+                "title": { "type": "string", "description": "Note title (case-insensitive). Returns the first match if multiple notes share the same title." },
                 "include_body": {
                     "type": "boolean",
-                    "description": "Include the full markdown body. Default true.",
+                    "description": "Include the full markdown body. Default true. Set to false to get only metadata (outline, frontmatter, section count).",
                     "default": true
                 },
                 "sections": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body."
+                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match."
                 }
             }
         }
@@ -825,12 +894,12 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_backlinks() -> Value {
     json!({
         "name": "backlinks",
-        "description": "Use to find everything that wiki-links TO a target note. Returns each source note that has a section linking to the target, with the link's confidence and display text. Pass either `uid` or `title`.",
+        "description": "Use to find every note that wiki-links TO a specific target note. Returns each source note with the linking section, confidence score, and display text. This reveals the reverse link graph — which notes reference the target.\n\nDo NOT use for forward links (what a note links to) — read the note body with note_get instead. Do NOT use for code symbol dependencies — use brain_impact or flow_trace instead.\n\nPass either `uid` (e.g. \"note:vlt:MyVault:abc123\") or `title` (case-insensitive, first match). Example: backlinks for \"API Design\" returns all notes that contain [[API Design]] wikilinks, along with the source note path and the confidence of each link resolution.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uid": { "type": "string", "description": "Note UID (note:vlt:...:hash)" },
-                "title": { "type": "string", "description": "Note title (case-insensitive match)" }
+                "uid": { "type": "string", "description": "Note UID (e.g. note:vlt:MyVault:abc123). Preferred for unambiguous lookup." },
+                "title": { "type": "string", "description": "Note title (case-insensitive match). Returns backlinks for the first matching note." }
             }
         }
     })
@@ -879,7 +948,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Use at the start of a session to see what the brain already knows about. Returns counts for vaults, notes, headings, sections, tags, wikilinks, and code repos — cheap and useful for sanity-checking that indexing happened.",
+        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. Do NOT use to check if the index is stale — use stale_check instead.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -937,14 +1006,14 @@ fn tool_brain_status(store: &GraphStore) -> Result<Value, anyhow::Error> {
 fn tool_schema_brain_add_source() -> Value {
     json!({
         "name": "brain_add_source",
-        "description": "Use when the user mentions notes / vaults / repos that aren't yet indexed. Auto-detects the source type (Obsidian vault if `.obsidian/` is present, code repo if `.git/` is present, plain markdown folder otherwise) and indexes it into the brain. Pass an absolute path or a path beginning with `~/`.",
+        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first. This tool requires the MCP server to be started with --allow-mcp-add-sources; it will return an error if that flag was not set.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Absolute or ~-relative directory path." },
+                "path": { "type": "string", "description": "Absolute or ~/-relative directory path to the vault, repo, or markdown folder to index." },
                 "name": {
                     "type": "string",
-                    "description": "Friendly name (vaults only). Defaults to the directory name."
+                    "description": "Friendly display name (vaults only). Defaults to the directory name. Has no effect for code repos."
                 }
             },
             "required": ["path"]
@@ -1053,12 +1122,12 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository relationships for a symbol. Returns other repos that share the same symbol name, with confidence scores. Use to understand blast radius across services when a shared symbol changes.",
+        "description": "Use when modifying a symbol that may be shared across multiple repositories to understand cross-repo blast radius. Returns other repos that reference or define the same symbol name, with confidence scores and link types (e.g. imports, re-exports, API contracts).\n\nDo NOT use for single-repo impact analysis — use brain_impact instead. Do NOT use for general search — use brain_search. This tool is only useful when multiple repos are indexed in the same brain.\n\nPass either `uid` (e.g. \"sym:repo:...:hash:42\") or `name` (e.g. \"UserService\"). Example: cross_repo_contracts for \"PaymentAPI\" returns all repos that import or implement that symbol, with confidence scores indicating match quality.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uid": { "type": "string", "description": "Symbol UID to look up" },
-                "name": { "type": "string", "description": "Symbol name (alternative to UID)" }
+                "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
+                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." }
             }
         }
     })
@@ -1110,12 +1179,18 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Analyze blast radius for a symbol. Returns all symbols that directly or transitively call/import/extend the target, grouped by depth. Use before modifying a function to understand what might break.",
+        "description": "Use BEFORE modifying a function, class, or interface to understand what might break. Performs reverse-dependency traversal from the target symbol and returns all symbols that directly or transitively call, import, or extend it, grouped by depth level.\n\nDo NOT use for forward call chains (what does this function call?) — use flow_trace instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for file-level change impact — use detect_changes instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"validateUser\") or a full UID (e.g. \"sym:repo:...:hash:42\"). The `depth` parameter controls how many hops to traverse (default 3). Use `response_format` \"concise\" to get just affected symbol names, or \"detailed\" (default) to include file paths, edge types (calls/imports/extends), and confidence scores.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Symbol name or UID" },
-                "depth": { "type": "integer", "description": "Max traversal depth", "default": 3 }
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Names are resolved via first-match lookup." },
+                "depth": { "type": "integer", "description": "Max traversal depth. Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns affected symbol names only; \"detailed\" (default) adds file paths, edge types, confidence scores, and depth levels."
+                }
             },
             "required": ["symbol"]
         }
@@ -1128,6 +1203,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'symbol' is required"))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+    let concise = is_concise(&args);
 
     // Resolve symbol — try UID first (contains ':'), then name lookup.
     let uid = if symbol.contains(':') {
@@ -1147,15 +1223,22 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let rows: Vec<Value> = nodes
         .iter()
         .map(|n| {
-            json!({
-                "uid": n.uid,
-                "name": n.name,
-                "file_path": n.file_path,
-                "start_line": n.start_line,
-                "edge_type": n.edge_type,
-                "confidence": n.confidence,
-                "depth": n.depth,
-            })
+            if concise {
+                json!({
+                    "name": n.name,
+                    "depth": n.depth,
+                })
+            } else {
+                json!({
+                    "uid": n.uid,
+                    "name": n.name,
+                    "file_path": n.file_path,
+                    "start_line": n.start_line,
+                    "edge_type": n.edge_type,
+                    "confidence": n.confidence,
+                    "depth": n.depth,
+                })
+            }
         })
         .collect();
 
@@ -1171,7 +1254,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_brain_guide() -> Value {
     json!({
         "name": "brain_guide",
-        "description": "Returns the auto-generated codebase intelligence guide. Use at the start of a session to understand the indexed codebase, its repos, vaults, and available tools.",
+        "description": "Use at the very start of a session to get a comprehensive overview of the indexed codebase and knowledge base. Returns an auto-generated intelligence guide covering all indexed repos (with language breakdowns and key entry points), vaults (with note counts and topics), cross-repo relationships, and a summary of available brain tools with usage tips.\n\nDo NOT use for specific queries — use brain_context or brain_search instead. This is a read-once orientation tool, not a query tool. No parameters are required.\n\nThe guide is regenerated from the current graph state on each call, so it always reflects the latest indexed content. Call this before brain_context to understand what seeds are available.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -1191,15 +1274,21 @@ fn tool_brain_guide(store: &GraphStore, _args: Value) -> Result<Value, anyhow::E
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Use when you need to see the forward call chain from a symbol — what functions it calls, what those call, etc. Returns a tree of callees. Best for understanding execution flow from entry points.",
+        "description": "Use when you need to understand execution flow: what functions a symbol calls, what those call, and so on. Returns a tree of callees rooted at the given symbol, following call edges forward through the graph. Best for tracing from entry points (e.g. main, request handlers) to understand the full execution path.\n\nDo NOT use for reverse dependencies (\"what calls this?\") — use brain_impact instead. Do NOT use for general context around a symbol — use brain_context instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"handleRequest\") or a full UID. The `max_depth` parameter caps tree depth (default 10). Cycles are detected and pruned. Use `response_format` \"concise\" for a function-name-only chain, or \"detailed\" (default) for full metadata including file paths and UIDs at each node.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "symbol": { "type": "string", "description": "Symbol name or UID to trace from" },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"handleRequest\") or full UID (e.g. \"sym:repo:...:hash:42\") to trace from." },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Maximum traversal depth. Default 10.",
+                    "description": "Maximum traversal depth. Default 10. Higher values trace deeper call chains but produce larger results.",
                     "default": 10
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "default": "detailed",
+                    "description": "\"concise\" returns function name chain only; \"detailed\" (default) adds file paths, UIDs, and depth at each node."
                 }
             },
             "required": ["symbol"]
@@ -1217,6 +1306,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(10);
+    let concise = is_concise(&args);
 
     // Resolve symbol — try UID first (contains ':'), then name lookup.
     let resolved_uid = if symbol.contains(':') {
@@ -1239,14 +1329,15 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     let mut visited = HashSet::new();
     visited.insert(root.uid.clone());
 
+    let opts = FlowTraceOpts { max_depth, concise };
     let tree = build_flow_tree(
         store,
         &root.uid,
         &root.name,
         &root.file_path,
         0,
-        max_depth,
         &mut visited,
+        &opts,
     );
 
     Ok(json!({
@@ -1257,18 +1348,25 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     }))
 }
 
+/// Configuration for `build_flow_tree` to keep the argument count under
+/// the clippy `too_many_arguments` threshold.
+struct FlowTraceOpts {
+    max_depth: usize,
+    concise: bool,
+}
+
 fn build_flow_tree(
     store: &GraphStore,
     uid: &str,
     name: &str,
     file_path: &str,
     depth: usize,
-    max_depth: usize,
     visited: &mut HashSet<String>,
+    opts: &FlowTraceOpts,
 ) -> Value {
     let mut children = Vec::new();
 
-    if depth < max_depth
+    if depth < opts.max_depth
         && let Ok(callees) = store.callees_of(uid)
     {
         for callee in &callees {
@@ -1282,20 +1380,27 @@ fn build_flow_tree(
                 &callee.name,
                 &callee.file_path,
                 depth + 1,
-                max_depth,
                 visited,
+                opts,
             );
             children.push(child);
         }
     }
 
-    json!({
-        "uid": uid,
-        "name": name,
-        "file_path": file_path,
-        "depth": depth,
-        "children": children,
-    })
+    if opts.concise {
+        json!({
+            "name": name,
+            "children": children,
+        })
+    } else {
+        json!({
+            "uid": uid,
+            "name": name,
+            "file_path": file_path,
+            "depth": depth,
+            "children": children,
+        })
+    }
 }
 
 // ── 11. detect_changes ─────────────────────────────────────────────────────
@@ -1303,14 +1408,14 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Use BEFORE committing changes to understand their blast radius. Maps changed files to affected execution flows and estimates risk level.",
+        "description": "Use BEFORE committing or reviewing changes to understand their blast radius at the file level. Takes a list of changed file paths, maps them to all symbols defined in those files, traces their transitive dependents, and returns a risk assessment (low/medium/high) with affected execution flows.\n\nDo NOT use for single-symbol impact — use brain_impact instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for git diff details — use brain_diff instead.\n\nThe `files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\", \"src/utils/validate.ts\"]). Returns affected symbols, affected processes/flows, and an overall risk level. Example: passing 3 changed files might return risk=\"high\" with 12 affected symbols across 2 execution flows.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "List of changed file paths (repo-relative)."
+                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
                 }
             },
             "required": ["files"]
@@ -1380,13 +1485,13 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
-        "description": "Use to understand the high-level architecture — shows functional communities of code detected by the Leiden algorithm. Each cluster groups tightly-connected symbols.",
+        "description": "Use to understand the high-level architecture of the codebase by viewing functional communities detected via the Leiden clustering algorithm. Each cluster groups tightly-connected symbols (functions, classes, modules) that form a cohesive unit, with a generated name, cohesion score, and key files.\n\nDo NOT use for specific symbol lookup — use brain_search or brain_context. Do NOT use for dependency analysis — use brain_impact or flow_trace. This is an exploratory tool for understanding overall code organization.\n\nThe optional `resolution` parameter controls cluster granularity: higher values produce more, smaller clusters; lower values produce fewer, larger clusters (default 1.0). Returns up to 20 member symbols per cluster. Example: resolution=0.5 might yield 3 broad architectural layers, while resolution=2.0 might yield 15 fine-grained feature modules.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "resolution": {
                     "type": "number",
-                    "description": "Leiden resolution parameter (higher = more clusters). Default 1.0.",
+                    "description": "Leiden resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 1.0. Try 0.5 for broad layers or 2.0 for fine-grained modules.",
                     "default": 1.0
                 }
             }
@@ -1445,7 +1550,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Use at the start of a session or after making changes to check if the code graph is up-to-date with the latest source. Compares indexed SHA with current git HEAD for each repo.",
+        "description": "Use at the start of a session or after the user makes code changes to verify the graph index is current. Compares each repo's indexed git SHA against the current HEAD and reports whether the index is stale. No parameters required.\n\nDo NOT use to see what changed — use brain_diff for that. Do NOT use for vault/note freshness — the brain auto-detects note modifications on query.\n\nReturns per-repo staleness status with indexed SHA, current HEAD SHA, and a boolean `any_stale` flag. If stale, suggest the user re-index with brain_add_source or the CLI `nestweaver index` command to update the graph.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -1533,20 +1638,20 @@ fn get_remote_head(url: &str) -> Option<String> {
 fn tool_schema_set_extension() -> Value {
     json!({
         "name": "set_extension",
-        "description": "Attach a custom metadata property to a node (symbol, note, etc.) in the extension sidecar. Use to store information that isn't in the core schema — e.g. team_owner, deprecated, review_needed. Properties are stored in a JSON sidecar alongside the database and queryable with query_extensions.",
+        "description": "Use to attach custom metadata to any node (symbol, note, section, tag) in the brain. Stores key-value properties in a JSON sidecar file alongside the database. Use this for information not in the core schema, such as team ownership, deprecation status, review flags, or custom taxonomies.\n\nDo NOT use for querying existing properties — use query_extensions instead. Properties persist across sessions and are queryable immediately after being set.\n\nThe `uid` parameter is the node's full UID (e.g. \"sym:repo:...:hash:42\" for symbols, \"note:vlt:...:hash\" for notes). The `key` is a property name (e.g. \"team_owner\", \"deprecated\", \"priority\"). The `value` accepts any JSON value: strings, numbers, booleans, arrays, or objects. Example: set_extension(uid=\"sym:...\", key=\"team_owner\", value=\"platform-team\").",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "uid": {
                     "type": "string",
-                    "description": "Node UID to annotate (e.g. sym:repo:...:hash:42)"
+                    "description": "Node UID to annotate (e.g. \"sym:repo:...:hash:42\" for symbols, \"note:vlt:...:hash\" for notes)."
                 },
                 "key": {
                     "type": "string",
-                    "description": "Property name (e.g. team_owner, deprecated)"
+                    "description": "Property name (e.g. \"team_owner\", \"deprecated\", \"review_needed\", \"priority\")."
                 },
                 "value": {
-                    "description": "Property value — any JSON value (string, number, boolean, object, array)"
+                    "description": "Property value — any JSON value (string, number, boolean, object, array). Overwrites any existing value for this key on this node."
                 }
             },
             "required": ["uid", "key", "value"]
@@ -1589,20 +1694,20 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
 fn tool_schema_query_extensions() -> Value {
     json!({
         "name": "query_extensions",
-        "description": "Query the extension sidecar to find nodes with a specific property value. Use to list all deprecated symbols, find nodes owned by a team, etc. Returns the UIDs and their full property maps.",
+        "description": "Use to find nodes by custom metadata or to inspect all properties on a specific node. Queries the extension sidecar (set via set_extension) and returns matching UIDs with their full property maps.\n\nDo NOT use to set properties — use set_extension. Do NOT use for core graph queries (symbols, notes, edges) — use brain_search or brain_context.\n\nTwo modes: (1) Pass `uid` alone to get all custom properties for that specific node. (2) Pass `key` + `value` to find all nodes matching that property (e.g. key=\"team_owner\", value=\"platform-team\" returns every node owned by that team). Example: query_extensions(key=\"deprecated\", value=true) returns all nodes marked as deprecated.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Property name to filter by (e.g. team_owner)"
+                    "description": "Property name to filter by (e.g. \"team_owner\", \"deprecated\"). Required when not using uid mode."
                 },
                 "value": {
-                    "description": "Value to match (any JSON value)"
+                    "description": "Value to match — any JSON value. Required when key is provided. Exact match only."
                 },
                 "uid": {
                     "type": "string",
-                    "description": "Optional: return all properties for a specific node UID instead of filtering"
+                    "description": "Return all custom properties for this specific node UID. When provided, key and value are ignored."
                 }
             }
         }
@@ -1661,17 +1766,17 @@ fn tool_query_extensions(args: Value) -> Result<Value, anyhow::Error> {
 fn tool_schema_brain_diff() -> Value {
     json!({
         "name": "brain_diff",
-        "description": "Show what changed in the graph since a given git SHA. Returns the files added/modified/deleted between the indexed SHA and the current HEAD, together with the symbols defined in those files. Use before a code review or after pulling to understand the scope of recent changes.",
+        "description": "Use before a code review or after pulling new changes to see what changed since the graph was last indexed. Returns files added, modified, and deleted between a base SHA and the current HEAD, plus all symbols defined in the changed files. Only works with locally-indexed repositories (file:// URLs).\n\nDo NOT use for impact analysis of hypothetical changes — use detect_changes instead. Do NOT use to check if the index is stale — use stale_check (faster, no git diff). Do NOT use for cross-repo change tracking.\n\nThe `repo` parameter is a repo name or substring of its URL (e.g. \"nestweaver\" or \"github.com/org/repo\"). The optional `since_sha` overrides the base SHA (defaults to the repo's last indexed SHA). Example: brain_diff(repo=\"my-app\") shows all files and symbols changed since the last index.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": {
                     "type": "string",
-                    "description": "Repo name or substring of its URL to diff"
+                    "description": "Repo name or substring of its URL (e.g. \"nestweaver\" or \"github.com/org/repo\"). Matched against indexed repos."
                 },
                 "since_sha": {
                     "type": "string",
-                    "description": "Git SHA to compare against. Defaults to the repo's indexed_sha."
+                    "description": "Git SHA to compare against. Defaults to the repo's indexed_sha. Use a specific SHA to diff against an older baseline."
                 }
             },
             "required": ["repo"]
@@ -1797,28 +1902,28 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Return all Notes, Symbols, and Sections associated with a Project, ranked by PPR within the project's subgraph. Use when you need to understand or work on a specific project.",
+        "description": "Use when you need the full context for a specific named project. Returns all Notes, Symbols, and Sections associated with the project, ranked by Personalized PageRank within the project's subgraph and bounded by a token budget. For composite projects, optionally includes content from component sub-projects.\n\nDo NOT use for ad-hoc topic queries — use brain_context with seed terms instead. Do NOT use if you don't know the project name — use brain_search to find it first. This tool requires projects to be defined in the graph (via vault taxonomy or instance config).\n\nThe `project` parameter accepts a project name (e.g. \"AuthService\"), alias, or UID. Use `kinds` to filter by node type (e.g. [\"Symbol\"] for code only, [\"Note\", \"Section\"] for docs only). Use `since` and `recency_weight` to prioritize recent content. Example: project_context(project=\"payments\", token_budget=5000, kinds=[\"Symbol\"]) returns the top code symbols in the payments project.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "Project name, alias, or UID"
+                    "description": "Project name (e.g. \"AuthService\"), alias, or UID. Resolved via name match, then alias match, then UID substring match."
                 },
                 "token_budget": {
                     "type": "integer",
                     "default": 3000,
-                    "description": "Approximate token cap for the result (chars / 4)"
+                    "description": "Approximate token cap for the result (chars / 4). Increase for comprehensive context, decrease for quick overview."
                 },
                 "kinds": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Filter result kinds (e.g. Symbol, Note, Section)"
+                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match."
                 },
                 "include_components": {
                     "type": "boolean",
                     "default": true,
-                    "description": "For composite projects, also include notes/symbols from component sub-projects"
+                    "description": "For composite projects, also include notes/symbols from component sub-projects. Set to false to see only direct project content."
                 },
                 "since": {
                     "type": "string",
