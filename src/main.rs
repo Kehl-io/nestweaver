@@ -700,6 +700,9 @@ enum Commands {
         /// Force-configure all tools even if not detected
         #[arg(long)]
         all: bool,
+        /// Include --allow-mcp-add-sources in generated configs (enables set_extension writes)
+        #[arg(long)]
+        allow_writes: bool,
         /// Path to the NestWeaver database
         #[arg(
             long,
@@ -2056,9 +2059,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::Setup { tool, all, db } => {
+        Commands::Setup {
+            tool,
+            all,
+            allow_writes,
+            db,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all)?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes)?;
             Ok((EXIT_SUCCESS, None))
         }
 
