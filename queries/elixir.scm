@@ -46,6 +46,12 @@
   target: (dot
     right: (identifier) @name)) @reference.call
 
+; Module attributes (@moduledoc, @doc, custom attributes)
+(unary_operator
+  operator: "@"
+  operand: (call
+    target: (identifier) @name)) @definition.const
+
 ; Alias references (like use, import, alias directives)
 (call
   target: (identifier) @_use

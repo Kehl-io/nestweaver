@@ -1,8 +1,16 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1860
 expression: "parsed_symbols(\"simple.js\", &source)"
 ---
+- name: fs
+  kind: Constant
+  start_line: 1
+  signature: "const fs = require('fs');"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
 - name: greet
   kind: Function
   start_line: 5
@@ -61,6 +69,15 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   kind: Method
   start_line: 22
   signature: "speak() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: dog
+  kind: Constant
+  start_line: 27
+  signature: "const dog = new Dog('Rex');"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

@@ -20,7 +20,21 @@
 
 ; Enum declarations
 (enum_declaration
-  name: (name) @name) @definition.class
+  name: (name) @name) @definition.enum
+
+; Class property declarations
+(property_declaration
+  (property_element
+    (variable_name) @name)) @definition.property
+
+; Class constant declarations
+(const_declaration
+  (const_element
+    (name) @name)) @definition.const
+
+; Enum case declarations
+(enum_case
+  name: (name) @name) @definition.const
 
 ; Function call expressions
 (function_call_expression

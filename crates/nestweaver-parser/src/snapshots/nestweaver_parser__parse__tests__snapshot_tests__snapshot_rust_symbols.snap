@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1902
 expression: "parsed_symbols(\"simple.rs\", &source)"
 ---
 - name: SensorManager
@@ -12,8 +11,17 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+- name: sensors
+  kind: Property
+  start_line: 5
+  signature: "sensors: HashMap<String, Sensor>"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
 - name: SensorKind
-  kind: Class
+  kind: Enum
   start_line: 8
   signature: "pub enum SensorKind {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -29,6 +37,15 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
+  type_info: ~
+- name: SensorManager
+  kind: Class
+  start_line: 18
+  signature: "impl Readable for SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
   type_info: ~
 - name: read
   kind: Method
@@ -46,6 +63,15 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   kind: Method
   start_line: 23
   signature: "fn calibrate(&mut self) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: SensorManager
+  kind: Class
+  start_line: 28
+  signature: "impl SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

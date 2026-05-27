@@ -6,9 +6,26 @@
 (interface_declaration
   name: (identifier) @name) @definition.interface
 
+; Enum declarations
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
 ; Method declarations
 (method_declaration
   name: (identifier) @name) @definition.method
+
+; Constructor declarations
+(constructor_declaration
+  name: (identifier) @name) @definition.constructor
+
+; Class field declarations
+(field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name)) @definition.property
+
+; Enum constants
+(enum_constant
+  name: (identifier) @name) @definition.const
 
 ; Method invocations (calls)
 (method_invocation
@@ -30,3 +47,10 @@
 (super_interfaces
   (type_list
     (type_identifier) @name)) @reference.implements
+
+; Annotation references
+(marker_annotation
+  name: (identifier) @name) @reference.call
+
+(annotation
+  name: (identifier) @name) @reference.call

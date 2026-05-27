@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1972
 expression: "parsed_symbols(\"simple.dart\", &source)"
 ---
 - name: Greeter
@@ -58,7 +57,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   visibility: Private
   type_info: ~
 - name: Priority
-  kind: Class
+  kind: Enum
   start_line: 26
   signature: "enum Priority { low, medium, high }"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1986
 expression: "parsed_symbols(\"Simple.java\", &source)"
 ---
 - name: Greeter
@@ -40,6 +39,24 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   kind: Class
   start_line: 9
   signature: "public class SimpleGreeter implements Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: prefix
+  kind: Property
+  start_line: 10
+  signature: private String prefix;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: SimpleGreeter
+  kind: Method
+  start_line: 12
+  signature: "public SimpleGreeter(String prefix) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

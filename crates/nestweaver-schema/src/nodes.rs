@@ -36,6 +36,10 @@ pub enum SymbolKind {
     Enum,
     Module,
     Extension,
+    Constant,
+    Property,
+    TypeAlias,
+    Variable,
 }
 
 impl fmt::Display for SymbolKind {
@@ -49,6 +53,10 @@ impl fmt::Display for SymbolKind {
             SymbolKind::Enum => write!(f, "Enum"),
             SymbolKind::Module => write!(f, "Module"),
             SymbolKind::Extension => write!(f, "Extension"),
+            SymbolKind::Constant => write!(f, "Constant"),
+            SymbolKind::Property => write!(f, "Property"),
+            SymbolKind::TypeAlias => write!(f, "TypeAlias"),
+            SymbolKind::Variable => write!(f, "Variable"),
         }
     }
 }

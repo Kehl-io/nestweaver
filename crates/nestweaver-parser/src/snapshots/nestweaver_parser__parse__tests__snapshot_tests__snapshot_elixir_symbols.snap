@@ -1,12 +1,20 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2398
 expression: "parsed_symbols(\"simple.ex\", &source)"
 ---
 - name: Greeter
   kind: Module
   start_line: 1
   signature: defmodule Greeter do
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: moduledoc
+  kind: Constant
+  start_line: 2
+  signature: "@moduledoc \"A simple greeter module\""
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

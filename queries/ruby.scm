@@ -14,6 +14,10 @@
 (module
   name: (constant) @name) @definition.module
 
+; Constant assignments (CONST = value)
+(assignment
+  left: (constant) @name) @definition.const
+
 ; Call expressions (receiver.method calls)
 (call
   method: (identifier) @name) @reference.call

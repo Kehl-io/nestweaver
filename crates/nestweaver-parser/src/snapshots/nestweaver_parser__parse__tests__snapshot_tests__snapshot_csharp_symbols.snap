@@ -1,8 +1,16 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1958
 expression: "parsed_symbols(\"Simple.cs\", &source)"
 ---
+- name: MyApp.Models
+  kind: Module
+  start_line: 4
+  signature: namespace MyApp.Models
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
 - name: IGreeter
   kind: Interface
   start_line: 6
@@ -25,13 +33,40 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
     parameter_types: []
     return_type: string
 - name: Priority
-  kind: Class
+  kind: Enum
   start_line: 11
   signature: public enum Priority
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
+  type_info: ~
+- name: Low
+  kind: Constant
+  start_line: 13
+  signature: Low
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Medium
+  kind: Constant
+  start_line: 14
+  signature: Medium
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: High
+  kind: Constant
+  start_line: 15
+  signature: High
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
   type_info: ~
 - name: SimpleGreeter
   kind: Class

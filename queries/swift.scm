@@ -10,6 +10,21 @@
 (protocol_declaration
   name: (type_identifier) @name) @definition.interface
 
+; Type alias declarations
+(typealias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; Stored properties (var/let declarations inside class/struct)
+(class_declaration
+  body: (class_body
+    (property_declaration
+      (pattern
+        (simple_identifier) @name)) @definition.property))
+
+; Enum case declarations
+(enum_entry
+  (simple_identifier) @name) @definition.const
+
 ; Import statements — import_declaration > identifier > simple_identifier
 (import_declaration
   (identifier

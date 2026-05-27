@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2042
 expression: "parsed_symbols(\"simple.swift\", &source)"
 ---
 - name: Greeter
@@ -54,10 +53,46 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+- name: defaultName
+  kind: Property
+  start_line: 18
+  signature: "let defaultName: String = \"World\""
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
 - name: Priority
   kind: Class
   start_line: 21
   signature: "enum Priority {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: low
+  kind: Constant
+  start_line: 22
+  signature: case low
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: medium
+  kind: Constant
+  start_line: 23
+  signature: case medium
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: high
+  kind: Constant
+  start_line: 24
+  signature: case high
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

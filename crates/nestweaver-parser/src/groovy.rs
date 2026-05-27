@@ -177,7 +177,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
             let visibility = infer_groovy_visibility(trimmed);
             symbols.push(RawSymbol {
                 name,
-                kind: SymbolKind::Class,
+                kind: SymbolKind::Enum,
                 start_line: line_no,
                 signature: trimmed.to_string(),
                 content_hash: sha256_hex(trimmed),

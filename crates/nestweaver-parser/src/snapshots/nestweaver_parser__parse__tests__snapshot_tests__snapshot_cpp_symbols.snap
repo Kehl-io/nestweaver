@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1944
 expression: "parsed_symbols(\"simple.cpp\", &source)"
 ---
 - name: SensorManager
@@ -25,6 +24,15 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   kind: Method
   start_line: 7
   signature: readTemperature()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: sensorId
+  kind: Property
+  start_line: 9
+  signature: int sensorId;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -57,10 +65,55 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+- name: pin
+  kind: Property
+  start_line: 21
+  signature: int pin;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: threshold
+  kind: Property
+  start_line: 22
+  signature: double threshold;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
 - name: SensorType
-  kind: Class
+  kind: Enum
   start_line: 25
   signature: "enum SensorType {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: TEMPERATURE
+  kind: Constant
+  start_line: 26
+  signature: TEMPERATURE
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: HUMIDITY
+  kind: Constant
+  start_line: 27
+  signature: HUMIDITY
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: PRESSURE
+  kind: Constant
+  start_line: 28
+  signature: PRESSURE
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -70,6 +123,15 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   kind: Function
   start_line: 31
   signature: setup()
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: temp
+  kind: Variable
+  start_line: 34
+  signature: double temp = mgr.readTemperature();
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

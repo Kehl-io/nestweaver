@@ -23,9 +23,37 @@
   name: (type_identifier) @name
   body: (_)) @definition.class
 
-; Enum definitions (mapped to class)
+; Enum definitions
 (enum_specifier
-  name: (type_identifier) @name) @definition.class
+  name: (type_identifier) @name) @definition.enum
+
+; #define macros
+(preproc_def
+  name: (identifier) @name) @definition.macro
+
+; Function-like macros
+(preproc_function_def
+  name: (identifier) @name) @definition.macro
+
+; Struct/union field declarations
+(field_declaration
+  declarator: (field_identifier) @name) @definition.field
+
+; Type aliases (typedef and using)
+(type_definition
+  declarator: (type_identifier) @name) @definition.type
+
+(alias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; Enum values (enumerators)
+(enumerator
+  name: (identifier) @name) @definition.const
+
+; Global variable declarations
+(declaration
+  declarator: (init_declarator
+    declarator: (identifier) @name)) @definition.variable
 
 ; Call expressions
 (call_expression

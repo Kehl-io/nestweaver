@@ -8,12 +8,21 @@
 
 ; Object declarations (companion objects and top-level objects)
 (object_declaration
-  (type_identifier) @name) @definition.class
+  (type_identifier) @name) @definition.module
 
 ; Methods (functions inside class body)
 (class_body
   (function_declaration
     (simple_identifier) @name) @definition.method)
+
+; Property declarations (val/var)
+(property_declaration
+  (variable_declaration
+    (simple_identifier) @name)) @definition.property
+
+; Enum entries
+(enum_entry
+  (simple_identifier) @name) @definition.const
 
 ; Call expressions — direct: greet(...)
 (call_expression

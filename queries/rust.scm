@@ -15,13 +15,41 @@
 (struct_item
   name: (type_identifier) @name) @definition.class
 
-; Enum definitions (mapped to class)
+; Enum definitions
 (enum_item
-  name: (type_identifier) @name) @definition.class
+  name: (type_identifier) @name) @definition.enum
 
 ; Trait definitions (mapped to interface)
 (trait_item
   name: (type_identifier) @name) @definition.interface
+
+; Const items
+(const_item
+  name: (identifier) @name) @definition.const
+
+; Static items
+(static_item
+  name: (identifier) @name) @definition.static
+
+; Type aliases
+(type_item
+  name: (type_identifier) @name) @definition.type
+
+; Module declarations
+(mod_item
+  name: (identifier) @name) @definition.module
+
+; Macro definitions
+(macro_definition
+  name: (identifier) @name) @definition.macro
+
+; Struct field declarations
+(field_declaration
+  name: (field_identifier) @name) @definition.field
+
+; Impl blocks
+(impl_item
+  type: (type_identifier) @name) @definition.impl
 
 ; Call expressions
 (call_expression

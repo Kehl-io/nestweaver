@@ -75,7 +75,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
 - name: Priority
-  kind: Class
+  kind: Enum
   start_line: 37
   signature: "enum Priority {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
