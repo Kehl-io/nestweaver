@@ -134,6 +134,14 @@ impl GraphStore {
 
     pub fn batch_insert_symbols(&self, symbols: &[Symbol]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_symbols_on(&conn, symbols)
+    }
+
+    /// Insert symbols using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_symbols_on(
+        conn: &lbug::Connection<'_>,
+        symbols: &[Symbol],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
@@ -191,6 +199,14 @@ impl GraphStore {
 
     pub fn batch_insert_files(&self, files: &[File]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_files_on(&conn, files)
+    }
+
+    /// Insert files using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_files_on(
+        conn: &lbug::Connection<'_>,
+        files: &[File],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:File {uid: $uid, path: $path, repo_uid: $repo, content_hash: $hash})",
@@ -213,6 +229,14 @@ impl GraphStore {
 
     pub fn batch_insert_repo_file_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_repo_file_edges_on(&conn, edges)
+    }
+
+    /// Insert repo-file edges using an externally-provided connection.
+    pub fn batch_insert_repo_file_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (r:Repo {uid: $repo}), (f:File {uid: $file}) \
@@ -234,6 +258,14 @@ impl GraphStore {
 
     pub fn batch_insert_file_symbol_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_file_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert file-symbol edges using an externally-provided connection.
+    pub fn batch_insert_file_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (f:File {uid: $file}), (s:Symbol {uid: $sym}) \
@@ -305,6 +337,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_service_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert service-symbol edges using an externally-provided connection.
+    pub fn batch_insert_service_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (svc:Service {uid: $svc}), (sym:Symbol {uid: $sym}) \
@@ -431,6 +471,67 @@ impl GraphStore {
         }
     }
 
+    /// Perform all bulk inserts for a full index in a single transaction.
+    /// This avoids per-statement WAL flushes and provides a major speedup.
+    pub fn bulk_index_write(
+        &self,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Insert file nodes.
+        Self::batch_insert_files_on(&conn, files)?;
+
+        // Insert symbol nodes.
+        Self::batch_insert_symbols_on(&conn, symbols)?;
+
+        // Insert REPO_HAS_FILE edges.
+        Self::batch_insert_repo_file_edges_on(&conn, repo_file_edges)?;
+
+        // Insert FILE_HAS_SYMBOL edges.
+        Self::batch_insert_file_symbol_edges_on(&conn, file_symbol_edges)?;
+
+        // Insert service nodes.
+        {
+            let mut stmt = conn
+                .prepare(
+                    "CREATE (:Service {uid: $uid, name: $name, repo_uid: $repo, \
+                     summary: $summary, summary_hash: $shash})",
+                )
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            for svc in services {
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("uid", lbug::Value::String(svc.uid.clone())),
+                        ("name", lbug::Value::String(svc.name.clone())),
+                        ("repo", lbug::Value::String(svc.repo_uid.clone())),
+                        (
+                            "summary",
+                            lbug::Value::String(svc.summary.clone().unwrap_or_default()),
+                        ),
+                        (
+                            "shash",
+                            lbug::Value::String(svc.summary_hash.clone().unwrap_or_default()),
+                        ),
+                    ],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            }
+        }
+
+        // Insert SERVICE_HAS_SYMBOL edges.
+        Self::batch_insert_service_symbol_edges_on(&conn, service_symbol_edges)?;
+
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
         // Group edges by their SQL query string so we prepare each statement only once.
         use std::collections::HashMap;
@@ -538,7 +639,7 @@ impl GraphStore {
             }
         }
 
-        let conn = self.conn()?;
+        let conn = self.begin_transaction()?;
         for (query, param_sets) in &groups {
             let mut stmt = conn
                 .prepare(query)
@@ -548,6 +649,7 @@ impl GraphStore {
                     .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
             }
         }
+        self.commit_transaction(&conn)?;
         Ok(())
     }
 
