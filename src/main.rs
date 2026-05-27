@@ -11,7 +11,7 @@ use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
     FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
+    build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_dead_code, discover_cross_domain_links,
     embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
@@ -21,7 +21,7 @@ use nestweaver_engine::{
     save_clusters, save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
-use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
+use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
 const EXIT_SUCCESS: i32 = 0;
@@ -401,6 +401,11 @@ enum Commands {
         feature: Option<String>,
         #[arg(long, help = "Path to instance config file (required with --feature)")]
         config: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
+        )]
+        intent: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -1553,10 +1558,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             seeds,
             feature,
             config,
+            intent,
             json,
             db,
         } => {
             let store = open_store(db.as_deref())?;
+
+            let parsed_intent: Option<QueryIntent> = intent
+                .as_deref()
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
 
             if let Some(feature_name) = &feature {
                 // Feature-mode: resolve via instance config.
@@ -1602,7 +1614,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 // Normal seed-based context.
-                match build_context(&store, &seeds) {
+                match build_context_with_intent(&store, &seeds, parsed_intent) {
                     Ok(result) => {
                         let stats = format!(
                             "{} seeds, {} connected nodes in {}",

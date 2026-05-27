@@ -1,5 +1,5 @@
 use nestweaver_schema::{Repo, Service, Symbol};
-use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
+use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex, detect_intent};
 use serde::Serialize;
 
 use anyhow::Context;
@@ -198,9 +198,26 @@ fn is_file_path(input: &str) -> bool {
 ///
 /// Personalized PageRank (d = 0.85, 20 iterations) is then run from all
 /// resolved seeds and the results are split into `seeds` and `connected`.
+///
+/// When `intent` is `None`, defaults to the standard damping (0.85) with
+/// no edge weight adjustments, preserving backward compatibility.
 pub fn build_context(
     store: &GraphStore,
     inputs: &[String],
+) -> Result<ContextResult, anyhow::Error> {
+    build_context_with_intent(store, inputs, None)
+}
+
+/// Like [`build_context`] but accepts an optional [`QueryIntent`] to
+/// dynamically tune PPR's damping factor and edge weights.
+///
+/// When `intent` is `Some`, the intent's parameters override the defaults.
+/// When `intent` is `None` but auto-detection is desired, use
+/// [`QueryIntent`] with [`detect_intent`] on the resolved seeds.
+pub fn build_context_with_intent(
+    store: &GraphStore,
+    inputs: &[String],
+    intent: Option<QueryIntent>,
 ) -> Result<ContextResult, anyhow::Error> {
     let mut seed_uids: Vec<String> = Vec::new();
     let mut file_paths_tried: Vec<String> = Vec::new();
@@ -252,11 +269,21 @@ pub fn build_context(
         anyhow::bail!("No matching symbols found. Try `nestweaver search <term>` to find symbols.");
     }
 
+    // Resolve the effective intent: use the caller's override if provided,
+    // otherwise auto-detect from the resolved seeds.
+    let effective_intent = intent.or_else(|| Some(detect_intent(store, &seed_uids)));
+
     // Run Personalized PageRank over the code-only scope (preserves the
     // pre-brain behaviour of `nestweaver context`). The unified scope that
     // mixes code + notes is exposed via `nestweaver brain context`.
     let ppr_results = store
-        .personalized_pagerank(&seed_uids, 0.85, 20, &GraphScope::code_only())
+        .personalized_pagerank_with_intent(
+            &seed_uids,
+            0.85,
+            20,
+            &GraphScope::code_only(),
+            effective_intent,
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
