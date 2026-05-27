@@ -101,3 +101,44 @@ name = "data-sync"
 description = "Real-time data sync from device through backend to clients"
 repos = ["device-firmware", "api-service", "web-client", "mobile-app"]
 entry_points = ["sendReading", "ingestData", "useRealtimeData", "DataStream"]
+
+# ── Projects ─────────────────────────────────────────────────────────────
+#
+# Projects aggregate notes, symbols, and components into named units.
+# They connect vault documentation to code repos for unified retrieval.
+
+[[projects]]
+name = "device-onboarding"
+description = "End-to-end device onboarding: discovery, pairing, registration"
+aliases = ["onboarding", "DO"]
+vault_folder = "Projects/device-onboarding"
+repos = ["mobile-app", "device-firmware", "api-service"]
+features = ["device-onboarding"]
+components = ["ble-scanner", "device-registry"]
+
+[[projects]]
+name = "platform"
+description = "Top-level platform composite"
+components = ["device-onboarding", "user-auth"]
+
+# ── Cross-domain config ──────────────────────────────────────────────────
+#
+# Tune how NestWeaver bridges notes to code symbols.
+
+[cross_domain]
+stoplist_extend = ["Platform", "Service", "Manager"]
+min_symbol_name_length = 4
+
+# ── MCP servers (for wiki source ingestion) ──────────────────────────────
+#
+# Declare external MCP servers that NestWeaver can call to fetch content
+# from wikis, project trackers, or other knowledge sources.
+
+# [[mcp_servers]]
+# name = "confluence"
+# command = "npx"
+# args = ["-y", "@anthropic/confluence-mcp"]
+#
+# [mcp_servers.env]
+# CONFLUENCE_URL = "https://yoursite.atlassian.net"
+# CONFLUENCE_API_TOKEN = "your-token"
