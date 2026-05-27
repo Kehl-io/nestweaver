@@ -2734,6 +2734,7 @@ dependencies = [
  "insta",
  "nestweaver-parser",
  "nestweaver-schema",
+ "proptest",
  "thiserror",
  "tracing",
 ]
