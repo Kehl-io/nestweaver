@@ -17,6 +17,30 @@ pub enum EdgeType {
     ProjectHasParent,
 }
 
+impl EdgeType {
+    /// Return the Cypher relationship table name used in the graph store.
+    ///
+    /// This may differ from the `Display` representation: `Extends`,
+    /// `Implements`, and `Includes` use a `_SYM` suffix in the DB to
+    /// disambiguate from note-level edge tables.
+    pub fn rel_table_name(&self) -> &'static str {
+        match self {
+            EdgeType::Calls => "CALLS",
+            EdgeType::Imports => "IMPORTS",
+            EdgeType::Extends => "EXTENDS_SYM",
+            EdgeType::Implements => "IMPLEMENTS_SYM",
+            EdgeType::Includes => "INCLUDES_SYM",
+            EdgeType::MemberOf => "MEMBER_OF",
+            EdgeType::Contains => "CONTAINS",
+            EdgeType::CrossRepoLink => "CROSS_REPO_LINK",
+            EdgeType::ProjectIncludesSymbol => "PROJECT_INCLUDES_SYMBOL",
+            EdgeType::ProjectIncludesNote => "PROJECT_INCLUDES_NOTE",
+            EdgeType::ProjectHasComponent => "PROJECT_HAS_COMPONENT",
+            EdgeType::ProjectHasParent => "PROJECT_HAS_PARENT",
+        }
+    }
+}
+
 impl fmt::Display for EdgeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
