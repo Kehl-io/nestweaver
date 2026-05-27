@@ -15,8 +15,8 @@ use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
     attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
     compute_clusters, detect_changes_impact, detect_dead_code, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, index_directory,
-    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
+    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
+    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
     parse_iso8601_to_epoch, query_by_property, render_text, save_extensions, set_property,
     truncate_to_budget,
 };
@@ -305,6 +305,14 @@ fn tool_brain_context(
         ..defaults
     };
 
+    // Parse optional intent parameter.
+    let intent: Option<nestweaver_store::QueryIntent> = args
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .map(|s| s.parse::<nestweaver_store::QueryIntent>())
+        .transpose()
+        .map_err(|e| anyhow!("invalid intent: {e}"))?;
+
     // Load taxonomy aliases so vault-defined name variants resolve correctly.
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
@@ -319,6 +327,7 @@ fn tool_brain_context(
         &config,
         &aliases,
         Some(&db_path),
+        intent,
     )?;
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
@@ -983,16 +992,25 @@ fn tool_brain_status(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let wikilinks = store.count_wikilink_edges().unwrap_or(0);
     let repos = store.list_repos(None).unwrap_or_default();
 
+    let db_path = current_db_path(store).ok();
+
     let vaults_json: Vec<Value> = vaults
         .iter()
         .map(|v| {
             let notes = store.list_notes(Some(&v.uid)).unwrap_or_default();
             let note_count = notes.len();
-            let last_indexed = notes
-                .iter()
-                .filter_map(|n| n.modified_at.as_deref())
-                .max()
-                .map(|s| s.to_string());
+            // Prefer the extension-store timestamp (actual indexer run);
+            // fall back to max(note.modified_at) for older databases.
+            let last_indexed = db_path
+                .as_deref()
+                .and_then(|p| get_last_indexed_at(p, &v.uid))
+                .or_else(|| {
+                    notes
+                        .iter()
+                        .filter_map(|n| n.modified_at.as_deref())
+                        .max()
+                        .map(|s| s.to_string())
+                });
             json!({
                 "name": v.name,
                 "root_path": v.root_path,
@@ -1100,6 +1118,10 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         let db_path = current_db_path(store)?;
         let result =
             index_markdown_directory(path, &db_path, "default", &name).context("index vault")?;
+        // Record the indexer run timestamp for this vault.
+        if let Err(e) = nestweaver_engine::record_last_indexed_at(&db_path, &result.vault_uid) {
+            tracing::warn!("failed to record last_indexed_at: {e}");
+        }
         return Ok(json!({
             "kind": kind,
             "name": result.vault_name,
@@ -2079,7 +2101,7 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Run hybrid PPR from seeds.
+    // 4. Run hybrid PPR from seeds with an architecture-focused default intent.
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
     let config = HybridSearchConfig::default();
@@ -2090,6 +2112,7 @@ fn tool_project_context(
         &config,
         &aliases,
         Some(&db_path),
+        Some(nestweaver_store::QueryIntent::UnderstandArchitecture),
     )?;
 
     // 5. Apply optional kinds filter.
@@ -2550,6 +2573,8 @@ fn tool_schema_get_summary() -> Value {
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    use nestweaver_engine::{load_summaries, save_summaries};
+
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
     let target = args.get("target").and_then(|v| v.as_str());
@@ -2558,7 +2583,43 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
 
-    let summaries = generate_summaries(store, level)?;
+    // Try loading cached summaries from the sidecar first; only use the
+    // cache when it contains entries at the requested level.
+    let db_path = current_db_path(store).ok();
+    let (summaries, from_cache) = if let Some(ref db) = db_path
+        && let Ok(Some(cached)) = load_summaries(db)
+    {
+        let level_filtered: Vec<nestweaver_engine::Summary> =
+            cached.into_iter().filter(|s| s.level == level).collect();
+        if level_filtered.is_empty() {
+            let fresh = generate_summaries(store, level)?;
+            (fresh, false)
+        } else {
+            (level_filtered, true)
+        }
+    } else {
+        let fresh = generate_summaries(store, level)?;
+        (fresh, false)
+    };
+
+    // Persist freshly generated summaries so subsequent calls hit the cache.
+    if !from_cache && let Some(ref db) = db_path {
+        // Merge with any existing cached summaries at other levels.
+        let mut all = if let Ok(Some(existing)) = load_summaries(db) {
+            existing
+                .into_iter()
+                .filter(|s| s.level != level)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        all.extend(summaries.iter().cloned());
+        // Best-effort save; don't fail the tool call on I/O error.
+        if let Err(e) = save_summaries(db, &all) {
+            tracing::warn!("failed to save summaries sidecar: {e}");
+        }
+    }
+
     let total_available = summaries.len();
 
     // Build the display list: filter by target, then truncate by budget.
@@ -2592,6 +2653,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "tokens_used": total_tokens,
         "token_budget": token_budget,
         "truncated": display.len() < after_filter_len,
+        "cached": from_cache,
         "summaries": text,
     }))
 }
