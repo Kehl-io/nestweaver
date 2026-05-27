@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, ContextResult, FeatureContextResult, HybridSearchConfig,
     LookupResult, build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    compute_clusters, discover_cross_domain_links, embedding::generate_embedding, generate_guide,
+    compute_clusters, discover_cross_domain_links, embedding::generate_embedding, generate_agents_md,
+    generate_cursor_rule, generate_guide, generate_skill,
     generate_repo_map, incremental_index, index_directory, index_markdown_directory,
     index_markdown_directory_since, list_repos, list_services, load_alias_sidecar, load_clusters,
     load_manifest_cache, lookup_symbol, save_clusters, search_symbols, suggest_links,
@@ -342,6 +343,12 @@ enum Commands {
             help = "Path to instance config (TOML) — enriches guide with features and declared links"
         )]
         config: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "markdown",
+            help = "Output format: markdown (default), skill, cursor-rule, agents-md"
+        )]
+        format: String,
     },
     /// Manage graph snapshots (build, verify, push)
     Snapshot {
@@ -1292,20 +1299,30 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(EXIT_SUCCESS)
         }
 
-        Commands::GenerateGuide { db, output, config } => {
+        Commands::GenerateGuide {
+            db,
+            output,
+            config,
+            format,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
             let instance_config = config
                 .as_deref()
                 .map(nestweaver_engine::InstanceConfig::from_file)
                 .transpose()?;
-            let guide = generate_guide(&store, instance_config.as_ref())?;
+            let output_str = match format.as_str() {
+                "skill" => generate_skill(&store, instance_config.as_ref())?,
+                "cursor-rule" => generate_cursor_rule(&store, instance_config.as_ref())?,
+                "agents-md" => generate_agents_md(&store, instance_config.as_ref())?,
+                _ => generate_guide(&store, instance_config.as_ref())?,
+            };
             match output {
                 Some(path) => {
-                    std::fs::write(&path, &guide)?;
+                    std::fs::write(&path, &output_str)?;
                     eprintln!("Guide written to {}", path.display());
                 }
-                None => print!("{guide}"),
+                None => print!("{output_str}"),
             }
             Ok(EXIT_SUCCESS)
         }
