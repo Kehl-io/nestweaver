@@ -35,7 +35,7 @@ cargo build --release
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/korykehl/nestweaver/releases)
+Download from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases)
 for Linux and macOS (x86_64 and aarch64).
 
 ## Quick Start
