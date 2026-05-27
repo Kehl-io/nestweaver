@@ -14,3 +14,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
+proptest = "1"
