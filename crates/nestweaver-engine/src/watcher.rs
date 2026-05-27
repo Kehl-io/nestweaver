@@ -479,6 +479,13 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    /// Create a `ShutdownHandle` from an existing `AtomicBool` flag.
+    /// Used by other watchers (`CodeWatcher`) that share the same
+    /// shutdown pattern but manage their own flag.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
     pub fn stop(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }

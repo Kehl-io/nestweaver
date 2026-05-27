@@ -22,6 +22,7 @@ pub mod snapshot;
 pub mod suggest;
 pub mod summary;
 pub mod vector_search;
+pub mod watch_code;
 pub mod watcher;
 
 pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
@@ -72,4 +73,5 @@ pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
     materialize_declared_links, persist_cross_repo_links, suggest_links,
 };
+pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
