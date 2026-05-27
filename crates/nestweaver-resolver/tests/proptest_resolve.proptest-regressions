@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a713f32cc045a52b950b1b3d2a1625a45f57d02c81a0d2a5a7b53d37059beb56 # shrinks to files = [("src/a.a", [RawSymbol { name: "_", kind: Function, start_line: 1, signature: "", content_hash: "", is_entry_point: false, entry_point_kind: None, visibility: Public, type_info: None }], []), ("src/a.a", [RawSymbol { name: "a_", kind: Function, start_line: 1, signature: "", content_hash: "", is_entry_point: false, entry_point_kind: None, visibility: Public, type_info: None }], [RawReference { name: "_", kind: Extends, start_line: 1, context: "" }])], language = JavaScript
