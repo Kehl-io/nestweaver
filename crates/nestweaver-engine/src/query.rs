@@ -607,6 +607,7 @@ pub fn build_brain_context_hybrid(
         tantivy,
         config,
         &std::collections::HashMap::new(),
+        None,
     )
 }
 
@@ -624,6 +625,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     tantivy: Option<&TantivyIndex>,
     config: &HybridSearchConfig,
     aliases: &std::collections::HashMap<String, Vec<String>>,
+    db_path: Option<&std::path::Path>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -712,6 +714,34 @@ pub fn build_brain_context_hybrid_with_aliases(
                 project_resolved = true;
             }
             if project_resolved {
+                continue;
+            }
+        }
+
+        // Try project alias lookup via the extension sidecar.
+        if let Some(db_path) = db_path {
+            let ext_store = crate::extensions::load_extensions(db_path);
+            let needle = trimmed.to_lowercase();
+            let alias_project = store.list_projects().ok().and_then(|projects| {
+                projects.into_iter().find(|p| {
+                    if let Some(serde_json::Value::Array(aliases)) =
+                        ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
+                    {
+                        aliases
+                            .iter()
+                            .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
+                    } else {
+                        false
+                    }
+                })
+            });
+            if let Some(project) = alias_project {
+                if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
+                    seed_uids.extend(note_uids);
+                }
+                if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid) {
+                    seed_uids.extend(sym_uids);
+                }
                 continue;
             }
         }

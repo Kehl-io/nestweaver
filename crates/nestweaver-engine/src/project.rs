@@ -123,7 +123,17 @@ pub fn materialize_projects(
             );
         }
 
-        // 6. Process wiki sources via MCP client calls.
+        // 6. Store aliases in the extension sidecar.
+        if !project_cfg.aliases.is_empty() {
+            set_property(
+                &mut ext_store,
+                &uid,
+                "aliases",
+                serde_json::json!(&project_cfg.aliases),
+            );
+        }
+
+        // 7. Process wiki sources via MCP client calls.
         for ws in &project_cfg.wiki_sources {
             // Find matching MCP server config.
             let server_config = config.mcp_servers.iter().find(|s| s.name == ws.mcp_server);

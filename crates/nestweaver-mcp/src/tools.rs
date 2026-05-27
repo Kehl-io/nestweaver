@@ -265,8 +265,14 @@ fn tool_brain_context(
     // Hybrid retrieval whenever the Tantivy index is open. When absent
     // (cold start, index missing), falls through to pure-PPR — still
     // correct, just less recall on text-only relevance.
-    let mut result: BrainContextResult =
-        build_brain_context_hybrid_with_aliases(store, &seeds, tantivy, &config, &aliases)?;
+    let mut result: BrainContextResult = build_brain_context_hybrid_with_aliases(
+        store,
+        &seeds,
+        tantivy,
+        &config,
+        &aliases,
+        Some(&db_path),
+    )?;
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
     let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
@@ -1743,14 +1749,33 @@ fn tool_project_context(
         {
             Some(p) => p,
             None => {
-                // Try aliases: load all projects, check aliases field via extension sidecar.
-                // For now fall back to checking if the string is a UID substring.
                 let all = store
                     .list_projects()
                     .map_err(|e| anyhow!("list_projects: {e}"))?;
-                all.into_iter()
-                    .find(|p| p.uid.contains(project_str))
-                    .ok_or_else(|| anyhow!("project '{}' not found", project_str))?
+
+                // Try alias match via extension sidecar.
+                let db_path = current_db_path(store).unwrap_or_default();
+                let ext_store = load_extensions(&db_path);
+                let needle = project_str.to_lowercase();
+                let alias_match = all.iter().find(|p| {
+                    if let Some(serde_json::Value::Array(aliases)) =
+                        ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
+                    {
+                        aliases
+                            .iter()
+                            .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
+                    } else {
+                        false
+                    }
+                });
+                if let Some(p) = alias_match {
+                    p.clone()
+                } else {
+                    // Fall back to UID substring match.
+                    all.into_iter()
+                        .find(|p| p.uid.contains(project_str))
+                        .ok_or_else(|| anyhow!("project '{}' not found", project_str))?
+                }
             }
         }
     };
@@ -1802,8 +1827,14 @@ fn tool_project_context(
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
     let config = HybridSearchConfig::default();
-    let mut result =
-        build_brain_context_hybrid_with_aliases(store, &seed_uids, tantivy, &config, &aliases)?;
+    let mut result = build_brain_context_hybrid_with_aliases(
+        store,
+        &seed_uids,
+        tantivy,
+        &config,
+        &aliases,
+        Some(&db_path),
+    )?;
 
     // 5. Apply optional kinds filter.
     if let Some(ref kinds) = filter_kinds {
