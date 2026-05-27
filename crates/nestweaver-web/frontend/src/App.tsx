@@ -57,7 +57,6 @@ function AppContent() {
   const isZen = layoutMode === "zen";
   // Responsive: below 900px behaves like zen (graph only), 900-1199 hides explorer
   const hideExplorer = isZen || width < 1200;
-  const floatDetail = isZen;
   const hideDetail = !isZen && width < 900;
 
   const graphView = activeView === "canvas" ? (

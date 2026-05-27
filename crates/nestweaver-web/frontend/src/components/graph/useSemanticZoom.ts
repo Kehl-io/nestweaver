@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useSigma } from "@react-sigma/core";
 
 // Sigma.js camera ratio: > 1 means zoomed OUT (seeing more), < 1 means zoomed IN (seeing less but bigger).
-export type ZoomTier = "overview" | "default" | "detail";
+export type ZoomTier = "overview" | "default" | "detail" | "packages" | "files";
 
 export function useSemanticZoom(): ZoomTier {
   const sigma = useSigma();
