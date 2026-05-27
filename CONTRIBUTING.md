@@ -2,7 +2,7 @@
 
 ## Reporting Issues
 
-Open a [GitHub issue](https://github.com/ci-build/nestweaver/issues) with:
+Open a [GitHub issue](https://github.com/Kehl-io/nestweaver/issues) with:
 
 - What you expected vs. what happened
 - Steps to reproduce
@@ -76,7 +76,7 @@ docs(cli): improve --help text for impact command
 
 ```sh
 # Clone and build
-git clone https://github.com/ci-build/nestweaver.git
+git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
 cargo build
 

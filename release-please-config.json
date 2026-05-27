@@ -1,0 +1,19 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "component": "nestweaver",
+      "extra-files": [
+        "crates/nestweaver-schema/Cargo.toml",
+        "crates/nestweaver-parser/Cargo.toml",
+        "crates/nestweaver-resolver/Cargo.toml",
+        "crates/nestweaver-store/Cargo.toml",
+        "crates/nestweaver-storage/Cargo.toml",
+        "crates/nestweaver-engine/Cargo.toml",
+        "crates/nestweaver-mcp/Cargo.toml",
+        "crates/nestweaver-web/Cargo.toml"
+      ]
+    }
+  },
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
+}
