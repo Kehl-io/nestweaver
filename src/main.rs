@@ -1,3 +1,5 @@
+mod setup;
+
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -432,6 +434,28 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Auto-detect and configure NestWeaver for installed AI coding tools
+    ///
+    /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, and VS Code,
+    /// then writes the correct MCP server config and instruction files for each.
+    #[command(
+        after_help = "Examples:\n  nestweaver setup\n  nestweaver setup --all\n  nestweaver setup --tool claude-code"
+    )]
+    Setup {
+        /// Configure a specific tool (claude-code, cursor, codex, windsurf, jetbrains, vscode)
+        #[arg(long)]
+        tool: Option<String>,
+        /// Force-configure all tools even if not detected
+        #[arg(long)]
+        all: bool,
+        /// Path to the NestWeaver database
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
     /// Generate embeddings for all symbols in the database using an external API.
     ///
     /// Calls an OpenAI-compatible embedding endpoint for each symbol's signature
@@ -1431,6 +1455,12 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     Ok(EXIT_NOT_FOUND)
                 }
             }
+        }
+
+        Commands::Setup { tool, all, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            setup::run_setup(tool.as_deref(), &db_path, all)?;
+            Ok(EXIT_SUCCESS)
         }
 
         Commands::Snapshot { command } => run_snapshot(command),
