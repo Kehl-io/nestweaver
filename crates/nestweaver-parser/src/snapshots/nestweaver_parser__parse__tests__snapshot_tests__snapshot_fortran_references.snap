@@ -1,0 +1,13 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2592
+expression: "parsed_references(\"simple.f90\", &source)"
+---
+- name: math_utils
+  kind: Import
+  start_line: 32
+  context: use math_utils
+- name: normalize
+  kind: Call
+  start_line: 41
+  context: call normalize(c)

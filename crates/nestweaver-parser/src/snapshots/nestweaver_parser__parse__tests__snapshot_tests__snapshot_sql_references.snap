@@ -1,0 +1,21 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 2564
+expression: "parsed_references(\"simple.sql\", &source)"
+---
+- name: users
+  kind: Call
+  start_line: 10
+  context: "user_id INTEGER REFERENCES users(id),"
+- name: users
+  kind: Call
+  start_line: 17
+  context: FROM users u
+- name: orders
+  kind: Call
+  start_line: 18
+  context: WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+- name: orders
+  kind: Call
+  start_line: 23
+  context: RETURN (SELECT SUM(total) FROM orders WHERE id = order_id);

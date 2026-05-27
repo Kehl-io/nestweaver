@@ -215,12 +215,17 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
             }
         }
         // Objective-C, Groovy, PowerShell: handled in their regex parsers
-        // Ruby, Cobol: inferred (visibility detection is complex, defer)
+        // Ruby, Cobol, and other regex-parsed languages: inferred
         Language::Ruby
         | Language::Cobol
         | Language::ObjectiveC
         | Language::Groovy
-        | Language::PowerShell => Visibility::Inferred,
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Sql
+        | Language::Hcl
+        | Language::Fortran
+        | Language::Pascal => Visibility::Inferred,
     }
 }
 
@@ -244,11 +249,18 @@ fn build_ts_language(lang: Language) -> tree_sitter::Language {
         Language::Bash => tree_sitter_bash::LANGUAGE.into(),
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
         Language::Elixir => tree_sitter_elixir::LANGUAGE.into(),
-        Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
-        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
-        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
-        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
-        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
+        Language::Cobol
+        | Language::Zig
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Sql
+        | Language::Hcl
+        | Language::Fortran
+        | Language::Pascal => {
+            unreachable!("regex-parsed languages are handled before reaching tree-sitter")
+        }
     }
 }
 
@@ -272,11 +284,18 @@ fn query_source(lang: Language) -> &'static str {
         Language::Bash => BASH_QUERY,
         Language::Scala => SCALA_QUERY,
         Language::Elixir => ELIXIR_QUERY,
-        Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
-        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
-        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
-        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
-        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
+        Language::Cobol
+        | Language::Zig
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Sql
+        | Language::Hcl
+        | Language::Fortran
+        | Language::Pascal => {
+            unreachable!("regex-parsed languages are handled before reaching tree-sitter")
+        }
     }
 }
 
@@ -430,8 +449,15 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let lang = detect_language(path)
         .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_string_lossy().into_owned()))?;
 
-    if lang == Language::Cobol {
-        return Ok(crate::cobol::parse_cobol(path, source));
+    // Languages with regex-based parsers (no tree-sitter grammar)
+    match lang {
+        Language::Cobol => return Ok(crate::cobol::parse_cobol(path, source)),
+        Language::Julia => return Ok(crate::julia::parse_julia(path, source)),
+        Language::Sql => return Ok(crate::sql::parse_sql(path, source)),
+        Language::Hcl => return Ok(crate::hcl::parse_hcl(path, source)),
+        Language::Fortran => return Ok(crate::fortran::parse_fortran(path, source)),
+        Language::Pascal => return Ok(crate::pascal::parse_pascal(path, source)),
+        _ => {}
     }
     if lang == Language::Zig {
         return Ok(crate::zig::parse_zig(path, source));
@@ -481,11 +507,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Bash => "bash",
         Language::Scala => "scala",
         Language::Elixir => "elixir",
-        Language::Cobol => unreachable!("COBOL is handled before reaching tree-sitter"),
-        Language::Zig => unreachable!("Zig is handled before reaching tree-sitter"),
-        Language::ObjectiveC => unreachable!("Objective-C is handled before reaching tree-sitter"),
-        Language::Groovy => unreachable!("Groovy is handled before reaching tree-sitter"),
-        Language::PowerShell => unreachable!("PowerShell is handled before reaching tree-sitter"),
+        Language::Cobol
+        | Language::Zig
+        | Language::ObjectiveC
+        | Language::Groovy
+        | Language::PowerShell
+        | Language::Julia
+        | Language::Sql
+        | Language::Hcl
+        | Language::Fortran
+        | Language::Pascal => {
+            unreachable!("regex-parsed languages are handled before reaching tree-sitter")
+        }
     };
     let file_path_str = path.to_string_lossy();
 
@@ -1899,6 +1932,464 @@ mod tests {
         );
     }
 
+    // ── Julia tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_julia_extracts_functions_and_structs() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "greet"),
+            "should find function 'greet'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "process"),
+            "should find function 'process'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "Animal"),
+            "should find struct 'Animal'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "Counter"),
+            "should find mutable struct 'Counter'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "Greetings"),
+            "should find module 'Greetings'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_julia_extracts_macro() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "log_call"),
+            "should find macro 'log_call' as function; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_julia_extracts_abstract_type() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+
+        let interfaces: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "LivingThing"),
+            "should find abstract type 'LivingThing'; got: {:?}",
+            interfaces.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_julia_extracts_call_references() {
+        let source = fixture("julia/simple.jl");
+        let parsed = parse_source(Path::new("simple.jl"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name == "greet"),
+            "should find call to 'greet'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            calls.iter().any(|r| r.name == "println"),
+            "should find call to 'println'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── SQL tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_sql_extracts_tables_and_views() {
+        let source = fixture("sql/simple.sql");
+        let parsed = parse_source(Path::new("simple.sql"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "users"),
+            "should find table 'users'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "orders"),
+            "should find table 'orders'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "active_users"),
+            "should find view 'active_users'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sql_extracts_functions_and_procedures() {
+        let source = fixture("sql/simple.sql");
+        let parsed = parse_source(Path::new("simple.sql"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "calculate_total"),
+            "should find function 'calculate_total'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "update_status"),
+            "should find procedure 'update_status'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_sql_extracts_references() {
+        let source = fixture("sql/simple.sql");
+        let parsed = parse_source(Path::new("simple.sql"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name == "users"),
+            "should find reference to 'users'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── HCL tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_hcl_extracts_resources() {
+        let source = fixture("hcl/simple.tf");
+        let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "aws_instance.web"),
+            "should find resource 'aws_instance.web'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes
+                .iter()
+                .any(|s| s.name == "aws_security_group.web_sg"),
+            "should find resource 'aws_security_group.web_sg'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_hcl_extracts_variables_and_outputs() {
+        let source = fixture("hcl/simple.tf");
+        let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "region"),
+            "should find variable 'region'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "instance_ip"),
+            "should find output 'instance_ip'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_hcl_extracts_module() {
+        let source = fixture("hcl/simple.tf");
+        let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "vpc"),
+            "should find module 'vpc'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_hcl_extracts_references() {
+        let source = fixture("hcl/simple.tf");
+        let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name.starts_with("var.")),
+            "should find var references; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            !imports.is_empty(),
+            "should find module source as import; got: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Fortran tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fortran_extracts_module_and_program() {
+        let source = fixture("fortran/simple.f90");
+        let parsed = parse_source(Path::new("simple.f90"), &source).unwrap();
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "math_utils"),
+            "should find module 'math_utils'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            modules.iter().any(|s| s.name == "main"),
+            "should find program 'main'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_fortran_extracts_subroutines_and_functions() {
+        let source = fixture("fortran/simple.f90");
+        let parsed = parse_source(Path::new("simple.f90"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "add_vectors"),
+            "should find function 'add_vectors'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "normalize"),
+            "should find subroutine 'normalize'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_fortran_extracts_references() {
+        let source = fixture("fortran/simple.f90");
+        let parsed = parse_source(Path::new("simple.f90"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "math_utils"),
+            "should find use math_utils; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.name == "normalize"),
+            "should find call to normalize; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Pascal tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pascal_extracts_classes_and_unit() {
+        let source = fixture("pascal/simple.pas");
+        let parsed = parse_source(Path::new("simple.pas"), &source).unwrap();
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert!(
+            modules.iter().any(|s| s.name == "Greeter"),
+            "should find unit 'Greeter'; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let classes: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "TAnimal"),
+            "should find class 'TAnimal'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            classes.iter().any(|s| s.name == "TDog"),
+            "should find class 'TDog'; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_pascal_extracts_procedures_and_functions() {
+        let source = fixture("pascal/simple.pas");
+        let parsed = parse_source(Path::new("simple.pas"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "PrintGreeting"),
+            "should find procedure 'PrintGreeting'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "FormatName"),
+            "should find function 'FormatName'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_pascal_extracts_methods() {
+        let source = fixture("pascal/simple.pas");
+        let parsed = parse_source(Path::new("simple.pas"), &source).unwrap();
+
+        let methods: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "Speak"),
+            "should find method 'Speak'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            methods.iter().any(|s| s.name == "Create"),
+            "should find constructor 'Create'; got: {:?}",
+            methods.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_pascal_extracts_references() {
+        let source = fixture("pascal/simple.pas");
+        let parsed = parse_source(Path::new("simple.pas"), &source).unwrap();
+
+        let imports: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.name == "SysUtils"),
+            "should find uses SysUtils; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            imports.iter().any(|r| r.name == "Classes"),
+            "should find uses Classes; got: {:?}",
+            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        let extends: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Extends)
+            .collect();
+        assert!(
+            extends.iter().any(|r| r.name == "TAnimal"),
+            "should find extends 'TAnimal'; got: {:?}",
+            extends.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
     // ── Lua tests ────────────────────────────────────────────────────────
 
     #[test]
@@ -2872,6 +3363,76 @@ mod tests {
         fn snapshot_powershell_references() {
             let source = fixture("powershell/simple.ps1");
             assert_yaml_snapshot!(parsed_references("simple.ps1", &source));
+        }
+
+        // ── Julia ───────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_julia_symbols() {
+            let source = fixture("julia/simple.jl");
+            assert_yaml_snapshot!(parsed_symbols("simple.jl", &source));
+        }
+
+        #[test]
+        fn snapshot_julia_references() {
+            let source = fixture("julia/simple.jl");
+            assert_yaml_snapshot!(parsed_references("simple.jl", &source));
+        }
+
+        // ── SQL ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_sql_symbols() {
+            let source = fixture("sql/simple.sql");
+            assert_yaml_snapshot!(parsed_symbols("simple.sql", &source));
+        }
+
+        #[test]
+        fn snapshot_sql_references() {
+            let source = fixture("sql/simple.sql");
+            assert_yaml_snapshot!(parsed_references("simple.sql", &source));
+        }
+
+        // ── HCL ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_hcl_symbols() {
+            let source = fixture("hcl/simple.tf");
+            assert_yaml_snapshot!(parsed_symbols("simple.tf", &source));
+        }
+
+        #[test]
+        fn snapshot_hcl_references() {
+            let source = fixture("hcl/simple.tf");
+            assert_yaml_snapshot!(parsed_references("simple.tf", &source));
+        }
+
+        // ── Fortran ─────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_fortran_symbols() {
+            let source = fixture("fortran/simple.f90");
+            assert_yaml_snapshot!(parsed_symbols("simple.f90", &source));
+        }
+
+        #[test]
+        fn snapshot_fortran_references() {
+            let source = fixture("fortran/simple.f90");
+            assert_yaml_snapshot!(parsed_references("simple.f90", &source));
+        }
+
+        // ── Pascal ──────────────────────────────────────────────────────
+
+        #[test]
+        fn snapshot_pascal_symbols() {
+            let source = fixture("pascal/simple.pas");
+            assert_yaml_snapshot!(parsed_symbols("simple.pas", &source));
+        }
+
+        #[test]
+        fn snapshot_pascal_references() {
+            let source = fixture("pascal/simple.pas");
+            assert_yaml_snapshot!(parsed_references("simple.pas", &source));
         }
     }
 }

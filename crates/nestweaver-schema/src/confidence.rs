@@ -25,6 +25,11 @@ pub enum Language {
     ObjectiveC,
     Groovy,
     PowerShell,
+    Julia,
+    Sql,
+    Hcl,
+    Fortran,
+    Pascal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,6 +123,11 @@ mod tests {
             Language::ObjectiveC,
             Language::Groovy,
             Language::PowerShell,
+            Language::Julia,
+            Language::Sql,
+            Language::Hcl,
+            Language::Fortran,
+            Language::Pascal,
         ] {
             let score = confidence_score(MatchType::Unresolved, lang);
             assert!((score - 0.0).abs() < f32::EPSILON, "got: {score}");
@@ -186,6 +196,11 @@ mod tests {
             Language::ObjectiveC,
             Language::Groovy,
             Language::PowerShell,
+            Language::Julia,
+            Language::Sql,
+            Language::Hcl,
+            Language::Fortran,
+            Language::Pascal,
         ];
         let matches = [
             MatchType::SameFileExact,
@@ -272,6 +287,11 @@ mod tests {
             Language::ObjectiveC,
             Language::Groovy,
             Language::PowerShell,
+            Language::Julia,
+            Language::Sql,
+            Language::Hcl,
+            Language::Fortran,
+            Language::Pascal,
         ];
         let matches = [
             MatchType::SameFileExact,
