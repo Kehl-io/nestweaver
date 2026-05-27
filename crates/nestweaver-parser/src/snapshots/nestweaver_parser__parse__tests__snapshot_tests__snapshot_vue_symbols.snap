@@ -20,3 +20,12 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+- name: handleClick
+  kind: Function
+  start_line: 25
+  signature: "function handleClick() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

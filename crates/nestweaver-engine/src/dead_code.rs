@@ -87,16 +87,22 @@ pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
         });
     }
 
-    // 2. Load the full code graph (symbols + edges).
-    let (_sym_basics, edges) = store
-        .load_code_symbols_and_edges()
-        .map_err(|e| anyhow::anyhow!("load_code_symbols_and_edges: {e}"))?;
+    // 2. Load the full code graph (symbols + typed edges).
+    let typed_edges = store
+        .load_typed_edges()
+        .map_err(|e| anyhow::anyhow!("load_typed_edges: {e}"))?;
 
     // Build adjacency list: source -> [target] (forward direction).
+    // Also add reverse MEMBER_OF edges (class -> member) so that when BFS
+    // reaches a class, its members become reachable too.
     let mut adjacency: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for (src, dst, _confidence) in &edges {
+    for (src, dst, edge_type, _confidence) in &typed_edges {
         adjacency.entry(src.clone()).or_default().push(dst.clone());
+        if edge_type == "MEMBER_OF" {
+            // MEMBER_OF goes member→class; reverse it so class→member is also traversed.
+            adjacency.entry(dst.clone()).or_default().push(src.clone());
+        }
     }
 
     // 3. Identify entry points.

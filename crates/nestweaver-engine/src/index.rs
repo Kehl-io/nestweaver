@@ -99,28 +99,18 @@ fn tiered_change_check(
             return Ok(ChangeVerdict::Unchanged);
         }
 
-        // Tier 2: mtime changed but size unchanged → skip.
-        if cached.size_bytes == size_bytes {
-            return Ok(ChangeVerdict::Unchanged);
-        }
+        // Tier 2: mtime changed but size unchanged → fall through to hash check.
+        // Same-size edits are common, so we cannot skip based on size alone.
 
-        // Tier 3: size differs → read file, compute hash, compare.
+        // Tier 3: mtime differs → read file, compute hash, compare.
         let source = std::fs::read_to_string(abs_path)
             .with_context(|| format!("read {}", abs_path.display()))?;
         let content_hash = sha2_hex(&source);
         if content_hash == cached.content_hash {
-            // Content identical despite size change (unlikely but possible with
-            // encoding differences). Still treat as unchanged for the graph, but
-            // update the cache entry with the new mtime+size.
-            return Ok(ChangeVerdict::Changed {
-                source,
-                content_hash,
-                meta: CachedFileMeta {
-                    mtime_secs,
-                    size_bytes,
-                    content_hash: cached.content_hash.clone(),
-                },
-            });
+            // Content identical despite mtime/size change — unchanged for the
+            // graph. No need to re-parse. (The caller will carry forward the
+            // cached entry.)
+            return Ok(ChangeVerdict::Unchanged);
         }
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
@@ -1266,7 +1256,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn tiered_check_same_size_different_mtime_returns_unchanged() {
+    fn tiered_check_same_size_different_mtime_falls_through_to_hash() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("hello.js");
         let content = "function hello() {}";
@@ -1274,7 +1264,8 @@ function hello(name) { return "Hello " + name; }
 
         let fs_meta = fs::metadata(&file_path).unwrap();
 
-        // Cache has a different mtime but same size.
+        // Cache has a different mtime but same size and same hash.
+        // Tier 2 falls through to Tier 3 hash check, which finds content unchanged.
         let mut cache = FileMetaCache::new();
         cache.insert(
             "hello.js".to_string(),
@@ -1286,8 +1277,26 @@ function hello(name) { return "Hello " + name; }
         );
 
         match tiered_change_check(&file_path, "hello.js", &cache).unwrap() {
-            ChangeVerdict::Unchanged => {} // expected — tier 2 skips same-size files
-            ChangeVerdict::Changed { .. } => panic!("expected Unchanged for same-size file"),
+            ChangeVerdict::Unchanged => {} // expected — hash matches, so unchanged
+            ChangeVerdict::Changed { .. } => panic!("expected Unchanged when hash matches"),
+        }
+
+        // Now test with same size but different content hash — should be Changed.
+        let mut cache2 = FileMetaCache::new();
+        cache2.insert(
+            "hello.js".to_string(),
+            CachedFileMeta {
+                mtime_secs: 1,
+                size_bytes: fs_meta.len(),
+                content_hash: sha2_hex("different content!"),
+            },
+        );
+
+        match tiered_change_check(&file_path, "hello.js", &cache2).unwrap() {
+            ChangeVerdict::Changed { .. } => {} // expected — hash differs
+            ChangeVerdict::Unchanged => {
+                panic!("expected Changed when hash differs despite same size")
+            }
         }
     }
 
