@@ -218,6 +218,11 @@ fn tool_schema_brain_context() -> Value {
                     "type": "string",
                     "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
                     "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors; 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
+                },
+                "include_seeds": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
                 }
             },
             "required": ["seeds"]
@@ -479,36 +484,47 @@ fn tool_brain_context(
         })
         .collect();
 
-    let seeds_json: Vec<Value> = result
-        .seeds
-        .iter()
-        .map(|n| {
-            if concise {
-                json!({
-                    "kind": n.kind,
-                    "title": n.title,
-                })
-            } else {
-                json!({
-                    "uid": n.uid,
-                    "kind": n.kind,
-                    "title": n.title,
-                    "location": n.location,
-                    "relevance": n.relevance,
-                })
-            }
-        })
-        .collect();
+    let include_seeds = args
+        .get("include_seeds")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    Ok(json!({
-        "seeds": seeds_json,
+    let mut resp = json!({
+        "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
-        "unresolved_seeds": result.unresolved_seeds,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
-        "truncated": cut < result.connected.len(),
-        "total_connected": result.connected.len(),
-    }))
+    });
+
+    if include_seeds {
+        let seeds_json: Vec<Value> = result
+            .seeds
+            .iter()
+            .map(|n| {
+                if concise {
+                    json!({
+                        "kind": n.kind,
+                        "title": n.title,
+                    })
+                } else {
+                    json!({
+                        "uid": n.uid,
+                        "kind": n.kind,
+                        "title": n.title,
+                        "location": n.location,
+                        "relevance": n.relevance,
+                    })
+                }
+            })
+            .collect();
+        resp["seeds"] = json!(seeds_json);
+    }
+
+    if !result.unresolved_seeds.is_empty() {
+        resp["unresolved_seeds"] = json!(result.unresolved_seeds);
+    }
+
+    Ok(resp)
 }
 
 /// Apply age-decay score boost to non-Symbol nodes.
@@ -2000,6 +2016,11 @@ fn tool_schema_project_context() -> Value {
                     "type": "number",
                     "default": 30.0,
                     "description": "Half-life for age-decay in days."
+                },
+                "include_seeds": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
                 }
             },
             "required": ["project"]
@@ -2112,13 +2133,10 @@ fn tool_project_context(
         return Ok(json!({
             "project": project.name,
             "project_uid": project.uid,
-            "seeds": [],
+            "seeds_expanded": 0,
             "connected": [],
-            "unresolved_seeds": [],
             "tokens_used": 0,
             "token_budget": token_budget,
-            "truncated": false,
-            "total_connected": 0,
             "note": "No notes or symbols are associated with this project yet.",
         }));
     }
@@ -2218,32 +2236,46 @@ fn tool_project_context(
         })
         .collect();
 
-    let seeds_json: Vec<Value> = result
-        .seeds
-        .iter()
-        .map(|n| {
-            json!({
-                "uid": n.uid,
-                "kind": n.kind,
-                "title": n.title,
-                "location": n.location,
-                "relevance": n.relevance,
-            })
-        })
-        .collect();
+    let include_seeds = args
+        .get("include_seeds")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    Ok(json!({
+    let mut resp = json!({
         "project": project.name,
         "project_uid": project.uid,
-        "seeds": seeds_json,
+        "seeds_expanded": result.seeds.len(),
         "connected": connected_json,
-        "unresolved_seeds": result.unresolved_seeds,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
-        "truncated": cut < result.connected.len(),
-        "total_connected": result.connected.len(),
-        "external_refs": external_refs,
-    }))
+    });
+
+    if include_seeds {
+        let seeds_json: Vec<Value> = result
+            .seeds
+            .iter()
+            .map(|n| {
+                json!({
+                    "uid": n.uid,
+                    "kind": n.kind,
+                    "title": n.title,
+                    "location": n.location,
+                    "relevance": n.relevance,
+                })
+            })
+            .collect();
+        resp["seeds"] = json!(seeds_json);
+    }
+
+    if !result.unresolved_seeds.is_empty() {
+        resp["unresolved_seeds"] = json!(result.unresolved_seeds);
+    }
+
+    if !external_refs.is_null() {
+        resp["external_refs"] = external_refs;
+    }
+
+    Ok(resp)
 }
 
 // ── 18. dead_code ─────────────────────────────────────────────────────────
