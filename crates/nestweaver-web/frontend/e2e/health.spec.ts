@@ -15,7 +15,7 @@ test.describe("App Health", () => {
     await page.goto("/");
     await expect(page.locator("body")).toBeVisible();
     await expect(
-      page.locator('[data-testid="top-bar"], header, nav').first()
+      page.locator('[data-testid="top-bar"]')
     ).toBeVisible({ timeout: 10_000 });
 
     expect(errors).toEqual([]);

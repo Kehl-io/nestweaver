@@ -4,10 +4,8 @@ test.describe("Graph Explorer", () => {
   test("graph panel renders with nodes", async ({ page }) => {
     await page.goto("/");
     await page.waitForTimeout(2_000);
-    const graphContainer = page.locator(
-      '[data-testid="graph-panel"], .sigma-container, canvas'
-    );
-    await expect(graphContainer.first()).toBeVisible({ timeout: 15_000 });
+    const graphContainer = page.locator('[data-testid="graph-panel"]');
+    await expect(graphContainer).toBeVisible({ timeout: 15_000 });
   });
 
   test("repo-map API returns data", async ({ request }) => {

@@ -150,7 +150,7 @@ export function GraphPanel() {
     : null;
 
   return (
-    <div className="flex h-full flex-col relative">
+    <div data-testid="graph-panel" className="flex h-full flex-col relative">
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
           aria-label="Code knowledge graph"
