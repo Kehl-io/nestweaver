@@ -1,1 +1,0 @@
-{"repo:default:70e165ebd782":{"package_name":"nestweaver","dependencies":["anyhow","clap","dirs","nestweaver-engine","nestweaver-mcp","nestweaver-schema","nestweaver-storage","nestweaver-store","nestweaver-web","serde","serde_json","tokio","tracing","tracing-subscriber","assert_cmd","criterion","predicates","serde_json","tempfile"]}}
