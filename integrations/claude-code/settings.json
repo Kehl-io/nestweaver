@@ -1,16 +1,46 @@
 {
+  "mcpServers": {
+    "nestweaver": {
+      "command": "nestweaver",
+      "args": ["mcp", "--db", "./nestweaver.lbug"]
+    }
+  },
   "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "nestweaver brain status --db ./nestweaver.lbug 2>/dev/null; echo '---'; nestweaver stale-check --db ./nestweaver.lbug 2>/dev/null"
+      }]
+    }],
     "PreToolUse": [
       {
         "matcher": "Read",
-        "command": ["bash", "integrations/claude-code/hooks/pre-read-enrich.sh"]
-      }
-    ],
-    "PostToolUse": [
+        "hooks": [{
+          "type": "command",
+          "command": "bash integrations/claude-code/hooks/pre-read-enrich.sh"
+        }]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [{
+          "type": "command",
+          "command": "bash integrations/claude-code/hooks/post-edit-impact.sh"
+        }]
+      },
       {
         "matcher": "Bash",
-        "command": ["bash", "integrations/claude-code/hooks/post-commit-stale-check.sh"]
+        "hooks": [{
+          "type": "command",
+          "command": "bash integrations/claude-code/hooks/pre-search-enrich.sh"
+        }]
       }
-    ]
+    ],
+    "PostToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{
+        "type": "command",
+        "command": "bash integrations/claude-code/hooks/post-commit-stale-check.sh"
+      }]
+    }]
   }
 }
