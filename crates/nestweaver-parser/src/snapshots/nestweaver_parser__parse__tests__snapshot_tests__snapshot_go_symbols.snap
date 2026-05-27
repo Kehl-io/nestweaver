@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1916
 expression: "parsed_symbols(\"simple.go\", &source)"
 ---
 - name: Greeter
@@ -16,6 +15,15 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   kind: Class
   start_line: 13
   signature: "type ConsoleGreeter struct {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Prefix
+  kind: Property
+  start_line: 14
+  signature: Prefix string
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

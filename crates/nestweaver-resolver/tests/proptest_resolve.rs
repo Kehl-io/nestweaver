@@ -15,6 +15,10 @@ fn arb_symbol_kind() -> impl Strategy<Value = SymbolKind> {
         Just(SymbolKind::Enum),
         Just(SymbolKind::Module),
         Just(SymbolKind::Extension),
+        Just(SymbolKind::Constant),
+        Just(SymbolKind::Property),
+        Just(SymbolKind::TypeAlias),
+        Just(SymbolKind::Variable),
     ]
 }
 

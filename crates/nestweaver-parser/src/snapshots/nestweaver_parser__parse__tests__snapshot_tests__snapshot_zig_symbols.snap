@@ -2,6 +2,24 @@
 source: crates/nestweaver-parser/src/parse.rs
 expression: "parsed_symbols(\"simple.zig\", &source)"
 ---
+- name: std
+  kind: Constant
+  start_line: 1
+  signature: "const std = @import(\"std\");"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: math
+  kind: Constant
+  start_line: 2
+  signature: "const math = @import(\"math.zig\");"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
 - name: SensorKind
   kind: Class
   start_line: 4
@@ -55,4 +73,13 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   is_entry_point: true
   entry_point_kind: Main
   visibility: Public
+  type_info: ~
+- name: config
+  kind: Constant
+  start_line: 31
+  signature: "const config = SensorConfig{"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
   type_info: ~

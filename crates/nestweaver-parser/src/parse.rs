@@ -564,8 +564,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "method" => SymbolKind::Method,
                     "interface" => SymbolKind::Interface,
                     "trait" => SymbolKind::Trait,
-                    "module" => SymbolKind::Module,
-                    _ => continue,
+                    "module" | "namespace" => SymbolKind::Module,
+                    "enum" => SymbolKind::Enum,
+                    "const" | "constant" | "static" => SymbolKind::Constant,
+                    "property" | "field" => SymbolKind::Property,
+                    "type" | "type_alias" => SymbolKind::TypeAlias,
+                    "variable" | "var" => SymbolKind::Variable,
+                    "macro" => SymbolKind::Function,
+                    "impl" => SymbolKind::Class,
+                    "constructor" => SymbolKind::Method,
+                    other => {
+                        tracing::debug!(
+                            capture = other,
+                            file = %file_path_str,
+                            "unknown definition capture, skipping"
+                        );
+                        continue;
+                    }
                 };
 
                 let name = name_text.clone().unwrap_or_else(|| node_text.clone());
@@ -586,6 +601,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     SymbolKind::Enum => "enum",
                     SymbolKind::Module => "module",
                     SymbolKind::Extension => "extension",
+                    SymbolKind::Constant => "constant",
+                    SymbolKind::Property => "property",
+                    SymbolKind::TypeAlias => "type_alias",
+                    SymbolKind::Variable => "variable",
                 };
                 let ep_kind = detect_entry_point(
                     &name,
@@ -951,9 +970,16 @@ mod tests {
             classes.iter().any(|s| s.name == "SensorConfig"),
             "should find struct SensorConfig as class"
         );
+
+        let enums: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Enum)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "SensorType"),
-            "should find enum SensorType as class"
+            enums.iter().any(|s| s.name == "SensorType"),
+            "should find enum SensorType as Enum; got: {:?}",
+            enums.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
 
         let methods: Vec<_> = parsed
@@ -1026,9 +1052,16 @@ mod tests {
             "should find struct SensorManager as class; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let enums: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Enum)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "SensorKind"),
-            "should find enum SensorKind as class"
+            enums.iter().any(|s| s.name == "SensorKind"),
+            "should find enum SensorKind as Enum; got: {:?}",
+            enums.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
 
         let interfaces: Vec<_> = parsed
@@ -1263,10 +1296,16 @@ mod tests {
             "should find class 'SimpleGreeter'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "AppConfig"),
-            "should find object 'AppConfig' as class; got: {:?}",
-            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+            modules.iter().any(|s| s.name == "AppConfig"),
+            "should find object 'AppConfig' as module; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
 
         let functions: Vec<_> = parsed
@@ -1574,10 +1613,16 @@ mod tests {
             "should find class 'SimpleGreeter'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let enums: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Enum)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "Priority"),
-            "should find enum 'Priority' as class; got: {:?}",
-            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+            enums.iter().any(|s| s.name == "Priority"),
+            "should find enum 'Priority' as Enum; got: {:?}",
+            enums.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
@@ -3113,10 +3158,16 @@ mod tests {
             "should find class 'SimpleGreeter'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let modules: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "AppConfig"),
-            "should find object 'AppConfig' as class; got: {:?}",
-            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+            modules.iter().any(|s| s.name == "AppConfig"),
+            "should find object 'AppConfig' as module; got: {:?}",
+            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
 
         let traits: Vec<_> = parsed
@@ -3365,10 +3416,16 @@ mod tests {
             "should find class 'SensorConfig'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let enums: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Enum)
+            .collect();
         assert!(
-            classes.iter().any(|s| s.name == "Priority"),
-            "should find enum 'Priority' as class; got: {:?}",
-            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
+            enums.iter().any(|s| s.name == "Priority"),
+            "should find enum 'Priority' as Enum; got: {:?}",
+            enums.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2384
 expression: "parsed_symbols(\"Simple.scala\", &source)"
 ---
 - name: Greeter
@@ -40,7 +39,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   visibility: Private
   type_info: ~
 - name: AppConfig
-  kind: Class
+  kind: Module
   start_line: 17
   signature: "object AppConfig {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -49,7 +48,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   visibility: Public
   type_info: ~
 - name: defaultGreeting
-  kind: Function
+  kind: Constant
   start_line: 18
   signature: "val defaultGreeting: String = \"Hello\""
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -76,7 +75,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   visibility: Public
   type_info: ~
 - name: greeter
-  kind: Function
+  kind: Constant
   start_line: 26
   signature: val greeter = AppConfig.createGreeter()
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"

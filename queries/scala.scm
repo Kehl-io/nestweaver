@@ -4,7 +4,7 @@
 
 ; Object definitions (singleton objects)
 (object_definition
-  name: (identifier) @name) @definition.class
+  name: (identifier) @name) @definition.module
 
 ; Trait definitions
 (trait_definition
@@ -14,9 +14,17 @@
 (function_definition
   name: (identifier) @name) @definition.function
 
-; Value definitions
+; Value definitions (val)
 (val_definition
-  pattern: (identifier) @name) @definition.function
+  pattern: (identifier) @name) @definition.const
+
+; Variable definitions (var)
+(var_definition
+  pattern: (identifier) @name) @definition.variable
+
+; Type definitions (type aliases)
+(type_definition
+  name: (type_identifier) @name) @definition.type
 
 ; Call expressions
 (call_expression

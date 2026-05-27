@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2014
 expression: "parsed_symbols(\"simple.php\", &source)"
 ---
 - name: GreeterInterface
@@ -67,9 +66,36 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Private
   type_info: ~
 - name: Priority
-  kind: Class
+  kind: Enum
   start_line: 37
   signature: enum Priority
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Low
+  kind: Constant
+  start_line: 39
+  signature: case Low;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Medium
+  kind: Constant
+  start_line: 40
+  signature: case Medium;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: High
+  kind: Constant
+  start_line: 41
+  signature: case High;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

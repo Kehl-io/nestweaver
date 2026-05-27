@@ -12,15 +12,40 @@
 
 ; Enum declarations
 (enum_declaration
-  name: (identifier) @name) @definition.class
+  name: (identifier) @name) @definition.enum
 
 ; Method declarations
 (method_declaration
   name: (identifier) @name) @definition.method
 
+; Constructor declarations
+(constructor_declaration
+  name: (identifier) @name) @definition.constructor
+
 ; Local function statements
 (local_function_statement
   name: (identifier) @name) @definition.function
+
+; Property declarations
+(property_declaration
+  name: (identifier) @name) @definition.property
+
+; Field declarations
+(field_declaration
+  (variable_declaration
+    (variable_declarator
+      (identifier) @name))) @definition.property
+
+; Enum member declarations
+(enum_member_declaration
+  name: (identifier) @name) @definition.const
+
+; Namespace declarations
+(namespace_declaration
+  name: (identifier) @name) @definition.namespace
+
+(namespace_declaration
+  name: (qualified_name) @name) @definition.namespace
 
 ; Call expressions
 (invocation_expression

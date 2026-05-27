@@ -1,10 +1,9 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1930
 expression: "parsed_symbols(\"simple.c\", &source)"
 ---
 - name: SensorConfig
-  kind: Class
+  kind: TypeAlias
   start_line: 4
   signature: "typedef struct {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -12,10 +11,46 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+- name: id
+  kind: Property
+  start_line: 5
+  signature: int id;
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
 - name: SensorType
-  kind: Class
+  kind: Enum
   start_line: 9
   signature: "enum SensorType {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: TEMPERATURE
+  kind: Constant
+  start_line: 10
+  signature: TEMPERATURE
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: HUMIDITY
+  kind: Constant
+  start_line: 11
+  signature: HUMIDITY
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: PRESSURE
+  kind: Constant
+  start_line: 12
+  signature: PRESSURE
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -25,6 +60,15 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   kind: Class
   start_line: 15
   signature: "struct SensorManager {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: count
+  kind: Property
+  start_line: 16
+  signature: int count;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -70,6 +114,15 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   kind: Class
   start_line: 29
   signature: struct SensorManager
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: val
+  kind: Variable
+  start_line: 31
+  signature: int val = calibrate(1);
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

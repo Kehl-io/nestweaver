@@ -16,6 +16,13 @@
     name: (identifier) @name
     value: [(arrow_function) (function_expression)])) @definition.function
 
+; Export-wrapped arrow functions
+(export_statement
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (arrow_function)))) @definition.function
+
 ; Class declarations
 (class_declaration
   name: (type_identifier) @name) @definition.class
@@ -36,6 +43,30 @@
 ; Interface declarations
 (interface_declaration
   name: (type_identifier) @name) @definition.interface
+
+; Type alias declarations
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; Enum declarations
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+; Class properties (public field definitions)
+(public_field_definition
+  name: (property_identifier) @name) @definition.property
+
+; Interface property signatures
+(property_signature
+  name: (property_identifier) @name) @definition.property
+
+; Const declarations (non-function values)
+(lexical_declaration
+  kind: "const"
+  (variable_declarator
+    name: (identifier) @name
+    value: (_) @_val)
+  (#not-match? @_val "^(\\(|function|class)")) @definition.const
 
 ; Call expressions
 (call_expression

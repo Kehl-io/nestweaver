@@ -21,7 +21,7 @@ expression: "parsed_symbols(\"simple.ps1\", &source)"
   visibility: Public
   type_info: ~
 - name: Priority
-  kind: Class
+  kind: Enum
   start_line: 18
   signature: "enum Priority {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
