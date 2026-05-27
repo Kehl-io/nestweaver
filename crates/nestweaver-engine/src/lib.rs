@@ -25,6 +25,7 @@ pub mod recency;
 pub mod registry;
 pub mod snapshot;
 pub mod suggest;
+pub mod summaries;
 pub mod summary;
 pub mod vector_search;
 pub mod watch_code;
@@ -85,6 +86,10 @@ pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
     materialize_declared_links, persist_cross_repo_links, suggest_links,
+};
+pub use summaries::{
+    Summary, SummaryLevel, SummaryStore, filter_by_target, generate_summaries, load_summaries,
+    render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};

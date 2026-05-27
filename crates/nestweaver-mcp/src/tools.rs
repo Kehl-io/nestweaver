@@ -12,12 +12,13 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, analyze_blast_radius,
+    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
     attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, detect_dead_code, find_bridge_nodes, find_hub_nodes,
-    generate_guide, get_all_properties, index_directory, index_markdown_directory,
-    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch, query_by_property,
-    save_extensions, set_property,
+    compute_clusters, detect_changes_impact, detect_dead_code, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, index_directory,
+    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
+    parse_iso8601_to_epoch, query_by_property, render_text, save_extensions, set_property,
+    truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -58,6 +59,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_hub_nodes(),
         tool_schema_bridge_nodes(),
         tool_schema_blast_radius(),
+        tool_schema_get_summary(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -96,6 +98,7 @@ pub fn dispatch(
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
+        "get_summary" => tool_get_summary(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -2468,6 +2471,80 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "affected_symbol_count": affected_json.len(),
         "affected_clusters": clusters_json,
         "affected_cluster_count": clusters_json.len(),
+    }))
+}
+
+// ── 22. get_summary ──────────────────────────────────────────────────────
+
+fn tool_schema_get_summary() -> Value {
+    json!({
+        "name": "get_summary",
+        "description": "Get hierarchical code summaries for token-efficient retrieval. Returns compact, deterministic summaries at three granularity levels: symbol (function/class with callers/callees), file (exports and import sources), or cluster (community architecture with dependencies). No LLM needed — derived entirely from graph data. Use to quickly understand architecture without reading raw code.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "string",
+                    "enum": ["symbol", "file", "cluster"],
+                    "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture.",
+                    "default": "file"
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Optional filter: file path, symbol name, or cluster name substring. Only matching summaries are returned."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Approximate token cap for the result. Default unlimited.",
+                }
+            }
+        }
+    })
+}
+
+fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
+    let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
+    let target = args.get("target").and_then(|v| v.as_str());
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let summaries = generate_summaries(store, level)?;
+    let total_available = summaries.len();
+
+    // Build the display list: filter by target, then truncate by budget.
+    let after_filter: Vec<nestweaver_engine::Summary> = if let Some(t) = target {
+        filter_by_target(&summaries, t)
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        summaries
+    };
+
+    let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
+        truncate_to_budget(&after_filter, budget)
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        after_filter.clone()
+    };
+
+    let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
+    let text = render_text(&display);
+
+    Ok(json!({
+        "level": level_str,
+        "target": target,
+        "count": display.len(),
+        "total_available": total_available,
+        "tokens_used": total_tokens,
+        "token_budget": token_budget,
+        "truncated": display.len() < after_filter.len(),
+        "summaries": text,
     }))
 }
 
