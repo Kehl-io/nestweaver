@@ -12,6 +12,7 @@ rules:
       - storage
       - engine
       - mcp
+      - cli
       - ci
       - deps
       - docs
