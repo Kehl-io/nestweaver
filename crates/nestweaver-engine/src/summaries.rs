@@ -304,11 +304,12 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
 
 // ── Sidecar persistence ──────────────────────────────────────────────────────
 
-/// Compute the sidecar file path: `<db>.summaries.json`.
+/// Compute the sidecar file path: `<db-stem>.summaries.json`.
+///
+/// Uses `with_extension` to match the convention used by other sidecars
+/// (e.g. `filemeta.json` in `index.rs`): `test.lbug` → `test.summaries.json`.
 pub fn sidecar_path(db_path: &Path) -> PathBuf {
-    let mut p = db_path.as_os_str().to_owned();
-    p.push(".summaries.json");
-    PathBuf::from(p)
+    db_path.with_extension("summaries.json")
 }
 
 /// Save summaries to the sidecar file.
@@ -573,9 +574,9 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_path_appends_extension() {
+    fn sidecar_path_replaces_extension() {
         let db = Path::new("/tmp/test.lbug");
-        let expected = PathBuf::from("/tmp/test.lbug.summaries.json");
+        let expected = PathBuf::from("/tmp/test.summaries.json");
         assert_eq!(sidecar_path(db), expected);
     }
 

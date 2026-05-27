@@ -75,8 +75,8 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     let message = format!("{err:#}");
     let lower = message.to_lowercase();
 
-    if lower.contains("no such file")
-        || lower.contains("not found") && (lower.contains("database") || lower.contains(".lbug"))
+    if (lower.contains("no such file") || lower.contains("not found"))
+        && (lower.contains("database") || lower.contains(".lbug"))
     {
         // Extract the path from common anyhow context patterns like
         // "failed to open database at ./foo.lbug: No such file ..."

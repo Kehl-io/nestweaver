@@ -11,7 +11,7 @@ use std::path::Path;
 pub fn detect_language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?;
     match ext {
-        "js" => Some(Language::JavaScript),
+        "js" | "jsx" => Some(Language::JavaScript),
         "ts" | "tsx" => Some(Language::TypeScript),
         "java" => Some(Language::Java),
         "go" => Some(Language::Go),

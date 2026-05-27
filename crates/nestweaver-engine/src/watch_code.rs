@@ -107,7 +107,7 @@ impl CodeWatcher {
         // Ensure the Repo node exists so incremental updates can attach
         // File and Symbol nodes. If there's no prior index we create a
         // minimal Repo node; the watcher will populate it file-by-file.
-        if store.lookup_repo(&r_uid).ok().is_none() {
+        if store.lookup_repo(&r_uid)?.is_none() {
             store
                 .insert_repo(&nestweaver_schema::Repo {
                     uid: r_uid.clone(),
