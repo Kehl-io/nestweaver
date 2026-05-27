@@ -1,0 +1,68 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1860
+expression: "parsed_symbols(\"simple.js\", &source)"
+---
+- name: greet
+  kind: Function
+  start_line: 5
+  signature: "function greet(name) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: add
+  kind: Function
+  start_line: 9
+  signature: "const add = (a, b) => a + b;"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: Animal
+  kind: Class
+  start_line: 11
+  signature: "class Animal {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: constructor
+  kind: Method
+  start_line: 12
+  signature: "constructor(name) {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: speak
+  kind: Method
+  start_line: 16
+  signature: "speak() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: Dog
+  kind: Class
+  start_line: 21
+  signature: "class Dog extends Animal {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: speak
+  kind: Method
+  start_line: 22
+  signature: "speak() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

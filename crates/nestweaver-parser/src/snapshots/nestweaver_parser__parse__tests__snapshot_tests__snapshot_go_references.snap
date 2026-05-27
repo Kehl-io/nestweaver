@@ -1,0 +1,37 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1922
+expression: "parsed_references(\"simple.go\", &source)"
+---
+- name: fmt
+  kind: Import
+  start_line: 4
+  context: (
+- name: strings
+  kind: Import
+  start_line: 5
+  context: (
+- name: Sprintf
+  kind: Call
+  start_line: 18
+  context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
+- name: Sprintf
+  kind: Call
+  start_line: 22
+  context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
+- name: TrimSpace
+  kind: Call
+  start_line: 26
+  context: strings.TrimSpace(prefix)
+- name: NewGreeter
+  kind: Call
+  start_line: 30
+  context: "NewGreeter(\">>>\")"
+- name: Greet
+  kind: Call
+  start_line: 31
+  context: "greeter.Greet(\"world\")"
+- name: Println
+  kind: Call
+  start_line: 32
+  context: fmt.Println(result)

@@ -1,0 +1,68 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1916
+expression: "parsed_symbols(\"simple.go\", &source)"
+---
+- name: Greeter
+  kind: Interface
+  start_line: 8
+  signature: "type Greeter interface {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: ConsoleGreeter
+  kind: Class
+  start_line: 13
+  signature: "type ConsoleGreeter struct {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+- name: Greet
+  kind: Method
+  start_line: 17
+  signature: "func (g *ConsoleGreeter) Greet(name string) string {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: Farewell
+  kind: Method
+  start_line: 21
+  signature: "func (g *ConsoleGreeter) Farewell(name string) string {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: string
+- name: NewGreeter
+  kind: Function
+  start_line: 25
+  signature: "func NewGreeter(prefix string) Greeter {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: Greeter
+- name: main
+  kind: Function
+  start_line: 29
+  signature: "func main() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~

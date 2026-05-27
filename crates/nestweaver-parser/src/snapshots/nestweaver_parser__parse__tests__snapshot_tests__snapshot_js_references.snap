@@ -1,0 +1,29 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1866
+expression: "parsed_references(\"simple.js\", &source)"
+---
+- name: fs
+  kind: Import
+  start_line: 1
+  context: "fs = require('fs')"
+- name: require
+  kind: Call
+  start_line: 1
+  context: "fs = require('fs')"
+- name: events
+  kind: Import
+  start_line: 3
+  context: "const fs = require('fs');"
+- name: greet
+  kind: Call
+  start_line: 28
+  context: "greet('world');"
+- name: world
+  kind: Import
+  start_line: 28
+  context: "greet('world');"
+- name: speak
+  kind: Call
+  start_line: 29
+  context: dog.speak();

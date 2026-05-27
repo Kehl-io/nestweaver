@@ -1,0 +1,104 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 1888
+expression: "parsed_symbols(\"simple.py\", &source)"
+---
+- name: standalone_function
+  kind: Function
+  start_line: 4
+  signature: "def standalone_function(name):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: decorator_factory
+  kind: Function
+  start_line: 7
+  signature: "def decorator_factory(prefix):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: decorator
+  kind: Function
+  start_line: 8
+  signature: "def decorator(func):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: wrapper
+  kind: Function
+  start_line: 9
+  signature: "def wrapper(*args, **kwargs):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: decorated_greet
+  kind: Function
+  start_line: 15
+  signature: "def decorated_greet(name):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Animal
+  kind: Class
+  start_line: 18
+  signature: "class Animal:"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: __init__
+  kind: Method
+  start_line: 19
+  signature: "def __init__(self, name):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+- name: speak
+  kind: Method
+  start_line: 22
+  signature: "def speak(self):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: Dog
+  kind: Class
+  start_line: 25
+  signature: "class Dog(Animal):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: speak
+  kind: Method
+  start_line: 26
+  signature: "def speak(self):"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+- name: main
+  kind: Function
+  start_line: 29
+  signature: "def main():"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: Main
+  visibility: Inferred
+  type_info: ~
