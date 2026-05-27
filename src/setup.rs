@@ -345,21 +345,90 @@ fn append_toml_if_missing(
 // ── Content generators ────────────────────────────────────────────────────────
 
 fn generate_skill_content() -> String {
-    "---\nname: nestweaver\ndescription: Use when exploring code architecture, checking blast radius, understanding dependencies, or working with vault notes\n---\n\n\
-## When to use NestWeaver\n\n\
-- **Starting a task**: Call `brain_context` with task keywords\n\
-- **Before modifying code**: Call `brain_impact` on the function\n\
-- **Exploring unfamiliar code**: Call `brain_search`\n\
-- **Working on a project**: Call `project_context`\n\n\
-## Tools\n\n\
-| Tool | Use when |\n\
-|------|----------|\n\
-| brain_context | You need structural context for a task |\n\
-| brain_search | You need to find symbols or notes |\n\
-| brain_impact | You need to check blast radius |\n\
-| brain_guide | You need an architecture overview |\n\
-| project_context | You're working on a named project |\n\
-| detect_changes | You want to assess risk of changes |\n".to_string()
+    "\
+---
+name: nestweaver
+description: |
+  Use when exploring codebase structure, understanding dependencies, analyzing
+  change impact, navigating architecture, or retrieving knowledge-vault notes.
+  Do NOT use for simple text search, file reading, or tasks unrelated to code
+  structure and project knowledge.
+---
+
+## When to activate
+
+Activate this skill when the task involves:
+
+- Understanding how a function, module, or file fits into the codebase
+- Checking what will break before modifying a symbol (blast radius)
+- Tracing call chains or execution flow from an entry point
+- Navigating cross-repository dependencies or shared contracts
+- Retrieving project knowledge from Obsidian vaults or markdown notes
+- Getting a structural overview of the architecture
+- Assessing risk of a set of changed files before commit
+
+Do NOT activate when:
+
+- The user just wants to read a specific file (use normal file reading)
+- The task is plain text search with no structural intent (use grep/ripgrep)
+- The question is about runtime behavior, logs, or deployment
+
+## Key concepts
+
+- **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), free-text terms, or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`).
+- **PPR (Personalized PageRank)**: Walks the code+notes graph from seeds and scores every reachable node by structural proximity.
+- **Context**: A token-budgeted, PPR-ranked list of symbols, notes, and sections relevant to given seeds.
+- **Brain**: The unified graph combining code symbols and markdown vault notes.
+- **Vault**: An indexed collection of markdown notes (e.g. an Obsidian vault).
+- **Confidence**: A 0.0\u{2013}1.0 score on edges indicating resolver certainty about a relationship.
+
+## Available MCP tools
+
+### Core retrieval
+
+| Tool | Purpose |
+|------|---------|
+| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. |
+| `brain_search` | BM25 full-text search across notes, headings, sections, and tags. |
+| `project_context` | PPR-ranked context scoped to a named project. |
+| `note_get` | Full markdown body of a specific note. |
+| `backlinks` | All notes that wikilink TO a target note. |
+
+### Analysis
+
+| Tool | Purpose |
+|------|---------|
+| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. |
+| `flow_trace` | Forward call chain from a symbol. |
+| `detect_changes` | Risk assessment for a list of changed files. |
+| `cross_repo_contracts` | Symbols shared across repositories. |
+| `clusters` | Functional communities detected by the Leiden algorithm. |
+
+### Status and maintenance
+
+| Tool | Purpose |
+|------|---------|
+| `brain_status` | Counts of vaults, notes, symbols, repos. |
+| `stale_check` | Compare indexed SHA to current git HEAD. |
+| `brain_diff` | Files and symbols changed since a given SHA. |
+| `brain_guide` | Auto-generated architecture overview. |
+| `brain_add_source` | Index a new repo or vault at runtime. |
+
+## Common workflows
+
+### Understanding a function
+
+1. `brain_context` with the function name as a seed.
+2. `flow_trace` for forward call chain.
+3. `brain_impact` for callers/dependents.
+
+### Before modifying code
+
+1. `brain_impact` on the symbol you plan to change.
+2. `detect_changes` with the list of files you expect to modify.
+3. `cross_repo_contracts` if the symbol may be shared across services.
+"
+    .to_string()
 }
 
 fn generate_cursor_rule_content() -> String {

@@ -295,50 +295,195 @@ pub fn generate_guide(
     Ok(out)
 }
 
-/// Generate a Claude Code skill file with YAML frontmatter.
+/// Generate a SKILL.md conforming to the Agent Skills open standard.
 ///
-/// Returns a skill document suitable for use as a Claude Code skill,
-/// including a YAML frontmatter header and a condensed architecture section
-/// derived from the indexed graph.
+/// Returns a skill document with YAML frontmatter (`name`, `description`)
+/// and a markdown body that teaches an AI agent how to use NestWeaver
+/// effectively: when to activate, which MCP tools to call, common
+/// workflows, graph query patterns, and response interpretation.
+///
+/// The `description` field acts as a classifier prompt so the agent
+/// activates this skill at the right time.
 pub fn generate_skill(
     store: &GraphStore,
     config: Option<&InstanceConfig>,
 ) -> Result<String, anyhow::Error> {
     let mut out = String::new();
 
+    // ── YAML frontmatter ─────────────────────────────────────────────────
     out.push_str("---\n");
     out.push_str("name: nestweaver\n");
-    out.push_str("description: Use when exploring code architecture, checking blast radius, understanding dependencies, or working with vault notes\n");
+    out.push_str("description: |\n");
+    out.push_str(
+        "  Use when exploring codebase structure, understanding dependencies, analyzing\n",
+    );
+    out.push_str(
+        "  change impact, navigating architecture, or retrieving knowledge-vault notes.\n",
+    );
+    out.push_str("  Do NOT use for simple text search, file reading, or tasks unrelated to code\n");
+    out.push_str("  structure and project knowledge.\n");
     out.push_str("---\n\n");
 
-    out.push_str("## When to use NestWeaver\n\n");
-    out.push_str("- **Starting a task**: Call `brain_context` with task keywords to get structural context\n");
+    // ── Trigger logic ────────────────────────────────────────────────────
+    out.push_str("## When to activate\n\n");
+    out.push_str("Activate this skill when the task involves:\n\n");
+    out.push_str("- Understanding how a function, module, or file fits into the codebase\n");
+    out.push_str("- Checking what will break before modifying a symbol (blast radius)\n");
+    out.push_str("- Tracing call chains or execution flow from an entry point\n");
+    out.push_str("- Navigating cross-repository dependencies or shared contracts\n");
+    out.push_str("- Retrieving project knowledge from Obsidian vaults or markdown notes\n");
+    out.push_str("- Getting a structural overview of the architecture\n");
+    out.push_str("- Assessing risk of a set of changed files before commit\n\n");
+
+    out.push_str("Do NOT activate when:\n\n");
+    out.push_str("- The user just wants to read a specific file (use normal file reading)\n");
+    out.push_str("- The task is plain text search with no structural intent (use grep/ripgrep)\n");
+    out.push_str("- The question is about runtime behavior, logs, or deployment\n\n");
+
+    // ── Vocabulary ───────────────────────────────────────────────────────
+    out.push_str("## Key concepts\n\n");
+    out.push_str("- **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), free-text terms, or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`).\n");
+    out.push_str("- **PPR (Personalized PageRank)**: The ranking algorithm. Walks the code+notes graph from seeds and scores every reachable node by structural proximity. Higher rank = closer relationship to the seeds.\n");
+    out.push_str("- **Context**: A token-budgeted, PPR-ranked list of symbols, notes, and sections relevant to given seeds. The primary retrieval primitive.\n");
     out.push_str(
-        "- **Before modifying code**: Call `brain_impact` on the function you're changing\n",
+        "- **Brain**: The unified graph combining code symbols and markdown vault notes.\n",
     );
-    out.push_str("- **Exploring unfamiliar code**: Call `brain_search` to find symbols or notes\n");
-    out.push_str("- **Working on a project**: Call `project_context` with the project name\n");
+    out.push_str("- **Vault**: An indexed collection of markdown notes (e.g. an Obsidian vault). Notes are linked to code via wikilinks and tags.\n");
+    out.push_str("- **Confidence**: A 0.0\u{2013}1.0 score on edges indicating how certain the resolver is about a relationship (e.g. an import or call). 1.0 = definite, <0.5 = heuristic guess.\n");
+    out.push_str("- **Token budget**: Approximate output cap in tokens (chars / 4). Controls how much context is returned.\n\n");
+
+    // ── MCP tools ────────────────────────────────────────────────────────
+    out.push_str("## Available MCP tools\n\n");
+
+    out.push_str("### Core retrieval\n\n");
+    out.push_str("| Tool | Purpose | Key parameters |\n");
+    out.push_str("|------|---------|----------------|\n");
+    out.push_str("| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. | `seeds` (required), `token_budget`, `kinds`, `repos`, `vaults`, `tags`, `since`, `recency_weight` |\n");
+    out.push_str("| `brain_search` | BM25 full-text search across notes, headings, sections, and tags. Use for keyword lookup. | `query`, `limit` |\n");
+    out.push_str("| `project_context` | PPR-ranked context scoped to a named project and its components. | `project`, `token_budget`, `kinds`, `include_components` |\n");
+    out.push_str("| `note_get` | Full markdown body of a specific note, with frontmatter and outline. | `uid` or `title`, `sections`, `include_body` |\n");
     out.push_str(
-        "- **Checking staleness**: Call `stale_check` to see if the index needs refreshing\n\n",
+        "| `backlinks` | All notes that wikilink TO a target note. | `uid` or `title` |\n\n",
     );
 
-    out.push_str("## Tools\n\n");
-    out.push_str("| Tool | Use when |\n");
-    out.push_str("|------|----------|\n");
-    out.push_str("| brain_context | You need structural context for a task |\n");
-    out.push_str("| brain_search | You need to find symbols or notes by keyword |\n");
-    out.push_str("| brain_impact | You need to check blast radius before changes |\n");
-    out.push_str("| brain_guide | You need an architecture overview |\n");
-    out.push_str("| project_context | You're working on a named project |\n");
-    out.push_str("| detect_changes | You want to assess risk of changed files |\n");
-    out.push_str("| brain_status | You need to check what's indexed |\n");
-    out.push_str("| brain_diff | You want to see what changed since last index |\n");
-    out.push_str("| flow_trace | You need to trace execution flow from a symbol |\n");
-    out.push_str("| note_get | You need the full body of a specific note |\n\n");
+    out.push_str("### Analysis\n\n");
+    out.push_str("| Tool | Purpose | Key parameters |\n");
+    out.push_str("|------|---------|----------------|\n");
+    out.push_str("| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. | `symbol`, `depth` |\n");
+    out.push_str("| `flow_trace` | Forward call chain from a symbol (what it calls, transitively). | `symbol`, `depth` |\n");
+    out.push_str("| `detect_changes` | Risk assessment for a list of changed files. Maps files to affected flows. | `files` |\n");
+    out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol` |\n");
+    out.push_str("| `clusters` | Functional communities detected by the Leiden algorithm. | `min_size`, `repo` |\n\n");
 
-    out.push_str("## Codebase\n\n");
+    out.push_str("### Status and maintenance\n\n");
+    out.push_str("| Tool | Purpose |\n");
+    out.push_str("|------|---------|\n");
+    out.push_str(
+        "| `brain_status` | Counts of vaults, notes, symbols, repos. Call to verify indexing. |\n",
+    );
+    out.push_str("| `stale_check` | Compare indexed SHA to current git HEAD. Shows if re-indexing is needed. |\n");
+    out.push_str("| `brain_diff` | Files and symbols changed since a given SHA. Useful before code review. |\n");
+    out.push_str(
+        "| `brain_guide` | Auto-generated architecture overview of the indexed codebase. |\n",
+    );
+    out.push_str(
+        "| `brain_add_source` | Index a new repo or vault at runtime. Pass an absolute path. |\n\n",
+    );
 
-    // Repos list
+    out.push_str("### Extensions\n\n");
+    out.push_str("| Tool | Purpose |\n");
+    out.push_str("|------|---------|\n");
+    out.push_str("| `set_extension` | Attach custom metadata (e.g. `team_owner`, `deprecated`) to any node. |\n");
+    out.push_str(
+        "| `query_extensions` | Find nodes with a specific extension property value. |\n\n",
+    );
+
+    // ── Workflows ────────────────────────────────────────────────────────
+    out.push_str("## Common workflows\n\n");
+
+    out.push_str("### Understanding a function\n\n");
+    out.push_str("1. `brain_context` with the function name as a seed. Review the ranked list of related symbols and notes.\n");
+    out.push_str(
+        "2. If you need the full call chain forward, use `flow_trace` on the same symbol.\n",
+    );
+    out.push_str("3. If you need to know what depends on it (callers), use `brain_impact`.\n\n");
+
+    out.push_str("### Starting work on a task\n\n");
+    out.push_str("1. `brain_context` with task-related keywords as seeds (e.g. `[\"authentication\", \"login\"]`). This returns the most structurally relevant symbols and notes.\n");
+    out.push_str("2. If a project exists for this area, use `project_context` instead for project-scoped results.\n");
+    out.push_str("3. Drill into specific notes with `note_get` when `brain_context` surfaces a relevant title.\n\n");
+
+    out.push_str("### Before modifying code\n\n");
+    out.push_str(
+        "1. `brain_impact` on the symbol you plan to change. Check the depth-grouped callers.\n",
+    );
+    out.push_str("2. `detect_changes` with the list of files you expect to modify. Review the risk assessment.\n");
+    out.push_str("3. If cross-repo, also call `cross_repo_contracts` to see if other services share the symbol.\n\n");
+
+    out.push_str("### Exploring architecture\n\n");
+    out.push_str("1. `brain_guide` for the full architecture overview.\n");
+    out.push_str("2. `clusters` to see functional communities of tightly-connected symbols.\n");
+    out.push_str("3. `brain_context` with broad seeds (module names, directory prefixes) for targeted exploration.\n\n");
+
+    out.push_str("### Working with vault notes\n\n");
+    out.push_str("1. `brain_search` with keywords to find relevant notes.\n");
+    out.push_str("2. `note_get` to read the full body of a matched note.\n");
+    out.push_str("3. `backlinks` to discover what links to a specific note.\n");
+    out.push_str("4. Use `since` or `recency_weight` parameters on `brain_context` to prioritize recent notes.\n\n");
+
+    // ── Query patterns ───────────────────────────────────────────────────
+    out.push_str("## Graph query patterns\n\n");
+
+    out.push_str("### Seeding context effectively\n\n");
+    out.push_str(
+        "- **Symbol name**: `seeds: [\"handleLogin\"]` — best for function-level exploration\n",
+    );
+    out.push_str("- **Multiple seeds**: `seeds: [\"auth\", \"session\", \"token\"]` — broader topic exploration; PPR walks from all seeds simultaneously\n");
+    out.push_str("- **File path**: `seeds: [\"src/auth/handler.rs\"]` — all symbols in that file become seeds\n");
+    out.push_str("- **Note title**: `seeds: [\"Architecture Decision Records\"]` — anchor on vault knowledge\n");
+    out.push_str("- **Tag**: `seeds: [\"#deprecated\"]` — all nodes with that tag\n");
+    out.push_str("- **UID**: `seeds: [\"sym:abc123\"]` — precise node targeting when you have a UID from a previous call\n\n");
+
+    out.push_str("### Filtering results\n\n");
+    out.push_str("- `kinds: [\"Symbol\"]` — code only, no notes\n");
+    out.push_str("- `kinds: [\"Note\", \"Section\"]` — notes only, no code\n");
+    out.push_str("- `repos: [\"backend\"]` — restrict to one repo\n");
+    out.push_str("- `path_prefix: \"src/auth/\"` — restrict to a directory\n");
+    out.push_str(
+        "- `tags: [\"api\"]` / `exclude_tags: [\"draft\"]` — tag-based filtering on notes\n\n",
+    );
+
+    out.push_str("### Tuning retrieval\n\n");
+    out.push_str("- Increase `token_budget` (default 2000) for broader context\n");
+    out.push_str("- Adjust `weight_ppr` / `weight_bm25` to balance structural vs. textual relevance (defaults: 0.7 / 0.3)\n");
+    out.push_str("- Set `recency_weight: 0.7` to boost recently-modified notes\n");
+    out.push_str("- Use `since: \"2026-01-01T00:00:00Z\"` to filter out old notes\n\n");
+
+    // ── Interpreting results ─────────────────────────────────────────────
+    out.push_str("## Interpreting results\n\n");
+
+    out.push_str("### PPR rankings in brain_context\n\n");
+    out.push_str("Results are ordered by PPR score (highest first). The score reflects structural proximity to your seeds in the code+notes graph:\n\n");
+    out.push_str("- **Top results** (highest PPR): Directly connected to your seeds — immediate callers, callees, or same-file symbols\n");
+    out.push_str("- **Mid-range results**: Two or three hops away — used by the same module or referenced in related notes\n");
+    out.push_str("- **Tail results**: Distant but still reachable — broader context that may or may not be relevant\n\n");
+
+    out.push_str("### Confidence scores\n\n");
+    out.push_str("Edges carry a confidence value from 0.0 to 1.0:\n\n");
+    out.push_str("- **1.0**: Definite relationship (e.g. explicit import, direct function call parsed from AST)\n");
+    out.push_str("- **0.7\u{2013}0.9**: High confidence (e.g. resolved cross-file reference with matching signature)\n");
+    out.push_str("- **0.3\u{2013}0.6**: Heuristic match (e.g. name-based resolution without full type information)\n");
+    out.push_str("- **<0.3**: Speculative (e.g. substring match on symbol names across repos)\n\n");
+
+    out.push_str("### Impact depth groups\n\n");
+    out.push_str("In `brain_impact` results, symbols are grouped by depth:\n\n");
+    out.push_str("- **Depth 1**: Direct callers/dependents — these will definitely be affected\n");
+    out.push_str("- **Depth 2**: Callers of callers — likely affected, review recommended\n");
+    out.push_str("- **Depth 3+**: Transitive dependents — possibly affected, check if the change propagates\n\n");
+
+    // ── Indexed codebase ─────────────────────────────────────────────────
+    out.push_str("## Indexed codebase\n\n");
+
     let repos = store.list_repos(None).unwrap_or_default();
     if repos.is_empty() {
         out.push_str("No repositories indexed yet.\n\n");
@@ -354,19 +499,47 @@ pub fn generate_skill(
         out.push('\n');
     }
 
-    // Condensed repo map
-    match crate::query::generate_repo_map(store, 1000) {
-        Ok(map) => {
-            out.push_str("```\n");
-            out.push_str(&map);
-            out.push_str("\n```\n");
+    // Vaults
+    let vaults = store.list_vaults(None).unwrap_or_default();
+    if !vaults.is_empty() {
+        out.push_str("### Vaults\n\n");
+        for vault in &vaults {
+            let notes = store.list_notes(Some(&vault.uid)).unwrap_or_default();
+            out.push_str(&format!("- **{}** ({} notes)\n", vault.name, notes.len()));
         }
-        Err(_) => {
-            out.push_str("No symbols indexed yet.\n");
-        }
+        out.push('\n');
     }
 
-    let _ = config; // reserved for future use
+    // Projects
+    let projects = store.list_projects().unwrap_or_default();
+    let empty_projects: Vec<crate::config::ProjectConfig> = Vec::new();
+    let config_projects: &[crate::config::ProjectConfig] = config
+        .map(|c| c.projects.as_slice())
+        .unwrap_or(&empty_projects);
+    let mut all_project_names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+    for cp in config_projects {
+        if !all_project_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&cp.name))
+        {
+            all_project_names.push(cp.name.clone());
+        }
+    }
+    if !all_project_names.is_empty() {
+        out.push_str("### Projects\n\n");
+        for name in &all_project_names {
+            out.push_str(&format!("- {name}\n"));
+        }
+        out.push('\n');
+    }
+
+    // Condensed repo map
+    if let Ok(map) = crate::query::generate_repo_map(store, 1000) {
+        out.push_str("### Architecture map\n\n");
+        out.push_str("```\n");
+        out.push_str(&map);
+        out.push_str("\n```\n");
+    }
 
     Ok(out)
 }
@@ -436,7 +609,42 @@ mod tests {
         let skill = generate_skill(&store, None).unwrap();
         assert!(skill.starts_with("---\n"));
         assert!(skill.contains("name: nestweaver"));
+        assert!(skill.contains("description: |"));
+        assert!(skill.contains("Do NOT use for simple text search"));
         assert!(skill.contains("brain_context"));
+    }
+
+    #[test]
+    fn generate_skill_contains_required_sections() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let skill = generate_skill(&store, None).unwrap();
+        // Trigger logic
+        assert!(skill.contains("## When to activate"));
+        assert!(skill.contains("Do NOT activate when"));
+        // Vocabulary
+        assert!(skill.contains("## Key concepts"));
+        assert!(skill.contains("Seeds"));
+        assert!(skill.contains("PPR (Personalized PageRank)"));
+        assert!(skill.contains("Confidence"));
+        // Tools table
+        assert!(skill.contains("## Available MCP tools"));
+        assert!(skill.contains("brain_impact"));
+        assert!(skill.contains("flow_trace"));
+        assert!(skill.contains("detect_changes"));
+        assert!(skill.contains("stale_check"));
+        assert!(skill.contains("set_extension"));
+        assert!(skill.contains("query_extensions"));
+        // Workflows
+        assert!(skill.contains("## Common workflows"));
+        assert!(skill.contains("### Understanding a function"));
+        assert!(skill.contains("### Before modifying code"));
+        // Query patterns
+        assert!(skill.contains("## Graph query patterns"));
+        assert!(skill.contains("### Seeding context effectively"));
+        // Interpreting results
+        assert!(skill.contains("## Interpreting results"));
+        assert!(skill.contains("### Confidence scores"));
+        assert!(skill.contains("### Impact depth groups"));
     }
 
     #[test]
