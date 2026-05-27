@@ -299,12 +299,13 @@ impl GraphStore {
             }
         }
 
-        // Combine forward + reverse for undirected neighbourhood propagation.
-        // Each forward edge (u→v, w) also contributes a reverse edge (v→u, w).
+        // Combine forward + reverse for neighbourhood propagation.
+        // Reverse edges use 30% of the forward weight so PPR can traverse
+        // backwards (discovery) while preserving the directional signal.
         let mut all_edges: Vec<(usize, usize, f64)> = Vec::with_capacity(forward_edges.len() * 2);
         for &(u, v, w) in &forward_edges {
             all_edges.push((u, v, w));
-            all_edges.push((v, u, w));
+            all_edges.push((v, u, w * 0.3)); // reverse edge at 30% weight
         }
 
         // Compute total outgoing weight and weighted incoming adjacency.
