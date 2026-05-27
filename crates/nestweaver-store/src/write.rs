@@ -421,10 +421,11 @@ impl GraphStore {
                 )
             }
             EdgeType::ProjectIncludesSymbol
+            | EdgeType::ProjectIncludesNote
             | EdgeType::ProjectHasComponent
             | EdgeType::ProjectHasParent => Err(StoreError::Query(
-                "Use batch_insert_project_symbol_edges / insert_project_component_edge / \
-                 insert_project_parent_edge for Project edges"
+                "Use batch_insert_project_symbol_edges / batch_insert_project_note_edges / \
+                 insert_project_component_edge / insert_project_parent_edge for Project edges"
                     .to_string(),
             )),
         }
@@ -525,11 +526,12 @@ impl GraphStore {
                     ]);
                 }
                 EdgeType::ProjectIncludesSymbol
+                | EdgeType::ProjectIncludesNote
                 | EdgeType::ProjectHasComponent
                 | EdgeType::ProjectHasParent => {
                     return Err(StoreError::Query(
-                        "Use batch_insert_project_symbol_edges / insert_project_component_edge / \
-                         insert_project_parent_edge for Project edges"
+                        "Use batch_insert_project_symbol_edges / batch_insert_project_note_edges / \
+                         insert_project_component_edge / insert_project_parent_edge for Project edges"
                             .to_string(),
                     ));
                 }
