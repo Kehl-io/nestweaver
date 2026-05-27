@@ -31,6 +31,10 @@ pub fn detect_entry_point(
         "bash" => detect_bash(name, file_path, kind, signature),
         "scala" => detect_scala(name, file_path, kind, signature),
         "elixir" => detect_elixir(name, file_path, kind, signature),
+        "zig" => detect_zig(name, file_path, kind, signature),
+        "objc" => detect_objc(name, file_path, kind, signature),
+        "groovy" => detect_groovy(name, file_path, kind, signature),
+        "powershell" => detect_powershell(name, file_path, kind, signature),
         _ => None,
     }
 }
@@ -466,6 +470,78 @@ fn detect_elixir(
     None
 }
 
+fn detect_zig(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    if name.starts_with("test") || name.starts_with("test_") {
+        return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_objc(
+    name: &str,
+    file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    if name == "applicationDidFinishLaunching"
+        || name == "didFinishLaunchingWithOptions"
+        || name == "application"
+    {
+        return Some(EntryPointKind::Main);
+    }
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if name.starts_with("test") && file_name.contains("Test") {
+        return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_groovy(
+    name: &str,
+    file_path: &str,
+    _kind: &str,
+    signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    if let Some(sig) = signature
+        && sig.contains("static void main(")
+    {
+        return Some(EntryPointKind::Main);
+    }
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if name.starts_with("test")
+        && (file_name.ends_with("Test.groovy") || file_name.ends_with("Spec.groovy"))
+    {
+        return Some(EntryPointKind::TestEntry);
+    }
+    None
+}
+
+fn detect_powershell(
+    name: &str,
+    _file_path: &str,
+    _kind: &str,
+    _signature: Option<&str>,
+) -> Option<EntryPointKind> {
+    if name == "Main" || name == "main" {
+        return Some(EntryPointKind::Main);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,7 +819,7 @@ mod tests {
 
     #[test]
     fn unsupported_language_returns_none() {
-        let result = detect_entry_point("foo", "src/foo.zig", "function", None, "zig");
+        let result = detect_entry_point("foo", "src/foo.unknown", "function", None, "unknown");
         assert_eq!(result, None);
     }
 
