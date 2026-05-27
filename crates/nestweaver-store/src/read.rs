@@ -1056,6 +1056,85 @@ impl GraphStore {
         Ok(uids)
     }
 
+    /// Returns the set of Note UIDs whose `modified_at` is >= `since` (ISO 8601 string).
+    /// If the Note table doesn't exist yet, returns an empty set (trace-level log).
+    pub fn list_note_uids_modified_since(
+        &self,
+        since: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (n:Note) WHERE n.modified_at >= $since RETURN n.uid";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(
+                    "list_note_uids_modified_since: query skipped (table may not exist): {e}"
+                );
+                return Ok(std::collections::HashSet::new());
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("since", Value::String(since.to_string()))],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("list_note_uids_modified_since: execute error: {e}");
+                return Ok(std::collections::HashSet::new());
+            }
+        };
+        let mut uids = std::collections::HashSet::new();
+        for row in result {
+            if let Some(Value::String(uid)) = row.first() {
+                uids.insert(uid.clone());
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Returns the set of Section UIDs whose parent Note has `modified_at` >= `since`.
+    /// Joins through Note → Section via `note_uid`. If the tables don't exist, returns empty set.
+    pub fn list_section_uids_modified_since(
+        &self,
+        since: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        // Get the note UIDs first, then collect all section UIDs for those notes.
+        let note_uids = self.list_note_uids_modified_since(since)?;
+        if note_uids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let conn = self.conn()?;
+        let mut uids = std::collections::HashSet::new();
+        for note_uid in &note_uids {
+            let q = "MATCH (s:Section) WHERE s.note_uid = $nid RETURN s.uid";
+            let mut stmt = match conn.prepare(q) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::trace!(
+                        "list_section_uids_modified_since: query skipped (table may not exist): {e}"
+                    );
+                    return Ok(uids);
+                }
+            };
+            let result = match conn.execute(
+                &mut stmt,
+                vec![("nid", Value::String(note_uid.clone()))],
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("list_section_uids_modified_since: execute error: {e}");
+                    continue;
+                }
+            };
+            for row in result {
+                if let Some(Value::String(uid)) = row.first() {
+                    uids.insert(uid.clone());
+                }
+            }
+        }
+        Ok(uids)
+    }
+
     /// Returns the set of all symbol UIDs that are the target of at least one
     /// CALLS edge. Single bulk query instead of per-symbol lookups.
     pub fn all_callee_uids(&self) -> Result<std::collections::HashSet<String>, StoreError> {

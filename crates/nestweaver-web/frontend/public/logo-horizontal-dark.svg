@@ -60,7 +60,7 @@
     </linearGradient>
   </defs>
 
-  <rect width="2221" height="512" rx="48" fill="#080c14"/>
+  <!-- transparent background for overlay on any dark surface -->
 
   <circle cx="256" cy="260" r="180" fill="url(#centerGlow)"/>
   <circle cx="256" cy="70" r="70" fill="url(#headGlow)"/>

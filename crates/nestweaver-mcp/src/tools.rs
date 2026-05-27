@@ -395,6 +395,129 @@ fn tool_brain_context(
     }))
 }
 
+/// Parse an ISO 8601 string (subset: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD) to Unix seconds.
+/// Returns 0.0 on any parse failure so the node gets no boost (treated as epoch-old).
+fn parse_iso8601_to_epoch(s: &str) -> f64 {
+    let s = s.trim();
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix("+00:00"))
+        .or_else(|| s.strip_suffix("-00:00"))
+        .unwrap_or(s);
+    let (date_part, time_part) = if let Some(pos) = s.find('T') {
+        (&s[..pos], Some(&s[pos + 1..]))
+    } else {
+        (s, None)
+    };
+    let dp: Vec<&str> = date_part.split('-').collect();
+    if dp.len() != 3 {
+        return 0.0;
+    }
+    let year: i64 = dp[0].parse().unwrap_or(0);
+    let month: u32 = dp[1].parse().unwrap_or(0);
+    let day: u32 = dp[2].parse().unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return 0.0;
+    }
+    let (hour, minute, second) = if let Some(t) = time_part {
+        let t = if let Some(pos) = t.rfind(['+', '-']) {
+            &t[..pos]
+        } else {
+            t
+        };
+        let tp: Vec<&str> = t.split(':').collect();
+        if tp.len() < 2 {
+            (0u32, 0u32, 0u32)
+        } else {
+            let h = tp[0].parse().unwrap_or(0);
+            let m = tp[1].parse().unwrap_or(0);
+            let sec: u32 = if tp.len() >= 3 {
+                tp[2]
+                    .split('.')
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (h, m, sec)
+        }
+    } else {
+        (0, 0, 0)
+    };
+    let m_adj = if month <= 2 { month + 9 } else { month - 3 };
+    let y_adj = if month <= 2 { year - 1 } else { year };
+    let era = if y_adj >= 0 {
+        y_adj / 400
+    } else {
+        (y_adj - 399) / 400
+    };
+    let yoe = (y_adj - era * 400) as u64;
+    let doy = (153 * m_adj as u64 + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe as i64) - 719_468;
+    let secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    if secs < 0 { 0.0 } else { secs as f64 }
+}
+
+/// Apply age-decay score boost to non-Symbol nodes.
+///
+/// For each Note/Section node, look up its `modified_at` from the store's notes,
+/// compute exponential decay, and multiply `relevance` by `1 + weight * decay`.
+/// After adjustment, re-sorts by descending relevance.
+fn apply_recency_bias(
+    store: &GraphStore,
+    nodes: &mut [nestweaver_engine::BrainNode],
+    recency_weight: f64,
+    recency_half_life_days: f64,
+) {
+    if recency_weight <= 0.0 {
+        return;
+    }
+    let note_timestamps: std::collections::HashMap<String, f64> =
+        store.list_notes(None).unwrap_or_default().into_iter()
+            .filter_map(|n| n.modified_at.map(|t| (n.uid, parse_iso8601_to_epoch(&t))))
+            .collect();
+    let section_note_map: std::collections::HashMap<String, String> =
+        store.list_all_sections().unwrap_or_default().into_iter()
+            .map(|s| (s.uid, s.note_uid))
+            .collect();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as f64;
+
+    let ln2 = std::f64::consts::LN_2;
+    let half_life_secs = recency_half_life_days * 86_400.0;
+
+    for node in nodes.iter_mut() {
+        if node.kind.to_lowercase().contains("symbol") {
+            continue;
+        }
+        let modified_at_secs = if let Some(&ts) = note_timestamps.get(&node.uid) {
+            ts
+        } else if let Some(note_uid) = section_note_map.get(&node.uid) {
+            note_timestamps.get(note_uid).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if modified_at_secs <= 0.0 {
+            continue;
+        }
+        let age_secs = (now - modified_at_secs).max(0.0);
+        let boost = 1.0 + recency_weight * (-(age_secs * ln2) / half_life_secs).exp();
+        node.relevance *= boost;
+    }
+
+    nodes.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize, usize) {
     let mut used = 0usize;
     let mut taken = 0usize;
@@ -1846,6 +1969,50 @@ fn tool_project_context(
         };
         apply_kinds(&mut result.seeds);
         apply_kinds(&mut result.connected);
+    }
+
+    // 6a. since filter: hard filter Note/Section nodes by modified_at.
+    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+        let recent_notes = store
+            .list_note_uids_modified_since(since)
+            .map_err(|e| anyhow!("list_note_uids_modified_since: {e}"))?;
+        let recent_sections = store
+            .list_section_uids_modified_since(since)
+            .map_err(|e| anyhow!("list_section_uids_modified_since: {e}"))?;
+        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+            nodes.retain(|item| {
+                if item.kind.to_lowercase().contains("symbol") {
+                    return true;
+                }
+                recent_notes.contains(&item.uid) || recent_sections.contains(&item.uid)
+            });
+        };
+        filter_since(&mut result.seeds);
+        filter_since(&mut result.connected);
+    }
+
+    // 6b. recency bias: soft boost based on note modified_at age.
+    let recency_weight = args
+        .get("recency_weight")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let recency_half_life_days = args
+        .get("recency_half_life_days")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(30.0);
+    if recency_weight > 0.0 {
+        apply_recency_bias(
+            store,
+            &mut result.connected,
+            recency_weight,
+            recency_half_life_days,
+        );
+        apply_recency_bias(
+            store,
+            &mut result.seeds,
+            recency_weight,
+            recency_half_life_days,
+        );
     }
 
     // 6. Apply token budget.

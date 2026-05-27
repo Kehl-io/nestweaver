@@ -291,7 +291,7 @@ enum Commands {
     /// wikilinks, and PPR-based retrieval arrive in later phases.
     Brain {
         #[command(subcommand)]
-        command: BrainCommands,
+        command: Box<BrainCommands>,
     },
     /// Run the brain as a Model Context Protocol server on stdio.
     ///
@@ -436,6 +436,27 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
+        /// Symbol nodes are always kept.
+        #[arg(
+            long = "since",
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+        )]
+        since: Option<String>,
+        /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
+        #[arg(
+            long = "recency-weight",
+            default_value = "0.0",
+            help = "Multiplier for age-decay boost (default 0.0 = disabled)"
+        )]
+        recency_weight: f64,
+        /// Half-life for the recency age-decay in days (default 30).
+        #[arg(
+            long = "recency-half-life-days",
+            default_value = "30.0",
+            help = "Half-life for age-decay in days (default 30.0)"
+        )]
+        recency_half_life_days: f64,
     },
     /// Auto-detect and configure NestWeaver for installed AI coding tools
     ///
@@ -675,6 +696,27 @@ enum BrainCommands {
             help = "Semantic embedding weight for hybrid retrieval (default 0.0)"
         )]
         weight_semantic: Option<f64>,
+        /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
+        /// Symbol nodes are always kept.
+        #[arg(
+            long = "since",
+            help = "Hard filter: only Note/Section nodes modified after this ISO 8601 timestamp"
+        )]
+        since: Option<String>,
+        /// Recency bias weight. 0 = disabled. 1.0 = same-day node ranks ~2x a year-old node.
+        #[arg(
+            long = "recency-weight",
+            default_value = "0.0",
+            help = "Multiplier for age-decay boost (default 0.0 = disabled)"
+        )]
+        recency_weight: f64,
+        /// Half-life for the recency age-decay in days (default 30).
+        #[arg(
+            long = "recency-half-life-days",
+            default_value = "30.0",
+            help = "Half-life for age-decay in days (default 30.0)"
+        )]
+        recency_half_life_days: f64,
     },
 }
 
@@ -1467,7 +1509,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
 
         Commands::Snapshot { command } => run_snapshot(command),
         Commands::Instance { command } => run_instance(command),
-        Commands::Brain { command } => run_brain(command),
+        Commands::Brain { command } => run_brain(*command),
         Commands::Embed {
             db,
             endpoint,
@@ -1703,6 +1745,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             include_components,
             json,
             db,
+            since,
+            recency_weight,
+            recency_half_life_days,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
@@ -1786,7 +1831,44 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 &aliases,
                 Some(&db_path),
             ) {
-                Ok(result) => {
+                Ok(mut result) => {
+                    // since filter: hard filter Note/Section nodes by modified_at.
+                    if let Some(ref since_ts) = since {
+                        let recent_notes = store
+                            .list_note_uids_modified_since(since_ts)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let recent_sections = store
+                            .list_section_uids_modified_since(since_ts)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                            nodes.retain(|item| {
+                                if item.kind.to_lowercase().contains("symbol") {
+                                    return true;
+                                }
+                                recent_notes.contains(&item.uid)
+                                    || recent_sections.contains(&item.uid)
+                            });
+                        };
+                        filter_since(&mut result.seeds);
+                        filter_since(&mut result.connected);
+                    }
+
+                    // recency bias: soft boost based on note modified_at age.
+                    if recency_weight > 0.0 {
+                        apply_recency_bias_cli(
+                            &store,
+                            &mut result.connected,
+                            recency_weight,
+                            recency_half_life_days,
+                        );
+                        apply_recency_bias_cli(
+                            &store,
+                            &mut result.seeds,
+                            recency_weight,
+                            recency_half_life_days,
+                        );
+                    }
+
                     let cut = token_budgeted_truncate(&result.connected, token_budget);
                     if json {
                         print_brain_context_json(&result, cut)?;
@@ -2543,6 +2625,9 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
             weight_ppr,
             weight_bm25,
             weight_semantic,
+            since,
+            recency_weight,
+            recency_half_life_days,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
@@ -2640,6 +2725,43 @@ fn run_brain(command: BrainCommands) -> anyhow::Result<i32> {
                         filter_excluded(&mut result.connected);
                     }
 
+                    // since filter: hard filter Note/Section nodes by modified_at.
+                    if let Some(ref since_ts) = since {
+                        let recent_notes = store
+                            .list_note_uids_modified_since(since_ts)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let recent_sections = store
+                            .list_section_uids_modified_since(since_ts)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let filter_since = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                            nodes.retain(|item| {
+                                if item.kind.to_lowercase().contains("symbol") {
+                                    return true;
+                                }
+                                recent_notes.contains(&item.uid)
+                                    || recent_sections.contains(&item.uid)
+                            });
+                        };
+                        filter_since(&mut result.seeds);
+                        filter_since(&mut result.connected);
+                    }
+
+                    // recency bias: soft boost based on note modified_at age.
+                    if recency_weight > 0.0 {
+                        apply_recency_bias_cli(
+                            &store,
+                            &mut result.connected,
+                            recency_weight,
+                            recency_half_life_days,
+                        );
+                        apply_recency_bias_cli(
+                            &store,
+                            &mut result.seeds,
+                            recency_weight,
+                            recency_half_life_days,
+                        );
+                    }
+
                     // token_budget takes precedence over the count-based limit.
                     let cut = match token_budget {
                         Some(budget) => token_budgeted_truncate(&result.connected, budget),
@@ -2693,6 +2815,125 @@ fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: u
         taken += 1;
     }
     taken
+}
+
+/// Parse an ISO 8601 string (subset) to Unix epoch seconds (f64).
+/// Returns 0.0 on failure — the node will receive no recency boost.
+fn cli_parse_iso8601_to_epoch(s: &str) -> f64 {
+    let s = s.trim();
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix("+00:00"))
+        .or_else(|| s.strip_suffix("-00:00"))
+        .unwrap_or(s);
+    let (date_part, time_part) = if let Some(pos) = s.find('T') {
+        (&s[..pos], Some(&s[pos + 1..]))
+    } else {
+        (s, None)
+    };
+    let dp: Vec<&str> = date_part.split('-').collect();
+    if dp.len() != 3 {
+        return 0.0;
+    }
+    let year: i64 = dp[0].parse().unwrap_or(0);
+    let month: u32 = dp[1].parse().unwrap_or(0);
+    let day: u32 = dp[2].parse().unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return 0.0;
+    }
+    let (hour, minute, second) = if let Some(t) = time_part {
+        let t = if let Some(pos) = t.rfind(['+', '-']) {
+            &t[..pos]
+        } else {
+            t
+        };
+        let tp: Vec<&str> = t.split(':').collect();
+        if tp.len() < 2 {
+            (0u32, 0u32, 0u32)
+        } else {
+            let h = tp[0].parse().unwrap_or(0);
+            let m = tp[1].parse().unwrap_or(0);
+            let sec: u32 = if tp.len() >= 3 {
+                tp[2]
+                    .split('.')
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (h, m, sec)
+        }
+    } else {
+        (0, 0, 0)
+    };
+    let m_adj = if month <= 2 { month + 9 } else { month - 3 };
+    let y_adj = if month <= 2 { year - 1 } else { year };
+    let era = if y_adj >= 0 {
+        y_adj / 400
+    } else {
+        (y_adj - 399) / 400
+    };
+    let yoe = (y_adj - era * 400) as u64;
+    let doy = (153 * m_adj as u64 + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe as i64) - 719_468;
+    let secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    if secs < 0 { 0.0 } else { secs as f64 }
+}
+
+/// Apply age-decay score boost to non-Symbol nodes (CLI variant).
+fn apply_recency_bias_cli(
+    store: &nestweaver_store::GraphStore,
+    nodes: &mut [nestweaver_engine::BrainNode],
+    recency_weight: f64,
+    recency_half_life_days: f64,
+) {
+    if recency_weight <= 0.0 {
+        return;
+    }
+    let note_timestamps: std::collections::HashMap<String, f64> =
+        store.list_notes(None).unwrap_or_default().into_iter()
+            .filter_map(|n| n.modified_at.map(|t| (n.uid, cli_parse_iso8601_to_epoch(&t))))
+            .collect();
+    let section_note_map: std::collections::HashMap<String, String> =
+        store.list_all_sections().unwrap_or_default().into_iter()
+            .map(|s| (s.uid, s.note_uid))
+            .collect();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as f64;
+
+    let ln2 = std::f64::consts::LN_2;
+    let half_life_secs = recency_half_life_days * 86_400.0;
+
+    for node in nodes.iter_mut() {
+        if node.kind.to_lowercase().contains("symbol") {
+            continue;
+        }
+        let modified_at_secs = if let Some(&ts) = note_timestamps.get(&node.uid) {
+            ts
+        } else if let Some(note_uid) = section_note_map.get(&node.uid) {
+            note_timestamps.get(note_uid).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if modified_at_secs <= 0.0 {
+            continue;
+        }
+        let age_secs = (now - modified_at_secs).max(0.0);
+        let boost = 1.0 + recency_weight * (-(age_secs * ln2) / half_life_secs).exp();
+        node.relevance *= boost;
+    }
+
+    nodes.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 /// Rough token cost of rendering a single BrainNode line (chars / 4).
