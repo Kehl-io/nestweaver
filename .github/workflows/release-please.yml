@@ -55,7 +55,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+          cat > .cargo/config.toml << 'EOF'
+          [target.x86_64-unknown-linux-gnu]
+          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+          EOF
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
