@@ -118,9 +118,15 @@ fn detect_express_nextjs(
     file_path: &str,
     hints: &mut Vec<(usize, FrameworkHint)>,
 ) {
-    if file_path.contains("/pages/") || file_path.contains("/app/") {
+    if file_path.contains("/pages/")
+        || file_path.contains("/app/")
+        || file_path.contains("/routes/")
+    {
         for (i, sym) in symbols.iter().enumerate() {
-            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Class) {
+            if matches!(
+                sym.kind,
+                SymbolKind::Function | SymbolKind::Class | SymbolKind::Constant
+            ) {
                 hints.push((
                     i,
                     FrameworkHint {
