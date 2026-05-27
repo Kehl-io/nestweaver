@@ -120,7 +120,7 @@ fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
         });
     }
 
-    // Sort by file path then start line for deterministic output.
+    // Sort by content string for deterministic output.
     summaries.sort_by(|a, b| a.content.cmp(&b.content));
 
     Ok(summaries)
