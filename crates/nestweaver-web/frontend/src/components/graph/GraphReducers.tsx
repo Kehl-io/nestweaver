@@ -122,9 +122,11 @@ export function GraphReducers() {
 
         // Semantic zoom label control
         if (zoomTier === "overview") {
-          // Only show labels for Module and Class nodes
+          // Truncate labels to 12 chars at overview tier instead of hiding
           if (data.kind !== "Module" && data.kind !== "Class") {
-            res.label = "";
+            if (res.label && res.label.length > 12) {
+              res.label = res.label.substring(0, 12) + "…";
+            }
           }
         } else if (zoomTier === "detail") {
           // Show full signature if available
