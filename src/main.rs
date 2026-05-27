@@ -9,14 +9,14 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, FeatureContextResult,
-    HybridSearchConfig, LookupResult, attach_cluster_ids, attach_communities,
+    HybridSearchConfig, LookupResult, analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context, build_feature_context,
-    compute_clusters, discover_cross_domain_links, embedding::generate_embedding,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
-    generate_repo_map, generate_skill, incremental_index, index_directory,
-    index_markdown_directory, index_markdown_directory_since, list_repos, list_services,
-    load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol, save_clusters,
-    search_symbols, suggest_links,
+    changed_files_from_git, compute_clusters, discover_cross_domain_links,
+    embedding::generate_embedding, find_bridge_nodes, find_hub_nodes, generate_agents_md,
+    generate_cursor_rule, generate_guide, generate_repo_map, generate_skill, incremental_index,
+    index_directory, index_markdown_directory, index_markdown_directory_since, list_repos,
+    list_services, load_alias_sidecar, load_clusters, load_manifest_cache, lookup_symbol,
+    save_clusters, search_symbols, suggest_links,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
@@ -703,6 +703,31 @@ enum Commands {
     Completions {
         /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
         shell: clap_complete::Shell,
+    },
+
+    /// Analyze the blast radius of changed files in a PR or working tree
+    ///
+    /// Maps changed files to their symbols, runs transitive impact analysis,
+    /// groups by cluster, and scores risk. When no --files are given, uses
+    /// `git diff --name-only` to detect changed files automatically.
+    #[command(
+        after_help = "Examples:\n  nestweaver pr-impact\n  nestweaver pr-impact --files src/auth.rs,src/db.rs\n  nestweaver pr-impact --depth 5 --json"
+    )]
+    PrImpact {
+        #[arg(
+            long,
+            help = "Comma-separated list of changed file paths (omit to auto-detect via git diff)"
+        )]
+        files: Option<String>,
+        #[arg(long, default_value = "3", help = "Maximum traversal depth")]
+        depth: u32,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 
     /// Watch a repository for source file changes and re-index incrementally
@@ -1883,6 +1908,106 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
             Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::PrImpact {
+            files,
+            depth,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            // Determine changed files: from --files flag or git diff.
+            let changed_files: Vec<PathBuf> = if let Some(files_str) = files {
+                files_str
+                    .split(',')
+                    .map(|s| PathBuf::from(s.trim()))
+                    .collect()
+            } else {
+                let repo_root = detect_repo_root();
+                out.status("No --files given, detecting via git diff...");
+                changed_files_from_git(&repo_root, None).context("git diff")?
+            };
+
+            if changed_files.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "changed_symbols": [],
+                            "affected_symbols": [],
+                            "affected_clusters": [],
+                            "risk_level": "Low",
+                            "summary": "No changed files detected.",
+                        }))?
+                    );
+                } else {
+                    println!("No changed files detected.");
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            out.status(&format!(
+                "Analyzing blast radius for {} file(s) (depth={})...",
+                changed_files.len(),
+                depth
+            ));
+
+            let result = analyze_blast_radius(&store, &changed_files, depth, Some(&db_path))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.summary);
+                println!();
+
+                if !result.changed_symbols.is_empty() {
+                    println!("Changed symbols ({}):", result.changed_symbols.len());
+                    for s in &result.changed_symbols {
+                        let pr = s
+                            .pagerank_score
+                            .map(|p| format!(" pr={p:.4}"))
+                            .unwrap_or_default();
+                        println!("  {} ({}) {}{pr}", s.name, s.kind, s.file_path);
+                    }
+                    println!();
+                }
+
+                if !result.affected_symbols.is_empty() {
+                    println!("Affected symbols ({}):", result.affected_symbols.len());
+                    for s in &result.affected_symbols {
+                        println!(
+                            "  [depth {}] {} via {} ({:.2}) — {}",
+                            s.depth, s.name, s.edge_type, s.confidence, s.file_path
+                        );
+                    }
+                    println!();
+                }
+
+                if !result.affected_clusters.is_empty() {
+                    println!("Affected clusters ({}):", result.affected_clusters.len());
+                    for c in &result.affected_clusters {
+                        println!(
+                            "  [{}] {} — {}/{} members affected (cohesion={:.2})",
+                            c.id, c.name, c.affected_count, c.total_count, c.cohesion
+                        );
+                    }
+                    println!();
+                }
+
+                println!("Risk level: {:?}", result.risk_level);
+            }
+
+            let stats = format!(
+                "{} changed, {} affected, risk={:?} in {}",
+                result.changed_symbols.len(),
+                result.affected_symbols.len(),
+                result.risk_level,
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::Watch { repo, db, instance } => {
