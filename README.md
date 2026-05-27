@@ -244,7 +244,7 @@ MIT
 
 <p align="center">
   <a href="https://kehl.io">
-    <img src="assets/kehl-io/kehl-icon.png" width="28" alt="kehl.io" style="vertical-align: middle;" />
+    <img src="assets/kehl-io/kehl-icon.png" width="56" alt="kehl.io" />
   </a>
   <br>
   <sub>Built by <a href="https://kehl.io">kehl.io</a></sub>
