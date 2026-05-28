@@ -197,10 +197,15 @@ pub fn index_directory(
         repo_url,
         indexed_sha,
         false,
+        None,
     )
 }
 
 /// Index a directory with explicit control over force-reindex behavior.
+///
+/// When `name` is `Some`, it is stored on the Repo node as a display name
+/// override. This avoids basename collisions when multiple repos share a
+/// generic last path segment (e.g. `client`, `server`).
 pub fn index_directory_with_options(
     repo_path: &Path,
     db_path: &Path,
@@ -208,6 +213,7 @@ pub fn index_directory_with_options(
     repo_url: &str,
     indexed_sha: &str,
     force: bool,
+    name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
@@ -226,6 +232,7 @@ pub fn index_directory_with_options(
             indexed_sha,
             None,
             Some(&mut new_filemeta),
+            name,
         )?
     } else {
         // Normal path: load the filemeta sidecar for tiered change detection.
@@ -238,6 +245,7 @@ pub fn index_directory_with_options(
             indexed_sha,
             Some(&filemeta_cache),
             Some(&mut new_filemeta),
+            name,
         )?
     };
 
@@ -276,6 +284,7 @@ pub fn index_directory_in_memory(
         indexed_sha,
         None,
         None,
+        None,
     )?;
     Ok((result, store))
 }
@@ -287,6 +296,7 @@ pub fn index_directory_in_memory(
 /// SHA-256 hashing and re-parsing for unchanged files). Entries for all
 /// processed files are written to `new_filemeta` so the caller can
 /// persist the updated sidecar after indexing completes.
+#[allow(clippy::too_many_arguments)]
 fn index_into_store(
     repo_path: &Path,
     store: &GraphStore,
@@ -295,6 +305,7 @@ fn index_into_store(
     indexed_sha: &str,
     filemeta_cache: Option<&FileMetaCache>,
     mut new_filemeta: Option<&mut FileMetaCache>,
+    name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     let started = Instant::now();
 
@@ -313,6 +324,7 @@ fn index_into_store(
             indexed_sha: indexed_sha.to_string(),
             staleness_commits_behind: 0,
             instance_id: instance_id.to_string(),
+            name: name.map(String::from),
         };
         store.insert_repo(&repo).context("insert_repo")?;
     }
@@ -753,11 +765,25 @@ pub struct IncrementalResult {
 /// - No Repo node exists in the store yet.
 /// - The previously indexed SHA is not an ancestor of the current HEAD
 ///   (e.g. force-push / rebase).
+///
+/// When `name` is `Some`, it is forwarded to the full-index fallback path
+/// so the Repo node is created with the display name override.
 pub fn incremental_index(
     repo_path: &Path,
     db_path: &Path,
     instance_id: &str,
     repo_url: &str,
+) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_name(repo_path, db_path, instance_id, repo_url, None)
+}
+
+/// Like [`incremental_index`] but accepts an optional display name override.
+pub fn incremental_index_with_name(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
     let store = nestweaver_store::GraphStore::open_or_create(db_path)
         .with_context(|| format!("open/create store at {}", db_path.display()))?;
@@ -773,7 +799,15 @@ pub fn incremental_index(
         Ok(sha) => sha,
         Err(_) => {
             tracing::info!("not a git repo; falling back to full index");
-            return full_index_fallback(repo_path, db_path, &store, instance_id, repo_url, "local");
+            return full_index_fallback(
+                repo_path,
+                db_path,
+                &store,
+                instance_id,
+                repo_url,
+                "local",
+                name,
+            );
         }
     };
 
@@ -788,6 +822,7 @@ pub fn incremental_index(
                 instance_id,
                 repo_url,
                 &new_sha,
+                name,
             );
         }
         Some(r) => r.indexed_sha,
@@ -803,7 +838,15 @@ pub fn incremental_index(
         // Delete all existing repo data before full re-index.
         delete_repo_all_data(&store, &r_uid)
             .with_context(|| "delete_repo_all_data before full re-index")?;
-        return full_index_fallback(repo_path, db_path, &store, instance_id, repo_url, &new_sha);
+        return full_index_fallback(
+            repo_path,
+            db_path,
+            &store,
+            instance_id,
+            repo_url,
+            &new_sha,
+            name,
+        );
     }
 
     // 4. Nothing changed.
@@ -1087,6 +1130,7 @@ fn full_index_fallback(
     instance_id: &str,
     repo_url: &str,
     new_sha: &str,
+    name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // Load filemeta sidecar for tiered change detection even in fallback.
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
@@ -1102,6 +1146,7 @@ fn full_index_fallback(
         new_sha,
         Some(&filemeta_cache),
         Some(&mut new_filemeta),
+        name,
     )?;
 
     // Persist the updated filemeta sidecar.

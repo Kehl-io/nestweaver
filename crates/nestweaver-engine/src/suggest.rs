@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::config::LinkConfig;
 use crate::cross_domain::STOPLIST;
 use crate::manifest::ManifestInfo;
-use crate::pull::repo_name_from_url;
+use crate::repo_display_name;
 
 /// Confidence level of a suggested cross-repo link.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -254,7 +254,7 @@ pub fn suggest_links(
 
     let mut uid_to_name: HashMap<String, String> = HashMap::new();
     for repo in &repos {
-        let display_name = repo_name_from_url(&repo.url);
+        let display_name = repo_display_name(repo);
         uid_to_name.insert(repo.uid.clone(), display_name);
     }
 
@@ -635,7 +635,7 @@ pub fn materialize_declared_links(
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
     let name_to_uid: HashMap<String, String> = all_repos
         .iter()
-        .map(|r| (repo_name_from_url(&r.url), r.uid.clone()))
+        .map(|r| (repo_display_name(r), r.uid.clone()))
         .collect();
 
     let mut total = 0usize;
@@ -717,6 +717,7 @@ mod tests {
             indexed_sha: "abc".to_string(),
             staleness_commits_behind: 0,
             instance_id: "test".to_string(),
+            name: None,
         }
     }
 
