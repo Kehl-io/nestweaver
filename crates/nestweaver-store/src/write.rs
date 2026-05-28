@@ -1193,14 +1193,35 @@ impl GraphStore {
     }
 
     /// Upsert a Project node. DETACH DELETEs any existing node with the
-    /// same UID (removing all incident edges) then re-creates it.
+    /// same UID **and** any existing node with the same name
+    /// (case-insensitive), then re-creates it. The name-based cleanup
+    /// prevents duplicate Project nodes when `instance_id` changes
+    /// between materializer runs (which changes the UID).
     pub fn upsert_project(&self, project: &Project) -> Result<(), StoreError> {
         let conn = self.conn()?;
+
+        // Delete by exact UID (fast path — covers the common case).
         exec_params(
             &conn,
             "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
             vec![("uid", lbug::Value::String(project.uid.clone()))],
         )?;
+
+        // Also delete any project with the same name regardless of UID.
+        // LadybugDB has no toLower(), so we list all projects and delete
+        // matches by UID in a second pass.
+        let all = self.list_projects()?;
+        let needle = project.name.to_lowercase();
+        for existing in &all {
+            if existing.uid != project.uid && existing.name.to_lowercase() == needle {
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+                    vec![("uid", lbug::Value::String(existing.uid.clone()))],
+                )?;
+            }
+        }
+
         self.insert_project(project)
     }
 

@@ -626,8 +626,11 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
 }
 
 fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // ~ "title  [kind]  location" / 4 — matches the CLI's estimate.
-    (n.title.len() + n.kind.len() + n.location.len() + 16).div_ceil(4)
+    // Estimate the token cost of the JSON serialization of each connected
+    // item: {"uid":"...","kind":"...","title":"...","location":"...","relevance":0.1234}
+    // JSON overhead: keys, quotes, braces, colons, commas ≈ 60 chars.
+    let json_chars = n.uid.len() + n.kind.len() + n.title.len() + n.location.len() + 60;
+    json_chars.div_ceil(4)
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
