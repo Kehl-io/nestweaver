@@ -16,6 +16,10 @@ pub struct GraphStore {
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
     pub(crate) pagerank_generation: AtomicU64,
+    /// Optional interaction memory scores keyed by node UID. When loaded,
+    /// PPR's personalization vector blends a small fraction of these scores
+    /// to boost nodes the user has frequently accessed.
+    pub(crate) interaction_cache: Mutex<Option<HashMap<String, f64>>>,
 }
 
 impl GraphStore {
@@ -26,6 +30,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
@@ -40,6 +45,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
@@ -54,6 +60,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            interaction_cache: Mutex::new(None),
         })
     }
 
@@ -91,6 +98,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
@@ -108,6 +116,18 @@ impl GraphStore {
     /// consulted them.
     pub fn is_pagerank_stale(&self, observed: u64) -> bool {
         observed < self.pagerank_generation()
+    }
+
+    /// Load pre-computed interaction memory scores into the in-memory cache.
+    /// When present, PPR's personalization vector blends a small fraction of
+    /// these scores to boost nodes the user has frequently accessed.
+    pub fn load_interaction_cache(&self, scores: HashMap<String, f64>) {
+        *self.interaction_cache.lock().unwrap() = Some(scores);
+    }
+
+    /// Clear the interaction memory cache (disables the PPR bias).
+    pub fn clear_interaction_cache(&self) {
+        *self.interaction_cache.lock().unwrap() = None;
     }
 
     /// Internal: bump the generation counter. Called by `compute_pagerank`

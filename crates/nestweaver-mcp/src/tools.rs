@@ -2975,6 +2975,7 @@ thread_local! {
     static LITE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
+    static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
@@ -2995,6 +2996,14 @@ pub fn set_allowed_tools(names: Vec<String>) {
 
 pub fn is_lite_mode() -> bool {
     LITE_MODE.with(|c| c.get())
+}
+
+pub fn set_track_interactions(track: bool) {
+    TRACK_INTERACTIONS.with(|c| c.set(track));
+}
+
+pub fn is_track_interactions() -> bool {
+    TRACK_INTERACTIONS.with(|c| c.get())
 }
 
 fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {

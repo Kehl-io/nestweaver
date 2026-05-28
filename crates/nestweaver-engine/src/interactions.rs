@@ -256,6 +256,11 @@ impl InteractionTracker {
         Ok(())
     }
 
+    /// Return the number of events buffered but not yet flushed.
+    pub fn pending_count(&self) -> usize {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Push an event into the buffer and auto-flush when the threshold is
     /// reached.
     fn push_event(&self, event: InteractionEvent) {
@@ -380,6 +385,65 @@ fn load_interaction_store(db_path: &Path) -> Option<InteractionStore> {
     let path = interaction_sidecar_path(db_path);
     let text = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Convenience view of the interaction sidecar used by the CLI
+/// `interactions status` subcommand.  Combines the raw event log with
+/// pre-computed per-node scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractionData {
+    /// Total recorded events (across all nodes).
+    pub event_count: usize,
+    /// Pre-computed scores keyed by node UID.
+    pub scores: HashMap<String, f64>,
+    /// Timestamp of the oldest event (seconds since epoch), if any.
+    pub oldest_timestamp: Option<f64>,
+    /// Timestamp of the newest event (seconds since epoch), if any.
+    pub newest_timestamp: Option<f64>,
+}
+
+/// Load the full interaction data from the sidecar.
+///
+/// Returns `None` if the file does not exist or cannot be parsed.
+pub fn load_interaction_data(db_path: &Path) -> Option<InteractionData> {
+    let store = load_interaction_store(db_path)?;
+    let scores: HashMap<String, f64> = store
+        .node_scores
+        .iter()
+        .map(|(k, v)| (k.clone(), v.computed_score))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    let event_count: usize = store
+        .node_scores
+        .values()
+        .map(|ns| (ns.access_count + ns.query_seed_count + ns.result_used_count) as usize)
+        .sum();
+    // Approximate oldest/newest from last_accessed timestamps.
+    let oldest_timestamp = store
+        .node_scores
+        .values()
+        .map(|ns| ns.last_accessed)
+        .filter(|t| *t > 0.0)
+        .reduce(f64::min);
+    let newest_timestamp = store
+        .node_scores
+        .values()
+        .map(|ns| ns.last_accessed)
+        .filter(|t| *t > 0.0)
+        .reduce(f64::max);
+    Some(InteractionData {
+        event_count,
+        scores,
+        oldest_timestamp,
+        newest_timestamp,
+    })
+}
+
+/// Delete the interaction sidecar file. Returns `true` if a file was
+/// removed.
+pub fn clear_interaction_sidecar(db_path: &Path) -> bool {
+    let path = interaction_sidecar_path(db_path);
+    std::fs::remove_file(&path).is_ok()
 }
 
 /// Load pre-computed interaction scores (UID -> score) for use in
