@@ -160,7 +160,9 @@ impl TantivyIndex {
             .writer
             .as_ref()
             .ok_or(TantivyError::WriterUnavailable)?;
-        let mut writer = writer_mutex.lock().unwrap();
+        let mut writer = writer_mutex
+            .lock()
+            .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
         writer.delete_all_documents()?;
         let count = self.write_full_corpus(&mut writer, store)?;
         writer.commit()?;
@@ -193,7 +195,9 @@ impl TantivyIndex {
             .writer
             .as_ref()
             .ok_or(TantivyError::WriterUnavailable)?;
-        let mut writer = writer_mutex.lock().unwrap();
+        let mut writer = writer_mutex
+            .lock()
+            .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
         // Remove all docs with this note_uid first.
         writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
         // Add fresh.
@@ -245,7 +249,9 @@ impl TantivyIndex {
             .writer
             .as_ref()
             .ok_or(TantivyError::WriterUnavailable)?;
-        let mut writer = writer_mutex.lock().unwrap();
+        let mut writer = writer_mutex
+            .lock()
+            .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
         writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
         writer.commit()?;
         self.reader.reload()?;

@@ -107,6 +107,10 @@ fn detect_js_ts(
     //
     // Functions in /hooks/ directories whose name starts with `use` are React
     // custom hooks and serve as public API for state/side-effect logic.
+    //
+    // NOTE: EventListener is overloaded here to represent React hooks and
+    // components until a dedicated variant (e.g., ReactHook, UiComponent)
+    // is added to EntryPointKind.
     if matches!(kind, "function")
         && file_path.contains("/hooks/")
         && name.starts_with("use")
@@ -133,6 +137,9 @@ fn detect_js_ts(
     // Exported functions and classes in /contexts/ or /providers/ directories
     // are React Context providers/consumers and serve as dependency injection
     // entry points.
+    //
+    // NOTE: EventListener is overloaded here for React contexts/providers
+    // (see hooks note above).
     if matches!(kind, "function" | "class" | "constant")
         && (file_path.contains("/contexts/") || file_path.contains("/providers/"))
         && !name.starts_with('_')
@@ -215,6 +222,9 @@ fn detect_js_ts(
     // Uppercase-starting functions/classes in component directories are React
     // components and serve as UI entry points. This catches default and named
     // component exports.
+    //
+    // NOTE: EventListener is overloaded here for React components (see hooks
+    // note above).
     if matches!(kind, "function" | "class")
         && name.starts_with(|c: char| c.is_uppercase())
         && file_path.contains("/components/")

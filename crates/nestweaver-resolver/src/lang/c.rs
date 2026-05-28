@@ -1,6 +1,12 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let specifier = specifier.trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
 
     let base_dir = parent_dir(from_file);
@@ -32,16 +38,20 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_relative_include() {
-        let known = ["src/sensor.h", "src/main.c"];
+        let known = set(&["src/sensor.h", "src/main.c"]);
         let result = resolve_import("src/main.c", "\"sensor.h\"", &known);
         assert_eq!(result, Some("src/sensor.h".to_string()));
     }
 
     #[test]
     fn skips_system_include() {
-        let known = ["src/main.c"];
+        let known = set(&["src/main.c"]);
         let result = resolve_import("src/main.c", "<stdio.h>", &known);
         assert_eq!(result, None);
     }

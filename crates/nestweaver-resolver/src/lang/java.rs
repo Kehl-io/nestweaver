@@ -1,10 +1,16 @@
+use std::collections::HashSet;
+
 /// Resolve a Java import specifier to a file path.
 ///
 /// Converts a dotted import like `com.example.Foo` → `com/example/Foo.java`
 /// and matches against known file paths.
 ///
 /// Wildcard imports like `com.example.*` are explicitly skipped (return `None`).
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let _ = from_file; // Java imports are absolute, from_file not needed
 
     // Skip wildcard imports — cannot resolve to a single file
@@ -29,12 +35,16 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn java_resolves_package_import() {
-        let known = [
+        let known = set(&[
             "src/main/java/com/example/Foo.java",
             "src/main/java/com/example/Bar.java",
-        ];
+        ]);
         let result = resolve_import(
             "src/main/java/com/example/Main.java",
             "com.example.Foo",
@@ -48,24 +58,24 @@ mod tests {
 
     #[test]
     fn java_resolves_root_level_import() {
-        let known = ["com/example/Foo.java"];
+        let known = set(&["com/example/Foo.java"]);
         let result = resolve_import("com/example/Main.java", "com.example.Foo", &known);
         assert_eq!(result, Some("com/example/Foo.java".to_string()));
     }
 
     #[test]
     fn java_unknown_import_returns_none() {
-        let known = ["com/example/Bar.java"];
+        let known = set(&["com/example/Bar.java"]);
         let result = resolve_import("com/example/Main.java", "com.example.Missing", &known);
         assert_eq!(result, None);
     }
 
     #[test]
     fn java_wildcard_import_returns_none() {
-        let known = [
+        let known = set(&[
             "src/main/java/com/example/Foo.java",
             "src/main/java/com/example/Bar.java",
-        ];
+        ]);
         let result = resolve_import("com/example/Main.java", "com.example.*", &known);
         assert_eq!(result, None);
     }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nestweaver_parser::{RawReference, RawSymbol, ReferenceKind};
 use nestweaver_schema::{Language, Visibility};
@@ -82,7 +82,7 @@ pub fn build_import_graph(
     language: Language,
     workspace_ctx: &WorkspaceContext,
 ) -> ImportGraph {
-    let known_files: Vec<&str> = files.iter().map(|(path, _, _)| path.as_str()).collect();
+    let known_files: HashSet<&str> = files.iter().map(|(path, _, _)| path.as_str()).collect();
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -125,7 +125,7 @@ pub fn build_import_graph(
 fn resolve_specifier(
     from_file: &str,
     specifier: &str,
-    known_files: &[&str],
+    known_files: &HashSet<&str>,
     language: Language,
     workspace_ctx: &WorkspaceContext,
 ) -> Option<String> {
