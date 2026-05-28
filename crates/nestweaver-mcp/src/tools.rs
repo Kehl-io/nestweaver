@@ -2223,13 +2223,13 @@ fn tool_project_context(
         });
 
     // 1. Resolve the project: name/alias/UID.
-    let project = if let Some(uid) = project_str.strip_prefix("proj:") {
-        // Direct UID — list all projects and find by uid.
+    let project = if project_str.starts_with("proj:") {
+        // Direct UID — list all projects and find by uid or substring.
         let all = store
             .list_projects()
             .map_err(|e| anyhow!("list_projects: {e}"))?;
         all.into_iter()
-            .find(|p| p.uid == uid || p.uid == project_str)
+            .find(|p| p.uid == project_str || p.uid.contains(project_str))
             .ok_or_else(|| anyhow!("project UID '{}' not found", project_str))?
     } else {
         // Try name match first.
