@@ -626,11 +626,8 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
 }
 
 fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // Estimate the token cost of the JSON serialization of each connected
-    // item: {"uid":"...","kind":"...","title":"...","location":"...","relevance":0.1234}
-    // JSON overhead: keys, quotes, braces, colons, commas ≈ 60 chars.
-    let json_chars = n.uid.len() + n.kind.len() + n.title.len() + n.location.len() + 60;
-    json_chars.div_ceil(4)
+    // ~ "title  [kind]  location" / 4 — matches the CLI's estimate.
+    (n.title.len() + n.kind.len() + n.location.len() + 16).div_ceil(4)
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
@@ -1223,7 +1220,15 @@ fn tool_brain_status(
     let wikilinks = store.count_wikilink_edges().unwrap_or(0);
     let repos = store.list_repos(None).unwrap_or_default();
 
-    let db_path = current_db_path(store).ok();
+    let db_path = match current_db_path(store) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(
+                "brain_status: db_path unavailable ({e}), extension store lookups will be skipped"
+            );
+            None
+        }
+    };
 
     let vaults_json: Vec<Value> = vaults
         .iter()
@@ -1232,16 +1237,23 @@ fn tool_brain_status(
             let note_count = notes.len();
             // Prefer the extension-store timestamp (actual indexer run);
             // fall back to max(note.modified_at) for older databases.
-            let last_indexed = db_path
+            let ext_ts = db_path
                 .as_deref()
-                .and_then(|p| get_last_indexed_at(p, &v.uid))
-                .or_else(|| {
-                    notes
-                        .iter()
-                        .filter_map(|n| n.modified_at.as_deref())
-                        .max()
-                        .map(|s| s.to_string())
-                });
+                .and_then(|p| get_last_indexed_at(p, &v.uid));
+            if ext_ts.is_none() {
+                tracing::debug!(
+                    vault_uid = %v.uid,
+                    db_path = ?db_path,
+                    "no extension-store timestamp; falling back to max(modified_at)"
+                );
+            }
+            let last_indexed = ext_ts.or_else(|| {
+                notes
+                    .iter()
+                    .filter_map(|n| n.modified_at.as_deref())
+                    .max()
+                    .map(|s| s.to_string())
+            });
             json!({
                 "name": v.name,
                 "root_path": v.root_path,
@@ -1780,8 +1792,8 @@ fn tool_schema_clusters() -> Value {
             "properties": {
                 "resolution": {
                     "type": "number",
-                    "description": "Leiden resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 1.0. Try 0.5 for broad layers or 2.0 for fine-grained modules.",
-                    "default": 1.0
+                    "description": "Leiden resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
+                    "default": 0.5
                 }
             }
         }
@@ -1789,10 +1801,11 @@ fn tool_schema_clusters() -> Value {
 }
 
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let resolution = args
-        .get("resolution")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0);
+    let user_resolution = args.get("resolution").and_then(|v| v.as_f64());
+    let resolution = user_resolution.unwrap_or_else(|| {
+        let sym_count = store.count_symbols().unwrap_or(0);
+        if sym_count > 10_000 { 0.3 } else { 0.5 }
+    });
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
@@ -2890,13 +2903,23 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 
     // Try loading cached summaries from the sidecar first; only use the
     // cache when it contains entries at the requested level.
-    let db_path = current_db_path(store).ok();
+    let db_path = match current_db_path(store) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("get_summary: db_path unavailable ({e}), sidecar cache disabled");
+            None
+        }
+    };
     let (summaries, from_cache) = if let Some(ref db) = db_path
         && let Ok(Some(cached)) = load_summaries(db)
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
         if level_filtered.is_empty() {
+            tracing::debug!(
+                level = level_str,
+                "sidecar has summaries but none at requested level; regenerating"
+            );
             let fresh = generate_summaries(store, level)?;
             (fresh, false)
         } else {
