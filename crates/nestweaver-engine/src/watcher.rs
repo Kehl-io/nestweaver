@@ -468,13 +468,18 @@ impl BrainWatcher {
                 .iter()
                 .map(|h| (heading_uid(&n_uid, &h.slug, h.start_line), h.text.clone()))
                 .collect();
-            let section_docs: Vec<(String, String)> = parsed
+            let section_docs: Vec<(String, String, String)> = parsed
                 .sections
                 .iter()
                 .map(|s| {
                     let th = sha256_full(&s.text);
                     let s_uid = section_uid(&n_uid, s.start_line, &th[..12]);
-                    (s_uid, s.text.clone())
+                    let heading_title = s
+                        .heading_idx
+                        .and_then(|i| parsed.headings.get(i))
+                        .map(|h| h.text.clone())
+                        .unwrap_or_default();
+                    (s_uid, s.text.clone(), heading_title)
                 })
                 .collect();
             let body_chunks: Vec<String> = parsed.sections.iter().map(|s| s.text.clone()).collect();
