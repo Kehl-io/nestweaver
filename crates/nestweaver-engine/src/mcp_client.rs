@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Timeout for MCP tool calls (seconds). Wiki fetches can be slow
+/// (TLS negotiation, large pages, network latency).
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of a single MCP `tools/call` invocation.
 pub struct ToolCallResult {
@@ -108,18 +113,38 @@ impl McpClient {
     }
 
     fn recv(&mut self) -> Result<serde_json::Value, anyhow::Error> {
+        let timeout = TOOL_CALL_TIMEOUT;
+        // Read lines in a loop, skipping notifications. The BufReader
+        // blocks on read_line, so we can't check a deadline mid-read.
+        // Instead, we rely on the child process having a finite response
+        // time and detect EOF (server crash) immediately.
+        let deadline = Instant::now() + timeout;
         loop {
+            // Check deadline between lines (catches servers that send
+            // many notifications but never a response).
+            if Instant::now() > deadline {
+                // Kill the server to unblock any pending read on the next call.
+                let _ = self.child.kill();
+                anyhow::bail!(
+                    "MCP server did not respond within {}s — the server may be hanging or the network request timed out",
+                    timeout.as_secs()
+                );
+            }
+
             let mut line = String::new();
-            self.reader.read_line(&mut line)?;
+            let bytes_read = self.reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                anyhow::bail!(
+                    "MCP server closed its stdout unexpectedly (EOF) — the server may have crashed"
+                );
+            }
             if line.trim().is_empty() {
                 continue;
             }
             let value: serde_json::Value = serde_json::from_str(&line)?;
-            // Skip notifications (no "id" field)
             if value.get("id").is_some() {
                 return Ok(value);
             }
-            // Notification — log and skip
             tracing::trace!("MCP notification: {}", line.trim());
         }
     }
