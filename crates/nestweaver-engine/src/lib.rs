@@ -86,7 +86,7 @@ pub use cross_domain::{
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
-    detect_dead_code_with_confidence,
+    detect_dead_code_with_confidence, detect_dead_code_with_manifests,
 };
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use extensions::{

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct ManifestInfo {
     pub package_name: Option<String>,
     pub dependencies: Vec<String>,
+    /// File paths referenced by `main`, `bin`, and `exports` in package.json.
+    /// These are entry points for the package and their symbols should not be
+    /// flagged as dead code.
+    #[serde(default)]
+    pub entry_files: Vec<String>,
 }
 
 /// Parse the manifest file(s) found in `repo_path` and return extracted
@@ -89,10 +94,48 @@ fn parse_package_json(repo_path: &Path) -> Option<ManifestInfo> {
         }
     }
 
+    // Extract entry files from main, bin, and exports fields.
+    let mut entry_files = Vec::new();
+    if let Some(main) = json.get("main").and_then(|v| v.as_str()) {
+        entry_files.push(main.to_string());
+    }
+    if let Some(bin) = json.get("bin") {
+        match bin {
+            serde_json::Value::String(s) => entry_files.push(s.clone()),
+            serde_json::Value::Object(obj) => {
+                for v in obj.values() {
+                    if let Some(s) = v.as_str() {
+                        entry_files.push(s.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(exports) = json.get("exports") {
+        collect_export_paths(exports, &mut entry_files);
+    }
+
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files,
     })
+}
+
+/// Recursively collect string values from the `exports` field of package.json.
+/// The `exports` field can be a string, an object with condition keys mapping
+/// to strings or nested objects, or an object with subpath keys.
+fn collect_export_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Object(obj) => {
+            for v in obj.values() {
+                collect_export_paths(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_go_mod(repo_path: &Path) -> Option<ManifestInfo> {
@@ -127,6 +170,7 @@ fn parse_go_mod(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -147,6 +191,7 @@ fn parse_cargo_toml(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -178,6 +223,7 @@ fn parse_pyproject_toml(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -206,6 +252,7 @@ fn parse_requirements_txt(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name: None,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -230,6 +277,7 @@ fn parse_composer_json(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -261,6 +309,7 @@ fn parse_gemfile(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name: None,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -288,6 +337,7 @@ fn parse_pubspec_yaml(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -333,6 +383,7 @@ fn parse_package_swift(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -388,6 +439,7 @@ fn parse_csproj(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name: None,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -426,6 +478,7 @@ fn parse_build_gradle_kts(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name: None,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -455,6 +508,7 @@ fn parse_cmake(repo_path: &Path) -> Option<ManifestInfo> {
     Some(ManifestInfo {
         package_name,
         dependencies: deps,
+        entry_files: vec![],
     })
 }
 
@@ -578,6 +632,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             ManifestInfo {
                 package_name: Some("my-pkg".to_string()),
                 dependencies: vec!["dep-a".to_string()],
+                entry_files: vec![],
             },
         );
         save_manifest_cache(&cache, &cache_path).unwrap();
@@ -691,5 +746,72 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         assert_eq!(info.package_name.as_deref(), Some("MyApp"));
         assert!(info.dependencies.contains(&"Boost".to_string()));
         assert!(info.dependencies.contains(&"OpenSSL".to_string()));
+    }
+
+    #[test]
+    fn parse_package_json_extracts_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "my-lib",
+                "main": "./dist/index.js",
+                "bin": {
+                    "cli": "./bin/cli.js"
+                },
+                "exports": {
+                    ".": {
+                        "import": "./dist/esm/index.js",
+                        "require": "./dist/cjs/index.js"
+                    },
+                    "./utils": "./dist/utils.js"
+                },
+                "dependencies": {}
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(dir.path());
+        assert!(info.entry_files.contains(&"./dist/index.js".to_string()));
+        assert!(info.entry_files.contains(&"./bin/cli.js".to_string()));
+        assert!(
+            info.entry_files
+                .contains(&"./dist/esm/index.js".to_string())
+        );
+        assert!(
+            info.entry_files
+                .contains(&"./dist/cjs/index.js".to_string())
+        );
+        assert!(info.entry_files.contains(&"./dist/utils.js".to_string()));
+    }
+
+    #[test]
+    fn parse_package_json_bin_as_string() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "my-cli",
+                "bin": "./bin/main.js",
+                "dependencies": {}
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(dir.path());
+        assert!(info.entry_files.contains(&"./bin/main.js".to_string()));
+    }
+
+    #[test]
+    fn parse_package_json_no_entry_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "simple-pkg",
+                "dependencies": { "lodash": "^4.0.0" }
+            }"#,
+        )
+        .unwrap();
+        let info = parse_manifest(dir.path());
+        assert!(info.entry_files.is_empty());
     }
 }
