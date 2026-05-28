@@ -3017,6 +3017,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            if tantivy.is_none() {
+                tracing::info!("Tantivy index unavailable — BM25 search disabled for this query");
+            }
 
             // Resolve the project: name -> alias -> UID substring.
             let project = if name.starts_with("proj:") {
@@ -4659,8 +4662,8 @@ fn apply_recency_bias_cli(
 /// Rough token cost of rendering a single BrainNode line (chars / 4).
 /// Aligned with the MCP render_cost to avoid CLI vs MCP divergence.
 fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
-    // Include UID length + JSON overhead (keys, quotes, braces, commas)
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 60).div_ceil(4)
+    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
+    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
 }
 
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {

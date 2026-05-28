@@ -626,8 +626,8 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
 }
 
 fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // Include UID length + JSON overhead (keys, quotes, braces, commas)
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 60).div_ceil(4)
+    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
+    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
@@ -2492,7 +2492,7 @@ fn tool_project_context(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let connected_json: Vec<Value> = result
+    let mut connected_json: Vec<Value> = result
         .connected
         .iter()
         .take(cut)
@@ -2512,6 +2512,62 @@ fn tool_project_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let seeds_json: Option<Vec<Value>> = if include_seeds {
+        Some(
+            result
+                .seeds
+                .iter()
+                .map(|n| {
+                    json!({
+                        "uid": n.uid,
+                        "kind": n.kind,
+                        "title": n.title,
+                        "location": n.location,
+                        "relevance": n.relevance,
+                    })
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    // Final budget enforcement: measure actual serialized size including
+    // response wrapper metadata (project, project_uid, seeds_expanded,
+    // token_budget, tokens_used, external_refs) which the per-node
+    // render_cost does not account for.
+    {
+        let mut probe = json!({
+            "project": project.name,
+            "project_uid": project.uid,
+            "seeds_expanded": result.seeds.len(),
+            "connected": connected_json,
+            "tokens_used": used_tokens,
+            "token_budget": token_budget,
+        });
+        if let Some(ref sj) = seeds_json {
+            probe["seeds"] = json!(sj);
+        }
+        if !result.unresolved_seeds.is_empty() {
+            probe["unresolved_seeds"] = json!(result.unresolved_seeds);
+        }
+        if !external_refs.is_null() {
+            probe["external_refs"] = external_refs.clone();
+        }
+        let serialized = serde_json::to_string(&probe)?;
+        let actual_tokens = serialized.len().div_ceil(4);
+        if actual_tokens > token_budget {
+            while connected_json.len() > 1 {
+                connected_json.pop();
+                probe["connected"] = json!(connected_json);
+                let check = serde_json::to_string(&probe)?;
+                if check.len().div_ceil(4) <= token_budget {
+                    break;
+                }
+            }
+        }
+    }
+
     let mut resp = json!({
         "project": project.name,
         "project_uid": project.uid,
@@ -2521,21 +2577,8 @@ fn tool_project_context(
         "token_budget": token_budget,
     });
 
-    if include_seeds {
-        let seeds_json: Vec<Value> = result
-            .seeds
-            .iter()
-            .map(|n| {
-                json!({
-                    "uid": n.uid,
-                    "kind": n.kind,
-                    "title": n.title,
-                    "location": n.location,
-                    "relevance": n.relevance,
-                })
-            })
-            .collect();
-        resp["seeds"] = json!(seeds_json);
+    if let Some(sj) = seeds_json {
+        resp["seeds"] = json!(sj);
     }
 
     if !result.unresolved_seeds.is_empty() {
