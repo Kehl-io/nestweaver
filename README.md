@@ -76,6 +76,16 @@ One-command setup for Claude Code, Cursor, Codex, Gemini CLI, Copilot CLI, Aider
 
 </td>
 </tr>
+<tr>
+<td width="50%" valign="top">
+
+**Agent Interaction Memory**<br>
+Opt-in usage tracking that learns from agent query patterns to improve PPR ranking over time. Privacy-first: local-only, records UIDs and timestamps only, no content capture. Enable with `--track-interactions`.
+
+</td>
+<td width="50%" valign="top">
+</td>
+</tr>
 </table>
 
 ## Quick Start

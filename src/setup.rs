@@ -773,7 +773,9 @@ Do NOT activate when:
 
 | Tool | Purpose |
 |------|---------|
-| `brain_status` | Counts of vaults, notes, symbols, repos. |
+| `brain_status` | Counts of vaults, notes, symbols, repos. Includes interaction tracking status when enabled. |
+| `interactions_status` | Show interaction memory stats (query count, top accessed symbols, memory age). Requires `--track-interactions`. |
+| `interactions_clear` | Wipe all interaction memory data. Requires `--track-interactions`. |
 | `stale_check` | Compare indexed SHA to current git HEAD. |
 | `brain_diff` | Files and symbols changed since a given SHA. |
 | `brain_guide` | Auto-generated architecture overview. |
@@ -845,7 +847,7 @@ fn generate_copilot_instructions() -> String {
     - **cross_repo_contracts** — Symbols shared across repositories\n\
     - **clusters** — Functional communities (Leiden algorithm)\n\n\
     ### Status and maintenance\n\
-    - **brain_status** — Vault, note, symbol, and repo counts\n\
+    - **brain_status** — Vault, note, symbol, and repo counts (includes interaction tracking status when enabled)\n\
     - **stale_check** — Compare indexed SHA to current git HEAD\n\
     - **brain_diff** — Files and symbols changed since a given SHA\n\
     - **brain_guide** — Auto-generated architecture overview\n\
@@ -857,7 +859,12 @@ fn generate_copilot_instructions() -> String {
     - Before modifying code: call `brain_impact` on the function\n\
     - Exploring unfamiliar code: call `brain_search`\n\
     - Finding dead code: call `dead_code` for unreachable symbols\n\
-    - Architecture overview: call `hub_nodes`, `clusters`, and `get_summary`\n"
+    - Architecture overview: call `hub_nodes`, `clusters`, and `get_summary`\n\n\
+    ## Interaction Memory\n\n\
+    When the MCP server is started with `--track-interactions`, NestWeaver learns from agent \
+    query patterns to improve retrieval ranking over time. Opt-in, local-only, records UIDs \
+    and timestamps only — no content is captured. Use `interactions status` to view memory stats \
+    and `interactions clear` to wipe interaction data.\n"
         .to_string()
 }
 
@@ -876,6 +883,8 @@ fn generate_agents_md_content() -> String {
 | project_context | Project-scoped retrieval |\n\
 | detect_changes | Risk assessment for changes |\n\
 | brain_status | Index status and staleness |\n\
+| interactions status | Show interaction memory stats |\n\
+| interactions clear | Wipe interaction memory data |\n\
 | stale_check | Check if re-indexing is needed |\n\
 | flow_trace | Execution flow tracing |\n\
 | note_get | Retrieve vault notes |\n\
