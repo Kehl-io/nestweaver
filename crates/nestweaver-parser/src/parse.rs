@@ -281,8 +281,20 @@ fn build_ts_language(lang: Language, path: &Path) -> tree_sitter::Language {
     }
 }
 
-fn query_source(lang: Language) -> &'static str {
-    match lang {
+/// JSX query patterns appended to JS/TS queries for files that use JSX syntax.
+const JSX_QUERY_SUFFIX: &str = r#"
+
+; JSX opening element — component reference
+(jsx_opening_element
+  name: (identifier) @name) @reference.call
+
+; JSX self-closing element — component reference
+(jsx_self_closing_element
+  name: (identifier) @name) @reference.call
+"#;
+
+fn query_source(lang: Language, path: &Path) -> std::borrow::Cow<'static, str> {
+    let base = match lang {
         Language::JavaScript => JS_QUERY,
         Language::TypeScript => TS_QUERY,
         Language::Java => JAVA_QUERY,
@@ -317,6 +329,17 @@ fn query_source(lang: Language) -> &'static str {
         | Language::SystemVerilog => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
+    };
+
+    // Append JSX patterns for .tsx and .jsx files whose grammars support JSX nodes.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "tsx" || ext == "jsx" {
+        let mut combined = String::with_capacity(base.len() + JSX_QUERY_SUFFIX.len());
+        combined.push_str(base);
+        combined.push_str(JSX_QUERY_SUFFIX);
+        std::borrow::Cow::Owned(combined)
+    } else {
+        std::borrow::Cow::Borrowed(base)
     }
 }
 
@@ -501,7 +524,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let tree = parser.parse(source, None).ok_or(ParseError::ParseFailed)?;
 
-    let query = Query::new(&ts_lang, query_source(lang))?;
+    let query_src = query_source(lang, path);
+    let query = Query::new(&ts_lang, &query_src)?;
     let capture_names: Vec<String> = query
         .capture_names()
         .iter()
@@ -657,6 +681,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let name = name_text
                     .clone()
                     .unwrap_or_else(|| strip_quotes(&node_text));
+
+                // Filter out HTML elements from JSX patterns: lowercase
+                // identifiers in jsx_opening_element / jsx_self_closing_element
+                // are native HTML tags (div, span, etc.), not component references.
+                let node_kind = node.kind();
+                if (node_kind == "jsx_opening_element" || node_kind == "jsx_self_closing_element")
+                    && name.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    continue;
+                }
 
                 references.push(RawReference {
                     name,
@@ -3489,6 +3523,112 @@ mod tests {
                 .iter()
                 .map(|r| (&r.name, r.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── JSX/TSX tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tsx_extracts_jsx_component_references() {
+        let source = fixture("tsx/simple.tsx");
+        let parsed = parse_source(Path::new("simple.tsx"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+
+        // Should find component references: Header, Sidebar, UserProfile, App
+        assert!(
+            calls.iter().any(|r| r.name == "Header"),
+            "should find JSX reference to 'Header'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            calls.iter().any(|r| r.name == "Sidebar"),
+            "should find JSX reference to 'Sidebar'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            calls.iter().any(|r| r.name == "UserProfile"),
+            "should find JSX reference to 'UserProfile'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            calls.iter().any(|r| r.name == "App"),
+            "should find JSX reference to 'App'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_tsx_filters_html_elements() {
+        let source = fixture("tsx/simple.tsx");
+        let parsed = parse_source(Path::new("simple.tsx"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+
+        // Should NOT find HTML elements: div, span
+        assert!(
+            !calls.iter().any(|r| r.name == "div"),
+            "should NOT find HTML element 'div' as component reference; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !calls.iter().any(|r| r.name == "span"),
+            "should NOT find HTML element 'span' as component reference; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_tsx_extracts_hook_call_references() {
+        let source = fixture("tsx/simple.tsx");
+        let parsed = parse_source(Path::new("simple.tsx"), &source).unwrap();
+
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .collect();
+
+        // useAuth() should be captured as a regular call reference
+        assert!(
+            calls.iter().any(|r| r.name == "useAuth"),
+            "should find hook call to 'useAuth'; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_tsx_extracts_symbols() {
+        let source = fixture("tsx/simple.tsx");
+        let parsed = parse_source(Path::new("simple.tsx"), &source).unwrap();
+
+        let functions: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "App"),
+            "should find function 'App'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "Dashboard"),
+            "should find function 'Dashboard'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            functions.iter().any(|s| s.name == "Header"),
+            "should find function 'Header'; got: {:?}",
+            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
