@@ -205,6 +205,14 @@ impl GraphStore {
         conn.query("CREATE REL TABLE IF NOT EXISTS CALLS(FROM Symbol TO Symbol, confidence FLOAT)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        conn.query("CREATE REL TABLE IF NOT EXISTS USES(FROM Symbol TO Symbol, confidence FLOAT)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS ACCESSES(FROM Symbol TO Symbol, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM Symbol TO Symbol, confidence FLOAT)",
         )
