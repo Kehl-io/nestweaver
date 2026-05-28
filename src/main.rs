@@ -2903,26 +2903,63 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::ListProjects {
-            json,
-            db,
-            config: _,
-        } => {
+        Commands::ListProjects { json, db, config } => {
             let store = open_store(db.as_deref())?;
-            let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+            let materialized = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+
+            // When --config is provided, also surface declared projects from
+            // [[projects]] that haven't been materialized into the store yet.
+            let declared_only: Vec<nestweaver_engine::ProjectConfig> =
+                if let Some(ref cfg_path) = config {
+                    let instance_config = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
+                    instance_config
+                        .projects
+                        .into_iter()
+                        .filter(|pc| !materialized.iter().any(|m| m.name == pc.name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
             if json {
-                println!("{}", serde_json::to_string_pretty(&projects)?);
-            } else if projects.is_empty() {
+                #[derive(serde::Serialize)]
+                struct ListProjectsJson<'a> {
+                    materialized: &'a [nestweaver_schema::Project],
+                    #[serde(
+                        skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty"
+                    )]
+                    declared: &'a [nestweaver_engine::ProjectConfig],
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ListProjectsJson {
+                        materialized: &materialized,
+                        declared: &declared_only,
+                    })?
+                );
+            } else if materialized.is_empty() && declared_only.is_empty() {
                 println!(
                     "No projects found. Use an instance config with [[projects]] to define them."
                 );
             } else {
-                for p in &projects {
-                    println!("{}", p.name);
-                    println!("  UID:      {}", p.uid);
-                    println!("  Instance: {}", p.instance_id);
-                    if let Some(ref summary) = p.summary {
-                        println!("  Summary:  {summary}");
+                if !materialized.is_empty() {
+                    for p in &materialized {
+                        println!("{}", p.name);
+                        println!("  UID:      {}", p.uid);
+                        println!("  Instance: {}", p.instance_id);
+                        if let Some(ref summary) = p.summary {
+                            println!("  Summary:  {summary}");
+                        }
+                        println!();
+                    }
+                }
+                if !declared_only.is_empty() {
+                    println!("Declared in config (not yet materialized):");
+                    for pc in &declared_only {
+                        println!("  {}", pc.name);
+                        if let Some(ref desc) = pc.description {
+                            println!("    {desc}");
+                        }
                     }
                     println!();
                 }
