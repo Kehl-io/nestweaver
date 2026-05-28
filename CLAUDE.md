@@ -43,6 +43,7 @@ nestweaver brain add ~/Documents/Obsidian/MyVault
 nestweaver brain search "architecture"
 nestweaver brain context "MyProject"     # unified code + notes context
 nestweaver brain status                  # vault counts, per-vault staleness
+nestweaver brain watch ~/notes --refresh-wiki-hours 6 --config ./instance.toml  # periodic wiki refresh
 
 # Projects
 nestweaver list-projects --config ./nestweaver-instance.toml
