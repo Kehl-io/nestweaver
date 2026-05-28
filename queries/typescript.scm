@@ -88,3 +88,58 @@
 ; Implements clause
 (implements_clause
   (type_identifier) @name) @reference.implements
+
+; ── Type references (USES edges) ────────────────────────────────────
+; Parameter type annotation
+(required_parameter
+  type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Optional parameter type annotation
+(optional_parameter
+  type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Return type annotation on function declarations
+(function_declaration
+  return_type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Return type annotation on function signatures
+(function_signature
+  return_type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Return type annotation on method definitions
+(method_definition
+  return_type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Return type annotation on method signatures
+(method_signature
+  return_type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Return type annotation on arrow functions
+(arrow_function
+  return_type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Variable type annotation
+(variable_declarator
+  type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; Generic type argument
+(generic_type
+  (type_identifier) @name) @reference.type_ref
+
+; Property type annotation on public fields
+(public_field_definition
+  type: (type_annotation
+    (type_identifier) @name)) @reference.type_ref
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Property read: obj.field
+(member_expression
+  property: (property_identifier) @name) @reference.read_access

@@ -68,3 +68,8 @@
 ; JSX self-closing element — component reference
 (jsx_self_closing_element
   name: (identifier) @name) @reference.call
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Property read: obj.field
+(member_expression
+  property: (property_identifier) @name) @reference.read_access

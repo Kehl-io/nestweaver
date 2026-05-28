@@ -1003,6 +1003,8 @@ impl GraphStore {
             "IMPORTS",
             "EXTENDS_SYM",
             "IMPLEMENTS_SYM",
+            "USES",
+            "ACCESSES",
             "MEMBER_OF",
             "INCLUDES_SYM",
         ];
@@ -1042,6 +1044,8 @@ impl GraphStore {
             "IMPORTS",
             "EXTENDS_SYM",
             "IMPLEMENTS_SYM",
+            "USES",
+            "ACCESSES",
             "MEMBER_OF",
             "INCLUDES_SYM",
         ];

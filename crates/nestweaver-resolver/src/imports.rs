@@ -4,6 +4,7 @@ use nestweaver_parser::{RawReference, RawSymbol, ReferenceKind};
 use nestweaver_schema::{Language, Visibility};
 
 use crate::lang;
+use crate::workspace::WorkspaceContext;
 
 /// Tracks an aliased import binding (e.g., `import { X as Y }`).
 ///
@@ -79,6 +80,7 @@ impl ImportGraph {
 pub fn build_import_graph(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
+    workspace_ctx: &WorkspaceContext,
 ) -> ImportGraph {
     let known_files: Vec<&str> = files.iter().map(|(path, _, _)| path.as_str()).collect();
 
@@ -104,7 +106,8 @@ pub fn build_import_graph(
                 continue;
             }
             let specifier = &reference.name;
-            if let Some(resolved) = resolve_specifier(file_path, specifier, &known_files, language)
+            if let Some(resolved) =
+                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx)
             {
                 imports.push((specifier.clone(), resolved));
             }
@@ -124,10 +127,11 @@ fn resolve_specifier(
     specifier: &str,
     known_files: &[&str],
     language: Language,
+    workspace_ctx: &WorkspaceContext,
 ) -> Option<String> {
     match language {
         Language::JavaScript | Language::TypeScript => {
-            lang::javascript::resolve_import(from_file, specifier, known_files)
+            lang::javascript::resolve_import(from_file, specifier, known_files, workspace_ctx)
         }
         Language::Java => lang::java::resolve_import(from_file, specifier, known_files),
         Language::Go => lang::go_lang::resolve_import(from_file, specifier, known_files),
@@ -156,7 +160,7 @@ fn resolve_specifier(
         | Language::Pascal
         | Language::SystemVerilog => None,
         Language::Vue | Language::Svelte | Language::Astro => {
-            lang::javascript::resolve_import(from_file, specifier, known_files)
+            lang::javascript::resolve_import(from_file, specifier, known_files, workspace_ctx)
         }
     }
 }
@@ -205,7 +209,7 @@ mod tests {
             ),
         ];
 
-        let graph = build_import_graph(&files, Language::JavaScript);
+        let graph = build_import_graph(&files, Language::JavaScript, &WorkspaceContext::default());
         assert!(
             graph.resolves("src/main.js", "./helper", "src/helper.js"),
             "should resolve ./helper to src/helper.js"
@@ -227,7 +231,7 @@ mod tests {
             ),
         ];
 
-        let graph = build_import_graph(&files, Language::JavaScript);
+        let graph = build_import_graph(&files, Language::JavaScript, &WorkspaceContext::default());
         assert!(
             graph.resolves("src/main.js", "./utils", "src/utils/index.js"),
             "should resolve ./utils to src/utils/index.js"
@@ -242,7 +246,7 @@ mod tests {
             vec![],
         )];
 
-        let graph = build_import_graph(&files, Language::JavaScript);
+        let graph = build_import_graph(&files, Language::JavaScript, &WorkspaceContext::default());
         let exports = graph.exports_of("src/api.js");
         assert!(exports.contains(&"fetchUser".to_string()));
         assert!(exports.contains(&"createUser".to_string()));
@@ -285,7 +289,7 @@ mod tests {
             ),
         ];
 
-        let graph = build_import_graph(&files, Language::JavaScript);
+        let graph = build_import_graph(&files, Language::JavaScript, &WorkspaceContext::default());
         let imports = graph.imports_of("src/main.js");
         // lodash is unresolved (package import), helper.js should be resolved
         assert!(

@@ -54,3 +54,29 @@
 
 (annotation
   name: (identifier) @name) @reference.call
+
+; ── Type references (USES edges) ────────────────────────────────────
+; Method return type: public MyType foo()
+(method_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Parameter type: void foo(MyType x)
+(formal_parameter
+  type: (type_identifier) @name) @reference.type_ref
+
+; Field type: private MyType field;
+(field_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Local variable type: MyType x = ...
+(local_variable_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Generic type argument: List<MyType>
+(generic_type
+  (type_identifier) @name) @reference.type_ref
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Field access: obj.field
+(field_access
+  field: (identifier) @name) @reference.read_access

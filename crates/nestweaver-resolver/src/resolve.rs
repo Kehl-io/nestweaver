@@ -5,6 +5,7 @@ use nestweaver_schema::{
 
 use crate::imports::build_import_graph;
 use crate::util::parent_dir;
+use crate::workspace::WorkspaceContext;
 
 /// Resolve all references across files into `ResolvedEdge`s.
 ///
@@ -21,12 +22,26 @@ use crate::util::parent_dir;
 ///    b) Named: link the enclosing source symbol to all exported target symbols
 ///
 /// Edges are deduplicated by (source_uid, target_uid, edge_type).
+///
+/// The optional `workspace_ctx` enables resolution of monorepo workspace
+/// package imports and tsconfig path aliases for JS/TS files.
 pub fn resolve_references(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
     repo_uid: &str,
 ) -> Vec<ResolvedEdge> {
-    let graph = build_import_graph(files, language);
+    resolve_references_with_context(files, language, repo_uid, &WorkspaceContext::default())
+}
+
+/// Like `resolve_references` but with an explicit `WorkspaceContext` for
+/// monorepo workspace package and tsconfig path alias resolution.
+pub fn resolve_references_with_context(
+    files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    language: Language,
+    repo_uid: &str,
+    workspace_ctx: &WorkspaceContext,
+) -> Vec<ResolvedEdge> {
+    let graph = build_import_graph(files, language, workspace_ctx);
 
     // Build a lookup: symbol_name → Vec<(file_path, RawSymbol)>
     let mut symbol_map: std::collections::HashMap<String, Vec<(&str, &RawSymbol)>> =
@@ -49,6 +64,8 @@ pub fn resolve_references(
                 ReferenceKind::Extends => EdgeType::Extends,
                 ReferenceKind::Implements => EdgeType::Implements,
                 ReferenceKind::Includes => EdgeType::Includes,
+                ReferenceKind::TypeRef => EdgeType::Uses,
+                ReferenceKind::ReadAccess | ReferenceKind::WriteAccess => EdgeType::Accesses,
                 ReferenceKind::Import | ReferenceKind::Uses => continue,
             };
 
