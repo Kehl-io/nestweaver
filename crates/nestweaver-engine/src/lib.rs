@@ -44,6 +44,7 @@ pub mod embedding;
 pub mod export;
 pub mod extensions;
 pub mod git_diff;
+pub mod html_to_md;
 pub mod hubs;
 pub mod index;
 pub mod index_md;
