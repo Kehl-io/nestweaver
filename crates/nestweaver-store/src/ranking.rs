@@ -176,6 +176,15 @@ type PprGraph = (
     Vec<f64>,
 );
 
+/// A single edge query paired with an optional `EdgeType` tag so downstream
+/// consumers (e.g. `load_ppr_graph`) can classify edges without parsing the
+/// Cypher query string.
+#[derive(Debug, Clone)]
+pub struct ScopedEdgeQuery {
+    pub query: String,
+    pub edge_type: Option<EdgeType>,
+}
+
 /// Describes which slice of the graph PageRank / PPR runs over.
 ///
 /// The algorithm itself is node-type-agnostic — `GraphScope` is what turns
@@ -196,7 +205,7 @@ type PprGraph = (
 #[derive(Debug, Clone)]
 pub struct GraphScope {
     pub node_queries: Vec<String>,
-    pub edge_queries: Vec<String>,
+    pub edge_queries: Vec<ScopedEdgeQuery>,
 }
 
 impl GraphScope {
@@ -219,11 +228,12 @@ impl GraphScope {
             node_queries: vec!["MATCH (s:Symbol) RETURN s.uid".to_string()],
             edge_queries: code_edge_types
                 .iter()
-                .map(|et| {
-                    format!(
+                .map(|et| ScopedEdgeQuery {
+                    query: format!(
                         "MATCH (a:Symbol)-[r:{}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence",
                         et.rel_table_name()
-                    )
+                    ),
+                    edge_type: Some(*et),
                 })
                 .collect(),
         }
@@ -245,19 +255,16 @@ impl GraphScope {
             ],
             edge_queries: vec![
                 // Structural containment edges: no confidence property → defaults to 1.0.
-                "MATCH (a:Note)-[:NOTE_HAS_HEADING]->(b:Heading) RETURN a.uid, b.uid".to_string(),
-                "MATCH (a:Note)-[:NOTE_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(),
-                "MATCH (a:Heading)-[:HEADING_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid"
-                    .to_string(),
-                "MATCH (a:Heading)-[:HEADING_PARENT]->(b:Heading) RETURN a.uid, b.uid".to_string(),
+                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_HEADING]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
+                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
+                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_HAS_SECTION]->(b:Section) RETURN a.uid, b.uid".to_string(), edge_type: None },
+                ScopedEdgeQuery { query: "MATCH (a:Heading)-[:HEADING_PARENT]->(b:Heading) RETURN a.uid, b.uid".to_string(), edge_type: None },
                 // Wikilinks carry confidence — query the property explicitly.
-                "MATCH (a:Section)-[r:WIKILINK_TO_NOTE]->(b:Note) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
-                "MATCH (a:Section)-[r:WIKILINK_TO_HEADING]->(b:Heading) RETURN a.uid, b.uid, r.confidence"
-                    .to_string(),
+                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_NOTE]->(b:Note) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
+                ScopedEdgeQuery { query: "MATCH (a:Section)-[r:WIKILINK_TO_HEADING]->(b:Heading) RETURN a.uid, b.uid, r.confidence".to_string(), edge_type: None },
                 // Tag edges: no confidence property → defaults to 1.0.
-                "MATCH (a:Note)-[:NOTE_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(),
-                "MATCH (a:Section)-[:SECTION_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(),
+                ScopedEdgeQuery { query: "MATCH (a:Note)-[:NOTE_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
+                ScopedEdgeQuery { query: "MATCH (a:Section)-[:SECTION_TAGGED_WITH]->(b:Tag) RETURN a.uid, b.uid".to_string(), edge_type: None },
             ],
         }
     }
@@ -271,30 +278,30 @@ impl GraphScope {
         scope.node_queries.extend(notes.node_queries);
         scope.edge_queries.extend(notes.edge_queries);
         // Cross-domain bridges — the architectural keystone.
-        scope.edge_queries.push(
-            "MATCH (a:Note)-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                .to_string(),
-        );
-        scope.edge_queries.push(
-            "MATCH (a:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid, r.confidence"
-                .to_string(),
-        );
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (a:Note)-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid, r.confidence".to_string(),
+            edge_type: None,
+        });
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (a:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) RETURN a.uid, b.uid, r.confidence".to_string(),
+            edge_type: None,
+        });
         // Project nodes and edges — allows PPR to traverse project membership.
         scope
             .node_queries
             .push("MATCH (p:Project) RETURN p.uid".to_string());
-        scope.edge_queries.push(
-            "MATCH (p:Project)-[r:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN p.uid, n.uid, r.confidence"
-                .to_string(),
-        );
-        scope.edge_queries.push(
-            "MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence"
-                .to_string(),
-        );
-        scope.edge_queries.push(
-            "MATCH (p:Project)-[r:PROJECT_HAS_COMPONENT]->(q:Project) RETURN p.uid, q.uid, r.confidence"
-                .to_string(),
-        );
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN p.uid, n.uid, r.confidence".to_string(),
+            edge_type: Some(EdgeType::ProjectIncludesNote),
+        });
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN p.uid, s.uid, r.confidence".to_string(),
+            edge_type: Some(EdgeType::ProjectIncludesSymbol),
+        });
+        scope.edge_queries.push(ScopedEdgeQuery {
+            query: "MATCH (p:Project)-[r:PROJECT_HAS_COMPONENT]->(q:Project) RETURN p.uid, q.uid, r.confidence".to_string(),
+            edge_type: Some(EdgeType::ProjectHasComponent),
+        });
         scope
     }
 }
@@ -392,8 +399,8 @@ impl GraphStore {
     ///
     /// When `intent` is provided, edge weights are adjusted: for
     /// `AnalyzeImpact`, CALLS edges receive a 2x multiplier. The intent
-    /// is identified from the edge query string (queries containing
-    /// `:CALLS]` are treated as CALLS edges).
+    /// is identified from the `ScopedEdgeQuery::edge_type` tag carried by
+    /// each query.
     ///
     /// Both forward and reverse directions are included so that PPR propagates
     /// relevance through the full neighbourhood.
@@ -435,9 +442,11 @@ impl GraphStore {
         let project_includes_multiplier =
             intent.map_or(1.0, |i| i.project_includes_weight_multiplier());
         let mut forward_edges: Vec<(usize, usize, f64)> = Vec::new();
-        for q in &scope.edge_queries {
-            // Detect edge type from the query string to apply type-aware
-            // base weights and intent multipliers.
+        for scoped_eq in &scope.edge_queries {
+            let q = &scoped_eq.query;
+            // Use the typed EdgeType tag to determine base weight and intent
+            // multipliers. This avoids fragile substring matching on the query
+            // string and stays in sync with EdgeType::rel_table_name().
             //
             // Base weights model coupling strength:
             //   CALLS          1.0  — direct invocation is strongest coupling
@@ -448,30 +457,17 @@ impl GraphStore {
             //   MEMBER_OF etc.  0.2  — structural containment
             //
             // Intent multipliers are layered on top of the base weight.
-            let base_weight = if q.contains(":CALLS]") {
-                1.0
-            } else if q.contains(":EXTENDS_SYM]") || q.contains(":IMPLEMENTS_SYM]") {
-                0.9
-            } else if q.contains(":IMPORTS]") {
-                0.7
-            } else if q.contains(":USES]") {
-                0.5
-            } else if q.contains(":ACCESSES]") {
-                0.4
-            } else if q.contains(":MEMBER_OF]") || q.contains(":INCLUDES_SYM]") {
-                0.2
-            } else {
-                1.0
-            };
-            let is_calls_query = q.contains(":CALLS]");
-            let is_project_includes_query =
-                q.contains(":PROJECT_INCLUDES_NOTE") || q.contains(":PROJECT_INCLUDES_SYMBOL");
-            let intent_multiplier = if is_calls_query {
-                calls_multiplier
-            } else if is_project_includes_query {
-                project_includes_multiplier
-            } else {
-                1.0
+            let (base_weight, intent_multiplier) = match scoped_eq.edge_type {
+                Some(EdgeType::Calls) => (1.0, calls_multiplier),
+                Some(EdgeType::Extends) | Some(EdgeType::Implements) => (0.9, 1.0),
+                Some(EdgeType::Imports) => (0.7, 1.0),
+                Some(EdgeType::Uses) => (0.5, 1.0),
+                Some(EdgeType::Accesses) => (0.4, 1.0),
+                Some(EdgeType::MemberOf) | Some(EdgeType::Includes) => (0.2, 1.0),
+                Some(EdgeType::ProjectIncludesNote) | Some(EdgeType::ProjectIncludesSymbol) => {
+                    (1.0, project_includes_multiplier)
+                }
+                _ => (1.0, 1.0),
             };
             let edge_multiplier = base_weight * intent_multiplier;
 
