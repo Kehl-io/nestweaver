@@ -524,6 +524,11 @@ impl ShutdownHandle {
     pub fn stop(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
+
+    /// Returns `true` if a shutdown has been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

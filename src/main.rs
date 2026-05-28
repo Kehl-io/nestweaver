@@ -2441,6 +2441,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let stop_signal = stop.clone();
             let _ = ctrlc_handler(move || stop_signal.stop());
 
+            // Spawn periodic wiki refresh thread if --refresh-wiki-hours
+            // is set. Same pattern as the brain watch handler.
+            if let (Some(hours), Some(config_path)) = (refresh_wiki_hours, config.as_deref()) {
+                let wiki_db = db_path.clone();
+                let wiki_config_path = config_path.to_path_buf();
+                let wiki_stop = stop.clone();
+                let wiki_instance = instance_id.clone();
+                std::thread::spawn(move || {
+                    let interval = std::time::Duration::from_secs(hours * 3600);
+                    loop {
+                        let deadline = std::time::Instant::now() + interval;
+                        while std::time::Instant::now() < deadline {
+                            if wiki_stop.is_stopped() {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                        }
+                        if wiki_stop.is_stopped() {
+                            return;
+                        }
+                        tracing::info!("periodic wiki refresh triggered");
+                        match nestweaver_engine::InstanceConfig::from_file(&wiki_config_path) {
+                            Ok(cfg) => {
+                                let store = match GraphStore::open_or_create(&wiki_db) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!("wiki refresh: failed to open store: {e}");
+                                        continue;
+                                    }
+                                };
+                                match materialize_projects(&store, &cfg, &wiki_instance, &wiki_db) {
+                                    Ok(res) => tracing::info!(
+                                        projects = res.projects_created,
+                                        wiki_notes = res.wiki_notes_ingested,
+                                        "wiki refresh complete"
+                                    ),
+                                    Err(e) => tracing::warn!("wiki refresh failed: {e}"),
+                                }
+                            }
+                            Err(e) => tracing::warn!("wiki refresh: config load failed: {e}"),
+                        }
+                    }
+                });
+            }
+
             eprintln!(
                 "Watching {} -> {} (Ctrl-C to stop)",
                 repo_path.display(),
@@ -3324,6 +3369,20 @@ fn run_brain(
                 }
             }
 
+            // Auto-populate Tantivy BM25 index after brain add so that
+            // `brain search` works immediately without a manual reindex.
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            match TantivyIndex::open_or_create(&tantivy_path) {
+                Ok(tantivy) => {
+                    let store_for_tantivy = open_store(Some(&db_path))?;
+                    match tantivy.reindex_from_store(&store_for_tantivy) {
+                        Ok(count) => out.status(&format!("Tantivy: indexed {count} document(s)")),
+                        Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("Tantivy open failed: {e}"),
+            }
+
             if !result.skipped.is_empty() {
                 out.status(&format!("Skipped {} file(s):", result.skipped.len()));
                 for sf in &result.skipped {
@@ -3536,6 +3595,7 @@ fn run_brain(
             let extra_patterns = parse_ignore_flag(&ignore);
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = db_path.with_extension("manifests.json");
+            let wiki_instance_id = instance_id.clone();
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
@@ -3557,12 +3617,68 @@ fn run_brain(
             let stop_signal = stop.clone();
             let _ = ctrlc_handler(move || stop_signal.stop());
 
+            // Spawn periodic wiki refresh thread if --refresh-wiki-hours
+            // is set. The thread sleeps for N hours, calls
+            // materialize_projects to re-fetch wiki sources, then loops
+            // until the shutdown handle signals stop.
+            if let (Some(hours), Some(config_path)) = (refresh_wiki_hours, config.as_deref()) {
+                let wiki_db = db_path.clone();
+                let wiki_config_path = config_path.to_path_buf();
+                let wiki_stop = stop.clone();
+                let wiki_instance = wiki_instance_id;
+                std::thread::spawn(move || {
+                    let interval = std::time::Duration::from_secs(hours * 3600);
+                    loop {
+                        // Sleep in small increments so we notice shutdown quickly.
+                        let deadline = std::time::Instant::now() + interval;
+                        while std::time::Instant::now() < deadline {
+                            if wiki_stop.is_stopped() {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                        }
+                        if wiki_stop.is_stopped() {
+                            return;
+                        }
+                        tracing::info!("periodic wiki refresh triggered");
+                        match nestweaver_engine::InstanceConfig::from_file(&wiki_config_path) {
+                            Ok(cfg) => {
+                                let store = match GraphStore::open_or_create(&wiki_db) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!("wiki refresh: failed to open store: {e}");
+                                        continue;
+                                    }
+                                };
+                                match materialize_projects(&store, &cfg, &wiki_instance, &wiki_db) {
+                                    Ok(res) => tracing::info!(
+                                        projects = res.projects_created,
+                                        wiki_notes = res.wiki_notes_ingested,
+                                        "wiki refresh complete"
+                                    ),
+                                    Err(e) => tracing::warn!("wiki refresh failed: {e}"),
+                                }
+                            }
+                            Err(e) => tracing::warn!("wiki refresh: config load failed: {e}"),
+                        }
+                    }
+                });
+            }
+
             out.status(&format!(
                 "Watching {} -> {} (Ctrl-C to stop)",
                 path.display(),
                 db_path.display()
             ));
             watcher.run().context("watcher")?;
+
+            // BrainWatcher::run() drops its GraphStore when it returns,
+            // which triggers lbug's internal cleanup. However, `launchctl
+            // unload` sends SIGKILL after a short grace period (~5 s) if
+            // the process hasn't exited. A small sleep here gives the OS
+            // time to flush any remaining WAL pages to disk after the
+            // store is dropped inside `run()`.
+            std::thread::sleep(std::time::Duration::from_millis(100));
 
             // Clean up the lock file on orderly shutdown.
             let _ = std::fs::remove_file(&lock_path);
@@ -3672,6 +3788,23 @@ fn run_brain(
                     result.wikilinks_unresolved,
                 );
             }
+
+            // Auto-populate Tantivy BM25 index after brain refresh so that
+            // `brain search` works immediately without a manual reindex.
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            match TantivyIndex::open_or_create(&tantivy_path) {
+                Ok(tantivy) => {
+                    let store_for_tantivy = open_store(Some(&db_path))?;
+                    match tantivy.reindex_from_store(&store_for_tantivy) {
+                        Ok(count) => {
+                            println!("Tantivy: indexed {count} document(s)");
+                        }
+                        Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("Tantivy open failed: {e}"),
+            }
+
             Ok((EXIT_SUCCESS, None))
         }
 
