@@ -36,6 +36,7 @@ const LITE_TOOLS: &[&str] = &[
 
 /// Returns the `tools/list` payload — schemas + descriptions for every tool
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
+/// When `--tools` was specified, only those named tools are included.
 pub fn tool_list(lite: bool) -> Value {
     let mut tools = vec![
         tool_schema_brain_context(),
@@ -64,18 +65,40 @@ pub fn tool_list(lite: bool) -> Value {
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
     }
+    // Apply explicit tool allowlist (--tools flag) when set.
+    let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
+    if let Some(ref names) = allowed {
+        tools.retain(|t| {
+            t["name"]
+                .as_str()
+                .is_some_and(|n| names.iter().any(|a| a == n))
+        });
+    }
     json!({ "tools": tools })
 }
 
 /// Dispatch a `tools/call` to the named tool. The optional `tantivy`
 /// index, when present, drives hybrid retrieval in `brain_context` and
 /// upgrades `brain_search` from substring to BM25.
+///
+/// When `--tools` was specified, calls to tools outside the allowlist
+/// are rejected with a descriptive error.
 pub fn dispatch(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     name: &str,
     args: Value,
 ) -> Result<Value, anyhow::Error> {
+    // Enforce tool allowlist when configured.
+    let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
+    if let Some(ref names) = allowed
+        && !names.iter().any(|a| a == name)
+    {
+        return Err(anyhow!(
+            "tool '{name}' is not in the allowed tools list; allowed: {}",
+            names.join(", ")
+        ));
+    }
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args),
         "brain_search" => tool_brain_search(store, tantivy, args),
@@ -2021,6 +2044,11 @@ fn tool_schema_project_context() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
+                    "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
                 }
             },
             "required": ["project"]
@@ -2141,8 +2169,18 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Run hybrid PPR from seeds with project-context intent (5x boost on
-    //    PROJECT_INCLUDES_* edges so the project's declared content dominates).
+    // 4. Run hybrid PPR from seeds. Default intent is understand-architecture
+    //    (best for project overviews), but callers can override via the
+    //    `intent` parameter. The 5x boost on PROJECT_INCLUDES_* edges
+    //    ensures the project's declared content dominates.
+    let intent: nestweaver_store::QueryIntent = args
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .map(|s| s.parse::<nestweaver_store::QueryIntent>())
+        .transpose()
+        .map_err(|e| anyhow!("invalid intent: {e}"))?
+        .unwrap_or(nestweaver_store::QueryIntent::UnderstandArchitecture);
+
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
     let config = HybridSearchConfig::default();
@@ -2153,7 +2191,7 @@ fn tool_project_context(
         &config,
         &aliases,
         Some(&db_path),
-        Some(nestweaver_store::QueryIntent::ProjectContext),
+        Some(intent),
     )?;
 
     // 4b. Post-PPR scope boost: multiply relevance for nodes that belong
@@ -2780,6 +2818,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static ALLOW_ADD_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static LITE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
@@ -2792,6 +2832,10 @@ pub fn set_allow_add_sources(allowed: bool) {
 
 pub fn set_lite_mode(lite: bool) {
     LITE_MODE.with(|c| c.set(lite));
+}
+
+pub fn set_allowed_tools(names: Vec<String>) {
+    ALLOWED_TOOLS.with(|c| *c.borrow_mut() = Some(names));
 }
 
 pub fn is_lite_mode() -> bool {
