@@ -14,3 +14,5 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 7. Use `clusters` to see which functional grouping this code belongs to
 8. If vault notes appear in results, call `note_get` to read relevant notes
 9. Summarize: what this code does, what calls it, what it depends on, and any design notes from the vault
+
+Note: When `--track-interactions` is enabled on the MCP server, frequently-explored areas rank higher over time as the interaction memory learns your navigation patterns.
