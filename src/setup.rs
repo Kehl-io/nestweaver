@@ -749,7 +749,7 @@ Do NOT activate when:
 | Tool | Purpose |
 |------|---------|
 | `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. Supports `intent` parameter. |
-| `brain_search` | BM25 full-text search across notes, headings, sections, and tags. |
+| `brain_search` | BM25 full-text search across code symbols, notes, headings, sections, and tags. |
 | `project_context` | PPR-ranked context scoped to a named project. Supports `intent` parameter. |
 | `note_get` | Full markdown body of a specific note. |
 | `backlinks` | All notes that wikilink TO a target note. |
@@ -831,7 +831,7 @@ fn generate_copilot_instructions() -> String {
     ## Available MCP Tools (22)\n\n\
     ### Core retrieval\n\
     - **brain_context** — PPR-ranked context from seeds (supports `intent` parameter)\n\
-    - **brain_search** — BM25 full-text search across code and notes\n\
+    - **brain_search** — BM25 full-text search across code symbols, notes, headings, sections, and tags\n\
     - **project_context** — Project-scoped PPR context (supports `intent` parameter)\n\
     - **note_get** — Full markdown body of a specific note\n\
     - **backlinks** — Notes that wikilink to a target note\n\
@@ -877,7 +877,7 @@ fn generate_agents_md_content() -> String {
 | Tool | Description |\n\
 |------|-------------|\n\
 | brain_context | PPR-ranked context for a task |\n\
-| brain_search | Full-text search across code and notes |\n\
+| brain_search | Full-text search across code symbols, notes, headings, sections, and tags |\n\
 | brain_impact | Blast radius analysis |\n\
 | brain_guide | Architecture overview |\n\
 | project_context | Project-scoped retrieval |\n\

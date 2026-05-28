@@ -164,7 +164,7 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `brain add` | Add an Obsidian vault or markdown directory to the knowledge graph |
-| `brain search` | Search across indexed notes and sections |
+| `brain search` | Search across code symbols, notes, headings, sections, and tags |
 | `brain context` | Get unified context spanning both code symbols and notes |
 | `brain list` | List all registered vaults |
 | `brain status` | Show vault counts, per-vault staleness, and index health |
@@ -234,7 +234,7 @@ Index Obsidian vaults and markdown directories alongside your code. NestWeaver b
 # Add a vault to the knowledge graph
 nestweaver brain add ~/Documents/Obsidian/MyVault
 
-# Search across all indexed notes
+# Search across code symbols and vault notes
 nestweaver brain search "architecture"
 
 # Get unified context spanning code and notes
