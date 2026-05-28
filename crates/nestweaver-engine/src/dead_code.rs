@@ -104,6 +104,11 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 /// If `manifests` is provided, symbols whose file paths match `main`, `bin`,
 /// or `exports` entries in a package.json manifest are treated as additional
 /// entry points.
+///
+/// **Performance note**: The BFS itself is O(V+E) and fast. On large graphs
+/// (80K+ symbols, 100K+ edges), the dominant cost is loading all symbols and
+/// typed edges from the database (~500-700ms). This is inherent to the full-
+/// graph traversal approach and cannot be reduced without pre-computed caching.
 pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
     detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new())
 }
