@@ -471,12 +471,14 @@ enum Commands {
     #[command(after_help = "Examples:\n  nestweaver list-features --config ./instance.toml")]
     ListFeatures {
         #[arg(long, help = "Path to instance config file")]
-        config: PathBuf,
+        config: Option<PathBuf>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
     /// Analyze indexed repos and suggest cross-repo links and feature bundles
-    #[command(after_help = "Examples:\n  nestweaver suggest-links --db ./all-repos.lbug")]
+    #[command(
+        after_help = "Examples:\n  nestweaver suggest-links --db ./all-repos.lbug\n  nestweaver suggest-links --config ./instance.toml"
+    )]
     SuggestLinks {
         #[arg(
             long,
@@ -485,6 +487,8 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Manage NestWeaver instances (register, list, remove, pull)
     Instance {
@@ -691,7 +695,7 @@ enum Commands {
     },
     /// List all projects from the store
     #[command(
-        after_help = "Examples:\n  nestweaver list-projects\n  nestweaver list-projects --json"
+        after_help = "Examples:\n  nestweaver list-projects\n  nestweaver list-projects --config ./instance.toml --json"
     )]
     ListProjects {
         #[arg(long, help = "Output as JSON")]
@@ -701,6 +705,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Materialize declared projects, wiki sources, and cross-repo links
     MaterializeProjects {
@@ -1820,7 +1826,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListFeatures { config, json } => {
-            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
+            let config_path =
+                config.ok_or_else(|| anyhow::anyhow!("--config is required for list-features"))?;
+            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config_path)?;
             let features = instance_config.features.unwrap_or_default();
 
             if json {
@@ -1841,7 +1849,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::SuggestLinks { db, json } => {
+        Commands::SuggestLinks {
+            db,
+            json,
+            config: _,
+        } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
@@ -2875,7 +2887,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::ListProjects { json, db } => {
+        Commands::ListProjects {
+            json,
+            db,
+            config: _,
+        } => {
             let store = open_store(db.as_deref())?;
             let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
             if json {

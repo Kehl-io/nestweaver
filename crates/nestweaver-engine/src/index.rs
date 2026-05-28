@@ -388,7 +388,7 @@ fn index_into_store(
 
     scan_pb.finish_with_message(format!("Scanned {} files", file_entries.len()));
 
-    // ── Phase 2: Parse files ──────────────────────────────────────────────
+    // ── Phase 2: Parse files (parallelised with rayon) ─────────────────
     let total_files = file_entries.len() as u64;
     let parse_pb = ProgressBar::new(total_files);
     parse_pb.set_style(
@@ -399,143 +399,174 @@ fn index_into_store(
         .progress_chars("━╸─"),
     );
 
-    // Vectors for batch inserts.
+    // Empty cache used as fallback when no sidecar was provided.
+    let empty_cache = FileMetaCache::new();
+    let cache = filemeta_cache.unwrap_or(&empty_cache);
+
+    // Per-file outcome from the parallel phase. Each entry is either
+    // Unchanged (carry forward cached meta), Skipped (error), or Parsed
+    // (with all data needed for the sequential collection phase).
+    enum ParseOutcome {
+        Unchanged {
+            rel_path: String,
+        },
+        Skipped(SkippedFile),
+        Parsed {
+            rel_path: String,
+            lang: Language,
+            file_meta: CachedFileMeta,
+            content_hash: String,
+            symbols: Vec<RawSymbol>,
+            references: Vec<RawReference>,
+        },
+    }
+
+    // Run change detection + parsing in parallel. Each file is independent:
+    // stat, read, hash, and tree-sitter parse are all CPU/IO-bound work
+    // that benefits from multi-core execution.
+    use rayon::prelude::*;
+
+    let outcomes: Vec<ParseOutcome> = file_entries
+        .par_iter()
+        .map(|(path, lang)| {
+            let display_name = path
+                .strip_prefix(repo_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+
+            // Tiered change detection.
+            let (source, content_hash, file_meta) =
+                match tiered_change_check(path, &display_name, cache) {
+                    Ok(ChangeVerdict::Unchanged) => {
+                        parse_pb.inc(1);
+                        return ParseOutcome::Unchanged {
+                            rel_path: display_name,
+                        };
+                    }
+                    Ok(ChangeVerdict::Changed {
+                        source,
+                        content_hash,
+                        meta,
+                    }) => (source, content_hash, meta),
+                    Err(err) => {
+                        parse_pb.inc(1);
+                        return ParseOutcome::Skipped(SkippedFile {
+                            path: path.to_string_lossy().into_owned(),
+                            reason: format!("stat/read error: {err}"),
+                        });
+                    }
+                };
+
+            // Parse the file (CPU-bound tree-sitter work).
+            match parse_source(path, &source) {
+                Ok(parsed) => {
+                    parse_pb.inc(1);
+                    ParseOutcome::Parsed {
+                        rel_path: display_name,
+                        lang: *lang,
+                        file_meta,
+                        content_hash,
+                        symbols: parsed.symbols,
+                        references: parsed.references,
+                    }
+                }
+                Err(err) => {
+                    parse_pb.inc(1);
+                    ParseOutcome::Skipped(SkippedFile {
+                        path: path.to_string_lossy().into_owned(),
+                        reason: err.to_string(),
+                    })
+                }
+            }
+        })
+        .collect();
+
+    parse_pb.finish_and_clear();
+
+    // ── Sequential collection of parallel results ────────────────────────
     let mut all_files: Vec<File> = Vec::new();
     let mut all_symbols: Vec<Symbol> = Vec::new();
-    // (repo_uid, file_uid) pairs for REPO_HAS_FILE edges.
     let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
-    // (file_uid, symbol_uid) pairs for FILE_HAS_SYMBOL edges.
     let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
-
-    // Per-file raw data for the full cross-file resolver.
     let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
         Vec::new();
-
-    // Track the detected language per file for choosing the resolver language.
     let mut detected_languages: Vec<Language> = Vec::new();
-
     let mut files_count = 0usize;
     let mut files_unchanged = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
 
-    // Empty cache used as fallback when no sidecar was provided.
-    let empty_cache = FileMetaCache::new();
-    let cache = filemeta_cache.unwrap_or(&empty_cache);
-
-    for (path, lang) in &file_entries {
-        // Show current file being parsed.
-        let display_name = path
-            .strip_prefix(repo_path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
-        parse_pb.set_message(display_name.clone());
-
-        // ── Tiered change detection ──────────────────────────────────────
-        let (source, content_hash, file_meta) =
-            match tiered_change_check(path, &display_name, cache) {
-                Ok(ChangeVerdict::Unchanged) => {
-                    // Carry forward the existing cache entry.
-                    if let (Some(ref mut new_cache), Some(cached)) =
-                        (new_filemeta.as_deref_mut(), cache.get(&display_name))
-                    {
-                        new_cache.insert(display_name.clone(), cached.clone());
-                    }
-                    files_unchanged += 1;
-                    parse_pb.inc(1);
-                    continue;
+    for outcome in outcomes {
+        match outcome {
+            ParseOutcome::Unchanged { rel_path } => {
+                // Carry forward the existing cache entry.
+                if let (Some(ref mut new_cache), Some(cached)) =
+                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                {
+                    new_cache.insert(rel_path, cached.clone());
                 }
-                Ok(ChangeVerdict::Changed {
-                    source,
-                    content_hash,
-                    meta,
-                }) => (source, content_hash, meta),
-                Err(err) => {
-                    skipped_files.push(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: format!("stat/read error: {err}"),
-                    });
-                    parse_pb.inc(1);
-                    continue;
-                }
-            };
-
-        // Parse the file.
-        let parsed = match parse_source(path, &source) {
-            Ok(p) => p,
-            Err(err) => {
-                skipped_files.push(SkippedFile {
-                    path: path.to_string_lossy().into_owned(),
-                    reason: err.to_string(),
-                });
-                parse_pb.inc(1);
-                continue;
+                files_unchanged += 1;
             }
-        };
+            ParseOutcome::Skipped(sf) => {
+                skipped_files.push(sf);
+            }
+            ParseOutcome::Parsed {
+                rel_path,
+                lang,
+                file_meta,
+                content_hash,
+                symbols: raw_symbols,
+                references: raw_references,
+            } => {
+                // Record in the new filemeta cache.
+                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
+                    new_cache.insert(rel_path.clone(), file_meta);
+                }
 
-        // Compute relative path for stable file UIDs.
-        let rel_path = display_name;
+                let f_uid = file_uid(&r_uid, &rel_path);
 
-        // Record in the new filemeta cache.
-        if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
-            new_cache.insert(rel_path.clone(), file_meta);
+                all_files.push(File {
+                    uid: f_uid.clone(),
+                    path: rel_path.clone(),
+                    repo_uid: r_uid.clone(),
+                    content_hash,
+                });
+
+                repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
+                files_count += 1;
+                detected_languages.push(lang);
+
+                for raw_sym in &raw_symbols {
+                    let s_uid = symbol_uid(&r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
+
+                    all_symbols.push(Symbol {
+                        uid: s_uid.clone(),
+                        name: raw_sym.name.clone(),
+                        kind: raw_sym.kind,
+                        repo_uid: r_uid.clone(),
+                        file_path: rel_path.clone(),
+                        start_line: raw_sym.start_line,
+                        signature: raw_sym.signature.clone(),
+                        summary: None,
+                        content_hash: raw_sym.content_hash.clone(),
+                        embedding: None,
+                        pagerank_score: None,
+                        is_entry_point: raw_sym.is_entry_point,
+                        entry_point_kind: raw_sym.entry_point_kind,
+                        visibility: raw_sym.visibility,
+                        type_info: raw_sym.type_info.clone(),
+                        framework_hint: None,
+                    });
+
+                    file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
+                    symbols_count += 1;
+                }
+
+                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references));
+            }
         }
-
-        let f_uid = file_uid(&r_uid, &rel_path);
-
-        // Collect File node.
-        all_files.push(File {
-            uid: f_uid.clone(),
-            path: rel_path.clone(),
-            repo_uid: r_uid.clone(),
-            content_hash,
-        });
-
-        // Collect REPO_HAS_FILE edge.
-        repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
-
-        files_count += 1;
-        detected_languages.push(*lang);
-
-        // Collect Symbol nodes and FILE_HAS_SYMBOL edges.
-        for raw_sym in &parsed.symbols {
-            let s_uid = symbol_uid(&r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
-
-            all_symbols.push(Symbol {
-                uid: s_uid.clone(),
-                name: raw_sym.name.clone(),
-                kind: raw_sym.kind,
-                repo_uid: r_uid.clone(),
-                file_path: rel_path.clone(),
-                start_line: raw_sym.start_line,
-                signature: raw_sym.signature.clone(),
-                summary: None,
-                content_hash: raw_sym.content_hash.clone(),
-                embedding: None,
-                pagerank_score: None,
-                is_entry_point: raw_sym.is_entry_point,
-                entry_point_kind: raw_sym.entry_point_kind,
-                visibility: raw_sym.visibility,
-                type_info: raw_sym.type_info.clone(),
-                framework_hint: None,
-            });
-
-            file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
-            symbols_count += 1;
-        }
-
-        // Collect raw parsed data for the cross-file resolver.
-        parsed_files_for_resolver.push((
-            rel_path.clone(),
-            parsed.symbols.clone(),
-            parsed.references.clone(),
-        ));
-
-        parse_pb.inc(1);
     }
-
-    parse_pb.finish_and_clear();
 
     // 2b. When re-indexing over an existing store (tiered detection is active
     //     and some files changed), clean up old File nodes and their symbols

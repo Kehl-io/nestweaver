@@ -2917,6 +2917,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "rand 0.10.1",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",
