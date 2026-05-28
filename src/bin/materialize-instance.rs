@@ -52,12 +52,13 @@ fn main() -> anyhow::Result<()> {
 
     println!(
         "Materialized {} project(s): {} note edges, {} symbol edges, \
-         {} component edges, {} wiki notes ingested",
+         {} component edges, {} wiki notes ingested, {} wiki fetch errors",
         result.projects_created,
         result.note_edges,
         result.symbol_edges,
         result.component_edges,
         result.wiki_notes_ingested,
+        result.wiki_fetch_errors,
     );
 
     Ok(())

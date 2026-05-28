@@ -692,6 +692,7 @@ pub fn build_brain_context_hybrid_with_aliases(
             || trimmed.starts_with("tag:")
             || trimmed.starts_with("repo:")
             || trimmed.starts_with("vlt:")
+            || trimmed.starts_with("proj:")
         {
             seed_uids.push(trimmed.to_string());
             continue;
