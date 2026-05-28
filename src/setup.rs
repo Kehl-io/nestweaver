@@ -809,6 +809,17 @@ Do NOT activate when:
 2. `bridge_nodes` to find architectural chokepoints.
 3. `clusters` to see functional groupings.
 4. `get_summary` at cluster or file level for a token-efficient overview.
+
+## Tips
+
+- **Multi-repo indexing**: Use `nestweaver index --repo ./path --name my-repo` to assign a custom repo name. This keeps repos distinct when indexing multiple repositories into one database.
+- **External MCP servers**: Configure `timeout_secs` in your instance config (default 30s):
+  ```toml
+  [[mcp_servers]]
+  name = \"wiki-mcp\"
+  command = \"wiki-mcp\"
+  timeout_secs = 60
+  ```
 "
     .to_string()
 }

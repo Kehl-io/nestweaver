@@ -147,7 +147,7 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository (auto-detects repo root from `.git`) |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
@@ -289,6 +289,15 @@ nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlis
 ```
 
 Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Use `--tools` to expose only the tools you need. Point any MCP client at the server to get started.
+
+External MCP servers can be configured in your instance config with `timeout_secs` (default 30):
+
+```toml
+[[mcp_servers]]
+name = "wiki-mcp"
+command = "wiki-mcp"
+timeout_secs = 60
+```
 
 ## Web UI
 
