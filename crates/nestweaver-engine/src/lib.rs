@@ -56,6 +56,7 @@ pub mod html_to_md;
 pub mod hubs;
 pub mod index;
 pub mod index_md;
+pub mod interactions;
 pub mod manifest;
 pub mod mcp_client;
 pub mod process;
@@ -112,6 +113,10 @@ pub use index_md::{
     index_markdown_directory_in_memory, index_markdown_directory_since,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
     load_alias_sidecar,
+};
+pub use interactions::{
+    EventType, InteractionStore, InteractionTracker, NodeScore, compute_decayed_score,
+    interaction_sidecar_path, load_interaction_scores, save_interaction_store,
 };
 pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
 pub use process::{
