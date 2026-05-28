@@ -1147,6 +1147,113 @@ pub fn generate_repo_map(store: &GraphStore, token_budget: usize) -> Result<Stri
 }
 
 #[cfg(test)]
+mod render_brain_node_tests {
+    use nestweaver_schema::{Note, NoteKind, Section};
+    use nestweaver_store::GraphStore;
+
+    use super::render_brain_node;
+
+    #[test]
+    fn section_with_heading_uses_heading_text() {
+        let store = GraphStore::in_memory().unwrap();
+        let note = Note {
+            uid: "note:test-note".to_string(),
+            vault_uid: "vault:test".to_string(),
+            file_path: "notes/test.md".to_string(),
+            title: "Test Note".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 100,
+            content_hash: "abc".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.insert_note(&note).unwrap();
+
+        let heading = nestweaver_schema::Heading {
+            uid: "head:test-heading".to_string(),
+            note_uid: "note:test-note".to_string(),
+            level: 2,
+            text: "My Heading".to_string(),
+            slug: "my-heading".to_string(),
+            start_line: 1,
+            end_line: 5,
+            content_hash: "def".to_string(),
+        };
+        store.insert_heading(&heading).unwrap();
+
+        let section = Section {
+            uid: "sec:test-section-with-heading".to_string(),
+            note_uid: "note:test-note".to_string(),
+            heading_uid: Some("head:test-heading".to_string()),
+            start_line: 1,
+            end_line: 5,
+            text_hash: "ghi".to_string(),
+            text_content: "Some body text here".to_string(),
+            word_count: 4,
+            pagerank_score: None,
+        };
+        store.insert_section(&section).unwrap();
+
+        let node = render_brain_node(&store, "sec:test-section-with-heading", 0.5)
+            .unwrap()
+            .expect("section should resolve");
+        assert_eq!(node.title, "My Heading");
+        assert_eq!(node.kind, "Section");
+    }
+
+    #[test]
+    fn section_without_heading_falls_back_to_body_preview() {
+        let store = GraphStore::in_memory().unwrap();
+        let note = Note {
+            uid: "note:fallback-note".to_string(),
+            vault_uid: "vault:test".to_string(),
+            file_path: "notes/fallback.md".to_string(),
+            title: "Fallback Note".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 50,
+            content_hash: "abc2".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.insert_note(&note).unwrap();
+
+        let section = Section {
+            uid: "sec:test-section-no-heading".to_string(),
+            note_uid: "note:fallback-note".to_string(),
+            heading_uid: None,
+            start_line: 0,
+            end_line: 3,
+            text_hash: "jkl".to_string(),
+            text_content: "This is the preamble text before any heading".to_string(),
+            word_count: 8,
+            pagerank_score: None,
+        };
+        store.insert_section(&section).unwrap();
+
+        let node = render_brain_node(&store, "sec:test-section-no-heading", 0.42)
+            .unwrap()
+            .expect("section should resolve");
+        assert_eq!(node.kind, "Section");
+        // Fallback title should be: "{note_title} -- {body_preview}"
+        assert!(
+            node.title.starts_with("Fallback Note \u{2014} "),
+            "expected fallback title starting with note title; got: {}",
+            node.title
+        );
+        assert!(
+            node.title.contains("preamble"),
+            "expected body preview in title; got: {}",
+            node.title
+        );
+        assert_eq!(node.location, "notes/fallback.md");
+    }
+}
+
+#[cfg(test)]
 mod repo_map_tests {
     use std::fs;
 
