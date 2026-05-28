@@ -681,118 +681,156 @@ fn tool_brain_search(
     // isn't open — keeps the tool useful before the first
     // `brain reindex-search`.
     if let Some(idx) = tantivy {
+        // Fetch extra raw hits to compensate for grouping (headings/sections
+        // collapse into their parent notes).
+        let raw_limit = limit * 5;
         let hits = idx
-            .search(&query, limit)
+            .search(&query, raw_limit)
             .map_err(|e| anyhow!("tantivy search: {e}"))?;
-        let results: Vec<Value> = hits
-            .iter()
-            .map(|h| {
-                if concise {
-                    json!({
-                        "kind": h.kind,
-                        "title": h.title,
-                    })
-                } else {
-                    json!({
-                        "uid": h.uid,
-                        "kind": h.kind,
-                        "title": h.title,
-                        "score": h.score,
-                        "vault_uid": h.vault_uid,
-                    })
-                }
-            })
-            .collect();
+        let results = group_search_hits_by_note(store, &hits, limit, concise);
         return Ok(json!({
             "query": query,
             "engine": "bm25",
             "results": results,
-            "total_matches": hits.len(),
+            "total_matches": results.len(),
         }));
     }
 
     // Substring fallback: search note titles, heading text, and section bodies.
+    // Collect raw hits then group by parent note.
     let needle = query.to_lowercase();
+    let raw_limit = limit * 5;
+
+    struct RawHit {
+        kind: String,
+        title: String,
+        note_uid: String,
+        score: f32,
+    }
+
+    let mut raw_hits: Vec<RawHit> = Vec::new();
 
     // Note title matches.
     let notes = store.list_notes(None).context("list_notes")?;
-    let mut results: Vec<Value> = notes
+    for n in &notes {
+        if n.title.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
+            raw_hits.push(RawHit {
+                kind: "note".to_string(),
+                title: n.title.clone(),
+                note_uid: n.uid.clone(),
+                score: 1.0,
+            });
+        }
+    }
+
+    // Heading text matches.
+    if raw_hits.len() < raw_limit {
+        let headings = store.list_all_headings().context("list_all_headings")?;
+        for h in &headings {
+            if h.text.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
+                raw_hits.push(RawHit {
+                    kind: "heading".to_string(),
+                    title: h.text.clone(),
+                    note_uid: h.note_uid.clone(),
+                    score: 0.8,
+                });
+            }
+        }
+    }
+
+    // Section body matches.
+    if raw_hits.len() < raw_limit {
+        let sections = store.list_all_sections().context("list_all_sections")?;
+        for s in &sections {
+            if s.text_content.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
+                let title = s
+                    .heading_uid
+                    .as_deref()
+                    .and_then(|h_uid| store.lookup_heading(h_uid).ok())
+                    .map(|h| h.text)
+                    .unwrap_or_else(|| "(untitled section)".to_string());
+                raw_hits.push(RawHit {
+                    kind: "section".to_string(),
+                    title,
+                    note_uid: s.note_uid.clone(),
+                    score: 0.6,
+                });
+            }
+        }
+    }
+
+    // Group by parent note: for each note, pick the highest-scoring hit and
+    // collect matched headings/sections.
+    use std::collections::HashMap;
+    struct NoteGroup {
+        note_uid: String,
+        best_score: f32,
+        best_title: String,
+        matched_headings: Vec<String>,
+    }
+    let mut groups: HashMap<String, NoteGroup> = HashMap::new();
+    let mut note_order: Vec<String> = Vec::new();
+
+    for hit in &raw_hits {
+        let group = groups.entry(hit.note_uid.clone()).or_insert_with(|| {
+            note_order.push(hit.note_uid.clone());
+            NoteGroup {
+                note_uid: hit.note_uid.clone(),
+                best_score: hit.score,
+                best_title: String::new(),
+                matched_headings: Vec::new(),
+            }
+        });
+        if hit.score > group.best_score {
+            group.best_score = hit.score;
+        }
+        if hit.kind == "note" {
+            group.best_title = hit.title.clone();
+        }
+        if hit.kind == "heading" || hit.kind == "section" {
+            group.matched_headings.push(hit.title.clone());
+        }
+    }
+
+    // For groups that had no direct note title match, look up the note title.
+    for group in groups.values_mut() {
+        if group.best_title.is_empty() {
+            group.best_title = store
+                .lookup_note(&group.note_uid)
+                .map(|n| n.title)
+                .unwrap_or_else(|_| group.note_uid.clone());
+        }
+    }
+
+    // Sort by best_score descending, then take `limit`.
+    note_order.sort_by(|a, b| {
+        let sa = groups.get(a).map(|g| g.best_score).unwrap_or(0.0);
+        let sb = groups.get(b).map(|g| g.best_score).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let results: Vec<Value> = note_order
         .iter()
-        .filter(|n| n.title.to_lowercase().contains(&needle))
-        .map(|n| {
+        .take(limit)
+        .filter_map(|nuid| groups.get(nuid))
+        .map(|g| {
             if concise {
                 json!({
                     "kind": "note",
-                    "title": n.title,
+                    "title": g.best_title,
+                    "matched_headings": g.matched_headings,
                 })
             } else {
                 json!({
-                    "uid": n.uid,
+                    "uid": g.note_uid,
                     "kind": "note",
-                    "title": n.title,
-                    "path": n.file_path,
-                    "note_kind": n.note_kind.to_string(),
-                    "word_count": n.word_count,
+                    "title": g.best_title,
+                    "score": g.best_score,
+                    "matched_headings": g.matched_headings,
                 })
             }
         })
         .collect();
-
-    // Heading text matches (if budget remains).
-    if results.len() < limit {
-        let headings = store.list_all_headings().context("list_all_headings")?;
-        let remaining = limit - results.len();
-        let heading_hits: Vec<Value> = headings
-            .iter()
-            .filter(|h| h.text.to_lowercase().contains(&needle))
-            .take(remaining)
-            .map(|h| {
-                if concise {
-                    json!({
-                        "kind": "heading",
-                        "title": h.text.clone(),
-                    })
-                } else {
-                    json!({
-                        "uid": h.uid,
-                        "kind": "heading",
-                        "title": h.text.clone(),
-                        "note_uid": h.note_uid,
-                        "level": h.level,
-                    })
-                }
-            })
-            .collect();
-        results.extend(heading_hits);
-    }
-
-    // Section body matches (if budget remains).
-    if results.len() < limit {
-        let sections = store.list_all_sections().context("list_all_sections")?;
-        let remaining = limit - results.len();
-        let section_hits: Vec<Value> = sections
-            .iter()
-            .filter(|s| s.text_content.to_lowercase().contains(&needle))
-            .take(remaining)
-            .map(|s| {
-                if concise {
-                    json!({
-                        "kind": "section",
-                        "title": s.heading_uid.as_deref().unwrap_or("(untitled)"),
-                    })
-                } else {
-                    json!({
-                        "uid": s.uid,
-                        "kind": "section",
-                        "note_uid": s.note_uid,
-                        "heading_uid": s.heading_uid,
-                        "word_count": s.word_count,
-                    })
-                }
-            })
-            .collect();
-        results.extend(section_hits);
-    }
 
     let total = results.len();
     Ok(json!({
@@ -802,6 +840,109 @@ fn tool_brain_search(
         "results": results,
         "total_matches": total,
     }))
+}
+
+/// Group BM25 search hits by parent Note.
+///
+/// For each note, picks the highest-scoring hit and collects matched
+/// heading/section titles. Returns at most `limit` note-level results
+/// sorted by best score.
+fn group_search_hits_by_note(
+    store: &GraphStore,
+    hits: &[nestweaver_store::SearchHit],
+    limit: usize,
+    concise: bool,
+) -> Vec<Value> {
+    use std::collections::HashMap;
+
+    struct NoteGroup {
+        note_uid: String,
+        best_score: f32,
+        best_title: String,
+        vault_uid: String,
+        matched_headings: Vec<String>,
+    }
+
+    let mut groups: HashMap<String, NoteGroup> = HashMap::new();
+    let mut note_order: Vec<String> = Vec::new();
+
+    for h in hits {
+        // Determine the parent note UID based on the hit kind.
+        let parent_note_uid = match h.kind.as_str() {
+            "note" => h.uid.clone(),
+            "heading" => store
+                .lookup_heading(&h.uid)
+                .map(|hd| hd.note_uid)
+                .unwrap_or_else(|_| h.uid.clone()),
+            "section" => store
+                .lookup_section(&h.uid)
+                .map(|s| s.note_uid)
+                .unwrap_or_else(|_| h.uid.clone()),
+            _ => h.uid.clone(),
+        };
+
+        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
+            note_order.push(parent_note_uid.clone());
+            NoteGroup {
+                note_uid: parent_note_uid.clone(),
+                best_score: 0.0,
+                best_title: String::new(),
+                vault_uid: h.vault_uid.clone(),
+                matched_headings: Vec::new(),
+            }
+        });
+
+        if h.score > group.best_score {
+            group.best_score = h.score;
+        }
+        if h.kind == "note" {
+            group.best_title = h.title.clone();
+        }
+        if h.kind == "heading" || h.kind == "section" {
+            group.matched_headings.push(h.title.clone());
+        }
+    }
+
+    // For groups that had no direct note title match, look up the note title.
+    for group in groups.values_mut() {
+        if group.best_title.is_empty() {
+            group.best_title = store
+                .lookup_note(&group.note_uid)
+                .map(|n| n.title)
+                .unwrap_or_else(|_| group.note_uid.clone());
+        }
+    }
+
+    // Sort by best_score descending, then take `limit`.
+    note_order.sort_by(|a, b| {
+        let sa = groups.get(a).map(|g| g.best_score).unwrap_or(0.0);
+        let sb = groups.get(b).map(|g| g.best_score).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    note_order
+        .iter()
+        .take(limit)
+        .filter_map(|nuid| groups.get(nuid))
+        .map(|g| {
+            if concise {
+                json!({
+                    "kind": "note",
+                    "title": g.best_title,
+                    "matched_headings": g.matched_headings,
+                })
+            } else {
+                json!({
+                    "uid": g.note_uid,
+                    "kind": "note",
+                    "title": g.best_title,
+                    "score": g.best_score,
+                    "vault_uid": g.vault_uid,
+                    "matched_headings": g.matched_headings,
+                })
+            }
+        })
+        .collect()
 }
 
 // ── 3. note_get ─────────────────────────────────────────────────────────────
@@ -2265,8 +2406,11 @@ fn tool_project_context(
         );
     }
 
-    // 6. Apply token budget.
-    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
+    // 6. Apply token budget: account for seed cost, allocate remainder to connected.
+    let seed_tokens: usize = result.seeds.iter().map(render_cost).sum();
+    let remaining_budget = token_budget.saturating_sub(seed_tokens);
+    let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget);
+    let used_tokens = seed_tokens + connected_tokens;
 
     // 7. Load external_refs from extension sidecar.
     let ext_store = load_extensions(&db_path);
