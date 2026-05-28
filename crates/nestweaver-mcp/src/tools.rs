@@ -2540,6 +2540,7 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         "total_symbols": result.total_symbols,
         "reachable_symbols": result.reachable_symbols,
         "unreachable_count": filtered.len(),
+        "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
         "min_confidence": min_conf_str,
         "unreachable_symbols": filtered,

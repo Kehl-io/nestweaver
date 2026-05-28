@@ -1030,6 +1030,7 @@ mod tests {
             ManifestInfo {
                 package_name: Some("@myorg/app".to_string()),
                 dependencies: vec!["@myorg/shared-types".to_string(), "react".to_string()],
+                entry_files: vec![],
             },
         );
         manifests.insert(
@@ -1037,6 +1038,7 @@ mod tests {
             ManifestInfo {
                 package_name: Some("@myorg/shared-types".to_string()),
                 dependencies: vec![],
+                entry_files: vec![],
             },
         );
 

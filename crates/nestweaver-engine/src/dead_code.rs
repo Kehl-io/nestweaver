@@ -6,10 +6,13 @@
 //! accounts for visibility: private unreachable symbols are
 //! high-confidence dead code; public ones could be library API.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use nestweaver_schema::SymbolKind;
 use nestweaver_store::GraphStore;
 use serde::Serialize;
+
+use crate::manifest::ManifestInfo;
 
 /// Confidence that a symbol is truly dead code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -63,6 +66,19 @@ pub struct DeadCodeResult {
     pub total_symbols: usize,
     pub reachable_symbols: usize,
     pub dead_percentage: f64,
+    /// Number of symbols excluded from analysis (type-only symbols, `.d.ts`
+    /// declarations, properties). These are not counted in `total_symbols`.
+    pub excluded_count: usize,
+}
+
+/// Returns `true` for symbols that should be excluded from dead code analysis
+/// because they are type-only constructs (erased at compile/runtime), live in
+/// `.d.ts` declaration files, or are properties (often accessed dynamically).
+fn is_excluded_from_dead_code(sym: &nestweaver_schema::Symbol) -> bool {
+    matches!(
+        sym.kind,
+        SymbolKind::TypeAlias | SymbolKind::Interface | SymbolKind::Property
+    ) || sym.file_path.ends_with(".d.ts")
 }
 
 /// Default minimum edge confidence for BFS traversal.
@@ -83,8 +99,13 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 ///    are reported as Medium confidence dead code instead of alive.
 /// 4. Any symbol not in the visited set is reported as unreachable.
 /// 5. Confidence is scored based on inferred visibility heuristics.
+/// 6. Methods of dead classes are deduplicated (only the class is reported).
+///
+/// If `manifests` is provided, symbols whose file paths match `main`, `bin`,
+/// or `exports` entries in a package.json manifest are treated as additional
+/// entry points.
 pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_with_confidence(store, DEFAULT_MIN_EDGE_CONFIDENCE)
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new())
 }
 
 /// Like [`detect_dead_code`] but with an explicit minimum edge confidence
@@ -95,10 +116,39 @@ pub fn detect_dead_code_with_confidence(
     store: &GraphStore,
     min_edge_confidence: f32,
 ) -> anyhow::Result<DeadCodeResult> {
-    // 1. Load all symbols.
-    let all_symbols = store
+    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new())
+}
+
+/// Like [`detect_dead_code`] but also accepts parsed manifest data so that
+/// symbols in manifest entry files (`main`, `bin`, `exports`) are treated as
+/// entry points.
+pub fn detect_dead_code_with_manifests(
+    store: &GraphStore,
+    manifests: &HashMap<String, ManifestInfo>,
+) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests)
+}
+
+/// Core implementation combining confidence-aware BFS with type exclusion,
+/// manifest-driven entry points, and dead-class method deduplication.
+fn detect_dead_code_inner(
+    store: &GraphStore,
+    min_edge_confidence: f32,
+    manifests: &HashMap<String, ManifestInfo>,
+) -> anyhow::Result<DeadCodeResult> {
+    // 1. Load all symbols and partition into analysable / excluded.
+    let raw_symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
+
+    let excluded_count = raw_symbols
+        .iter()
+        .filter(|s| is_excluded_from_dead_code(s))
+        .count();
+    let all_symbols: Vec<_> = raw_symbols
+        .into_iter()
+        .filter(|s| !is_excluded_from_dead_code(s))
+        .collect();
 
     if all_symbols.is_empty() {
         return Ok(DeadCodeResult {
@@ -106,6 +156,7 @@ pub fn detect_dead_code_with_confidence(
             total_symbols: 0,
             reachable_symbols: 0,
             dead_percentage: 0.0,
+            excluded_count,
         });
     }
 
@@ -117,8 +168,9 @@ pub fn detect_dead_code_with_confidence(
     // Build adjacency list: source -> [(target, confidence)].
     // Also add reverse MEMBER_OF edges (class -> member) so that when BFS
     // reaches a class, its members become reachable too.
-    let mut adjacency: std::collections::HashMap<String, Vec<(String, f32)>> =
-        std::collections::HashMap::new();
+    // Additionally, track class -> [member_uid] for dedup in step 6.
+    let mut adjacency: HashMap<String, Vec<(String, f32)>> = HashMap::new();
+    let mut class_members: HashMap<String, Vec<String>> = HashMap::new();
     for (src, dst, edge_type, confidence) in &typed_edges {
         let conf = *confidence as f32;
         adjacency
@@ -131,17 +183,38 @@ pub fn detect_dead_code_with_confidence(
                 .entry(dst.clone())
                 .or_default()
                 .push((src.clone(), conf));
+            // Track class -> [members] for dead-class dedup.
+            class_members
+                .entry(dst.clone())
+                .or_default()
+                .push(src.clone());
         }
     }
 
-    // 3. Identify entry points.
-    let entry_point_uids: Vec<String> = all_symbols
-        .iter()
-        .filter(|s| s.is_entry_point)
-        .map(|s| s.uid.clone())
+    // 3. Collect manifest entry file paths (normalized, no leading `./`).
+    let manifest_entry_files: HashSet<String> = manifests
+        .values()
+        .flat_map(|m| m.entry_files.iter())
+        .map(|p| p.strip_prefix("./").unwrap_or(p).to_string())
         .collect();
 
-    // 4. Confidence-aware BFS from all entry points.
+    // 4. Identify entry points (flag + manifest-driven).
+    let mut entry_point_uids: Vec<String> = Vec::new();
+    for sym in &all_symbols {
+        if sym.is_entry_point {
+            entry_point_uids.push(sym.uid.clone());
+            continue;
+        }
+        // Manifest-driven: exported symbols in manifest entry files.
+        if !manifest_entry_files.is_empty() {
+            let normalized = sym.file_path.strip_prefix("./").unwrap_or(&sym.file_path);
+            if manifest_entry_files.contains(normalized) {
+                entry_point_uids.push(sym.uid.clone());
+            }
+        }
+    }
+
+    // 5. Confidence-aware BFS from all entry points.
     //
     // Two-pass BFS:
     //   - `strong_visited`: symbols reachable via at least one path where
@@ -152,8 +225,7 @@ pub fn detect_dead_code_with_confidence(
     // We track the "max minimum confidence along any path" for each node.
     // If max_min >= WEAK_EDGE_THRESHOLD the symbol is strongly reachable;
     // otherwise it's weakly reachable.
-    let mut best_path_conf: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::new();
+    let mut best_path_conf: HashMap<String, f32> = HashMap::new();
     let mut queue: VecDeque<(String, f32)> = VecDeque::new();
 
     for uid in &entry_point_uids {
@@ -185,7 +257,7 @@ pub fn detect_dead_code_with_confidence(
         }
     }
 
-    // 5. Collect unreachable symbols with confidence scoring.
+    // 6. Collect unreachable symbols with confidence scoring.
     let total_symbols = all_symbols.len();
 
     // Symbols in best_path_conf with strong path confidence are truly reachable.
@@ -202,11 +274,37 @@ pub fn detect_dead_code_with_confidence(
         .map(|(uid, _)| uid)
         .collect();
 
-    let reachable_symbols = strong_reachable.len();
+    // Build a lookup: uid -> kind for dead-class dedup.
+    let kind_by_uid: HashMap<&str, SymbolKind> = all_symbols
+        .iter()
+        .map(|s| (s.uid.as_str(), s.kind))
+        .collect();
+
+    // Find unreachable class UIDs so we can suppress their members.
+    let unreachable_class_uids: HashSet<&str> = all_symbols
+        .iter()
+        .filter(|s| !strong_reachable.contains(&s.uid) && s.kind == SymbolKind::Class)
+        .map(|s| s.uid.as_str())
+        .collect();
+
+    // Collect member UIDs of dead classes (to suppress from the unreachable list).
+    let suppressed_member_uids: HashSet<String> = unreachable_class_uids
+        .iter()
+        .flat_map(|cls_uid| class_members.get(*cls_uid).cloned().unwrap_or_default())
+        .filter(|member_uid| {
+            // Only suppress if the member is actually a Method and is also unreachable.
+            kind_by_uid.get(member_uid.as_str()) == Some(&SymbolKind::Method)
+                && !strong_reachable.contains(member_uid)
+        })
+        .collect();
 
     let mut unreachable_symbols: Vec<UnreachableSymbol> = Vec::new();
     for sym in &all_symbols {
         if strong_reachable.contains(&sym.uid) {
+            continue;
+        }
+        // Suppress methods of dead classes — the class itself is reported.
+        if suppressed_member_uids.contains(&sym.uid) {
             continue;
         }
 
@@ -239,6 +337,8 @@ pub fn detect_dead_code_with_confidence(
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    let reachable_symbols = total_symbols - unreachable_symbols.len();
+
     let dead_percentage = if total_symbols > 0 {
         (unreachable_symbols.len() as f64 / total_symbols as f64) * 100.0
     } else {
@@ -250,6 +350,7 @@ pub fn detect_dead_code_with_confidence(
         total_symbols,
         reachable_symbols,
         dead_percentage,
+        excluded_count,
     })
 }
 
@@ -317,6 +418,37 @@ mod tests {
         }
     }
 
+    fn make_symbol_with_kind(
+        uid: &str,
+        name: &str,
+        kind: SymbolKind,
+        file_path: &str,
+        is_entry: bool,
+    ) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind,
+            repo_uid: "repo-1".to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.5),
+            is_entry_point: is_entry,
+            entry_point_kind: if is_entry {
+                Some(nestweaver_schema::EntryPointKind::Main)
+            } else {
+                None
+            },
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+        }
+    }
+
     #[test]
     fn empty_graph_returns_empty_result() {
         let store = GraphStore::in_memory().unwrap();
@@ -324,6 +456,7 @@ mod tests {
         assert_eq!(result.total_symbols, 0);
         assert_eq!(result.reachable_symbols, 0);
         assert!(result.unreachable_symbols.is_empty());
+        assert_eq!(result.excluded_count, 0);
     }
 
     #[test]
@@ -597,6 +730,8 @@ mod tests {
         );
     }
 
+    // ── Confidence-aware BFS tests ──
+
     #[test]
     fn low_confidence_edges_are_skipped_below_threshold() {
         let store = GraphStore::in_memory().unwrap();
@@ -768,6 +903,285 @@ mod tests {
         let result = detect_dead_code(&store).unwrap();
         // target should be strongly reachable via the strong path (min 0.8 >= 0.5)
         assert_eq!(result.reachable_symbols, 3);
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    // ── Type exclusion tests ──
+
+    #[test]
+    fn type_alias_excluded_from_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "alias",
+                "MyType",
+                SymbolKind::TypeAlias,
+                "src/types.ts",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.excluded_count, 1);
+        // TypeAlias should not appear in total_symbols or unreachable.
+        assert_eq!(result.total_symbols, 1);
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    #[test]
+    fn interface_excluded_from_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "iface",
+                "IUser",
+                SymbolKind::Interface,
+                "src/types.ts",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.excluded_count, 1);
+        assert_eq!(result.total_symbols, 1);
+    }
+
+    #[test]
+    fn property_excluded_from_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "prop",
+                "name",
+                SymbolKind::Property,
+                "src/model.ts",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.excluded_count, 1);
+        assert_eq!(result.total_symbols, 1);
+    }
+
+    #[test]
+    fn d_ts_symbols_excluded_from_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        // A function in a .d.ts file should be excluded.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "decl",
+                "fetchData",
+                SymbolKind::Function,
+                "src/api.d.ts",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.excluded_count, 1);
+        assert_eq!(result.total_symbols, 1);
+    }
+
+    // ── Dead class method dedup tests ──
+
+    #[test]
+    fn dead_class_methods_not_double_counted() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+
+        // Dead class with two methods.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "cls",
+                "DeadClass",
+                SymbolKind::Class,
+                "src/dead.ts",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "m1",
+                "methodA",
+                SymbolKind::Method,
+                "src/dead.ts",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "m2",
+                "methodB",
+                SymbolKind::Method,
+                "src/dead.ts",
+                false,
+            ))
+            .unwrap();
+
+        // m1 --MEMBER_OF--> cls, m2 --MEMBER_OF--> cls
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "m1".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::MemberOf,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "m2".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::MemberOf,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        // Only the class should be in unreachable, not its methods.
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "DeadClass");
+        assert_eq!(result.unreachable_symbols[0].kind, "Class");
+    }
+
+    #[test]
+    fn reachable_class_methods_not_suppressed() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry -> cls (reachable class), method is MEMBER_OF cls
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "cls",
+                "LiveClass",
+                SymbolKind::Class,
+                "src/live.ts",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "m1",
+                "methodA",
+                SymbolKind::Method,
+                "src/live.ts",
+                false,
+            ))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "m1".to_string(),
+                target_uid: "cls".to_string(),
+                edge_type: EdgeType::MemberOf,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        // Class is reachable, BFS reaches method via reverse MEMBER_OF.
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    // ── Manifest-driven entry point tests ──
+
+    #[test]
+    fn manifest_entry_files_mark_symbols_as_entry_points() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // No explicit entry point, but the symbol's file is a manifest entry.
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "lib",
+                "libMain",
+                SymbolKind::Function,
+                "src/index.ts",
+                false,
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "orphan",
+                "orphanFn",
+                SymbolKind::Function,
+                "src/utils.ts",
+                false,
+            ))
+            .unwrap();
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "repo-1".to_string(),
+            ManifestInfo {
+                package_name: Some("my-pkg".to_string()),
+                dependencies: vec![],
+                entry_files: vec!["./src/index.ts".to_string()],
+            },
+        );
+
+        let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
+        assert_eq!(result.total_symbols, 2);
+        // libMain should be reachable (manifest entry), orphanFn should not.
+        assert_eq!(result.reachable_symbols, 1);
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "orphanFn");
+    }
+
+    #[test]
+    fn manifest_entry_file_without_leading_dot_slash() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "bin",
+                "cliMain",
+                SymbolKind::Function,
+                "bin/cli.js",
+                false,
+            ))
+            .unwrap();
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "repo-1".to_string(),
+            ManifestInfo {
+                package_name: Some("my-cli".to_string()),
+                dependencies: vec![],
+                entry_files: vec!["bin/cli.js".to_string()],
+            },
+        );
+
+        let result = detect_dead_code_with_manifests(&store, &manifests).unwrap();
+        assert_eq!(result.reachable_symbols, 1);
         assert!(result.unreachable_symbols.is_empty());
     }
 }
