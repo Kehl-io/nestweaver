@@ -977,20 +977,68 @@ fn render_brain_node(
             Err(e) => Err(anyhow::anyhow!(e)),
         }
     } else if uid.starts_with("head:") {
-        // Headings don't have a direct lookup yet — synthesise minimal info.
+        // Look up the Heading node for its text; fall back to UID.
+        let (title, location) = match store.lookup_heading(uid) {
+            Ok(h) => {
+                let parent_path = store
+                    .lookup_note(&h.note_uid)
+                    .map(|n| n.file_path)
+                    .unwrap_or_default();
+                (h.text, parent_path)
+            }
+            Err(_) => (uid.to_string(), String::new()),
+        };
         Ok(Some(BrainNode {
             uid: uid.to_string(),
             kind: "Heading".to_string(),
-            title: uid.to_string(),
-            location: String::new(),
+            title,
+            location,
             relevance: score,
         }))
     } else if uid.starts_with("sec:") {
+        // Look up the Section node and derive a readable title from the
+        // parent note title + section body preview.
+        let (title, location) = match store.lookup_section(uid) {
+            Ok(sec) => {
+                let parent_note = store.lookup_note(&sec.note_uid).ok();
+                let heading_text = sec
+                    .heading_uid
+                    .as_deref()
+                    .and_then(|h_uid| store.lookup_heading(h_uid).ok())
+                    .map(|h| h.text);
+
+                let title = if let Some(heading) = heading_text {
+                    heading
+                } else {
+                    // No heading -- build "{parent_note_title} -- {first_60_chars}..."
+                    let note_title = parent_note
+                        .as_ref()
+                        .map(|n| n.title.as_str())
+                        .unwrap_or("Untitled");
+                    let body_preview: String = sec
+                        .text_content
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
+                        .replace('\n', " ");
+                    let ellipsis = if sec.text_content.len() > 60 {
+                        "..."
+                    } else {
+                        ""
+                    };
+                    format!("{note_title} \u{2014} {body_preview}{ellipsis}")
+                };
+
+                let loc = parent_note.map(|n| n.file_path).unwrap_or_default();
+                (title, loc)
+            }
+            Err(_) => (uid.to_string(), String::new()),
+        };
         Ok(Some(BrainNode {
             uid: uid.to_string(),
             kind: "Section".to_string(),
-            title: uid.to_string(),
-            location: String::new(),
+            title,
+            location,
             relevance: score,
         }))
     } else if uid.starts_with("tag:") {

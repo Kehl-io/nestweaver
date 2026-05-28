@@ -912,6 +912,38 @@ impl GraphStore {
         }
     }
 
+    /// Look up a single Section by UID.
+    pub fn lookup_section(&self, uid: &str) -> Result<Section, StoreError> {
+        let conn = self.conn()?;
+        let q = format!("MATCH (s:Section {{uid: $uid}}) RETURN {SECTION_COLUMNS}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => row_to_section(&row),
+            None => Err(StoreError::NotFound),
+        }
+    }
+
+    /// Look up a single Heading by UID.
+    pub fn lookup_heading(&self, uid: &str) -> Result<Heading, StoreError> {
+        let conn = self.conn()?;
+        let q = format!("MATCH (h:Heading {{uid: $uid}}) RETURN {HEADING_COLUMNS}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => row_to_heading(&row),
+            None => Err(StoreError::NotFound),
+        }
+    }
+
     /// Returns every File node whose `repo_uid` matches `repo_uid`.
     /// Each row is `(file_uid, file_path)`.
     pub fn list_files_by_repo(&self, repo_uid: &str) -> Result<Vec<(String, String)>, StoreError> {
