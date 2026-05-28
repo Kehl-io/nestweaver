@@ -479,6 +479,12 @@ enum Commands {
             help = "Expose only 6 core tools (for tools with limited tool slots like Cursor)"
         )]
         lite: bool,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated list of tool names to expose (default: all)"
+        )]
+        tools: Option<Vec<String>>,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -2382,10 +2388,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             allow_mcp_add_sources,
             lite,
+            tools: tool_allowlist,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            // The server runs until the client closes stdin. Errors bubble
-            // up as an EXIT_ERROR; clean EOF exits 0.
+            if let Some(ref allowed) = tool_allowlist {
+                nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
+            }
             nestweaver_mcp::run_stdio_server(&db_path, allow_mcp_add_sources, lite)
                 .context("mcp server")?;
             Ok((EXIT_SUCCESS, None))
