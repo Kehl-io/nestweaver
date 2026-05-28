@@ -29,6 +29,13 @@ pub struct HubNode {
 /// degree for each symbol, attaches PageRank scores from the in-memory
 /// cache, and optionally attaches cluster IDs from a cached clustering
 /// result. Returns the top-N by total degree descending.
+///
+/// **Performance note**: PageRank scores are read from the in-memory cache
+/// (fast). The bottleneck is `load_code_symbols_and_edges` which loads all
+/// symbols and edges from the database to compute degree counts. On large
+/// graphs (80K+ symbols), this takes ~500-700ms, dominated by DB I/O.
+/// Degree counts require the full edge set and cannot use the PageRank
+/// cache (which stores centrality, not in/out degree).
 pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> {
     let (symbols, edges) = store
         .load_code_symbols_and_edges()
