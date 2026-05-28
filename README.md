@@ -19,8 +19,8 @@
 
 <p align="center">
   NestWeaver parses 32 languages, resolves cross-file references with confidence scoring,<br>
-  and gives agents precomputed answers about symbols, dependencies, and call graphs —<br>
-  no source reading required.
+  and gives agents precomputed answers about symbols, dependencies, call graphs,<br>
+  type usage, and field access — no source reading required.
 </p>
 
 ---
@@ -38,7 +38,7 @@
 <td width="50%" valign="top">
 
 **32 Languages**<br>
-Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more.
+Tree-sitter parsing for JS, TS, Go, Python, Rust, Java, C/C++, Lua, Scala, Elixir, Zig, Vue, Svelte, and 19 more. Tracks CALLS, IMPORTS, USES, and ACCESSES edges. Resolves monorepo workspaces and tsconfig path aliases.
 
 </td>
 <td width="50%" valign="top">
@@ -52,7 +52,7 @@ Index Obsidian vaults alongside code. Unified knowledge graph across notes and s
 <td width="50%" valign="top">
 
 **Intent-Aware Context**<br>
-Personalized PageRank with `--intent` tuning surfaces exactly the symbols relevant to your task.
+Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES) and `--intent` tuning surfaces exactly the symbols relevant to your task.
 
 </td>
 <td width="50%" valign="top">
@@ -66,7 +66,7 @@ Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mod
 <td width="50%" valign="top">
 
 **PR Impact & Dead Code**<br>
-PR blast radius with risk scoring, dead code detection, hub/bridge analysis, and graph export.
+PR blast radius with risk scoring; confidence-aware dead code detection with type exclusion and manifest-driven entry points; hub/bridge analysis and graph export.
 
 </td>
 <td width="50%" valign="top">
@@ -216,7 +216,7 @@ cargo build --release
 <details>
 <summary>Markdown Brain</summary>
 
-Index Obsidian vaults and markdown directories alongside your code. NestWeaver builds a unified knowledge graph that connects notes, sections, and tags to code symbols — letting you query across both worlds.
+Index Obsidian vaults and markdown directories alongside your code. NestWeaver builds a unified knowledge graph that connects notes, sections, and tags to code symbols — letting you query across both worlds. Wiki/HTML content is auto-converted to markdown during ingestion. Use `.brainignore` for glob exclusion patterns or `--ignore` for ad-hoc filtering.
 
 ```sh
 # Add a vault to the knowledge graph
@@ -273,9 +273,10 @@ NestWeaver exposes 22 tools via the [Model Context Protocol](https://modelcontex
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
+nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
 ```
 
-Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Point any MCP client at the server to get started.
+Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Use `--tools` to expose only the tools you need. Point any MCP client at the server to get started.
 
 ## Web UI
 
@@ -298,7 +299,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080
 |-------|-------------|
 | `nestweaver-schema` | Node/edge types, UIDs, confidence scoring, schema versioning |
 | `nestweaver-parser` | Tree-sitter + regex parsing for 32 languages |
-| `nestweaver-resolver` | Cross-file symbol resolution with import graphs |
+| `nestweaver-resolver` | Cross-file symbol resolution with import graphs, monorepo workspace packages, and tsconfig path aliases |
 | `nestweaver-store` | LadybugDB graph store, PageRank, hybrid search |
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
 | `nestweaver-engine` | Indexing pipeline, query dispatch, config, snapshots, LLM integration |
