@@ -183,6 +183,8 @@ cargo build --release
 |---------|-------------|
 | `list-projects` | List all projects defined in the instance config |
 | `project-context` | Get context scoped to a specific project |
+| `materialize-projects` | Materialize declared projects, wiki sources, and cross-repo links from instance config |
+| `detect-implicit-projects` | Detect implicit projects from vault structure and code patterns |
 | `suggest-links` | Discover potential cross-repo links between symbols |
 | `list-links` | List all cross-repo links in the instance |
 | `list-features` | List features spanning multiple repositories |
