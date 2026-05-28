@@ -34,6 +34,7 @@ nestweaver summary --level symbol        # hierarchical code summaries (symbol/f
 # Graph analysis
 nestweaver hubs                          # most connected hub nodes (degree centrality + PageRank)
 nestweaver bridges                       # architectural chokepoints (betweenness centrality)
+nestweaver clusters                      # functional communities (adaptive resolution: 0.3 for >10K symbols, 0.5 default)
 nestweaver pr-impact                     # PR blast radius with risk scoring (Low/Medium/High)
 nestweaver dead-code                     # detect unreachable symbols via entry point reachability
 
