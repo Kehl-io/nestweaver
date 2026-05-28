@@ -262,7 +262,7 @@ fn reindex_file(
     store: &GraphStore,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol, parse_source};
-    use nestweaver_resolver::resolve_references;
+    use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
     use sha2::{Digest, Sha256};
 
@@ -344,12 +344,27 @@ fn reindex_file(
 
     // Resolve cross-file edges within this file.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
+
+    // Load workspace context for JS/TS monorepo resolution.
+    let workspace_ctx = if matches!(
+        lang,
+        nestweaver_schema::Language::JavaScript
+            | nestweaver_schema::Language::TypeScript
+            | nestweaver_schema::Language::Vue
+            | nestweaver_schema::Language::Svelte
+            | nestweaver_schema::Language::Astro
+    ) {
+        discover_workspace_context(repo_root)
+    } else {
+        Default::default()
+    };
+
     let file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = vec![(
         rel_str.clone(),
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges = resolve_references(&file_data, lang, r_uid);
+    let resolved_edges = resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))

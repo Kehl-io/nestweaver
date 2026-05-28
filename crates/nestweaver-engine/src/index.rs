@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{RawReference, RawSymbol, SkippedFile, detect_language, parse_source};
-use nestweaver_resolver::resolve_references;
+use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, file_uid, repo_uid, service_uid, symbol_uid,
 };
@@ -614,7 +614,26 @@ fn index_into_store(
             .unwrap_or(Language::JavaScript)
     };
 
-    let resolved_edges = resolve_references(&parsed_files_for_resolver, language, &r_uid);
+    // Load workspace context (monorepo packages + tsconfig aliases) for JS/TS resolution.
+    let workspace_ctx = if matches!(
+        language,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    ) {
+        discover_workspace_context(repo_path)
+    } else {
+        Default::default()
+    };
+
+    let resolved_edges = resolve_references_with_context(
+        &parsed_files_for_resolver,
+        language,
+        &r_uid,
+        &workspace_ctx,
+    );
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
     let insertable_edges: Vec<_> = resolved_edges
@@ -916,7 +935,7 @@ fn process_added_or_modified_file(
     store: &nestweaver_store::GraphStore,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
-    use nestweaver_resolver::resolve_references;
+    use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
 
     let abs_path = repo_path.join(rel_path);
@@ -1000,12 +1019,26 @@ fn process_added_or_modified_file(
     let lang = nestweaver_parser::detect_language(&abs_path)
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
+    // Load workspace context for JS/TS monorepo resolution.
+    let workspace_ctx = if matches!(
+        lang,
+        nestweaver_schema::Language::JavaScript
+            | nestweaver_schema::Language::TypeScript
+            | nestweaver_schema::Language::Vue
+            | nestweaver_schema::Language::Svelte
+            | nestweaver_schema::Language::Astro
+    ) {
+        discover_workspace_context(repo_path)
+    } else {
+        Default::default()
+    };
+
     let file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = vec![(
         rel_str.clone(),
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges = resolve_references(&file_data, lang, r_uid);
+    let resolved_edges = resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
