@@ -626,8 +626,8 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
 }
 
 fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // ~ "title  [kind]  location" / 4 — matches the CLI's estimate.
-    (n.title.len() + n.kind.len() + n.location.len() + 16).div_ceil(4)
+    // Include UID length + JSON overhead (keys, quotes, braces, commas)
+    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 60).div_ceil(4)
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
@@ -1247,18 +1247,26 @@ fn tool_brain_status(
                     "no extension-store timestamp; falling back to max(modified_at)"
                 );
             }
-            let last_indexed = ext_ts.or_else(|| {
-                notes
+            let (last_indexed, last_indexed_source) = if let Some(ts) = ext_ts {
+                (Some(ts), "extension_store")
+            } else {
+                let fallback = notes
                     .iter()
                     .filter_map(|n| n.modified_at.as_deref())
                     .max()
-                    .map(|s| s.to_string())
-            });
+                    .map(|s| s.to_string());
+                if fallback.is_some() {
+                    (fallback, "file_mtime")
+                } else {
+                    (None, "none")
+                }
+            };
             json!({
                 "name": v.name,
                 "root_path": v.root_path,
                 "note_count": note_count,
                 "last_indexed": last_indexed,
+                "last_indexed_source": last_indexed_source,
             })
         })
         .collect();

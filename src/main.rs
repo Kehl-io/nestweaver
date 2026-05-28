@@ -247,6 +247,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// List all services/modules in the graph
     ListServices {
@@ -340,6 +342,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Generate a structural skeleton ranked by symbol importance
     ///
@@ -603,6 +607,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Show architectural bridge/chokepoint nodes in the code graph
     ///
@@ -620,6 +626,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// List detected code communities (Leiden clustering)
     ///
@@ -642,6 +650,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Generate hierarchical code summaries for token-efficient retrieval
     ///
@@ -745,6 +755,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
         /// ISO 8601 timestamp. Only return Note/Section nodes modified after this time.
         /// Symbol nodes are always kept.
         #[arg(
@@ -974,6 +986,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Watch a vault directory for changes and keep the brain in sync.
     /// Runs in the foreground; Ctrl-C stops it cleanly. On each .md save
@@ -1067,6 +1081,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Unified PPR context across code + notes. Seeds may be note titles,
     /// tag names (with or without #), symbol names, or any UID
@@ -1091,6 +1107,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
         /// Filter results to nodes whose kind starts with one of these values
         /// (e.g. Symbol, Note, Section, Tag, Heading).
         #[arg(
@@ -1469,7 +1487,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
     match cli.command {
-        Commands::ListRepos { instance, json, db } => {
+        Commands::ListRepos {
+            instance,
+            json,
+            db,
+            config: _,
+        } => {
             let store = open_store(db.as_deref())?;
             let repos = list_repos(&store, instance.as_deref())?;
 
@@ -1953,7 +1976,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
-        Commands::Hubs { top, json, db } => {
+        Commands::Hubs {
+            top,
+            json,
+            db,
+            config: _,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
 
@@ -1990,7 +2018,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
-        Commands::Bridges { top, json, db } => {
+        Commands::Bridges {
+            top,
+            json,
+            db,
+            config: _,
+        } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
 
@@ -2101,6 +2134,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             resolution,
             json,
             db,
+            config: _,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
@@ -2806,6 +2840,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
             repo: repo_filter,
+            config: _,
             ..
         } => {
             let store = open_store(db.as_deref())?;
@@ -2973,6 +3008,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             include_components,
             json,
             db,
+            config: _,
             since,
             recency_weight,
             recency_half_life_days,
@@ -3710,7 +3746,11 @@ fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
 
-        BrainCommands::Status { json, db } => {
+        BrainCommands::Status {
+            json,
+            db,
+            config: _,
+        } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
@@ -4121,6 +4161,7 @@ fn run_brain(
             limit,
             json,
             db,
+            config: _,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
@@ -4257,6 +4298,7 @@ fn run_brain(
             limit,
             json,
             db,
+            config: _,
             kinds,
             repos,
             vaults,
@@ -4615,16 +4657,10 @@ fn apply_recency_bias_cli(
 }
 
 /// Rough token cost of rendering a single BrainNode line (chars / 4).
+/// Aligned with the MCP render_cost to avoid CLI vs MCP divergence.
 fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
-    // Match the human-readable format below: "  0.1234  TITLE  [KIND]  LOCATION\n"
-    let chars = 8 // "  0.XXXX  "
-        + n.title.len()
-        + 3 // "  ["
-        + n.kind.len()
-        + 1 // "]"
-        + if n.location.is_empty() { 0 } else { 2 + n.location.len() } // "  LOCATION"
-        + 1; // "\n"
-    chars.div_ceil(4)
+    // Include UID length + JSON overhead (keys, quotes, braces, commas)
+    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 60).div_ceil(4)
 }
 
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
