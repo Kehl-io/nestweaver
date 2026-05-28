@@ -200,9 +200,10 @@ pub struct GraphScope {
 }
 
 impl GraphScope {
-    /// The original PPR scope: Symbol nodes + the six code edge types
-    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF, INCLUDES_SYM).
-    /// Edge confidence is returned as the third column to weight PPR transitions.
+    /// The original PPR scope: Symbol nodes + the eight code edge types
+    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF, INCLUDES_SYM,
+    /// USES, ACCESSES). Edge confidence is returned as the third column to
+    /// weight PPR transitions.
     pub fn code_only() -> Self {
         let code_edge_types = [
             EdgeType::Calls,
@@ -211,6 +212,8 @@ impl GraphScope {
             EdgeType::Implements,
             EdgeType::MemberOf,
             EdgeType::Includes,
+            EdgeType::Uses,
+            EdgeType::Accesses,
         ];
         Self {
             node_queries: vec!["MATCH (s:Symbol) RETURN s.uid".to_string()],
@@ -433,18 +436,44 @@ impl GraphStore {
             intent.map_or(1.0, |i| i.project_includes_weight_multiplier());
         let mut forward_edges: Vec<(usize, usize, f64)> = Vec::new();
         for q in &scope.edge_queries {
-            // Detect whether this query fetches CALLS edges so we can
-            // apply the intent-aware weight multiplier.
+            // Detect edge type from the query string to apply type-aware
+            // base weights and intent multipliers.
+            //
+            // Base weights model coupling strength:
+            //   CALLS          1.0  — direct invocation is strongest coupling
+            //   EXTENDS/IMPL   0.9  — inheritance is near-call coupling
+            //   IMPORTS         0.7  — dependency without call detail
+            //   USES            0.5  — type reference is real but weaker
+            //   ACCESSES        0.4  — field access is medium coupling
+            //   MEMBER_OF etc.  0.2  — structural containment
+            //
+            // Intent multipliers are layered on top of the base weight.
+            let base_weight = if q.contains(":CALLS]") {
+                1.0
+            } else if q.contains(":EXTENDS_SYM]") || q.contains(":IMPLEMENTS_SYM]") {
+                0.9
+            } else if q.contains(":IMPORTS]") {
+                0.7
+            } else if q.contains(":USES]") {
+                0.5
+            } else if q.contains(":ACCESSES]") {
+                0.4
+            } else if q.contains(":MEMBER_OF]") || q.contains(":INCLUDES_SYM]") {
+                0.2
+            } else {
+                1.0
+            };
             let is_calls_query = q.contains(":CALLS]");
             let is_project_includes_query =
                 q.contains(":PROJECT_INCLUDES_NOTE") || q.contains(":PROJECT_INCLUDES_SYMBOL");
-            let edge_multiplier = if is_calls_query {
+            let intent_multiplier = if is_calls_query {
                 calls_multiplier
             } else if is_project_includes_query {
                 project_includes_multiplier
             } else {
                 1.0
             };
+            let edge_multiplier = base_weight * intent_multiplier;
 
             let rows = match conn.query(q) {
                 Ok(r) => r,

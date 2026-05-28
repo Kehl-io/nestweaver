@@ -45,3 +45,21 @@
 ; Decorator references
 (decorator
   (identifier) @name) @reference.call
+
+; ── Type references (USES edges) ────────────────────────────────────
+; Parameter type annotation: def foo(x: MyType)
+(typed_parameter
+  type: (type) @name) @reference.type_ref
+
+; Return type annotation: def foo() -> MyType:
+(function_definition
+  return_type: (type) @name) @reference.type_ref
+
+; Variable type annotation: x: MyType = ...
+(type
+  (identifier) @name) @reference.type_ref
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Attribute read: obj.field
+(attribute
+  attribute: (identifier) @name) @reference.read_access

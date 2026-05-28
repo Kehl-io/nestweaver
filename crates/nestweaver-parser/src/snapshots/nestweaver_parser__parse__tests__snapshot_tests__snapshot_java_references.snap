@@ -10,22 +10,78 @@ expression: "parsed_references(\"Simple.java\", &source)"
   kind: Import
   start_line: 2
   context: import java.util.List;
+- name: String
+  kind: TypeRef
+  start_line: 5
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 5
+  context: (String name)
+- name: String
+  kind: TypeRef
+  start_line: 6
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 6
+  context: (String name)
 - name: Greeter
   kind: Implements
   start_line: 9
   context: "public class SimpleGreeter implements Greeter {"
+- name: String
+  kind: TypeRef
+  start_line: 10
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 12
+  context: (String prefix)
+- name: prefix
+  kind: ReadAccess
+  start_line: 13
+  context: this.prefix = prefix
 - name: Override
   kind: Call
   start_line: 16
   context: "@Override"
+- name: String
+  kind: TypeRef
+  start_line: 16
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 17
+  context: (String name)
 - name: Override
   kind: Call
   start_line: 21
   context: "@Override"
+- name: String
+  kind: TypeRef
+  start_line: 21
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 22
+  context: (String name)
+- name: SimpleGreeter
+  kind: TypeRef
+  start_line: 27
+  context: "{"
+- name: String
+  kind: TypeRef
+  start_line: 28
+  context: "{"
 - name: greet
   kind: Call
   start_line: 28
   context: "result = greeter.greet(\"world\")"
+- name: out
+  kind: ReadAccess
+  start_line: 29
+  context: System.out.println(result)
 - name: println
   kind: Call
   start_line: 29

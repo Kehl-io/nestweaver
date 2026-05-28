@@ -429,6 +429,26 @@ impl GraphStore {
                     ("conf", lbug::Value::Double(conf)),
                 ],
             ),
+            EdgeType::Uses => exec_params(
+                conn,
+                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
+                 CREATE (a)-[:USES {confidence: $conf}]->(b)",
+                vec![
+                    ("src", lbug::Value::String(src)),
+                    ("tgt", lbug::Value::String(tgt)),
+                    ("conf", lbug::Value::Double(conf)),
+                ],
+            ),
+            EdgeType::Accesses => exec_params(
+                conn,
+                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
+                 CREATE (a)-[:ACCESSES {confidence: $conf}]->(b)",
+                vec![
+                    ("src", lbug::Value::String(src)),
+                    ("tgt", lbug::Value::String(tgt)),
+                    ("conf", lbug::Value::Double(conf)),
+                ],
+            ),
             EdgeType::MemberOf => exec_params(
                 conn,
                 "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
@@ -588,6 +608,26 @@ impl GraphStore {
                 EdgeType::Includes => {
                     let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
                                CREATE (a)-[:INCLUDES_SYM {confidence: $conf}]->(b)"
+                        .to_string();
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ]);
+                }
+                EdgeType::Uses => {
+                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
+                               CREATE (a)-[:USES {confidence: $conf}]->(b)"
+                        .to_string();
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ]);
+                }
+                EdgeType::Accesses => {
+                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
+                               CREATE (a)-[:ACCESSES {confidence: $conf}]->(b)"
                         .to_string();
                     groups.entry(key).or_default().push(vec![
                         ("src", lbug::Value::String(src)),
@@ -1374,7 +1414,7 @@ impl GraphStore {
 
     /// Delete all Symbol nodes that belong to a specific file (matching both
     /// `repo_uid` AND `file_path`). Uses `DETACH DELETE` so all incident edges
-    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, MEMBER_OF,
+    /// (CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, USES, ACCESSES, MEMBER_OF,
     /// FILE_HAS_SYMBOL, CROSS_REPO_LINK, REFERENCES_CODE_*) are automatically
     /// removed. Returns the count of deleted symbols.
     pub fn delete_symbols_in_file(

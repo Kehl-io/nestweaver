@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1894
 expression: "parsed_references(\"simple.py\", &source)"
 ---
 - name: ".utils"
@@ -19,10 +18,22 @@ expression: "parsed_references(\"simple.py\", &source)"
   kind: Call
   start_line: 14
   context: "@decorator_factory(\">>> \")"
+- name: name
+  kind: ReadAccess
+  start_line: 20
+  context: self.name = name
+- name: name
+  kind: ReadAccess
+  start_line: 23
+  context: "{self.name}"
 - name: Animal
   kind: Extends
   start_line: 25
   context: from .utils import helper
+- name: name
+  kind: ReadAccess
+  start_line: 27
+  context: "{self.name}"
 - name: Dog
   kind: Call
   start_line: 30
@@ -31,12 +42,20 @@ expression: "parsed_references(\"simple.py\", &source)"
   kind: Call
   start_line: 31
   context: result = dog.speak()
+- name: speak
+  kind: ReadAccess
+  start_line: 31
+  context: dog.speak()
 - name: standalone_function
   kind: Call
   start_line: 32
   context: "standalone_function(\"world\")"
 - name: getcwd
   kind: Call
+  start_line: 33
+  context: os.getcwd()
+- name: getcwd
+  kind: ReadAccess
   start_line: 33
   context: os.getcwd()
 - name: main

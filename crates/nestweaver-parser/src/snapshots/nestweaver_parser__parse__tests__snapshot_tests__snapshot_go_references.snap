@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1922
 expression: "parsed_references(\"simple.go\", &source)"
 ---
 - name: fmt
@@ -11,16 +10,80 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Import
   start_line: 5
   context: (
+- name: string
+  kind: TypeRef
+  start_line: 9
+  context: (name string)
+- name: string
+  kind: TypeRef
+  start_line: 10
+  context: (name string)
+- name: string
+  kind: TypeRef
+  start_line: 14
+  context: "{"
+- name: ConsoleGreeter
+  kind: TypeRef
+  start_line: 17
+  context: g *ConsoleGreeter
+- name: string
+  kind: TypeRef
+  start_line: 17
+  context: (name string)
+- name: string
+  kind: TypeRef
+  start_line: 17
+  context: package main
+- name: Prefix
+  kind: ReadAccess
+  start_line: 18
+  context: "(\"%s Hello, %s!\", g.Prefix, name)"
 - name: Sprintf
   kind: Call
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
 - name: Sprintf
+  kind: ReadAccess
+  start_line: 18
+  context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
+- name: ConsoleGreeter
+  kind: TypeRef
+  start_line: 21
+  context: g *ConsoleGreeter
+- name: string
+  kind: TypeRef
+  start_line: 21
+  context: (name string)
+- name: string
+  kind: TypeRef
+  start_line: 21
+  context: package main
+- name: Prefix
+  kind: ReadAccess
+  start_line: 22
+  context: "(\"%s Goodbye, %s!\", g.Prefix, name)"
+- name: Sprintf
   kind: Call
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
+- name: Sprintf
+  kind: ReadAccess
+  start_line: 22
+  context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
+- name: Greeter
+  kind: TypeRef
+  start_line: 25
+  context: package main
+- name: string
+  kind: TypeRef
+  start_line: 25
+  context: (prefix string)
 - name: TrimSpace
   kind: Call
+  start_line: 26
+  context: strings.TrimSpace(prefix)
+- name: TrimSpace
+  kind: ReadAccess
   start_line: 26
   context: strings.TrimSpace(prefix)
 - name: NewGreeter
@@ -31,7 +94,15 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 31
   context: "greeter.Greet(\"world\")"
+- name: Greet
+  kind: ReadAccess
+  start_line: 31
+  context: "greeter.Greet(\"world\")"
 - name: Println
   kind: Call
+  start_line: 32
+  context: fmt.Println(result)
+- name: Println
+  kind: ReadAccess
   start_line: 32
   context: fmt.Println(result)

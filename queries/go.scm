@@ -65,3 +65,37 @@
 ; Import specs
 (import_spec
   path: (interpreted_string_literal) @name) @reference.import
+
+; ── Type references (USES edges) ────────────────────────────────────
+; Parameter type: func foo(x MyType)
+(parameter_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Return type: func foo() MyType
+(function_declaration
+  result: (type_identifier) @name) @reference.type_ref
+
+; Method return type
+(method_declaration
+  result: (type_identifier) @name) @reference.type_ref
+
+; Struct field type: FieldName MyType
+(field_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Var/const type: var x MyType
+(var_spec
+  type: (type_identifier) @name) @reference.type_ref
+
+; Pointer type: *MyType
+(pointer_type
+  (type_identifier) @name) @reference.type_ref
+
+; Slice type: []MyType
+(slice_type
+  element: (type_identifier) @name) @reference.type_ref
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Selector expression: obj.Field
+(selector_expression
+  field: (field_identifier) @name) @reference.read_access

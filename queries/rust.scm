@@ -81,3 +81,33 @@
 ; Trait implementations as extends
 (impl_item
   trait: (type_identifier) @name) @reference.extends
+
+; ── Type references (USES edges) ────────────────────────────────────
+; Parameter type: fn foo(x: MyType)
+(parameter
+  type: (type_identifier) @name) @reference.type_ref
+
+; Return type: fn foo() -> MyType
+(function_item
+  return_type: (type_identifier) @name) @reference.type_ref
+
+; Struct field type: field: MyType
+(field_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Let binding type: let x: MyType = ...
+(let_declaration
+  type: (type_identifier) @name) @reference.type_ref
+
+; Generic type argument: Vec<MyType>
+(generic_type
+  type: (type_identifier) @name) @reference.type_ref
+
+; Reference type: &MyType
+(reference_type
+  type: (type_identifier) @name) @reference.type_ref
+
+; ── Field access (ACCESSES edges) ───────────────────────────────────
+; Field expression: obj.field
+(field_expression
+  field: (field_identifier) @name) @reference.read_access
