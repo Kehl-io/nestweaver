@@ -174,10 +174,6 @@ impl TantivyIndex {
     /// `note_uid` (the note itself + all its headings + sections) and
     /// re-indexes the supplied fresh data. Called by the file watcher
     /// after re-parsing a saved file.
-    /// Per-note incremental update. Drops every Tantivy doc tagged with
-    /// `note_uid` (the note itself + all its headings + sections) and
-    /// re-indexes the supplied fresh data. Called by the file watcher
-    /// after re-parsing a saved file.
     ///
     /// `sections` is a slice of `(uid, body_text, heading_title)` tuples.
     /// The heading title is indexed in the section's `title` field so that
