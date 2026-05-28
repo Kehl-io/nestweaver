@@ -2,6 +2,14 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
+/// Result of a single MCP `tools/call` invocation.
+pub struct ToolCallResult {
+    /// The text content returned by the tool.
+    pub content: String,
+    /// Whether the MCP server flagged the response as an error (`isError: true`).
+    pub is_error: bool,
+}
+
 pub struct McpClient {
     stdin: std::process::ChildStdin,
     reader: std::io::BufReader<std::process::ChildStdout>,
@@ -63,15 +71,15 @@ impl McpClient {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolCallResult, anyhow::Error> {
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": self.next_id(), "method": "tools/call",
             "params": { "name": name, "arguments": arguments }
         });
         self.send(&req)?;
         let resp = self.recv()?;
-        let content = resp
-            .get("result")
+        let result_obj = resp.get("result");
+        let content = result_obj
             .and_then(|r| r.get("content"))
             .and_then(|c| c.as_array())
             .and_then(|a| a.first())
@@ -79,7 +87,11 @@ impl McpClient {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
-        Ok(content)
+        let is_error = result_obj
+            .and_then(|r| r.get("isError"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(ToolCallResult { content, is_error })
     }
 
     fn next_id(&mut self) -> u64 {

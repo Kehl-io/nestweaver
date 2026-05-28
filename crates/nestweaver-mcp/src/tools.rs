@@ -2270,35 +2270,37 @@ fn tool_project_context(
         }
     };
 
-    // 2. Collect target UIDs: notes + symbols for this project.
-    let mut seed_uids: Vec<String> = Vec::new();
+    // 2. Collect member UIDs (notes + symbols) for the post-PPR boost.
+    let mut member_uids: Vec<String> = Vec::new();
     let note_uids = store
         .list_project_note_uids(&project.uid)
         .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
-    seed_uids.extend(note_uids);
+    member_uids.extend(note_uids);
     let sym_uids = store
         .list_project_symbol_uids(&project.uid)
         .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
-    seed_uids.extend(sym_uids);
+    member_uids.extend(sym_uids);
 
     // 3. If include_components, also collect note/symbol UIDs from each component project.
-    if include_components {
-        let component_uids = store
+    let component_uids = if include_components {
+        store
             .list_project_component_uids(&project.uid)
-            .map_err(|e| anyhow!("list_project_component_uids: {e}"))?;
-        for comp_uid in &component_uids {
-            let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
-            seed_uids.extend(comp_notes);
-            let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
-            seed_uids.extend(comp_syms);
-        }
+            .map_err(|e| anyhow!("list_project_component_uids: {e}"))?
+    } else {
+        vec![]
+    };
+    for comp_uid in &component_uids {
+        let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+        member_uids.extend(comp_notes);
+        let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
+        member_uids.extend(comp_syms);
     }
 
-    // Deduplicate seeds.
+    // Deduplicate members.
     let mut seen = std::collections::HashSet::new();
-    seed_uids.retain(|u| seen.insert(u.clone()));
+    member_uids.retain(|u| seen.insert(u.clone()));
 
-    if seed_uids.is_empty() {
+    if member_uids.is_empty() {
         return Ok(json!({
             "project": project.name,
             "project_uid": project.uid,
@@ -2310,10 +2312,13 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Run hybrid PPR from seeds. Default intent is understand-architecture
-    //    (best for project overviews), but callers can override via the
-    //    `intent` parameter. The 5x boost on PROJECT_INCLUDES_* edges
-    //    ensures the project's declared content dominates.
+    // 4. Seed PPR from the project node itself (not all member UIDs).
+    //    With ProjectContext intent the PROJECT_INCLUDES_* edges get a
+    //    5x weight boost, so the walk efficiently discovers all members
+    //    and places them in `connected` instead of `seeds`.
+    let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
+    ppr_seeds.extend(component_uids);
+
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
         .and_then(|v| v.as_str())
@@ -2327,7 +2332,7 @@ fn tool_project_context(
     let config = HybridSearchConfig::default();
     let mut result = build_brain_context_hybrid_with_aliases(
         store,
-        &seed_uids,
+        &ppr_seeds,
         tantivy,
         &config,
         &aliases,
@@ -2336,11 +2341,11 @@ fn tool_project_context(
     )?;
 
     // 4b. Post-PPR scope boost: multiply relevance for nodes that belong
-    //     to the project (seeds are the authoritative membership signal).
-    let seed_set_boost: std::collections::HashSet<&str> =
-        seed_uids.iter().map(|s| s.as_str()).collect();
+    //     to the project (member UIDs are the authoritative membership signal).
+    let member_set: std::collections::HashSet<&str> =
+        member_uids.iter().map(|s| s.as_str()).collect();
     for node in &mut result.connected {
-        if seed_set_boost.contains(node.uid.as_str()) {
+        if member_set.contains(node.uid.as_str()) {
             node.relevance *= 5.0;
         }
     }
