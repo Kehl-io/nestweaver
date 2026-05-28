@@ -7,7 +7,7 @@
 //! Parses tsconfig path aliases from:
 //! - `tsconfig.json`, `tsconfig.app.json`, `tsconfig.base.json`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// A workspace package discovered from package.json workspaces or pnpm-workspace.yaml.
@@ -155,7 +155,7 @@ fn expand_workspace_globs(
         } else if let Some(parent) = clean.strip_suffix("/**") {
             // e.g., "packages/**" -> recurse into subdirectories
             let search_dir = repo_path.join(parent);
-            collect_packages_recursive(repo_path, &search_dir, packages);
+            collect_packages_recursive(repo_path, &search_dir, packages, 0);
         } else {
             // Exact path, e.g., "tools/cli"
             let dir_path = repo_path.join(clean);
@@ -175,14 +175,32 @@ fn expand_workspace_globs(
     }
 }
 
+/// Maximum recursion depth for workspace package discovery. Prevents
+/// runaway traversal in deeply nested or symlinked directory trees.
+const MAX_PACKAGE_RECURSION_DEPTH: usize = 10;
+
+/// Directories that are never useful for workspace package discovery.
+const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target", "build", "dist"];
+
 /// Recursively collect packages from a directory tree.
-fn collect_packages_recursive(repo_path: &Path, dir: &Path, packages: &mut Vec<WorkspacePackage>) {
+fn collect_packages_recursive(
+    repo_path: &Path,
+    dir: &Path,
+    packages: &mut Vec<WorkspacePackage>,
+    depth: usize,
+) {
+    if depth >= MAX_PACKAGE_RECURSION_DEPTH {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 let dir_path = entry.path();
-                // Skip node_modules
-                if dir_path.file_name().is_some_and(|n| n == "node_modules") {
+                // Skip well-known non-source directories
+                if dir_path
+                    .file_name()
+                    .is_some_and(|n| SKIP_DIRS.iter().any(|&s| n == s))
+                {
                     continue;
                 }
                 let pkg_json = dir_path.join("package.json");
@@ -199,7 +217,7 @@ fn collect_packages_recursive(repo_path: &Path, dir: &Path, packages: &mut Vec<W
                 }
                 // Continue recursing even if this dir has a package.json
                 // (nested workspaces)
-                collect_packages_recursive(repo_path, &dir_path, packages);
+                collect_packages_recursive(repo_path, &dir_path, packages, depth + 1);
             }
         }
     }
@@ -424,9 +442,9 @@ pub fn extract_package_name(specifier: &str) -> &str {
 ///
 /// This is similar to Node.js module resolution: tries exact, then with
 /// `.ts`, `.tsx`, `.js`, `.jsx` extensions, then as a directory index.
-pub fn try_resolve_with_extensions(path: &str, known_files: &[&str]) -> Option<String> {
+pub fn try_resolve_with_extensions(path: &str, known_files: &HashSet<&str>) -> Option<String> {
     // Try exact
-    if known_files.contains(&path) {
+    if known_files.contains(path) {
         return Some(path.to_string());
     }
 
@@ -598,9 +616,13 @@ mod tests {
 
     // ── try_resolve_with_extensions ───────────────────────────────────────
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_exact() {
-        let known = ["src/utils.ts"];
+        let known = set(&["src/utils.ts"]);
         assert_eq!(
             try_resolve_with_extensions("src/utils.ts", &known),
             Some("src/utils.ts".to_string())
@@ -609,7 +631,7 @@ mod tests {
 
     #[test]
     fn resolves_with_ts_extension() {
-        let known = ["src/utils.ts"];
+        let known = set(&["src/utils.ts"]);
         assert_eq!(
             try_resolve_with_extensions("src/utils", &known),
             Some("src/utils.ts".to_string())
@@ -618,7 +640,7 @@ mod tests {
 
     #[test]
     fn resolves_directory_index() {
-        let known = ["src/utils/index.ts"];
+        let known = set(&["src/utils/index.ts"]);
         assert_eq!(
             try_resolve_with_extensions("src/utils", &known),
             Some("src/utils/index.ts".to_string())

@@ -1,8 +1,14 @@
+use std::collections::HashSet;
+
 /// Resolve a Go import path to a file path.
 ///
 /// Go import paths like `"internal/service"` correspond to directory paths.
 /// We find `.go` files that live in the matching package directory.
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let _ = from_file; // Go imports are module-relative, from_file not needed
 
     // Remove surrounding quotes if any (import specifier may still have them)
@@ -31,13 +37,17 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn go_resolves_package_import() {
-        let known = [
+        let known = set(&[
             "internal/service/server.go",
             "internal/service/client.go",
             "cmd/main.go",
-        ];
+        ]);
         let result = resolve_import("cmd/main.go", "internal/service", &known);
         // Should return the first matching .go file in the package directory
         assert!(result.is_some());
@@ -50,7 +60,7 @@ mod tests {
 
     #[test]
     fn go_resolves_package_with_module_prefix() {
-        let known = ["github.com/org/repo/internal/service/server.go"];
+        let known = set(&["github.com/org/repo/internal/service/server.go"]);
         let result = resolve_import(
             "github.com/org/repo/cmd/main.go",
             "internal/service",
@@ -64,7 +74,7 @@ mod tests {
 
     #[test]
     fn go_unknown_package_returns_none() {
-        let known = ["internal/other/thing.go"];
+        let known = set(&["internal/other/thing.go"]);
         let result = resolve_import("cmd/main.go", "internal/service", &known);
         assert_eq!(result, None);
     }

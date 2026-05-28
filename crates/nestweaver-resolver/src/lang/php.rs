@@ -1,6 +1,12 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let specifier = specifier.trim_matches(|c| c == '"' || c == '\'');
     let specifier = specifier.trim_start_matches('\\');
 
@@ -33,9 +39,13 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_psr4_namespace() {
-        let known = ["src/App/Models/User.php"];
+        let known = set(&["src/App/Models/User.php"]);
         let result = resolve_import(
             "src/App/Controllers/UserController.php",
             "App\\Models\\User",
@@ -46,7 +56,7 @@ mod tests {
 
     #[test]
     fn unknown_namespace_returns_none() {
-        let known = ["src/App/Models/User.php"];
+        let known = set(&["src/App/Models/User.php"]);
         let result = resolve_import(
             "src/index.php",
             "Illuminate\\Support\\Facades\\Route",

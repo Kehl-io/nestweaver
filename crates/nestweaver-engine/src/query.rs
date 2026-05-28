@@ -119,7 +119,7 @@ pub fn lookup_symbol(store: &GraphStore, name_or_uid: &str) -> Result<LookupResu
         match matches.len() {
             0 => Ok(LookupResult::NotFound),
             1 => {
-                let sym = matches.into_iter().next().unwrap();
+                let sym = matches.into_iter().next().expect("checked len == 1");
                 let callers = store.callers_of(&sym.uid).context("fetch callers")?;
                 let callees = store.callees_of(&sym.uid).context("fetch callees")?;
                 Ok(LookupResult::Found(Box::new(SymbolDetail {

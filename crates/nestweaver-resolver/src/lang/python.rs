@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 
 /// Resolve a Python import specifier to a file path.
@@ -7,7 +9,11 @@ use crate::util::parent_dir;
 /// - Multi-dot relative imports: `..helper` → parent package's `helper.py`
 /// - Relative package imports: `.utils` → `utils/__init__.py`
 /// - Absolute dotted imports: `app.helper` → `app/helper.py`
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     if specifier.starts_with('.') {
         // Relative import — count leading dots
         let dot_count = specifier.chars().take_while(|c| *c == '.').count();
@@ -84,37 +90,41 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn python_resolves_relative_import() {
-        let known = ["app/helper.py", "app/main.py"];
+        let known = set(&["app/helper.py", "app/main.py"]);
         let result = resolve_import("app/main.py", ".helper", &known);
         assert_eq!(result, Some("app/helper.py".to_string()));
     }
 
     #[test]
     fn python_resolves_init_package() {
-        let known = ["app/utils/__init__.py", "app/main.py"];
+        let known = set(&["app/utils/__init__.py", "app/main.py"]);
         let result = resolve_import("app/main.py", ".utils", &known);
         assert_eq!(result, Some("app/utils/__init__.py".to_string()));
     }
 
     #[test]
     fn python_resolves_absolute_import() {
-        let known = ["app/models.py"];
+        let known = set(&["app/models.py"]);
         let result = resolve_import("app/views.py", "app.models", &known);
         assert_eq!(result, Some("app/models.py".to_string()));
     }
 
     #[test]
     fn python_resolves_absolute_package_import() {
-        let known = ["app/utils/__init__.py"];
+        let known = set(&["app/utils/__init__.py"]);
         let result = resolve_import("app/views.py", "app.utils", &known);
         assert_eq!(result, Some("app/utils/__init__.py".to_string()));
     }
 
     #[test]
     fn python_unknown_import_returns_none() {
-        let known = ["app/models.py"];
+        let known = set(&["app/models.py"]);
         let result = resolve_import("app/views.py", ".missing", &known);
         assert_eq!(result, None);
     }
@@ -126,7 +136,7 @@ mod tests {
         //   first dot = app/sub (parent dir of module.py)
         //   second dot = app (parent of app/sub)
         // so resolves to app/helper.py
-        let known = ["app/helper.py", "app/sub/module.py"];
+        let known = set(&["app/helper.py", "app/sub/module.py"]);
         let result = resolve_import("app/sub/module.py", "..helper", &known);
         assert_eq!(result, Some("app/helper.py".to_string()));
     }

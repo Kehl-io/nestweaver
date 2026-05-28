@@ -1,6 +1,12 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let specifier = specifier.trim_matches(|c| c == '"' || c == '\'');
 
     if specifier.starts_with("dart:") || specifier.starts_with("package:") {
@@ -25,23 +31,27 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_relative_import() {
-        let known = ["lib/helper.dart"];
+        let known = set(&["lib/helper.dart"]);
         let result = resolve_import("lib/main.dart", "'helper.dart'", &known);
         assert_eq!(result, Some("lib/helper.dart".to_string()));
     }
 
     #[test]
     fn skips_dart_sdk_import() {
-        let known = ["lib/main.dart"];
+        let known = set(&["lib/main.dart"]);
         let result = resolve_import("lib/main.dart", "'dart:core'", &known);
         assert_eq!(result, None);
     }
 
     #[test]
     fn skips_package_import() {
-        let known = ["lib/main.dart"];
+        let known = set(&["lib/main.dart"]);
         let result = resolve_import("lib/main.dart", "'package:flutter/material.dart'", &known);
         assert_eq!(result, None);
     }
