@@ -210,15 +210,47 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     Ok(summaries)
 }
 
+/// Maximum number of clusters to summarize. On large graphs, Leiden can
+/// produce thousands of tiny communities; summarizing all of them yields
+/// noise rather than signal. We keep only the top-N largest clusters.
+const MAX_CLUSTER_SUMMARIES: usize = 50;
+
+/// Lower resolution parameter used when the default (1.0) produces too
+/// many small clusters. A lower resolution merges communities more
+/// aggressively, yielding fewer but larger clusters.
+const FALLBACK_CLUSTER_RESOLUTION: f64 = 0.5;
+
 /// Cluster-level: community description with key types and cross-cluster deps.
 ///
 /// Format: `Cluster {id} ({name}, {n} symbols): key types: [{top symbols}] | files: [{file list}] | depends on: [other clusters]`
+///
+/// At scale (tens of thousands of symbols), Leiden with resolution=1.0 can
+/// produce thousands of singleton or near-singleton communities that are not
+/// useful for summarization. This function:
+/// 1. Filters out singleton clusters (1 member).
+/// 2. If the default resolution produces no non-singleton clusters, retries
+///    with a lower resolution to force larger communities.
+/// 3. Limits output to the top-N largest clusters by member count.
 fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
-    let output = crate::cluster_dispatch::compute_clusters(store, 1.0)?;
+    let mut output = crate::cluster_dispatch::compute_clusters(store, 1.0)?;
+
+    // Filter out singleton clusters — they carry no architectural signal.
+    output.communities.retain(|c| c.member_count > 1);
+
+    // If the default resolution produced no usable clusters (everything was a
+    // singleton), retry with a lower resolution that merges more aggressively.
+    if output.communities.is_empty() {
+        output = crate::cluster_dispatch::compute_clusters(store, FALLBACK_CLUSTER_RESOLUTION)?;
+        output.communities.retain(|c| c.member_count > 1);
+    }
 
     if output.communities.is_empty() {
         return Ok(vec![]);
     }
+
+    // Communities are already sorted by size descending from compute_clusters.
+    // Keep only the top-N largest for summarization.
+    output.communities.truncate(MAX_CLUSTER_SUMMARIES);
 
     // Build symbol UID -> cluster ID mapping for cross-cluster dependency detection.
     let mut uid_to_cluster: HashMap<String, u32> = HashMap::new();
