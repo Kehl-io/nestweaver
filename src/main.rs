@@ -2814,7 +2814,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                     }
 
-                    let cut = token_budgeted_truncate(&result.connected, token_budget);
+                    // Compute seed token cost and allocate the remainder to connected.
+                    let seed_tokens: usize = result.seeds.iter().map(render_cost_tokens).sum();
+                    let remaining_budget = token_budget.saturating_sub(seed_tokens);
+                    let cut = token_budgeted_truncate(&result.connected, remaining_budget);
                     if json {
                         print_brain_context_json(&result, cut)?;
                     } else {
@@ -3579,21 +3582,27 @@ fn run_brain(
 
             let result_count;
             if let Some(ref idx) = tantivy {
+                // Fetch extra raw hits to compensate for note grouping.
+                let raw_limit = limit * 5;
                 let hits = idx
-                    .search(&query, limit)
+                    .search(&query, raw_limit)
                     .with_context(|| "tantivy search")?;
-                result_count = hits.len();
+                let grouped = group_bm25_hits_by_note(&store, &hits, limit);
+                result_count = grouped.len();
                 if json {
-                    let results: Vec<serde_json::Value> = hits
+                    let results: Vec<serde_json::Value> = grouped
                         .iter()
-                        .map(|h| {
-                            serde_json::json!({
-                                "uid": h.uid,
-                                "kind": h.kind,
-                                "title": h.title,
-                                "score": h.score,
-                                "vault_uid": h.vault_uid,
-                            })
+                        .map(|g| {
+                            let mut v = serde_json::json!({
+                                "uid": g.note_uid,
+                                "kind": "note",
+                                "title": g.title,
+                                "score": g.best_score,
+                            });
+                            if !g.matched_headings.is_empty() {
+                                v["matched_headings"] = serde_json::json!(g.matched_headings);
+                            }
+                            v
                         })
                         .collect();
                     println!(
@@ -3602,15 +3611,24 @@ fn run_brain(
                             "query": query,
                             "engine": "bm25",
                             "results": results,
-                            "total_matches": hits.len(),
+                            "total_matches": grouped.len(),
                         }))?
                     );
-                } else if hits.is_empty() {
+                } else if grouped.is_empty() {
                     println!("No results for '{query}'.");
                 } else {
-                    println!("Brain search (BM25): {} result(s)\n", hits.len());
-                    for h in &hits {
-                        println!("  [{:.2}] {} ({})", h.score, h.title, h.kind);
+                    println!("Brain search (BM25): {} note(s)\n", grouped.len());
+                    for g in &grouped {
+                        if g.matched_headings.is_empty() {
+                            println!("  [{:.2}] {}", g.best_score, g.title);
+                        } else {
+                            println!(
+                                "  [{:.2}] {} (matched: {})",
+                                g.best_score,
+                                g.title,
+                                g.matched_headings.join(", "),
+                            );
+                        }
                     }
                 }
             } else {
@@ -3872,6 +3890,99 @@ fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: u
         taken += 1;
     }
     taken
+}
+
+/// A note-level search result after grouping BM25 hits by parent note.
+struct NoteSearchResult {
+    note_uid: String,
+    title: String,
+    best_score: f32,
+    matched_headings: Vec<String>,
+}
+
+/// Group BM25 search hits by their parent Note, picking the highest-scoring
+/// hit per note and collecting matched heading/section titles.
+fn group_bm25_hits_by_note(
+    store: &nestweaver_store::GraphStore,
+    hits: &[nestweaver_store::SearchHit],
+    limit: usize,
+) -> Vec<NoteSearchResult> {
+    use std::collections::HashMap;
+
+    struct Group {
+        note_uid: String,
+        best_score: f32,
+        title: String,
+        matched_headings: Vec<String>,
+    }
+
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    let mut note_order: Vec<String> = Vec::new();
+
+    for h in hits {
+        let parent_note_uid = match h.kind.as_str() {
+            "note" => h.uid.clone(),
+            "heading" => store
+                .lookup_heading(&h.uid)
+                .map(|hd| hd.note_uid)
+                .unwrap_or_else(|_| h.uid.clone()),
+            "section" => store
+                .lookup_section(&h.uid)
+                .map(|s| s.note_uid)
+                .unwrap_or_else(|_| h.uid.clone()),
+            _ => h.uid.clone(),
+        };
+
+        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
+            note_order.push(parent_note_uid.clone());
+            Group {
+                note_uid: parent_note_uid.clone(),
+                best_score: 0.0,
+                title: String::new(),
+                matched_headings: Vec::new(),
+            }
+        });
+
+        if h.score > group.best_score {
+            group.best_score = h.score;
+        }
+        if h.kind == "note" {
+            group.title = h.title.clone();
+        }
+        if h.kind == "heading" || h.kind == "section" {
+            group.matched_headings.push(h.title.clone());
+        }
+    }
+
+    // Look up note titles for groups that had no direct note-title match.
+    for group in groups.values_mut() {
+        if group.title.is_empty() {
+            group.title = store
+                .lookup_note(&group.note_uid)
+                .map(|n| n.title)
+                .unwrap_or_else(|_| group.note_uid.clone());
+        }
+    }
+
+    // Sort by best_score descending.
+    note_order.sort_by(|a, b| {
+        let sa = groups.get(a).map(|g| g.best_score).unwrap_or(0.0);
+        let sb = groups.get(b).map(|g| g.best_score).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    note_order
+        .into_iter()
+        .take(limit)
+        .filter_map(|nuid| {
+            groups.remove(&nuid).map(|g| NoteSearchResult {
+                note_uid: g.note_uid,
+                title: g.title,
+                best_score: g.best_score,
+                matched_headings: g.matched_headings,
+            })
+        })
+        .collect()
 }
 
 /// Apply age-decay score boost to non-Symbol nodes (CLI variant).
