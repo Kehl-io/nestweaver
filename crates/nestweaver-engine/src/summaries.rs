@@ -641,4 +641,64 @@ mod tests {
         let result = load_summaries(&db_path).unwrap();
         assert!(result.is_none());
     }
+
+    #[test]
+    fn sidecar_path_uses_push_convention() {
+        use std::path::Path;
+        // The sidecar path should append ".summaries.json" to the full db
+        // path (push), NOT replace the extension (with_extension).
+        let p = sidecar_path(Path::new("data.lbug"));
+        assert_eq!(p, Path::new("data.lbug.summaries.json"));
+
+        // Ensure multi-dot paths also work correctly.
+        let p2 = sidecar_path(Path::new("my.project.lbug"));
+        assert_eq!(p2, Path::new("my.project.lbug.summaries.json"));
+    }
+
+    #[test]
+    fn save_load_round_trip_preserves_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        let file_summaries = vec![Summary {
+            level: SummaryLevel::File,
+            target_uid: "src/main.rs".to_string(),
+            target_name: "src/main.rs".to_string(),
+            content: "file summary".to_string(),
+            token_estimate: 5,
+        }];
+        let symbol_summaries = vec![Summary {
+            level: SummaryLevel::Symbol,
+            target_uid: "sym:main".to_string(),
+            target_name: "main".to_string(),
+            content: "symbol summary".to_string(),
+            token_estimate: 5,
+        }];
+
+        // Save file-level summaries.
+        save_summaries(&db_path, &file_summaries).unwrap();
+
+        // Merge with symbol-level summaries (as the MCP tool does).
+        let mut all = load_summaries(&db_path)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.level != SummaryLevel::Symbol)
+            .collect::<Vec<_>>();
+        all.extend(symbol_summaries.iter().cloned());
+        save_summaries(&db_path, &all).unwrap();
+
+        // Load back and verify both levels are present.
+        let loaded = load_summaries(&db_path).unwrap().unwrap();
+        let file_count = loaded
+            .iter()
+            .filter(|s| s.level == SummaryLevel::File)
+            .count();
+        let sym_count = loaded
+            .iter()
+            .filter(|s| s.level == SummaryLevel::Symbol)
+            .count();
+        assert_eq!(file_count, 1, "file summaries should be preserved");
+        assert_eq!(sym_count, 1, "symbol summaries should be saved");
+    }
 }

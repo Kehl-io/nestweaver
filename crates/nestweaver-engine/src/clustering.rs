@@ -340,4 +340,38 @@ mod tests {
         assert_ne!(result.assignment[0], result.assignment[2]);
         assert_eq!(result.communities.len(), 3);
     }
+
+    #[test]
+    fn leiden_low_resolution_produces_finite_values() {
+        // Two triangles connected by a weak bridge.
+        let neighbors = vec![
+            vec![(1, 1.0), (2, 1.0)],
+            vec![(0, 1.0), (2, 1.0)],
+            vec![(0, 1.0), (1, 1.0), (3, 0.1)],
+            vec![(2, 0.1), (4, 1.0), (5, 1.0)],
+            vec![(3, 1.0), (5, 1.0)],
+            vec![(3, 1.0), (4, 1.0)],
+        ];
+        let graph = Graph {
+            n: 6,
+            neighbors,
+            total_weight: 6.1,
+        };
+        // Test with different resolution values including the new defaults.
+        for &res in &[0.3, 0.5, 1.0, 2.0] {
+            let result = leiden(&graph, res, 100);
+            assert!(
+                result.modularity.is_finite(),
+                "modularity should be finite at resolution={res}, got {}",
+                result.modularity
+            );
+            for c in &result.communities {
+                assert!(
+                    c.cohesion.is_finite(),
+                    "cohesion should be finite at resolution={res}, got {}",
+                    c.cohesion
+                );
+            }
+        }
+    }
 }

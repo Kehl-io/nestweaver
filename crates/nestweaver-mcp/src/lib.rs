@@ -73,8 +73,11 @@ pub fn run_stdio_server(
     };
 
     // Make the DB path available to tool handlers that need to spawn
-    // additional indexer invocations against the same DB.
-    tools::set_current_db_path(db_path.to_path_buf());
+    // additional indexer invocations against the same DB.  Canonicalize
+    // so that sidecar lookups (extensions, summaries, clusters) always
+    // resolve to the correct location regardless of CWD changes.
+    let canonical_db = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    tools::set_current_db_path(canonical_db);
     tools::set_allow_add_sources(allow_add_sources);
     tools::set_lite_mode(lite);
 
