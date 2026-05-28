@@ -84,7 +84,10 @@ pub use cross_domain::{
     discover_cross_domain_links, discover_cross_domain_links_for_note,
     discover_cross_domain_links_for_note_with_index, discover_cross_domain_links_with_config,
 };
-pub use dead_code::{DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code};
+pub use dead_code::{
+    DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
+    detect_dead_code_with_confidence,
+};
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use extensions::{
     ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
