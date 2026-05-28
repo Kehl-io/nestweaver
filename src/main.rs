@@ -3316,10 +3316,10 @@ fn resolve_uid_with_repo_filter(
                 .iter()
                 .filter(|s| {
                     // Match by repo display name (primary — supports --name overrides)
-                    if let Some(name) = repo_names.get(&s.repo_uid) {
-                        if name.to_lowercase().contains(&filter_lower) {
-                            return true;
-                        }
+                    if let Some(name) = repo_names.get(&s.repo_uid)
+                        && name.to_lowercase().contains(&filter_lower)
+                    {
+                        return true;
                     }
                     // Fallback: file_path prefix or UID substring
                     s.file_path.to_lowercase().starts_with(&filter_lower)
