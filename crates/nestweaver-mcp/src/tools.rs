@@ -1161,7 +1161,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. Do NOT use to check if the index is stale — use stale_check instead.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
+        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. When interaction tracking is enabled (--track-interactions), also reports interaction memory status including query count and memory age. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. Do NOT use to check if the index is stale — use stale_check instead.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
         "inputSchema": {
             "type": "object",
             "properties": {}

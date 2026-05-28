@@ -77,6 +77,11 @@ nestweaver generate-guide --format agents-md                          # Codex AG
 # Shell completions
 nestweaver completions bash              # also: zsh, fish, powershell
 
+# Interaction memory (opt-in, improves ranking over time)
+nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tracking
+nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
+nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
+
 # MCP server (22 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
@@ -99,6 +104,7 @@ Sidecar files written alongside the database:
 - `<db>.clusters.json` — community/cluster detection output
 - `<db>.extensions.json` — user-defined extension properties on nodes
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
+- `<db>.interactions.json` — agent interaction memory (query patterns, access frequency, follow-up signals)
 - `<db>.perspectives.json` — saved web UI perspectives (web crate only)
 
 ## Architecture

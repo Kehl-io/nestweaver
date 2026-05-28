@@ -13,3 +13,5 @@ When debugging an error or unexpected behavior:
 6. Check `dead_code` — if the error is in unreachable code, it may be safe to remove instead of fix
 7. Check if any vault notes mention the error pattern via `brain_search`
 8. Report: the call chain leading to the error, related code, and any existing documentation
+
+Note: With `--track-interactions` enabled, debugging patterns are remembered across sessions — symbols involved in past debugging flows rank higher in future queries.
