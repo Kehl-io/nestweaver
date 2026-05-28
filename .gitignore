@@ -51,6 +51,9 @@ docs/specs/
 .junie/
 AGENTS.md
 
+# Competitor skills (not part of this project)
+.claude/skills/gitnexus/
+
 # Sidecar files (generated at runtime)
 *.pagerank.json
 *.manifests.json
