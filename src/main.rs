@@ -492,6 +492,11 @@ enum Commands {
             help = "Comma-separated list of tool names to expose (default: all)"
         )]
         tools: Option<Vec<String>>,
+        #[arg(
+            long,
+            help = "Record interaction telemetry to a sidecar file for usage-based ranking"
+        )]
+        track_interactions: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -2509,13 +2514,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             allow_mcp_add_sources,
             lite,
             tools: tool_allowlist,
+            track_interactions,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
             }
-            nestweaver_mcp::run_stdio_server(&db_path, allow_mcp_add_sources, lite)
-                .context("mcp server")?;
+            nestweaver_mcp::run_stdio_server(
+                &db_path,
+                allow_mcp_add_sources,
+                lite,
+                track_interactions,
+            )
+            .context("mcp server")?;
             Ok((EXIT_SUCCESS, None))
         }
 
