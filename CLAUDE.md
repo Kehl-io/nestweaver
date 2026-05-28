@@ -18,6 +18,7 @@ cargo fmt --all                                             # format in place
 # Index a repo and query it
 nestweaver index                         # auto-detects repo root from .git
 nestweaver index --repo ./testdata/js    # explicit repo path
+nestweaver index --repo ./client --name coyote-client  # explicit repo name for multi-repo setups
 nestweaver index --stats                 # show timing and statistics after indexing
 nestweaver watch                         # live re-indexing via filesystem watcher with debouncing
 nestweaver watch ./my-project            # watch a specific directory
@@ -89,6 +90,12 @@ nestweaver interactions clear --db ./nestweaver.lbug           # wipe interactio
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
+
+# Instance config: external MCP servers with timeout
+# [[mcp_servers]]
+# name = "wiki-mcp"
+# command = "wiki-mcp"
+# timeout_secs = 60  # default 30
 
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
