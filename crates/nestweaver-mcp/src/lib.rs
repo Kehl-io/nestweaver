@@ -44,6 +44,12 @@ pub fn run_stdio_server(
     let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
+    // Load interaction memory scores so PPR can apply a small bias toward
+    // frequently-accessed nodes.
+    if let Some(scores) = nestweaver_engine::load_interaction_scores(db_path) {
+        store.load_interaction_cache(scores);
+    }
+
     // Open the Tantivy index sidecar in read-only mode. The MCP server
     // only searches — it never writes to the index. Reader-only mode
     // avoids contending for the writer lock with a running brain watcher.
