@@ -3292,8 +3292,9 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
 }
 
 /// Like [`resolve_uid`] but applies an optional repo filter to narrow ambiguous
-/// matches. When `repo_filter` is `Some`, only symbols whose `file_path` starts
-/// with the repo name (or whose UID contains it) are kept.
+/// matches. When `repo_filter` is `Some`, only symbols belonging to a repo
+/// whose display name matches the filter are kept. Also matches against
+/// file_path prefix and UID substring as fallbacks.
 fn resolve_uid_with_repo_filter(
     store: &GraphStore,
     name_or_uid: &str,
@@ -3302,9 +3303,28 @@ fn resolve_uid_with_repo_filter(
     let result = resolve_uid(store, name_or_uid)?;
     match (&result, repo_filter) {
         (ResolveResult::Ambiguous(candidates), Some(filter)) => {
+            let filter_lower = filter.to_lowercase();
+
+            // Build a repo_uid → display_name map for matching
+            let repos = list_repos(store, None)?;
+            let repo_names: std::collections::HashMap<String, String> = repos
+                .iter()
+                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+                .collect();
+
             let filtered: Vec<Symbol> = candidates
                 .iter()
-                .filter(|s| s.file_path.starts_with(filter) || s.uid.contains(filter))
+                .filter(|s| {
+                    // Match by repo display name (primary — supports --name overrides)
+                    if let Some(name) = repo_names.get(&s.repo_uid) {
+                        if name.to_lowercase().contains(&filter_lower) {
+                            return true;
+                        }
+                    }
+                    // Fallback: file_path prefix or UID substring
+                    s.file_path.to_lowercase().starts_with(&filter_lower)
+                        || s.uid.to_lowercase().contains(&filter_lower)
+                })
                 .cloned()
                 .collect();
             match filtered.len() {
