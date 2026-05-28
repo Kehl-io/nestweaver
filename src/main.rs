@@ -13,10 +13,10 @@ use nestweaver_engine::{
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embedding, export_cypher, export_graphml,
-    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md,
-    generate_cursor_rule, generate_guide, generate_repo_map, generate_skill, generate_summaries,
-    get_last_indexed_at, incremental_index, index_directory,
+    discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
+    export_cypher, export_graphml, export_mermaid, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map,
+    generate_skill, generate_summaries, get_last_indexed_at, incremental_index, index_directory,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -3856,7 +3856,7 @@ fn run_brain(
         }
 
         BrainCommands::Search {
-            query,
+            query: raw_query,
             limit,
             json,
             db,
@@ -3865,6 +3865,10 @@ fn run_brain(
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+
+            // Expand the query with taxonomy aliases for better recall.
+            let aliases = load_alias_sidecar(&db_path);
+            let query = expand_query_with_aliases(&raw_query, &aliases);
 
             let result_count;
             if let Some(ref idx) = tantivy {

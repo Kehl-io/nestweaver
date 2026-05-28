@@ -1146,6 +1146,59 @@ pub fn generate_repo_map(store: &GraphStore, token_budget: usize) -> Result<Stri
     Ok(output)
 }
 
+/// Expand a search query by appending canonical names for any taxonomy alias
+/// found as a whole word in the query.
+///
+/// For example, if the alias map contains `"Parallel Paths" → ["PP"]` and the
+/// query is `"PP"`, the returned string is `"PP Parallel Paths"`. This bridges
+/// the vocabulary gap so that brain_search finds notes titled with the canonical
+/// name even when the user searches by abbreviation.
+///
+/// Rules:
+/// - Only aliases with length >= 2 are considered (avoids single-letter noise).
+/// - Matching is case-insensitive and whole-word only.
+/// - At most 10 canonical expansions are appended (prevents query explosion).
+/// - When no alias matches, the original query is returned unchanged.
+pub fn expand_query_with_aliases(
+    query: &str,
+    aliases: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    if aliases.is_empty() {
+        return query.to_string();
+    }
+
+    // Build reverse map: alias (lowercase) -> list of canonical names.
+    let mut reverse: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (canonical, alias_list) in aliases {
+        for alias in alias_list {
+            let key = alias.to_lowercase();
+            if key.len() >= 2 {
+                reverse.entry(key).or_default().push(canonical.clone());
+            }
+        }
+    }
+
+    // Collect query words (lowercased) for whole-word matching.
+    let query_words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+
+    let mut expansions: Vec<String> = Vec::new();
+    for (alias, canonicals) in &reverse {
+        if query_words.iter().any(|w| w == alias) {
+            for c in canonicals {
+                if !expansions.contains(c) && expansions.len() < 10 {
+                    expansions.push(c.clone());
+                }
+            }
+        }
+    }
+
+    if expansions.is_empty() {
+        return query.to_string();
+    }
+    format!("{} {}", query, expansions.join(" "))
+}
+
 #[cfg(test)]
 mod render_brain_node_tests {
     use nestweaver_schema::{Note, NoteKind, Section};
@@ -1313,6 +1366,113 @@ mod repo_map_tests {
         assert!(
             map.contains("greet") || map.contains("hello") || map.contains("formatDate"),
             "repo map should contain a function name; got:\n{map}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expand_query_tests {
+    use std::collections::HashMap;
+
+    use super::expand_query_with_aliases;
+
+    #[test]
+    fn expands_matching_alias() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert(
+            "Parallel Paths".to_string(),
+            vec!["PP".to_string(), "ParPaths".to_string()],
+        );
+        let result = expand_query_with_aliases("PP", &aliases);
+        assert!(
+            result.starts_with("PP "),
+            "should start with original query; got: {result}"
+        );
+        assert!(
+            result.contains("Parallel Paths"),
+            "should contain canonical name; got: {result}"
+        );
+    }
+
+    #[test]
+    fn no_match_returns_unchanged() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert("Authentication".to_string(), vec!["Auth".to_string()]);
+        let result = expand_query_with_aliases("database migration", &aliases);
+        assert_eq!(result, "database migration");
+    }
+
+    #[test]
+    fn skips_short_aliases() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert("Something".to_string(), vec!["X".to_string()]);
+        let result = expand_query_with_aliases("X", &aliases);
+        // Single-char alias "X" should be skipped (len < 2).
+        assert_eq!(result, "X");
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert("Authentication".to_string(), vec!["auth".to_string()]);
+        let result = expand_query_with_aliases("Auth", &aliases);
+        assert!(
+            result.contains("Authentication"),
+            "should match case-insensitively; got: {result}"
+        );
+    }
+
+    #[test]
+    fn caps_at_ten_expansions() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        // Create 15 canonical names all sharing the same alias.
+        for i in 0..15 {
+            aliases.insert(format!("Canonical{i}"), vec!["shared".to_string()]);
+        }
+        let result = expand_query_with_aliases("shared", &aliases);
+        // Count space-separated tokens after the original query word.
+        let expansion_count = result.split_whitespace().count() - 1; // minus "shared"
+        assert!(
+            expansion_count <= 10,
+            "should cap at 10 expansions; got {expansion_count} in: {result}"
+        );
+    }
+
+    #[test]
+    fn empty_aliases_returns_unchanged() {
+        let aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let result = expand_query_with_aliases("anything", &aliases);
+        assert_eq!(result, "anything");
+    }
+
+    #[test]
+    fn whole_word_only() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert("Authentication".to_string(), vec!["auth".to_string()]);
+        // "authorize" contains "auth" as a substring but not as a whole word.
+        let result = expand_query_with_aliases("authorize", &aliases);
+        assert_eq!(
+            result, "authorize",
+            "should not match partial words; got: {result}"
+        );
+    }
+
+    #[test]
+    fn multiple_aliases_expand_independently() {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        aliases.insert("Authentication".to_string(), vec!["Auth".to_string()]);
+        aliases.insert(
+            "Device Pairing".to_string(),
+            vec!["Pairing".to_string(), "BTP".to_string()],
+        );
+        let result = expand_query_with_aliases("Auth Pairing", &aliases);
+        assert!(
+            result.contains("Authentication"),
+            "should expand Auth; got: {result}"
+        );
+        assert!(
+            result.contains("Device Pairing"),
+            "should expand Pairing; got: {result}"
         );
     }
 }
