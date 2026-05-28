@@ -4042,98 +4042,116 @@ fn run_brain(
             let aliases = load_alias_sidecar(&db_path);
             let query = expand_query_with_aliases(&raw_query, &aliases);
 
-            let result_count;
-            if let Some(ref idx) = tantivy {
-                // Fetch extra raw hits to compensate for note grouping.
+            // ── Vault note results ──────────────────────────────────────
+            let (note_results, engine) = if let Some(ref idx) = tantivy {
                 let raw_limit = limit * 5;
                 let hits = idx
                     .search(&query, raw_limit)
                     .with_context(|| "tantivy search")?;
                 let grouped = group_bm25_hits_by_note(&store, &hits, limit);
-                result_count = grouped.len();
-                if json {
-                    let results: Vec<serde_json::Value> = grouped
-                        .iter()
-                        .map(|g| {
-                            let mut v = serde_json::json!({
-                                "uid": g.note_uid,
-                                "kind": "note",
-                                "title": g.title,
-                                "score": g.best_score,
-                            });
-                            if !g.matched_headings.is_empty() {
-                                v["matched_headings"] = serde_json::json!(g.matched_headings);
-                            }
-                            v
-                        })
-                        .collect();
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "query": query,
-                            "engine": "bm25",
-                            "results": results,
-                            "total_matches": grouped.len(),
-                        }))?
-                    );
-                } else if grouped.is_empty() {
-                    println!("No results for '{query}'.");
-                } else {
-                    println!("Brain search (BM25): {} note(s)\n", grouped.len());
-                    for g in &grouped {
-                        if g.matched_headings.is_empty() {
-                            println!("  [{:.2}] {}", g.best_score, g.title);
-                        } else {
-                            println!(
-                                "  [{:.2}] {} (matched: {})",
-                                g.best_score,
-                                g.title,
-                                g.matched_headings.join(", "),
-                            );
-                        }
-                    }
-                }
+                (grouped, "bm25")
             } else {
                 let needle = query.to_lowercase();
                 let notes = store.list_notes(None).context("list_notes")?;
-                let matches: Vec<_> = notes
+                let matches: Vec<NoteSearchResult> = notes
                     .iter()
                     .filter(|n| n.title.to_lowercase().contains(&needle))
                     .take(limit)
+                    .map(|n| NoteSearchResult {
+                        note_uid: n.uid.clone(),
+                        title: n.title.clone(),
+                        best_score: 1.0,
+                        matched_headings: Vec::new(),
+                    })
                     .collect();
-                result_count = matches.len();
-                if json {
-                    let results: Vec<serde_json::Value> = matches
-                        .iter()
-                        .map(|n| {
-                            serde_json::json!({
-                                "uid": n.uid,
-                                "kind": "note",
-                                "title": n.title,
-                                "path": n.file_path,
-                                "word_count": n.word_count,
-                            })
-                        })
-                        .collect();
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "query": query,
-                            "engine": "substring",
-                            "results": results,
-                            "total_matches": matches.len(),
-                        }))?
-                    );
-                } else if matches.is_empty() {
-                    println!("No results for '{query}'.");
+                (matches, "substring")
+            };
+
+            // ── Code symbol results ─────────────────────────────────────
+            let seen_titles: std::collections::HashSet<String> = note_results
+                .iter()
+                .map(|r| r.title.to_lowercase())
+                .collect();
+
+            let code_results = search_symbols(&store, &query, limit).unwrap_or_default();
+            let code_results: Vec<_> = code_results
+                .into_iter()
+                .filter(|sym| !seen_titles.contains(&sym.name.to_lowercase()))
+                .collect();
+
+            let result_count = note_results.len() + code_results.len();
+
+            if json {
+                let mut results: Vec<serde_json::Value> = note_results
+                    .iter()
+                    .map(|g| {
+                        let mut v = serde_json::json!({
+                            "uid": g.note_uid,
+                            "kind": "note",
+                            "title": g.title,
+                            "score": g.best_score,
+                        });
+                        if !g.matched_headings.is_empty() {
+                            v["matched_headings"] = serde_json::json!(g.matched_headings);
+                        }
+                        v
+                    })
+                    .collect();
+                for sym in &code_results {
+                    results.push(serde_json::json!({
+                        "uid": sym.uid,
+                        "kind": format!("Symbol/{}", sym.kind),
+                        "title": sym.name,
+                        "score": 0.5,
+                        "location": format!("{}:{}", sym.file_path, sym.start_line),
+                    }));
+                }
+                // Sort by score descending and truncate.
+                results.sort_by(|a, b| {
+                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                results.truncate(limit);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query": query,
+                        "engine": engine,
+                        "results": results,
+                        "total_matches": results.len(),
+                    }))?
+                );
+            } else if note_results.is_empty() && code_results.is_empty() {
+                println!("No results for '{query}'.");
+            } else {
+                let header = if engine == "bm25" {
+                    "Brain search (BM25)"
                 } else {
-                    println!(
-                        "Brain search (substring fallback): {} result(s)\n",
-                        matches.len()
-                    );
-                    for n in &matches {
-                        println!("  {} @ {}", n.title, n.file_path);
+                    "Brain search (substring fallback)"
+                };
+                println!(
+                    "{}: {} result(s)\n",
+                    header,
+                    note_results.len() + code_results.len()
+                );
+                for g in &note_results {
+                    if g.matched_headings.is_empty() {
+                        println!("  [{:.2}] {}", g.best_score, g.title);
+                    } else {
+                        println!(
+                            "  [{:.2}] {} (matched: {})",
+                            g.best_score,
+                            g.title,
+                            g.matched_headings.join(", "),
+                        );
                     }
+                }
+                for sym in &code_results {
+                    println!(
+                        "  [0.50] {} [{}] @ {}:{}",
+                        sym.name, sym.kind, sym.file_path, sym.start_line,
+                    );
                 }
             }
             let stats = format!(
