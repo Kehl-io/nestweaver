@@ -67,6 +67,11 @@ pub struct InteractionEvent {
     pub tool_name: String,
     pub uids: Vec<String>,
     pub session_id: String,
+    /// For `Query` events: how many of the leading `uids` are seeds.
+    /// The remainder are shown results.  `0` means "all are seeds" (or
+    /// the boundary is unknown — legacy events).
+    #[serde(default)]
+    pub seed_count: usize,
 }
 
 /// Per-node aggregated interaction scores.
@@ -146,6 +151,7 @@ impl InteractionTracker {
     /// scoring.
     pub fn record_query(&self, tool: &str, seed_uids: &[String], result_uids: &[String]) {
         let now = now_epoch();
+        let seed_count = seed_uids.len();
         let mut all_uids: Vec<String> = Vec::with_capacity(seed_uids.len() + result_uids.len());
         all_uids.extend_from_slice(seed_uids);
         all_uids.extend_from_slice(result_uids);
@@ -156,6 +162,7 @@ impl InteractionTracker {
             tool_name: tool.to_string(),
             uids: all_uids,
             session_id: self.session_id.clone(),
+            seed_count,
         };
 
         // Update last-query bookkeeping *before* pushing the event so
@@ -211,6 +218,7 @@ impl InteractionTracker {
             tool_name: tool.to_string(),
             uids: vec![target_uid.to_string()],
             session_id: self.session_id.clone(),
+            seed_count: 0,
         };
 
         self.push_event(event);
@@ -225,6 +233,7 @@ impl InteractionTracker {
             tool_name: tool.to_string(),
             uids: seed_uids.to_vec(),
             session_id: self.session_id.clone(),
+            seed_count: seed_uids.len(),
         };
 
         self.push_event(event);
@@ -283,22 +292,17 @@ fn consolidate_events(store: &mut InteractionStore, events: &[InteractionEvent])
     for event in events {
         match event.event_type {
             EventType::Query => {
-                // By convention the first N UIDs are seeds, the rest are
-                // results.  Since `record_query` concatenates seed_uids
-                // then result_uids, we need the seed count.  We store
-                // all UIDs together so we process them uniformly here,
-                // but to distinguish seeds from results we mark all UIDs
-                // that appear in the event.  The caller already tagged
-                // the event; however we don't store the split index.
-                //
-                // Instead, we increment `query_seed_count` for *all*
-                // UIDs (conservative — seeds definitely queried, results
-                // were returned) and additionally `result_shown_count`
-                // for all UIDs.
-                for uid in &event.uids {
+                // The first `seed_count` UIDs are seeds (weight 0.5 via
+                // `query_seed_count`); the remainder are shown results
+                // (weight 0.1 via `result_shown_count`).
+                let boundary = event.seed_count.min(event.uids.len());
+                for (i, uid) in event.uids.iter().enumerate() {
                     let ns = store.node_scores.entry(uid.clone()).or_default();
-                    ns.query_seed_count += 1;
-                    ns.result_shown_count += 1;
+                    if i < boundary {
+                        ns.query_seed_count += 1;
+                    } else {
+                        ns.result_shown_count += 1;
+                    }
                     ns.last_accessed = event.timestamp;
                     ns.session_ids.insert(event.session_id.clone());
                     ns.distinct_sessions = ns.session_ids.len() as u32;
@@ -525,6 +529,7 @@ mod tests {
         assert_eq!(events[0].event_type, EventType::Query);
         assert_eq!(events[0].tool_name, "brain_context");
         assert_eq!(events[0].uids.len(), 3);
+        assert_eq!(events[0].seed_count, 1); // 1 seed, 2 results
     }
 
     #[test]
@@ -582,6 +587,7 @@ mod tests {
                 tool_name: "brain_context".into(),
                 uids: vec!["uid-a".into(), "uid-b".into()],
                 session_id: "s1".into(),
+                seed_count: 1, // uid-a is a seed, uid-b is a result
             },
             InteractionEvent {
                 timestamp: 1010.0,
@@ -589,6 +595,7 @@ mod tests {
                 tool_name: "note_get".into(),
                 uids: vec!["uid-a".into()],
                 session_id: "s1".into(),
+                seed_count: 0,
             },
             InteractionEvent {
                 timestamp: 1020.0,
@@ -596,6 +603,7 @@ mod tests {
                 tool_name: "note_get".into(),
                 uids: vec!["uid-b".into()],
                 session_id: "s1".into(),
+                seed_count: 0,
             },
         ];
 
@@ -603,15 +611,16 @@ mod tests {
         consolidate_events(&mut store, &events);
 
         let a = store.node_scores.get("uid-a").unwrap();
-        assert_eq!(a.query_seed_count, 1);
-        assert_eq!(a.result_shown_count, 1);
+        assert_eq!(a.query_seed_count, 1); // seed in the Query event
+        assert_eq!(a.result_shown_count, 0); // not a shown result
         assert_eq!(a.access_count, 1);
         assert_eq!(a.result_used_count, 0);
         assert!((a.last_accessed - 1010.0).abs() < 0.001);
 
         let b = store.node_scores.get("uid-b").unwrap();
-        assert_eq!(b.query_seed_count, 1);
-        assert_eq!(b.result_used_count, 1);
+        assert_eq!(b.query_seed_count, 0); // not a seed
+        assert_eq!(b.result_shown_count, 1); // shown result in the Query event
+        assert_eq!(b.result_used_count, 1); // FollowUp event
     }
 
     #[test]

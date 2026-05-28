@@ -601,7 +601,10 @@ impl GraphStore {
         // personalization vector so frequently-accessed nodes receive a
         // slight ranking boost without overwhelming seed-based relevance.
         let interaction_bias_weight = 0.05;
-        let interaction_lock = self.interaction_cache.lock().unwrap();
+        let interaction_lock = self
+            .interaction_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(ref scores) = *interaction_lock {
             let mut interaction_mass = 0.0;
             let mut contributions: Vec<(usize, f64)> = Vec::new();
