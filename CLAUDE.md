@@ -20,12 +20,14 @@ nestweaver index                         # auto-detects repo root from .git
 nestweaver index --repo ./testdata/js    # explicit repo path
 nestweaver index --stats                 # show timing and statistics after indexing
 nestweaver watch                         # live re-indexing via filesystem watcher with debouncing
+nestweaver watch ./my-project            # watch a specific directory
 nestweaver context greet                 # task-focused subgraph via PPR
 nestweaver context greet --intent find-definition          # intent-tuned PPR
 nestweaver context src/main.js           # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
+nestweaver impact "fetchRegions" --repo acme  # filter impact to a specific repo
 nestweaver repo-map --token-budget 2000
 nestweaver summary --level symbol        # hierarchical code summaries (symbol/file/cluster)
 
@@ -40,7 +42,7 @@ nestweaver export --format cypher        # graph export (cypher, graphml, mermai
 
 # Markdown brain (`.brainignore` for glob exclusion patterns; `--ignore` flag for ad-hoc)
 nestweaver brain add ~/Documents/Obsidian/MyVault
-nestweaver brain search "architecture"
+nestweaver brain search "architecture"   # searches code symbols AND vault notes
 nestweaver brain context "MyProject"     # unified code + notes context
 nestweaver brain status                  # vault counts, per-vault staleness
 nestweaver brain watch ~/notes --refresh-wiki-hours 6 --config ./instance.toml  # periodic wiki refresh
@@ -53,7 +55,7 @@ nestweaver detect-implicit-projects --vault ~/Documents/Obsidian/MyVault
 
 # Multi-repo / instance config
 nestweaver suggest-links --db ./all.lbug
-nestweaver list-links --config ./nestweaver-instance.toml
+nestweaver list-links --config ./nestweaver-instance.toml --db ./main.lbug
 nestweaver list-features --config ./nestweaver-instance.toml
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
 
