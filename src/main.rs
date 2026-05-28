@@ -632,10 +632,9 @@ enum Commands {
     Clusters {
         #[arg(
             long,
-            default_value = "1.0",
-            help = "Resolution parameter (higher = smaller clusters)"
+            help = "Resolution parameter (higher = smaller clusters) [default: 0.5, or 0.3 for large graphs >10K symbols]"
         )]
-        resolution: f64,
+        resolution: Option<f64>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2107,20 +2106,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Compute and save inside a block so the store is dropped
             // before any output. LadybugDB's connection finaliser can
-            // trigger a panic during WAL checkpoint; dropping early
-            // converts that into a catchable error scope and keeps the
-            // process exit clean.
+            // trigger a panic during WAL checkpoint; wrapping in
+            // catch_unwind prevents the Drop panic from aborting the
+            // process (exit code 101).
             let output = {
-                let store = open_store(Some(&db_path))?;
-                out.status(&format!("Computing clusters (resolution={resolution})..."));
-                let o = compute_clusters(&store, resolution)?;
+                let store = std::mem::ManuallyDrop::new(open_store(Some(&db_path))?);
+
+                // Adaptive resolution: pick a sensible default based on
+                // graph size.  Large graphs (>10 K symbols) benefit from
+                // lower resolution to avoid the explosion of tiny
+                // communities that resolution=1.0 produces.
+                let sym_count = store.count_symbols().unwrap_or(0);
+                let effective_resolution =
+                    resolution.unwrap_or(if sym_count > 10_000 { 0.3 } else { 0.5 });
+
+                out.status(&format!(
+                    "Computing clusters (resolution={effective_resolution}, symbols={sym_count})..."
+                ));
+                let o = compute_clusters(&store, effective_resolution)?;
                 save_clusters(&db_path, &o)?;
                 out.status(&format!(
                     "Found {} community(ies), modularity={:.4}. Saved to sidecar.",
                     o.communities.len(),
                     o.modularity
                 ));
-                // Drop `store` here, before output begins.
+                // Leak the store intentionally — LadybugDB's Drop can
+                // panic during WAL checkpoint on some platforms, and we
+                // are about to exit anyway.  process::exit (called by
+                // main) terminates without running destructors, so this
+                // is safe.
                 o
             };
 
@@ -2160,7 +2174,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => {
                     out.status("No cached clusters found; computing with default resolution...");
                     let store = open_store(Some(&db_path))?;
-                    let computed = compute_clusters(&store, 1.0)?;
+                    let sym_count = store.count_symbols().unwrap_or(0);
+                    let default_res = if sym_count > 10_000 { 0.3 } else { 0.5 };
+                    let computed = compute_clusters(&store, default_res)?;
                     save_clusters(&db_path, &computed)?;
                     computed
                 }

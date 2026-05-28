@@ -213,4 +213,71 @@ mod tests {
         let store = ExtensionStore::new();
         assert_eq!(get_property(&store, "no-such-uid", "key"), None);
     }
+
+    #[test]
+    fn record_and_get_last_indexed_at_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        // Write a dummy file so the sidecar path is deterministic.
+        std::fs::write(&db_path, b"").unwrap();
+
+        let vault_uid = "vlt:default:abc123";
+
+        // Before recording, should return None.
+        assert!(get_last_indexed_at(&db_path, vault_uid).is_none());
+
+        // Record and verify it comes back.
+        let ts = record_last_indexed_at(&db_path, vault_uid).unwrap();
+        assert!(!ts.is_empty(), "timestamp should be non-empty");
+
+        let got = get_last_indexed_at(&db_path, vault_uid);
+        assert_eq!(
+            got,
+            Some(ts.clone()),
+            "should retrieve the recorded timestamp"
+        );
+
+        // A different vault UID should still return None.
+        assert!(get_last_indexed_at(&db_path, "vlt:default:other").is_none());
+
+        // Recording again should update the timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let ts2 = record_last_indexed_at(&db_path, vault_uid).unwrap();
+        assert!(
+            ts2 >= ts,
+            "second recording should produce an equal or later timestamp"
+        );
+        let got2 = get_last_indexed_at(&db_path, vault_uid);
+        assert_eq!(got2, Some(ts2));
+    }
+
+    #[test]
+    fn last_indexed_at_survives_other_property_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        std::fs::write(&db_path, b"").unwrap();
+
+        let vault_uid = "vlt:default:xyz789";
+
+        // Record a timestamp.
+        let ts = record_last_indexed_at(&db_path, vault_uid).unwrap();
+
+        // Write an unrelated property via the generic path.
+        let mut store = load_extensions(&db_path);
+        set_property(
+            &mut store,
+            "sym:r:x:1",
+            "team_owner",
+            serde_json::json!("platform"),
+        );
+        save_extensions(&db_path, &store).unwrap();
+
+        // The vault timestamp should still be present.
+        let got = get_last_indexed_at(&db_path, vault_uid);
+        assert_eq!(
+            got,
+            Some(ts),
+            "timestamp should survive unrelated property writes"
+        );
+    }
 }

@@ -769,6 +769,15 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Total count of Symbol nodes in the graph.
+    pub fn count_symbols(&self) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let result = conn
+            .query("MATCH (s:Symbol) RETURN s.uid")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        Ok(result.count())
+    }
+
     /// All symbols with full details including the embedding field.
     /// Used by vector KNN search to load embeddings for cosine similarity.
     pub fn list_all_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
