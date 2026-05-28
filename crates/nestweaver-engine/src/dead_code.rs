@@ -65,14 +65,36 @@ pub struct DeadCodeResult {
     pub dead_percentage: f64,
 }
 
+/// Default minimum edge confidence for BFS traversal.
+const DEFAULT_MIN_EDGE_CONFIDENCE: f32 = 0.3;
+
+/// Edge confidence below which reachability is considered "weak".
+/// Symbols reachable *only* via edges below this threshold are
+/// reported as Medium confidence dead code rather than alive.
+const WEAK_EDGE_THRESHOLD: f32 = 0.5;
+
 /// Detect potentially dead code by walking forward from all entry points.
 ///
 /// Algorithm:
 /// 1. Collect every Symbol with `is_entry_point == true`.
-/// 2. BFS forward from entry points following reachability edges.
-/// 3. Any symbol not in the visited set is reported as unreachable.
-/// 4. Confidence is scored based on inferred visibility heuristics.
+/// 2. BFS forward from entry points following reachability edges,
+///    skipping edges with confidence below `min_edge_confidence`.
+/// 3. Symbols reachable only through low-confidence edges (< 0.5)
+///    are reported as Medium confidence dead code instead of alive.
+/// 4. Any symbol not in the visited set is reported as unreachable.
+/// 5. Confidence is scored based on inferred visibility heuristics.
 pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_with_confidence(store, DEFAULT_MIN_EDGE_CONFIDENCE)
+}
+
+/// Like [`detect_dead_code`] but with an explicit minimum edge confidence
+/// threshold. Edges with confidence below `min_edge_confidence` are not
+/// traversed at all. Symbols reachable only via edges below
+/// [`WEAK_EDGE_THRESHOLD`] (0.5) are reported as Medium confidence dead code.
+pub fn detect_dead_code_with_confidence(
+    store: &GraphStore,
+    min_edge_confidence: f32,
+) -> anyhow::Result<DeadCodeResult> {
     // 1. Load all symbols.
     let all_symbols = store
         .list_all_symbols()
@@ -92,16 +114,23 @@ pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
         .load_typed_edges()
         .map_err(|e| anyhow::anyhow!("load_typed_edges: {e}"))?;
 
-    // Build adjacency list: source -> [target] (forward direction).
+    // Build adjacency list: source -> [(target, confidence)].
     // Also add reverse MEMBER_OF edges (class -> member) so that when BFS
     // reaches a class, its members become reachable too.
-    let mut adjacency: std::collections::HashMap<String, Vec<String>> =
+    let mut adjacency: std::collections::HashMap<String, Vec<(String, f32)>> =
         std::collections::HashMap::new();
-    for (src, dst, edge_type, _confidence) in &typed_edges {
-        adjacency.entry(src.clone()).or_default().push(dst.clone());
+    for (src, dst, edge_type, confidence) in &typed_edges {
+        let conf = *confidence as f32;
+        adjacency
+            .entry(src.clone())
+            .or_default()
+            .push((dst.clone(), conf));
         if edge_type == "MEMBER_OF" {
-            // MEMBER_OF goes member→class; reverse it so class→member is also traversed.
-            adjacency.entry(dst.clone()).or_default().push(src.clone());
+            // MEMBER_OF goes member->class; reverse it so class->member is also traversed.
+            adjacency
+                .entry(dst.clone())
+                .or_default()
+                .push((src.clone(), conf));
         }
     }
 
@@ -112,21 +141,45 @@ pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
         .map(|s| s.uid.clone())
         .collect();
 
-    // 4. BFS from all entry points.
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
+    // 4. Confidence-aware BFS from all entry points.
+    //
+    // Two-pass BFS:
+    //   - `strong_visited`: symbols reachable via at least one path where
+    //     every edge has confidence >= WEAK_EDGE_THRESHOLD.
+    //   - `weak_visited`: symbols reachable via edges above min_edge_confidence
+    //     but NOT via any fully-strong path.
+    //
+    // We track the "max minimum confidence along any path" for each node.
+    // If max_min >= WEAK_EDGE_THRESHOLD the symbol is strongly reachable;
+    // otherwise it's weakly reachable.
+    let mut best_path_conf: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+    let mut queue: VecDeque<(String, f32)> = VecDeque::new();
 
     for uid in &entry_point_uids {
-        if visited.insert(uid.clone()) {
-            queue.push_back(uid.clone());
+        let prev = best_path_conf.entry(uid.clone()).or_insert(0.0_f32);
+        if *prev < 1.0 {
+            *prev = 1.0; // entry points themselves are fully confident
+            queue.push_back((uid.clone(), 1.0));
         }
     }
 
-    while let Some(current) = queue.pop_front() {
+    while let Some((current, path_conf)) = queue.pop_front() {
         if let Some(targets) = adjacency.get(&current) {
-            for target in targets {
-                if visited.insert(target.clone()) {
-                    queue.push_back(target.clone());
+            for (target, edge_conf) in targets {
+                // Skip edges below the minimum confidence threshold entirely.
+                if *edge_conf < min_edge_confidence {
+                    continue;
+                }
+
+                // The path confidence is the minimum confidence along
+                // the entire path from an entry point to this target.
+                let new_path_conf = path_conf.min(*edge_conf);
+
+                let entry = best_path_conf.entry(target.clone()).or_insert(0.0_f32);
+                if new_path_conf > *entry {
+                    *entry = new_path_conf;
+                    queue.push_back((target.clone(), new_path_conf));
                 }
             }
         }
@@ -134,16 +187,39 @@ pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
 
     // 5. Collect unreachable symbols with confidence scoring.
     let total_symbols = all_symbols.len();
-    let reachable_symbols = visited.len();
+
+    // Symbols in best_path_conf with strong path confidence are truly reachable.
+    let strong_reachable: HashSet<&String> = best_path_conf
+        .iter()
+        .filter(|(_, conf)| **conf >= WEAK_EDGE_THRESHOLD)
+        .map(|(uid, _)| uid)
+        .collect();
+
+    // Symbols reachable only via weak paths.
+    let weak_reachable: HashSet<&String> = best_path_conf
+        .iter()
+        .filter(|(uid, conf)| **conf < WEAK_EDGE_THRESHOLD && !strong_reachable.contains(uid))
+        .map(|(uid, _)| uid)
+        .collect();
+
+    let reachable_symbols = strong_reachable.len();
 
     let mut unreachable_symbols: Vec<UnreachableSymbol> = Vec::new();
     for sym in &all_symbols {
-        if visited.contains(&sym.uid) {
+        if strong_reachable.contains(&sym.uid) {
             continue;
         }
 
         let visibility_str = sym.visibility.to_string();
-        let confidence = infer_confidence(&sym.name, &visibility_str, &sym.file_path);
+
+        // Symbols reachable only via weak edges are reported as Medium
+        // confidence dead code — they might be reachable but the edges
+        // are not highly confident.
+        let confidence = if weak_reachable.contains(&sym.uid) {
+            DeadCodeConfidence::Medium
+        } else {
+            infer_confidence(&sym.name, &visibility_str, &sym.file_path)
+        };
 
         unreachable_symbols.push(UnreachableSymbol {
             uid: sym.uid.clone(),
@@ -519,5 +595,179 @@ mod tests {
             infer_confidence("Helper", "private", "src/lib.rs"),
             DeadCodeConfidence::High
         );
+    }
+
+    #[test]
+    fn low_confidence_edges_are_skipped_below_threshold() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --0.2--> weak_target (below default 0.3 threshold)
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("weak_target", "weakFn", false))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "weak_target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.2,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        // weak_target should NOT be reachable (edge below 0.3)
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "weakFn");
+    }
+
+    #[test]
+    fn weak_edges_produce_medium_confidence_dead_code() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --0.4--> borderline (above 0.3 min, below 0.5 weak threshold)
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("borderline", "maybeDead", false))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "borderline".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.4,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        // borderline should be reported as Medium confidence dead code
+        // because it's only reachable via a weak edge (0.4 < 0.5)
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "maybeDead");
+        assert_eq!(
+            result.unreachable_symbols[0].confidence,
+            DeadCodeConfidence::Medium
+        );
+    }
+
+    #[test]
+    fn strong_edges_still_mark_symbols_as_reachable() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --0.9--> strong_target (well above both thresholds)
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("strong_target", "strongFn", false))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "strong_target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.reachable_symbols, 2);
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    #[test]
+    fn custom_min_confidence_threshold() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --0.5--> target
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "fn_a", false))
+            .unwrap();
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.5,
+                link_type: None,
+            })
+            .unwrap();
+
+        // With min_confidence=0.6, the edge (0.5) should be skipped entirely
+        let result = detect_dead_code_with_confidence(&store, 0.6).unwrap();
+        assert_eq!(result.unreachable_symbols.len(), 1);
+        assert_eq!(result.unreachable_symbols[0].name, "fn_a");
+
+        // With min_confidence=0.3 (default), the edge (0.5) should be traversed
+        // and 0.5 >= 0.5 weak threshold, so strongly reachable
+        let result = detect_dead_code_with_confidence(&store, 0.3).unwrap();
+        assert!(result.unreachable_symbols.is_empty());
+    }
+
+    #[test]
+    fn mixed_strong_and_weak_paths_uses_best() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // entry --0.4--> target (weak path)
+        // entry --0.9--> middle --0.8--> target (strong path)
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("middle", "helper", false))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "fn_a", false))
+            .unwrap();
+
+        // Weak direct path
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.4,
+                link_type: None,
+            })
+            .unwrap();
+
+        // Strong indirect path
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "entry".to_string(),
+                target_uid: "middle".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "middle".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.8,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        // target should be strongly reachable via the strong path (min 0.8 >= 0.5)
+        assert_eq!(result.reachable_symbols, 3);
+        assert!(result.unreachable_symbols.is_empty());
     }
 }

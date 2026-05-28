@@ -60,3 +60,11 @@
 (call_expression
   function: (identifier)
   arguments: (arguments (string) @name)) @reference.import
+
+; JSX opening element — component reference
+(jsx_opening_element
+  name: (identifier) @name) @reference.call
+
+; JSX self-closing element — component reference
+(jsx_self_closing_element
+  name: (identifier) @name) @reference.call
