@@ -35,6 +35,7 @@ pub fn run_stdio_server(
     db_path: &Path,
     allow_add_sources: bool,
     lite: bool,
+    track_interactions: bool,
 ) -> Result<(), anyhow::Error> {
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
@@ -71,8 +72,15 @@ pub fn run_stdio_server(
     tools::set_allow_add_sources(allow_add_sources);
     tools::set_lite_mode(lite);
 
+    let tracker: Option<nestweaver_engine::InteractionTracker> = if track_interactions {
+        Some(nestweaver_engine::InteractionTracker::new(db_path))
+    } else {
+        None
+    };
+
     tracing::info!(
         path = %db_path.display(),
+        track_interactions,
         "brain MCP server ready on stdio"
     );
 
@@ -86,6 +94,11 @@ pub fn run_stdio_server(
         let n = reader.read_line(&mut line)?;
         if n == 0 {
             // EOF from the client — clean shutdown.
+            if let Some(tracker) = &tracker
+                && let Err(e) = tracker.flush()
+            {
+                tracing::warn!("failed to flush interaction tracker: {e}");
+            }
             tracing::info!("client closed stdin; shutting down");
             return Ok(());
         }
@@ -134,7 +147,7 @@ pub fn run_stdio_server(
                     }
                 };
                 let is_notification = req.id.is_none();
-                let outcome = dispatch_method(&store, tantivy.as_ref(), &req);
+                let outcome = dispatch_method(&store, tantivy.as_ref(), &req, tracker.as_ref());
                 if is_notification {
                     if let Frame::Error(e) = outcome {
                         tracing::warn!(
@@ -172,7 +185,7 @@ pub fn run_stdio_server(
                 }
             };
             let is_notification = req.id.is_none();
-            let outcome = dispatch_method(&store, tantivy.as_ref(), &req);
+            let outcome = dispatch_method(&store, tantivy.as_ref(), &req, tracker.as_ref());
             if is_notification {
                 if let Frame::Error(e) = outcome {
                     tracing::warn!(
@@ -208,6 +221,7 @@ fn dispatch_method(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     req: &protocol::Request,
+    tracker: Option<&nestweaver_engine::InteractionTracker>,
 ) -> Frame {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -256,8 +270,13 @@ fn dispatch_method(
                 ));
             };
 
-            match tools::dispatch(store, tantivy, &name, arguments) {
-                Ok(result) => Frame::Success(success(id, tools::wrap_tool_result(result))),
+            match tools::dispatch(store, tantivy, &name, arguments.clone()) {
+                Ok(result) => {
+                    if let Some(tracker) = tracker {
+                        record_interaction(tracker, &name, &arguments, &result);
+                    }
+                    Frame::Success(success(id, tools::wrap_tool_result(result)))
+                }
                 Err(e) => {
                     // Tool errors come back inside the result envelope with
                     // isError=true — not as JSON-RPC errors — so the client
@@ -280,6 +299,73 @@ fn dispatch_method(
     }
 }
 
+// ── interaction telemetry helpers ──────────────────────────────────────────
+
+/// Classify the tool call and record an appropriate interaction event.
+fn record_interaction(
+    tracker: &nestweaver_engine::InteractionTracker,
+    name: &str,
+    arguments: &Value,
+    result: &Value,
+) {
+    match name {
+        "brain_context" | "brain_search" | "project_context" => {
+            let seeds = extract_string_array(arguments, "seeds");
+            let results = extract_result_uids(result);
+            tracker.record_query(name, &seeds, &results);
+        }
+        "note_get" | "backlinks" | "get_summary" => {
+            if let Some(uid) = arguments.get("uid").and_then(|v| v.as_str()) {
+                tracker.record_access(name, uid);
+            }
+        }
+        "brain_impact" | "blast_radius" => {
+            let seeds = extract_string_array(arguments, "seeds");
+            tracker.record_impact(name, &seeds);
+        }
+        _ => {}
+    }
+}
+
+/// Extract a string array from a JSON object by key.
+fn extract_string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Try to extract UIDs from a tool result value.
+///
+/// The result is the raw structured JSON returned by `dispatch()` (before
+/// `wrap_tool_result` wraps it). Different tools use different field names:
+/// - `brain_context` / `project_context` → `connected[].uid`
+/// - `brain_search` → `results[].uid`
+fn extract_result_uids(result: &Value) -> Vec<String> {
+    // brain_context / project_context: connected[].uid
+    if let Some(connected) = result.get("connected").and_then(|c| c.as_array()) {
+        let uids: Vec<String> = connected
+            .iter()
+            .filter_map(|n| n.get("uid").and_then(|u| u.as_str()).map(String::from))
+            .collect();
+        if !uids.is_empty() {
+            return uids;
+        }
+    }
+    // brain_search: results[].uid
+    if let Some(results) = result.get("results").and_then(|r| r.as_array()) {
+        return results
+            .iter()
+            .filter_map(|n| n.get("uid").and_then(|u| u.as_str()).map(String::from))
+            .collect();
+    }
+    vec![]
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -299,7 +385,7 @@ mod tests {
     fn initialize_returns_capabilities_and_server_info() {
         let store = GraphStore::in_memory().unwrap();
         let req = make_request("initialize", 1, json!({}));
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Success(resp) => {
                 assert_eq!(resp.id, json!(1));
@@ -316,7 +402,7 @@ mod tests {
     fn tools_list_returns_all_tools() {
         let store = GraphStore::in_memory().unwrap();
         let req = make_request("tools/list", 2, json!({}));
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Success(resp) => {
                 let tools = resp.result["tools"].as_array().expect("tools array");
@@ -366,7 +452,7 @@ mod tests {
             3,
             json!({ "name": "no_such_tool", "arguments": {} }),
         );
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         // Tool errors come back as success frames with isError=true (the
         // intentional design — Claude sees the error in-band).
         match frame {
@@ -381,7 +467,7 @@ mod tests {
     fn unknown_method_returns_method_not_found() {
         let store = GraphStore::in_memory().unwrap();
         let req = make_request("not_a_real_method", 4, json!({}));
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Error(e) => {
                 assert_eq!(e.error.code, error_code::METHOD_NOT_FOUND);
@@ -398,7 +484,7 @@ mod tests {
             5,
             json!({ "name": "brain_status", "arguments": {} }),
         );
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Success(resp) => {
                 let structured = &resp.result["structuredContent"];
@@ -438,7 +524,7 @@ mod tests {
         let mut responses: Vec<Value> = Vec::new();
         for item in arr {
             let req: protocol::Request = serde_json::from_value(item.clone()).unwrap();
-            let outcome = dispatch_method(&store, None, &req);
+            let outcome = dispatch_method(&store, None, &req, None);
             let val = match outcome {
                 Frame::Success(r) => serde_json::to_value(r).unwrap(),
                 Frame::Error(e) => serde_json::to_value(e).unwrap(),
@@ -469,7 +555,7 @@ mod tests {
         for item in arr {
             let req: protocol::Request = serde_json::from_value(item.clone()).unwrap();
             let is_notification = req.id.is_none();
-            let outcome = dispatch_method(&store, None, &req);
+            let outcome = dispatch_method(&store, None, &req, None);
             if is_notification {
                 continue;
             }
@@ -491,7 +577,7 @@ mod tests {
             6,
             json!({ "name": "brain_search", "arguments": { "query": "nope" } }),
         );
-        let frame = dispatch_method(&store, None, &req);
+        let frame = dispatch_method(&store, None, &req, None);
         match frame {
             Frame::Success(resp) => {
                 assert_eq!(resp.result["isError"], json!(false));
@@ -499,5 +585,141 @@ mod tests {
             }
             Frame::Error(e) => panic!("brain_search should succeed: {}", e.error.message),
         }
+    }
+
+    // ── interaction telemetry helper tests ────────────────────────────────
+
+    #[test]
+    fn extract_string_array_returns_strings() {
+        let args = json!({ "seeds": ["a", "b", "c"] });
+        let result = extract_string_array(&args, "seeds");
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn extract_string_array_handles_missing_key() {
+        let args = json!({});
+        let result = extract_string_array(&args, "seeds");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_string_array_handles_non_array() {
+        let args = json!({ "seeds": "not_an_array" });
+        let result = extract_string_array(&args, "seeds");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_string_array_filters_non_strings() {
+        let args = json!({ "seeds": ["a", 42, "b", null] });
+        let result = extract_string_array(&args, "seeds");
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn extract_result_uids_from_brain_context_format() {
+        let result = json!({
+            "seeds_expanded": 1,
+            "connected": [
+                { "uid": "sym:repo:a:hash:1", "kind": "Symbol", "title": "foo" },
+                { "uid": "note:vlt:b:hash:2", "kind": "Note", "title": "bar" },
+            ],
+            "tokens_used": 100,
+        });
+        let uids = extract_result_uids(&result);
+        assert_eq!(uids, vec!["sym:repo:a:hash:1", "note:vlt:b:hash:2"]);
+    }
+
+    #[test]
+    fn extract_result_uids_from_brain_search_format() {
+        let result = json!({
+            "query": "test",
+            "engine": "bm25",
+            "results": [
+                { "uid": "note:vlt:x:hash:1", "kind": "note", "title": "Test" },
+                { "uid": "note:vlt:x:hash:2", "kind": "note", "title": "Test2" },
+            ],
+            "total_matches": 2,
+        });
+        let uids = extract_result_uids(&result);
+        assert_eq!(uids, vec!["note:vlt:x:hash:1", "note:vlt:x:hash:2"]);
+    }
+
+    #[test]
+    fn extract_result_uids_returns_empty_for_unknown_format() {
+        let result = json!({ "something_else": true });
+        let uids = extract_result_uids(&result);
+        assert!(uids.is_empty());
+    }
+
+    #[test]
+    fn record_interaction_records_query_for_brain_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({ "seeds": ["AuthService"] });
+        let result = json!({
+            "connected": [
+                { "uid": "sym:a", "kind": "Symbol", "title": "AuthService" }
+            ]
+        });
+
+        record_interaction(&tracker, "brain_context", &args, &result);
+        assert_eq!(tracker.pending_count(), 1);
+    }
+
+    #[test]
+    fn record_interaction_records_access_for_note_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({ "uid": "note:vlt:x:hash:1" });
+        let result = json!({ "uid": "note:vlt:x:hash:1", "title": "Test" });
+
+        record_interaction(&tracker, "note_get", &args, &result);
+        assert_eq!(tracker.pending_count(), 1);
+    }
+
+    #[test]
+    fn record_interaction_records_impact_for_brain_impact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({ "seeds": ["sym:xyz"] });
+        let result = json!({ "target": "sym:xyz", "impact_nodes": [] });
+
+        record_interaction(&tracker, "brain_impact", &args, &result);
+        assert_eq!(tracker.pending_count(), 1);
+    }
+
+    #[test]
+    fn record_interaction_ignores_untracked_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        let args = json!({});
+        let result = json!({});
+
+        record_interaction(&tracker, "brain_status", &args, &result);
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn record_interaction_skips_access_when_no_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        // note_get called with title instead of uid — no uid to record.
+        let args = json!({ "title": "My Note" });
+        let result = json!({ "uid": "note:abc", "title": "My Note" });
+
+        record_interaction(&tracker, "note_get", &args, &result);
+        assert_eq!(tracker.pending_count(), 0);
     }
 }
