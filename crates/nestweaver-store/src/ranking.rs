@@ -586,7 +586,7 @@ impl GraphStore {
         let personalization_val = 1.0 / seed_count as f64;
 
         // Personalization vector: 1/|seeds| for seeds, 0 otherwise.
-        let personalization: Vec<f64> = (0..n)
+        let mut personalization: Vec<f64> = (0..n)
             .map(|i| {
                 if seed_set.contains(&i) {
                     personalization_val
@@ -595,6 +595,37 @@ impl GraphStore {
                 }
             })
             .collect();
+
+        // Apply interaction memory bias (conservative: 5% weight).
+        // Blends a small fraction of interaction history scores into the
+        // personalization vector so frequently-accessed nodes receive a
+        // slight ranking boost without overwhelming seed-based relevance.
+        let interaction_bias_weight = 0.05;
+        let interaction_lock = self.interaction_cache.lock().unwrap();
+        if let Some(ref scores) = *interaction_lock {
+            let mut interaction_mass = 0.0;
+            let mut contributions: Vec<(usize, f64)> = Vec::new();
+
+            for (i, uid) in uids.iter().enumerate() {
+                if let Some(&score) = scores.get(uid)
+                    && score > 0.0
+                {
+                    contributions.push((i, score));
+                    interaction_mass += score;
+                }
+            }
+
+            if interaction_mass > 0.0 {
+                // Blend: 95% from seeds, 5% from interaction history.
+                for p in personalization.iter_mut() {
+                    *p *= 1.0 - interaction_bias_weight;
+                }
+                for (i, score) in &contributions {
+                    personalization[*i] += interaction_bias_weight * score / interaction_mass;
+                }
+            }
+        }
+        drop(interaction_lock);
 
         // Initialize scores to the personalization vector.
         let mut scores: Vec<f64> = personalization.clone();
@@ -1522,6 +1553,115 @@ mod tests {
             super::QueryIntent::GeneralContext,
             "empty seeds should default to GeneralContext"
         );
+    }
+
+    #[test]
+    fn ppr_interaction_bias_boosts_accessed_nodes() {
+        // Graph: A->B->C->D
+        // Seed from A. Without interaction bias, B ranks highest after A
+        // (directly called). With interaction bias on D, D should get a
+        // ranking boost compared to the baseline.
+        use std::collections::HashMap;
+
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("C", "D")).unwrap();
+
+        // Baseline: no interaction cache.
+        let baseline = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+        let baseline_d = baseline
+            .iter()
+            .find(|(u, _)| u == "D")
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0);
+
+        // Load interaction scores that heavily favor D.
+        let mut scores = HashMap::new();
+        scores.insert("D".to_string(), 10.0);
+        store.load_interaction_cache(scores);
+
+        let biased = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+        let biased_d = biased
+            .iter()
+            .find(|(u, _)| u == "D")
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0);
+
+        assert!(
+            biased_d > baseline_d,
+            "interaction bias should boost D: biased={biased_d:.6} vs baseline={baseline_d:.6}"
+        );
+    }
+
+    #[test]
+    fn ppr_empty_interaction_cache_matches_baseline() {
+        // When the interaction cache is loaded but empty, PPR should produce
+        // identical results to having no cache at all.
+        use std::collections::HashMap;
+
+        let store = test_store();
+        for uid in ["A", "B", "C"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+
+        // Baseline with no interaction cache.
+        let baseline = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        // Load an empty interaction cache.
+        store.load_interaction_cache(HashMap::new());
+
+        let with_empty = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        assert_eq!(
+            baseline.len(),
+            with_empty.len(),
+            "empty interaction cache should not change result count"
+        );
+        for ((uid1, s1), (uid2, s2)) in baseline.iter().zip(with_empty.iter()) {
+            assert_eq!(uid1, uid2);
+            assert!(
+                (s1 - s2).abs() < 1e-10,
+                "scores should be identical with empty cache: {uid1}: {s1} vs {s2}"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_cache_load_and_clear() {
+        use std::collections::HashMap;
+
+        let store = test_store();
+        let mut scores = HashMap::new();
+        scores.insert("A".to_string(), 1.0);
+        store.load_interaction_cache(scores);
+
+        // Verify it's loaded.
+        let cache = store.interaction_cache.lock().unwrap();
+        assert!(cache.is_some());
+        drop(cache);
+
+        // Clear it.
+        store.clear_interaction_cache();
+        let cache = store.interaction_cache.lock().unwrap();
+        assert!(cache.is_none());
     }
 
     #[test]

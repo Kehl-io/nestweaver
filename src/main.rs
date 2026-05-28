@@ -197,6 +197,34 @@ impl OutputConfig {
     }
 }
 
+/// Format a Unix epoch timestamp (seconds since 1970-01-01) into
+/// an ISO 8601 UTC string for human-readable display.
+fn format_epoch_timestamp(epoch_secs: f64) -> String {
+    let secs = epoch_secs as i64;
+    // Days since Unix epoch using Howard Hinnant's civil-from-days algorithm.
+    let mut days = secs.div_euclid(86400);
+    let day_secs = secs.rem_euclid(86400);
+    let hour = day_secs / 3600;
+    let minute = (day_secs % 3600) / 60;
+    let second = day_secs % 60;
+
+    days += 719_468;
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn format_elapsed(elapsed: std::time::Duration) -> String {
     let secs = elapsed.as_secs_f64();
     if secs >= 1.0 {
@@ -514,6 +542,11 @@ enum Commands {
 
         #[arg(long, help = "Do not open the browser automatically")]
         no_open: bool,
+    },
+    /// Manage interaction memory
+    Interactions {
+        #[command(subcommand)]
+        command: InteractionCommands,
     },
     /// Generate an AGENTS.md codebase intelligence guide from the indexed graph.
     GenerateGuide {
@@ -1159,6 +1192,26 @@ enum SnapshotCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum InteractionCommands {
+    /// Show interaction memory statistics
+    Status {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Clear all interaction memory
+    Clear {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn default_db_path() -> PathBuf {
@@ -1219,6 +1272,13 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     };
     let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
+
+    // Load interaction memory scores so PPR can apply a small bias toward
+    // frequently-accessed nodes.
+    if let Some(scores) = nestweaver_engine::load_interaction_scores(path) {
+        store.load_interaction_cache(scores);
+    }
+
     Ok(store)
 }
 
@@ -2137,6 +2197,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
+        Commands::Interactions { command } => match command {
+            InteractionCommands::Status { db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                match nestweaver_engine::load_interaction_data(&db_path) {
+                    Some(data) => {
+                        let node_count = data.scores.len();
+                        let event_count = data.event_count;
+                        println!("Interaction memory:");
+                        println!("  Nodes with scores: {node_count}");
+                        println!("  Total events:      {event_count}");
+                        if let Some(ts) = data.oldest_timestamp {
+                            println!("  Oldest event:      {}", format_epoch_timestamp(ts));
+                        }
+                        if let Some(ts) = data.newest_timestamp {
+                            println!("  Newest event:      {}", format_epoch_timestamp(ts));
+                        }
+                    }
+                    None => {
+                        println!("No interaction data found.");
+                        println!("Use `nestweaver mcp --track-interactions` to start recording.");
+                    }
+                }
+                Ok((EXIT_SUCCESS, None))
+            }
+            InteractionCommands::Clear { db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                if nestweaver_engine::clear_interaction_sidecar(&db_path) {
+                    println!("Interaction memory cleared.");
+                } else {
+                    println!("No interaction data to clear.");
+                }
+                Ok((EXIT_SUCCESS, None))
+            }
+        },
+
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0),
@@ -2519,6 +2614,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
+            }
+            if track_interactions {
+                nestweaver_mcp::tools::set_track_interactions(true);
             }
             nestweaver_mcp::run_stdio_server(
                 &db_path,
