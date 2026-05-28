@@ -14,11 +14,11 @@ use anyhow::{Context, anyhow};
 use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
     attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, detect_dead_code, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
-    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
-    parse_iso8601_to_epoch, query_by_property, render_text, save_extensions, set_property,
-    truncate_to_budget,
+    compute_clusters, detect_changes_impact, detect_dead_code, expand_query_with_aliases,
+    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries,
+    get_all_properties, get_last_indexed_at, index_directory, index_markdown_directory,
+    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch, query_by_property,
+    render_text, save_extensions, set_property, truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -665,7 +665,7 @@ fn tool_brain_search(
     tantivy: Option<&TantivyIndex>,
     args: Value,
 ) -> Result<Value, anyhow::Error> {
-    let query = args
+    let raw_query = args
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'query' must be a string"))?
@@ -676,6 +676,11 @@ fn tool_brain_search(
         .map(|n| n as usize)
         .unwrap_or(20);
     let concise = is_concise(&args);
+
+    // Expand the query with taxonomy aliases for better recall.
+    let db_path = current_db_path(store).unwrap_or_default();
+    let aliases = load_alias_sidecar(&db_path);
+    let query = expand_query_with_aliases(&raw_query, &aliases);
 
     // Tantivy path (preferred). Falls back to substring scan if the index
     // isn't open — keeps the tool useful before the first
