@@ -174,6 +174,14 @@ impl TantivyIndex {
     /// `note_uid` (the note itself + all its headings + sections) and
     /// re-indexes the supplied fresh data. Called by the file watcher
     /// after re-parsing a saved file.
+    /// Per-note incremental update. Drops every Tantivy doc tagged with
+    /// `note_uid` (the note itself + all its headings + sections) and
+    /// re-indexes the supplied fresh data. Called by the file watcher
+    /// after re-parsing a saved file.
+    ///
+    /// `sections` is a slice of `(uid, body_text, heading_title)` tuples.
+    /// The heading title is indexed in the section's `title` field so that
+    /// heading-name searches also surface section body content.
     #[allow(clippy::too_many_arguments)]
     pub fn update_note(
         &self,
@@ -182,7 +190,7 @@ impl TantivyIndex {
         vault_uid: &str,
         body_chunks: &[String],
         headings: &[(String, String)],
-        sections: &[(String, String)],
+        sections: &[(String, String, String)],
         tags: &[String],
     ) -> Result<(), TantivyError> {
         let writer_mutex = self
@@ -214,12 +222,12 @@ impl TantivyIndex {
                 self.fields.note_uid => note_uid.to_string(),
             ))?;
         }
-        // 3. Per-section docs.
-        for (s_uid, s_body) in sections {
+        // 3. Per-section docs — heading text in title, body text in body.
+        for (s_uid, s_body, s_heading_title) in sections {
             writer.add_document(doc!(
                 self.fields.uid => s_uid.to_string(),
                 self.fields.kind => "section".to_string(),
-                self.fields.title => String::new(),
+                self.fields.title => s_heading_title.to_string(),
                 self.fields.body => s_body.to_string(),
                 self.fields.vault_uid => vault_uid.to_string(),
                 self.fields.note_uid => note_uid.to_string(),
@@ -357,10 +365,18 @@ impl TantivyIndex {
                 } else {
                     slice_section_lines(&body_lines, s.start_line, s.end_line)
                 };
+                // Resolve the section's heading text so keyword searches
+                // on a heading name also surface the section's body.
+                let section_title = s
+                    .heading_uid
+                    .as_deref()
+                    .and_then(|h_uid| headings.iter().find(|h| h.uid == h_uid))
+                    .map(|h| h.text.clone())
+                    .unwrap_or_default();
                 writer.add_document(doc!(
                     self.fields.uid => s.uid.clone(),
                     self.fields.kind => "section".to_string(),
-                    self.fields.title => String::new(),
+                    self.fields.title => section_title,
                     self.fields.body => section_text,
                     self.fields.vault_uid => note.vault_uid.clone(),
                     self.fields.note_uid => note.uid.clone(),
