@@ -331,6 +331,8 @@ enum Commands {
         confidence: f32,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
+        #[arg(long, help = "Filter to symbols in this repo")]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -363,6 +365,8 @@ enum Commands {
     CrossRepoRefs {
         /// Symbol name or UID
         name_or_uid: String,
+        #[arg(long, help = "Filter to symbols in this repo")]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -457,6 +461,11 @@ enum Commands {
         config: PathBuf,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
     /// List declared feature bundles from an instance config
     #[command(after_help = "Examples:\n  nestweaver list-features --config ./instance.toml")]
@@ -902,7 +911,8 @@ enum Commands {
         after_help = "Examples:\n  nestweaver watch\n  nestweaver watch --repo ./my-project\n  nestweaver watch --repo ./my-project --db ./custom.lbug"
     )]
     Watch {
-        #[arg(long, help = "Path to the local repository to watch")]
+        /// Path to the repository to watch (auto-detects if omitted)
+        #[arg(help = "Repository path to watch")]
         repo: Option<PathBuf>,
         #[arg(
             long,
@@ -1554,11 +1564,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::CrossRepoRefs {
             name_or_uid,
+            repo: repo_filter,
             json,
             db,
         } => {
             let store = open_store(db.as_deref())?;
-            match resolve_uid(&store, &name_or_uid)? {
+            match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
                 ResolveResult::Found(uid) => {
                     let refs = store
                         .cross_repo_links(&uid)
@@ -1777,7 +1788,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
-        Commands::ListLinks { config, json } => {
+        Commands::ListLinks {
+            config,
+            json,
+            db: _,
+        } => {
             let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
             let links = instance_config.links.unwrap_or_default();
 
@@ -2762,12 +2777,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             confidence,
             json,
             db,
+            repo: repo_filter,
             ..
         } => {
             let store = open_store(db.as_deref())?;
 
             // Resolve the symbol UID first (may be a name).
-            match resolve_uid(&store, &name_or_uid)? {
+            match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
                 ResolveResult::Found(uid) => {
                     let nodes = store.impact(&uid, depth, confidence)?;
                     let count = nodes.len();
@@ -3272,6 +3288,32 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
             1 => Ok(ResolveResult::Found(matches.remove(0).uid)),
             _ => Ok(ResolveResult::Ambiguous(matches)),
         }
+    }
+}
+
+/// Like [`resolve_uid`] but applies an optional repo filter to narrow ambiguous
+/// matches. When `repo_filter` is `Some`, only symbols whose `file_path` starts
+/// with the repo name (or whose UID contains it) are kept.
+fn resolve_uid_with_repo_filter(
+    store: &GraphStore,
+    name_or_uid: &str,
+    repo_filter: Option<&str>,
+) -> anyhow::Result<ResolveResult> {
+    let result = resolve_uid(store, name_or_uid)?;
+    match (&result, repo_filter) {
+        (ResolveResult::Ambiguous(candidates), Some(filter)) => {
+            let filtered: Vec<Symbol> = candidates
+                .iter()
+                .filter(|s| s.file_path.starts_with(filter) || s.uid.contains(filter))
+                .cloned()
+                .collect();
+            match filtered.len() {
+                0 => Ok(ResolveResult::NotFound),
+                1 => Ok(ResolveResult::Found(filtered[0].uid.clone())),
+                _ => Ok(ResolveResult::Ambiguous(filtered)),
+            }
+        }
+        _ => Ok(result),
     }
 }
 
