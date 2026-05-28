@@ -10,6 +10,7 @@ use crate::config::InstanceConfig;
 use crate::extensions::{load_extensions, save_extensions, set_property};
 use crate::html_to_md::maybe_convert_html_to_markdown;
 use crate::mcp_client::McpClient;
+use crate::repo_display_name;
 
 pub struct ProjectMaterializationResult {
     pub projects_created: usize,
@@ -116,10 +117,12 @@ pub fn materialize_projects(
             let mut symbol_uids: Vec<String> = Vec::new();
 
             for repo_name in &project_cfg.repos {
-                // Match by URL containing the repo name fragment.
+                // Match by display name (respects --name override) or URL fragment.
                 let matched: Vec<_> = all_repos
                     .iter()
-                    .filter(|r| r.url.contains(repo_name.as_str()))
+                    .filter(|r| {
+                        repo_display_name(r) == *repo_name || r.url.contains(repo_name.as_str())
+                    })
                     .collect();
 
                 for repo in matched {
