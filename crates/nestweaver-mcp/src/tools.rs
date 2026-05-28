@@ -2320,7 +2320,7 @@ fn tool_project_context(
         .map(|s| s.parse::<nestweaver_store::QueryIntent>())
         .transpose()
         .map_err(|e| anyhow!("invalid intent: {e}"))?
-        .unwrap_or(nestweaver_store::QueryIntent::UnderstandArchitecture);
+        .unwrap_or(nestweaver_store::QueryIntent::ProjectContext);
 
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
