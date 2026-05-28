@@ -2766,32 +2766,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
-            // Collect seed UIDs from this project (and optionally its components).
-            let mut seed_uids: Vec<String> = Vec::new();
+            // Collect member UIDs for the post-PPR boost. These are the
+            // notes and symbols declared as belonging to this project.
+            let mut member_uids: Vec<String> = Vec::new();
             let note_uids = store
                 .list_project_note_uids(&project.uid)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            seed_uids.extend(note_uids);
+            member_uids.extend(note_uids);
             let sym_uids = store
                 .list_project_symbol_uids(&project.uid)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            seed_uids.extend(sym_uids);
+            member_uids.extend(sym_uids);
 
-            if include_components {
-                let comp_uids = store
+            let comp_uids = if include_components {
+                store
                     .list_project_component_uids(&project.uid)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                for comp_uid in &comp_uids {
-                    seed_uids.extend(store.list_project_note_uids(comp_uid).unwrap_or_default());
-                    seed_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
-                }
+                    .map_err(|e| anyhow::anyhow!(e))?
+            } else {
+                vec![]
+            };
+            for comp_uid in &comp_uids {
+                member_uids.extend(store.list_project_note_uids(comp_uid).unwrap_or_default());
+                member_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
             }
 
-            // Deduplicate seeds.
+            // Deduplicate members.
             let mut seen = std::collections::HashSet::new();
-            seed_uids.retain(|u| seen.insert(u.clone()));
+            member_uids.retain(|u| seen.insert(u.clone()));
 
-            if seed_uids.is_empty() {
+            if member_uids.is_empty() {
                 if json {
                     println!(
                         "{}",
@@ -2811,11 +2814,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
+            // Seed PPR from the project node itself (not all member UIDs).
+            // With ProjectContext intent the PROJECT_INCLUDES_* edges get a
+            // 5x weight boost, so the walk efficiently discovers all members
+            // and places them in `connected` instead of `seeds`.
+            let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
+            ppr_seeds.extend(comp_uids);
+
             let defaults = HybridSearchConfig::default();
             let aliases = load_alias_sidecar(&db_path);
             match build_brain_context_hybrid_with_aliases(
                 &store,
-                &seed_uids,
+                &ppr_seeds,
                 tantivy.as_ref(),
                 &defaults,
                 &aliases,
@@ -2825,10 +2835,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(mut result) => {
                     // Post-PPR scope boost: multiply relevance for nodes that
                     // belong to the project so declared content ranks highest.
-                    let seed_set_boost: std::collections::HashSet<&str> =
-                        seed_uids.iter().map(|s| s.as_str()).collect();
+                    let member_set: std::collections::HashSet<&str> =
+                        member_uids.iter().map(|s| s.as_str()).collect();
                     for node in &mut result.connected {
-                        if seed_set_boost.contains(node.uid.as_str()) {
+                        if member_set.contains(node.uid.as_str()) {
                             node.relevance *= 5.0;
                         }
                     }
