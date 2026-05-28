@@ -722,6 +722,8 @@ Activate this skill when the task involves:
 - Retrieving project knowledge from Obsidian vaults or markdown notes
 - Getting a structural overview of the architecture
 - Assessing risk of a set of changed files before commit
+- Detecting dead or unused code
+- Finding architectural hotspots or chokepoints
 
 Do NOT activate when:
 
@@ -733,9 +735,11 @@ Do NOT activate when:
 
 - **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), free-text terms, or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`).
 - **PPR (Personalized PageRank)**: Walks the code+notes graph from seeds and scores every reachable node by structural proximity.
+- **Intent**: The `intent` parameter on `brain_context`/`project_context` tunes PPR edge weights for specific query types (e.g. `find-definition`, `find-callers`).
 - **Context**: A token-budgeted, PPR-ranked list of symbols, notes, and sections relevant to given seeds.
 - **Brain**: The unified graph combining code symbols and markdown vault notes.
-- **Vault**: An indexed collection of markdown notes (e.g. an Obsidian vault).
+- **Vault**: An indexed collection of markdown notes (e.g. an Obsidian vault). Use `.brainignore` for glob exclusion patterns.
+- **Edge types**: CALLS (function calls), IMPORTS, USES (type references), ACCESSES (field access). PPR weights each differently.
 - **Confidence**: A 0.0\u{2013}1.0 score on edges indicating resolver certainty about a relationship.
 
 ## Available MCP tools
@@ -744,11 +748,12 @@ Do NOT activate when:
 
 | Tool | Purpose |
 |------|---------|
-| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. |
+| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. Supports `intent` parameter. |
 | `brain_search` | BM25 full-text search across notes, headings, sections, and tags. |
-| `project_context` | PPR-ranked context scoped to a named project. |
+| `project_context` | PPR-ranked context scoped to a named project. Supports `intent` parameter. |
 | `note_get` | Full markdown body of a specific note. |
 | `backlinks` | All notes that wikilink TO a target note. |
+| `get_summary` | Hierarchical code summaries at symbol, file, or cluster level. Token-efficient overview. |
 
 ### Analysis
 
@@ -757,6 +762,10 @@ Do NOT activate when:
 | `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. |
 | `flow_trace` | Forward call chain from a symbol. |
 | `detect_changes` | Risk assessment for a list of changed files. |
+| `blast_radius` | Analyze blast radius of a symbol change with risk scoring. |
+| `dead_code` | Detect unreachable symbols via entry point reachability analysis. |
+| `hub_nodes` | Most connected hub nodes by degree centrality and PageRank. |
+| `bridge_nodes` | Architectural chokepoints by betweenness centrality. |
 | `cross_repo_contracts` | Symbols shared across repositories. |
 | `clusters` | Functional communities detected by the Leiden algorithm. |
 
@@ -769,6 +778,8 @@ Do NOT activate when:
 | `brain_diff` | Files and symbols changed since a given SHA. |
 | `brain_guide` | Auto-generated architecture overview. |
 | `brain_add_source` | Index a new repo or vault at runtime. |
+| `set_extension` | Attach custom metadata to graph nodes. |
+| `query_extensions` | Query custom metadata on graph nodes. |
 
 ## Common workflows
 
@@ -783,6 +794,19 @@ Do NOT activate when:
 1. `brain_impact` on the symbol you plan to change.
 2. `detect_changes` with the list of files you expect to modify.
 3. `cross_repo_contracts` if the symbol may be shared across services.
+
+### Assessing dead code
+
+1. `dead_code` to find unreachable symbols across the codebase.
+2. `brain_context` on flagged symbols to verify they are truly unused.
+3. Remove confirmed dead code with confidence.
+
+### Architecture overview
+
+1. `hub_nodes` to identify the most connected symbols.
+2. `bridge_nodes` to find architectural chokepoints.
+3. `clusters` to see functional groupings.
+4. `get_summary` at cluster or file level for a token-efficient overview.
 "
     .to_string()
 }
@@ -791,26 +815,49 @@ fn generate_cursor_rule_content() -> String {
     "---\ndescription: Use NestWeaver for structural codebase understanding\nglobs:\nalwaysApply: true\n---\n\n\
 When exploring unfamiliar code, use the `brain_context` MCP tool with relevant symbol names as seeds.\n\n\
 Before modifying functions with many callers, use `brain_impact` to check blast radius.\n\n\
-For architecture questions, use `brain_guide`.\n\n\
+For architecture questions, use `brain_guide` for a narrative overview, or `hub_nodes` and `bridge_nodes` to find the most connected and most critical nodes.\n\n\
+For token-efficient overviews, use `get_summary` at file or cluster level instead of reading entire files.\n\n\
 When working on a named project, use `project_context`.\n\n\
-After making changes, use `detect_changes` to assess risk.\n".to_string()
+After making changes, use `detect_changes` to assess risk.\n\n\
+To find cleanup opportunities, use `dead_code` to detect unreachable symbols.\n\n\
+If using many MCP servers, pass `--tools` to the NestWeaver server to allowlist only the tools you need.\n".to_string()
 }
 
 fn generate_copilot_instructions() -> String {
     "# Copilot Instructions — NestWeaver\n\n\
     > Auto-generated by NestWeaver. Provides codebase intelligence via MCP.\n\n\
-    ## Available MCP Tools\n\n\
-    Use the NestWeaver MCP server for code intelligence:\n\n\
-    - **brain_context** — PPR-ranked context for a task\n\
-    - **brain_search** — Full-text search across code and notes\n\
-    - **brain_impact** — Blast radius analysis before changes\n\
-    - **brain_guide** — Architecture overview\n\
-    - **project_context** — Project-scoped retrieval\n\
-    - **detect_changes** — Risk assessment for changes\n\n\
+    ## Available MCP Tools (22)\n\n\
+    ### Core retrieval\n\
+    - **brain_context** — PPR-ranked context from seeds (supports `intent` parameter)\n\
+    - **brain_search** — BM25 full-text search across code and notes\n\
+    - **project_context** — Project-scoped PPR context (supports `intent` parameter)\n\
+    - **note_get** — Full markdown body of a specific note\n\
+    - **backlinks** — Notes that wikilink to a target note\n\
+    - **get_summary** — Hierarchical code summaries (symbol/file/cluster level)\n\n\
+    ### Analysis\n\
+    - **brain_impact** — Reverse dependency blast radius, grouped by depth\n\
+    - **flow_trace** — Forward call chain from a symbol\n\
+    - **detect_changes** — Risk assessment for a list of changed files\n\
+    - **blast_radius** — Symbol change blast radius with risk scoring\n\
+    - **dead_code** — Detect unreachable symbols via entry point reachability\n\
+    - **hub_nodes** — Most connected nodes by degree centrality and PageRank\n\
+    - **bridge_nodes** — Architectural chokepoints by betweenness centrality\n\
+    - **cross_repo_contracts** — Symbols shared across repositories\n\
+    - **clusters** — Functional communities (Leiden algorithm)\n\n\
+    ### Status and maintenance\n\
+    - **brain_status** — Vault, note, symbol, and repo counts\n\
+    - **stale_check** — Compare indexed SHA to current git HEAD\n\
+    - **brain_diff** — Files and symbols changed since a given SHA\n\
+    - **brain_guide** — Auto-generated architecture overview\n\
+    - **brain_add_source** — Index a new repo or vault at runtime\n\
+    - **set_extension** — Attach custom metadata to graph nodes\n\
+    - **query_extensions** — Query custom metadata on graph nodes\n\n\
     ## When to Use\n\n\
     - Starting a task: call `brain_context` with task keywords\n\
     - Before modifying code: call `brain_impact` on the function\n\
-    - Exploring unfamiliar code: call `brain_search`\n"
+    - Exploring unfamiliar code: call `brain_search`\n\
+    - Finding dead code: call `dead_code` for unreachable symbols\n\
+    - Architecture overview: call `hub_nodes`, `clusters`, and `get_summary`\n"
         .to_string()
 }
 
