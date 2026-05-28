@@ -149,6 +149,9 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Timeout in seconds for tool calls to this server (default 30).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl InstanceConfig {

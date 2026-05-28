@@ -3,15 +3,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Timeout for MCP tool calls (seconds). Wiki fetches can be slow
-/// (TLS negotiation, large pages, network latency).
-const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for MCP tool calls (seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of a single MCP `tools/call` invocation.
 pub struct ToolCallResult {
-    /// The text content returned by the tool.
     pub content: String,
-    /// Whether the MCP server flagged the response as an error (`isError: true`).
     pub is_error: bool,
 }
 
@@ -20,6 +17,8 @@ pub struct McpClient {
     reader: std::io::BufReader<std::process::ChildStdout>,
     child: Child,
     next_id: u64,
+    timeout: Duration,
+    poisoned: bool,
 }
 
 impl McpClient {
@@ -27,6 +26,15 @@ impl McpClient {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::spawn_with_timeout(command, args, env, DEFAULT_TIMEOUT)
+    }
+
+    pub fn spawn_with_timeout(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        timeout: Duration,
     ) -> Result<Self, anyhow::Error> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -51,6 +59,8 @@ impl McpClient {
             reader,
             child,
             next_id: 1,
+            timeout,
+            poisoned: false,
         };
         client.initialize()?;
         Ok(client)
@@ -62,7 +72,7 @@ impl McpClient {
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": { "name": "nestweaver", "version": "0.1.0" }
+                "clientInfo": { "name": "nestweaver", "version": "0.9.0" }
             }
         });
         self.send(&req)?;
@@ -77,6 +87,11 @@ impl McpClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolCallResult, anyhow::Error> {
+        if self.poisoned {
+            anyhow::bail!(
+                "MCP client is in a failed state — previous call timed out or server crashed"
+            );
+        }
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": self.next_id(), "method": "tools/call",
             "params": { "name": name, "arguments": arguments }
@@ -99,6 +114,10 @@ impl McpClient {
         Ok(ToolCallResult { content, is_error })
     }
 
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     fn next_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -106,6 +125,9 @@ impl McpClient {
     }
 
     fn send(&mut self, value: &serde_json::Value) -> Result<(), anyhow::Error> {
+        if self.poisoned {
+            anyhow::bail!("MCP client is poisoned");
+        }
         serde_json::to_writer(&mut self.stdin, value)?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
@@ -113,30 +135,22 @@ impl McpClient {
     }
 
     fn recv(&mut self) -> Result<serde_json::Value, anyhow::Error> {
-        let timeout = TOOL_CALL_TIMEOUT;
-        // Read lines in a loop, skipping notifications. The BufReader
-        // blocks on read_line, so we can't check a deadline mid-read.
-        // Instead, we rely on the child process having a finite response
-        // time and detect EOF (server crash) immediately.
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + self.timeout;
         loop {
-            // Check deadline between lines (catches servers that send
-            // many notifications but never a response).
             if Instant::now() > deadline {
-                // Kill the server to unblock any pending read on the next call.
+                self.poisoned = true;
                 let _ = self.child.kill();
                 anyhow::bail!(
-                    "MCP server did not respond within {}s — the server may be hanging or the network request timed out",
-                    timeout.as_secs()
+                    "MCP server did not respond within {}s",
+                    self.timeout.as_secs()
                 );
             }
 
             let mut line = String::new();
             let bytes_read = self.reader.read_line(&mut line)?;
             if bytes_read == 0 {
-                anyhow::bail!(
-                    "MCP server closed its stdout unexpectedly (EOF) — the server may have crashed"
-                );
+                self.poisoned = true;
+                anyhow::bail!("MCP server closed stdout unexpectedly (EOF)");
             }
             if line.trim().is_empty() {
                 continue;
