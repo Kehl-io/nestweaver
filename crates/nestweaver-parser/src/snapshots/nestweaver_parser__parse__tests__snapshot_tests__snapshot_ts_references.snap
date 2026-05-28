@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1880
 expression: "parsed_references(\"simple.ts\", &source)"
 ---
 - name: events
@@ -19,6 +18,10 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: Call
   start_line: 22
   context: console.log(message);
+- name: log
+  kind: ReadAccess
+  start_line: 22
+  context: console.log(message)
 - name: ConsoleGreeter
   kind: Extends
   start_line: 26
@@ -27,10 +30,22 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: Call
   start_line: 28
   context: "this.log(`Greeting ${name}`);"
+- name: log
+  kind: ReadAccess
+  start_line: 28
+  context: "this.log(`Greeting ${name}`)"
 - name: greet
   kind: Call
   start_line: 29
   context: return super.greet(name);
+- name: greet
+  kind: ReadAccess
+  start_line: 29
+  context: super.greet(name)
+- name: Greeter
+  kind: TypeRef
+  start_line: 33
+  context: "import { EventEmitter } from 'events';"
 - name: createGreeter
   kind: Call
   start_line: 37
@@ -39,3 +54,7 @@ expression: "parsed_references(\"simple.ts\", &source)"
   kind: Call
   start_line: 38
   context: "greeter.greet('world');"
+- name: greet
+  kind: ReadAccess
+  start_line: 38
+  context: "greeter.greet('world')"

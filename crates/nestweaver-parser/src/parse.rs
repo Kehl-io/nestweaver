@@ -50,6 +50,9 @@ pub enum ReferenceKind {
     Implements,
     Includes,
     Uses,
+    TypeRef,
+    ReadAccess,
+    WriteAccess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,6 +670,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "implements" => ReferenceKind::Implements,
                     "includes" => ReferenceKind::Includes,
                     "uses" => ReferenceKind::Uses,
+                    "type_ref" => ReferenceKind::TypeRef,
+                    "read_access" => ReferenceKind::ReadAccess,
+                    "write_access" => ReferenceKind::WriteAccess,
                     _ => continue,
                 };
 
