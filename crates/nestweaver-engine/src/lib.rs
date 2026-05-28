@@ -31,6 +31,14 @@ pub fn migrate_sidecar(db_path: &Path, old_extension: &str, new_suffix: &str) ->
     }
 }
 
+/// Return the display name for a repo: the explicit `name` override if set,
+/// otherwise the URL-derived basename via [`repo_name_from_url`].
+pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
+    repo.name
+        .clone()
+        .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
+}
+
 pub mod agent_guide;
 pub mod blast_radius;
 pub mod brainignore;
@@ -96,8 +104,8 @@ pub use extensions::{
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
     CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
-    index_directory, index_directory_in_memory, index_directory_with_options, load_filemeta_cache,
-    save_filemeta_cache,
+    incremental_index_with_name, index_directory, index_directory_in_memory,
+    index_directory_with_options, load_filemeta_cache, save_filemeta_cache,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,

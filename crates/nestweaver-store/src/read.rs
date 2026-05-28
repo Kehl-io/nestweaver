@@ -313,7 +313,7 @@ impl GraphStore {
 
     pub fn list_repos(&self, instance_id: Option<&str>) -> Result<Vec<Repo>, StoreError> {
         let conn = self.conn()?;
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id";
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
         let result = if let Some(iid) = instance_id {
             let q = format!("MATCH (r:Repo) WHERE r.instance_id = $iid RETURN {cols}");
             let mut stmt = conn
@@ -333,12 +333,14 @@ impl GraphStore {
                 let indexed_sha = extract_string(&row, 2)?;
                 let staleness = u32::try_from(extract_i64(&row, 3)?).unwrap_or(0);
                 let instance_id = extract_string(&row, 4)?;
+                let name = extract_opt_string(&row, 5).unwrap_or(None);
                 Ok(Repo {
                     uid,
                     url,
                     indexed_sha,
                     staleness_commits_behind: staleness,
                     instance_id,
+                    name,
                 })
             })
             .collect()

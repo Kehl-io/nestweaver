@@ -78,6 +78,7 @@ impl CodeWatcher {
                     indexed_sha: "watch".to_string(),
                     staleness_commits_behind: 0,
                     instance_id: self.instance_id.clone(),
+                    name: None,
                 })
                 .context("insert initial Repo node")?;
         }

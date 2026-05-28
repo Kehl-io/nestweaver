@@ -89,6 +89,7 @@ fn setup_test_store() -> GraphStore {
         indexed_sha: "abc123".to_string(),
         staleness_commits_behind: 0,
         instance_id: String::new(),
+        name: None,
     };
     store.insert_repo(&repo).unwrap();
 

@@ -16,7 +16,7 @@ use nestweaver_engine::{
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_mermaid, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map,
-    generate_skill, generate_summaries, get_last_indexed_at, incremental_index, index_directory,
+    generate_skill, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -386,6 +386,12 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Force full re-index, bypassing incremental detection")]
         force: bool,
+        #[arg(
+            long,
+            help = "Display name override for the repo (avoids basename collisions when \
+                    multiple repos share a generic name like 'client' or 'server')"
+        )]
+        name: Option<String>,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -1564,7 +1570,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .iter()
                     .find(|r| {
                         r.url == repo
-                            || nestweaver_engine::repo_name_from_url(&r.url)
+                            || nestweaver_engine::repo_display_name(r)
                                 == nestweaver_engine::repo_name_from_url(&repo)
                     })
                     .map(|r| r.indexed_sha.clone())
@@ -1578,7 +1584,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .iter()
                 .find(|r| {
                     r.url == repo
-                        || nestweaver_engine::repo_name_from_url(&r.url)
+                        || nestweaver_engine::repo_display_name(r)
                             == nestweaver_engine::repo_name_from_url(&repo)
                 })
                 .map(|r| r.indexed_sha.clone())
@@ -3027,6 +3033,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             instance,
             db,
             force,
+            name,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -3043,8 +3050,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if force {
                 // Full re-index requested explicitly.
-                let result = index_directory(&repo_path, &db_path, instance_id, &repo_url, "local")
-                    .context("index_directory")?;
+                let result = nestweaver_engine::index_directory_with_options(
+                    &repo_path,
+                    &db_path,
+                    instance_id,
+                    &repo_url,
+                    "local",
+                    true,
+                    name.as_deref(),
+                )
+                .context("index_directory")?;
 
                 files_count = result.files_count;
                 symbols_count = result.symbols_count;
@@ -3063,8 +3078,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = incremental_index(&repo_path, &db_path, instance_id, &repo_url)
-                    .context("incremental_index")?;
+                let inc = nestweaver_engine::incremental_index_with_name(
+                    &repo_path,
+                    &db_path,
+                    instance_id,
+                    &repo_url,
+                    name.as_deref(),
+                )
+                .context("incremental_index")?;
 
                 files_count = inc.files_added + inc.files_modified;
                 symbols_count = inc.symbols_added;
