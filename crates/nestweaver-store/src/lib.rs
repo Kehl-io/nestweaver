@@ -721,6 +721,38 @@ mod tests {
     }
 
     #[test]
+    fn upsert_project_deduplicates_by_name_on_instance_id_change() {
+        use nestweaver_schema::Project;
+        let store = test_store();
+
+        // Insert a project with instance_id "default".
+        let v1 = Project {
+            uid: "proj:default:abc123".to_string(),
+            name: "MyProject".to_string(),
+            summary: Some("original".to_string()),
+            instance_id: "default".to_string(),
+        };
+        store.upsert_project(&v1).unwrap();
+        assert_eq!(store.list_projects().unwrap().len(), 1);
+
+        // Re-upsert with a different instance_id (and therefore different UID).
+        // This simulates the user changing their instance config.
+        let v2 = Project {
+            uid: "proj:kkehl-work:def456".to_string(),
+            name: "MyProject".to_string(),
+            summary: Some("updated".to_string()),
+            instance_id: "kkehl-work".to_string(),
+        };
+        store.upsert_project(&v2).unwrap();
+
+        // Should still have exactly one project, not two.
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].uid, "proj:kkehl-work:def456");
+        assert_eq!(projects[0].summary.as_deref(), Some("updated"));
+    }
+
+    #[test]
     fn upsert_note_is_idempotent() {
         use nestweaver_schema::{Note, NoteKind, Section};
         let store = test_store();
