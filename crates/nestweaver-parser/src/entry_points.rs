@@ -89,6 +89,57 @@ fn detect_js_ts(
         return Some(EntryPointKind::Main);
     }
 
+    // ── Middleware files ──
+    //
+    // Files named middleware.{ts,js,mjs,cjs} at any depth are framework
+    // middleware entry points (Next.js, Express, etc.).
+    if matches!(kind, "function" | "class" | "constant")
+        && (file_name == "middleware.ts"
+            || file_name == "middleware.js"
+            || file_name == "middleware.mjs"
+            || file_name == "middleware.cjs")
+        && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::HttpHandler);
+    }
+
+    // ── Custom hooks ──
+    //
+    // Functions in /hooks/ directories whose name starts with `use` are React
+    // custom hooks and serve as public API for state/side-effect logic.
+    if matches!(kind, "function")
+        && file_path.contains("/hooks/")
+        && name.starts_with("use")
+        && name.len() > 3
+        && name[3..].starts_with(|c: char| c.is_uppercase())
+        && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::EventListener);
+    }
+
+    // ── State management stores ──
+    //
+    // Exported symbols in /stores/ or /state/ directories are entry points
+    // for state management libraries (Zustand, Redux, Pinia, MobX, etc.).
+    if matches!(kind, "function" | "constant")
+        && (file_path.contains("/stores/") || file_path.contains("/state/"))
+        && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::Main);
+    }
+
+    // ── React Context / Provider directories ──
+    //
+    // Exported functions and classes in /contexts/ or /providers/ directories
+    // are React Context providers/consumers and serve as dependency injection
+    // entry points.
+    if matches!(kind, "function" | "class" | "constant")
+        && (file_path.contains("/contexts/") || file_path.contains("/providers/"))
+        && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::EventListener);
+    }
+
     // ── React / Next.js / TanStack Router / Remix page & layout entry points ──
     //
     // Files under /pages/, /app/, or /routes/ are framework entry points.
@@ -1208,6 +1259,137 @@ mod tests {
         let result = detect_entry_point(
             "_helper",
             "src/__tests__/utils.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, None);
+    }
+
+    // ── New entry point patterns: hooks, stores, contexts, providers, middleware ──
+
+    #[test]
+    fn detects_custom_hook_in_hooks_dir() {
+        let result = detect_entry_point(
+            "useAuth",
+            "src/hooks/useAuth.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::EventListener));
+    }
+
+    #[test]
+    fn detects_custom_hook_use_prefix_only() {
+        // "use" alone is too short; must have an uppercase char after.
+        let result = detect_entry_point("use", "src/hooks/use.ts", "function", None, "typescript");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn non_hook_in_hooks_dir_not_entry() {
+        let result = detect_entry_point(
+            "helperFn",
+            "src/hooks/utils.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detects_store_export_in_stores_dir() {
+        let result = detect_entry_point(
+            "useStore",
+            "src/stores/authStore.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_constant_in_state_dir() {
+        let result = detect_entry_point(
+            "initialState",
+            "src/state/appState.ts",
+            "constant",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    #[test]
+    fn detects_context_in_contexts_dir() {
+        let result = detect_entry_point(
+            "AuthContext",
+            "src/contexts/AuthContext.tsx",
+            "constant",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::EventListener));
+    }
+
+    #[test]
+    fn detects_provider_in_providers_dir() {
+        let result = detect_entry_point(
+            "ThemeProvider",
+            "src/providers/ThemeProvider.tsx",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::EventListener));
+    }
+
+    #[test]
+    fn detects_middleware_ts_file() {
+        let result = detect_entry_point(
+            "middleware",
+            "src/middleware.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        // Should match the middleware file pattern (HttpHandler), not just
+        // the name == "middleware" check further down.
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_exported_fn_in_middleware_file() {
+        let result = detect_entry_point(
+            "authCheck",
+            "app/middleware.ts",
+            "function",
+            None,
+            "typescript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn detects_middleware_js_at_any_depth() {
+        let result = detect_entry_point(
+            "handler",
+            "packages/web/middleware.js",
+            "function",
+            None,
+            "javascript",
+        );
+        assert_eq!(result, Some(EntryPointKind::HttpHandler));
+    }
+
+    #[test]
+    fn private_in_hooks_dir_not_entry() {
+        let result = detect_entry_point(
+            "_useInternal",
+            "src/hooks/_useInternal.ts",
             "function",
             None,
             "typescript",

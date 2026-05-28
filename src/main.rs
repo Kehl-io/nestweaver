@@ -12,7 +12,7 @@ use nestweaver_engine::{
     FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, detect_dead_code, discover_cross_domain_links,
+    changed_files_from_git, compute_clusters, discover_cross_domain_links,
     embedding::generate_embedding, export_cypher, export_graphml, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
     generate_repo_map, generate_skill, generate_summaries, get_last_indexed_at, incremental_index,
@@ -2133,7 +2133,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     DeadCodeConfidence::Low
                 });
             let store = open_store(db.as_deref())?;
-            let result = detect_dead_code(&store)?;
+
+            // Load manifest sidecar for manifest-driven entry points.
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+            let manifest_cache_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+            let manifests =
+                nestweaver_engine::load_manifest_cache(&manifest_cache_path).unwrap_or_default();
+
+            let result = nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests)?;
 
             // Filter by minimum confidence.
             let filtered: Vec<_> = result
@@ -2149,6 +2156,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     total_symbols: usize,
                     reachable_symbols: usize,
                     unreachable_count: usize,
+                    excluded_count: usize,
                     dead_percentage: f64,
                     min_confidence: String,
                     unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
@@ -2159,6 +2167,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         total_symbols: result.total_symbols,
                         reachable_symbols: result.reachable_symbols,
                         unreachable_count: filtered_count,
+                        excluded_count: result.excluded_count,
                         dead_percentage: result.dead_percentage,
                         min_confidence: min_conf.to_string(),
                         unreachable_symbols: filtered,
@@ -2169,6 +2178,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "No dead code detected ({} symbols, all reachable from entry points).",
                     result.total_symbols
                 );
+                if result.excluded_count > 0 {
+                    println!(
+                        "({} type-only/declaration symbols excluded from analysis)",
+                        result.excluded_count
+                    );
+                }
             } else {
                 println!(
                     "Dead code analysis: {} of {} symbols ({:.1}%) unreachable from entry points\n",
@@ -2176,6 +2191,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     result.total_symbols,
                     result.dead_percentage,
                 );
+                if result.excluded_count > 0 {
+                    println!(
+                        "({} type-only/declaration symbols excluded from analysis)",
+                        result.excluded_count
+                    );
+                }
                 if min_conf != DeadCodeConfidence::Low {
                     println!(
                         "Showing {} symbol(s) with confidence >= {}\n",
