@@ -110,6 +110,12 @@ pub struct Repo {
     pub indexed_sha: String,
     pub staleness_commits_behind: u32,
     pub instance_id: String,
+    /// Optional display name override. When `Some`, used instead of the
+    /// URL-derived basename for display and feature-config matching.
+    /// Avoids collisions when multiple repos share a generic basename
+    /// (e.g. `client`, `server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

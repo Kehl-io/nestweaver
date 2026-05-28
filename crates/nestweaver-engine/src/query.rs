@@ -5,7 +5,7 @@ use serde::Serialize;
 use anyhow::Context;
 
 use crate::config::{FeatureConfig, LinkConfig};
-use crate::pull::repo_name_from_url;
+use crate::repo_display_name;
 
 /// Tuning knobs for hybrid PPR + BM25 + semantic retrieval.
 ///
@@ -466,7 +466,7 @@ pub fn build_feature_context(
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
     let feature_repo_uids: std::collections::HashSet<String> = all_repos
         .iter()
-        .filter(|r| feature.repos.contains(&repo_name_from_url(&r.url)))
+        .filter(|r| feature.repos.contains(&repo_display_name(r)))
         .map(|r| r.uid.clone())
         .collect();
 

@@ -25,7 +25,7 @@ impl GraphStore {
         exec_params(
             &conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
             vec![
                 ("uid", lbug::Value::String(repo.uid.clone())),
                 ("url", lbug::Value::String(repo.url.clone())),
@@ -35,6 +35,10 @@ impl GraphStore {
                     lbug::Value::Int64(repo.staleness_commits_behind as i64),
                 ),
                 ("iid", lbug::Value::String(repo.instance_id.clone())),
+                (
+                    "name",
+                    lbug::Value::String(repo.name.clone().unwrap_or_default()),
+                ),
             ],
         )
     }
@@ -1519,7 +1523,7 @@ impl GraphStore {
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id";
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
         let rows: Vec<_> = conn
             .query(&format!(
                 "MATCH (r:Repo {{uid: '{}'}}) RETURN {cols}",
@@ -1546,6 +1550,10 @@ impl GraphStore {
             Some(lbug::Value::String(s)) => s.clone(),
             _ => return Err(StoreError::Query("repo instance_id missing".to_string())),
         };
+        let name = match row.get(5) {
+            Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => String::new(),
+        };
 
         exec_params(
             &conn,
@@ -1556,13 +1564,14 @@ impl GraphStore {
         exec_params(
             &conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
             vec![
                 ("uid", lbug::Value::String(uid)),
                 ("url", lbug::Value::String(url)),
                 ("sha", lbug::Value::String(new_sha.to_string())),
                 ("scb", lbug::Value::Int64(staleness)),
                 ("iid", lbug::Value::String(instance_id)),
+                ("name", lbug::Value::String(name)),
             ],
         )?;
 

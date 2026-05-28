@@ -149,9 +149,13 @@ impl GraphStore {
                 indexed_sha STRING, \
                 staleness_commits_behind INT64, \
                 instance_id STRING, \
+                name STRING, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Migration: add `name` column to pre-existing Repo tables that lack it.
+        let _ = conn.query("ALTER TABLE Repo ADD name STRING DEFAULT ''");
 
         conn.query(
             "CREATE NODE TABLE IF NOT EXISTS File(\
