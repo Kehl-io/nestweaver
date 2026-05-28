@@ -122,12 +122,18 @@ impl GraphStore {
     /// When present, PPR's personalization vector blends a small fraction of
     /// these scores to boost nodes the user has frequently accessed.
     pub fn load_interaction_cache(&self, scores: HashMap<String, f64>) {
-        *self.interaction_cache.lock().unwrap() = Some(scores);
+        *self
+            .interaction_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(scores);
     }
 
     /// Clear the interaction memory cache (disables the PPR bias).
     pub fn clear_interaction_cache(&self) {
-        *self.interaction_cache.lock().unwrap() = None;
+        *self
+            .interaction_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Internal: bump the generation counter. Called by `compute_pagerank`
