@@ -38,7 +38,7 @@ nestweaver dead-code                     # detect unreachable symbols via entry 
 # Export
 nestweaver export --format cypher        # graph export (cypher, graphml, mermaid)
 
-# Markdown brain
+# Markdown brain (`.brainignore` for glob exclusion patterns; `--ignore` flag for ad-hoc)
 nestweaver brain add ~/Documents/Obsidian/MyVault
 nestweaver brain search "architecture"
 nestweaver brain context "MyProject"     # unified code + notes context
@@ -67,6 +67,7 @@ nestweaver brain context "project" --recency-weight 0.7               # boost re
 # Cline, OpenCode, Trae, Devin, Hermes
 nestweaver setup                                                      # auto-detect and configure all
 nestweaver setup claude-code                                           # configure specific tool
+nestweaver setup claude-code --allow-writes                            # enable write-mode tools
 
 # Generate tool-specific instruction files
 nestweaver generate-guide --format skill                              # Claude Code skill (SKILL.md)
@@ -79,6 +80,7 @@ nestweaver completions bash              # also: zsh, fish, powershell
 # MCP server (22 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
+nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
 
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
@@ -115,6 +117,15 @@ crates/
   nestweaver-mcp/               # optional MCP wrapper (feature-gated, delegates to engine)
   nestweaver-web/               # optional web UI and API backend (Axum + React)
 ```
+
+### Edge types and weighting
+
+The graph has four edge kinds: **CALLS** (function calls + JSX `<Component />` usage), **IMPORTS**, **USES** (type references), and **ACCESSES** (field access). PPR applies per-edge-type weights (CALLS=1.0, IMPORTS=0.8, USES=0.5, ACCESSES=0.4). Dead-code BFS uses edge confidence thresholds to avoid false positives.
+
+### Key resolver behaviors
+
+- Monorepo workspace packages and tsconfig path aliases are resolved automatically
+- Wiki/HTML content from brain vaults is auto-converted to markdown during ingestion
 
 ### Dependency flow
 
