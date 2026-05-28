@@ -8,6 +8,7 @@ use nestweaver_store::GraphStore;
 
 use crate::config::InstanceConfig;
 use crate::extensions::{load_extensions, save_extensions, set_property};
+use crate::html_to_md::maybe_convert_html_to_markdown;
 use crate::mcp_client::McpClient;
 
 pub struct ProjectMaterializationResult {
@@ -160,6 +161,12 @@ pub fn materialize_projects(
                                 tracing::warn!(label = ws.label, "MCP tool returned empty content");
                                 continue;
                             }
+
+                            // Wiki PRDs from Confluence arrive as HTML storage
+                            // format. Convert to markdown so comrak produces
+                            // proper Heading / Section nodes instead of a single
+                            // plaintext blob.
+                            let content = maybe_convert_html_to_markdown(&content);
 
                             // Create a Note from the wiki content.
                             let wiki_note_uid = note_uid(
