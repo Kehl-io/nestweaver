@@ -1,4 +1,10 @@
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+use std::collections::HashSet;
+
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let _ = from_file;
 
     if specifier.ends_with(".*") {
@@ -21,9 +27,13 @@ pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) ->
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_kotlin_package_import() {
-        let known = ["src/main/kotlin/com/example/utils/Helper.kt"];
+        let known = set(&["src/main/kotlin/com/example/utils/Helper.kt"]);
         let result = resolve_import(
             "src/main/kotlin/com/example/Main.kt",
             "com.example.utils.Helper",
@@ -37,7 +47,7 @@ mod tests {
 
     #[test]
     fn wildcard_import_returns_none() {
-        let known = ["src/com/example/Foo.kt"];
+        let known = set(&["src/com/example/Foo.kt"]);
         let result = resolve_import("src/Main.kt", "com.example.*", &known);
         assert_eq!(result, None);
     }

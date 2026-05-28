@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 use crate::workspace::{
     TsconfigAlias, WorkspaceContext, WorkspacePackage, extract_package_name,
@@ -18,7 +20,7 @@ use crate::workspace::{
 pub fn resolve_import(
     from_file: &str,
     specifier: &str,
-    known_files: &[&str],
+    known_files: &HashSet<&str>,
     workspace_ctx: &WorkspaceContext,
 ) -> Option<String> {
     if specifier.starts_with('.') {
@@ -41,23 +43,12 @@ pub fn resolve_import(
     None
 }
 
-/// Legacy API for callers that don't have workspace context.
-/// Equivalent to calling `resolve_import` with an empty context.
-pub fn resolve_import_basic(
+/// Resolve a relative import specifier.
+fn resolve_relative(
     from_file: &str,
     specifier: &str,
-    known_files: &[&str],
+    known_files: &HashSet<&str>,
 ) -> Option<String> {
-    resolve_import(
-        from_file,
-        specifier,
-        known_files,
-        &WorkspaceContext::default(),
-    )
-}
-
-/// Resolve a relative import specifier.
-fn resolve_relative(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
     let base_dir = parent_dir(from_file);
     let joined = join_path(base_dir, specifier);
     let normalized = normalize_path(&joined);
@@ -89,7 +80,7 @@ fn resolve_relative(from_file: &str, specifier: &str, known_files: &[&str]) -> O
 /// Resolve a specifier against tsconfig path aliases.
 fn resolve_tsconfig_alias(
     specifier: &str,
-    known_files: &[&str],
+    known_files: &HashSet<&str>,
     aliases: &[TsconfigAlias],
 ) -> Option<String> {
     for alias in aliases {
@@ -106,7 +97,7 @@ fn resolve_tsconfig_alias(
 /// Resolve a bare specifier against workspace packages.
 fn resolve_workspace_package(
     specifier: &str,
-    known_files: &[&str],
+    known_files: &HashSet<&str>,
     packages: &[WorkspacePackage],
 ) -> Option<String> {
     let pkg_name = extract_package_name(specifier);
@@ -190,32 +181,36 @@ mod tests {
         WorkspaceContext::default()
     }
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     // ── Relative imports ──────────────────────────────────────────────────
 
     #[test]
     fn resolves_relative_import_js() {
-        let known = ["src/helper.js", "src/index.js"];
+        let known = set(&["src/helper.js", "src/index.js"]);
         let result = resolve_import("src/main.js", "./helper", &known, &empty_ctx());
         assert_eq!(result, Some("src/helper.js".to_string()));
     }
 
     #[test]
     fn resolves_relative_import_ts() {
-        let known = ["src/utils.ts"];
+        let known = set(&["src/utils.ts"]);
         let result = resolve_import("src/main.ts", "./utils", &known, &empty_ctx());
         assert_eq!(result, Some("src/utils.ts".to_string()));
     }
 
     #[test]
     fn resolves_barrel_import_js() {
-        let known = ["src/utils/index.js", "src/utils/helper.js"];
+        let known = set(&["src/utils/index.js", "src/utils/helper.js"]);
         let result = resolve_import("src/main.js", "./utils", &known, &empty_ctx());
         assert_eq!(result, Some("src/utils/index.js".to_string()));
     }
 
     #[test]
     fn resolves_parent_dir_import() {
-        let known = ["src/shared.ts", "src/components/Button.tsx"];
+        let known = set(&["src/shared.ts", "src/components/Button.tsx"]);
         let result = resolve_import(
             "src/components/Button.tsx",
             "../shared",
@@ -227,14 +222,14 @@ mod tests {
 
     #[test]
     fn non_relative_import_returns_none_without_context() {
-        let known = ["node_modules/lodash/index.js"];
+        let known = set(&["node_modules/lodash/index.js"]);
         let result = resolve_import("src/main.js", "lodash", &known, &empty_ctx());
         assert_eq!(result, None);
     }
 
     #[test]
     fn unknown_file_returns_none() {
-        let known: [&str; 0] = [];
+        let known: HashSet<&str> = HashSet::new();
         let result = resolve_import("src/main.js", "./missing", &known, &empty_ctx());
         assert_eq!(result, None);
     }
@@ -243,7 +238,7 @@ mod tests {
 
     #[test]
     fn resolves_tsconfig_alias() {
-        let known = ["src/utils/helpers.ts"];
+        let known = set(&["src/utils/helpers.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![],
             aliases: vec![TsconfigAlias {
@@ -257,7 +252,7 @@ mod tests {
 
     #[test]
     fn resolves_tsconfig_alias_to_directory_index() {
-        let known = ["src/utils/index.ts"];
+        let known = set(&["src/utils/index.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![],
             aliases: vec![TsconfigAlias {
@@ -271,7 +266,7 @@ mod tests {
 
     #[test]
     fn resolves_tilde_alias() {
-        let known = ["lib/core.ts"];
+        let known = set(&["lib/core.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![],
             aliases: vec![TsconfigAlias {
@@ -285,7 +280,7 @@ mod tests {
 
     #[test]
     fn alias_not_matching_returns_none() {
-        let known = ["src/utils.ts"];
+        let known = set(&["src/utils.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![],
             aliases: vec![TsconfigAlias {
@@ -301,11 +296,11 @@ mod tests {
 
     #[test]
     fn resolves_workspace_package_to_entry() {
-        let known = [
+        let known = set(&[
             "packages/shared/src/index.ts",
             "packages/shared/src/utils.ts",
             "apps/web/src/main.ts",
-        ];
+        ]);
         let ctx = WorkspaceContext {
             packages: vec![WorkspacePackage {
                 name: "@myorg/shared".to_string(),
@@ -319,10 +314,10 @@ mod tests {
 
     #[test]
     fn resolves_workspace_package_with_subpath() {
-        let known = [
+        let known = set(&[
             "packages/shared/src/index.ts",
             "packages/shared/src/utils.ts",
-        ];
+        ]);
         let ctx = WorkspaceContext {
             packages: vec![WorkspacePackage {
                 name: "@myorg/shared".to_string(),
@@ -341,7 +336,7 @@ mod tests {
 
     #[test]
     fn resolves_unscoped_workspace_package() {
-        let known = ["packages/utils/index.ts"];
+        let known = set(&["packages/utils/index.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![WorkspacePackage {
                 name: "my-utils".to_string(),
@@ -355,7 +350,7 @@ mod tests {
 
     #[test]
     fn workspace_package_not_found_returns_none() {
-        let known = ["packages/shared/src/index.ts"];
+        let known = set(&["packages/shared/src/index.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![WorkspacePackage {
                 name: "@myorg/shared".to_string(),
@@ -372,7 +367,7 @@ mod tests {
     #[test]
     fn alias_takes_priority_over_workspace() {
         // When both alias and workspace could match, alias wins
-        let known = ["src/shared/index.ts", "packages/shared/src/index.ts"];
+        let known = set(&["src/shared/index.ts", "packages/shared/src/index.ts"]);
         let ctx = WorkspaceContext {
             packages: vec![WorkspacePackage {
                 name: "@/shared".to_string(),
@@ -386,14 +381,5 @@ mod tests {
         let result = resolve_import("apps/web/main.ts", "@/shared", &known, &ctx);
         // Alias resolves "@/shared" -> "src/shared" -> "src/shared/index.ts"
         assert_eq!(result, Some("src/shared/index.ts".to_string()));
-    }
-
-    // ── Legacy API ────────────────────────────────────────────────────────
-
-    #[test]
-    fn legacy_api_resolves_relative() {
-        let known = ["src/helper.js"];
-        let result = resolve_import_basic("src/main.js", "./helper", &known);
-        assert_eq!(result, Some("src/helper.js".to_string()));
     }
 }

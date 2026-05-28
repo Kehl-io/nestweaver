@@ -1389,9 +1389,13 @@ impl GraphStore {
         // Section-level edges: find sections belonging to this note and
         // delete their outgoing REFERENCES_CODE edges.
         let section_uids: Vec<String> = {
+            // LadybugDB does not support parameterized compound
+            // property-match queries. Sanitize user-derived UIDs by
+            // escaping single quotes to prevent Cypher injection.
+            let safe_note_uid = note_uid.replace('\'', "\\'");
             let rows = conn
                 .query(&format!(
-                    "MATCH (n:Note {{uid: '{note_uid}'}})-[:NOTE_HAS_SECTION]->(s:Section) RETURN s.uid"
+                    "MATCH (n:Note {{uid: '{safe_note_uid}'}})-[:NOTE_HAS_SECTION]->(s:Section) RETURN s.uid"
                 ))
                 .map_err(|e| StoreError::Query(format!("query sections: {e}")))?;
             rows.filter_map(|row| {
@@ -1427,9 +1431,14 @@ impl GraphStore {
         // parameterization, so we format the lookup query the same way
         // `delete_cross_domain_edges_for_note` does for its section query).
         let symbol_uids: Vec<String> = {
+            // LadybugDB does not support parameterized compound WHERE
+            // clauses. Sanitize user-derived values by escaping single
+            // quotes to prevent Cypher injection.
+            let safe_repo_uid = repo_uid.replace('\'', "\\'");
+            let safe_file_path = file_path.replace('\'', "\\'");
             let rows = conn
                 .query(&format!(
-                    "MATCH (s:Symbol) WHERE s.repo_uid = '{repo_uid}' AND s.file_path = '{file_path}' RETURN s.uid"
+                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN s.uid"
                 ))
                 .map_err(|e| StoreError::Query(format!("query symbols: {e}")))?;
             rows.filter_map(|row| {

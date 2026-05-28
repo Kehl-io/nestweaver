@@ -1,10 +1,16 @@
+use std::collections::HashSet;
+
 use crate::util::parent_dir;
 
 // NOTE: Ruby `require`/`require_relative` are parsed as Call references,
 // not Import references. Import resolution for Ruby currently relies on
 // same-package-fallback. A future enhancement could post-process Call
 // references named "require"/"require_relative" to extract import paths.
-pub fn resolve_import(from_file: &str, specifier: &str, known_files: &[&str]) -> Option<String> {
+pub fn resolve_import(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+) -> Option<String> {
     let specifier = specifier.trim_matches(|c| c == '"' || c == '\'');
 
     // require_relative: resolve relative to current file
@@ -54,23 +60,27 @@ fn normalize_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
+        files.iter().copied().collect()
+    }
+
     #[test]
     fn resolves_require_relative() {
-        let known = ["app/helper.rb"];
+        let known = set(&["app/helper.rb"]);
         let result = resolve_import("app/main.rb", "'./helper'", &known);
         assert_eq!(result, Some("app/helper.rb".to_string()));
     }
 
     #[test]
     fn resolves_lib_require() {
-        let known = ["lib/json.rb"];
+        let known = set(&["lib/json.rb"]);
         let result = resolve_import("app/main.rb", "'json'", &known);
         assert_eq!(result, Some("lib/json.rb".to_string()));
     }
 
     #[test]
     fn unknown_gem_returns_none() {
-        let known = ["app/main.rb"];
+        let known = set(&["app/main.rb"]);
         let result = resolve_import("app/main.rb", "'rails'", &known);
         assert_eq!(result, None);
     }
