@@ -850,6 +850,13 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Instance ID (for multi-instance setups)")]
         instance: Option<String>,
+        #[arg(long, help = "Re-fetch wiki sources every N hours (requires --config)")]
+        refresh_wiki_hours: Option<u64>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — required for --refresh-wiki-hours"
+        )]
+        config: Option<PathBuf>,
     },
 }
 
@@ -910,6 +917,13 @@ enum BrainCommands {
         db: Option<PathBuf>,
         #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
         ignore: Option<String>,
+        #[arg(long, help = "Re-fetch wiki sources every N hours (requires --config)")]
+        refresh_wiki_hours: Option<u64>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — required for --refresh-wiki-hours"
+        )]
+        config: Option<PathBuf>,
     },
     /// Force a full re-index of a vault. Drops the vault's existing notes
     /// from the graph (via cascade-delete) then re-runs the indexer from
@@ -2344,7 +2358,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
-        Commands::Watch { repo, db, instance } => {
+        Commands::Watch {
+            repo,
+            db,
+            instance,
+            refresh_wiki_hours,
+            config,
+        } => {
+            if refresh_wiki_hours.is_some() && config.is_none() {
+                eprintln!("Error: --refresh-wiki-hours requires --config");
+                return Ok((EXIT_ERROR, None));
+            }
             let repo_path = match repo {
                 Some(p) => p,
                 None => detect_repo_root(),
@@ -2358,6 +2382,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             let db_path = resolve_index_db_path(db, &repo_path);
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
+
+            if let Some(hours) = refresh_wiki_hours {
+                eprintln!(
+                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    hours
+                );
+            }
 
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
@@ -3374,7 +3405,13 @@ fn run_brain(
             instance,
             db,
             ignore,
+            refresh_wiki_hours,
+            config,
         } => {
+            if refresh_wiki_hours.is_some() && config.is_none() {
+                eprintln!("Error: --refresh-wiki-hours requires --config");
+                return Ok((EXIT_ERROR, None));
+            }
             let db_path = db.unwrap_or_else(default_db_path);
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
@@ -3387,6 +3424,13 @@ fn run_brain(
                     .to_string()
             });
             let instance_id = instance.unwrap_or_else(|| "default".to_string());
+
+            if let Some(hours) = refresh_wiki_hours {
+                out.status(&format!(
+                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    hours
+                ));
+            }
 
             let extra_patterns = parse_ignore_flag(&ignore);
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);

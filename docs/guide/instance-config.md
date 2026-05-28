@@ -555,3 +555,100 @@ mcp_server = "confluence"
 tool = "get_page_content"
 args = { pageId = "12345" }
 ```
+
+## Scheduled wiki refresh
+
+`materialize-instance` only ingests wiki content when run explicitly. Wiki
+pages edited by collaborators cause graph drift over time. To keep wiki
+content fresh, set up a periodic refresh using your platform's scheduler.
+
+### Option A: watcher flag (logs the interval, pair with cron/launchd)
+
+The `--refresh-wiki-hours` flag on `watch` and `brain watch` records the
+intended refresh cadence. Pair it with an external scheduler that runs
+`materialize-instance` on the same interval:
+
+```sh
+nestweaver brain watch ~/notes --db ./brain.lbug \
+  --refresh-wiki-hours 6 --config ./nestweaver-instance.toml
+```
+
+### Option B: cron (Linux)
+
+```cron
+# Re-fetch wiki sources every 6 hours
+0 */6 * * * /usr/local/bin/nestweaver-materialize-instance \
+  --config /path/to/nestweaver-instance.toml \
+  --db /path/to/main.lbug
+```
+
+### Option C: launchd (macOS)
+
+Save as `~/Library/LaunchAgents/com.nestweaver.wiki-refresh.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nestweaver.wiki-refresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/nestweaver-materialize-instance</string>
+        <string>--config</string>
+        <string>/path/to/nestweaver-instance.toml</string>
+        <string>--db</string>
+        <string>/path/to/main.lbug</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/nestweaver-wiki-refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/nestweaver-wiki-refresh.log</string>
+</dict>
+</plist>
+```
+
+Load it:
+
+```sh
+launchctl load ~/Library/LaunchAgents/com.nestweaver.wiki-refresh.plist
+```
+
+### Option D: systemd timer (Linux)
+
+Create `/etc/systemd/user/nestweaver-wiki-refresh.service`:
+
+```ini
+[Unit]
+Description=NestWeaver wiki source refresh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nestweaver-materialize-instance \
+  --config /path/to/nestweaver-instance.toml \
+  --db /path/to/main.lbug
+```
+
+Create `/etc/systemd/user/nestweaver-wiki-refresh.timer`:
+
+```ini
+[Unit]
+Description=Refresh NestWeaver wiki sources every 6 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable:
+
+```sh
+systemctl --user enable --now nestweaver-wiki-refresh.timer
+```
