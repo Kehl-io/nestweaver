@@ -509,6 +509,26 @@ impl GraphStore {
                     ("conf", lbug::Value::Double(conf)),
                 ],
             ),
+            EdgeType::Supersedes
+            | EdgeType::DependsOn
+            | EdgeType::CausedBy
+            | EdgeType::RelatesTo => {
+                // F11 typed Note→Note relationships.
+                let rel = edge.edge_type.rel_table_name();
+                let q = format!(
+                    "MATCH (a:Note {{uid: $src}}), (b:Note {{uid: $tgt}}) \
+                     CREATE (a)-[:{rel} {{confidence: $conf}}]->(b)"
+                );
+                exec_params(
+                    conn,
+                    &q,
+                    vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ],
+                )
+            }
             EdgeType::ProjectIncludesSymbol
             | EdgeType::ProjectIncludesNote
             | EdgeType::ProjectHasComponent
@@ -699,6 +719,22 @@ impl GraphStore {
                     let key = "MATCH (a:Symbol {uid: $src}), (b:Contract {uid: $tgt}) \
                                CREATE (a)-[:IMPLEMENTS_CONTRACT {confidence: $conf}]->(b)"
                         .to_string();
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ]);
+                }
+                EdgeType::Supersedes
+                | EdgeType::DependsOn
+                | EdgeType::CausedBy
+                | EdgeType::RelatesTo => {
+                    // F11 typed Note→Note relationships.
+                    let rel = edge.edge_type.rel_table_name();
+                    let key = format!(
+                        "MATCH (a:Note {{uid: $src}}), (b:Note {{uid: $tgt}}) \
+                         CREATE (a)-[:{rel} {{confidence: $conf}}]->(b)"
+                    );
                     groups.entry(key).or_default().push(vec![
                         ("src", lbug::Value::String(src)),
                         ("tgt", lbug::Value::String(tgt)),
