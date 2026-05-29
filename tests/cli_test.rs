@@ -15,12 +15,14 @@ fn cli_ui_shows_help() {
 
 #[test]
 fn cli_shows_version() {
+    // Assert against the actual package version so this test survives release
+    // bumps (release-please advances the workspace version on `main`).
     Command::cargo_bin("nestweaver")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(contains("0.9.0"));
+        .stdout(contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
