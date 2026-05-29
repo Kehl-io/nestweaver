@@ -40,7 +40,9 @@ impl WasmGraph {
         let seeds: Vec<String> = serde_json::from_str(seeds_json)
             .map_err(|e| JsError::new(&format!("Invalid seeds JSON: {e}")))?;
 
-        let adjacency = self.graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let adjacency = self
+            .graph
+            .build_adjacency(&EdgeWeightConfig::default_config());
         let config = PprConfig {
             damping,
             max_iterations: 20,
