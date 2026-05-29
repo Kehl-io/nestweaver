@@ -309,7 +309,10 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ```
 
 <p align="center">
-  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI — graph view with glowing nodes">
+  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI — context graph with glowing nodes">
+</p>
+<p align="center">
+  <img src="assets/web-ui-graph.png" width="700" alt="NestWeaver Web UI — class hierarchy with bloom effects">
 </p>
 
 **Graph features:**
