@@ -4,6 +4,7 @@ import { OrbitControls } from "@react-three/drei";
 import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
+import { EdgeParticles } from "./EdgeParticles";
 import { useGraphBridge, type GraphBuffers } from "../../hooks/useGraphBridge";
 import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
@@ -138,6 +139,7 @@ export function GraphCanvas() {
       {buffers.nodeCount > 0 && (
         <>
           <EdgeInstanceMesh buffers={buffers} />
+          {!reducedMotion && <EdgeParticles buffers={buffers} />}
           <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
         </>
       )}

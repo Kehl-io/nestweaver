@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
+import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
 import { NodeFilterBar } from "./NodeFilterBar";
 import { ModeTabs } from "./ModeTabs";
@@ -71,6 +72,7 @@ export function GraphPanel() {
   const diffState = useStore((s) => s.diffState);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
+  const viewMode = useStore((s) => s.viewMode);
 
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -94,13 +96,13 @@ export function GraphPanel() {
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
-          aria-label="Code knowledge graph"
+          aria-label={viewMode === "list" ? "Node list view" : "Code knowledge graph"}
           role="application"
           tabIndex={0}
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
         >
-          <GraphCanvas />
+          {viewMode === "list" ? <NodeListView /> : <GraphCanvas />}
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />

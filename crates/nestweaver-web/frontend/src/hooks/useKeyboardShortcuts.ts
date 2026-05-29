@@ -13,6 +13,7 @@ export function useKeyboardShortcuts() {
   const toggleMinimap = useStore((s) => s.toggleMinimap);
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
+  const toggleViewMode = useStore((s) => s.toggleViewMode);
   const { undo, redo } = useNavigationHistory();
 
   useHotkeys("1", () => setMode(MODES[0]));
@@ -71,6 +72,16 @@ export function useKeyboardShortcuts() {
     (e) => {
       e.preventDefault();
       useStore.getState().openLlmBar();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
+
+  // mod+l — toggle between graph and list view
+  useHotkeys(
+    "mod+l",
+    (e) => {
+      e.preventDefault();
+      toggleViewMode();
     },
     { enableOnFormTags: ["INPUT"] },
   );
