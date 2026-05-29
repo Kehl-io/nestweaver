@@ -351,6 +351,7 @@ mod promote_tests {
             title: uid.to_string(),
             location: format!("Projects/x/{uid}.md"),
             relevance: 0.9,
+            inline_body: None,
         }
     }
 
@@ -361,6 +362,7 @@ mod promote_tests {
             title: uid.to_string(),
             location: format!("src/{uid}.rs"),
             relevance: 0.5,
+            inline_body: None,
         }
     }
 
@@ -664,6 +666,12 @@ pub struct BrainNode {
     pub title: String,
     pub location: String,
     pub relevance: f64,
+    /// Feature F8 (tiered inline bodies): the node's source body, populated
+    /// only when the caller opted in *and* the node's normalized relevance
+    /// cleared the configured threshold. `None` (and omitted from JSON) by
+    /// default so existing callers see unchanged output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_body: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1070,6 +1078,7 @@ fn render_brain_node(
                 title: s.name,
                 location: format!("{}:{}", s.file_path, s.start_line),
                 relevance: score,
+                inline_body: None,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -1082,6 +1091,7 @@ fn render_brain_node(
                 title: n.title,
                 location: n.file_path,
                 relevance: score,
+                inline_body: None,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -1104,6 +1114,7 @@ fn render_brain_node(
             title,
             location,
             relevance: score,
+            inline_body: None,
         }))
     } else if uid.starts_with("sec:") {
         // Look up the Section node and derive a readable title from the
@@ -1150,6 +1161,7 @@ fn render_brain_node(
             title,
             location,
             relevance: score,
+            inline_body: None,
         }))
     } else if uid.starts_with("tag:") {
         Ok(Some(BrainNode {
@@ -1158,10 +1170,107 @@ fn render_brain_node(
             title: uid.to_string(),
             location: String::new(),
             relevance: score,
+            inline_body: None,
         }))
     } else {
         Ok(None)
     }
+}
+
+/// Feature F8 — tiered inline bodies.
+///
+/// Populate `inline_body` on each node whose **normalized** relevance clears
+/// `threshold`. Relevance is normalized against the maximum relevance in
+/// `nodes`, so the threshold (e.g. 0.75) is meaningful regardless of the raw
+/// PPR/RRF score scale. Bodies are truncated to `max_body_tokens`
+/// (chars/4 estimate) and, when `token_budget` is `Some`, charged against the
+/// budget in rank order: once the budget would be exceeded, lower-ranked nodes
+/// are left metadata-only (`inline_body = None`) — the node itself is never
+/// dropped.
+///
+/// Source of the body by kind:
+/// - `Section` → the stored `text_content`.
+/// - `Note` → the concatenated text of its sections.
+/// - `Symbol/*` → the symbol's source span, read from `root` via the
+///   `read_symbols` span logic.
+/// - other kinds (Heading, Tag) → no inline body.
+///
+/// Callers opt in by calling this at all; it is never invoked on the
+/// default (off) path.
+pub fn populate_inline_bodies(
+    store: &GraphStore,
+    nodes: &mut [BrainNode],
+    root: &std::path::Path,
+    threshold: f64,
+    max_body_tokens: usize,
+    token_budget: Option<usize>,
+) {
+    let max_relevance = nodes.iter().map(|n| n.relevance).fold(0.0_f64, f64::max);
+    if max_relevance <= 0.0 {
+        return;
+    }
+    let max_body_chars = max_body_tokens.saturating_mul(4);
+    let mut used_tokens = 0usize;
+
+    for node in nodes.iter_mut() {
+        let normalized = node.relevance / max_relevance;
+        if normalized < threshold {
+            continue;
+        }
+        let Some(mut body) = fetch_node_body(store, &node.uid, root) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        // Truncate to the per-body cap (chars/4 estimate). Respect char
+        // boundaries so we never split a UTF-8 codepoint.
+        if body.chars().count() > max_body_chars {
+            body = body.chars().take(max_body_chars).collect();
+        }
+        // Token-budget gate: charge inline bodies ahead of metadata. The first
+        // qualifying node is always allowed (mirrors read_symbols), so a single
+        // oversized body never starves the whole result.
+        if let Some(budget) = token_budget {
+            let cost = estimate_tokens(&body);
+            if used_tokens > 0 && used_tokens + cost > budget {
+                continue;
+            }
+            used_tokens += cost;
+        }
+        node.inline_body = Some(body);
+    }
+}
+
+/// Resolve a node UID to its source body for inline embedding. Returns `None`
+/// for kinds without a meaningful body (Heading, Tag) or on lookup failure.
+fn fetch_node_body(store: &GraphStore, uid: &str, root: &std::path::Path) -> Option<String> {
+    if uid.starts_with("sym:") {
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        return res.symbols.into_iter().next().map(|w| w.body);
+    }
+    if uid.starts_with("sec:") {
+        return store.lookup_section(uid).ok().map(|s| s.text_content);
+    }
+    if uid.starts_with("note:") {
+        let sections = store.sections_in_note(uid).ok()?;
+        if sections.is_empty() {
+            return None;
+        }
+        let mut combined: Vec<(u32, String)> = sections
+            .into_iter()
+            .map(|s| (s.start_line, s.text_content))
+            .collect();
+        combined.sort_by_key(|(line, _)| *line);
+        return Some(
+            combined
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+    }
+    None
 }
 
 // ── List helpers ──────────────────────────────────────────────────────────────
@@ -1412,6 +1521,154 @@ mod render_brain_node_tests {
             node.title
         );
         assert_eq!(node.location, "notes/fallback.md");
+    }
+}
+
+#[cfg(test)]
+mod inline_body_tests {
+    use super::{BrainNode, populate_inline_bodies};
+    use nestweaver_schema::{Note, NoteKind, Section};
+    use nestweaver_store::GraphStore;
+    use std::fs;
+
+    fn node(uid: &str, kind: &str, relevance: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: uid.to_string(),
+            location: String::new(),
+            relevance,
+            inline_body: None,
+        }
+    }
+
+    fn store_with_section() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let note = Note {
+            uid: "note:n".to_string(),
+            vault_uid: "vault:v".to_string(),
+            file_path: "notes/n.md".to_string(),
+            title: "N".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 10,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.insert_note(&note).unwrap();
+        let sec = Section {
+            uid: "sec:high".to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 0,
+            end_line: 2,
+            text_hash: "th".to_string(),
+            text_content: "THE BODY OF THE HIGH RELEVANCE SECTION".to_string(),
+            word_count: 7,
+            pagerank_score: None,
+        };
+        store.insert_section(&sec).unwrap();
+        let sec_lo = Section {
+            uid: "sec:low".to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 3,
+            end_line: 5,
+            text_hash: "tl".to_string(),
+            text_content: "low relevance body".to_string(),
+            word_count: 3,
+            pagerank_score: None,
+        };
+        store.insert_section(&sec_lo).unwrap();
+        store
+    }
+
+    #[test]
+    fn populates_above_threshold_only() {
+        let store = store_with_section();
+        // Max relevance is 1.0 → sec:high normalizes to 1.0 (>= 0.75),
+        // sec:low normalizes to 0.5 (< 0.75).
+        let mut nodes = vec![
+            node("sec:high", "Section", 1.0),
+            node("sec:low", "Section", 0.5),
+        ];
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, None);
+        assert_eq!(
+            nodes[0].inline_body.as_deref(),
+            Some("THE BODY OF THE HIGH RELEVANCE SECTION"),
+            "above-threshold node should have inline body"
+        );
+        assert!(
+            nodes[1].inline_body.is_none(),
+            "below-threshold node should NOT have inline body"
+        );
+    }
+
+    #[test]
+    fn off_by_default_no_call_means_none() {
+        // Sanity: constructing a node leaves inline_body None; the populate
+        // path is the only thing that sets it.
+        let n = node("sec:high", "Section", 1.0);
+        assert!(n.inline_body.is_none());
+    }
+
+    #[test]
+    fn token_budget_leaves_lower_ranked_metadata_only() {
+        let store = store_with_section();
+        let mut nodes = vec![
+            node("sec:high", "Section", 1.0),
+            node("sec:low", "Section", 0.9),
+        ];
+        // Both normalize above threshold (1.0 and 0.9). Budget only fits the
+        // first body (~10 tokens for 38 chars). The lower-ranked node keeps
+        // its slot but gets no inline body.
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, Some(11));
+        assert!(nodes[0].inline_body.is_some(), "top node fits the budget");
+        assert!(
+            nodes[1].inline_body.is_none(),
+            "lower-ranked node should be metadata-only once budget exhausts"
+        );
+        // Node itself is never dropped.
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn truncates_to_max_body_tokens() {
+        let store = store_with_section();
+        let mut nodes = vec![node("sec:high", "Section", 1.0)];
+        // max_body_tokens = 2 → 8 chars.
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 2, None);
+        let body = nodes[0].inline_body.as_deref().unwrap();
+        assert!(
+            body.len() <= 8,
+            "body should be truncated to ~8 chars, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_body_read_from_disk() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let sym = store.lookup_symbols_by_name("greet").unwrap();
+        let uid = sym[0].uid.clone();
+        let mut nodes = vec![node(&uid, "Symbol/Function", 1.0)];
+        populate_inline_bodies(&store, &mut nodes, &src, 0.75, 800, None);
+        let body = nodes[0].inline_body.as_deref().expect("symbol body");
+        assert!(body.contains("function greet"), "got: {body:?}");
     }
 }
 
