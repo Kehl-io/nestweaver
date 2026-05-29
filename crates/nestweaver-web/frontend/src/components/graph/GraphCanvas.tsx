@@ -1,9 +1,93 @@
-import { Canvas } from "@react-three/fiber";
+import { useCallback, useRef } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
-import { useGraphBridge } from "../../hooks/useGraphBridge";
+import { useGraphBridge, type GraphBuffers } from "../../hooks/useGraphBridge";
+import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
+
+/**
+ * Handles pointer interactions inside the R3F scene.
+ * Uses CPU-based picking (useGPUPicking) to map screen coordinates to nodes.
+ */
+function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
+  const { pick } = useGPUPicking(buffers);
+  const selectNode = useStore((s) => s.selectNode);
+  const hoverNode = useStore((s) => s.hoverNode);
+  const setSeeds = useStore((s) => s.setSeeds);
+  const { camera, size } = useThree();
+  const lastClickRef = useRef<{ time: number; nodeUid: string | null }>({
+    time: 0,
+    nodeUid: null,
+  });
+
+  const handlePointerDown = useCallback(
+    (event: { nativeEvent: PointerEvent }) => {
+      const e = event.nativeEvent;
+      // Get the canvas-relative position from the DOM event
+      const rect = (e.target as HTMLElement).getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      const result = pick(x, y, camera, size);
+
+      const now = Date.now();
+      const prev = lastClickRef.current;
+
+      if (result.nodeUid) {
+        // Double-click detection: same node within 400ms
+        if (
+          prev.nodeUid === result.nodeUid &&
+          now - prev.time < 400
+        ) {
+          setSeeds([result.nodeUid]);
+        } else {
+          // Read kind from graphology attributes
+          const graphInstance = useStore.getState().graphInstance;
+          const kind = graphInstance?.hasNode(result.nodeUid)
+            ? (graphInstance.getNodeAttribute(result.nodeUid, "kind") as string | null)
+            : null;
+          selectNode(result.nodeUid, kind);
+        }
+      } else {
+        // Clicked on background — deselect
+        selectNode(null);
+      }
+
+      lastClickRef.current = { time: now, nodeUid: result.nodeUid };
+    },
+    [pick, camera, size, selectNode, setSeeds],
+  );
+
+  const handlePointerMove = useCallback(
+    (event: { nativeEvent: PointerEvent }) => {
+      const e = event.nativeEvent;
+      const rect = (e.target as HTMLElement).getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      const result = pick(x, y, camera, size);
+      hoverNode(result.nodeUid);
+
+      // Update cursor
+      const canvas = e.target as HTMLElement;
+      canvas.style.cursor = result.nodeUid ? "pointer" : "default";
+    },
+    [pick, camera, size, hoverNode],
+  );
+
+  return (
+    <mesh
+      visible={false}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+    >
+      <planeGeometry args={[100000, 100000]} />
+      <meshBasicMaterial transparent opacity={0} />
+    </mesh>
+  );
+}
 
 export function GraphCanvas() {
   const buffers = useGraphBridge();
@@ -31,6 +115,7 @@ export function GraphCanvas() {
           <NodeInstanceMesh buffers={buffers} />
         </>
       )}
+      <GraphInteraction buffers={buffers} />
       <OrbitControls
         enableRotate={false}
         enableDamping
