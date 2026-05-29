@@ -75,6 +75,7 @@ pub mod query;
 pub mod read_symbols;
 pub mod recency;
 pub mod registry;
+pub mod rerank;
 pub mod snapshot;
 pub mod suggest;
 pub mod summaries;
@@ -174,6 +175,11 @@ pub use query::{
 };
 pub use recency::parse_iso8601_to_epoch;
 pub use registry::*;
+pub use rerank::{
+    DEFAULT_TOP_N as RERANK_DEFAULT_TOP_N, LoadedModelReranker, MonotonicReranker,
+    MonotonicWeights, RerankFeatures, RerankModel, Reranker, TrainingRow, export_training_rows,
+    load_rerank_model, rerank, rerank_sidecar_path, select_reranker,
+};
 pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,

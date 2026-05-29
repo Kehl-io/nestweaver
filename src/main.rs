@@ -686,6 +686,17 @@ enum Commands {
         #[command(subcommand)]
         command: InteractionCommands,
     },
+    /// Feature F17 — lightweight result reranker (off-by-default heuristic).
+    ///
+    /// The reranker reorders the top-N of an already-retrieved set; it does NOT
+    /// change recall. The default scorer is a transparent MONOTONIC heuristic,
+    /// not a validated nDCG win. A learned model is only trustworthy after the
+    /// eval harness + accumulated labels gate it at >= 5% nDCG@10. This command
+    /// group exposes the offline-training-export scaffold.
+    Rerank {
+        #[command(subcommand)]
+        command: RerankCommands,
+    },
     /// Inspect the API contract graph (F2-core).
     ///
     /// Contracts are HTTP routes / gRPC methods / GraphQL operations derived
@@ -1519,6 +1530,17 @@ enum BrainCommands {
             help = "Enable pseudo-relevance-feedback query expansion (Feature F7)"
         )]
         prf: bool,
+        /// Feature F17: rerank the top-N retrieved candidates before
+        /// truncation. OFF by default; behavior is byte-identical when off.
+        /// Uses a hand-tuned MONOTONIC heuristic scorer (an unvalidated
+        /// reordering, NOT a proven nDCG win) unless an optional learned-weights
+        /// file `<db>.rerank.json` is present and version-matched. Reranking
+        /// only reorders an already-retrieved set; recall is unchanged.
+        #[arg(
+            long = "rerank",
+            help = "Rerank the top-N retrieved candidates (Feature F17, heuristic, off by default)"
+        )]
+        rerank: bool,
     },
     /// List wikilinks whose target is ambiguous or low-confidence
     /// (confidence < 1.0), with suggested target notes for each.
@@ -1773,6 +1795,28 @@ enum ContractCommands {
         repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RerankCommands {
+    /// SCAFFOLD: export per-candidate feature+label rows (JSONL) derived from
+    /// F1 interaction success signals (TerminalSuccess/FollowUp → positive) for
+    /// OFFLINE training elsewhere. This does NOT train a model — there is no
+    /// labelled data of meaningful size yet and no eval harness to gate one. It
+    /// exports whatever interaction data exists (possibly empty). A future
+    /// external trainer would consume this JSONL and emit a `<db>.rerank.json`
+    /// weights file, which must beat the monotonic baseline by >= 5% nDCG@10 on
+    /// the (not-yet-built) eval harness before being trusted.
+    ExportTraining {
+        /// Output JSONL path (default: `<db>.rerank-training.jsonl`).
+        #[arg(long, help = "Output JSONL path")]
+        out: Option<PathBuf>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -3040,6 +3084,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
                     Ok((EXIT_ERROR, None))
                 }
+            }
+        },
+
+        Commands::Rerank { command } => match command {
+            RerankCommands::ExportTraining { out, db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                let out_path = out.unwrap_or_else(|| {
+                    nestweaver_engine::sidecar_path(&db_path, ".rerank-training.jsonl")
+                });
+                let rows = nestweaver_engine::export_training_rows(&db_path, &out_path)?;
+                println!(
+                    "Exported {rows} training row(s) to {} (SCAFFOLD — no model is trained here).",
+                    out_path.display()
+                );
+                if rows == 0 {
+                    println!(
+                        "No interaction data found. Enable `nestweaver mcp --track-interactions` to accumulate labels."
+                    );
+                }
+                println!(
+                    "Note: a learned reranker is only trustworthy after the eval harness gates it at >= 5% nDCG@10; the default scorer is a transparent heuristic."
+                );
+                Ok((EXIT_SUCCESS, None))
             }
         },
 
@@ -5910,6 +5977,7 @@ fn run_brain(
             inline_bodies,
             root,
             prf,
+            rerank,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let store = open_store(Some(&db_path))?;
@@ -6079,6 +6147,23 @@ fn run_brain(
                             &mut result.seeds,
                             recency_weight,
                             recency_half_life_days,
+                        );
+                    }
+
+                    // Feature F17: rerank the top-N retrieved candidates. OFF by
+                    // default → byte-identical output. Applied AFTER fusion +
+                    // F6 priors + filters, BEFORE truncation. The default scorer
+                    // is a transparent monotonic heuristic (NOT a validated nDCG
+                    // win); an optional `<db>.rerank.json` learned-weights file
+                    // is used if present and version-matched. Reranking only
+                    // reorders an already-retrieved set; recall is unchanged.
+                    if rerank {
+                        let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+                        nestweaver_engine::rerank(
+                            &mut result.connected,
+                            reranker.as_ref(),
+                            &store,
+                            nestweaver_engine::RERANK_DEFAULT_TOP_N,
                         );
                     }
 

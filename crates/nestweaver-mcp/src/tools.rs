@@ -840,6 +840,11 @@ fn tool_schema_brain_context() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, run pseudo-relevance-feedback query expansion on the BM25 leg: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language seeds. Mined terms are returned under `expansion_terms`. Default false."
+                },
+                "rerank": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, rerank the top-N retrieved candidates before truncation (Feature F17). OFF by default; output is byte-identical when off. The default scorer is a transparent MONOTONIC heuristic — an UNVALIDATED reordering, NOT a proven nDCG win. An optional learned-weights file `<db>.rerank.json` is used instead if present and version-matched, but a learned model should only be trusted after the eval harness + accumulated interaction labels gate it at >= 5% nDCG@10. Reranking only reorders an already-retrieved set; recall is unchanged. Default false."
                 }
             },
             "required": ["seeds"]
@@ -1087,6 +1092,26 @@ fn tool_brain_context(
     // Feature F8: embed high-relevance bodies inline when the caller opted in
     // via `include_bodies: true`. Off by default → output unchanged. Threshold
     // and per-body cap come from [response] config when supplied, else defaults.
+    // Feature F17: rerank the top-N retrieved candidates. OFF by default →
+    // byte-identical output. Applied after fusion + filters + recency, BEFORE
+    // truncation/inline-bodies. The default scorer is a transparent monotonic
+    // heuristic (NOT a validated nDCG win); an optional `<db>.rerank.json`
+    // learned-weights file is used if present and version-matched. Reranking
+    // only reorders an already-retrieved set; recall is unchanged.
+    let do_rerank = args
+        .get("rerank")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if do_rerank {
+        let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+        nestweaver_engine::rerank(
+            &mut result.connected,
+            reranker.as_ref(),
+            store,
+            nestweaver_engine::RERANK_DEFAULT_TOP_N,
+        );
+    }
+
     let include_bodies = args
         .get("include_bodies")
         .and_then(|v| v.as_bool())
@@ -1308,6 +1333,11 @@ fn tool_schema_brain_search() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, run pseudo-relevance-feedback query expansion: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language queries. Mined terms are returned under `expansion_terms`. Default false."
+                },
+                "rerank": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true (detailed mode only), rerank the top-N hits before truncation (Feature F17). OFF by default; output is byte-identical when off. The default scorer is a transparent MONOTONIC heuristic — an UNVALIDATED reordering, NOT a proven nDCG win. An optional learned-weights file `<db>.rerank.json` is used instead if present and version-matched, but a learned model should only be trusted after the eval harness + accumulated interaction labels gate it at >= 5% nDCG@10. Reranking only reorders an already-retrieved set; recall is unchanged. Default false."
                 }
             },
             "required": ["query"]
@@ -1540,6 +1570,64 @@ fn tool_brain_search(
         let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Feature F17: rerank the top-N before truncation. OFF by default →
+    // byte-identical output. Detailed mode only (concise rows carry no UID to
+    // key the reorder on). The default scorer is a transparent monotonic
+    // heuristic, NOT a validated nDCG win; an optional `<db>.rerank.json`
+    // learned-weights file is used if present and version-matched. Reranking
+    // only reorders an already-retrieved set; recall is unchanged.
+    let do_rerank = args
+        .get("rerank")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if do_rerank && !concise {
+        // Build BrainNodes mirroring the JSON rows (UID-keyed; rows without a
+        // UID — none in detailed mode — are dropped from the reorder set).
+        let nodes: Vec<nestweaver_engine::BrainNode> = note_results
+            .iter()
+            .filter_map(|v| {
+                let uid = v.get("uid").and_then(|u| u.as_str())?;
+                Some(nestweaver_engine::BrainNode {
+                    uid: uid.to_string(),
+                    kind: v
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: String::new(),
+                    location: v
+                        .get("location")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    relevance: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
+                    inline_body: None,
+                })
+            })
+            .collect();
+        if nodes.len() == note_results.len() {
+            let mut nodes = nodes;
+            let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+            nestweaver_engine::rerank(
+                &mut nodes,
+                reranker.as_ref(),
+                store,
+                nestweaver_engine::RERANK_DEFAULT_TOP_N,
+            );
+            // Reorder note_results to match the reranked UID order.
+            let mut by_uid: std::collections::HashMap<String, Value> = note_results
+                .drain(..)
+                .filter_map(|v| {
+                    v.get("uid")
+                        .and_then(|u| u.as_str())
+                        .map(|u| (u.to_string(), v.clone()))
+                })
+                .collect();
+            note_results = nodes.iter().filter_map(|n| by_uid.remove(&n.uid)).collect();
+        }
+    }
+
     note_results.truncate(limit);
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by

@@ -485,6 +485,14 @@ fn load_interaction_store(db_path: &Path) -> Option<InteractionStore> {
     serde_json::from_str(&text).ok()
 }
 
+/// Public wrapper around [`load_interaction_store`] for callers outside this
+/// module (e.g. the Feature F17 training-export scaffold) that need the full
+/// per-node counters, not just the derived scores. Returns `None` when the
+/// sidecar is missing or unparseable.
+pub fn load_interaction_store_public(db_path: &Path) -> Option<InteractionStore> {
+    load_interaction_store(db_path)
+}
+
 /// Convenience view of the interaction sidecar used by the CLI
 /// `interactions status` subcommand.  Combines the raw event log with
 /// pre-computed per-node scores.
