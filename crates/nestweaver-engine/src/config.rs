@@ -44,6 +44,11 @@ pub struct FeatureConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InstanceConfig {
     pub instance_id: String,
+    /// Optional path to the graph database (`.lbug`) this instance reads.
+    /// Lets `--config` select a DB so read commands don't also need `--db`.
+    /// Absent → callers fall back to `--db` / `NESTWEAVER_DB` / the default.
+    #[serde(default)]
+    pub db: Option<String>,
     pub snapshot_storage: StorageConfig,
     pub workspace: WorkspaceConfig,
     pub inference: InferenceConfig,
@@ -155,6 +160,11 @@ pub struct McpServerConfig {
 }
 
 impl InstanceConfig {
+    /// The DB path declared by this instance, if any.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        self.db.as_ref().map(std::path::PathBuf::from)
+    }
+
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
         let config: Self = toml::from_str(s)?;
@@ -242,6 +252,25 @@ url = "https://github.com/example/repo"
         assert_eq!(cfg.repos.len(), 1);
         assert_eq!(cfg.repos[0].url, "https://github.com/example/repo");
         assert!(cfg.schema_extensions.is_none());
+    }
+
+    // Bug #19: `--config` should let a command select its DB. The config
+    // carries an optional `db` path; absent → None (backward compatible).
+    #[test]
+    fn parses_optional_db_path() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert_eq!(
+            cfg.db_path(),
+            None,
+            "absent db must stay None (backward compatible)"
+        );
+
+        let with_db = format!("db = \"/home/u/.nestweaver/main.lbug\"\n{MINIMAL_TOML}");
+        let cfg2 = InstanceConfig::from_toml_str(&with_db).expect("should parse");
+        assert_eq!(
+            cfg2.db_path(),
+            Some(std::path::PathBuf::from("/home/u/.nestweaver/main.lbug"))
+        );
     }
 
     #[test]
