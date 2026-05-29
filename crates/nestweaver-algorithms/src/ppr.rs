@@ -90,6 +90,15 @@ pub fn personalized_pagerank(
             }
         }
         if interaction_mass > 0.0 {
+            // Anti-feedback-loop / exploration floor: we scale every seed's
+            // personalization weight by `(1 - w)` and only redistribute the
+            // remaining `w` (default 5%) according to interaction history.
+            // Because `w < 1`, a seed with NO interaction history still
+            // retains `(1 - w)` of its original personalization mass — it can
+            // never be driven to zero by the interaction blend. This keeps
+            // newly-seeded, never-before-accessed nodes discoverable and
+            // prevents the feedback loop from collapsing onto historically
+            // popular nodes.
             for p in personalization.iter_mut() {
                 *p *= 1.0 - config.interaction_bias_weight;
             }
@@ -400,6 +409,69 @@ mod tests {
         let c_without = result_without.iter().find(|(uid, _)| uid == "c").unwrap().1;
         let c_with = result_with.iter().find(|(uid, _)| uid == "c").unwrap().1;
         assert!(c_with > c_without);
+    }
+
+    #[test]
+    fn exploration_floor_keeps_non_interacted_seed_nonzero() {
+        // Seed from "a" (which has NO interaction history) while a heavy
+        // interaction score is loaded for an unrelated node "c". The blend
+        // must NOT drive a's personalization weight to zero — a must still
+        // retain its (1 - w) share so it stays discoverable.
+        let graph = InMemoryGraph {
+            uids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            nodes: vec![
+                NodeMeta {
+                    name: "a".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+                NodeMeta {
+                    name: "b".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+                NodeMeta {
+                    name: "c".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+            ],
+            // No edges: dangling seed so its score reflects its
+            // personalization weight directly.
+            edges: vec![],
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+
+        let mut interaction_scores = HashMap::new();
+        interaction_scores.insert("c".to_string(), 1_000_000.0);
+        let w = 0.05;
+        let config = PprConfig {
+            interaction_scores: Some(interaction_scores),
+            interaction_bias_weight: w,
+            ..PprConfig::default()
+        };
+
+        let result = personalized_pagerank(&graph.uids, &adj, &["a".to_string()], &config);
+        let a_score = result.iter().find(|(uid, _)| uid == "a").map(|(_, s)| *s);
+
+        // "a" must appear (seeds are always included) and must be strictly
+        // positive — at least its (1 - w) seed share survives the blend.
+        let a_score = a_score.expect("seed 'a' should always be present");
+        assert!(
+            a_score >= 1.0 - w - 1e-6,
+            "non-interacted seed should keep >= (1-w) of its mass, got {a_score}"
+        );
+        assert!(
+            a_score > 0.0,
+            "exploration floor violated: a_score={a_score}"
+        );
     }
 
     #[test]

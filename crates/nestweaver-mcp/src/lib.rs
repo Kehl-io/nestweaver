@@ -103,10 +103,17 @@ pub fn run_stdio_server(
         let n = reader.read_line(&mut line)?;
         if n == 0 {
             // EOF from the client — clean shutdown.
-            if let Some(tracker) = &tracker
-                && let Err(e) = tracker.flush()
-            {
-                tracing::warn!("failed to flush interaction tracker: {e}");
+            if let Some(tracker) = &tracker {
+                // Best-effort terminal-success heuristic: if the agent's last
+                // tool call was NOT another search (i.e. it stopped looking),
+                // the context it had at that point was "good enough". Record a
+                // TerminalSuccess for the UIDs most recently surfaced this
+                // session so that positive outcome reinforces those nodes.
+                // This is purely heuristic and must never break shutdown.
+                maybe_record_terminal_success(tracker);
+                if let Err(e) = tracker.flush() {
+                    tracing::warn!("failed to flush interaction tracker: {e}");
+                }
             }
             tracing::info!("client closed stdin; shutting down");
             return Ok(());
@@ -309,6 +316,40 @@ fn dispatch_method(
 }
 
 // ── interaction telemetry helpers ──────────────────────────────────────────
+
+/// Tool names that count as "the agent is still searching". If the last
+/// recorded tool call was one of these, we do NOT record a terminal-success
+/// signal at shutdown — the agent was still looking when the session ended.
+const SEARCH_TOOLS: &[&str] = &["brain_search", "brain_context", "project_context"];
+
+/// Best-effort, shutdown-time heuristic: record a [`TerminalSuccess`] event
+/// for the UIDs most recently surfaced this session, *unless* the agent's
+/// last tool call was itself a search (which means it had not yet found what
+/// it needed). Called at clean stdin-EOF shutdown.
+///
+/// This is intentionally simple and conservative:
+/// - No last tool recorded → nothing happened, skip.
+/// - Last tool was a search → agent was still looking, skip.
+/// - Otherwise → reinforce the last surfaced UIDs (the retrieval the agent
+///   acted on and then stopped searching).
+///
+/// `record_terminal_success` no-ops on an empty UID list, so this is safe
+/// even when nothing was ever surfaced.
+///
+/// [`TerminalSuccess`]: nestweaver_engine::EventType::TerminalSuccess
+fn maybe_record_terminal_success(tracker: &nestweaver_engine::InteractionTracker) {
+    let last_tool = match tracker.last_tool_name() {
+        Some(t) => t,
+        None => return, // nothing happened this session
+    };
+    if SEARCH_TOOLS.contains(&last_tool.as_str()) {
+        // Agent's last action was a search — it was still looking, so we do
+        // not treat the session as a successful terminal retrieval.
+        return;
+    }
+    let surfaced = tracker.last_surfaced_uids();
+    tracker.record_terminal_success(&surfaced);
+}
 
 /// Classify the tool call and record an appropriate interaction event.
 fn record_interaction(
@@ -738,6 +779,68 @@ mod tests {
         let result = json!({ "uid": "note:abc", "title": "My Note" });
 
         record_interaction(&tracker, "note_get", &args, &result);
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn terminal_success_recorded_when_last_call_was_not_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        // Query surfaces a result, then the agent reads it (a non-search
+        // tool) and stops — a successful terminal retrieval.
+        record_interaction(
+            &tracker,
+            "brain_context",
+            &json!({ "seeds": ["AuthService"] }),
+            &json!({ "connected": [{ "uid": "sym:a", "kind": "Symbol" }] }),
+        );
+        record_interaction(
+            &tracker,
+            "note_get",
+            &json!({ "uid": "sym:a" }),
+            &json!({ "uid": "sym:a" }),
+        );
+
+        let before = tracker.pending_count();
+        maybe_record_terminal_success(&tracker);
+        assert_eq!(
+            tracker.pending_count(),
+            before + 1,
+            "should record a terminal-success event"
+        );
+    }
+
+    #[test]
+    fn terminal_success_skipped_when_last_call_was_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+
+        // Agent's last action was a search — it was still looking.
+        record_interaction(
+            &tracker,
+            "brain_search",
+            &json!({ "query": "auth" }),
+            &json!({ "results": [{ "uid": "sym:a", "kind": "Symbol" }] }),
+        );
+
+        let before = tracker.pending_count();
+        maybe_record_terminal_success(&tracker);
+        assert_eq!(
+            tracker.pending_count(),
+            before,
+            "should NOT record terminal success after a search"
+        );
+    }
+
+    #[test]
+    fn terminal_success_skipped_when_no_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+        maybe_record_terminal_success(&tracker);
         assert_eq!(tracker.pending_count(), 0);
     }
 }
