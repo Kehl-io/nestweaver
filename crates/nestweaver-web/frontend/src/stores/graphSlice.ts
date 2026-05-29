@@ -19,6 +19,8 @@ export interface GraphSlice {
   forceParams: { repulsion: number; gravity: number; settling: number };
   layoutMode: "panels" | "zen";
   activeStyleRules: Record<string, boolean>;
+  reducedEffects: boolean;
+  toggleReducedEffects: () => void;
   selectNode: (id: string | null, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
@@ -70,6 +72,12 @@ export const createGraphSlice: StateCreator<
     colorByDir: false, sizeByCallers: false,
     highlightEntryPoints: false, highlightHighPageRank: false,
   },
+  reducedEffects: false,
+
+  toggleReducedEffects: () =>
+    set((s) => {
+      s.reducedEffects = !s.reducedEffects;
+    }),
 
   selectNode: (id, kind) =>
     set((s) => {

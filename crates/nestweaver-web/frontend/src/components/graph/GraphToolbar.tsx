@@ -13,6 +13,8 @@ export function GraphToolbar() {
   const toggleCommunity = useStore((s) => s.toggleCommunityOverlay);
   const toggleTags = useStore((s) => s.toggleTags);
   const toggleMinimap = useStore((s) => s.toggleMinimap);
+  const reducedEffects = useStore((s) => s.reducedEffects);
+  const toggleReducedEffects = useStore((s) => s.toggleReducedEffects);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
 
@@ -32,6 +34,7 @@ export function GraphToolbar() {
     { label: "C", title: "Toggle community detection (c)", active: communityOverlay, onClick: toggleCommunity },
     { label: "#", title: "Toggle tag nodes (t)", active: tagsVisible, onClick: toggleTags },
     { label: "M", title: "Toggle minimap (m)", active: minimapVisible, onClick: toggleMinimap },
+    { label: "~", title: "Reduced effects — disable bloom and breathing animations", active: reducedEffects, onClick: toggleReducedEffects },
   ];
 
   const isZen = layoutMode === "zen";

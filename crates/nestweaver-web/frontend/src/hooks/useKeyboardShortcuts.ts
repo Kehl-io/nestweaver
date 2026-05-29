@@ -1,6 +1,7 @@
 import { useHotkeys } from "react-hotkeys-hook";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
+import { useNavigationHistory } from "./useNavigationHistory";
 
 const MODES: GraphMode[] = ["context", "impact", "repos", "features", "inspector"];
 
@@ -12,6 +13,7 @@ export function useKeyboardShortcuts() {
   const toggleMinimap = useStore((s) => s.toggleMinimap);
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
+  const { undo, redo } = useNavigationHistory();
 
   useHotkeys("1", () => setMode(MODES[0]));
   useHotkeys("2", () => setMode(MODES[1]));
@@ -27,6 +29,26 @@ export function useKeyboardShortcuts() {
   useHotkeys("t", () => toggleTags());
 
   useHotkeys("escape", () => selectNode(null));
+
+  // mod+z — undo navigation
+  useHotkeys(
+    "mod+z",
+    (e) => {
+      e.preventDefault();
+      undo();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
+
+  // mod+shift+z — redo navigation
+  useHotkeys(
+    "mod+shift+z",
+    (e) => {
+      e.preventDefault();
+      redo();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
 
   // i — impact analysis for selected node
   useHotkeys("i", () => {

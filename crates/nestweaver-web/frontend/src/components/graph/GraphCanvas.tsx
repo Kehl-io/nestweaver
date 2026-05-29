@@ -116,7 +116,8 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
 export function GraphCanvas() {
   const buffers = useGraphBridge();
   const theme = useStore((s) => s.theme);
-  const reducedMotion = useReducedMotion();
+  const reducedEffectsToggle = useStore((s) => s.reducedEffects);
+  const reducedMotion = useReducedMotion() || reducedEffectsToggle;
 
   // Determine background color from theme
   const isDark =
