@@ -63,6 +63,45 @@ pub struct InstanceConfig {
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Feature F8 — tiered inline bodies. Controls when brain_context /
+    /// brain_search may embed a result's source body inline.
+    #[serde(default)]
+    pub response: ResponseConfig,
+}
+
+/// `[response]` — tuning for tiered inline bodies (Feature F8).
+///
+/// Inline bodies are off by default; the caller must opt in (CLI
+/// `--inline-bodies`, MCP `include_bodies: true`). When opted in, a result's
+/// body is embedded only if its normalized relevance clears
+/// `inline_body_threshold`. Each body is truncated to `inline_max_body_tokens`
+/// (chars/4 estimate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseConfig {
+    /// Minimum normalized relevance (0.0–1.0) a result must reach before its
+    /// body is embedded inline. Default 0.75.
+    #[serde(default = "default_inline_body_threshold")]
+    pub inline_body_threshold: f64,
+    /// Per-body cap in estimated tokens (chars/4). Default 800.
+    #[serde(default = "default_inline_max_body_tokens")]
+    pub inline_max_body_tokens: usize,
+}
+
+fn default_inline_body_threshold() -> f64 {
+    0.75
+}
+
+fn default_inline_max_body_tokens() -> usize {
+    800
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            inline_body_threshold: default_inline_body_threshold(),
+            inline_max_body_tokens: default_inline_max_body_tokens(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1219,6 +1219,18 @@ enum BrainCommands {
             help = "Half-life for age-decay in days (default 30.0)"
         )]
         recency_half_life_days: f64,
+        /// Feature F8: embed each high-relevance result's source body inline so
+        /// the agent can skip a follow-up read. Off by default.
+        #[arg(
+            long = "inline-bodies",
+            help = "Embed high-relevance result bodies inline (Feature F8)"
+        )]
+        inline_bodies: bool,
+        /// Repo root for resolving Symbol bodies when --inline-bodies is set
+        /// (default: current dir). Note/Section bodies come from the store and
+        /// ignore this.
+        #[arg(long, help = "Repo root for inline Symbol bodies (default: cwd)")]
+        root: Option<PathBuf>,
     },
 }
 
@@ -4496,11 +4508,21 @@ fn run_brain(
             since,
             recency_weight,
             recency_half_life_days,
+            inline_bodies,
+            root,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+
+            // Feature F8: response tuning comes from [response] in the instance
+            // config when one is supplied; otherwise the built-in defaults.
+            let response_config = config_path
+                .as_deref()
+                .and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok())
+                .map(|c| c.response)
+                .unwrap_or_default();
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
             let defaults = HybridSearchConfig::default();
@@ -4628,6 +4650,22 @@ fn run_brain(
                             &mut result.seeds,
                             recency_weight,
                             recency_half_life_days,
+                        );
+                    }
+
+                    // Feature F8: embed high-relevance bodies inline when the
+                    // caller opted in. Off by default → output unchanged.
+                    if inline_bodies {
+                        let root = root.clone().unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        });
+                        nestweaver_engine::populate_inline_bodies(
+                            &store,
+                            &mut result.connected,
+                            &root,
+                            response_config.inline_body_threshold,
+                            response_config.inline_max_body_tokens,
+                            token_budget,
                         );
                     }
 
@@ -4890,6 +4928,11 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
                     "  {:.4}  {}  [{}]  {}",
                     n.relevance, n.title, n.kind, n.location
                 );
+            }
+            if let Some(body) = &n.inline_body {
+                for line in body.lines() {
+                    println!("      | {line}");
+                }
             }
         }
     }
