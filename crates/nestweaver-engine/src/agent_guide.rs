@@ -290,7 +290,23 @@ pub fn generate_guide(
     out.push_str("nestweaver context <name>\n\n");
     out.push_str("# Launch the web UI\n");
     out.push_str("nestweaver ui\n");
-    out.push_str("```\n");
+    out.push_str("```\n\n");
+
+    // Section 10: Web UI
+    out.push_str("## Web UI\n\n");
+    out.push_str("NestWeaver includes an interactive graph visualization accessible from a browser.\n\n");
+    out.push_str("```bash\n");
+    out.push_str("nestweaver ui --db ./nestweaver.lbug --port 8080\n");
+    out.push_str("nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing\n");
+    out.push_str("```\n\n");
+    out.push_str("Open `http://localhost:8080` after starting. Append `?engine=wasm` to the URL to run graph algorithms (PPR) client-side via WebAssembly — the browser downloads a MessagePack snapshot and executes queries locally with no server round-trips.\n\n");
+    out.push_str("**API endpoints** (served by the running UI process):\n\n");
+    out.push_str("| Endpoint | Description |\n");
+    out.push_str("|----------|-------------|\n");
+    out.push_str("| `GET /api/v1/version` | `{\"graph_generation\": N, \"pagerank_generation\": N}` |\n");
+    out.push_str("| `GET /api/v1/snapshot.msgpack` | MessagePack-encoded graph (`X-Graph-Generation` header) |\n");
+    out.push_str("| `GET /api/v1/events` | SSE stream: `graph:updated`, `pagerank:recomputed`, `full_refresh` |\n");
+    out.push('\n');
 
     Ok(out)
 }
