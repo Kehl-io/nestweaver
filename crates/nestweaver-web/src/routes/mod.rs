@@ -12,6 +12,7 @@ pub mod paths;
 pub mod perspectives;
 pub mod presentations;
 pub mod repos;
+pub mod snapshot;
 pub mod source;
 pub mod symbols;
 pub mod timeline;

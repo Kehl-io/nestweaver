@@ -14,7 +14,8 @@ use nestweaver_engine::{
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
-    export_cypher, export_graphml, export_mermaid, filter_by_target, find_bridge_nodes,
+    export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
+    find_bridge_nodes,
     find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map,
     generate_skill, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
@@ -860,13 +861,13 @@ enum Commands {
     /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), and Mermaid flowchart
     /// formats. Writes to stdout by default; use --output to write to a file.
     #[command(
-        after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30"
+        after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30\n  nestweaver export --format msgpack --output graph.msgpack"
     )]
     Export {
         #[arg(
             long,
             default_value = "cypher",
-            help = "Output format: cypher, graphml, mermaid"
+            help = "Output format: cypher, graphml, mermaid, msgpack"
         )]
         format: String,
         #[arg(long, help = "Write to file instead of stdout")]
@@ -2447,6 +2448,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let store = open_store(db.as_deref())?;
 
+            if format == "msgpack" {
+                let graph = export_in_memory_graph(&store)?;
+                let bytes = rmp_serde::to_vec(&graph)
+                    .with_context(|| "failed to serialize graph to msgpack")?;
+                let default_db = default_db_path();
+                let db_path = db.as_deref().unwrap_or(&default_db);
+                let path = match &output {
+                    Some(p) => p.clone(),
+                    None => {
+                        let mut name = db_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        name.push_str(".graph.msgpack");
+                        db_path
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join(name)
+                    }
+                };
+                std::fs::write(&path, &bytes)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                out.status(&format!(
+                    "Exported graph to {} ({} nodes, {} edges, {} bytes)",
+                    path.display(),
+                    graph.uids.len(),
+                    graph.edges.len(),
+                    bytes.len()
+                ));
+                let stats = format!("exported msgpack in {}", format_elapsed(t0.elapsed()));
+                return Ok((EXIT_SUCCESS, Some(stats)));
+            }
+
             let write_to: Box<dyn std::io::Write> = match &output {
                 Some(path) => Box::new(
                     std::fs::File::create(path)
@@ -2462,7 +2497,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "mermaid" => export_mermaid(&store, top, &mut writer)?,
                 other => {
                     eprintln!(
-                        "Unknown format '{}'. Supported: cypher, graphml, mermaid",
+                        "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
                         other
                     );
                     return Ok((EXIT_ERROR, None));
