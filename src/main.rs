@@ -3817,6 +3817,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                 }
             }
+            // Exit 2 when targets were requested but none resolved to a symbol
+            // (consistent with `symbol`/`impact`). When at least one target
+            // resolves, succeed even if others were not-found/ambiguous.
+            if !targets.is_empty() && res.symbols.is_empty() {
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             Ok((EXIT_SUCCESS, None))
         }
         Commands::Symbol {
@@ -4888,7 +4894,19 @@ fn run_ranking(
                 .unwrap_or_default();
 
             // Resolve the node's location (the path globs are matched against).
-            let location = ranking_location_for_uid(&store, &uid).unwrap_or_default();
+            // Exit 2 when the uid doesn't resolve to a node, consistent with
+            // `symbol`/`impact`/`ranking rank`.
+            let location = match ranking_location_for_uid(&store, &uid) {
+                Some(loc) => loc,
+                None => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": "not found", "uid": uid}));
+                    } else {
+                        eprintln!("uid '{uid}' not found.");
+                    }
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+            };
 
             // Delegate the matching + clamping to the engine so the math matches
             // exactly what brain context / search apply.
