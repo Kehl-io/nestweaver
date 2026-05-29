@@ -12,8 +12,8 @@ export interface WasmBridge {
 
 type WorkerApi = {
   init(): Promise<boolean>;
-  loadSnapshot(data: ArrayBuffer): Promise<boolean>;
-  ppr(seeds: string[], damping: number): Promise<Array<[string, number]>>;
+  loadSnapshot(data: ArrayBuffer): boolean;
+  ppr(seedsJson: string, damping: number): string;
   nodeCount(): number;
   edgeCount(): number;
   generation(): number;
@@ -29,15 +29,22 @@ export async function createWasmBridge(): Promise<WasmBridge> {
     { type: "module" },
   );
 
-  const api = Comlink.wrap<WorkerApi>(worker);
+  const remote = Comlink.wrap<WorkerApi>(worker);
 
   const bridge: WasmBridge = {
-    init: () => api.init(),
-    loadSnapshot: (data) => api.loadSnapshot(Comlink.transfer(data, [data])),
-    ppr: (seeds, damping) => api.ppr(seeds, damping),
-    nodeCount: () => api.nodeCount(),
-    edgeCount: () => api.edgeCount(),
-    generation: () => api.generation(),
+    init: () => remote.init(),
+    loadSnapshot: (data) => remote.loadSnapshot(Comlink.transfer(data, [data])),
+    async ppr(seeds: string[], damping: number): Promise<Array<[string, number]>> {
+      const json = await remote.ppr(JSON.stringify(seeds), damping);
+      try {
+        return JSON.parse(json);
+      } catch {
+        return [];
+      }
+    },
+    nodeCount: () => remote.nodeCount(),
+    edgeCount: () => remote.edgeCount(),
+    generation: () => remote.generation(),
     dispose: () => {
       worker.terminate();
       instance = null;
