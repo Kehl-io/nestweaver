@@ -41,6 +41,7 @@ nestweaver dead-code                     # detect unreachable symbols via entry 
 
 # Export
 nestweaver export --format cypher        # graph export (cypher, graphml, mermaid)
+nestweaver export --format msgpack       # graph snapshot for WASM engine
 
 # Markdown brain (`.brainignore` for glob exclusion patterns; `--ignore` flag for ad-hoc)
 nestweaver brain add ~/Documents/Obsidian/MyVault
@@ -86,7 +87,7 @@ nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tra
 nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
 nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
 
-# MCP server (22 tools, or 6 in lite mode for Cursor)
+# MCP server (23 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
@@ -99,6 +100,7 @@ nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlis
 
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
+nestweaver ui --watch                    # live re-indexing via filesystem watcher
 
 # Global flags: --stats, --quiet, --verbose, --no-color, --plain
 ```
