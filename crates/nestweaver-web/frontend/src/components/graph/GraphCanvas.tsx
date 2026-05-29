@@ -1,11 +1,34 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState, useEffect } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
+import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { useGraphBridge, type GraphBuffers } from "../../hooks/useGraphBridge";
 import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
+
+// ---- Reduced motion hook ----
+
+function useReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const handler = (e: MediaQueryListEvent) => setReduced(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  return reduced;
+}
+
+// ---- Interaction handler (inside R3F scene) ----
 
 /**
  * Handles pointer interactions inside the R3F scene.
@@ -37,16 +60,15 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
 
       if (result.nodeUid) {
         // Double-click detection: same node within 400ms
-        if (
-          prev.nodeUid === result.nodeUid &&
-          now - prev.time < 400
-        ) {
+        if (prev.nodeUid === result.nodeUid && now - prev.time < 400) {
           setSeeds([result.nodeUid]);
         } else {
           // Read kind from graphology attributes
           const graphInstance = useStore.getState().graphInstance;
           const kind = graphInstance?.hasNode(result.nodeUid)
-            ? (graphInstance.getNodeAttribute(result.nodeUid, "kind") as string | null)
+            ? (graphInstance.getNodeAttribute(result.nodeUid, "kind") as
+                | string
+                | null)
             : null;
           selectNode(result.nodeUid, kind);
         }
@@ -89,9 +111,12 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   );
 }
 
+// ---- Main canvas ----
+
 export function GraphCanvas() {
   const buffers = useGraphBridge();
   const theme = useStore((s) => s.theme);
+  const reducedMotion = useReducedMotion();
 
   // Determine background color from theme
   const isDark =
@@ -112,7 +137,7 @@ export function GraphCanvas() {
       {buffers.nodeCount > 0 && (
         <>
           <EdgeInstanceMesh buffers={buffers} />
-          <NodeInstanceMesh buffers={buffers} />
+          <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
         </>
       )}
       <GraphInteraction buffers={buffers} />
@@ -124,6 +149,17 @@ export function GraphCanvas() {
         maxZoom={100}
         mouseButtons={{ LEFT: 0, MIDDLE: 2, RIGHT: 2 }}
       />
+      {/* Bloom post-processing — skipped when reduced motion is active */}
+      {!reducedMotion && (
+        <EffectComposer>
+          <Bloom
+            luminanceThreshold={0.8}
+            luminanceSmoothing={0.3}
+            intensity={0.5}
+            radius={0.4}
+          />
+        </EffectComposer>
+      )}
     </Canvas>
   );
 }
