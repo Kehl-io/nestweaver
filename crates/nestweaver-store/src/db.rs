@@ -425,6 +425,26 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // ── F11 memory-bank: typed Note→Note relationships ─────────────────
+        // Explicit, semantically-typed knowledge edges derived from frontmatter
+        // keys and heading-grouped wikilinks. Map to PROV-O / SKOS vocab:
+        // SUPERSEDES→prov:wasRevisionOf, DEPENDS_ON→prov:wasInformedBy,
+        // CAUSED_BY→prov:wasDerivedFrom, RELATES_TO→skos:related.
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS SUPERSEDES(FROM Note TO Note, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(FROM Note TO Note, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query("CREATE REL TABLE IF NOT EXISTS CAUSED_BY(FROM Note TO Note, confidence FLOAT)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS RELATES_TO(FROM Note TO Note, confidence FLOAT)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         conn.query("CREATE REL TABLE IF NOT EXISTS NOTE_TAGGED_WITH(FROM Note TO Tag)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
 

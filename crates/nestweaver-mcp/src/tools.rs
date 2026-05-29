@@ -18,10 +18,10 @@ use nestweaver_engine::{
     detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
     index_directory, index_markdown_directory, investigate, investigate_expand,
-    investigate_hydrate, load_alias_sidecar, load_clusters, load_extensions, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
-    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
-    truncate_to_budget,
+    investigate_hydrate, load_alias_sidecar, load_clusters, load_extensions, memory_consolidate,
+    memory_lint, memory_related, orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies,
+    query_by_property, render_text, save_extensions, search_symbols, set_property, tag_graph,
+    tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -77,6 +77,9 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_investigate_expand(),
         tool_schema_investigate_hydrate(),
         tool_schema_contract_drift(),
+        tool_schema_brain_memory_lint(),
+        tool_schema_brain_memory_consolidate(),
+        tool_schema_brain_memory_related(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -151,6 +154,9 @@ pub fn dispatch(
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
         "contract_drift" => tool_contract_drift(store, args),
+        "brain_memory_lint" => tool_brain_memory_lint(store),
+        "brain_memory_consolidate" => tool_brain_memory_consolidate(store, args),
+        "brain_memory_related" => tool_brain_memory_related(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -445,6 +451,87 @@ fn tool_schema_brain_doc_stats() -> Value {
                     "default": 10
                 }
             }
+        }
+    })
+}
+
+// ── F11: memory-bank tools ───────────────────────────────────────────────────
+
+/// Current wall-clock time as Unix epoch seconds (f64). Falls back to 0.0
+/// (pre-epoch) only if the system clock is before 1970, which never happens.
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn tool_brain_memory_lint(store: &GraphStore) -> Result<Value, anyhow::Error> {
+    let report = memory_lint(store, now_epoch_secs())?;
+    Ok(serde_json::to_value(&report)?)
+}
+
+fn tool_schema_brain_memory_lint() -> Value {
+    json!({
+        "name": "brain_memory_lint",
+        "description": "Use to audit a markdown 'memory bank' vault for health problems. Runs SEVEN checks and returns them keyed: `stale` (notes marked status:active but unmodified for >90 days), `contradictions` (Supersedes cycles like A→B→A), `orphans` (notes with no inbound/outbound wikilinks), `broken_wikilinks` (ambiguous/low-confidence links), `supersession_chains` (a superseded note still actively linked), `schema_drift` (note frontmatter keys missing vs the _templates/<kind>.md template), `dangling_relationships` (a typed relationship whose target note does not exist). All keys always present; empty on a no-vault DB. Output: `{stale:[...], contradictions:[...], orphans:[...], broken_wikilinks:[...], supersession_chains:[...], schema_drift:[...], dangling_relationships:[...]}`.",
+        "inputSchema": { "type": "object", "properties": {} }
+    })
+}
+
+fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let manifest = memory_consolidate(store, apply, now_epoch_secs())?;
+    Ok(serde_json::to_value(&manifest)?)
+}
+
+fn tool_schema_brain_memory_consolidate() -> Value {
+    json!({
+        "name": "brain_memory_consolidate",
+        "description": "Use to propose promotions of vault notes UP the memory tiers (daily logs → ideas → project files). DRY-RUN BY DEFAULT — it never mutates files. Proposes: (1) a daily log (under _logs/) wikilinked from >=3 distinct idea notes and older than 14 days → _ideas candidate; (2) an idea (under _ideas/) referenced from BOTH a project's sync.md and status.md → project-file candidate. Set `apply:true` to opt into write-mode; today that is an explicit no-op stub that records a warning and still mutates nothing. Output: `{dry_run, applied, proposals:[{source_uid, source_title, source_path, promote_to, rationale, evidence:[...]}], warnings:[...]}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "apply": {
+                    "type": "boolean",
+                    "description": "Opt into write-mode (currently a no-op stub that warns; default false = safe dry-run).",
+                    "default": false
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let uid = args
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'uid' (string) is required"))?;
+    let edge_types = parse_string_array(&args, "edge_types").unwrap_or_default();
+    let depth = args
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let related = memory_related(store, uid, &edge_types, depth)?;
+    Ok(json!({ "related": serde_json::to_value(&related)?, "total": related.len() }))
+}
+
+fn tool_schema_brain_memory_related() -> Value {
+    json!({
+        "name": "brain_memory_related",
+        "description": "Use to walk the TYPED relationship graph from a note — Supersedes / DependsOn / CausedBy / RelatesTo — without the noise of generic wikilinks. Breadth-first from `uid` over the chosen `edge_types` (default all four) to `depth` hops (default 2). Returns only the typed neighbours. Empty on unknown node / no-vault DB. Output: `{related:[{uid, title, file_path, depth, via_edge}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": { "type": "string", "description": "Seed note UID to traverse from." },
+                "edge_types": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Edge types to follow (Supersedes, DependsOn, CausedBy, RelatesTo; case/format-insensitive). Default: all four."
+                },
+                "depth": { "type": "integer", "description": "Max BFS depth (default 2).", "default": 2 }
+            },
+            "required": ["uid"]
         }
     })
 }

@@ -1567,6 +1567,31 @@ impl GraphStore {
         Ok(edges)
     }
 
+    /// All F11 typed Note→Note relationship edges, as `(source_uid,
+    /// target_uid, rel_table_name)` where `rel_table_name` is one of
+    /// `SUPERSEDES`, `DEPENDS_ON`, `CAUSED_BY`, `RELATES_TO`. Generic
+    /// wikilinks are NOT included. Empty DB / no typed edges → empty vec.
+    pub fn typed_note_edges(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for rel in ["SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "RELATES_TO"] {
+            let q = format!("MATCH (a:Note)-[:{rel}]->(b:Note) RETURN a.uid, b.uid");
+            let result = match conn.query(&q) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("typed_note_edges {rel}: query skipped: {e}");
+                    continue;
+                }
+            };
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                out.push((src, dst, rel.to_string()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Wikilink edges whose resolution is suspect — confidence below 1.0.
     ///
     /// These are ambiguous or low-priority resolutions (the indexer splits
