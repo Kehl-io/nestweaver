@@ -129,7 +129,8 @@ pub use index_md::{
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
     clear_interaction_sidecar, compute_decayed_score, interaction_sidecar_path,
-    load_interaction_data, load_interaction_scores, save_interaction_store,
+    load_interaction_data, load_interaction_scores, load_node_score, save_interaction_store,
+    top_uids_by_kind,
 };
 pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
 pub use process::{

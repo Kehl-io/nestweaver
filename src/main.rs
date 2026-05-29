@@ -1508,6 +1508,25 @@ enum InteractionCommands {
         )]
         db: Option<PathBuf>,
     },
+    /// Show recorded interaction events / decayed score for a UID, or the
+    /// top UIDs by a given event kind.
+    Show {
+        /// UID to inspect.
+        #[arg(long)]
+        uid: Option<String>,
+        /// List the top N UIDs (by `--kind`) instead of a single UID.
+        #[arg(long)]
+        top: Option<usize>,
+        /// Event kind to rank by with `--top`: access, query, follow_up,
+        /// impact, terminal_success, or score (default).
+        #[arg(long, default_value = "score")]
+        kind: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2609,6 +2628,48 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!("No interaction data to clear.");
                 }
                 Ok((EXIT_SUCCESS, None))
+            }
+            InteractionCommands::Show { uid, top, kind, db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                if let Some(n) = top {
+                    let rows = nestweaver_engine::top_uids_by_kind(&db_path, &kind, n);
+                    if rows.is_empty() {
+                        println!("No interaction data for kind '{kind}'.");
+                    } else {
+                        println!("Top {} UIDs by {kind}:", rows.len());
+                        for (uid, value) in rows {
+                            println!("  {value:>10.4}  {uid}");
+                        }
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                } else if let Some(uid) = uid {
+                    match nestweaver_engine::load_node_score(&db_path, &uid) {
+                        Some(ns) => {
+                            println!("Interaction record for {uid}:");
+                            println!("  query_seed_count:       {}", ns.query_seed_count);
+                            println!("  access_count:           {}", ns.access_count);
+                            println!("  result_shown_count:     {}", ns.result_shown_count);
+                            println!("  result_used_count:      {}", ns.result_used_count);
+                            println!("  terminal_success_count: {}", ns.terminal_success_count);
+                            println!("  distinct_sessions:      {}", ns.distinct_sessions);
+                            if ns.last_accessed > 0.0 {
+                                println!(
+                                    "  last_accessed:          {}",
+                                    format_epoch_timestamp(ns.last_accessed)
+                                );
+                            }
+                            println!("  decayed_score:          {:.4}", ns.computed_score);
+                            Ok((EXIT_SUCCESS, None))
+                        }
+                        None => {
+                            println!("No interaction data for UID '{uid}'.");
+                            Ok((EXIT_NOT_FOUND, None))
+                        }
+                    }
+                } else {
+                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
+                    Ok((EXIT_ERROR, None))
+                }
             }
         },
 
@@ -4536,6 +4597,22 @@ fn run_brain(
                 println!("  Tags:      {tag_count}");
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
+                // Interaction tracking is opt-in (enabled via `mcp
+                // --track-interactions`). Its presence is indicated by an
+                // interaction sidecar; when absent, surface the hint.
+                match nestweaver_engine::load_interaction_data(db_path) {
+                    Some(data) => {
+                        println!(
+                            "  interaction_tracking: enabled ({} nodes scored)",
+                            data.scores.len()
+                        );
+                    }
+                    None => {
+                        println!(
+                            "  interaction_tracking: disabled (run with --track-interactions to enable)"
+                        );
+                    }
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
