@@ -105,3 +105,32 @@ html, body, #root {
     flex-wrap: wrap;
   }
 }
+
+/* Glassmorphism panel */
+.glass-panel {
+  position: relative;
+  background: rgba(15, 23, 42, 0.88);
+  backdrop-filter: blur(12px) saturate(1.1);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 12px;
+}
+
+:root.light .glass-panel,
+.light .glass-panel {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+/* Cursor-responsive light effect */
+.glass-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    circle at var(--mx, 50%) var(--my, 50%),
+    rgba(255, 255, 255, 0.04),
+    transparent 60%
+  );
+  pointer-events: none;
+  border-radius: inherit;
+}
