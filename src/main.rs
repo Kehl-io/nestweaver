@@ -15,9 +15,8 @@ use nestweaver_engine::{
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes,
-    find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map,
-    generate_skill, generate_summaries, get_last_indexed_at,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
+    generate_repo_map, generate_skill, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -1258,6 +1257,26 @@ fn default_db_path() -> PathBuf {
     } else {
         PathBuf::from("./nestweaver.lbug")
     }
+}
+
+/// Resolve the DB path for a read command, honoring `--config`.
+///
+/// Precedence: an explicit `--db` always wins; otherwise the instance
+/// config's `db` field (when `--config` is given and declares one); otherwise
+/// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
+/// select a DB instead of being silently ignored (Bug #19).
+fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(db) = db {
+        return Ok(db);
+    }
+    if let Some(cfg_path) = config {
+        let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)
+            .with_context(|| format!("loading --config {}", cfg_path.display()))?;
+        if let Some(db) = cfg.db_path() {
+            return Ok(db);
+        }
+    }
+    Ok(default_db_path())
 }
 
 fn detect_repo_root() -> PathBuf {
@@ -2757,11 +2776,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let state = if watch {
                 let store = std::sync::Arc::new(open_store(Some(&db_path))?);
-                nestweaver_web::state::AppState::new_with_store(
-                    store,
-                    tantivy,
-                    db_path.clone(),
-                )
+                nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
             } else {
                 let store = open_store(Some(&db_path))?;
                 nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
@@ -2776,10 +2791,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 std::thread::spawn(move || {
                     let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
+                    let store_for_cb = code_store.clone();
                     let on_change = Box::new(move || {
+                        let generation = store_for_cb.graph_generation();
                         let _ = code_tx.send(nestweaver_web::state::GraphEvent {
                             event_type: "graph:updated".to_string(),
-                            payload: serde_json::json!({"source": "code_watcher"}),
+                            payload: serde_json::json!({"source": "code_watcher", "generation": generation}),
                         });
                     });
                     if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
@@ -3139,10 +3156,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Collect member UIDs for the post-PPR boost. These are the
             // notes and symbols declared as belonging to this project.
+            // Member note UIDs are tracked separately: they get seeded into
+            // PPR and surfaced into `connected` (Bug #12).
             let mut member_uids: Vec<String> = Vec::new();
+            let mut member_note_uids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let note_uids = store
                 .list_project_note_uids(&project.uid)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            member_note_uids.extend(note_uids.iter().cloned());
             member_uids.extend(note_uids);
             let sym_uids = store
                 .list_project_symbol_uids(&project.uid)
@@ -3157,7 +3179,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 vec![]
             };
             for comp_uid in &comp_uids {
-                member_uids.extend(store.list_project_note_uids(comp_uid).unwrap_or_default());
+                let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+                member_note_uids.extend(comp_notes.iter().cloned());
+                member_uids.extend(comp_notes);
                 member_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
             }
 
@@ -3185,12 +3209,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Seed PPR from the project node itself (not all member UIDs).
-            // With ProjectContext intent the PROJECT_INCLUDES_* edges get a
-            // 5x weight boost, so the walk efficiently discovers all members
-            // and places them in `connected` instead of `seeds`.
+            // Seed PPR from the project node, its components, and the
+            // project's member notes (Bug #12). Seeding the notes guarantees
+            // they survive the `min_score` filter in PPR — when a project
+            // declares repos, the project node's mass is split across tens of
+            // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
+            // below threshold so it never reaches `connected`.
             let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
             ppr_seeds.extend(comp_uids);
+            ppr_seeds.extend(member_note_uids.iter().cloned());
 
             let defaults = HybridSearchConfig::default();
             let aliases = load_alias_sidecar(&db_path);
@@ -3204,6 +3231,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(nestweaver_store::QueryIntent::ProjectContext),
             ) {
                 Ok(mut result) => {
+                    // Surface the project's curated member notes into
+                    // `connected` (Bug #12). Seeded notes land in `seeds`,
+                    // which print_brain_context_json does not render.
+                    nestweaver_engine::promote_member_notes_into_connected(
+                        &mut result,
+                        &member_note_uids,
+                    );
+
                     // Post-PPR scope boost: multiply relevance for nodes that
                     // belong to the project so declared content ranks highest.
                     let member_set: std::collections::HashSet<&str> =
@@ -3819,13 +3854,9 @@ fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
 
-        BrainCommands::Status {
-            json,
-            db,
-            config: _,
-        } => {
-            let db_default = default_db_path();
-            let db_path = db.as_deref().unwrap_or(&db_default);
+        BrainCommands::Status { json, db, config } => {
+            let db_resolved = resolve_db_with_config(db, config.as_deref())?;
+            let db_path = db_resolved.as_path();
             let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
             let note_count = store.count_notes().map_err(|e| anyhow::anyhow!(e))?;
@@ -4234,9 +4265,9 @@ fn run_brain(
             limit,
             json,
             db,
-            config: _,
+            config,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -4371,7 +4402,7 @@ fn run_brain(
             limit,
             json,
             db,
-            config: _,
+            config: config_path,
             kinds,
             repos,
             vaults,
@@ -4385,7 +4416,7 @@ fn run_brain(
             recency_weight,
             recency_half_life_days,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
