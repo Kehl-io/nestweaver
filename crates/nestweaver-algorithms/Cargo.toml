@@ -1,0 +1,13 @@
+[package]
+name = "nestweaver-algorithms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-compute graph algorithms (PPR, impact BFS, search) for NestWeaver"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+[dev-dependencies]
