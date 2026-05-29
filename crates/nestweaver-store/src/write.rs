@@ -1154,6 +1154,56 @@ impl GraphStore {
         )
     }
 
+    /// Record a genuinely-unresolved wikilink (`[[Target]]` with no matching
+    /// note) so the broken-links query can surface it. `uid` is derived from
+    /// the source section + link text by the caller so re-indexing the same
+    /// note replaces rather than duplicates. DETACH DELETE-by-uid first makes
+    /// the insert idempotent. Table may not exist on older DBs — caller treats
+    /// errors as best-effort.
+    pub fn insert_unresolved_wikilink(
+        &self,
+        uid: &str,
+        source_note_uid: &str,
+        source_path: &str,
+        source_title: &str,
+        wikilink_text: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (u:UnresolvedWikilink {uid: $uid}) DETACH DELETE u",
+            vec![("uid", lbug::Value::String(uid.to_string()))],
+        )?;
+        exec_params(
+            &conn,
+            "CREATE (:UnresolvedWikilink {uid: $uid, source_note_uid: $snu, \
+             source_path: $sp, source_title: $st, wikilink_text: $wt})",
+            vec![
+                ("uid", lbug::Value::String(uid.to_string())),
+                ("snu", lbug::Value::String(source_note_uid.to_string())),
+                ("sp", lbug::Value::String(source_path.to_string())),
+                ("st", lbug::Value::String(source_title.to_string())),
+                ("wt", lbug::Value::String(wikilink_text.to_string())),
+            ],
+        )
+    }
+
+    /// Remove all recorded unresolved wikilinks originating from `note_uid`.
+    /// Called from `delete_note_cascade` so stale rows do not linger after a
+    /// note is re-indexed (e.g. once its target note appears). Best-effort:
+    /// silently succeeds if the table does not exist.
+    pub fn delete_unresolved_wikilinks_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        if let Err(e) = exec_params(
+            &conn,
+            "MATCH (u:UnresolvedWikilink {source_note_uid: $uid}) DETACH DELETE u",
+            vec![("uid", lbug::Value::String(note_uid.to_string()))],
+        ) {
+            tracing::trace!("delete_unresolved_wikilinks_for_note skipped: {e}");
+        }
+        Ok(())
+    }
+
     /// Insert (or idempotently replace) a Contract node. Mirrors
     /// `insert_project`: DETACH DELETE by UID first so re-indexing a spec
     /// or handler does not accumulate duplicate Contract nodes.
@@ -1426,6 +1476,10 @@ impl GraphStore {
             "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
+
+        // 4. Drop any recorded unresolved-wikilink rows for this note so they
+        //    do not linger after re-index (e.g. once the target note appears).
+        self.delete_unresolved_wikilinks_for_note(note_uid)?;
 
         Ok(())
     }
@@ -1769,6 +1823,39 @@ impl GraphStore {
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         )?;
+        Ok(())
+    }
+
+    /// Delete all repo-scoped graph nodes that are NOT keyed off a stable,
+    /// re-derivable UID and therefore would collide on a forced full re-index.
+    ///
+    /// `bulk_index_write` plain-`CREATE`s `Service` nodes (whose UID is derived
+    /// from `repo_uid` + directory), and the contracts pass creates `Contract`
+    /// nodes. Re-running `index --force` regenerates the same UIDs, so without
+    /// clearing them first the second run trips LadybugDB's primary-key
+    /// uniqueness constraint (`Found duplicated primary key value svc:...`).
+    ///
+    /// `DETACH DELETE` also removes incident `SERVICE_HAS_SYMBOL`,
+    /// `IMPLEMENTS_CONTRACT`, and `SUPERSEDES`/`DEPENDS_ON`/`CAUSED_BY`/
+    /// `RELATES_TO` edges. `Symbol`/`File` nodes are cleared separately by the
+    /// per-file `delete_symbols_in_file` / `delete_file_node` path. Idempotent:
+    /// a no-op for repos with no services/contracts.
+    pub fn clear_repo_derived_nodes(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        // Service nodes for this repo.
+        exec_params(
+            &conn,
+            "MATCH (s:Service {repo_uid: $uid}) DETACH DELETE s",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        )?;
+        // Contract nodes for this repo (table may not exist on older DBs).
+        if let Err(e) = exec_params(
+            &conn,
+            "MATCH (c:Contract {repo_uid: $uid}) DETACH DELETE c",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        ) {
+            tracing::trace!("clear_repo_derived_nodes: Contract delete skipped: {e}");
+        }
         Ok(())
     }
 

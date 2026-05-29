@@ -508,6 +508,50 @@ mod tests {
     }
 
     #[test]
+    fn broken_links_includes_unresolved_and_dedups_ambiguous() {
+        // BUG repro: a vault with a genuinely-unresolved [[GhostLink]] (no
+        // target note) AND an ambiguous [[Dup]] (two notes titled "Dup").
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\nSee [[GhostLink]] and [[Dup]].\n"),
+            ("one/Dup.md", "# Dup\n\nfirst dup\n"),
+            ("two/Dup.md", "# Dup\n\nsecond dup\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let broken = broken_links(&store, 5).unwrap();
+
+        // GhostLink resolves to no note → must surface as broken.
+        let ghost = broken
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("GhostLink"));
+        assert!(
+            ghost.is_some(),
+            "genuinely-unresolved [[GhostLink]] must surface as broken, got: {:?}",
+            broken.iter().map(|b| &b.wikilink_text).collect::<Vec<_>>()
+        );
+
+        // The ambiguous [[Dup]] must collapse to exactly ONE row, not one per
+        // candidate note.
+        let dup_rows: Vec<_> = broken
+            .iter()
+            .filter(|b| b.wikilink_text.eq_ignore_ascii_case("Dup"))
+            .collect();
+        assert_eq!(
+            dup_rows.len(),
+            1,
+            "ambiguous [[Dup]] must produce exactly one row, got {}",
+            dup_rows.len()
+        );
+
+        // doc-stats broken count must be > 0.
+        let stats = doc_stats(&store, 5).unwrap();
+        assert!(
+            stats.broken_wikilinks > 0,
+            "doc-stats broken_wikilinks must be > 0"
+        );
+    }
+
+    #[test]
     fn orphans_list_island_but_not_allowlisted_index() {
         let (_dir, store) = f9_vault();
         let orphans = orphan_documents(&store, None, None, &[]).unwrap();
