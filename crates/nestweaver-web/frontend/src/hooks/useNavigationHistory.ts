@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 
@@ -59,6 +59,24 @@ export function useNavigationHistory() {
     selectNode(entry.selectedNodeId);
     isNavigating.current = false;
   }, [setSeeds, setGraphMode, selectNode]);
+
+  // Auto-push when seeds or graphMode change (unless we're navigating via undo/redo)
+  const seeds = useStore((s) => s.seeds);
+  const graphMode = useStore((s) => s.graphMode);
+  const prevSeedsRef = useRef<string>(JSON.stringify(seeds));
+  const prevModeRef = useRef<GraphMode>(graphMode);
+
+  useEffect(() => {
+    const seedsKey = JSON.stringify(seeds);
+    if (
+      seedsKey !== prevSeedsRef.current ||
+      graphMode !== prevModeRef.current
+    ) {
+      prevSeedsRef.current = seedsKey;
+      prevModeRef.current = graphMode;
+      pushState();
+    }
+  }, [seeds, graphMode, pushState]);
 
   const canUndo = indexRef.current > 0;
   const canRedo = indexRef.current < historyRef.current.length - 1;
