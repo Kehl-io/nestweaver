@@ -60,6 +60,7 @@ pub mod hubs;
 pub mod index;
 pub mod index_md;
 pub mod interactions;
+pub mod investigate;
 pub mod manifest;
 pub mod mcp_client;
 pub mod process;
@@ -131,6 +132,11 @@ pub use interactions::{
     clear_interaction_sidecar, compute_decayed_score, interaction_sidecar_path,
     load_interaction_data, load_interaction_scores, load_node_score, save_interaction_store,
     top_uids_by_kind,
+};
+pub use investigate::{
+    Bundle, BundleEntry, BundleStore, Domain, ExpandResult, HydrateResult, InvestigateResult,
+    NeighborRef, bundle_sidecar_path, investigate, investigate_expand, investigate_hydrate,
+    load_bundle, load_bundle_store, save_bundle_store,
 };
 pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
 pub use process::{
