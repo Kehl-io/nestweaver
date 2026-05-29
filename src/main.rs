@@ -525,6 +525,18 @@ enum Commands {
                     (opt-in storage cost)"
         )]
         with_trigrams: bool,
+        #[arg(
+            long = "with-git-activity",
+            help = "Feature F12: mine git history and write a <db>.gitactivity.json recency \
+                    sidecar so dormant code is demoted at rank-read time (opt-in)"
+        )]
+        with_git_activity: bool,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML). Honors per-repo [[repos]] use_git_activity \
+                    opt-out for --with-git-activity"
+        )]
+        config: Option<PathBuf>,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -1207,6 +1219,26 @@ enum RankingCommands {
         )]
         base_relevance: f64,
     },
+    /// Feature F12: explain how git-activity recency dampens a symbol's
+    /// CodeRank. Prints `base_pagerank`, `git_activity_score`, and `final_rank`
+    /// (= base × clamped recency multiplier). Neutral (multiplier 1.0) when no
+    /// `<db>.gitactivity.json` sidecar is loaded for the symbol's file.
+    Rank {
+        /// UID or name of the symbol to explain.
+        uid: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) carrying [ranking] git_activity_weight"
+        )]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1832,6 +1864,11 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     if let Some(scores) = nestweaver_engine::load_interaction_scores(path) {
         store.load_interaction_cache(scores);
     }
+
+    // Feature F12: load the git-activity recency sidecar (if present) so
+    // ranking/hubs demote dormant code at read time. Absent → neutral.
+    let ga_path = nestweaver_engine::sidecar_path(path, ".gitactivity.json");
+    let _ = store.load_git_activity_sidecar(&ga_path);
 
     Ok(store)
 }
@@ -4264,6 +4301,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             name,
             with_trigrams,
+            with_git_activity,
+            config,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -4355,6 +4394,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
             out.status("PageRank complete.");
+
+            // Feature F12: mine git history and write the recency sidecar so
+            // subsequent commands demote dormant code at rank-read time.
+            // Honor the per-repo `use_git_activity = false` opt-out when a
+            // config matches this repo's URL.
+            let repo_opted_out = load_instance_config_opt(config.as_deref())
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .find(|r| r.url == repo_url)
+                        .and_then(|r| r.use_git_activity)
+                        == Some(false)
+                })
+                .unwrap_or(false);
+
+            if with_git_activity && repo_opted_out {
+                out.status(
+                    "Repo has use_git_activity = false in config; skipping git-activity sidecar.",
+                );
+            } else if with_git_activity {
+                out.status("Mining git activity...");
+                let scores = nestweaver_engine::git_activity::compute_git_activity(&repo_path);
+                if scores.is_empty() {
+                    out.status("No usable git history found; git-activity sidecar not written.");
+                } else {
+                    let ga_path = nestweaver_engine::sidecar_path(&db_path, ".gitactivity.json");
+                    nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path)
+                        .with_context(|| "save git activity sidecar")?;
+                    out.status(&format!(
+                        "Git activity sidecar written ({} files scored).",
+                        scores.len()
+                    ));
+                }
+            }
 
             if with_trigrams {
                 out.status("Building trigram index...");
@@ -4647,6 +4720,78 @@ fn run_ranking(
                     None => println!("matched_rule:    none"),
                 }
                 println!("final_relevance: {final_relevance}");
+            }
+            Ok((
+                EXIT_SUCCESS,
+                Some(format!("done in {}", format_elapsed(t0.elapsed()))),
+            ))
+        }
+        RankingCommands::Rank {
+            uid,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+
+            // Apply the configured git-activity weight if a config carries one.
+            if let Some(cfg) = load_instance_config_opt(config.as_deref()) {
+                store.set_git_activity_weight(cfg.ranking.git_activity_weight);
+            }
+
+            // Resolve name-or-uid → uid, then load the symbol.
+            let resolved = match resolve_uid(&store, &uid)? {
+                ResolveResult::Found(u) => u,
+                ResolveResult::NotFound => {
+                    eprintln!("Symbol not found: {uid}");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                ResolveResult::Ambiguous(matches) => {
+                    eprintln!("Ambiguous symbol '{uid}' — {} matches:", matches.len());
+                    for m in matches.iter().take(10) {
+                        eprintln!("  {} ({}:{})", m.uid, m.file_path, m.start_line);
+                    }
+                    return Ok((EXIT_AMBIGUOUS, None));
+                }
+            };
+
+            let sym = store
+                .lookup_symbol(&resolved)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let base_pagerank = store
+                .pagerank_scores()
+                .get(&resolved)
+                .copied()
+                .unwrap_or(0.0);
+            let git_activity_score = store.git_activity_score(&sym.file_path);
+            let weight = store.git_activity_weight();
+            let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
+            let final_rank = base_pagerank * multiplier;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "uid": resolved,
+                        "file_path": sym.file_path,
+                        "base_pagerank": base_pagerank,
+                        "git_activity_score": git_activity_score,
+                        "git_activity_weight": weight,
+                        "multiplier": multiplier,
+                        "final_rank": final_rank,
+                    }))?
+                );
+            } else {
+                println!("uid:                {resolved}");
+                println!("file_path:          {}", sym.file_path);
+                println!("base_pagerank:      {base_pagerank:.8}");
+                match git_activity_score {
+                    Some(s) => println!("git_activity_score: {s:.4}"),
+                    None => println!("git_activity_score: (none → neutral)"),
+                }
+                println!("multiplier:         {multiplier:.4} (weight {weight})");
+                println!("final_rank:         {final_rank:.8}");
             }
             Ok((
                 EXIT_SUCCESS,

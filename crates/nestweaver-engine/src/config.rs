@@ -28,7 +28,7 @@ pub struct GlobRule {
 /// are clamped to the same bounds). When several rules match a result, the
 /// **last** matching rule wins (last-match-wins), with `dampen` rules ordered
 /// before `boost` rules in the merged list. Empty config → no-op.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankingConfig {
     #[serde(default)]
     pub dampen: Vec<GlobRule>,
@@ -40,6 +40,34 @@ pub struct RankingConfig {
     /// flag and MCP `prf: true` argument override this per call.
     #[serde(default)]
     pub enable_prf: bool,
+    /// Feature F12 — git-activity-dampened CodeRank weight. Controls how
+    /// strongly the per-file recency score rescales `pagerank_score` at read
+    /// time via `clamp(1 + w*(score - 0.5), 0.4, 1.6)`.
+    ///
+    /// Default `1.2` (NOT `0.6`): with `score ∈ [0, 1]` the factor spans
+    /// `[1 - w/2, 1 + w/2]`, so only `w = 1.2` reaches the full `[0.4, 1.6]`
+    /// clamp; `0.6` would top out at `[0.7, 1.3]` and never bind the clamp.
+    /// This is only applied when a `<db>.gitactivity.json` sidecar is present
+    /// (populated via `index --with-git-activity`).
+    #[serde(default = "default_git_activity_weight")]
+    pub git_activity_weight: f64,
+}
+
+/// Default for [`RankingConfig::git_activity_weight`]. See the field doc and
+/// `nestweaver_engine::git_activity` for the clamp/weight rationale.
+fn default_git_activity_weight() -> f64 {
+    1.2
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        RankingConfig {
+            dampen: Vec::new(),
+            boost: Vec::new(),
+            enable_prf: false,
+            git_activity_weight: default_git_activity_weight(),
+        }
+    }
 }
 
 impl RankingConfig {
@@ -204,6 +232,11 @@ pub struct RepoConfig {
     pub url: String,
     pub sparse: Option<bool>,
     pub pin_sha: Option<String>,
+    /// Feature F12 — per-repo opt-out for git-activity-dampened CodeRank.
+    /// `None`/`Some(true)` → recency dampening applies when a sidecar exists;
+    /// `Some(false)` → this repo never has its CodeRank dampened by git
+    /// activity (e.g. a vendored/generated repo where commit recency is noise).
+    pub use_git_activity: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -574,6 +607,51 @@ multiplier = 100.0
     fn ranking_defaults_to_empty_noop() {
         let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
         assert!(cfg.ranking.is_empty(), "absent [ranking] must be a no-op");
+    }
+
+    // Feature F12: git_activity_weight defaults to 1.2 (the clamp-fix value, not
+    // the RFC's 0.6) and per-repo use_git_activity parses as an opt-out.
+    #[test]
+    fn git_activity_weight_defaults_to_1_2() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(
+            (cfg.ranking.git_activity_weight - 1.2).abs() < 1e-9,
+            "default git_activity_weight must be 1.2, got {}",
+            cfg.ranking.git_activity_weight
+        );
+    }
+
+    #[test]
+    fn git_activity_weight_override_and_repo_opt_out_parse() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[ranking]
+git_activity_weight = 0.8
+
+[[repos]]
+url = "https://github.com/example/live"
+
+[[repos]]
+url = "https://github.com/example/vendored"
+use_git_activity = false
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert!((cfg.ranking.git_activity_weight - 0.8).abs() < 1e-9);
+        let live = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/live")
+            .expect("live repo");
+        let vendored = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/vendored")
+            .expect("vendored repo");
+        assert_eq!(live.use_git_activity, None);
+        assert_eq!(vendored.use_git_activity, Some(false));
     }
 
     #[test]

@@ -1729,6 +1729,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1745,6 +1746,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 1.5)],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1763,6 +1765,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("Projects/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 2.0)],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1780,6 +1783,7 @@ mod ranking_prior_tests {
             dampen: vec![],
             boost: vec![dampen("critical/**", 5.0)],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut high, &rules_hi);
         assert!(
@@ -1794,6 +1798,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("archive/**", 0.05)],
             boost: vec![],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut low, &rules_lo);
         assert!(
@@ -1811,6 +1816,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("src/legacy/**", 0.5)],
             boost: vec![],
             enable_prf: false,
+            git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
