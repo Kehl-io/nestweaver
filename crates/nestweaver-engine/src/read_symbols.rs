@@ -1,0 +1,201 @@
+//! Symbol-window reads (RFC F5).
+//!
+//! Returns just a symbol's source span (`start_line..=end_line`, from P0.1's
+//! `Symbol.end_line`) instead of a whole file — the cheapest token cut in the
+//! agent loop. Optionally includes adjacent symbols in the same file
+//! (`neighbors`) and is token-budget aware. Comment stripping is a planned
+//! follow-up (default-off; deferred to avoid false-elision risk).
+
+use std::path::Path;
+
+use nestweaver_schema::Symbol;
+use nestweaver_store::GraphStore;
+use serde::Serialize;
+
+/// One returned symbol window.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolWindow {
+    pub uid: String,
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub body: String,
+    /// True when this symbol was pulled in via `neighbors`, not requested directly.
+    pub is_neighbor: bool,
+}
+
+/// A spec that matched more than one symbol.
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousMatch {
+    pub query: String,
+    pub candidate_uids: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ReadSymbolsResult {
+    pub symbols: Vec<SymbolWindow>,
+    /// Specs that resolved to no symbol.
+    pub not_found: Vec<String>,
+    /// Specs that resolved to multiple symbols (caller should disambiguate by UID).
+    pub ambiguous: Vec<AmbiguousMatch>,
+    /// UIDs dropped because the token budget was exhausted.
+    pub dropped: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Read lines `start..=end` (1-based, inclusive) from `root/file_path`.
+fn read_span(root: &Path, file_path: &str, start: u32, end: u32) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(file_path)).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if start == 0 || start as usize > lines.len() {
+        return None;
+    }
+    let lo = (start - 1) as usize;
+    // `end` is 1-based inclusive; clamp to the file and never below `start`
+    // (old DBs may carry end_line = 0 before a `index --force`).
+    let hi = (end.max(start) as usize).min(lines.len());
+    Some(lines[lo..hi].join("\n"))
+}
+
+/// Resolve a spec (`sym:` UID, bare name, or dotted/`::` FQN) to candidate symbols.
+fn resolve(store: &GraphStore, spec: &str) -> Vec<Symbol> {
+    if spec.starts_with("sym:") {
+        return store.lookup_symbol(spec).ok().into_iter().collect();
+    }
+    // FQN forms: take the last path segment as the symbol name.
+    let name = spec
+        .rsplit("::")
+        .next()
+        .unwrap_or(spec)
+        .rsplit('.')
+        .next()
+        .unwrap_or(spec);
+    store.lookup_symbols_by_name(name).unwrap_or_default()
+}
+
+/// Estimate the token cost of a window (chars/4 + small metadata overhead).
+fn window_cost(body: &str) -> usize {
+    body.len() / 4 + 16
+}
+
+pub fn read_symbols(
+    store: &GraphStore,
+    specs: &[String],
+    root: &Path,
+    neighbors: u8,
+    token_budget: Option<usize>,
+) -> ReadSymbolsResult {
+    let mut result = ReadSymbolsResult::default();
+
+    // 1. Resolve specs → primary symbols (preserving input order).
+    let mut primary: Vec<Symbol> = Vec::new();
+    for spec in specs {
+        let candidates = resolve(store, spec);
+        match candidates.len() {
+            0 => result.not_found.push(spec.clone()),
+            1 => primary.push(candidates.into_iter().next().expect("len == 1")),
+            _ => result.ambiguous.push(AmbiguousMatch {
+                query: spec.clone(),
+                candidate_uids: candidates.iter().map(|s| s.uid.clone()).collect(),
+            }),
+        }
+    }
+
+    // 2. Expand with neighbours (adjacent symbols in the same file), de-duped.
+    let mut ordered: Vec<(Symbol, bool)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sym in primary {
+        if neighbors > 0 {
+            let mut in_file = store.symbols_in_file(&sym.file_path).unwrap_or_default();
+            in_file.sort_by_key(|s| s.start_line);
+            if let Some(idx) = in_file.iter().position(|s| s.uid == sym.uid) {
+                let lo = idx.saturating_sub(neighbors as usize);
+                let hi = (idx + neighbors as usize).min(in_file.len().saturating_sub(1));
+                for (j, n) in in_file.into_iter().enumerate() {
+                    if j < lo || j > hi {
+                        continue;
+                    }
+                    let is_self = n.uid == sym.uid;
+                    if seen.insert(n.uid.clone()) {
+                        ordered.push((n, !is_self));
+                    }
+                }
+                continue;
+            }
+        }
+        if seen.insert(sym.uid.clone()) {
+            ordered.push((sym, false));
+        }
+    }
+
+    // 3. Build windows, honoring the token budget (input order).
+    let mut used = 0usize;
+    for (sym, is_neighbor) in ordered {
+        let body =
+            read_span(root, &sym.file_path, sym.start_line, sym.end_line).unwrap_or_default();
+        let cost = window_cost(&body);
+        if let Some(budget) = token_budget
+            && !result.symbols.is_empty()
+            && used + cost > budget
+        {
+            result.dropped.push(sym.uid.clone());
+            result.truncated = true;
+            continue;
+        }
+        used += cost;
+        result.symbols.push(SymbolWindow {
+            uid: sym.uid,
+            name: sym.name,
+            kind: sym.kind.to_string(),
+            path: sym.file_path,
+            start_line: sym.start_line,
+            end_line: sym.end_line,
+            body,
+            is_neighbor,
+        });
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::index_directory_in_memory;
+    use std::fs;
+
+    fn test_repo() -> (tempfile::TempDir, std::path::PathBuf, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\nfunction hello(n) {\n  return n;\n}\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        (dir, src, store)
+    }
+
+    #[test]
+    fn read_symbols_returns_the_symbol_span_body() {
+        let (_dir, src, store) = test_repo();
+        let res = read_symbols(&store, &["greet".to_string()], &src, 0, None);
+        assert_eq!(res.symbols.len(), 1, "should resolve 'greet'");
+        let w = &res.symbols[0];
+        assert!(
+            w.body.contains("function greet") && w.body.contains("return hello"),
+            "body should be the greet span, got: {:?}",
+            w.body
+        );
+        assert!(
+            !w.body.contains("function hello"),
+            "body should NOT spill into the next function: {:?}",
+            w.body
+        );
+        assert!(w.end_line > w.start_line, "multi-line span");
+    }
+}
