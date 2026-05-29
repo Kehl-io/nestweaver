@@ -983,6 +983,38 @@ enum Commands {
         )]
         config: Option<PathBuf>,
     },
+    /// Inspect per-path ranking priors (Feature F6).
+    Ranking {
+        #[command(subcommand)]
+        command: RankingCommands,
+    },
+}
+
+/// Subcommands under `nestweaver ranking`.
+#[derive(Subcommand)]
+enum RankingCommands {
+    /// Dry-run: show how the configured `[ranking]` priors would rescale a
+    /// single node's relevance. Looks up the node's file-path location, finds
+    /// the last matching glob rule (last-match-wins), and prints the math.
+    Explain {
+        /// UID of the node to explain (e.g. `sym:...`, `note:...`).
+        uid: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML) carrying [ranking]")]
+        config: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "1.0",
+            help = "Base relevance to apply the prior against"
+        )]
+        base_relevance: f64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1322,6 +1354,24 @@ fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow:
         }
     }
     Ok(default_db_path())
+}
+
+/// Load an optional instance config for `[ranking]`/`[response]` settings.
+/// Returns `None` when no path is given; when a path IS given but fails to
+/// parse, warns and returns `None` — so a typo'd `--config` doesn't silently
+/// disable ranking priors / inline-body tuning.
+fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
+    let p = path?;
+    match nestweaver_engine::InstanceConfig::from_file(p) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "warning: --config {} failed to load ({e}); ranking/response settings ignored",
+                p.display()
+            );
+            None
+        }
+    }
 }
 
 fn detect_repo_root() -> PathBuf {
@@ -2381,6 +2431,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0),
+        Commands::Ranking { command } => run_ranking(command, t0),
         Commands::Embed {
             db,
             endpoint,
@@ -3764,6 +3815,91 @@ where
     Ok(())
 }
 
+/// Resolve a node UID to its file-path location for ranking-prior matching.
+/// Mirrors the location each kind renders with in brain results.
+fn ranking_location_for_uid(store: &nestweaver_store::GraphStore, uid: &str) -> Option<String> {
+    if uid.starts_with("sym:") {
+        let s = store.lookup_symbol(uid).ok()?;
+        Some(format!("{}:{}", s.file_path, s.start_line))
+    } else if uid.starts_with("note:") {
+        store.lookup_note(uid).ok().map(|n| n.file_path)
+    } else if uid.starts_with("sec:") {
+        let sec = store.lookup_section(uid).ok()?;
+        store.lookup_note(&sec.note_uid).ok().map(|n| n.file_path)
+    } else if uid.starts_with("head:") {
+        let h = store.lookup_heading(uid).ok()?;
+        store.lookup_note(&h.note_uid).ok().map(|n| n.file_path)
+    } else {
+        None
+    }
+}
+
+/// Dispatch a `ranking` subcommand.
+fn run_ranking(
+    command: RankingCommands,
+    t0: std::time::Instant,
+) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        RankingCommands::Explain {
+            uid,
+            json,
+            db,
+            config,
+            base_relevance,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+
+            let ranking = load_instance_config_opt(config.as_deref())
+                .map(|c| c.ranking)
+                .unwrap_or_default();
+
+            // Resolve the node's location (the path globs are matched against).
+            let location = ranking_location_for_uid(&store, &uid).unwrap_or_default();
+
+            // Delegate the matching + clamping to the engine so the math matches
+            // exactly what brain context / search apply.
+            let (matched, final_relevance) =
+                nestweaver_engine::explain_ranking_prior(&location, base_relevance, &ranking);
+
+            if json {
+                let matched_json = match &matched {
+                    Some((glob, mult)) => serde_json::json!({
+                        "glob": glob,
+                        "multiplier": mult,
+                    }),
+                    None => serde_json::Value::Null,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "uid": uid,
+                        "location": location,
+                        "base_relevance": base_relevance,
+                        "matched_rule": matched_json,
+                        "final_relevance": final_relevance,
+                    }))?
+                );
+            } else {
+                println!("uid:             {uid}");
+                println!("location:        {location}");
+                println!("base_relevance:  {base_relevance}");
+                match &matched {
+                    Some((glob, mult)) => {
+                        println!("matched_rule:    {glob} (x{mult})");
+                    }
+                    None => println!("matched_rule:    none"),
+                }
+                println!("final_relevance: {final_relevance}");
+            }
+            Ok((
+                EXIT_SUCCESS,
+                Some(format!("done in {}", format_elapsed(t0.elapsed()))),
+            ))
+        }
+    }
+}
+
 /// Dispatch a `brain` subcommand.
 fn run_brain(
     command: BrainCommands,
@@ -4365,6 +4501,12 @@ fn run_brain(
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
+            // Feature F6: per-path ranking priors from `[ranking]` in the
+            // instance config, if supplied. None → no-op.
+            let ranking_config = load_instance_config_opt(config.as_deref())
+                .map(|c| c.ranking)
+                .filter(|r| !r.is_empty());
+
             // Expand the query with taxonomy aliases for better recall.
             let aliases = load_alias_sidecar(&db_path);
             let query = expand_query_with_aliases(&raw_query, &aliases);
@@ -4406,6 +4548,52 @@ fn run_brain(
                 .filter(|sym| !seen_titles.contains(&sym.name.to_lowercase()))
                 .collect();
 
+            // Feature F6: apply per-path ranking priors as a multiplier on each
+            // result's relevance, keyed by file-path glob. Reuse the engine
+            // helper by projecting results into BrainNodes, then map the
+            // adjusted relevance back by UID. No config → empty map (no-op).
+            let mut note_results = note_results;
+            let prior_scores: std::collections::HashMap<String, f64> =
+                if let Some(ref ranking) = ranking_config {
+                    let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
+                    for n in &note_results {
+                        let location = store
+                            .lookup_note(&n.note_uid)
+                            .map(|note| note.file_path)
+                            .unwrap_or_default();
+                        probe.push(nestweaver_engine::BrainNode {
+                            uid: n.note_uid.clone(),
+                            kind: "Note".to_string(),
+                            title: n.title.clone(),
+                            location,
+                            relevance: n.best_score as f64,
+                            inline_body: None,
+                        });
+                    }
+                    for sym in &code_results {
+                        probe.push(nestweaver_engine::BrainNode {
+                            uid: sym.uid.clone(),
+                            kind: format!("Symbol/{}", sym.kind),
+                            title: sym.name.clone(),
+                            location: format!("{}:{}", sym.file_path, sym.start_line),
+                            relevance: 0.5,
+                            inline_body: None,
+                        });
+                    }
+                    nestweaver_engine::apply_ranking_priors(&mut probe, ranking);
+                    probe.into_iter().map(|n| (n.uid, n.relevance)).collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+            // Fold adjusted note scores back in.
+            for n in &mut note_results {
+                if let Some(&adj) = prior_scores.get(&n.note_uid) {
+                    n.best_score = adj as f32;
+                }
+            }
+            // Symbol display score: prior-adjusted when present, else 0.5.
+            let code_score = |uid: &str| prior_scores.get(uid).copied().unwrap_or(0.5);
+
             let result_count = note_results.len() + code_results.len();
 
             if json {
@@ -4429,7 +4617,7 @@ fn run_brain(
                         "uid": sym.uid,
                         "kind": format!("Symbol/{}", sym.kind),
                         "title": sym.name,
-                        "score": 0.5,
+                        "score": code_score(&sym.uid),
                         "location": format!("{}:{}", sym.file_path, sym.start_line),
                     }));
                 }
@@ -4476,8 +4664,12 @@ fn run_brain(
                 }
                 for sym in &code_results {
                     println!(
-                        "  [0.50] {} [{}] @ {}:{}",
-                        sym.name, sym.kind, sym.file_path, sym.start_line,
+                        "  [{:.2}] {} [{}] @ {}:{}",
+                        code_score(&sym.uid),
+                        sym.name,
+                        sym.kind,
+                        sym.file_path,
+                        sym.start_line,
                     );
                 }
             }
@@ -4516,13 +4708,20 @@ fn run_brain(
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
+            // Parse the instance config once (when supplied) and reuse it for
+            // both Feature F8 ([response]) and Feature F6 ([ranking]).
+            let instance_cfg = load_instance_config_opt(config_path.as_deref());
             // Feature F8: response tuning comes from [response] in the instance
             // config when one is supplied; otherwise the built-in defaults.
-            let response_config = config_path
-                .as_deref()
-                .and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok())
-                .map(|c| c.response)
+            let response_config = instance_cfg
+                .as_ref()
+                .map(|c| c.response.clone())
                 .unwrap_or_default();
+            // Feature F6: per-path ranking priors. None → no-op below.
+            let ranking_config = instance_cfg
+                .as_ref()
+                .map(|c| c.ranking.clone())
+                .filter(|r| !r.is_empty());
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
             let defaults = HybridSearchConfig::default();
@@ -4544,6 +4743,20 @@ fn run_brain(
                 None,
             ) {
                 Ok(mut result) => {
+                    // Feature F6: apply per-path ranking priors (dampen/boost)
+                    // from `[ranking]` in the instance config, if supplied.
+                    // Applied AFTER fusion on the final relevance, BEFORE the
+                    // sort/truncation below. No config → no-op.
+                    if let Some(ranking) = ranking_config.as_ref() {
+                        nestweaver_engine::apply_ranking_priors(&mut result.seeds, ranking);
+                        nestweaver_engine::apply_ranking_priors(&mut result.connected, ranking);
+                        result.connected.sort_by(|a, b| {
+                            b.relevance
+                                .partial_cmp(&a.relevance)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =
                         kinds.iter().map(|k| k.to_lowercase()).collect();

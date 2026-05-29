@@ -1,6 +1,64 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Bounds applied to a ranking-prior multiplier and to the final product
+/// after a prior is applied. A multiplier below the floor would erase a
+/// result; above the ceiling would let a prior dominate every other signal.
+pub const RANKING_MULTIPLIER_MIN: f64 = 0.05;
+pub const RANKING_MULTIPLIER_MAX: f64 = 5.0;
+
+/// A single path-glob ranking rule (Feature F6). `glob` is matched against a
+/// result's file-path location; `multiplier` scales that result's relevance.
+///
+/// A multiplier < 1.0 dampens (e.g. `_logs/2020/** → 0.3`); a multiplier > 1.0
+/// boosts (e.g. `Projects/*/sync.md → 1.5`). The multiplier is clamped to
+/// `[RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX]` on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobRule {
+    pub glob: String,
+    pub multiplier: f64,
+}
+
+/// `[ranking]` — query-independent path-glob priors on result relevance
+/// (Feature F6).
+///
+/// `dampen` and `boost` are just two ordered lists of [`GlobRule`]s; the
+/// distinction is documentation only (a `dampen` rule conventionally has a
+/// multiplier < 1.0 and a `boost` rule > 1.0, but neither is enforced — both
+/// are clamped to the same bounds). When several rules match a result, the
+/// **last** matching rule wins (last-match-wins), with `dampen` rules ordered
+/// before `boost` rules in the merged list. Empty config → no-op.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RankingConfig {
+    #[serde(default)]
+    pub dampen: Vec<GlobRule>,
+    #[serde(default)]
+    pub boost: Vec<GlobRule>,
+}
+
+impl RankingConfig {
+    /// Clamp every rule's multiplier into the allowed bounds. Called on load so
+    /// downstream code can trust the values without re-validating.
+    pub fn clamp_multipliers(&mut self) {
+        for rule in self.dampen.iter_mut().chain(self.boost.iter_mut()) {
+            rule.multiplier = rule
+                .multiplier
+                .clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX);
+        }
+    }
+
+    /// Return the merged, ordered rule list used for last-match-wins matching:
+    /// all `dampen` rules first (in declaration order) then all `boost` rules.
+    pub fn ordered_rules(&self) -> Vec<&GlobRule> {
+        self.dampen.iter().chain(self.boost.iter()).collect()
+    }
+
+    /// True when there are no rules at all (the off / no-op path).
+    pub fn is_empty(&self) -> bool {
+        self.dampen.is_empty() && self.boost.is_empty()
+    }
+}
+
 /// Configuration for cross-domain link discovery (notes ↔ code bridging).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossDomainConfig {
@@ -67,6 +125,10 @@ pub struct InstanceConfig {
     /// brain_search may embed a result's source body inline.
     #[serde(default)]
     pub response: ResponseConfig,
+    /// Feature F6 — per-path dampen/boost ranking priors. Query-independent
+    /// multipliers on result relevance, keyed by file-path glob.
+    #[serde(default)]
+    pub ranking: RankingConfig,
 }
 
 /// `[response]` — tuning for tiered inline bodies (Feature F8).
@@ -206,7 +268,10 @@ impl InstanceConfig {
 
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
-        let config: Self = toml::from_str(s)?;
+        let mut config: Self = toml::from_str(s)?;
+        // Feature F6: clamp ranking-prior multipliers into bounds on load so
+        // downstream code can trust the values without re-validating.
+        config.ranking.clamp_multipliers();
         if config.inference.endpoint.is_empty() {
             anyhow::bail!("inference.endpoint must be set (no global default allowed)");
         }
@@ -458,6 +523,51 @@ entry_points = ["syncData", "fetchRecords"]
         assert_eq!(features[0].name, "data-sync");
         assert_eq!(features[0].repos, vec!["app", "service"]);
         assert_eq!(features[0].entry_points, vec!["syncData", "fetchRecords"]);
+    }
+
+    // Feature F6: `[ranking]` parses into dampen/boost lists and multipliers
+    // are clamped to [0.05, 5.0] on load.
+    #[test]
+    fn parses_ranking_priors_and_clamps_multipliers() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[ranking]
+
+[[ranking.dampen]]
+glob = "_logs/2020/**"
+multiplier = 0.3
+
+[[ranking.dampen]]
+glob = "archive/**"
+multiplier = 0.0
+
+[[ranking.boost]]
+glob = "Projects/*/sync.md"
+multiplier = 1.5
+
+[[ranking.boost]]
+glob = "critical/**"
+multiplier = 100.0
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert_eq!(cfg.ranking.dampen.len(), 2);
+        assert_eq!(cfg.ranking.boost.len(), 2);
+        assert_eq!(cfg.ranking.dampen[0].glob, "_logs/2020/**");
+        assert!((cfg.ranking.dampen[0].multiplier - 0.3).abs() < 1e-9);
+        // 0.0 clamped up to the floor.
+        assert!((cfg.ranking.dampen[1].multiplier - RANKING_MULTIPLIER_MIN).abs() < 1e-9);
+        assert!((cfg.ranking.boost[0].multiplier - 1.5).abs() < 1e-9);
+        // 100.0 clamped down to the ceiling.
+        assert!((cfg.ranking.boost[1].multiplier - RANKING_MULTIPLIER_MAX).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ranking_defaults_to_empty_noop() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(cfg.ranking.is_empty(), "absent [ranking] must be a no-op");
     }
 
     #[test]
