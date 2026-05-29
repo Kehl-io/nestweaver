@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use lbug::Value;
+use nestweaver_algorithms::graph::AdjacencyData;
+use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr};
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -562,124 +564,28 @@ impl GraphStore {
         let effective_damping = intent.map_or(damping, |i| i.damping());
         let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, intent)?;
 
-        let n = uids.len();
-        if n == 0 {
-            return Ok(vec![]);
-        }
-
-        // Build seed index set for O(1) lookup.
-        let seed_set: std::collections::HashSet<usize> = seed_uids
-            .iter()
-            .filter_map(|uid| uid_to_idx.get(uid).copied())
-            .collect();
-
-        let seed_count = seed_set.len();
-        if seed_count == 0 {
-            // No seeds present in the graph — return empty.
-            return Ok(vec![]);
-        }
-
-        let personalization_val = 1.0 / seed_count as f64;
-
-        // Personalization vector: 1/|seeds| for seeds, 0 otherwise.
-        let mut personalization: Vec<f64> = (0..n)
-            .map(|i| {
-                if seed_set.contains(&i) {
-                    personalization_val
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-
-        // Apply interaction memory bias (conservative: 5% weight).
-        // Blends a small fraction of interaction history scores into the
-        // personalization vector so frequently-accessed nodes receive a
-        // slight ranking boost without overwhelming seed-based relevance.
-        let interaction_bias_weight = 0.05;
-        let interaction_lock = self
+        // Clone interaction scores out of the mutex for the algorithms crate.
+        let interaction_scores = self
             .interaction_cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(ref scores) = *interaction_lock {
-            let mut interaction_mass = 0.0;
-            let mut contributions: Vec<(usize, f64)> = Vec::new();
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
-            for (i, uid) in uids.iter().enumerate() {
-                if let Some(&score) = scores.get(uid)
-                    && score > 0.0
-                {
-                    contributions.push((i, score));
-                    interaction_mass += score;
-                }
-            }
+        let adjacency = AdjacencyData {
+            uid_to_idx,
+            incoming,
+            out_weight,
+        };
 
-            if interaction_mass > 0.0 {
-                // Blend: 95% from seeds, 5% from interaction history.
-                for p in personalization.iter_mut() {
-                    *p *= 1.0 - interaction_bias_weight;
-                }
-                for (i, score) in &contributions {
-                    personalization[*i] += interaction_bias_weight * score / interaction_mass;
-                }
-            }
-        }
-        drop(interaction_lock);
+        let config = PprConfig {
+            damping: effective_damping,
+            max_iterations,
+            min_score: 1e-4,
+            interaction_scores,
+            interaction_bias_weight: 0.05,
+        };
 
-        // Initialize scores to the personalization vector.
-        let mut scores: Vec<f64> = personalization.clone();
-
-        for _ in 0..max_iterations {
-            let mut new_scores: Vec<f64> = vec![0.0; n];
-
-            // Dangling-node handling: redistribute mass from nodes with no
-            // outgoing edges through the personalization vector.
-            let dangling_sum: f64 = scores
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| out_weight[i] == 0.0)
-                .map(|(_, &s)| s)
-                .sum::<f64>();
-
-            for v in 0..n {
-                new_scores[v] = (1.0 - effective_damping) * personalization[v]
-                    + effective_damping * dangling_sum * personalization[v];
-
-                for &(u, w) in &incoming[v] {
-                    if out_weight[u] > 0.0 {
-                        new_scores[v] += effective_damping * scores[u] * w / out_weight[u];
-                    }
-                }
-            }
-
-            // Check convergence.
-            let delta: f64 = new_scores
-                .iter()
-                .zip(scores.iter())
-                .map(|(n, o)| (n - o).abs())
-                .fold(0.0_f64, f64::max);
-
-            scores = new_scores;
-
-            if delta < 1e-6 {
-                break;
-            }
-        }
-
-        let min_score = 1e-4;
-
-        // Collect results: always include seeds, filter others by min_score.
-        let mut results: Vec<(String, f64)> = uids
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| seed_set.contains(&i) || scores[i] > min_score)
-            .map(|(i, uid)| (uid.clone(), scores[i]))
-            .collect();
-
-        // Sort descending by score.
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        Ok(results)
+        Ok(algo_ppr(&uids, &adjacency, seed_uids, &config))
     }
 
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
