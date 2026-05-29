@@ -2,6 +2,7 @@ pub mod db;
 pub mod error;
 pub mod ranking;
 pub mod read;
+pub mod regex;
 pub mod search;
 pub mod tantivy_index;
 pub mod traverse;
@@ -11,6 +12,9 @@ pub use db::GraphStore;
 pub use error::StoreError;
 pub use ranking::{GraphScope, QueryIntent, ScopedEdgeQuery, detect_intent};
 pub use read::{BacklinkRow, CodeEdge, CodeGraph, CrossRepoRef, SymbolBasic};
+pub use regex::{
+    CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
+};
 pub use search::{EmbeddingIndex, SearchResult};
 pub use tantivy_index::{SearchHit, TantivyError, TantivyIndex};
 pub use traverse::ImpactNode;
