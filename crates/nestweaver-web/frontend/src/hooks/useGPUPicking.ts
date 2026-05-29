@@ -24,8 +24,9 @@ export interface GPUPickingResult {
 
 /**
  * Provides a pick() function that identifies which node is at a given screen position.
- * For Phase 1, uses a simplified approach: CPU-based distance check against projected positions.
- * Full GPU picking (offscreen render target) deferred to Phase 2 when we have custom shaders.
+ * Uses CPU-based distance check against projected positions, which works well for graphs
+ * under ~10K nodes. GPU picking via an offscreen render target is an optimization
+ * opportunity for larger graphs but is not required at current scale.
  */
 export function useGPUPicking(buffers: GraphBuffers) {
   const pickRef = useRef({ buffers });
