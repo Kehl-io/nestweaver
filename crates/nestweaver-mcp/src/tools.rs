@@ -17,8 +17,9 @@ use nestweaver_engine::{
     compute_clusters, detect_changes_impact, detect_dead_code, expand_query_with_aliases,
     filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries,
     get_all_properties, get_last_indexed_at, index_directory, index_markdown_directory,
-    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch, query_by_property,
-    render_text, save_extensions, search_symbols, set_property, truncate_to_budget,
+    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch,
+    populate_inline_bodies, query_by_property, render_text, save_extensions, search_symbols,
+    set_property, truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -320,6 +321,15 @@ fn tool_schema_brain_context() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
+                },
+                "include_bodies": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, embed each high-relevance result's source body inline (under `inline_body`) so you can skip a follow-up read. Only results whose normalized relevance clears the configured threshold (default 0.75) get a body, and bodies count against `token_budget` in rank order. Default false."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
                 }
             },
             "required": ["seeds"]
@@ -555,6 +565,34 @@ fn tool_brain_context(
         );
     }
 
+    // Feature F8: embed high-relevance bodies inline when the caller opted in
+    // via `include_bodies: true`. Off by default → output unchanged. Threshold
+    // and per-body cap come from [response] config when supplied, else defaults.
+    let include_bodies = args
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if include_bodies {
+        // The MCP server has no instance-config handle here, so use the
+        // built-in [response] defaults (threshold 0.75, cap 800 tokens).
+        let response_config = nestweaver_engine::ResponseConfig::default();
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        populate_inline_bodies(
+            store,
+            &mut result.connected,
+            &root,
+            response_config.inline_body_threshold,
+            response_config.inline_max_body_tokens,
+            Some(token_budget),
+        );
+    }
+
     let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
 
     let concise = is_concise(&args);
@@ -570,13 +608,17 @@ fn tool_brain_context(
                     "title": n.title,
                 })
             } else {
-                json!({
+                let mut obj = json!({
                     "uid": n.uid,
                     "kind": n.kind,
                     "title": n.title,
                     "location": n.location,
                     "relevance": n.relevance,
-                })
+                });
+                if let Some(body) = &n.inline_body {
+                    obj["inline_body"] = json!(body);
+                }
+                obj
             }
         })
         .collect();
@@ -727,6 +769,15 @@ fn tool_schema_brain_search() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns note titles and kinds only; \"detailed\" (default) adds section text excerpts, BM25 scores, and vault UIDs."
+                },
+                "include_bodies": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true (detailed mode only), embed each high-relevance hit's source body inline (under `inline_body`) so you can skip a follow-up note_get / read. Only hits whose normalized score clears the configured threshold (default 0.75) get a body. Default false."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
                 }
             },
             "required": ["query"]
@@ -944,6 +995,63 @@ fn tool_brain_search(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
     note_results.truncate(limit);
+
+    // Feature F8: embed high-relevance bodies inline when opted in. Off by
+    // default. Concise mode carries no UID/score, so inline bodies are skipped
+    // there. Bodies are computed via the shared engine helper for parity with
+    // brain_context (normalized-relevance threshold + per-body truncation).
+    let include_bodies = args
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if include_bodies && !concise {
+        let response_config = nestweaver_engine::ResponseConfig::default();
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        let mut nodes: Vec<nestweaver_engine::BrainNode> = note_results
+            .iter()
+            .filter_map(|v| {
+                let uid = v.get("uid").and_then(|u| u.as_str())?;
+                let score = v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                Some(nestweaver_engine::BrainNode {
+                    uid: uid.to_string(),
+                    kind: v
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: String::new(),
+                    location: String::new(),
+                    relevance: score,
+                    inline_body: None,
+                })
+            })
+            .collect();
+        populate_inline_bodies(
+            store,
+            &mut nodes,
+            &root,
+            response_config.inline_body_threshold,
+            response_config.inline_max_body_tokens,
+            None,
+        );
+        let bodies: std::collections::HashMap<String, String> = nodes
+            .into_iter()
+            .filter_map(|n| n.inline_body.map(|b| (n.uid, b)))
+            .collect();
+        for item in note_results.iter_mut() {
+            if let Some(uid) = item.get("uid").and_then(|u| u.as_str())
+                && let Some(body) = bodies.get(uid)
+            {
+                item["inline_body"] = json!(body);
+            }
+        }
+    }
 
     let total = note_results.len();
     let mut response = json!({
@@ -3337,6 +3445,65 @@ mod project_context_bug12_tests {
             note_uids.len(),
             "all {} member notes must surface in connected; got {uids:?}",
             note_uids.len()
+        );
+    }
+
+    // Feature F8: brain_context with include_bodies embeds the source span of
+    // high-relevance connected symbols inline; off by default it does not.
+    #[test]
+    fn brain_context_inline_bodies_opt_in() {
+        use nestweaver_engine::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\nfunction hello(n) {\n  return n;\n}\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let root = src.to_string_lossy().to_string();
+
+        // Off by default: no inline_body anywhere.
+        let off = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
+        )
+        .unwrap();
+        let any_body_off = off["connected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.get("inline_body").is_some());
+        assert!(!any_body_off, "default path must not embed inline bodies");
+
+        // Opted in: at least the top connected symbol carries an inline_body
+        // that contains its source span.
+        let on = tool_brain_context(
+            &store,
+            None,
+            json!({
+                "seeds": ["greet"],
+                "token_budget": 5000,
+                "include_bodies": true,
+                "root": root,
+            }),
+        )
+        .unwrap();
+        let connected = on["connected"].as_array().unwrap();
+        assert!(!connected.is_empty(), "expected connected results");
+        let bodied: Vec<&str> = connected
+            .iter()
+            .filter_map(|n| n.get("inline_body").and_then(|b| b.as_str()))
+            .collect();
+        assert!(
+            bodied.iter().any(|b| b.contains("function")),
+            "opted-in path should embed at least one symbol body; got connected={connected:?}"
         );
     }
 }

@@ -87,8 +87,8 @@ pub use cluster_dispatch::{
 };
 pub use config::{
     CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, InferenceConfig,
-    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, SchemaExtensions,
-    StorageConfig, WikiSourceConfig, WorkspaceConfig,
+    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, ResponseConfig,
+    SchemaExtensions, StorageConfig, WikiSourceConfig, WorkspaceConfig,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
@@ -134,7 +134,7 @@ pub use query::{
     FeatureInfo, HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
     build_brain_context, build_brain_context_hybrid, build_brain_context_hybrid_with_aliases,
     build_context, build_context_with_intent, build_feature_context, expand_query_with_aliases,
-    generate_repo_map, list_repos, list_services, lookup_symbol,
+    generate_repo_map, list_repos, list_services, lookup_symbol, populate_inline_bodies,
     promote_member_notes_into_connected, search_symbols,
 };
 pub use recency::parse_iso8601_to_epoch;
