@@ -57,7 +57,6 @@ export function useForceLayout(): ForceLayoutControls {
 
     const graph = graphInstance;
 
-    // Extract topology snapshot
     const nodes: Array<{ id: string; x: number; y: number }> = [];
     graph.forEachNode((uid, attrs) => {
       nodes.push({
@@ -72,7 +71,6 @@ export function useForceLayout(): ForceLayoutControls {
       links.push({ source: sourceUid, target: targetUid });
     });
 
-    // Build a stable index for writing positions back
     const nodeIds = nodes.map((n) => n.id);
 
     const worker = getOrCreateWorker();
@@ -82,7 +80,6 @@ export function useForceLayout(): ForceLayoutControls {
 
       if (msg.type === "tick") {
         const positions = msg.positions;
-        // Write positions back into the graphology instance
         for (let i = 0; i < nodeIds.length; i++) {
           const uid = nodeIds[i];
           if (graph.hasNode(uid)) {
@@ -90,7 +87,6 @@ export function useForceLayout(): ForceLayoutControls {
             graph.setNodeAttribute(uid, "y", positions[i * 2 + 1]);
           }
         }
-        // Trigger useGraphBridge to rebuild buffers
         setGraphData(graph);
         return;
       }
@@ -119,7 +115,6 @@ export function useForceLayout(): ForceLayoutControls {
     setIsRunning(true);
   }, [graphInstance, forceParams, getOrCreateWorker, setGraphData]);
 
-  // Terminate worker on unmount
   useEffect(() => {
     return () => {
       if (workerRef.current) {
