@@ -5,6 +5,7 @@ import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { EdgeParticles } from "./EdgeParticles";
+import { NodeLabels } from "./NodeLabels";
 import { useGraphBridge, type GraphBuffers } from "../../hooks/useGraphBridge";
 import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
@@ -141,6 +142,7 @@ export function GraphCanvas() {
           <EdgeInstanceMesh buffers={buffers} />
           {!reducedMotion && <EdgeParticles buffers={buffers} />}
           <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
+          <NodeLabels buffers={buffers} />
         </>
       )}
       <GraphInteraction buffers={buffers} />
