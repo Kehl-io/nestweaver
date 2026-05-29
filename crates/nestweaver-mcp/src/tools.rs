@@ -118,6 +118,23 @@ pub fn dispatch(
             names.join(", ")
         ));
     }
+
+    // F16: serve cacheable read tools from (or populate) the response cache.
+    // Correctness rests on the cache KEY — see `maybe_cached`.
+    if is_cacheable_tool(name) && !cache_bypassed(&args) {
+        return maybe_cached(store, tantivy, name, args);
+    }
+
+    dispatch_uncached(store, tantivy, name, args)
+}
+
+/// The actual tool dispatch table, after cache handling.
+fn dispatch_uncached(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args),
         "brain_search" => tool_brain_search(store, tantivy, args),
@@ -159,6 +176,149 @@ pub fn dispatch(
         "brain_memory_related" => tool_brain_memory_related(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+// ── F16: response cache ──────────────────────────────────────────────────────
+
+/// Deterministic READ tools whose responses are safe to cache. A tool qualifies
+/// only if, given the same graph (same generation + scope digest) and the same
+/// normalized args, it returns the same response.
+///
+/// Deliberately EXCLUDED:
+/// - write/mutation tools (`brain_add_source`, `set_extension`) — they change
+///   state, so caching them would be wrong;
+/// - stateful bundle tools (`investigate`, `investigate_expand`,
+///   `investigate_hydrate`) — they accumulate per-session state;
+/// - `brain_status` / `stale_check` — they report live process/lock state and
+///   the cache's own stats, which must not be frozen.
+const CACHEABLE_TOOLS: &[&str] = &[
+    "brain_context",
+    "brain_search",
+    "note_get",
+    "backlinks",
+    "cross_repo_contracts",
+    "brain_impact",
+    "flow_trace",
+    "clusters",
+    "query_extensions",
+    "brain_diff",
+    "project_context",
+    "dead_code",
+    "hub_nodes",
+    "bridge_nodes",
+    "blast_radius",
+    "get_summary",
+    "read_symbols",
+    "regex_search",
+    "count_patterns",
+    "brain_broken_links",
+    "brain_orphan_documents",
+    "brain_topic_clusters",
+    "brain_tag_graph",
+    "brain_doc_stats",
+    "affected_tests",
+    "contract_drift",
+    "brain_memory_related",
+];
+
+/// True when `tool` is a deterministic read tool eligible for response caching.
+fn is_cacheable_tool(tool: &str) -> bool {
+    CACHEABLE_TOOLS.contains(&tool)
+}
+
+/// True when the caller asked to skip the cache: MCP arg `cache: "bypass"` or
+/// `no_cache: true` (the latter is the shape the CLI `--no-cache` flag maps to).
+fn cache_bypassed(args: &Value) -> bool {
+    let bypass_str = args
+        .get("cache")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("bypass"))
+        .unwrap_or(false);
+    let no_cache = args
+        .get("no_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    bypass_str || no_cache
+}
+
+/// Whole-DB scope digest: a hash over the content-hashes in `<db>.filemeta.json`.
+/// Using the whole-DB digest (rather than per-query file scope) is simpler and
+/// still correct — a wider scope only ever causes MORE conservative misses,
+/// never an incorrect hit. Returns 0 when the filemeta sidecar is absent
+/// (consistent across calls, so caching still works on the generation key
+/// alone).
+fn whole_db_scope_digest(db_path: &Path) -> u64 {
+    let filemeta_path = nestweaver_engine::sidecar_path(db_path, ".filemeta.json");
+    let cache = nestweaver_engine::load_filemeta_cache(&filemeta_path);
+    nestweaver_store::cache::scope_digest_from_hashes(
+        cache
+            .iter()
+            .map(|(p, m)| (p.as_str(), m.content_hash.as_str())),
+    )
+}
+
+/// Run a cacheable tool through the F16 response cache.
+///
+/// On a HIT (same persisted `graph_generation` AND same scope digest AND not
+/// expired) the stored, byte-identical response is returned without running the
+/// tool. On a MISS the tool runs and its response is inserted.
+///
+/// Why no daemon is needed: the generation is persisted to `<db>.generation`
+/// (P0.2) and bumped at the end of every index/reindex. A fresh process loads
+/// that value on open, so any entry written under an older generation misses —
+/// the cache is self-invalidating on reindex without any sweep.
+///
+/// If the db path is unknown (e.g. in tests with no server-set path), caching
+/// is skipped and the tool runs directly.
+fn maybe_cached(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    let Ok(db_path) = current_db_path(store) else {
+        return dispatch_uncached(store, tantivy, name, args);
+    };
+
+    let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
+    let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, max_mb);
+    let key = nestweaver_store::cache::ResponseCache::key(name, &args);
+    let generation = store.graph_generation();
+    let scope_digest = whole_db_scope_digest(&db_path);
+
+    if let Some(bytes) = cache.get(key, generation, scope_digest) {
+        CACHE_HITS.with(|c| c.set(c.get() + 1));
+        cache.save(); // persist updated LRU last_access
+        let value: Value =
+            serde_json::from_slice(&bytes).with_context(|| "decode cached response")?;
+        return Ok(value);
+    }
+
+    CACHE_MISSES.with(|c| c.set(c.get() + 1));
+    let result = dispatch_uncached(store, tantivy, name, args)?;
+    if let Ok(bytes) = serde_json::to_vec(&result) {
+        cache.insert(key, name, &bytes, generation, scope_digest);
+        cache.save();
+    }
+    Ok(result)
+}
+
+/// Session cache stats `(size_bytes, entries, hit_rate)` for `brain_status`.
+/// `hit_rate` is `hits / (hits + misses)` over this process's lifetime;
+/// it is `None` when no cacheable calls have been made yet. Honest framing:
+/// this hit-rate is unproven and should be measured in real usage.
+fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
+    let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
+    let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+    let hits = CACHE_HITS.with(|c| c.get());
+    let misses = CACHE_MISSES.with(|c| c.get());
+    let total = hits + misses;
+    let hit_rate = if total > 0 {
+        Some(hits as f64 / total as f64)
+    } else {
+        None
+    };
+    (cache.size_bytes(), cache.len(), hit_rate)
 }
 
 /// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
@@ -1862,6 +2022,14 @@ fn tool_brain_status(
             .and_then(|s| s.trim().parse::<u32>().ok())
     });
 
+    // F16: response-cache stats. Correctness is key-based (persisted
+    // generation + filemeta scope digest), so the cache reflects the LAST
+    // INDEX — same staleness as the graph itself, which is the correct
+    // semantic. The session hit-rate below is unproven and should be measured.
+    let (cache_size, cache_entries, cache_hit_rate) =
+        db_path.as_deref().map(cache_stats).unwrap_or((0, 0, None));
+    let cache_hit_rate_pct = cache_hit_rate.map(|r| (r * 100.0).round() as u64);
+
     Ok(json!({
         "vaults": vaults_json,
         "vault_count": vaults.len(),
@@ -1875,6 +2043,17 @@ fn tool_brain_status(
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,
         "watcher_pid": watcher_pid,
+        // F16 response cache. `hit_rate_pct` is the session hit-rate
+        // (hits/(hits+misses)); null until the first cacheable call. The
+        // cache's correctness is key-based (persisted graph_generation +
+        // filemeta scope digest), so results are consistent with the last
+        // index — the same staleness as the graph. The hit-rate is unproven
+        // and should be measured in real usage.
+        "cache": {
+            "size_bytes": cache_size,
+            "entries": cache_entries,
+            "hit_rate_pct": cache_hit_rate_pct,
+        },
     }))
 }
 
@@ -3790,10 +3969,20 @@ thread_local! {
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // F16 response cache: size cap (MiB) and per-session hit/miss counters.
+    static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
+    static CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
     CURRENT_DB_PATH.with(|c| *c.borrow_mut() = Some(path));
+}
+
+/// Set the F16 response-cache size cap in MiB (from `[cache] max_size_mb`).
+pub fn set_cache_max_size_mb(mb: u64) {
+    CACHE_MAX_SIZE_MB.with(|c| c.set(mb));
 }
 
 pub fn set_allow_add_sources(allowed: bool) {
@@ -4133,6 +4322,186 @@ mod project_context_bug12_tests {
         assert!(
             bodied.iter().any(|b| b.contains("function")),
             "opted-in path should embed at least one symbol body; got connected={connected:?}"
+        );
+    }
+}
+
+// ── F16: response-cache dispatch tests ───────────────────────────────────────
+#[cfg(test)]
+mod cache_dispatch_tests {
+    use super::*;
+    use std::fs;
+
+    /// Index a small JS repo to an on-disk db and return its path + the repo
+    /// source dir (kept alive by the returned tempdir).
+    fn index_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(n){return hello(n);}\nfunction hello(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        // Compute + persist PageRank so hub_nodes has scores (mirrors the CLI).
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+            .unwrap();
+        store
+            .save_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        (dir, db_path)
+    }
+
+    /// Reset the per-thread cache state that other tests in this thread may
+    /// have touched (thread-locals persist across tests on the same thread).
+    fn reset_session() {
+        CACHE_HITS.with(|c| c.set(0));
+        CACHE_MISSES.with(|c| c.set(0));
+    }
+
+    #[test]
+    fn same_query_twice_is_a_cache_hit_byte_identical() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        let args = json!({ "limit": 5 });
+        let first = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        let second = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+
+        assert_eq!(
+            first, second,
+            "2nd call must return byte-identical response"
+        );
+        // The cache file exists and holds an entry.
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert_eq!(cache.len(), 1);
+        // Exactly one miss (1st) then one hit (2nd).
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn reindex_bump_invalidates_cache() {
+        reset_session();
+        let (dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        let gen_before = store.graph_generation();
+        let args = json!({ "limit": 5 });
+        let _ = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        drop(store);
+
+        // Re-index with a new file → generation bumps + persists.
+        let src = dir.path().join("repo");
+        fs::write(src.join("extra.js"), "function added(){return 1;}\n").unwrap();
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory_with_options(
+            &src, &db_path, "test", &repo_url, "local", true, None,
+        )
+        .unwrap();
+
+        // Fresh process: reopen → generation loaded from sidecar is higher.
+        let store2 = GraphStore::open(&db_path).unwrap();
+        store2
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(
+            store2.graph_generation() > gen_before,
+            "reindex must bump the persisted generation"
+        );
+
+        reset_session();
+        let _ = dispatch(&store2, None, "hub_nodes", args).unwrap();
+        // The old entry's generation no longer matches → MISS (recomputed).
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1, "stale entry must miss");
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn bypass_always_misses() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        // Prime the cache.
+        let _ = dispatch(&store, None, "hub_nodes", json!({ "limit": 5 })).unwrap();
+        reset_session();
+        // cache:"bypass" skips the cache entirely (no hit recorded).
+        let _ = dispatch(
+            &store,
+            None,
+            "hub_nodes",
+            json!({ "limit": 5, "cache": "bypass" }),
+        )
+        .unwrap();
+        // no_cache:true likewise.
+        let _ = dispatch(
+            &store,
+            None,
+            "hub_nodes",
+            json!({ "limit": 5, "no_cache": true }),
+        )
+        .unwrap();
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0, "bypass must never hit");
+        assert_eq!(
+            CACHE_MISSES.with(|c| c.get()),
+            0,
+            "bypass should not even consult the cache (no miss counted)"
+        );
+    }
+
+    #[test]
+    fn write_tools_are_never_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        // Write/mutation and stateful tools are excluded from the cacheable set.
+        assert!(!is_cacheable_tool("brain_add_source"));
+        assert!(!is_cacheable_tool("set_extension"));
+        assert!(!is_cacheable_tool("investigate"));
+        assert!(!is_cacheable_tool("investigate_expand"));
+        assert!(!is_cacheable_tool("investigate_hydrate"));
+        assert!(!is_cacheable_tool("brain_status"));
+        assert!(!is_cacheable_tool("stale_check"));
+        // And a representative read tool IS cacheable.
+        assert!(is_cacheable_tool("hub_nodes"));
+
+        let store = GraphStore::open(&db_path).unwrap();
+        // set_extension is a write tool; dispatching it must not create a cache.
+        let _ = dispatch(
+            &store,
+            None,
+            "set_extension",
+            json!({ "uid": "sym:x", "key": "k", "value": "v" }),
+        );
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "write tools must never populate the cache"
         );
     }
 }

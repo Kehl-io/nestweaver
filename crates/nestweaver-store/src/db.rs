@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,6 +35,11 @@ pub struct GraphStore {
     /// recency multiplier. Defaults to [`crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT`]
     /// (1.2); `set_git_activity_weight` overrides it from config.
     pub(crate) git_activity_weight: Mutex<f64>,
+    /// P0.2: the on-disk database path this store was opened from, when known.
+    /// In-memory stores have `None`. Used to locate the `<db>.generation`
+    /// sidecar so `graph_generation` can be loaded on open and persisted on
+    /// mutation without callers having to thread the path through.
+    pub(crate) db_path: Option<PathBuf>,
 }
 
 impl GraphStore {
@@ -49,8 +54,10 @@ impl GraphStore {
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
+            db_path: Some(path.to_path_buf()),
         };
         store.init_schema()?;
+        store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
     }
 
@@ -67,8 +74,10 @@ impl GraphStore {
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
+            db_path: Some(path.to_path_buf()),
         };
         store.init_schema()?;
+        store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
     }
 
@@ -77,7 +86,7 @@ impl GraphStore {
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         let config = lbug::SystemConfig::default().read_only(true);
         let db = lbug::Database::new(path, config)?;
-        Ok(GraphStore {
+        let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
@@ -85,7 +94,10 @@ impl GraphStore {
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
-        })
+            db_path: Some(path.to_path_buf()),
+        };
+        store.load_graph_generation(&store.generation_sidecar_path());
+        Ok(store)
     }
 
     /// Open an existing database if it exists, or create a new one with schema initialised.
@@ -126,6 +138,7 @@ impl GraphStore {
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
+            db_path: None,
         };
         store.init_schema()?;
         Ok(store)
@@ -249,6 +262,41 @@ impl GraphStore {
     /// push an SSE event to connected clients.
     pub fn bump_graph_generation(&self) {
         self.graph_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The on-disk database path this store was opened from, when known
+    /// (`None` for in-memory stores). Lets callers locate sidecars.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    /// Path to the `<db>.generation` sidecar. For in-memory stores (no
+    /// `db_path`) this returns a relative `.generation` path that is never
+    /// actually read or written — `load_graph_generation` no-ops on absence
+    /// and persistence is only triggered through the path-taking helpers.
+    pub(crate) fn generation_sidecar_path(&self) -> PathBuf {
+        match &self.db_path {
+            Some(p) => {
+                let mut s = p.as_os_str().to_owned();
+                s.push(".generation");
+                PathBuf::from(s)
+            }
+            None => PathBuf::from(".generation"),
+        }
+    }
+
+    /// P0.2: bump the `graph_generation` counter and persist it to this
+    /// store's `<db>.generation` sidecar. No-op persistence for in-memory
+    /// stores (the in-memory bump still happens). Call this at the end of any
+    /// graph-mutating operation so later short-lived processes observe the
+    /// bump without a running daemon.
+    pub fn bump_and_persist_generation(&self) {
+        if self.db_path.is_some() {
+            let path = self.generation_sidecar_path();
+            self.bump_and_persist_graph_generation(&path);
+        } else {
+            self.bump_graph_generation();
+        }
     }
 
     /// Return a new connection to the underlying database.
@@ -639,5 +687,31 @@ mod tests {
         assert_eq!(store.graph_generation(), 1);
         store.bump_graph_generation();
         assert_eq!(store.graph_generation(), 2);
+    }
+
+    /// P0.2: the persisted generation survives a reopen. Open → bump+persist
+    /// (simulating the `index` path) → drop → reopen → the counter reflects the
+    /// incremented value, NOT 0.
+    #[test]
+    fn graph_generation_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            assert_eq!(store.graph_generation(), 0, "fresh store starts at 0");
+            // Simulate the end of a graph-mutating operation.
+            store.bump_and_persist_generation();
+            store.bump_and_persist_generation();
+            assert_eq!(store.graph_generation(), 2);
+        }
+
+        // Reopen: the in-memory counter is restored from the sidecar.
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            reopened.graph_generation(),
+            2,
+            "generation must survive reopen and NOT reset to 0"
+        );
     }
 }
