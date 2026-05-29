@@ -28,4 +28,19 @@ impl AppState {
             file_lock: Mutex::new(()),
         })
     }
+
+    pub fn new_with_store(
+        store: Arc<GraphStore>,
+        tantivy: Option<TantivyIndex>,
+        db_path: PathBuf,
+    ) -> Arc<Self> {
+        let (event_tx, _) = broadcast::channel(256);
+        Arc::new(Self {
+            store,
+            tantivy,
+            event_tx,
+            db_path,
+            file_lock: Mutex::new(()),
+        })
+    }
 }
