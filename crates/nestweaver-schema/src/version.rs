@@ -3,10 +3,12 @@ use sha2::{Digest, Sha256};
 /// The canonical set of node labels, their properties, edge labels, and their properties.
 /// These are sorted to ensure a stable hash regardless of insertion order.
 const NODE_LABELS: &[&str] = &[
-    "File", "Heading", "Note", "Project", "Repo", "Section", "Service", "Symbol", "Tag", "Vault",
+    "Contract", "File", "Heading", "Note", "Project", "Repo", "Section", "Service", "Symbol",
+    "Tag", "Vault",
 ];
 
 const NODE_PROPERTIES: &[&str] = &[
+    "confidence",
     "content_hash",
     "created_at",
     "embedding",
@@ -24,12 +26,14 @@ const NODE_PROPERTIES: &[&str] = &[
     "name",
     "note_kind",
     "note_uid",
+    "operation_id",
     "pagerank_score",
     "path",
     "repo_uid",
     "root_path",
     "signature",
     "slug",
+    "source_path",
     "staleness_commits_behind",
     "start_line",
     "summary",
@@ -41,17 +45,21 @@ const NODE_PROPERTIES: &[&str] = &[
     "uid",
     "url",
     "vault_uid",
+    "verb",
     "word_count",
 ];
 
 const EDGE_LABELS: &[&str] = &[
     "CALLS",
+    "CAUSED_BY",
     "CONTAINS",
     "CROSS_REPO_LINK",
+    "DEPENDS_ON",
     "EXTENDS",
     "HEADING_HAS_SECTION",
     "HEADING_PARENT",
     "IMPLEMENTS",
+    "IMPLEMENTS_CONTRACT",
     "IMPORTS",
     "MEMBER_OF",
     "NOTE_HAS_HEADING",
@@ -60,7 +68,9 @@ const EDGE_LABELS: &[&str] = &[
     "PROJECT_INCLUDES_NOTE",
     "REFERENCES_CODE_NOTE_TO_SYMBOL",
     "REFERENCES_CODE_SECTION_TO_SYMBOL",
+    "RELATES_TO",
     "SECTION_TAGGED_WITH",
+    "SUPERSEDES",
     "VAULT_HAS_NOTE",
     "WIKILINK_TO_HEADING",
     "WIKILINK_TO_NOTE",

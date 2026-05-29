@@ -1,11 +1,10 @@
 import { useCallback, useEffect } from "react";
-import { useLoadGraph } from "@react-sigma/core";
 import { useStore } from "../../../stores";
 import { api } from "../../../api/client";
 import { buildGraphFromRepos } from "../utils/buildGraphFromRepos";
 
 export function useReposMode() {
-  const loadGraph = useLoadGraph();
+  const setGraphData = useStore((s) => s.setGraphData);
   const graphMode = useStore((s) => s.graphMode);
 
   const loadReposData = useCallback(async () => {
@@ -17,11 +16,11 @@ export function useReposMode() {
         api.services(),
       ]);
       const graph = buildGraphFromRepos(repos, services);
-      loadGraph(graph);
+      setGraphData(graph);
     } catch (err) {
       console.error("Failed to load repos:", err);
     }
-  }, [graphMode, loadGraph]);
+  }, [graphMode, setGraphData]);
 
   useEffect(() => {
     loadReposData();

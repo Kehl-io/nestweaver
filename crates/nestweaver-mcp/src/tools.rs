@@ -12,13 +12,16 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
-    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, detect_dead_code, expand_query_with_aliases,
-    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries,
-    get_all_properties, get_last_indexed_at, index_directory, index_markdown_directory,
-    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch, query_by_property,
-    render_text, save_extensions, search_symbols, set_property, truncate_to_budget,
+    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, affected_tests,
+    analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
+    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
+    index_directory, index_markdown_directory, investigate, investigate_expand,
+    investigate_hydrate, load_alias_sidecar, load_clusters, load_extensions, memory_consolidate,
+    memory_lint, memory_related, orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies,
+    query_by_property, render_text, save_extensions, search_symbols, set_property, tag_graph,
+    tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -61,6 +64,22 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_bridge_nodes(),
         tool_schema_blast_radius(),
         tool_schema_get_summary(),
+        tool_schema_read_symbols(),
+        tool_schema_regex_search(),
+        tool_schema_count_patterns(),
+        tool_schema_brain_broken_links(),
+        tool_schema_brain_orphan_documents(),
+        tool_schema_brain_topic_clusters(),
+        tool_schema_brain_tag_graph(),
+        tool_schema_brain_doc_stats(),
+        tool_schema_affected_tests(),
+        tool_schema_investigate(),
+        tool_schema_investigate_expand(),
+        tool_schema_investigate_hydrate(),
+        tool_schema_contract_drift(),
+        tool_schema_brain_memory_lint(),
+        tool_schema_brain_memory_consolidate(),
+        tool_schema_brain_memory_related(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -99,6 +118,23 @@ pub fn dispatch(
             names.join(", ")
         ));
     }
+
+    // F16: serve cacheable read tools from (or populate) the response cache.
+    // Correctness rests on the cache KEY — see `maybe_cached`.
+    if is_cacheable_tool(name) && !cache_bypassed(&args) {
+        return maybe_cached(store, tantivy, name, args);
+    }
+
+    dispatch_uncached(store, tantivy, name, args)
+}
+
+/// The actual tool dispatch table, after cache handling.
+fn dispatch_uncached(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args),
         "brain_search" => tool_brain_search(store, tantivy, args),
@@ -122,8 +158,552 @@ pub fn dispatch(
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
         "get_summary" => tool_get_summary(store, args),
+        "read_symbols" => tool_read_symbols(store, args),
+        "regex_search" => tool_regex_search(store, args),
+        "count_patterns" => tool_count_patterns(store, args),
+        "brain_broken_links" => tool_brain_broken_links(store, args),
+        "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
+        "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
+        "brain_tag_graph" => tool_brain_tag_graph(store, args),
+        "brain_doc_stats" => tool_brain_doc_stats(store, args),
+        "affected_tests" => tool_affected_tests(store, args),
+        "investigate" => tool_investigate(store, tantivy, args),
+        "investigate_expand" => tool_investigate_expand(store, args),
+        "investigate_hydrate" => tool_investigate_hydrate(store, args),
+        "contract_drift" => tool_contract_drift(store, args),
+        "brain_memory_lint" => tool_brain_memory_lint(store),
+        "brain_memory_consolidate" => tool_brain_memory_consolidate(store, args),
+        "brain_memory_related" => tool_brain_memory_related(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+// ── F16: response cache ──────────────────────────────────────────────────────
+
+/// Deterministic READ tools whose responses are safe to cache. A tool qualifies
+/// only if, given the same graph (same generation + scope digest) and the same
+/// normalized args, it returns the same response.
+///
+/// Deliberately EXCLUDED:
+/// - write/mutation tools (`brain_add_source`, `set_extension`) — they change
+///   state, so caching them would be wrong;
+/// - stateful bundle tools (`investigate`, `investigate_expand`,
+///   `investigate_hydrate`) — they accumulate per-session state;
+/// - `brain_status` / `stale_check` — they report live process/lock state and
+///   the cache's own stats, which must not be frozen.
+const CACHEABLE_TOOLS: &[&str] = &[
+    "brain_context",
+    "brain_search",
+    "note_get",
+    "backlinks",
+    "cross_repo_contracts",
+    "brain_impact",
+    "flow_trace",
+    "clusters",
+    "query_extensions",
+    "brain_diff",
+    "project_context",
+    "dead_code",
+    "hub_nodes",
+    "bridge_nodes",
+    "blast_radius",
+    "get_summary",
+    "read_symbols",
+    "regex_search",
+    "count_patterns",
+    "brain_broken_links",
+    "brain_orphan_documents",
+    "brain_topic_clusters",
+    "brain_tag_graph",
+    "brain_doc_stats",
+    "affected_tests",
+    "contract_drift",
+    "brain_memory_related",
+];
+
+/// True when `tool` is a deterministic read tool eligible for response caching.
+fn is_cacheable_tool(tool: &str) -> bool {
+    CACHEABLE_TOOLS.contains(&tool)
+}
+
+/// True when the caller asked to skip the cache: MCP arg `cache: "bypass"` or
+/// `no_cache: true` (the latter is the shape the CLI `--no-cache` flag maps to).
+fn cache_bypassed(args: &Value) -> bool {
+    let bypass_str = args
+        .get("cache")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("bypass"))
+        .unwrap_or(false);
+    let no_cache = args
+        .get("no_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    bypass_str || no_cache
+}
+
+/// Whole-DB scope digest: a hash over the content-hashes in `<db>.filemeta.json`.
+/// Using the whole-DB digest (rather than per-query file scope) is simpler and
+/// still correct — a wider scope only ever causes MORE conservative misses,
+/// never an incorrect hit. Returns 0 when the filemeta sidecar is absent
+/// (consistent across calls, so caching still works on the generation key
+/// alone).
+fn whole_db_scope_digest(db_path: &Path) -> u64 {
+    let filemeta_path = nestweaver_engine::sidecar_path(db_path, ".filemeta.json");
+    let cache = nestweaver_engine::load_filemeta_cache(&filemeta_path);
+    nestweaver_store::cache::scope_digest_from_hashes(
+        cache
+            .iter()
+            .map(|(p, m)| (p.as_str(), m.content_hash.as_str())),
+    )
+}
+
+/// Run a cacheable tool through the F16 response cache.
+///
+/// On a HIT (same persisted `graph_generation` AND same scope digest AND not
+/// expired) the stored, byte-identical response is returned without running the
+/// tool. On a MISS the tool runs and its response is inserted.
+///
+/// Why no daemon is needed: the generation is persisted to `<db>.generation`
+/// (P0.2) and bumped at the end of every index/reindex. A fresh process loads
+/// that value on open, so any entry written under an older generation misses —
+/// the cache is self-invalidating on reindex without any sweep.
+///
+/// If the db path is unknown (e.g. in tests with no server-set path), caching
+/// is skipped and the tool runs directly.
+fn maybe_cached(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    let Ok(db_path) = current_db_path(store) else {
+        return dispatch_uncached(store, tantivy, name, args);
+    };
+
+    let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
+    let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, max_mb);
+    let key = nestweaver_store::cache::ResponseCache::key(name, &args);
+    let generation = store.graph_generation();
+    let scope_digest = whole_db_scope_digest(&db_path);
+
+    if let Some(bytes) = cache.get(key, generation, scope_digest) {
+        CACHE_HITS.with(|c| c.set(c.get() + 1));
+        cache.save(); // persist updated LRU last_access
+        let value: Value =
+            serde_json::from_slice(&bytes).with_context(|| "decode cached response")?;
+        return Ok(value);
+    }
+
+    CACHE_MISSES.with(|c| c.set(c.get() + 1));
+    let result = dispatch_uncached(store, tantivy, name, args)?;
+    if let Ok(bytes) = serde_json::to_vec(&result) {
+        cache.insert(key, name, &bytes, generation, scope_digest);
+        cache.save();
+    }
+    Ok(result)
+}
+
+/// Session cache stats `(size_bytes, entries, hit_rate)` for `brain_status`.
+/// `hit_rate` is `hits / (hits + misses)` over this process's lifetime;
+/// it is `None` when no cacheable calls have been made yet. Honest framing:
+/// this hit-rate is unproven and should be measured in real usage.
+fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
+    let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
+    let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+    let hits = CACHE_HITS.with(|c| c.get());
+    let misses = CACHE_MISSES.with(|c| c.get());
+    let total = hits + misses;
+    let hit_rate = if total > 0 {
+        Some(hits as f64 / total as f64)
+    } else {
+        None
+    };
+    (cache.size_bytes(), cache.len(), hit_rate)
+}
+
+/// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
+/// FQNs, optionally includes adjacent symbols, and respects a token budget.
+fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let targets: Vec<String> = args
+        .get("targets")
+        .or_else(|| args.get("uids_or_fqns"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "'targets' must be a non-empty array of symbol UIDs, names, or FQNs"
+        ));
+    }
+    let neighbors = args
+        .get("include_neighbors")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u8::MAX as u64) as u8;
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let res = nestweaver_engine::read_symbols::read_symbols(
+        store,
+        &targets,
+        &root,
+        neighbors,
+        token_budget,
+    );
+    Ok(serde_json::to_value(res)?)
+}
+
+fn tool_schema_read_symbols() -> Value {
+    json!({
+        "name": "read_symbols",
+        "description": "Use when you need to READ a symbol's source — return just that symbol's span (start_line..end_line), not the whole file. Far cheaper in tokens than reading entire files. Accepts UIDs (sym:...), bare names, or FQNs; an ambiguous name returns candidate UIDs to disambiguate. Use include_neighbors to also return adjacent symbols in the same file, and token_budget to cap output. `root` is the repository root used to resolve file paths (defaults to the server's working directory).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                },
+                "include_neighbors": {
+                    "type": "integer",
+                    "description": "Include N adjacent symbols in the same file (default 0)."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Approximate token cap for the combined output."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Repository root for resolving file paths (default: server working directory)."
+                }
+            },
+            "required": ["targets"]
+        }
+    })
+}
+
+/// F3: trigram-accelerated regex search over indexed text. Lets agents run a
+/// real regex against Section bodies, Note titles, and Symbol signatures
+/// without shelling out to rg/grep.
+fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let pattern = args
+        .get("pattern")
+        .or_else(|| args.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let kinds = parse_string_array(&args, "kinds");
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
+
+    let res = store
+        .regex_search(pattern, path_prefix, kinds.as_deref(), limit, max_millis)
+        .map_err(|e| anyhow!("regex_search: {e}"))?;
+    Ok(serde_json::to_value(res)?)
+}
+
+fn tool_schema_regex_search() -> Value {
+    json!({
+        "name": "regex_search",
+        "description": "Use when you need to find text by REGEX across indexed content (markdown section bodies, note titles, code symbol signatures) — a first-party replacement for shelling out to rg/grep. Runs a real Rust `regex` against the indexed text, accelerated by a trigram pre-filter when one was built (`nestweaver index --with-trigrams`). When no trigram index exists, or the pattern has no usable literals (e.g. `.{4,}`), it falls back to scanning all candidate text — still correct, just slower, and `scanned_fallback` is set.\n\nDo NOT use for fuzzy/semantic lookup — use brain_search. Returns `{results:[{uid,kind,title,location,line,snippet}], truncated, scanned_fallback}`. `truncated` is set when the candidate cap (5000) or time budget was hit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                },
+                "limit": { "type": "integer", "description": "Maximum results to return. Default: unlimited (capped by the candidate budget)." },
+                "max_millis": { "type": "integer", "description": "Wall-clock time budget in milliseconds. Default 2000." }
+            },
+            "required": ["pattern"]
+        }
+    })
+}
+
+/// F4: counts-only companion to regex_search. Counts matches per pattern across
+/// indexed text and reports the busiest files.
+fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let patterns = parse_string_array(&args, "patterns")
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow!("'patterns' must be a non-empty array of regex strings"))?;
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let kinds = parse_string_array(&args, "kinds");
+
+    let counts = store
+        .count_patterns(&patterns, path_prefix, kinds.as_deref())
+        .map_err(|e| anyhow!("count_patterns: {e}"))?;
+    Ok(json!({ "patterns": serde_json::to_value(counts)? }))
+}
+
+fn tool_schema_count_patterns() -> Value {
+    json!({
+        "name": "count_patterns",
+        "description": "Use when you only need COUNTS of regex matches across indexed text, not the matches themselves — e.g. \"how many sections mention TODO?\" Counts one match per node and reports, per pattern, `{pattern, total_matches, files_matched, top_files:[{path,count}]}`. Reuses the same trigram pre-filter as regex_search and the same full-scan fallback when no literals/index are available.\n\nDo NOT use when you need the matching text — use regex_search. Pass multiple patterns to compare counts in one call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "patterns": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "One or more Rust regex patterns to count."
+                },
+                "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                }
+            },
+            "required": ["patterns"]
+        }
+    })
+}
+
+// ── F9: document-graph tools ──────────────────────────────────────────────
+
+fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let max_suggestions = args
+        .get("max_suggestions")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(5);
+    let links = broken_links(store, max_suggestions)?;
+    Ok(json!({ "broken_links": serde_json::to_value(&links)?, "total": links.len() }))
+}
+
+fn tool_schema_brain_broken_links() -> Value {
+    json!({
+        "name": "brain_broken_links",
+        "description": "Use when auditing a markdown vault for wikilinks that did not resolve cleanly — links whose target is ambiguous or low-confidence (confidence < 1.0). For each, returns the source note, the link text, and suggested target note UIDs (fuzzy title match) so you can repair the link. Returns empty when there is no vault. Output: `{broken_links:[{source_uid, source_path, wikilink_text, confidence, suggested_target_uids:[...]}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_suggestions": {
+                    "type": "integer",
+                    "description": "Max suggested target UIDs per broken link (default 5).",
+                    "default": 5
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let vault = args.get("vault").and_then(|v| v.as_str());
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
+    let orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
+    Ok(json!({ "orphans": serde_json::to_value(&orphans)?, "total": orphans.len() }))
+}
+
+fn tool_schema_brain_orphan_documents() -> Value {
+    json!({
+        "name": "brain_orphan_documents",
+        "description": "Use to find notes that are disconnected from the knowledge graph — notes with ZERO inbound and ZERO outbound wikilinks. These are candidates to link up or archive. Index/MOC notes are excluded via a configurable allowlist (default includes Projects.md, index.md, README.md, _brain/index.md, and any note whose path/title contains \"MOC\"). Optional `vault` and `path_prefix` filters. Returns empty when there is no vault. Output: `{orphans:[{uid, title, file_path}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vault": { "type": "string", "description": "Restrict to this vault UID." },
+                "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
+                "allowlist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let resolution = args
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+    let clusters = topic_clusters(store, resolution)?;
+    Ok(json!({ "clusters": serde_json::to_value(&clusters)?, "total": clusters.len() }))
+}
+
+fn tool_schema_brain_topic_clusters() -> Value {
+    json!({
+        "name": "brain_topic_clusters",
+        "description": "Use to discover the thematic structure of a markdown vault: runs Leiden community detection over the note-to-note wikilink graph and groups notes into topics. Each cluster is labelled by its most central member (highest PageRank, then highest link degree). Returns empty when there is no vault. Output: `{clusters:[{cluster_id, members:[note_uid], label}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resolution": {
+                    "type": "number",
+                    "description": "Leiden resolution — higher yields more, smaller clusters (default 0.5).",
+                    "default": 0.5
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // `tag` is optional. When present we accept only a string (reject other
+    // JSON types); when absent we return the whole tag co-occurrence graph.
+    match args.get("tag") {
+        Some(Value::Null) | None => {
+            let tags = tag_graph_all(store)?;
+            Ok(json!({ "tags": serde_json::to_value(&tags)? }))
+        }
+        Some(Value::String(tag)) => {
+            let tg = tag_graph(store, tag)?;
+            Ok(serde_json::to_value(&tg)?)
+        }
+        Some(_) => Err(anyhow!("'tag' must be a string")),
+    }
+}
+
+fn tool_schema_brain_tag_graph() -> Value {
+    json!({
+        "name": "brain_tag_graph",
+        "description": "Use to understand how tags relate to each other in a markdown vault. Two modes. (1) With `tag`: returns that focus tag's note count plus the tags that co-occur with it (appear on the same notes), ranked by shared-note count. Output: `{tag, count, co_occurring:[{tag, count}]}`. (2) Without `tag`: returns the WHOLE tag co-occurrence graph — one entry per distinct tag, sorted by note count descending then name — for taxonomy-drift detection. Output: `{tags:[{tag, count, co_occurring:[{tag, count}]}]}`. The `tag` argument may include or omit a leading `#`. Returns count 0 / empty when the tag or vault is absent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." }
+            }
+        }
+    })
+}
+
+fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let top_tags_limit = args
+        .get("top_tags_limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+    let stats = doc_stats(store, top_tags_limit)?;
+    Ok(serde_json::to_value(&stats)?)
+}
+
+fn tool_schema_brain_doc_stats() -> Value {
+    json!({
+        "name": "brain_doc_stats",
+        "description": "Use for a one-shot health summary of a markdown vault's document graph. Composes the other brain document tools plus counts. Returns all seven keys even on an empty vault (zeros / empty collections). Output: `{total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags:[{tag,count}], notes_by_year:{year:count}}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top_tags_limit": {
+                    "type": "integer",
+                    "description": "Max entries in top_tags (default 10).",
+                    "default": 10
+                }
+            }
+        }
+    })
+}
+
+// ── F11: memory-bank tools ───────────────────────────────────────────────────
+
+/// Current wall-clock time as Unix epoch seconds (f64). Falls back to 0.0
+/// (pre-epoch) only if the system clock is before 1970, which never happens.
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn tool_brain_memory_lint(store: &GraphStore) -> Result<Value, anyhow::Error> {
+    let report = memory_lint(store, now_epoch_secs())?;
+    Ok(serde_json::to_value(&report)?)
+}
+
+fn tool_schema_brain_memory_lint() -> Value {
+    json!({
+        "name": "brain_memory_lint",
+        "description": "Use to audit a markdown 'memory bank' vault for health problems. Runs SEVEN checks and returns them keyed: `stale` (notes marked status:active but unmodified for >90 days), `contradictions` (Supersedes cycles like A→B→A), `orphans` (notes with no inbound/outbound wikilinks), `broken_wikilinks` (ambiguous/low-confidence links), `supersession_chains` (a superseded note still actively linked), `schema_drift` (note frontmatter keys missing vs the _templates/<kind>.md template), `dangling_relationships` (a typed relationship whose target note does not exist). All keys always present; empty on a no-vault DB. Output: `{stale:[...], contradictions:[...], orphans:[...], broken_wikilinks:[...], supersession_chains:[...], schema_drift:[...], dangling_relationships:[...]}`.",
+        "inputSchema": { "type": "object", "properties": {} }
+    })
+}
+
+fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let manifest = memory_consolidate(store, apply, now_epoch_secs())?;
+    Ok(serde_json::to_value(&manifest)?)
+}
+
+fn tool_schema_brain_memory_consolidate() -> Value {
+    json!({
+        "name": "brain_memory_consolidate",
+        "description": "Use to propose promotions of vault notes UP the memory tiers (daily logs → ideas → project files). DRY-RUN BY DEFAULT — it never mutates files. Proposes: (1) a daily log (under _logs/) wikilinked from >=3 distinct idea notes and older than 14 days → _ideas candidate; (2) an idea (under _ideas/) referenced from BOTH a project's sync.md and status.md → project-file candidate. Set `apply:true` to opt into write-mode; today that is an explicit no-op stub that records a warning and still mutates nothing. Output: `{dry_run, applied, proposals:[{source_uid, source_title, source_path, promote_to, rationale, evidence:[...]}], warnings:[...]}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "apply": {
+                    "type": "boolean",
+                    "description": "Opt into write-mode (currently a no-op stub that warns; default false = safe dry-run).",
+                    "default": false
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let uid = args
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'uid' (string) is required"))?;
+    let edge_types = parse_string_array(&args, "edge_types").unwrap_or_default();
+    let depth = args
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let related = memory_related(store, uid, &edge_types, depth)?;
+    Ok(json!({ "related": serde_json::to_value(&related)?, "total": related.len() }))
+}
+
+fn tool_schema_brain_memory_related() -> Value {
+    json!({
+        "name": "brain_memory_related",
+        "description": "Use to walk the TYPED relationship graph from a note — Supersedes / DependsOn / CausedBy / RelatesTo — without the noise of generic wikilinks. Breadth-first from `uid` over the chosen `edge_types` (default all four) to `depth` hops (default 2). Returns only the typed neighbours. Empty on unknown node / no-vault DB. Output: `{related:[{uid, title, file_path, depth, via_edge}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uid": { "type": "string", "description": "Seed note UID to traverse from." },
+                "edge_types": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Edge types to follow (Supersedes, DependsOn, CausedBy, RelatesTo; case/format-insensitive). Default: all four."
+                },
+                "depth": { "type": "integer", "description": "Max BFS depth (default 2).", "default": 2 }
+            },
+            "required": ["uid"]
+        }
+    })
+}
+
+/// Parse a JSON string array argument into `Vec<String>`; returns `None` when
+/// the key is absent.
+fn parse_string_array(args: &Value, key: &str) -> Option<Vec<String>> {
+    args.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    })
 }
 
 /// Wrap a tool's structured output in MCP's `content` envelope. Returns
@@ -246,6 +826,25 @@ fn tool_schema_brain_context() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, include the full seeds array in the response. Default false — only seeds_expanded (count) is returned to keep responses small."
+                },
+                "include_bodies": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, embed each high-relevance result's source body inline (under `inline_body`) so you can skip a follow-up read. Only results whose normalized relevance clears the configured threshold (default 0.75) get a body, and bodies count against `token_budget` in rank order. Default false."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                },
+                "prf": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, run pseudo-relevance-feedback query expansion on the BM25 leg: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language seeds. Mined terms are returned under `expansion_terms`. Default false."
+                },
+                "rerank": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, rerank the top-N retrieved candidates before truncation (Feature F17). OFF by default; output is byte-identical when off. The default scorer is a transparent MONOTONIC heuristic — an UNVALIDATED reordering, NOT a proven nDCG win. An optional learned-weights file `<db>.rerank.json` is used instead if present and version-matched, but a learned model should only be trusted after the eval harness + accumulated interaction labels gate it at >= 5% nDCG@10. Reranking only reorders an already-retrieved set; recall is unchanged. Default false."
                 }
             },
             "required": ["seeds"]
@@ -326,10 +925,14 @@ fn tool_brain_context(
         } else {
             (weight_ppr, weight_bm25, weight_semantic)
         };
+    // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
+    // expansion on the BM25 leg via `prf: true`. Off by default.
+    let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
     let config = HybridSearchConfig {
         weight_ppr,
         weight_bm25,
         weight_semantic,
+        prf,
         ..defaults
     };
 
@@ -357,6 +960,11 @@ fn tool_brain_context(
         Some(&db_path),
         intent,
     )?;
+
+    // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
+    // server holds no InstanceConfig at the call site (same as F8, which uses
+    // ResponseConfig::default()), so there is no `[ranking]` to load. Priors are
+    // applied on the CLI `brain context` / `brain search` paths instead.
 
     // RFC #2: apply post-PPR filters to seeds and connected lists.
     let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
@@ -481,6 +1089,54 @@ fn tool_brain_context(
         );
     }
 
+    // Feature F8: embed high-relevance bodies inline when the caller opted in
+    // via `include_bodies: true`. Off by default → output unchanged. Threshold
+    // and per-body cap come from [response] config when supplied, else defaults.
+    // Feature F17: rerank the top-N retrieved candidates. OFF by default →
+    // byte-identical output. Applied after fusion + filters + recency, BEFORE
+    // truncation/inline-bodies. The default scorer is a transparent monotonic
+    // heuristic (NOT a validated nDCG win); an optional `<db>.rerank.json`
+    // learned-weights file is used if present and version-matched. Reranking
+    // only reorders an already-retrieved set; recall is unchanged.
+    let do_rerank = args
+        .get("rerank")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if do_rerank {
+        let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+        nestweaver_engine::rerank(
+            &mut result.connected,
+            reranker.as_ref(),
+            store,
+            nestweaver_engine::RERANK_DEFAULT_TOP_N,
+        );
+    }
+
+    let include_bodies = args
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if include_bodies {
+        // The MCP server has no instance-config handle here, so use the
+        // built-in [response] defaults (threshold 0.75, cap 800 tokens).
+        let response_config = nestweaver_engine::ResponseConfig::default();
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        populate_inline_bodies(
+            store,
+            &mut result.connected,
+            &root,
+            response_config.inline_body_threshold,
+            response_config.inline_max_body_tokens,
+            Some(token_budget),
+        );
+    }
+
     let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
 
     let concise = is_concise(&args);
@@ -496,13 +1152,17 @@ fn tool_brain_context(
                     "title": n.title,
                 })
             } else {
-                json!({
+                let mut obj = json!({
                     "uid": n.uid,
                     "kind": n.kind,
                     "title": n.title,
                     "location": n.location,
                     "relevance": n.relevance,
-                })
+                });
+                if let Some(body) = &n.inline_body {
+                    obj["inline_body"] = json!(body);
+                }
+                obj
             }
         })
         .collect();
@@ -545,6 +1205,12 @@ fn tool_brain_context(
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = json!(result.unresolved_seeds);
+    }
+
+    // Feature F7: surface the PRF-mined expansion terms for auditing. Only
+    // present when PRF was enabled and mined at least one term.
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = json!(result.expansion_terms);
     }
 
     Ok(resp)
@@ -653,6 +1319,25 @@ fn tool_schema_brain_search() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns note titles and kinds only; \"detailed\" (default) adds section text excerpts, BM25 scores, and vault UIDs."
+                },
+                "include_bodies": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true (detailed mode only), embed each high-relevance hit's source body inline (under `inline_body`) so you can skip a follow-up note_get / read. Only hits whose normalized score clears the configured threshold (default 0.75) get a body. Default false."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                },
+                "prf": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, run pseudo-relevance-feedback query expansion: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language queries. Mined terms are returned under `expansion_terms`. Default false."
+                },
+                "rerank": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true (detailed mode only), rerank the top-N hits before truncation (Feature F17). OFF by default; output is byte-identical when off. The default scorer is a transparent MONOTONIC heuristic — an UNVALIDATED reordering, NOT a proven nDCG win. An optional learned-weights file `<db>.rerank.json` is used instead if present and version-matched, but a learned model should only be trusted after the eval harness + accumulated interaction labels gate it at >= 5% nDCG@10. Reranking only reorders an already-retrieved set; recall is unchanged. Default false."
                 }
             },
             "required": ["query"]
@@ -682,14 +1367,30 @@ fn tool_brain_search(
     let aliases = load_alias_sidecar(&db_path);
     let query = expand_query_with_aliases(&raw_query, &aliases);
 
+    // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
+    // expansion via `prf: true`. Off by default.
+    let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
+
     // ── Vault note results ──────────────────────────────────────────────
 
+    let mut expansion_terms: Vec<String> = Vec::new();
     let (mut note_results, engine) = if let Some(idx) = tantivy {
         // Tantivy BM25 path (preferred).
         let raw_limit = limit * 5;
-        let hits = idx
-            .search(&query, raw_limit)
-            .map_err(|e| anyhow!("tantivy search: {e}"))?;
+        let hits = if prf {
+            let (hits, terms) = idx
+                .search_prf(
+                    &query,
+                    raw_limit,
+                    nestweaver_engine::query::nestweaver_store_stoplist(),
+                )
+                .map_err(|e| anyhow!("tantivy prf search: {e}"))?;
+            expansion_terms = terms;
+            hits
+        } else {
+            idx.search(&query, raw_limit)
+                .map_err(|e| anyhow!("tantivy search: {e}"))?
+        };
         let results = group_search_hits_by_note(store, &hits, limit, concise);
         (results, "bm25")
     } else {
@@ -869,7 +1570,122 @@ fn tool_brain_search(
         let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Feature F17: rerank the top-N before truncation. OFF by default →
+    // byte-identical output. Detailed mode only (concise rows carry no UID to
+    // key the reorder on). The default scorer is a transparent monotonic
+    // heuristic, NOT a validated nDCG win; an optional `<db>.rerank.json`
+    // learned-weights file is used if present and version-matched. Reranking
+    // only reorders an already-retrieved set; recall is unchanged.
+    let do_rerank = args
+        .get("rerank")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if do_rerank && !concise {
+        // Build BrainNodes mirroring the JSON rows (UID-keyed; rows without a
+        // UID — none in detailed mode — are dropped from the reorder set).
+        let nodes: Vec<nestweaver_engine::BrainNode> = note_results
+            .iter()
+            .filter_map(|v| {
+                let uid = v.get("uid").and_then(|u| u.as_str())?;
+                Some(nestweaver_engine::BrainNode {
+                    uid: uid.to_string(),
+                    kind: v
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: String::new(),
+                    location: v
+                        .get("location")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    relevance: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
+                    inline_body: None,
+                })
+            })
+            .collect();
+        if nodes.len() == note_results.len() {
+            let mut nodes = nodes;
+            let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+            nestweaver_engine::rerank(
+                &mut nodes,
+                reranker.as_ref(),
+                store,
+                nestweaver_engine::RERANK_DEFAULT_TOP_N,
+            );
+            // Reorder note_results to match the reranked UID order.
+            let mut by_uid: std::collections::HashMap<String, Value> = note_results
+                .drain(..)
+                .filter_map(|v| {
+                    v.get("uid")
+                        .and_then(|u| u.as_str())
+                        .map(|u| (u.to_string(), v.clone()))
+                })
+                .collect();
+            note_results = nodes.iter().filter_map(|n| by_uid.remove(&n.uid)).collect();
+        }
+    }
+
     note_results.truncate(limit);
+
+    // Feature F8: embed high-relevance bodies inline when opted in. Off by
+    // default. Concise mode carries no UID/score, so inline bodies are skipped
+    // there. Bodies are computed via the shared engine helper for parity with
+    // brain_context (normalized-relevance threshold + per-body truncation).
+    let include_bodies = args
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if include_bodies && !concise {
+        let response_config = nestweaver_engine::ResponseConfig::default();
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        let mut nodes: Vec<nestweaver_engine::BrainNode> = note_results
+            .iter()
+            .filter_map(|v| {
+                let uid = v.get("uid").and_then(|u| u.as_str())?;
+                let score = v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                Some(nestweaver_engine::BrainNode {
+                    uid: uid.to_string(),
+                    kind: v
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: String::new(),
+                    location: String::new(),
+                    relevance: score,
+                    inline_body: None,
+                })
+            })
+            .collect();
+        populate_inline_bodies(
+            store,
+            &mut nodes,
+            &root,
+            response_config.inline_body_threshold,
+            response_config.inline_max_body_tokens,
+            None,
+        );
+        let bodies: std::collections::HashMap<String, String> = nodes
+            .into_iter()
+            .filter_map(|n| n.inline_body.map(|b| (n.uid, b)))
+            .collect();
+        for item in note_results.iter_mut() {
+            if let Some(uid) = item.get("uid").and_then(|u| u.as_str())
+                && let Some(body) = bodies.get(uid)
+            {
+                item["inline_body"] = json!(body);
+            }
+        }
+    }
 
     let total = note_results.len();
     let mut response = json!({
@@ -882,6 +1698,10 @@ fn tool_brain_search(
         response["engine_warning"] = json!(
             "tantivy_unavailable: BM25 index could not be opened (another process may hold the writer lock, or it has not been built yet). Results are substring matches only. Run `nestweaver brain reindex-search` to build the index."
         );
+    }
+    // Feature F7: surface the PRF-mined expansion terms for auditing.
+    if !expansion_terms.is_empty() {
+        response["expansion_terms"] = json!(expansion_terms);
     }
     Ok(response)
 }
@@ -1290,6 +2110,14 @@ fn tool_brain_status(
             .and_then(|s| s.trim().parse::<u32>().ok())
     });
 
+    // F16: response-cache stats. Correctness is key-based (persisted
+    // generation + filemeta scope digest), so the cache reflects the LAST
+    // INDEX — same staleness as the graph itself, which is the correct
+    // semantic. The session hit-rate below is unproven and should be measured.
+    let (cache_size, cache_entries, cache_hit_rate) =
+        db_path.as_deref().map(cache_stats).unwrap_or((0, 0, None));
+    let cache_hit_rate_pct = cache_hit_rate.map(|r| (r * 100.0).round() as u64);
+
     Ok(json!({
         "vaults": vaults_json,
         "vault_count": vaults.len(),
@@ -1303,6 +2131,17 @@ fn tool_brain_status(
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,
         "watcher_pid": watcher_pid,
+        // F16 response cache. `hit_rate_pct` is the session hit-rate
+        // (hits/(hits+misses)); null until the first cacheable call. The
+        // cache's correctness is key-based (persisted graph_generation +
+        // filemeta scope digest), so results are consistent with the last
+        // index — the same staleness as the graph. The hit-rate is unproven
+        // and should be measured in real usage.
+        "cache": {
+            "size_bytes": cache_size,
+            "entries": cache_entries,
+            "hit_rate_pct": cache_hit_rate_pct,
+        },
     }))
 }
 
@@ -1462,7 +2301,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         .cross_repo_links(&uid)
         .map_err(|e| anyhow!("cross_repo_links: {e}"))?;
 
-    let rows: Vec<Value> = refs
+    let mut rows: Vec<Value> = refs
         .iter()
         .map(|r| {
             json!({
@@ -1476,10 +2315,55 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         })
         .collect();
 
+    // F2-core: also surface API contracts this symbol implements (HTTP route /
+    // gRPC method / GraphQL operation). These are HYPOTHESES, not ground truth
+    // — the confidence reflects match quality (1.0 exact verb+path, 0.8
+    // base-path-inferred).
+    let contract_links = store
+        .contracts_implemented_by(&uid)
+        .map_err(|e| anyhow!("contracts_implemented_by: {e}"))?;
+    for (contract_uid, confidence) in &contract_links {
+        rows.push(json!({
+            "source_uid": uid,
+            "target_uid": contract_uid,
+            "link_type": "contract",
+            "confidence": confidence,
+        }));
+    }
+
     Ok(json!({
         "uid": uid,
         "count": rows.len(),
+        "note": "Links are hypotheses, not ground truth — check confidence. \
+                 link_type \"contract\" denotes an implemented API contract.",
         "contracts": rows,
+    }))
+}
+
+// ── 35. contract_drift ──────────────────────────────────────────────────────
+
+fn tool_schema_contract_drift() -> Value {
+    json!({
+        "name": "contract_drift",
+        "description": "Use to audit API contract drift in the indexed code graph: routes/methods/operations DECLARED in a spec file (OpenAPI/Swagger, .proto, GraphQL) but not implemented by any handler, and routes IMPLEMENTED by a Spring/NestJS handler but declared in no spec.\n\nContract links are HYPOTHESES, not ground truth — derived from spec parsing and framework handler heuristics (same-repo only). Use this to spot missing endpoints or undocumented APIs.\n\nOptional `repo` filters to a single repo by UID. Returns two buckets: declared_not_implemented and implemented_not_declared, each a list of contract UIDs (e.g. \"contract:http:POST:/v1/approvals\").",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." }
+            }
+        }
+    })
+}
+
+fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let repo = args.get("repo").and_then(|v| v.as_str());
+    let report = nestweaver_engine::contracts::drift_for_store(store, repo)
+        .map_err(|e| anyhow!("drift_for_store: {e}"))?;
+    Ok(json!({
+        "note": "Contract links are hypotheses, not ground truth.",
+        "declared_not_implemented": report.declared_not_implemented,
+        "implemented_not_declared": report.implemented_not_declared,
+        "clean": report.is_clean(),
     }))
 }
 
@@ -1787,6 +2671,72 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
     }))
+}
+
+// ── 31. affected_tests ──────────────────────────────────────────────────────
+
+fn tool_schema_affected_tests() -> Value {
+    json!({
+        "name": "affected_tests",
+        "description": "Use to prioritize which test files an MR/PR should run for a set of code changes. Maps changed files to the symbols they define, reverse-traverses the call/import graph, and returns the test files that (transitively) depend on the changed code, bucketed into priority tiers: tier_1 = tests that directly reference a changed symbol, tier_2 = tests of a direct caller, tier_3 = transitively reachable tests.\n\nIMPORTANT — this is STATIC, call-graph-based regression test selection. It is a prioritized signal, NOT a provably-safe subset. It misses tests reached via reflection, dependency injection, codegen/macros, and data-driven or integration/e2e tests. \"No tests found\" does NOT mean it is safe to skip testing — keep a periodic full test run in CI. Treat the output as a ranked starting point, not a guarantee.\n\nDo NOT use for symbol-level blast radius — use brain_impact. Do NOT use for risk scoring of a change — use detect_changes.\n\nProvide either `changed_files` (repo-relative paths) or `base_ref` (a git ref such as \"main\"; runs `git diff --name-only base...HEAD` against the locally-indexed repo). Example: affected_tests(base_ref=\"main\") → {tier_1: [...], tier_2: [...], tier_3: [...], summary: \"3 tier-1, 2 tier-2, 0 tier-3 tests affected\"}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "changed_files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]."
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted; diffs the locally-indexed repo via git."
+                }
+            }
+        }
+    })
+}
+
+fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // Resolve the set of changed files: explicit list takes precedence over base_ref.
+    let mut changed_files: Vec<String> = args
+        .get("changed_files")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if changed_files.is_empty()
+        && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
+    {
+        let repo_path = first_local_repo_path(store).unwrap_or_else(|| ".".to_string());
+        let files =
+            nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
+                .context("git diff for base_ref")?;
+        changed_files = files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+    }
+
+    if changed_files.is_empty() {
+        return Err(anyhow!(
+            "provide either 'changed_files' (non-empty) or 'base_ref'"
+        ));
+    }
+
+    let result = affected_tests(store, &changed_files).context("affected_tests")?;
+    Ok(serde_json::to_value(&result)?)
+}
+
+/// Return the filesystem path of the first locally-indexed repo (file:// URL).
+fn first_local_repo_path(store: &GraphStore) -> Option<String> {
+    let repos = store.list_repos(None).unwrap_or_default();
+    repos
+        .iter()
+        .find_map(|r| r.url.strip_prefix("file://").map(|p| p.to_string()))
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
@@ -2339,10 +3289,14 @@ fn tool_project_context(
     };
 
     // 2. Collect member UIDs (notes + symbols) for the post-PPR boost.
+    //    Member note UIDs are tracked separately: they get seeded into PPR
+    //    and surfaced into `connected` (Bug #12).
     let mut member_uids: Vec<String> = Vec::new();
+    let mut member_note_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let note_uids = store
         .list_project_note_uids(&project.uid)
         .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
+    member_note_uids.extend(note_uids.iter().cloned());
     member_uids.extend(note_uids);
     let sym_uids = store
         .list_project_symbol_uids(&project.uid)
@@ -2359,6 +3313,7 @@ fn tool_project_context(
     };
     for comp_uid in &component_uids {
         let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+        member_note_uids.extend(comp_notes.iter().cloned());
         member_uids.extend(comp_notes);
         let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
         member_uids.extend(comp_syms);
@@ -2380,12 +3335,16 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Seed PPR from the project node itself (not all member UIDs).
-    //    With ProjectContext intent the PROJECT_INCLUDES_* edges get a
-    //    5x weight boost, so the walk efficiently discovers all members
-    //    and places them in `connected` instead of `seeds`.
+    // 4. Seed PPR from the project node, its components, and — critically —
+    //    the project's member notes (Bug #12). Seeding the notes guarantees
+    //    they survive the `min_score` filter in PPR: when a project declares
+    //    repos, the project node's mass is split across tens of thousands of
+    //    PROJECT_INCLUDES_SYMBOL edges, leaving each PROJECT_INCLUDES_NOTE
+    //    target below threshold so it never reaches `connected`. Seeding also
+    //    lets the walk explore each note's neighbourhood (sections, links).
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
     ppr_seeds.extend(component_uids);
+    ppr_seeds.extend(member_note_uids.iter().cloned());
 
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
@@ -2408,7 +3367,13 @@ fn tool_project_context(
         Some(intent),
     )?;
 
-    // 4b. Post-PPR scope boost: multiply relevance for nodes that belong
+    // 4b. Surface the project's curated member notes into `connected`. They
+    //     were seeded above, so they live in `result.seeds` — which is
+    //     disjoint from `connected` and not rendered. For project orientation
+    //     the curated notes are the answer, so promote them (Bug #12).
+    nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+
+    // 4c. Post-PPR scope boost: multiply relevance for nodes that belong
     //     to the project (member UIDs are the authoritative membership signal).
     let member_set: std::collections::HashSet<&str> =
         member_uids.iter().map(|s| s.as_str()).collect();
@@ -3092,10 +4057,20 @@ thread_local! {
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // F16 response cache: size cap (MiB) and per-session hit/miss counters.
+    static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
+    static CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
     CURRENT_DB_PATH.with(|c| *c.borrow_mut() = Some(path));
+}
+
+/// Set the F16 response-cache size cap in MiB (from `[cache] max_size_mb`).
+pub fn set_cache_max_size_mb(mb: u64) {
+    CACHE_MAX_SIZE_MB.with(|c| c.set(mb));
 }
 
 pub fn set_allow_add_sources(allowed: bool) {
@@ -3122,10 +4097,499 @@ pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
 }
 
+// ── F10: investigate bundle primitive ─────────────────────────────────────
+
+/// Resolve the source root for body reads: explicit `root` arg, else cwd.
+fn arg_root(args: &Value) -> std::path::PathBuf {
+    args.get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+fn tool_schema_investigate() -> Value {
+    json!({
+        "name": "investigate",
+        "description": "Use to orient yourself on an unfamiliar topic, feature, or subsystem in ONE call instead of a chain of searches. Runs hybrid PPR + BM25 retrieval (with pseudo-relevance feedback) for your query, groups the results into architectural domains (code directories + notes), inlines a few high-confidence source bodies, and returns a token-budgeted map plus a `bundle_id`. Drill into specific entries afterwards with `investigate_expand` (by asset_id) or fill in all remaining bodies with `investigate_hydrate`.\n\nScope: \"project:<slug>\" restricts seeds to a project's members, \"repo:<name>\" restricts results to a repo, \"vault\"/\"all\"/omitted = no restriction. Returns `{bundle_id, domains:[{label, entry_point, members}], entries:[{asset_id, uid, kind, title, location, summary, inline_body?, relevance}], more_available}`. `more_available` counts entries dropped by the token budget — raise `token_budget` to see them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
+                "scope": { "type": "string", "description": "Optional scope: \"project:<slug>\", \"repo:<name>\", or \"vault\"/\"all\" (default = no restriction)." },
+                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
+                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
+fn tool_investigate(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'query' must be a string"))?;
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("vault");
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = arg_root(&args);
+    let db_path = current_db_path(store).ok();
+    let result = investigate(
+        store,
+        tantivy,
+        db_path.as_deref(),
+        &root,
+        query,
+        scope,
+        token_budget,
+    )?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn tool_schema_investigate_expand() -> Value {
+    json!({
+        "name": "investigate_expand",
+        "description": "Use after `investigate` to drill into specific map entries. Given a `bundle_id` and one or more targets (each an `asset_id` from the map, or a raw node uid), returns each entry's full source body plus its immediate neighbors (callers/callees for symbols, wikilink sources for notes) and marks the entries expanded. Returns `{bundle_id, expanded:[entry], neighbors:[{of, uid, kind, title, relation}], unresolved:[target]}`. Bundles expire 24h after creation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
+                "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["bundle_id", "targets"]
+        }
+    })
+}
+
+fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let bundle_id = args
+        .get("bundle_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'bundle_id' must be a string"))?;
+    let targets: Vec<String> = args
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(anyhow!("'targets' must be a non-empty array"));
+    }
+    let root = arg_root(&args);
+    let db_path = current_db_path(store)?;
+    let result = investigate_expand(store, &db_path, &root, bundle_id, &targets)?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn tool_schema_investigate_hydrate() -> Value {
+    json!({
+        "name": "investigate_hydrate",
+        "description": "Use after `investigate` to fill in source bodies/summaries for every map entry that doesn't yet have one — the bulk version of `investigate_expand`, budget-bounded. Given a `bundle_id`, reads bodies for all un-hydrated entries up to the token budget. Returns `{bundle_id, hydrated, entries}`. Bundles expire 24h after creation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
+                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["bundle_id"]
+        }
+    })
+}
+
+fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let bundle_id = args
+        .get("bundle_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'bundle_id' must be a string"))?;
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = arg_root(&args);
+    let db_path = current_db_path(store)?;
+    let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
+    Ok(serde_json::to_value(result)?)
+}
+
 fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {
     CURRENT_DB_PATH.with(|c| {
         c.borrow()
             .clone()
             .ok_or_else(|| anyhow!("database path not set on server"))
     })
+}
+
+#[cfg(test)]
+mod project_context_bug12_tests {
+    use super::*;
+    use nestweaver_schema::{Note, NoteKind, Project, Symbol, SymbolKind, Vault, Visibility};
+
+    fn mk_note(uid: &str, vault_uid: &str, file_path: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: vault_uid.to_string(),
+            file_path: file_path.to_string(),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 100,
+            content_hash: format!("hash-{uid}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        }
+    }
+
+    fn mk_symbol(uid: &str, repo_uid: &str, file_path: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+        }
+    }
+
+    // Bug #12: a project that declares repos (so it has a large
+    // PROJECT_INCLUDES_SYMBOL fan-out) must still surface its curated member
+    // notes through `project_context`. Notes are seeded into PPR — so they
+    // land in `seeds`, disjoint from the rendered `connected` list — and must
+    // be promoted into `connected`. This guards the wiring at the call site:
+    // removing the promote step leaves notes in `seeds` only and fails here.
+    #[test]
+    fn project_context_surfaces_member_notes_when_project_has_symbol_mass() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".into(),
+                name: "t".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+
+        let proj = Project {
+            uid: "proj:pp".into(),
+            name: "Parallel Paths".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        let note_uids = ["note:prd", "note:status", "note:arch"];
+        for (i, n) in note_uids.iter().enumerate() {
+            store
+                .insert_note(&mk_note(
+                    n,
+                    "vlt:t",
+                    &format!("Projects/parallel-paths/doc{i}.md"),
+                    n,
+                ))
+                .unwrap();
+        }
+
+        // 50 symbols simulate an attached repo's code mass.
+        let mut sym_uids: Vec<String> = Vec::new();
+        for i in 0..50 {
+            let uid = format!("sym:s{i}");
+            store
+                .insert_symbol(&mk_symbol(
+                    &uid,
+                    "repo:r",
+                    &format!("src/f{i}.rs"),
+                    &format!("fn{i}"),
+                ))
+                .unwrap();
+            sym_uids.push(uid);
+        }
+
+        let note_edges: Vec<(&str, &str)> = note_uids.iter().map(|n| ("proj:pp", *n)).collect();
+        store.batch_insert_project_note_edges(&note_edges).unwrap();
+        store
+            .batch_insert_project_symbol_edges("proj:pp", &sym_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({ "project": "Parallel Paths", "token_budget": 5000 }),
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        let uids: Vec<&str> = connected.iter().filter_map(|n| n["uid"].as_str()).collect();
+        let hits = note_uids.iter().filter(|n| uids.contains(n)).count();
+        assert_eq!(
+            hits,
+            note_uids.len(),
+            "all {} member notes must surface in connected; got {uids:?}",
+            note_uids.len()
+        );
+    }
+
+    // Feature F8: brain_context with include_bodies embeds the source span of
+    // high-relevance connected symbols inline; off by default it does not.
+    #[test]
+    fn brain_context_inline_bodies_opt_in() {
+        use nestweaver_engine::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\nfunction hello(n) {\n  return n;\n}\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let root = src.to_string_lossy().to_string();
+
+        // Off by default: no inline_body anywhere.
+        let off = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
+        )
+        .unwrap();
+        let any_body_off = off["connected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.get("inline_body").is_some());
+        assert!(!any_body_off, "default path must not embed inline bodies");
+
+        // Opted in: at least the top connected symbol carries an inline_body
+        // that contains its source span.
+        let on = tool_brain_context(
+            &store,
+            None,
+            json!({
+                "seeds": ["greet"],
+                "token_budget": 5000,
+                "include_bodies": true,
+                "root": root,
+            }),
+        )
+        .unwrap();
+        let connected = on["connected"].as_array().unwrap();
+        assert!(!connected.is_empty(), "expected connected results");
+        let bodied: Vec<&str> = connected
+            .iter()
+            .filter_map(|n| n.get("inline_body").and_then(|b| b.as_str()))
+            .collect();
+        assert!(
+            bodied.iter().any(|b| b.contains("function")),
+            "opted-in path should embed at least one symbol body; got connected={connected:?}"
+        );
+    }
+}
+
+// ── F16: response-cache dispatch tests ───────────────────────────────────────
+#[cfg(test)]
+mod cache_dispatch_tests {
+    use super::*;
+    use std::fs;
+
+    /// Index a small JS repo to an on-disk db and return its path + the repo
+    /// source dir (kept alive by the returned tempdir).
+    fn index_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(n){return hello(n);}\nfunction hello(n){return n;}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory(&src, &db_path, "test", &repo_url, "local").unwrap();
+        // Compute + persist PageRank so hub_nodes has scores (mirrors the CLI).
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+            .unwrap();
+        store
+            .save_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        (dir, db_path)
+    }
+
+    /// Reset the per-thread cache state that other tests in this thread may
+    /// have touched (thread-locals persist across tests on the same thread).
+    fn reset_session() {
+        CACHE_HITS.with(|c| c.set(0));
+        CACHE_MISSES.with(|c| c.set(0));
+    }
+
+    #[test]
+    fn same_query_twice_is_a_cache_hit_byte_identical() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        let args = json!({ "limit": 5 });
+        let first = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        let second = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+
+        assert_eq!(
+            first, second,
+            "2nd call must return byte-identical response"
+        );
+        // The cache file exists and holds an entry.
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert_eq!(cache.len(), 1);
+        // Exactly one miss (1st) then one hit (2nd).
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn reindex_bump_invalidates_cache() {
+        reset_session();
+        let (dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        let gen_before = store.graph_generation();
+        let args = json!({ "limit": 5 });
+        let _ = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        drop(store);
+
+        // Re-index with a new file → generation bumps + persists.
+        let src = dir.path().join("repo");
+        fs::write(src.join("extra.js"), "function added(){return 1;}\n").unwrap();
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory_with_options(
+            &src, &db_path, "test", &repo_url, "local", true, None,
+        )
+        .unwrap();
+
+        // Fresh process: reopen → generation loaded from sidecar is higher.
+        let store2 = GraphStore::open(&db_path).unwrap();
+        store2
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(
+            store2.graph_generation() > gen_before,
+            "reindex must bump the persisted generation"
+        );
+
+        reset_session();
+        let _ = dispatch(&store2, None, "hub_nodes", args).unwrap();
+        // The old entry's generation no longer matches → MISS (recomputed).
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1, "stale entry must miss");
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn bypass_always_misses() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        // Prime the cache.
+        let _ = dispatch(&store, None, "hub_nodes", json!({ "limit": 5 })).unwrap();
+        reset_session();
+        // cache:"bypass" skips the cache entirely (no hit recorded).
+        let _ = dispatch(
+            &store,
+            None,
+            "hub_nodes",
+            json!({ "limit": 5, "cache": "bypass" }),
+        )
+        .unwrap();
+        // no_cache:true likewise.
+        let _ = dispatch(
+            &store,
+            None,
+            "hub_nodes",
+            json!({ "limit": 5, "no_cache": true }),
+        )
+        .unwrap();
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0, "bypass must never hit");
+        assert_eq!(
+            CACHE_MISSES.with(|c| c.get()),
+            0,
+            "bypass should not even consult the cache (no miss counted)"
+        );
+    }
+
+    #[test]
+    fn write_tools_are_never_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        // Write/mutation and stateful tools are excluded from the cacheable set.
+        assert!(!is_cacheable_tool("brain_add_source"));
+        assert!(!is_cacheable_tool("set_extension"));
+        assert!(!is_cacheable_tool("investigate"));
+        assert!(!is_cacheable_tool("investigate_expand"));
+        assert!(!is_cacheable_tool("investigate_hydrate"));
+        assert!(!is_cacheable_tool("brain_status"));
+        assert!(!is_cacheable_tool("stale_check"));
+        // And a representative read tool IS cacheable.
+        assert!(is_cacheable_tool("hub_nodes"));
+
+        let store = GraphStore::open(&db_path).unwrap();
+        // set_extension is a write tool; dispatching it must not create a cache.
+        let _ = dispatch(
+            &store,
+            None,
+            "set_extension",
+            json!({ "uid": "sym:x", "key": "k", "value": "v" }),
+        );
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "write tools must never populate the cache"
+        );
+    }
 }

@@ -1,4 +1,5 @@
 import { useStore } from "../../stores";
+import { GlassPanel } from "../panels/GlassPanel";
 import { DiffDetail } from "./DiffDetail";
 import { FlowDetail } from "./FlowDetail";
 import { GapDetail } from "./GapDetail";
@@ -21,7 +22,7 @@ export function DetailPanel() {
 
   if (!selectedNodeId) {
     return (
-      <div data-testid="detail-panel" className="flex h-full flex-col items-center justify-center gap-3 border-l border-[var(--color-border)] bg-[var(--color-surface)] p-6 text-center text-sm text-[var(--color-text-muted)]">
+      <GlassPanel data-testid="detail-panel" className="flex h-full flex-col items-center justify-center gap-3 border-l border-[var(--color-border)] bg-[var(--color-surface)] p-6 text-center text-sm text-[var(--color-text-muted)]">
         <p>Click a node in the graph to see its details here.</p>
         <div className="space-y-1 text-xs">
           <p>
@@ -37,7 +38,7 @@ export function DetailPanel() {
             Close search
           </p>
         </div>
-      </div>
+      </GlassPanel>
     );
   }
 
@@ -45,7 +46,7 @@ export function DetailPanel() {
   const isNote = selectedNodeId.startsWith("note:") || (!isSymbol && selectedNodeKind !== "file");
 
   return (
-    <div data-testid="detail-panel" className="h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
+    <GlassPanel data-testid="detail-panel" className="h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
       {llmResult && <LlmResultDetail />}
       {diffActive && <DiffDetail />}
       {gapActive && <GapDetail />}
@@ -63,6 +64,6 @@ export function DetailPanel() {
           </p>
         </div>
       )}
-    </div>
+    </GlassPanel>
   );
 }

@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 4
+  end_line: 6
   signature: "pub struct SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: sensors
   kind: Property
   start_line: 5
+  end_line: 5
   signature: "sensors: HashMap<String, Sensor>"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: SensorKind
   kind: Enum
   start_line: 8
+  end_line: 11
   signature: "pub enum SensorKind {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -32,6 +35,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: Readable
   kind: Interface
   start_line: 13
+  end_line: 16
   signature: "pub trait Readable {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,6 +45,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 18
+  end_line: 26
   signature: "impl Readable for SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -50,6 +55,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: read
   kind: Method
   start_line: 19
+  end_line: 21
   signature: "fn read(&self) -> f64 {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -62,6 +68,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: calibrate
   kind: Method
   start_line: 23
+  end_line: 25
   signature: "fn calibrate(&mut self) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -71,6 +78,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 28
+  end_line: 38
   signature: "impl SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -80,6 +88,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: new
   kind: Method
   start_line: 29
+  end_line: 33
   signature: "pub fn new() -> Self {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -92,6 +101,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: get_primary
   kind: Method
   start_line: 35
+  end_line: 37
   signature: "fn get_primary(&self) -> &Sensor {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -104,6 +114,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
 - name: initialize
   kind: Function
   start_line: 40
+  end_line: 44
   signature: "pub fn initialize(config: &Settings) -> SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

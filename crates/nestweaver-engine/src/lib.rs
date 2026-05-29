@@ -39,32 +39,44 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
         .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
 }
 
+pub mod admin;
+pub mod affected_tests;
 pub mod agent_guide;
 pub mod blast_radius;
+pub mod brain_docgraph;
+pub mod brain_memory;
 pub mod brainignore;
 pub mod bridges;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
+pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
 pub mod embedding;
+pub mod eval;
 pub mod export;
+pub mod export_graph;
 pub mod extensions;
+pub mod git_activity;
 pub mod git_diff;
+pub mod guide_rules;
 pub mod html_to_md;
 pub mod hubs;
 pub mod index;
 pub mod index_md;
 pub mod interactions;
+pub mod investigate;
 pub mod manifest;
 pub mod mcp_client;
 pub mod process;
 pub mod project;
 pub mod pull;
 pub mod query;
+pub mod read_symbols;
 pub mod recency;
 pub mod registry;
+pub mod rerank;
 pub mod snapshot;
 pub mod suggest;
 pub mod summaries;
@@ -73,10 +85,26 @@ pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
 
-pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
+pub use affected_tests::{
+    AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
+};
+pub use agent_guide::{
+    generate_agents_md, generate_agents_md_with_rules, generate_cursor_rule,
+    generate_cursor_rule_with_rules, generate_guide, generate_guide_with_rules, generate_skill,
+    generate_skill_with_rules,
+};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,
+};
+pub use brain_docgraph::{
+    BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
+    broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
+};
+pub use brain_memory::{
+    ConsolidationManifest, ConsolidationProposal, Contradiction, DanglingRelationship,
+    MemoryLintReport, RelatedNode, SchemaDrift, StaleNote, SupersessionChain, memory_consolidate,
+    memory_lint, memory_related,
 };
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
@@ -84,9 +112,9 @@ pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
 pub use config::{
-    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, InferenceConfig,
-    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RepoConfig, SchemaExtensions,
-    StorageConfig, WikiSourceConfig, WorkspaceConfig,
+    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
+    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
+    ResponseConfig, SchemaExtensions, StorageConfig, WikiSourceConfig, WorkspaceConfig,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
@@ -97,10 +125,19 @@ pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
     detect_dead_code_with_confidence, detect_dead_code_with_manifests,
 };
+pub use eval::{
+    EvalComparison, EvalReport, JudgedQuery, PerQueryRow, compare_reports, load_judged_queries,
+    mrr, ndcg_at_k, precision_at_k, run_eval,
+};
 pub use export::{export_cypher, export_graphml, export_mermaid};
+pub use export_graph::export_in_memory_graph;
 pub use extensions::{
     ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
     query_by_property, record_last_indexed_at, save_extensions, set_property,
+};
+pub use guide_rules::{
+    HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
+    render_rules_markdown,
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
@@ -117,7 +154,13 @@ pub use index_md::{
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
     clear_interaction_sidecar, compute_decayed_score, interaction_sidecar_path,
-    load_interaction_data, load_interaction_scores, save_interaction_store,
+    load_interaction_data, load_interaction_scores, load_node_score, save_interaction_store,
+    top_uids_by_kind,
+};
+pub use investigate::{
+    Bundle, BundleEntry, BundleStore, Domain, ExpandResult, HydrateResult, InvestigateResult,
+    NeighborRef, bundle_sidecar_path, investigate, investigate_expand, investigate_hydrate,
+    load_bundle, load_bundle_store, save_bundle_store,
 };
 pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
 pub use process::{
@@ -129,12 +172,19 @@ pub use pull::*;
 pub use query::{
     BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, FeatureContextResult,
     FeatureInfo, HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
-    build_brain_context, build_brain_context_hybrid, build_brain_context_hybrid_with_aliases,
-    build_context, build_context_with_intent, build_feature_context, expand_query_with_aliases,
-    generate_repo_map, list_repos, list_services, lookup_symbol, search_symbols,
+    apply_ranking_priors, build_brain_context, build_brain_context_hybrid,
+    build_brain_context_hybrid_with_aliases, build_context, build_context_with_intent,
+    build_feature_context, expand_query_with_aliases, explain_ranking_prior, generate_repo_map,
+    list_repos, list_services, lookup_symbol, populate_inline_bodies,
+    promote_member_notes_into_connected, search_symbols,
 };
 pub use recency::parse_iso8601_to_epoch;
 pub use registry::*;
+pub use rerank::{
+    DEFAULT_TOP_N as RERANK_DEFAULT_TOP_N, LoadedModelReranker, MonotonicReranker,
+    MonotonicWeights, RerankFeatures, RerankModel, Reranker, TrainingRow, export_training_rows,
+    load_rerank_model, rerank, rerank_sidecar_path, select_reranker,
+};
 pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,

@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: Greeter
   kind: Class
   start_line: 4
+  end_line: 6
   signature: "abstract class Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: Loggable
   kind: Trait
   start_line: 8
+  end_line: 12
   signature: "mixin Loggable {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: log
   kind: Method
   start_line: 9
+  end_line: 9
   signature: void log(String message)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -32,6 +35,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: SimpleGreeter
   kind: Class
   start_line: 14
+  end_line: 24
   signature: "class SimpleGreeter extends Greeter with Loggable {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,6 +45,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: greet
   kind: Method
   start_line: 16
+  end_line: 16
   signature: String greet(String name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -50,6 +55,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: _formatName
   kind: Method
   start_line: 21
+  end_line: 21
   signature: String _formatName(String name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -59,6 +65,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: Priority
   kind: Enum
   start_line: 26
+  end_line: 26
   signature: "enum Priority { low, medium, high }"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -68,6 +75,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
 - name: main
   kind: Function
   start_line: 28
+  end_line: 33
   signature: "void main() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

@@ -9,14 +9,15 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
-    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
+    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel, affected_tests,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
-    export_cypher, export_graphml, export_mermaid, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide, generate_repo_map,
-    generate_skill, generate_summaries, get_last_indexed_at,
+    export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    generate_cursor_rule_with_rules, generate_guide_with_rules, generate_repo_map,
+    generate_skill_with_rules, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -313,6 +314,97 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Read a symbol's source span (start_line..end_line) — just the symbol,
+    /// not the whole file. Optionally include adjacent symbols; token-budget aware.
+    #[command(
+        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
+    )]
+    ReadSymbols {
+        /// Symbol UIDs, names, or FQNs to read.
+        #[arg(required = true)]
+        targets: Vec<String>,
+        #[arg(
+            long,
+            default_value = "0",
+            help = "Include N adjacent symbols in the same file"
+        )]
+        neighbors: u8,
+        #[arg(
+            long = "token-budget",
+            help = "Approximate token budget for the combined output"
+        )]
+        token_budget: Option<usize>,
+        #[arg(
+            long,
+            help = "Repository root for resolving file paths (default: current dir)"
+        )]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Regex search over indexed text (section bodies, note titles, symbol signatures)
+    ///
+    /// First-party replacement for shelling out to rg/grep. Uses a trigram
+    /// pre-filter when built (`index --with-trigrams`), else falls back to
+    /// scanning all candidate text — always correct, just slower.
+    #[command(
+        after_help = "Examples:\n  nestweaver regex-search 'fn\\s+authenticate'\n  nestweaver regex-search '(?i)todo' --path-prefix src/ --limit 20"
+    )]
+    RegexSearch {
+        /// Rust regex pattern to search for
+        pattern: String,
+        #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
+        path_prefix: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+        )]
+        kinds: Option<Vec<String>>,
+        #[arg(long, help = "Maximum number of results")]
+        limit: Option<usize>,
+        #[arg(long = "max-millis", help = "Wall-clock time budget in milliseconds")]
+        max_millis: Option<u64>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Count regex matches per pattern across indexed text (counts only)
+    ///
+    /// Companion to regex-search. Reports total matches, files matched, and the
+    /// busiest files for each pattern. Reuses the same trigram pre-filter.
+    #[command(
+        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
+    )]
+    CountPatterns {
+        /// One or more regex patterns to count
+        #[arg(required = true)]
+        patterns: Vec<String>,
+        #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
+        path_prefix: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+        )]
+        kinds: Option<Vec<String>>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Analyze blast radius: what depends on this symbol
     ///
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
@@ -428,6 +520,24 @@ enum Commands {
                     multiple repos share a generic name like 'client' or 'server')"
         )]
         name: Option<String>,
+        #[arg(
+            long = "with-trigrams",
+            help = "Build a trigram posting table over indexed text to accelerate `regex-search` \
+                    (opt-in storage cost)"
+        )]
+        with_trigrams: bool,
+        #[arg(
+            long = "with-git-activity",
+            help = "Feature F12: mine git history and write a <db>.gitactivity.json recency \
+                    sidecar so dormant code is demoted at rank-read time (opt-in)"
+        )]
+        with_git_activity: bool,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML). Honors per-repo [[repos]] use_git_activity \
+                    opt-out for --with-git-activity"
+        )]
+        config: Option<PathBuf>,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -508,6 +618,13 @@ enum Commands {
         #[command(subcommand)]
         command: Box<BrainCommands>,
     },
+    /// F11 memory-bank operations over the vault: typed-relationship health
+    /// (`lint`), tier-promotion proposals (`consolidate`), and typed-edge
+    /// traversal (`related`).
+    Memory {
+        #[command(subcommand)]
+        command: Box<MemoryCommands>,
+    },
     /// Run the brain as a Model Context Protocol server on stdio.
     ///
     /// Intended to be launched by Claude Desktop / Claude Code / Cowork via
@@ -559,11 +676,35 @@ enum Commands {
 
         #[arg(long, help = "Do not open the browser automatically")]
         no_open: bool,
+
+        /// Enable live re-indexing watchers (file system watching)
+        #[arg(long)]
+        watch: bool,
     },
     /// Manage interaction memory
     Interactions {
         #[command(subcommand)]
         command: InteractionCommands,
+    },
+    /// Feature F17 — lightweight result reranker (off-by-default heuristic).
+    ///
+    /// The reranker reorders the top-N of an already-retrieved set; it does NOT
+    /// change recall. The default scorer is a transparent MONOTONIC heuristic,
+    /// not a validated nDCG win. A learned model is only trustworthy after the
+    /// eval harness + accumulated labels gate it at >= 5% nDCG@10. This command
+    /// group exposes the offline-training-export scaffold.
+    Rerank {
+        #[command(subcommand)]
+        command: RerankCommands,
+    },
+    /// Inspect the API contract graph (F2-core).
+    ///
+    /// Contracts are HTTP routes / gRPC methods / GraphQL operations derived
+    /// from spec files and framework handlers. Links are HYPOTHESES, not
+    /// ground truth — see the confidence scores.
+    Contracts {
+        #[command(subcommand)]
+        command: ContractCommands,
     },
     /// Generate an AGENTS.md codebase intelligence guide from the indexed graph.
     GenerateGuide {
@@ -585,6 +726,21 @@ enum Commands {
             help = "Output format: markdown (default), skill, cursor-rule, agents-md"
         )]
         format: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Override the built-in hard rules from a TOML ([[rules]]) or markdown file"
+        )]
+        rules_from: Option<PathBuf>,
+    },
+    /// Admin: subagent guidance instruction store and runtime hook installation.
+    ///
+    /// Injected guidance HELPS but is NOT enforcement — instruction-following
+    /// by an LLM is probabilistic (Geng et al. 2025, "Control Illusion"). Hook
+    /// JSON schemas are Claude-Code-specific.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
     },
     /// Manage graph snapshots (build, verify, push)
     Snapshot {
@@ -779,6 +935,86 @@ enum Commands {
         )]
         recency_half_life_days: f64,
     },
+    /// F10: orient on a topic in one call — architectural map + bundle_id
+    ///
+    /// Runs hybrid retrieval (PPR + BM25 + PRF) for the query, groups results into
+    /// architectural domains, inlines a few high-confidence bodies, and persists a
+    /// bundle (24h TTL). Drill in afterwards with `investigate-expand` /
+    /// `investigate-hydrate`.
+    #[command(
+        after_help = "Examples:\n  nestweaver investigate \"device pairing\"\n  nestweaver investigate \"how indexing works\" --scope repo:nestweaver --token-budget 8000 --json"
+    )]
+    Investigate {
+        /// Topic / feature / subsystem to orient on
+        query: String,
+        #[arg(
+            long,
+            help = "Scope: project:<slug>, repo:<name>, or vault/all (default = no restriction)"
+        )]
+        scope: Option<String>,
+        #[arg(
+            long,
+            default_value = "4000",
+            help = "Approximate token budget (chars/4)"
+        )]
+        token_budget: usize,
+        #[arg(long, help = "Filesystem root for inline bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// F10: drill into investigate bundle entries (full body + neighbors)
+    #[command(
+        after_help = "Examples:\n  nestweaver investigate-expand bndl_abc --targets a123,sym:foo"
+    )]
+    InvestigateExpand {
+        /// Bundle id returned by `investigate`
+        bundle_id: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated asset_ids (from the map) or node uids to expand"
+        )]
+        targets: Vec<String>,
+        #[arg(long, help = "Filesystem root for source bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// F10: fill in bodies/summaries for all un-hydrated bundle entries
+    #[command(after_help = "Examples:\n  nestweaver investigate-hydrate bndl_abc")]
+    InvestigateHydrate {
+        /// Bundle id returned by `investigate`
+        bundle_id: String,
+        #[arg(
+            long,
+            default_value = "4000",
+            help = "Approximate token budget (chars/4)"
+        )]
+        token_budget: usize,
+        #[arg(long, help = "Filesystem root for source bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
     /// Auto-detect and configure NestWeaver for installed AI coding tools
     ///
     /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code, Gemini CLI,
@@ -856,13 +1092,13 @@ enum Commands {
     /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), and Mermaid flowchart
     /// formats. Writes to stdout by default; use --output to write to a file.
     #[command(
-        after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30"
+        after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30\n  nestweaver export --format msgpack --output graph.msgpack"
     )]
     Export {
         #[arg(
             long,
             default_value = "cypher",
-            help = "Output format: cypher, graphml, mermaid"
+            help = "Output format: cypher, graphml, mermaid, msgpack"
         )]
         format: String,
         #[arg(long, help = "Write to file instead of stdout")]
@@ -919,6 +1155,38 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
+    /// Select the test files an MR should run for a set of code changes (F13).
+    ///
+    /// Static, call-graph-based regression test selection: maps changed files
+    /// to their symbols, reverse-traverses CALLS/IMPORTS to depth 3, and buckets
+    /// dependent test files into priority tiers. This is a prioritized signal,
+    /// NOT a provably-safe subset — it misses reflection, DI, codegen, and
+    /// data-driven/integration tests. "No tests found" is NOT safe-to-skip.
+    #[command(
+        name = "affected-tests",
+        after_help = "Examples:\n  nestweaver affected-tests --files src/auth.rs,src/db.rs\n  nestweaver affected-tests --base-ref main\n  nestweaver affected-tests --base-ref main --json"
+    )]
+    AffectedTests {
+        #[arg(
+            long,
+            help = "Comma-separated changed file paths (repo-relative)",
+            conflicts_with = "base_ref"
+        )]
+        files: Option<String>,
+        #[arg(
+            long = "base-ref",
+            help = "Git ref to diff against (e.g. main); uses git diff --name-only base...HEAD"
+        )]
+        base_ref: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
     /// Watch a repository for source file changes and re-index incrementally
     ///
     /// Monitors the repo directory for creates, modifies, and deletes of
@@ -943,6 +1211,138 @@ enum Commands {
         #[arg(
             long,
             help = "Path to instance config (TOML) — required for --refresh-wiki-hours"
+        )]
+        config: Option<PathBuf>,
+    },
+    /// Inspect per-path ranking priors (Feature F6).
+    Ranking {
+        #[command(subcommand)]
+        command: RankingCommands,
+    },
+    /// P0.3 — offline retrieval-quality evaluation harness.
+    ///
+    /// Scores retrieval (nDCG@10 / MRR / precision@5) over a JUDGED query set
+    /// so the off-by-default quality features (F6/F7/F1/F12/F17) can be
+    /// MEASURED before being trusted.
+    ///
+    /// HONEST FRAMING: meaningful evaluation needs REAL human relevance labels
+    /// over the actual corpus you index. The bundled sample file is a FORMAT
+    /// TEMPLATE, not a benchmark; metrics on a tiny/synthetic set are not
+    /// authoritative. Look at per-query win/loss + confidence and use
+    /// time/query-based splits — not just the mean — before trusting a small
+    /// delta.
+    #[command(
+        after_help = "Examples:\n  nestweaver eval run --queries ./eval-queries.jsonl\n  nestweaver eval run --queries ./eval-queries.jsonl --json --prf\n  nestweaver eval compare --queries ./eval-queries.jsonl --prf\n\nFormat template + guide: examples/eval/ (eval-queries.example.jsonl, README.md)"
+    )]
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommands,
+    },
+}
+
+/// Subcommands under `nestweaver eval`.
+#[derive(Subcommand)]
+enum EvalCommands {
+    /// Run the harness once over a judged query set and print metrics.
+    ///
+    /// Prints the aggregate (mean nDCG@10 / MRR / precision@5) plus a per-query
+    /// table. With `--json`, prints the full `EvalReport` instead.
+    Run {
+        /// Path to the judged-query file (JSON array or JSONL of
+        /// {query, intent?, relevance} objects). REQUIRED.
+        #[arg(long, help = "Judged-query file (JSON array or JSONL)")]
+        queries: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output the EvalReport as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Enable Feature F7 pseudo-relevance feedback on the BM25 leg (off by default)"
+        )]
+        prf: bool,
+        #[arg(
+            long,
+            help = "Enable Feature F17 reranking of the top-N before scoring (off by default)"
+        )]
+        rerank: bool,
+    },
+    /// Run the SAME judged set twice — baseline vs a toggled feature — and print
+    /// the mean nDCG@10 delta plus per-query win/loss counts.
+    ///
+    /// Pass `--prf` and/or `--rerank` to choose which feature to toggle ON in
+    /// the treatment run (baseline always has it OFF). Judge the result against
+    /// the >= 5% nDCG@10 gate — but remember a small mean delta on a small set
+    /// is NOT authoritative; inspect the win/loss counts too.
+    Compare {
+        /// Path to the judged-query file (JSON array or JSONL). REQUIRED.
+        #[arg(long, help = "Judged-query file (JSON array or JSONL)")]
+        queries: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output the EvalComparison as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Toggle: compare PRF-on (treatment) vs PRF-off (baseline)"
+        )]
+        prf: bool,
+        #[arg(
+            long,
+            help = "Toggle: compare rerank-on (treatment) vs rerank-off (baseline)"
+        )]
+        rerank: bool,
+    },
+}
+
+/// Subcommands under `nestweaver ranking`.
+#[derive(Subcommand)]
+enum RankingCommands {
+    /// Dry-run: show how the configured `[ranking]` priors would rescale a
+    /// single node's relevance. Looks up the node's file-path location, finds
+    /// the last matching glob rule (last-match-wins), and prints the math.
+    Explain {
+        /// UID of the node to explain (e.g. `sym:...`, `note:...`).
+        uid: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML) carrying [ranking]")]
+        config: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "1.0",
+            help = "Base relevance to apply the prior against"
+        )]
+        base_relevance: f64,
+    },
+    /// Feature F12: explain how git-activity recency dampens a symbol's
+    /// CodeRank. Prints `base_pagerank`, `git_activity_score`, and `final_rank`
+    /// (= base × clamped recency multiplier). Neutral (multiplier 1.0) when no
+    /// `<db>.gitactivity.json` sidecar is loaded for the symbol's file.
+    Rank {
+        /// UID or name of the symbol to explain.
+        uid: String,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) carrying [ranking] git_activity_weight"
         )]
         config: Option<PathBuf>,
     },
@@ -1083,6 +1483,14 @@ enum BrainCommands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
+        /// Feature F7: pseudo-relevance-feedback query expansion. Mines
+        /// high-IDF terms from the top hits and re-runs BM25 with them
+        /// down-weighted to improve recall. Off by default.
+        #[arg(
+            long = "prf",
+            help = "Enable pseudo-relevance-feedback query expansion (Feature F7)"
+        )]
+        prf: bool,
     },
     /// Unified PPR context across code + notes. Seeds may be note titles,
     /// tag names (with or without #), symbol names, or any UID
@@ -1182,6 +1590,183 @@ enum BrainCommands {
             help = "Half-life for age-decay in days (default 30.0)"
         )]
         recency_half_life_days: f64,
+        /// Feature F8: embed each high-relevance result's source body inline so
+        /// the agent can skip a follow-up read. Off by default.
+        #[arg(
+            long = "inline-bodies",
+            help = "Embed high-relevance result bodies inline (Feature F8)"
+        )]
+        inline_bodies: bool,
+        /// Repo root for resolving Symbol bodies when --inline-bodies is set
+        /// (default: current dir). Note/Section bodies come from the store and
+        /// ignore this.
+        #[arg(long, help = "Repo root for inline Symbol bodies (default: cwd)")]
+        root: Option<PathBuf>,
+        /// Feature F7: pseudo-relevance-feedback query expansion on the BM25
+        /// leg. Mines high-IDF terms from the top hits and re-runs BM25 with
+        /// them down-weighted to improve recall. Off by default.
+        #[arg(
+            long = "prf",
+            help = "Enable pseudo-relevance-feedback query expansion (Feature F7)"
+        )]
+        prf: bool,
+        /// Feature F17: rerank the top-N retrieved candidates before
+        /// truncation. OFF by default; behavior is byte-identical when off.
+        /// Uses a hand-tuned MONOTONIC heuristic scorer (an unvalidated
+        /// reordering, NOT a proven nDCG win) unless an optional learned-weights
+        /// file `<db>.rerank.json` is present and version-matched. Reranking
+        /// only reorders an already-retrieved set; recall is unchanged.
+        #[arg(
+            long = "rerank",
+            help = "Rerank the top-N retrieved candidates (Feature F17, heuristic, off by default)"
+        )]
+        rerank: bool,
+    },
+    /// List wikilinks whose target is ambiguous or low-confidence
+    /// (confidence < 1.0), with suggested target notes for each.
+    BrokenLinks {
+        #[arg(long, default_value = "5", help = "Max suggested targets per link")]
+        max_suggestions: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// List notes with zero inbound and zero outbound wikilinks. Index/MOC
+    /// notes are excluded via a default allowlist (override with --allow).
+    Orphans {
+        #[arg(long, help = "Restrict to this vault UID")]
+        vault: Option<String>,
+        #[arg(
+            long = "path-prefix",
+            help = "Restrict to notes under this path prefix"
+        )]
+        path_prefix: Option<String>,
+        #[arg(
+            long = "allow",
+            help = "Note path/title to exclude (repeatable; overrides the default allowlist)"
+        )]
+        allow: Vec<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Detect topic clusters by running Leiden community detection over the
+    /// note-to-note wikilink graph. Each cluster is labelled by its most
+    /// central member.
+    TopicClusters {
+        #[arg(long, default_value = "0.5", help = "Leiden resolution")]
+        resolution: f64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Show a tag's note count and the tags that co-occur with it.
+    /// Omit the tag to dump the whole tag co-occurrence graph (all tags).
+    TagGraph {
+        /// Optional focus tag (with or without leading #). When omitted,
+        /// prints the full tag co-occurrence graph for every tag.
+        tag: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// One-shot health summary of the vault's document graph: note/wikilink
+    /// counts, broken links, orphans, average out-degree, top tags, and notes
+    /// by year.
+    DocStats {
+        #[arg(long, default_value = "10", help = "Max entries in top_tags")]
+        top_tags_limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Run the seven F11 memory-bank health checks over the vault: stale
+    /// notes, Supersedes contradictions, orphans, broken wikilinks,
+    /// supersession chains, schema drift, and dangling relationships.
+    Lint {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Propose tier promotions (daily logs → ideas → project files).
+    /// DRY-RUN by default; `--apply` is an explicit no-op stub for now.
+    Consolidate {
+        #[arg(
+            long,
+            help = "Opt into write-mode (currently a no-op stub that warns; default is dry-run)"
+        )]
+        apply: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Walk the typed-relationship graph (Supersedes/DependsOn/CausedBy/
+    /// RelatesTo) from a note, excluding generic wikilinks.
+    Related {
+        /// Seed note UID to traverse from.
+        uid: String,
+        #[arg(
+            long = "edge-type",
+            help = "Edge type to follow (repeatable; default: all four)"
+        )]
+        edge_types: Vec<String>,
+        #[arg(long, default_value = "2", help = "Max BFS depth")]
+        depth: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
 }
 
@@ -1207,6 +1792,50 @@ enum InstanceCommands {
 }
 
 #[derive(Subcommand)]
+enum AdminCommands {
+    /// Print or manage the agent instruction store.
+    ///
+    /// With no flag, prints the main instructions. The stores live at
+    /// `~/.nestweaver/instructions.md` and `~/.nestweaver/instructions.subagent.md`.
+    ///
+    /// NOTE: injected guidance helps but is NOT enforcement — an LLM follows
+    /// instructions probabilistically (Geng et al. 2025).
+    Instructions {
+        #[arg(
+            long,
+            help = "Print the subagent guidance to stdout (single clean output, hook-friendly)"
+        )]
+        for_subagent: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Install FILE as the instruction store (subagent store when --for-subagent is set)"
+        )]
+        set: Option<PathBuf>,
+        #[arg(long, help = "Reset both stores to the bundled defaults")]
+        reset: bool,
+    },
+    /// Install a runtime hook that injects subagent guidance.
+    ///
+    /// For the `claude` runtime, adds a PreToolUse hook on the `Task` matcher
+    /// that runs `nestweaver admin instructions --for-subagent`. Hook JSON
+    /// schemas are Claude-Code-specific.
+    InstallHook {
+        #[arg(
+            long,
+            default_value = "claude",
+            help = "Target runtime (only 'claude' is supported in this version)"
+        )]
+        runtime: String,
+        #[arg(
+            long,
+            help = "Print the JSON patch that would be applied, without writing"
+        )]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCommands {
     /// Build a snapshot from the current graph
     Build {
@@ -1222,6 +1851,57 @@ enum SnapshotCommands {
     Push {
         #[arg(long, help = "Instance ID to push snapshot for")]
         instance: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContractCommands {
+    /// List API contracts derived from spec files and framework handlers.
+    List {
+        #[arg(long, help = "Filter to a single repo by name or UID")]
+        repo: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Show contract drift: routes declared in a spec but not implemented,
+    /// and routes implemented by a handler but declared in no spec.
+    Drift {
+        #[arg(long, help = "Filter to a single repo by name or UID")]
+        repo: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RerankCommands {
+    /// SCAFFOLD: export per-candidate feature+label rows (JSONL) derived from
+    /// F1 interaction success signals (TerminalSuccess/FollowUp → positive) for
+    /// OFFLINE training elsewhere. This does NOT train a model — there is no
+    /// labelled data of meaningful size yet and no eval harness to gate one. It
+    /// exports whatever interaction data exists (possibly empty). A future
+    /// external trainer would consume this JSONL and emit a `<db>.rerank.json`
+    /// weights file, which must beat the monotonic baseline by >= 5% nDCG@10 on
+    /// the (not-yet-built) eval harness before being trusted.
+    ExportTraining {
+        /// Output JSONL path (default: `<db>.rerank-training.jsonl`).
+        #[arg(long, help = "Output JSONL path")]
+        out: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -1243,6 +1923,25 @@ enum InteractionCommands {
         )]
         db: Option<PathBuf>,
     },
+    /// Show recorded interaction events / decayed score for a UID, or the
+    /// top UIDs by a given event kind.
+    Show {
+        /// UID to inspect.
+        #[arg(long)]
+        uid: Option<String>,
+        /// List the top N UIDs (by `--kind`) instead of a single UID.
+        #[arg(long)]
+        top: Option<usize>,
+        /// Event kind to rank by with `--top`: access, query, follow_up,
+        /// impact, terminal_success, or score (default).
+        #[arg(long, default_value = "score")]
+        kind: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1252,6 +1951,44 @@ fn default_db_path() -> PathBuf {
         PathBuf::from(env_db)
     } else {
         PathBuf::from("./nestweaver.lbug")
+    }
+}
+
+/// Resolve the DB path for a read command, honoring `--config`.
+///
+/// Precedence: an explicit `--db` always wins; otherwise the instance
+/// config's `db` field (when `--config` is given and declares one); otherwise
+/// `NESTWEAVER_DB` / the default. This is what makes `--config` actually
+/// select a DB instead of being silently ignored (Bug #19).
+fn resolve_db_with_config(db: Option<PathBuf>, config: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(db) = db {
+        return Ok(db);
+    }
+    if let Some(cfg_path) = config {
+        let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)
+            .with_context(|| format!("loading --config {}", cfg_path.display()))?;
+        if let Some(db) = cfg.db_path() {
+            return Ok(db);
+        }
+    }
+    Ok(default_db_path())
+}
+
+/// Load an optional instance config for `[ranking]`/`[response]` settings.
+/// Returns `None` when no path is given; when a path IS given but fails to
+/// parse, warns and returns `None` — so a typo'd `--config` doesn't silently
+/// disable ranking priors / inline-body tuning.
+fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
+    let p = path?;
+    match nestweaver_engine::InstanceConfig::from_file(p) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "warning: --config {} failed to load ({e}); ranking/response settings ignored",
+                p.display()
+            );
+            None
+        }
     }
 }
 
@@ -1311,6 +2048,11 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     if let Some(scores) = nestweaver_engine::load_interaction_scores(path) {
         store.load_interaction_cache(scores);
     }
+
+    // Feature F12: load the git-activity recency sidecar (if present) so
+    // ranking/hubs demote dormant code at read time. Absent → neutral.
+    let ga_path = nestweaver_engine::sidecar_path(path, ".gitactivity.json");
+    let _ = store.load_git_activity_sidecar(&ga_path);
 
     Ok(store)
 }
@@ -1953,6 +2695,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             output,
             config,
             format,
+            rules_from,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
@@ -1960,11 +2703,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .as_deref()
                 .map(nestweaver_engine::InstanceConfig::from_file)
                 .transpose()?;
+            // Optional hard-rule override loaded from a TOML/markdown file.
+            let override_rules = match &rules_from {
+                Some(path) => {
+                    let contents = std::fs::read_to_string(path)?;
+                    Some(nestweaver_engine::parse_rules_override(&contents)?)
+                }
+                None => None,
+            };
+            let rules_ref = override_rules.as_deref();
+            let cfg_ref = instance_config.as_ref();
             let output_str = match format.as_str() {
-                "skill" => generate_skill(&store, instance_config.as_ref())?,
-                "cursor-rule" => generate_cursor_rule(&store, instance_config.as_ref())?,
-                "agents-md" => generate_agents_md(&store, instance_config.as_ref())?,
-                _ => generate_guide(&store, instance_config.as_ref())?,
+                "skill" => generate_skill_with_rules(&store, cfg_ref, rules_ref)?,
+                "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
+                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref)?,
+                _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
             match output {
                 Some(path) => {
@@ -1975,6 +2728,72 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             Ok((EXIT_SUCCESS, None))
         }
+
+        Commands::Admin { command } => match command {
+            AdminCommands::Instructions {
+                for_subagent,
+                set,
+                reset,
+            } => {
+                use nestweaver_engine::admin;
+                if reset {
+                    admin::reset_instructions()?;
+                    out.status("Instruction stores reset to bundled defaults.");
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                if let Some(src) = set {
+                    let dst = if for_subagent {
+                        admin::set_subagent_instructions(&src)?
+                    } else {
+                        admin::set_main_instructions(&src)?
+                    };
+                    out.status(&format!("Installed instructions to {}", dst.display()));
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                // No flag (or only --for-subagent): print the relevant store.
+                // --for-subagent prints a single clean stdout payload for hooks.
+                let text = if for_subagent {
+                    admin::read_subagent_instructions()?
+                } else {
+                    admin::read_main_instructions()?
+                };
+                print!("{text}");
+                Ok((EXIT_SUCCESS, None))
+            }
+            AdminCommands::InstallHook { runtime, dry_run } => {
+                use nestweaver_engine::admin;
+                let rt = admin::Runtime::parse(&runtime)?;
+                let settings_path = admin::runtime_settings_path(rt);
+                let existing: serde_json::Value = if settings_path.exists() {
+                    let raw = std::fs::read_to_string(&settings_path)?;
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Null
+                };
+                if dry_run {
+                    // PRINT only the minimal delta that WOULD be added — not the
+                    // whole merged settings document (which may contain unrelated
+                    // pre-existing permissions). Do not write.
+                    let delta = admin::compute_hook_delta(rt, &existing)?;
+                    println!("{}", serde_json::to_string_pretty(&delta)?);
+                    eprintln!(
+                        "(dry-run) Would merge the above hook entry into {} (existing settings preserved). Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
+                        settings_path.display()
+                    );
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                let patched = admin::compute_hook_patch(rt, &existing)?;
+                if let Some(parent) = settings_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&patched)?)?;
+                out.status(&format!(
+                    "Hook installed (idempotent) to {}",
+                    settings_path.display()
+                ));
+                Ok((EXIT_SUCCESS, None))
+            }
+        },
 
         Commands::Hubs {
             top,
@@ -2307,11 +3126,81 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Ok((EXIT_SUCCESS, None))
             }
+            InteractionCommands::Show { uid, top, kind, db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                if let Some(n) = top {
+                    let rows = nestweaver_engine::top_uids_by_kind(&db_path, &kind, n);
+                    if rows.is_empty() {
+                        println!("No interaction data for kind '{kind}'.");
+                    } else {
+                        println!("Top {} UIDs by {kind}:", rows.len());
+                        for (uid, value) in rows {
+                            println!("  {value:>10.4}  {uid}");
+                        }
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                } else if let Some(uid) = uid {
+                    match nestweaver_engine::load_node_score(&db_path, &uid) {
+                        Some(ns) => {
+                            println!("Interaction record for {uid}:");
+                            println!("  query_seed_count:       {}", ns.query_seed_count);
+                            println!("  access_count:           {}", ns.access_count);
+                            println!("  result_shown_count:     {}", ns.result_shown_count);
+                            println!("  result_used_count:      {}", ns.result_used_count);
+                            println!("  terminal_success_count: {}", ns.terminal_success_count);
+                            println!("  distinct_sessions:      {}", ns.distinct_sessions);
+                            if ns.last_accessed > 0.0 {
+                                println!(
+                                    "  last_accessed:          {}",
+                                    format_epoch_timestamp(ns.last_accessed)
+                                );
+                            }
+                            println!("  decayed_score:          {:.4}", ns.computed_score);
+                            Ok((EXIT_SUCCESS, None))
+                        }
+                        None => {
+                            println!("No interaction data for UID '{uid}'.");
+                            Ok((EXIT_NOT_FOUND, None))
+                        }
+                    }
+                } else {
+                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
+                    Ok((EXIT_ERROR, None))
+                }
+            }
         },
+
+        Commands::Rerank { command } => match command {
+            RerankCommands::ExportTraining { out, db } => {
+                let db_path = db.unwrap_or_else(default_db_path);
+                let out_path = out.unwrap_or_else(|| {
+                    nestweaver_engine::sidecar_path(&db_path, ".rerank-training.jsonl")
+                });
+                let rows = nestweaver_engine::export_training_rows(&db_path, &out_path)?;
+                println!(
+                    "Exported {rows} training row(s) to {} (SCAFFOLD — no model is trained here).",
+                    out_path.display()
+                );
+                if rows == 0 {
+                    println!(
+                        "No interaction data found. Enable `nestweaver mcp --track-interactions` to accumulate labels."
+                    );
+                }
+                println!(
+                    "Note: a learned reranker is only trustworthy after the eval harness gates it at >= 5% nDCG@10; the default scorer is a transparent heuristic."
+                );
+                Ok((EXIT_SUCCESS, None))
+            }
+        },
+
+        Commands::Contracts { command } => run_contracts(command),
 
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0),
+        Commands::Memory { command } => run_memory(*command, t0),
+        Commands::Ranking { command } => run_ranking(command, t0),
+        Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
         Commands::Embed {
             db,
             endpoint,
@@ -2443,6 +3332,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let store = open_store(db.as_deref())?;
 
+            if format == "msgpack" {
+                let graph = export_in_memory_graph(&store)?;
+                let bytes = rmp_serde::to_vec(&graph)
+                    .with_context(|| "failed to serialize graph to msgpack")?;
+                let default_db = default_db_path();
+                let db_path = db.as_deref().unwrap_or(&default_db);
+                let path = match &output {
+                    Some(p) => p.clone(),
+                    None => {
+                        let mut name = db_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        name.push_str(".graph.msgpack");
+                        db_path
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join(name)
+                    }
+                };
+                std::fs::write(&path, &bytes)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                out.status(&format!(
+                    "Exported graph to {} ({} nodes, {} edges, {} bytes)",
+                    path.display(),
+                    graph.uids.len(),
+                    graph.edges.len(),
+                    bytes.len()
+                ));
+                let stats = format!("exported msgpack in {}", format_elapsed(t0.elapsed()));
+                return Ok((EXIT_SUCCESS, Some(stats)));
+            }
+
             let write_to: Box<dyn std::io::Write> = match &output {
                 Some(path) => Box::new(
                     std::fs::File::create(path)
@@ -2458,7 +3381,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "mermaid" => export_mermaid(&store, top, &mut writer)?,
                 other => {
                     eprintln!(
-                        "Unknown format '{}'. Supported: cypher, graphml, mermaid",
+                        "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
                         other
                     );
                     return Ok((EXIT_ERROR, None));
@@ -2576,6 +3499,93 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 result.risk_level,
                 format_elapsed(t0.elapsed())
             );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::AffectedTests {
+            files,
+            base_ref,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            // Resolve changed files: explicit --files, else git diff against --base-ref.
+            let changed_files: Vec<String> = if let Some(files_str) = files {
+                files_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else if let Some(base) = base_ref {
+                let repo_root = detect_repo_root();
+                out.status(&format!("Detecting changed files via git diff {base}..."));
+                changed_files_from_git(&repo_root, Some(&base))
+                    .context("git diff")?
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            } else {
+                eprintln!("Error: provide either --files or --base-ref");
+                return Ok((EXIT_ERROR, None));
+            };
+
+            if changed_files.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "changed_files": [],
+                            "changed_symbols": [],
+                            "tier_1": [],
+                            "tier_2": [],
+                            "tier_3": [],
+                            "summary": "0 tier-1, 0 tier-2, 0 tier-3 tests affected",
+                        }))?
+                    );
+                } else {
+                    println!("No changed files detected.");
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            let result = affected_tests(&store, &changed_files)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.summary);
+                println!();
+                if !result.changed_symbols.is_empty() {
+                    println!("Changed symbols ({}):", result.changed_symbols.len());
+                    for s in &result.changed_symbols {
+                        println!("  {} — {}", s.name, s.file_path);
+                    }
+                    println!();
+                }
+                let print_tier = |label: &str, tier: &[nestweaver_engine::AffectedTestFile]| {
+                    if tier.is_empty() {
+                        return;
+                    }
+                    println!("{label} ({} file(s)):", tier.len());
+                    for f in tier {
+                        println!(
+                            "  {} (conf {:.2}) — {}",
+                            f.test_file,
+                            f.confidence,
+                            f.tests.join(", ")
+                        );
+                    }
+                    println!();
+                };
+                print_tier("Tier 1 (direct)", &result.tier_1);
+                print_tier("Tier 2 (caller's tests)", &result.tier_2);
+                print_tier("Tier 3 (transitive)", &result.tier_3);
+                println!("Note: {}", result.disclaimer);
+            }
+
+            let stats = format!("{} in {}", result.summary, format_elapsed(t0.elapsed()));
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
@@ -2710,13 +3720,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             port,
             config: _config,
             no_open,
+            watch,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            let state = nestweaver_web::state::AppState::new(store, tantivy, db_path);
+            let state = if watch {
+                let store = std::sync::Arc::new(open_store(Some(&db_path))?);
+                nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
+            } else {
+                let store = open_store(Some(&db_path))?;
+                nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
+            };
+
+            if watch {
+                let repo_root = detect_repo_root();
+                let code_store = state.store.clone();
+                let code_tx = state.event_tx.clone();
+                let code_db = db_path.clone();
+                let code_instance = "default".to_string();
+
+                std::thread::spawn(move || {
+                    let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
+                    let store_for_cb = code_store.clone();
+                    let on_change = Box::new(move || {
+                        let generation = store_for_cb.graph_generation();
+                        let _ = code_tx.send(nestweaver_web::state::GraphEvent {
+                            event_type: "graph:updated".to_string(),
+                            payload: serde_json::json!({"source": "code_watcher", "generation": generation}),
+                        });
+                    });
+                    if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
+                        tracing::error!("CodeWatcher failed: {e}");
+                    }
+                });
+            }
 
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
@@ -2746,6 +3785,127 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
+        Commands::RegexSearch {
+            pattern,
+            path_prefix,
+            kinds,
+            limit,
+            max_millis,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let res = store
+                .regex_search(
+                    &pattern,
+                    path_prefix.as_deref(),
+                    kinds.as_deref(),
+                    limit,
+                    max_millis,
+                )
+                .context("regex_search")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else if res.results.is_empty() {
+                println!("No matches for '{pattern}'.");
+            } else {
+                println!("Found {} match(es) for '{pattern}':", res.results.len());
+                for m in &res.results {
+                    println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
+                }
+                if res.truncated {
+                    println!("(results truncated — hit candidate cap or time budget)");
+                }
+                if res.scanned_fallback {
+                    println!(
+                        "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                    );
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::CountPatterns {
+            patterns,
+            path_prefix,
+            kinds,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let counts = store
+                .count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref())
+                .context("count_patterns")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&counts)?);
+            } else {
+                for c in &counts {
+                    println!(
+                        "'{}': {} match(es) across {} file(s)",
+                        c.pattern, c.total_matches, c.files_matched
+                    );
+                    for f in &c.top_files {
+                        println!("    {} ({})", f.path, f.count);
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::ReadSymbols {
+            targets,
+            neighbors,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let res = nestweaver_engine::read_symbols::read_symbols(
+                &store,
+                &targets,
+                &root,
+                neighbors,
+                token_budget,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                for w in &res.symbols {
+                    let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+                    println!(
+                        "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+                        w.name, w.kind, w.path, w.start_line, w.end_line, tag
+                    );
+                    println!("{}", w.body);
+                    println!();
+                }
+                for nf in &res.not_found {
+                    eprintln!("not found: {nf}");
+                }
+                for a in &res.ambiguous {
+                    eprintln!(
+                        "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                        a.query,
+                        a.candidate_uids.len()
+                    );
+                }
+                if res.truncated {
+                    eprintln!(
+                        "truncated: {} symbol(s) dropped for token budget",
+                        res.dropped.len()
+                    );
+                }
+            }
+            // Exit 2 when targets were requested but none resolved to a symbol
+            // (consistent with `symbol`/`impact`). When at least one target
+            // resolves, succeed even if others were not-found/ambiguous.
+            if !targets.is_empty() && res.symbols.is_empty() {
+                return Ok((EXIT_NOT_FOUND, None));
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
         Commands::Symbol {
             name_or_uid,
             json,
@@ -3069,10 +4229,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Collect member UIDs for the post-PPR boost. These are the
             // notes and symbols declared as belonging to this project.
+            // Member note UIDs are tracked separately: they get seeded into
+            // PPR and surfaced into `connected` (Bug #12).
             let mut member_uids: Vec<String> = Vec::new();
+            let mut member_note_uids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let note_uids = store
                 .list_project_note_uids(&project.uid)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            member_note_uids.extend(note_uids.iter().cloned());
             member_uids.extend(note_uids);
             let sym_uids = store
                 .list_project_symbol_uids(&project.uid)
@@ -3087,7 +4252,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 vec![]
             };
             for comp_uid in &comp_uids {
-                member_uids.extend(store.list_project_note_uids(comp_uid).unwrap_or_default());
+                let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+                member_note_uids.extend(comp_notes.iter().cloned());
+                member_uids.extend(comp_notes);
                 member_uids.extend(store.list_project_symbol_uids(comp_uid).unwrap_or_default());
             }
 
@@ -3115,12 +4282,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Seed PPR from the project node itself (not all member UIDs).
-            // With ProjectContext intent the PROJECT_INCLUDES_* edges get a
-            // 5x weight boost, so the walk efficiently discovers all members
-            // and places them in `connected` instead of `seeds`.
+            // Seed PPR from the project node, its components, and the
+            // project's member notes (Bug #12). Seeding the notes guarantees
+            // they survive the `min_score` filter in PPR — when a project
+            // declares repos, the project node's mass is split across tens of
+            // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
+            // below threshold so it never reaches `connected`.
             let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
             ppr_seeds.extend(comp_uids);
+            ppr_seeds.extend(member_note_uids.iter().cloned());
 
             let defaults = HybridSearchConfig::default();
             let aliases = load_alias_sidecar(&db_path);
@@ -3134,6 +4304,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(nestweaver_store::QueryIntent::ProjectContext),
             ) {
                 Ok(mut result) => {
+                    // Surface the project's curated member notes into
+                    // `connected` (Bug #12). Seeded notes land in `seeds`,
+                    // which print_brain_context_json does not render.
+                    nestweaver_engine::promote_member_notes_into_connected(
+                        &mut result,
+                        &member_note_uids,
+                    );
+
                     // Post-PPR scope boost: multiply relevance for nodes that
                     // belong to the project so declared content ranks highest.
                     let member_set: std::collections::HashSet<&str> =
@@ -3208,6 +4386,152 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
+        Commands::Investigate {
+            query,
+            scope,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let root = root.unwrap_or_else(detect_repo_root);
+            let scope = scope.unwrap_or_else(|| "vault".to_string());
+            let result = nestweaver_engine::investigate(
+                &store,
+                tantivy.as_ref(),
+                Some(&db_path),
+                &root,
+                &query,
+                &scope,
+                Some(token_budget),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Bundle: {}  (query: {:?})", result.bundle_id, result.query);
+                println!(
+                    "{} domain(s), {} entr{}{}",
+                    result.domains.len(),
+                    result.entries.len(),
+                    if result.entries.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    if result.more_available > 0 {
+                        format!(
+                            " ({} more available — raise --token-budget)",
+                            result.more_available
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                for d in &result.domains {
+                    println!("\n[{}]", d.label);
+                    for asset_id in &d.members {
+                        if let Some(e) = result.entries.iter().find(|e| &e.asset_id == asset_id) {
+                            let marker = if e.asset_id == d.entry_point {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!(
+                                "  {marker} {}  {} ({})  {}",
+                                e.asset_id, e.title, e.kind, e.location
+                            );
+                            if let Some(s) = &e.summary {
+                                println!("      {s}");
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
+                    result.bundle_id
+                );
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::InvestigateExpand {
+            bundle_id,
+            targets,
+            root,
+            json,
+            db,
+        } => {
+            if targets.is_empty() {
+                eprintln!("Error: --targets must list at least one asset_id or uid");
+                return Ok((EXIT_ERROR, None));
+            }
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let root = root.unwrap_or_else(detect_repo_root);
+            let result = nestweaver_engine::investigate_expand(
+                &store, &db_path, &root, &bundle_id, &targets,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                if !result.unresolved.is_empty() {
+                    println!("Unresolved targets: {}", result.unresolved.join(", "));
+                }
+                for e in &result.expanded {
+                    println!("\n=== {}  {} ({}) ===", e.asset_id, e.title, e.location);
+                    if let Some(body) = &e.inline_body {
+                        println!("{body}");
+                    }
+                    let neighbors: Vec<&nestweaver_engine::NeighborRef> = result
+                        .neighbors
+                        .iter()
+                        .filter(|n| n.of == e.asset_id)
+                        .collect();
+                    if !neighbors.is_empty() {
+                        println!("-- neighbors --");
+                        for n in neighbors {
+                            println!("  [{}] {} ({})", n.relation, n.title, n.uid);
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::InvestigateHydrate {
+            bundle_id,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let root = root.unwrap_or_else(detect_repo_root);
+            let result = nestweaver_engine::investigate_hydrate(
+                &store,
+                &db_path,
+                &root,
+                &bundle_id,
+                Some(token_budget),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Hydrated {} entr{} in bundle {}",
+                    result.hydrated,
+                    if result.hydrated == 1 { "y" } else { "ies" },
+                    result.bundle_id
+                );
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
         Commands::MaterializeProjects { config, db } => {
             let config_path = &config;
             let instance_config = nestweaver_engine::InstanceConfig::from_file(config_path)
@@ -3267,6 +4591,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             force,
             name,
+            with_trigrams,
+            with_git_activity,
+            config,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -3358,6 +4685,48 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
             out.status("PageRank complete.");
+
+            // Feature F12: mine git history and write the recency sidecar so
+            // subsequent commands demote dormant code at rank-read time.
+            // Honor the per-repo `use_git_activity = false` opt-out when a
+            // config matches this repo's URL.
+            let repo_opted_out = load_instance_config_opt(config.as_deref())
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .find(|r| r.url == repo_url)
+                        .and_then(|r| r.use_git_activity)
+                        == Some(false)
+                })
+                .unwrap_or(false);
+
+            if with_git_activity && repo_opted_out {
+                out.status(
+                    "Repo has use_git_activity = false in config; skipping git-activity sidecar.",
+                );
+            } else if with_git_activity {
+                out.status("Mining git activity...");
+                let scores = nestweaver_engine::git_activity::compute_git_activity(&repo_path);
+                if scores.is_empty() {
+                    out.status("No usable git history found; git-activity sidecar not written.");
+                } else {
+                    let ga_path = nestweaver_engine::sidecar_path(&db_path, ".gitactivity.json");
+                    nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path)
+                        .with_context(|| "save git activity sidecar")?;
+                    out.status(&format!(
+                        "Git activity sidecar written ({} files scored).",
+                        scores.len()
+                    ));
+                }
+            }
+
+            if with_trigrams {
+                out.status("Building trigram index...");
+                let postings = store
+                    .build_trigram_index()
+                    .with_context(|| "build_trigram_index")?;
+                out.status(&format!("Trigram index built ({postings} postings)."));
+            }
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
@@ -3566,7 +4935,464 @@ where
     Ok(())
 }
 
+/// Resolve a node UID to its file-path location for ranking-prior matching.
+/// Mirrors the location each kind renders with in brain results.
+fn ranking_location_for_uid(store: &nestweaver_store::GraphStore, uid: &str) -> Option<String> {
+    if uid.starts_with("sym:") {
+        let s = store.lookup_symbol(uid).ok()?;
+        Some(format!("{}:{}", s.file_path, s.start_line))
+    } else if uid.starts_with("note:") {
+        store.lookup_note(uid).ok().map(|n| n.file_path)
+    } else if uid.starts_with("sec:") {
+        let sec = store.lookup_section(uid).ok()?;
+        store.lookup_note(&sec.note_uid).ok().map(|n| n.file_path)
+    } else if uid.starts_with("head:") {
+        let h = store.lookup_heading(uid).ok()?;
+        store.lookup_note(&h.note_uid).ok().map(|n| n.file_path)
+    } else {
+        None
+    }
+}
+
+/// Build a [`HybridSearchConfig`] for the eval harness with the given PRF
+/// toggle, otherwise defaults (identical to the product's default retrieval).
+fn eval_hybrid_config(prf: bool) -> HybridSearchConfig {
+    HybridSearchConfig {
+        prf,
+        ..HybridSearchConfig::default()
+    }
+}
+
+/// Print the per-query table and aggregate for an `EvalReport` (human form).
+fn print_eval_report(report: &nestweaver_engine::EvalReport) {
+    println!("Query                                              nDCG@10    MRR  P@5");
+    println!("{}", "-".repeat(78));
+    for row in &report.per_query {
+        let q: String = row.query.chars().take(48).collect();
+        println!(
+            "{q:<48}  {:>7.4}  {:>5.3}  {:>4.2}",
+            row.ndcg10, row.mrr, row.p_at_5
+        );
+    }
+    println!("{}", "-".repeat(78));
+    println!(
+        "MEAN over {} quer{}:  nDCG@10={:.4}  MRR={:.4}  P@5={:.4}",
+        report.n,
+        if report.n == 1 { "y" } else { "ies" },
+        report.mean_ndcg10,
+        report.mean_mrr,
+        report.mean_p5,
+    );
+}
+
+/// Dispatch an `eval` subcommand (P0.3 retrieval-quality harness).
+fn run_eval_cmd(command: EvalCommands) -> anyhow::Result<i32> {
+    // Honest-framing banner shown on every human-readable run.
+    const HONEST_NOTE: &str = "Note: meaningful evaluation requires REAL human relevance labels over your actual\n      corpus. A tiny/synthetic set is NOT authoritative — inspect per-query\n      win/loss and confidence, and use time/query-based splits, before trusting a\n      small mean delta.";
+
+    match command {
+        EvalCommands::Run {
+            queries,
+            db,
+            json,
+            prf,
+            rerank,
+        } => {
+            let queries_data = nestweaver_engine::load_judged_queries(&queries)?;
+            let db_path = resolve_db_with_config(db, None)?;
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let aliases = load_alias_sidecar(&db_path);
+
+            let cfg = eval_hybrid_config(prf);
+            let report = nestweaver_engine::run_eval(
+                &store,
+                tantivy.as_ref(),
+                &queries_data,
+                &cfg,
+                &aliases,
+                Some(&db_path),
+                rerank,
+            )?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_eval_report(&report);
+                println!("\n{HONEST_NOTE}");
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        EvalCommands::Compare {
+            queries,
+            db,
+            json,
+            prf,
+            rerank,
+        } => {
+            if !prf && !rerank {
+                anyhow::bail!("eval compare needs a feature to toggle: pass --prf and/or --rerank");
+            }
+            let queries_data = nestweaver_engine::load_judged_queries(&queries)?;
+            let db_path = resolve_db_with_config(db, None)?;
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let aliases = load_alias_sidecar(&db_path);
+
+            // Baseline: feature(s) OFF. Treatment: the chosen toggle(s) ON.
+            // PRF lives in the HybridSearchConfig; rerank is a run_eval flag.
+            let baseline_cfg = eval_hybrid_config(false);
+            let treatment_cfg = eval_hybrid_config(prf);
+
+            let run = |cfg: &HybridSearchConfig, do_rerank: bool| {
+                nestweaver_engine::run_eval(
+                    &store,
+                    tantivy.as_ref(),
+                    &queries_data,
+                    cfg,
+                    &aliases,
+                    Some(&db_path),
+                    do_rerank,
+                )
+            };
+            let baseline = run(&baseline_cfg, false)?;
+            let treatment = run(&treatment_cfg, rerank)?;
+
+            let mut toggles = Vec::new();
+            if prf {
+                toggles.push("prf");
+            }
+            if rerank {
+                toggles.push("rerank");
+            }
+            let label = toggles.join("+");
+            let cmp = nestweaver_engine::compare_reports(
+                format!("{label}-off"),
+                baseline,
+                format!("{label}-on"),
+                treatment,
+            );
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cmp)?);
+            } else {
+                println!(
+                    "Comparison: {} (baseline) vs {} (treatment) over {} quer{}",
+                    cmp.baseline_label,
+                    cmp.treatment_label,
+                    cmp.baseline.n,
+                    if cmp.baseline.n == 1 { "y" } else { "ies" },
+                );
+                println!("  baseline  mean nDCG@10 = {:.4}", cmp.baseline.mean_ndcg10);
+                println!(
+                    "  treatment mean nDCG@10 = {:.4}",
+                    cmp.treatment.mean_ndcg10
+                );
+                println!(
+                    "  delta = {:+.4}  ({:+.1}% relative)",
+                    cmp.mean_ndcg10_delta,
+                    cmp.mean_ndcg10_rel_delta * 100.0,
+                );
+                println!(
+                    "  per-query: {} win(s), {} loss(es), {} tie(s)",
+                    cmp.wins, cmp.losses, cmp.ties,
+                );
+                let gate = cmp.mean_ndcg10_rel_delta >= 0.05;
+                println!(
+                    "  >= 5% nDCG@10 gate: {}",
+                    if gate {
+                        "MET (mean only — confirm with per-query win/loss + a larger set)"
+                    } else {
+                        "NOT met"
+                    }
+                );
+                println!("\n{HONEST_NOTE}");
+            }
+            Ok(EXIT_SUCCESS)
+        }
+    }
+}
+
+/// Dispatch a `ranking` subcommand.
+fn run_ranking(
+    command: RankingCommands,
+    t0: std::time::Instant,
+) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        RankingCommands::Explain {
+            uid,
+            json,
+            db,
+            config,
+            base_relevance,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+
+            let ranking = load_instance_config_opt(config.as_deref())
+                .map(|c| c.ranking)
+                .unwrap_or_default();
+
+            // Resolve the node's location (the path globs are matched against).
+            // Exit 2 when the uid doesn't resolve to a node, consistent with
+            // `symbol`/`impact`/`ranking rank`.
+            let location = match ranking_location_for_uid(&store, &uid) {
+                Some(loc) => loc,
+                None => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": "not found", "uid": uid}));
+                    } else {
+                        eprintln!("uid '{uid}' not found.");
+                    }
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+            };
+
+            // Delegate the matching + clamping to the engine so the math matches
+            // exactly what brain context / search apply.
+            let (matched, final_relevance) =
+                nestweaver_engine::explain_ranking_prior(&location, base_relevance, &ranking);
+
+            if json {
+                let matched_json = match &matched {
+                    Some((glob, mult)) => serde_json::json!({
+                        "glob": glob,
+                        "multiplier": mult,
+                    }),
+                    None => serde_json::Value::Null,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "uid": uid,
+                        "location": location,
+                        "base_relevance": base_relevance,
+                        "matched_rule": matched_json,
+                        "final_relevance": final_relevance,
+                    }))?
+                );
+            } else {
+                println!("uid:             {uid}");
+                println!("location:        {location}");
+                println!("base_relevance:  {base_relevance}");
+                match &matched {
+                    Some((glob, mult)) => {
+                        println!("matched_rule:    {glob} (x{mult})");
+                    }
+                    None => println!("matched_rule:    none"),
+                }
+                println!("final_relevance: {final_relevance}");
+            }
+            Ok((
+                EXIT_SUCCESS,
+                Some(format!("done in {}", format_elapsed(t0.elapsed()))),
+            ))
+        }
+        RankingCommands::Rank {
+            uid,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+
+            // Apply the configured git-activity weight if a config carries one.
+            if let Some(cfg) = load_instance_config_opt(config.as_deref()) {
+                store.set_git_activity_weight(cfg.ranking.git_activity_weight);
+            }
+
+            // Resolve name-or-uid → uid, then load the symbol.
+            let resolved = match resolve_uid(&store, &uid)? {
+                ResolveResult::Found(u) => u,
+                ResolveResult::NotFound => {
+                    eprintln!("Symbol not found: {uid}");
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+                ResolveResult::Ambiguous(matches) => {
+                    eprintln!("Ambiguous symbol '{uid}' — {} matches:", matches.len());
+                    for m in matches.iter().take(10) {
+                        eprintln!("  {} ({}:{})", m.uid, m.file_path, m.start_line);
+                    }
+                    return Ok((EXIT_AMBIGUOUS, None));
+                }
+            };
+
+            let sym = store
+                .lookup_symbol(&resolved)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let base_pagerank = store
+                .pagerank_scores()
+                .get(&resolved)
+                .copied()
+                .unwrap_or(0.0);
+            let git_activity_score = store.git_activity_score(&sym.file_path);
+            let weight = store.git_activity_weight();
+            let multiplier = nestweaver_store::git_activity_multiplier(git_activity_score, weight);
+            let final_rank = base_pagerank * multiplier;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "uid": resolved,
+                        "file_path": sym.file_path,
+                        "base_pagerank": base_pagerank,
+                        "git_activity_score": git_activity_score,
+                        "git_activity_weight": weight,
+                        "multiplier": multiplier,
+                        "final_rank": final_rank,
+                    }))?
+                );
+            } else {
+                println!("uid:                {resolved}");
+                println!("file_path:          {}", sym.file_path);
+                println!("base_pagerank:      {base_pagerank:.8}");
+                match git_activity_score {
+                    Some(s) => println!("git_activity_score: {s:.4}"),
+                    None => println!("git_activity_score: (none → neutral)"),
+                }
+                println!("multiplier:         {multiplier:.4} (weight {weight})");
+                println!("final_rank:         {final_rank:.8}");
+            }
+            Ok((
+                EXIT_SUCCESS,
+                Some(format!("done in {}", format_elapsed(t0.elapsed()))),
+            ))
+        }
+    }
+}
+
 /// Dispatch a `brain` subcommand.
+/// Current wall-clock time as Unix epoch seconds (f64).
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn run_memory(
+    command: MemoryCommands,
+    t0: std::time::Instant,
+) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        MemoryCommands::Lint { json, db, config } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let report = nestweaver_engine::memory_lint(&store, now_epoch_secs())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Memory lint:");
+                println!("  stale notes:           {}", report.stale.len());
+                println!("  contradictions:        {}", report.contradictions.len());
+                println!("  orphans:               {}", report.orphans.len());
+                println!("  broken wikilinks:      {}", report.broken_wikilinks.len());
+                println!(
+                    "  supersession chains:   {}",
+                    report.supersession_chains.len()
+                );
+                println!("  schema drift:          {}", report.schema_drift.len());
+                println!(
+                    "  dangling relationships: {}",
+                    report.dangling_relationships.len()
+                );
+                for s in &report.stale {
+                    println!("  stale: {} ({} days)", s.file_path, s.days_stale);
+                }
+                for c in &report.contradictions {
+                    println!("  contradiction cycle: {}", c.cycle.join(" → "));
+                }
+                for d in &report.dangling_relationships {
+                    println!(
+                        "  dangling: {} -[{}]-> {} (missing)",
+                        d.source_uid, d.edge_type, d.target_uid
+                    );
+                }
+            }
+            let issues = report.stale.len()
+                + report.contradictions.len()
+                + report.supersession_chains.len()
+                + report.schema_drift.len()
+                + report.dangling_relationships.len();
+            let stats = format!("{} issue(s) in {}", issues, format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        MemoryCommands::Consolidate {
+            apply,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let manifest = nestweaver_engine::memory_consolidate(&store, apply, now_epoch_secs())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            } else {
+                println!(
+                    "Consolidation ({}):",
+                    if manifest.dry_run { "dry-run" } else { "apply" }
+                );
+                for w in &manifest.warnings {
+                    println!("  warning: {w}");
+                }
+                if manifest.proposals.is_empty() {
+                    println!("  no promotion candidates.");
+                } else {
+                    for p in &manifest.proposals {
+                        println!("  promote {} → {}", p.source_path, p.promote_to);
+                        println!("    {}", p.rationale);
+                    }
+                }
+            }
+            let stats = format!(
+                "{} proposal(s) in {}",
+                manifest.proposals.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        MemoryCommands::Related {
+            uid,
+            edge_types,
+            depth,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let related =
+                nestweaver_engine::memory_related(&store, &uid, &edge_types, Some(depth))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&related)?);
+            } else if related.is_empty() {
+                println!("No typed neighbours found for {uid}.");
+            } else {
+                println!("Typed neighbours of {uid} ({}):", related.len());
+                for r in &related {
+                    println!(
+                        "  [{}] {} — {} (via {})",
+                        r.depth, r.title, r.file_path, r.via_edge
+                    );
+                }
+            }
+            let stats = format!(
+                "{} neighbour(s) in {}",
+                related.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+    }
+}
+
 fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
@@ -3749,13 +5575,9 @@ fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
 
-        BrainCommands::Status {
-            json,
-            db,
-            config: _,
-        } => {
-            let db_default = default_db_path();
-            let db_path = db.as_deref().unwrap_or(&db_default);
+        BrainCommands::Status { json, db, config } => {
+            let db_resolved = resolve_db_with_config(db, config.as_deref())?;
+            let db_path = db_resolved.as_path();
             let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
             let note_count = store.count_notes().map_err(|e| anyhow::anyhow!(e))?;
@@ -3859,6 +5681,22 @@ fn run_brain(
                 println!("  Tags:      {tag_count}");
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
+                // Interaction tracking is opt-in (enabled via `mcp
+                // --track-interactions`). Its presence is indicated by an
+                // interaction sidecar; when absent, surface the hint.
+                match nestweaver_engine::load_interaction_data(db_path) {
+                    Some(data) => {
+                        println!(
+                            "  interaction_tracking: enabled ({} nodes scored)",
+                            data.scores.len()
+                        );
+                    }
+                    None => {
+                        println!(
+                            "  interaction_tracking: disabled (run with --track-interactions to enable)"
+                        );
+                    }
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -4164,23 +6002,51 @@ fn run_brain(
             limit,
             json,
             db,
-            config: _,
+            config,
+            prf,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+
+            // Parse the instance config once and reuse for ranking priors and
+            // the Feature F7 `[ranking] enable_prf` default.
+            let instance_cfg = load_instance_config_opt(config.as_deref());
+            // Feature F6: per-path ranking priors from `[ranking]`. None → no-op.
+            let ranking_config = instance_cfg
+                .as_ref()
+                .map(|c| c.ranking.clone())
+                .filter(|r| !r.is_empty());
+            // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
+            let prf_enabled = prf
+                || instance_cfg
+                    .as_ref()
+                    .map(|c| c.ranking.enable_prf)
+                    .unwrap_or(false);
 
             // Expand the query with taxonomy aliases for better recall.
             let aliases = load_alias_sidecar(&db_path);
             let query = expand_query_with_aliases(&raw_query, &aliases);
 
             // ── Vault note results ──────────────────────────────────────
+            let mut expansion_terms: Vec<String> = Vec::new();
             let (note_results, engine) = if let Some(ref idx) = tantivy {
                 let raw_limit = limit * 5;
-                let hits = idx
-                    .search(&query, raw_limit)
-                    .with_context(|| "tantivy search")?;
+                let hits = if prf_enabled {
+                    let (hits, terms) = idx
+                        .search_prf(
+                            &query,
+                            raw_limit,
+                            nestweaver_engine::query::nestweaver_store_stoplist(),
+                        )
+                        .with_context(|| "tantivy prf search")?;
+                    expansion_terms = terms;
+                    hits
+                } else {
+                    idx.search(&query, raw_limit)
+                        .with_context(|| "tantivy search")?
+                };
                 let grouped = group_bm25_hits_by_note(&store, &hits, limit);
                 (grouped, "bm25")
             } else {
@@ -4212,6 +6078,52 @@ fn run_brain(
                 .filter(|sym| !seen_titles.contains(&sym.name.to_lowercase()))
                 .collect();
 
+            // Feature F6: apply per-path ranking priors as a multiplier on each
+            // result's relevance, keyed by file-path glob. Reuse the engine
+            // helper by projecting results into BrainNodes, then map the
+            // adjusted relevance back by UID. No config → empty map (no-op).
+            let mut note_results = note_results;
+            let prior_scores: std::collections::HashMap<String, f64> =
+                if let Some(ref ranking) = ranking_config {
+                    let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
+                    for n in &note_results {
+                        let location = store
+                            .lookup_note(&n.note_uid)
+                            .map(|note| note.file_path)
+                            .unwrap_or_default();
+                        probe.push(nestweaver_engine::BrainNode {
+                            uid: n.note_uid.clone(),
+                            kind: "Note".to_string(),
+                            title: n.title.clone(),
+                            location,
+                            relevance: n.best_score as f64,
+                            inline_body: None,
+                        });
+                    }
+                    for sym in &code_results {
+                        probe.push(nestweaver_engine::BrainNode {
+                            uid: sym.uid.clone(),
+                            kind: format!("Symbol/{}", sym.kind),
+                            title: sym.name.clone(),
+                            location: format!("{}:{}", sym.file_path, sym.start_line),
+                            relevance: 0.5,
+                            inline_body: None,
+                        });
+                    }
+                    nestweaver_engine::apply_ranking_priors(&mut probe, ranking);
+                    probe.into_iter().map(|n| (n.uid, n.relevance)).collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+            // Fold adjusted note scores back in.
+            for n in &mut note_results {
+                if let Some(&adj) = prior_scores.get(&n.note_uid) {
+                    n.best_score = adj as f32;
+                }
+            }
+            // Symbol display score: prior-adjusted when present, else 0.5.
+            let code_score = |uid: &str| prior_scores.get(uid).copied().unwrap_or(0.5);
+
             let result_count = note_results.len() + code_results.len();
 
             if json {
@@ -4235,7 +6147,7 @@ fn run_brain(
                         "uid": sym.uid,
                         "kind": format!("Symbol/{}", sym.kind),
                         "title": sym.name,
-                        "score": 0.5,
+                        "score": code_score(&sym.uid),
                         "location": format!("{}:{}", sym.file_path, sym.start_line),
                     }));
                 }
@@ -4246,15 +6158,17 @@ fn run_brain(
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 results.truncate(limit);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "query": query,
-                        "engine": engine,
-                        "results": results,
-                        "total_matches": results.len(),
-                    }))?
-                );
+                let mut payload = serde_json::json!({
+                    "query": query,
+                    "engine": engine,
+                    "results": results,
+                    "total_matches": results.len(),
+                });
+                // Feature F7: surface PRF-mined expansion terms for auditing.
+                if !expansion_terms.is_empty() {
+                    payload["expansion_terms"] = serde_json::json!(expansion_terms);
+                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if note_results.is_empty() && code_results.is_empty() {
                 println!("No results for '{query}'.");
             } else {
@@ -4264,10 +6178,15 @@ fn run_brain(
                     "Brain search (substring fallback)"
                 };
                 println!(
-                    "{}: {} result(s)\n",
+                    "{}: {} result(s)",
                     header,
                     note_results.len() + code_results.len()
                 );
+                // Feature F7: show PRF-mined expansion terms for auditing.
+                if !expansion_terms.is_empty() {
+                    println!("  PRF expansion terms: {}", expansion_terms.join(", "));
+                }
+                println!();
                 for g in &note_results {
                     if g.matched_headings.is_empty() {
                         println!("  [{:.2}] {}", g.best_score, g.title);
@@ -4282,8 +6201,12 @@ fn run_brain(
                 }
                 for sym in &code_results {
                     println!(
-                        "  [0.50] {} [{}] @ {}:{}",
-                        sym.name, sym.kind, sym.file_path, sym.start_line,
+                        "  [{:.2}] {} [{}] @ {}:{}",
+                        code_score(&sym.uid),
+                        sym.name,
+                        sym.kind,
+                        sym.file_path,
+                        sym.start_line,
                     );
                 }
             }
@@ -4301,7 +6224,7 @@ fn run_brain(
             limit,
             json,
             db,
-            config: _,
+            config: config_path,
             kinds,
             repos,
             vaults,
@@ -4314,11 +6237,37 @@ fn run_brain(
             since,
             recency_weight,
             recency_half_life_days,
+            inline_bodies,
+            root,
+            prf,
+            rerank,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+
+            // Parse the instance config once (when supplied) and reuse it for
+            // both Feature F8 ([response]) and Feature F6 ([ranking]).
+            let instance_cfg = load_instance_config_opt(config_path.as_deref());
+            // Feature F8: response tuning comes from [response] in the instance
+            // config when one is supplied; otherwise the built-in defaults.
+            let response_config = instance_cfg
+                .as_ref()
+                .map(|c| c.response.clone())
+                .unwrap_or_default();
+            // Feature F6: per-path ranking priors. None → no-op below.
+            let ranking_config = instance_cfg
+                .as_ref()
+                .map(|c| c.ranking.clone())
+                .filter(|r| !r.is_empty());
+
+            // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
+            let prf_enabled = prf
+                || instance_cfg
+                    .as_ref()
+                    .map(|c| c.ranking.enable_prf)
+                    .unwrap_or(false);
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
             let defaults = HybridSearchConfig::default();
@@ -4326,6 +6275,7 @@ fn run_brain(
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
                 weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
+                prf: prf_enabled,
                 ..defaults
             };
 
@@ -4340,6 +6290,20 @@ fn run_brain(
                 None,
             ) {
                 Ok(mut result) => {
+                    // Feature F6: apply per-path ranking priors (dampen/boost)
+                    // from `[ranking]` in the instance config, if supplied.
+                    // Applied AFTER fusion on the final relevance, BEFORE the
+                    // sort/truncation below. No config → no-op.
+                    if let Some(ranking) = ranking_config.as_ref() {
+                        nestweaver_engine::apply_ranking_priors(&mut result.seeds, ranking);
+                        nestweaver_engine::apply_ranking_priors(&mut result.connected, ranking);
+                        result.connected.sort_by(|a, b| {
+                            b.relevance
+                                .partial_cmp(&a.relevance)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+
                     // RFC #2: apply post-PPR filters when any filter flag was set.
                     let filter_kinds_lower: Vec<String> =
                         kinds.iter().map(|k| k.to_lowercase()).collect();
@@ -4449,6 +6413,39 @@ fn run_brain(
                         );
                     }
 
+                    // Feature F17: rerank the top-N retrieved candidates. OFF by
+                    // default → byte-identical output. Applied AFTER fusion +
+                    // F6 priors + filters, BEFORE truncation. The default scorer
+                    // is a transparent monotonic heuristic (NOT a validated nDCG
+                    // win); an optional `<db>.rerank.json` learned-weights file
+                    // is used if present and version-matched. Reranking only
+                    // reorders an already-retrieved set; recall is unchanged.
+                    if rerank {
+                        let reranker = nestweaver_engine::select_reranker(Some(&db_path));
+                        nestweaver_engine::rerank(
+                            &mut result.connected,
+                            reranker.as_ref(),
+                            &store,
+                            nestweaver_engine::RERANK_DEFAULT_TOP_N,
+                        );
+                    }
+
+                    // Feature F8: embed high-relevance bodies inline when the
+                    // caller opted in. Off by default → output unchanged.
+                    if inline_bodies {
+                        let root = root.clone().unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        });
+                        nestweaver_engine::populate_inline_bodies(
+                            &store,
+                            &mut result.connected,
+                            &root,
+                            response_config.inline_body_threshold,
+                            response_config.inline_max_body_tokens,
+                            token_budget,
+                        );
+                    }
+
                     // token_budget takes precedence over the count-based limit.
                     let cut = match token_budget {
                         Some(budget) => token_budgeted_truncate(&result.connected, budget),
@@ -4485,6 +6482,191 @@ fn run_brain(
                     }
                 }
             }
+        }
+
+        BrainCommands::BrokenLinks {
+            max_suggestions,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let links = nestweaver_engine::broken_links(&store, max_suggestions)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&links)?);
+            } else if links.is_empty() {
+                println!("No broken or ambiguous wikilinks found.");
+            } else {
+                println!("Broken / ambiguous wikilinks ({}):", links.len());
+                for l in &links {
+                    println!(
+                        "  [[{}]] in {} (confidence {:.2})",
+                        l.wikilink_text, l.source_path, l.confidence
+                    );
+                    if !l.suggested_target_uids.is_empty() {
+                        println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                    }
+                }
+            }
+            let stats = format!(
+                "{} link(s) in {}",
+                links.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::Orphans {
+            vault,
+            path_prefix,
+            allow,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let orphans = nestweaver_engine::orphan_documents(
+                &store,
+                vault.as_deref(),
+                path_prefix.as_deref(),
+                &allow,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&orphans)?);
+            } else if orphans.is_empty() {
+                println!("No orphan documents found.");
+            } else {
+                println!("Orphan documents ({}):", orphans.len());
+                for o in &orphans {
+                    println!("  {} — {}", o.title, o.file_path);
+                }
+            }
+            let stats = format!(
+                "{} orphan(s) in {}",
+                orphans.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::TopicClusters {
+            resolution,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&clusters)?);
+            } else if clusters.is_empty() {
+                println!("No topic clusters found.");
+            } else {
+                println!("Topic clusters ({}):", clusters.len());
+                for c in &clusters {
+                    println!(
+                        "  [{}] {} ({} note(s))",
+                        c.cluster_id,
+                        c.label,
+                        c.members.len()
+                    );
+                }
+            }
+            let stats = format!(
+                "{} cluster(s) in {}",
+                clusters.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::TagGraph {
+            tag,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            match tag {
+                Some(tag) => {
+                    let tg = nestweaver_engine::tag_graph(&store, &tag)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&tg)?);
+                    } else {
+                        println!("#{} — {} note(s)", tg.tag, tg.count);
+                        if tg.co_occurring.is_empty() {
+                            println!("  no co-occurring tags");
+                        } else {
+                            println!("  co-occurring:");
+                            for c in &tg.co_occurring {
+                                println!("    #{} ({})", c.tag, c.count);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let graphs = nestweaver_engine::tag_graph_all(&store)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&graphs)?);
+                    } else if graphs.is_empty() {
+                        println!("no tags");
+                    } else {
+                        for tg in &graphs {
+                            let co = if tg.co_occurring.is_empty() {
+                                "—".to_string()
+                            } else {
+                                tg.co_occurring
+                                    .iter()
+                                    .map(|c| format!("#{} ({})", c.tag, c.count))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            println!("#{} ({}) → {}", tg.tag, tg.count, co);
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        BrainCommands::DocStats {
+            top_tags_limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let stats = nestweaver_engine::doc_stats(&store, top_tags_limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!("Document graph stats:");
+                println!("  total notes:      {}", stats.total_notes);
+                println!("  total wikilinks:  {}", stats.total_wikilinks);
+                println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                println!("  orphans:          {}", stats.orphans);
+                println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
+                if !stats.top_tags.is_empty() {
+                    println!("  top tags:");
+                    for t in &stats.top_tags {
+                        println!("    #{} ({})", t.tag, t.count);
+                    }
+                }
+                if !stats.notes_by_year.is_empty() {
+                    let mut years: Vec<(&String, &usize)> = stats.notes_by_year.iter().collect();
+                    years.sort_by(|a, b| a.0.cmp(b.0));
+                    println!("  notes by year:");
+                    for (year, count) in years {
+                        println!("    {year}: {count}");
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
         }
     }
 }
@@ -4667,6 +6849,11 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
 }
 
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
+    // Feature F7: show PRF-mined expansion terms for auditing.
+    if !result.expansion_terms.is_empty() {
+        println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
+        println!();
+    }
     println!("Seeds ({} resolved):", result.seeds.len());
     for n in &result.seeds {
         if n.location.is_empty() {
@@ -4709,6 +6896,11 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
                     n.relevance, n.title, n.kind, n.location
                 );
             }
+            if let Some(body) = &n.inline_body {
+                for line in body.lines() {
+                    println!("      | {line}");
+                }
+            }
         }
     }
 }
@@ -4721,6 +6913,11 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+
+    // Feature F7: surface PRF-mined expansion terms for auditing.
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
 
     println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -4800,6 +6997,111 @@ fn run_embed(
         Ok(EXIT_ERROR)
     } else {
         Ok(EXIT_SUCCESS)
+    }
+}
+
+/// Resolve a `--repo` filter (display name or literal UID) to a repo UID.
+/// Returns `Ok(None)` when no filter was given, or an error when the filter
+/// matches no indexed repo.
+fn resolve_contract_repo_filter(
+    store: &GraphStore,
+    filter: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let repos = list_repos(store, None)?;
+    // Exact UID match first, then display-name (case-insensitive) match.
+    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
+        return Ok(Some(r.uid.clone()));
+    }
+    let needle = filter.to_lowercase();
+    if let Some(r) = repos
+        .iter()
+        .find(|r| nestweaver_engine::repo_display_name(r).to_lowercase() == needle)
+    {
+        return Ok(Some(r.uid.clone()));
+    }
+    anyhow::bail!("no indexed repo matches --repo '{filter}'")
+}
+
+fn run_contracts(command: ContractCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        ContractCommands::List { repo, json, db } => {
+            let store = open_store(db.as_deref())?;
+            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+            let mut contracts = store
+                .list_contracts(repo_uid.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            contracts.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&contracts)?);
+            } else if contracts.is_empty() {
+                println!(
+                    "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
+                     Spring/NestJS controllers first."
+                );
+            } else {
+                println!(
+                    "API contracts ({} total). NOTE: contract links are hypotheses, \
+                     not ground truth — see confidence.\n",
+                    contracts.len()
+                );
+                for c in &contracts {
+                    println!("{}", c.uid);
+                    println!("  kind:       {}", c.kind);
+                    if let Some(ref v) = c.verb {
+                        println!("  verb:       {v}");
+                    }
+                    if let Some(ref p) = c.path {
+                        println!("  path:       {p}");
+                    }
+                    if let Some(ref op) = c.operation_id {
+                        println!("  operation:  {op}");
+                    }
+                    println!("  source:     {}", c.source_path);
+                    println!("  confidence: {:.2}", c.confidence);
+                    println!();
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+        ContractCommands::Drift { repo, json, db } => {
+            let store = open_store(db.as_deref())?;
+            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+            let report = nestweaver_engine::contracts::drift_for_store(&store, repo_uid.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.is_clean() {
+                println!("No contract drift detected.");
+            } else {
+                println!("Contract drift (hypotheses, not ground truth):\n");
+                if !report.declared_not_implemented.is_empty() {
+                    println!(
+                        "Declared but NOT implemented ({}):",
+                        report.declared_not_implemented.len()
+                    );
+                    for f in &report.declared_not_implemented {
+                        println!("  - {}", f.uid);
+                    }
+                    println!();
+                }
+                if !report.implemented_not_declared.is_empty() {
+                    println!(
+                        "Implemented but NOT declared in any spec ({}):",
+                        report.implemented_not_declared.len()
+                    );
+                    for f in &report.implemented_not_declared {
+                        println!("  - {}", f.uid);
+                    }
+                    println!();
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
     }
 }
 
