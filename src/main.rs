@@ -346,6 +346,64 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Regex search over indexed text (section bodies, note titles, symbol signatures)
+    ///
+    /// First-party replacement for shelling out to rg/grep. Uses a trigram
+    /// pre-filter when built (`index --with-trigrams`), else falls back to
+    /// scanning all candidate text — always correct, just slower.
+    #[command(
+        after_help = "Examples:\n  nestweaver regex-search 'fn\\s+authenticate'\n  nestweaver regex-search '(?i)todo' --path-prefix src/ --limit 20"
+    )]
+    RegexSearch {
+        /// Rust regex pattern to search for
+        pattern: String,
+        #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
+        path_prefix: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+        )]
+        kinds: Option<Vec<String>>,
+        #[arg(long, help = "Maximum number of results")]
+        limit: Option<usize>,
+        #[arg(long = "max-millis", help = "Wall-clock time budget in milliseconds")]
+        max_millis: Option<u64>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Count regex matches per pattern across indexed text (counts only)
+    ///
+    /// Companion to regex-search. Reports total matches, files matched, and the
+    /// busiest files for each pattern. Reuses the same trigram pre-filter.
+    #[command(
+        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
+    )]
+    CountPatterns {
+        /// One or more regex patterns to count
+        #[arg(required = true)]
+        patterns: Vec<String>,
+        #[arg(long = "path-prefix", help = "Restrict to file paths with this prefix")]
+        path_prefix: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+        )]
+        kinds: Option<Vec<String>>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Analyze blast radius: what depends on this symbol
     ///
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
@@ -461,6 +519,12 @@ enum Commands {
                     multiple repos share a generic name like 'client' or 'server')"
         )]
         name: Option<String>,
+        #[arg(
+            long = "with-trigrams",
+            help = "Build a trigram posting table over indexed text to accelerate `regex-search` \
+                    (opt-in storage cost)"
+        )]
+        with_trigrams: bool,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -2929,6 +2993,73 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
+        Commands::RegexSearch {
+            pattern,
+            path_prefix,
+            kinds,
+            limit,
+            max_millis,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let res = store
+                .regex_search(
+                    &pattern,
+                    path_prefix.as_deref(),
+                    kinds.as_deref(),
+                    limit,
+                    max_millis,
+                )
+                .context("regex_search")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else if res.results.is_empty() {
+                println!("No matches for '{pattern}'.");
+            } else {
+                println!("Found {} match(es) for '{pattern}':", res.results.len());
+                for m in &res.results {
+                    println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
+                }
+                if res.truncated {
+                    println!("(results truncated — hit candidate cap or time budget)");
+                }
+                if res.scanned_fallback {
+                    println!(
+                        "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                    );
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::CountPatterns {
+            patterns,
+            path_prefix,
+            kinds,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let counts = store
+                .count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref())
+                .context("count_patterns")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&counts)?);
+            } else {
+                for c in &counts {
+                    println!(
+                        "'{}': {} match(es) across {} file(s)",
+                        c.pattern, c.total_matches, c.files_matched
+                    );
+                    for f in &c.top_files {
+                        println!("    {} ({})", f.path, f.count);
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
         Commands::ReadSymbols {
             targets,
             neighbors,
@@ -3516,6 +3647,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             force,
             name,
+            with_trigrams,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -3607,6 +3739,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .save_pagerank_cache(&pr_path)
                 .with_context(|| "save_pagerank_cache")?;
             out.status("PageRank complete.");
+
+            if with_trigrams {
+                out.status("Building trigram index...");
+                let postings = store
+                    .build_trigram_index()
+                    .with_context(|| "build_trigram_index")?;
+                out.status(&format!("Trigram index built ({postings} postings)."));
+            }
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",

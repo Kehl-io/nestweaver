@@ -470,6 +470,20 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // ── Trigram posting table (F3/F4) ───────────────────────────────────
+        // Maps a lowercased 3-gram to a node UID whose indexed text contains
+        // it. Built opt-in via `index --with-trigrams`; used to pre-filter
+        // candidate nodes before running the real regex. Correctness never
+        // depends on its presence — see crate::regex.
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS TrigramPosting(\
+                uid STRING, \
+                trigram STRING, \
+                node_uid STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         Ok(())
     }
 }

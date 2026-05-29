@@ -63,6 +63,8 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_blast_radius(),
         tool_schema_get_summary(),
         tool_schema_read_symbols(),
+        tool_schema_regex_search(),
+        tool_schema_count_patterns(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -125,6 +127,8 @@ pub fn dispatch(
         "blast_radius" => tool_blast_radius(store, args),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
+        "regex_search" => tool_regex_search(store, args),
+        "count_patterns" => tool_count_patterns(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -198,6 +202,100 @@ fn tool_schema_read_symbols() -> Value {
             },
             "required": ["targets"]
         }
+    })
+}
+
+/// F3: trigram-accelerated regex search over indexed text. Lets agents run a
+/// real regex against Section bodies, Note titles, and Symbol signatures
+/// without shelling out to rg/grep.
+fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let pattern = args
+        .get("pattern")
+        .or_else(|| args.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let kinds = parse_string_array(&args, "kinds");
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
+
+    let res = store
+        .regex_search(pattern, path_prefix, kinds.as_deref(), limit, max_millis)
+        .map_err(|e| anyhow!("regex_search: {e}"))?;
+    Ok(serde_json::to_value(res)?)
+}
+
+fn tool_schema_regex_search() -> Value {
+    json!({
+        "name": "regex_search",
+        "description": "Use when you need to find text by REGEX across indexed content (markdown section bodies, note titles, code symbol signatures) — a first-party replacement for shelling out to rg/grep. Runs a real Rust `regex` against the indexed text, accelerated by a trigram pre-filter when one was built (`nestweaver index --with-trigrams`). When no trigram index exists, or the pattern has no usable literals (e.g. `.{4,}`), it falls back to scanning all candidate text — still correct, just slower, and `scanned_fallback` is set.\n\nDo NOT use for fuzzy/semantic lookup — use brain_search. Returns `{results:[{uid,kind,title,location,line,snippet}], truncated, scanned_fallback}`. `truncated` is set when the candidate cap (5000) or time budget was hit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                },
+                "limit": { "type": "integer", "description": "Maximum results to return. Default: unlimited (capped by the candidate budget)." },
+                "max_millis": { "type": "integer", "description": "Wall-clock time budget in milliseconds. Default 2000." }
+            },
+            "required": ["pattern"]
+        }
+    })
+}
+
+/// F4: counts-only companion to regex_search. Counts matches per pattern across
+/// indexed text and reports the busiest files.
+fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let patterns = parse_string_array(&args, "patterns")
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow!("'patterns' must be a non-empty array of regex strings"))?;
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let kinds = parse_string_array(&args, "kinds");
+
+    let counts = store
+        .count_patterns(&patterns, path_prefix, kinds.as_deref())
+        .map_err(|e| anyhow!("count_patterns: {e}"))?;
+    Ok(json!({ "patterns": serde_json::to_value(counts)? }))
+}
+
+fn tool_schema_count_patterns() -> Value {
+    json!({
+        "name": "count_patterns",
+        "description": "Use when you only need COUNTS of regex matches across indexed text, not the matches themselves — e.g. \"how many sections mention TODO?\" Counts one match per node and reports, per pattern, `{pattern, total_matches, files_matched, top_files:[{path,count}]}`. Reuses the same trigram pre-filter as regex_search and the same full-scan fallback when no literals/index are available.\n\nDo NOT use when you need the matching text — use regex_search. Pass multiple patterns to compare counts in one call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "patterns": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "One or more Rust regex patterns to count."
+                },
+                "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                }
+            },
+            "required": ["patterns"]
+        }
+    })
+}
+
+/// Parse a JSON string array argument into `Vec<String>`; returns `None` when
+/// the key is absent.
+fn parse_string_array(args: &Value, key: &str) -> Option<Vec<String>> {
+    args.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
     })
 }
 
