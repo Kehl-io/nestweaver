@@ -301,20 +301,34 @@ timeout_secs = 60
 
 ## Web UI
 
-Launch an interactive graph visualization to explore your codebase visually. The web UI includes force-directed layout, community detection, semantic zoom, and full search.
+Launch an interactive graph visualization powered by Three.js with GPU-accelerated rendering. Nodes glow with per-kind colors, radial gradients, and bloom post-processing on a deep dark canvas. Features force-directed layout, community detection overlays, semantic zoom, accessible list view, and full search.
 
 ```sh
 nestweaver ui --db ./nestweaver.lbug --port 8080
+nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ```
 
 <p align="center">
-  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI">
+  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI — graph view with glowing nodes">
 </p>
+
+**Graph features:**
+- GPU-rendered nodes with SDF circles, radial gradients, outer glow halos, and breathing animation
+- Bloom post-processing for a premium atmospheric feel
+- Edge particles with directional flow
+- Click to inspect: callers, callees, source code with syntax highlighting
+- Accessible node list view (Ctrl+L) with keyboard navigation
+- Community overlay with Louvain detection
+- Reduced effects toggle for accessibility (`prefers-reduced-motion` auto-detected)
+- URL deep-linking for shareable views
+- Navigation history (Ctrl+Z / Ctrl+Shift+Z)
+- Glassmorphism panels with cursor-responsive lighting
+- Dark/light/system theme with kehl.io-inspired dark palette
 
 ## Architecture
 
 <details>
-<summary>Cargo workspace with 8 internal crates compiling to a single static binary</summary>
+<summary>Cargo workspace with 10 crates compiling to a single static binary + optional WASM module</summary>
 
 | Crate | Description |
 |-------|-------------|
@@ -324,16 +338,20 @@ nestweaver ui --db ./nestweaver.lbug --port 8080
 | `nestweaver-store` | LadybugDB graph store, PageRank, hybrid search |
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
 | `nestweaver-engine` | Indexing pipeline, query dispatch, config, snapshots, LLM integration |
+| `nestweaver-algorithms` | Pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible, no I/O |
 | `nestweaver-mcp` | Optional MCP server for non-shell AI clients |
-| `nestweaver-web` | Optional web UI and API backend |
+| `nestweaver-web` | Web UI (Three.js/R3F) and Axum API backend |
+| `nestweaver-wasm` | Browser-side WASM module wrapping nestweaver-algorithms |
 
 ```
-schema          (zero internal deps)
+schema              (zero internal deps)
   <- parser
   <- resolver
   <- store
-storage         (zero internal deps)
-       <- engine <- (parser, resolver, store, storage)
+algorithms          (zero internal deps — WASM target)
+  <- wasm
+storage             (zero internal deps)
+       <- engine <- (parser, resolver, store, storage, algorithms)
             <- mcp
             <- web
 ```
