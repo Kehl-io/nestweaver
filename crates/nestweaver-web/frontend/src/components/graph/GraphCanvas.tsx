@@ -37,17 +37,27 @@ function useReducedMotion(): boolean {
 /**
  * Handles pointer interactions inside the R3F scene.
  * Uses CPU-based picking (useGPUPicking) to map screen coordinates to nodes.
+ * Also supports dragging nodes to reposition them.
  */
 function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const { pick } = useGPUPicking(buffers);
   const selectNode = useStore((s) => s.selectNode);
   const hoverNode = useStore((s) => s.hoverNode);
   const setSeeds = useStore((s) => s.setSeeds);
+  const setGraphData = useStore((s) => s.setGraphData);
   const { camera, size } = useThree();
   const lastClickRef = useRef<{ time: number; nodeUid: string | null }>({
     time: 0,
     nodeUid: null,
   });
+
+  // Drag state
+  const dragRef = useRef<{
+    isDragging: boolean;
+    nodeUid: string | null;
+    lastX: number;
+    lastY: number;
+  }>({ isDragging: false, nodeUid: null, lastX: 0, lastY: 0 });
 
   const handlePointerDown = useCallback(
     (event: { nativeEvent: PointerEvent }) => {
@@ -58,6 +68,17 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       const y = e.clientY - rect.top;
 
       const result = pick(x, y, camera, size);
+
+      // Start drag if we hit a node
+      if (result.nodeUid) {
+        dragRef.current = {
+          isDragging: true,
+          nodeUid: result.nodeUid,
+          lastX: e.clientX,
+          lastY: e.clientY,
+        };
+        (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      }
 
       const now = Date.now();
       const prev = lastClickRef.current;
@@ -93,6 +114,44 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
 
+      // Handle drag
+      const drag = dragRef.current;
+      if (drag.isDragging && drag.nodeUid) {
+        const graphInstance = useStore.getState().graphInstance;
+        if (graphInstance?.hasNode(drag.nodeUid)) {
+          const screenDx = e.clientX - drag.lastX;
+          const screenDy = e.clientY - drag.lastY;
+
+          // Convert screen delta to world delta.
+          // With a perspective camera at z=500, world units per pixel ≈
+          // camera.z / size.height * 2 (accounts for the vertical FOV mapping).
+          const camZ = camera.position.z;
+          const scale = (camZ / size.height) * 2;
+          const worldDx = screenDx * scale;
+          const worldDy = -screenDy * scale; // Y is inverted between screen and world
+
+          const curX =
+            typeof graphInstance.getNodeAttribute(drag.nodeUid, "x") === "number"
+              ? (graphInstance.getNodeAttribute(drag.nodeUid, "x") as number)
+              : 0;
+          const curY =
+            typeof graphInstance.getNodeAttribute(drag.nodeUid, "y") === "number"
+              ? (graphInstance.getNodeAttribute(drag.nodeUid, "y") as number)
+              : 0;
+
+          graphInstance.setNodeAttribute(drag.nodeUid, "x", curX + worldDx);
+          graphInstance.setNodeAttribute(drag.nodeUid, "y", curY + worldDy);
+
+          // Trigger a re-render by calling setGraphData with the same instance.
+          // graphDataSlice increments graphVersion on every call.
+          setGraphData(graphInstance);
+
+          drag.lastX = e.clientX;
+          drag.lastY = e.clientY;
+        }
+        return;
+      }
+
       const result = pick(x, y, camera, size);
       hoverNode(result.nodeUid);
 
@@ -100,7 +159,18 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       const canvas = e.target as HTMLElement;
       canvas.style.cursor = result.nodeUid ? "pointer" : "default";
     },
-    [pick, camera, size, hoverNode],
+    [pick, camera, size, hoverNode, setGraphData],
+  );
+
+  const handlePointerUp = useCallback(
+    (event: { nativeEvent: PointerEvent }) => {
+      const e = event.nativeEvent;
+      if (dragRef.current.isDragging) {
+        (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+        dragRef.current = { isDragging: false, nodeUid: null, lastX: 0, lastY: 0 };
+      }
+    },
+    [],
   );
 
   return (
@@ -108,6 +178,7 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       visible={false}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
     >
       <planeGeometry args={[100000, 100000]} />
       <meshBasicMaterial transparent opacity={0} />
