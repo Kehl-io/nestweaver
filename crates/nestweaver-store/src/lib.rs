@@ -705,6 +705,48 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn clear_repo_derived_nodes_enables_idempotent_reindex() {
+        use nestweaver_schema::Contract;
+        let store = test_store();
+        let repo = make_repo("repo-clear-1");
+        store.insert_repo(&repo).unwrap();
+
+        // Simulate a first index: a Service node (plain CREATE, no upsert) and
+        // a Contract node, both with deterministic repo-derived UIDs.
+        let svc = make_service("svc:repo-clear-1:src", "repo-clear-1");
+        store.insert_service(&svc).unwrap();
+        let contract = Contract {
+            uid: "contract:repo-clear-1:get:/x".to_string(),
+            kind: "rest-endpoint".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some("/x".to_string()),
+            operation_id: None,
+            repo_uid: "repo-clear-1".to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 0.9,
+        };
+        store.insert_contract(&contract).unwrap();
+        assert_eq!(store.list_services(None).unwrap().len(), 1);
+
+        // Re-indexing the SAME service UID without clearing first would trip the
+        // primary-key uniqueness constraint. clear_repo_derived_nodes must make
+        // it idempotent.
+        store.clear_repo_derived_nodes("repo-clear-1").unwrap();
+        assert_eq!(store.list_services(None).unwrap().len(), 0);
+
+        // Second index pass: re-insert the same Service must now succeed.
+        store
+            .insert_service(&svc)
+            .expect("re-insert after clear must not collide on primary key");
+        assert_eq!(store.list_services(None).unwrap().len(), 1);
+
+        // Idempotent for repos with nothing to clear.
+        store
+            .clear_repo_derived_nodes("repo-does-not-exist")
+            .unwrap();
+    }
+
     // ── Upsert idempotency tests ─────────────────────────────────────
 
     #[test]

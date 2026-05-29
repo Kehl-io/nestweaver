@@ -669,6 +669,25 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // ── Unresolved wikilink table (broken-links) ────────────────────────
+        // A `[[Target]]` whose text matches no note in the vault produces NO
+        // WIKILINK_TO_NOTE edge (there is nothing to point at), so the
+        // edge-based broken-link query can never surface it. We record each
+        // genuinely-unresolved wikilink here so `broken_wikilinks` (and thus
+        // brain_broken_links / doc-stats / memory lint) reports it as broken.
+        // `uid` is derived from (source_section_uid, wikilink_text) so a
+        // re-index of the same note replaces rather than duplicates.
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS UnresolvedWikilink(\
+                uid STRING, \
+                source_note_uid STRING, \
+                source_path STRING, \
+                source_title STRING, \
+                wikilink_text STRING, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         Ok(())
     }
 }

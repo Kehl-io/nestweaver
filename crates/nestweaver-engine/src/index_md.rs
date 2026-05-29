@@ -571,6 +571,21 @@ fn reinsert_single_note(
         let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
         let key = wl.target.to_lowercase();
         let Some(candidates) = title_lookup.get(&key) else {
+            // Genuinely unresolved — record so broken-links can surface it.
+            let uw_uid = format!(
+                "unresolved:{}:{}",
+                source_section,
+                sha256_hex_short(&wl.target)
+            );
+            if let Err(e) = store.insert_unresolved_wikilink(
+                &uw_uid,
+                n_uid,
+                rel_path,
+                &parsed.title,
+                &wl.target,
+            ) {
+                tracing::warn!("failed to record unresolved wikilink '{}': {e}", wl.target);
+            }
             continue;
         };
         let n = candidates.len() as f32;
@@ -1109,6 +1124,8 @@ fn index_into_store(
     let mut wikilink_to_note: Vec<(String, String, f32, String)> = Vec::new();
     let mut wikilink_to_heading: Vec<(String, String, f32, String)> = Vec::new();
     let mut wikilinks_unresolved: usize = 0;
+    // (uid, source_note_uid, source_path, source_title, wikilink_text)
+    let mut unresolved_records: Vec<(String, String, String, String, String)> = Vec::new();
 
     for ctx in &note_contexts {
         for wl in &ctx.wikilinks {
@@ -1154,6 +1171,22 @@ fn index_into_store(
                         wl.target,
                         ctx.title,
                     );
+                    // Record it so broken-links can surface a genuinely-broken
+                    // wikilink (one that resolves to no note at all). UID is
+                    // derived from the source section + target text so a
+                    // re-index replaces rather than duplicates.
+                    let uw_uid = format!(
+                        "unresolved:{}:{}",
+                        source_section_uid,
+                        sha256_hex_short(&wl.target)
+                    );
+                    unresolved_records.push((
+                        uw_uid,
+                        ctx.note_uid.clone(),
+                        ctx.rel_path.clone(),
+                        ctx.title.clone(),
+                        wl.target.clone(),
+                    ));
                 }
             }
         }
@@ -1176,6 +1209,13 @@ fn index_into_store(
     store
         .batch_insert_wikilink_to_heading_edges(&wl_head_refs)
         .context("batch_insert_wikilink_to_heading_edges")?;
+
+    // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
+    for (uid, snu, sp, st, wt) in &unresolved_records {
+        if let Err(e) = store.insert_unresolved_wikilink(uid, snu, sp, st, wt) {
+            tracing::warn!("failed to record unresolved wikilink '{wt}': {e}");
+        }
+    }
 
     resolve_pb.finish_and_clear();
 
