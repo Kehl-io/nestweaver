@@ -22,9 +22,9 @@ export function EdgeInstanceMesh({ buffers }: Props) {
   if (buffers.edgeCount === 0) return null;
 
   return (
-    <lineSegments ref={lineRef} frustumCulled={false}>
+    <lineSegments ref={lineRef} frustumCulled={false} renderOrder={-1}>
       <bufferGeometry />
-      <lineBasicMaterial vertexColors transparent opacity={0.4} toneMapped={false} />
+      <lineBasicMaterial vertexColors transparent opacity={0.5} depthTest={false} toneMapped={false} />
     </lineSegments>
   );
 }
