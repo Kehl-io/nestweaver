@@ -1328,6 +1328,94 @@ enum BrainCommands {
         #[arg(long, help = "Repo root for inline Symbol bodies (default: cwd)")]
         root: Option<PathBuf>,
     },
+    /// List wikilinks whose target is ambiguous or low-confidence
+    /// (confidence < 1.0), with suggested target notes for each.
+    BrokenLinks {
+        #[arg(long, default_value = "5", help = "Max suggested targets per link")]
+        max_suggestions: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// List notes with zero inbound and zero outbound wikilinks. Index/MOC
+    /// notes are excluded via a default allowlist (override with --allow).
+    Orphans {
+        #[arg(long, help = "Restrict to this vault UID")]
+        vault: Option<String>,
+        #[arg(
+            long = "path-prefix",
+            help = "Restrict to notes under this path prefix"
+        )]
+        path_prefix: Option<String>,
+        #[arg(
+            long = "allow",
+            help = "Note path/title to exclude (repeatable; overrides the default allowlist)"
+        )]
+        allow: Vec<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Detect topic clusters by running Leiden community detection over the
+    /// note-to-note wikilink graph. Each cluster is labelled by its most
+    /// central member.
+    TopicClusters {
+        #[arg(long, default_value = "0.5", help = "Leiden resolution")]
+        resolution: f64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Show a tag's note count and the tags that co-occur with it.
+    /// Omit the tag to dump the whole tag co-occurrence graph (all tags).
+    TagGraph {
+        /// Optional focus tag (with or without leading #). When omitted,
+        /// prints the full tag co-occurrence graph for every tag.
+        tag: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// One-shot health summary of the vault's document graph: note/wikilink
+    /// counts, broken links, orphans, average out-degree, top tags, and notes
+    /// by year.
+    DocStats {
+        #[arg(long, default_value = "10", help = "Max entries in top_tags")]
+        top_tags_limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5058,6 +5146,191 @@ fn run_brain(
                     }
                 }
             }
+        }
+
+        BrainCommands::BrokenLinks {
+            max_suggestions,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let links = nestweaver_engine::broken_links(&store, max_suggestions)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&links)?);
+            } else if links.is_empty() {
+                println!("No broken or ambiguous wikilinks found.");
+            } else {
+                println!("Broken / ambiguous wikilinks ({}):", links.len());
+                for l in &links {
+                    println!(
+                        "  [[{}]] in {} (confidence {:.2})",
+                        l.wikilink_text, l.source_path, l.confidence
+                    );
+                    if !l.suggested_target_uids.is_empty() {
+                        println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                    }
+                }
+            }
+            let stats = format!(
+                "{} link(s) in {}",
+                links.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::Orphans {
+            vault,
+            path_prefix,
+            allow,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let orphans = nestweaver_engine::orphan_documents(
+                &store,
+                vault.as_deref(),
+                path_prefix.as_deref(),
+                &allow,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&orphans)?);
+            } else if orphans.is_empty() {
+                println!("No orphan documents found.");
+            } else {
+                println!("Orphan documents ({}):", orphans.len());
+                for o in &orphans {
+                    println!("  {} — {}", o.title, o.file_path);
+                }
+            }
+            let stats = format!(
+                "{} orphan(s) in {}",
+                orphans.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::TopicClusters {
+            resolution,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&clusters)?);
+            } else if clusters.is_empty() {
+                println!("No topic clusters found.");
+            } else {
+                println!("Topic clusters ({}):", clusters.len());
+                for c in &clusters {
+                    println!(
+                        "  [{}] {} ({} note(s))",
+                        c.cluster_id,
+                        c.label,
+                        c.members.len()
+                    );
+                }
+            }
+            let stats = format!(
+                "{} cluster(s) in {}",
+                clusters.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        BrainCommands::TagGraph {
+            tag,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            match tag {
+                Some(tag) => {
+                    let tg = nestweaver_engine::tag_graph(&store, &tag)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&tg)?);
+                    } else {
+                        println!("#{} — {} note(s)", tg.tag, tg.count);
+                        if tg.co_occurring.is_empty() {
+                            println!("  no co-occurring tags");
+                        } else {
+                            println!("  co-occurring:");
+                            for c in &tg.co_occurring {
+                                println!("    #{} ({})", c.tag, c.count);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let graphs = nestweaver_engine::tag_graph_all(&store)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&graphs)?);
+                    } else if graphs.is_empty() {
+                        println!("no tags");
+                    } else {
+                        for tg in &graphs {
+                            let co = if tg.co_occurring.is_empty() {
+                                "—".to_string()
+                            } else {
+                                tg.co_occurring
+                                    .iter()
+                                    .map(|c| format!("#{} ({})", c.tag, c.count))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            println!("#{} ({}) → {}", tg.tag, tg.count, co);
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        BrainCommands::DocStats {
+            top_tags_limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let stats = nestweaver_engine::doc_stats(&store, top_tags_limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!("Document graph stats:");
+                println!("  total notes:      {}", stats.total_notes);
+                println!("  total wikilinks:  {}", stats.total_wikilinks);
+                println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                println!("  orphans:          {}", stats.orphans);
+                println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
+                if !stats.top_tags.is_empty() {
+                    println!("  top tags:");
+                    for t in &stats.top_tags {
+                        println!("    #{} ({})", t.tag, t.count);
+                    }
+                }
+                if !stats.notes_by_year.is_empty() {
+                    let mut years: Vec<(&String, &usize)> = stats.notes_by_year.iter().collect();
+                    years.sort_by(|a, b| a.0.cmp(b.0));
+                    println!("  notes by year:");
+                    for (year, count) in years {
+                        println!("    {year}: {count}");
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
         }
     }
 }
