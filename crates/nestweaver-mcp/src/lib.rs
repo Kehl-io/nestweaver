@@ -489,10 +489,13 @@ mod tests {
                     "brain_tag_graph",
                     "brain_doc_stats",
                     "affected_tests",
+                    "investigate",
+                    "investigate_expand",
+                    "investigate_hydrate",
                 ] {
                     assert!(names.contains(&expected), "missing tool: {expected}");
                 }
-                assert_eq!(tools.len(), 31, "expected 31 tools, got {}", tools.len());
+                assert_eq!(tools.len(), 34, "expected 34 tools, got {}", tools.len());
                 // Every tool has a description leading with usage guidance.
                 for tool in tools {
                     let desc = tool["description"].as_str().expect("description");
