@@ -10,36 +10,38 @@ export const KIND_COLORS: Record<string, string> = {
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  calls: "#9CA3AF",
-  imports: "#22C55E",
-  extends: "#F97316",
-  implements: "#06B6D4",
-  wikilink: "#78716C",
-  references_code: "#F43F5E",
-  tagged_with: "#22C55E",
-  cross_repo_declared: "#3B82F6",
-  cross_repo_suggested: "#3B82F6",
+  calls: "#67e8f9",
+  imports: "#4ade80",
+  extends: "#fb923c",
+  implements: "#22d3ee",
+  wikilink: "#94a3b8",
+  references_code: "#fb7185",
+  tagged_with: "#4ade80",
+  cross_repo_declared: "#38bdf8",
+  cross_repo_suggested: "#38bdf8",
 };
 
 export function kindColor(kind: string, isDark: boolean): string {
   const dark: Record<string, string> = {
-    Function: "#3b82f6", Class: "#8b5cf6", Method: "#ec4899",
-    Interface: "#06b6d4", Trait: "#84cc16", Enum: "#f59e0b",
-    Module: "#f97316", Extension: "#f43f5e", Note: "#a78bfa",
-    Section: "#78716c", Tag: "#22c55e",
+    Function: "#22d3ee", Class: "#a855f7", Method: "#f472b6",
+    Interface: "#2dd4bf", Trait: "#a3e635", Enum: "#fbbf24",
+    Module: "#fb923c", Extension: "#fb7185", Note: "#c084fc",
+    Section: "#94a3b8", Tag: "#4ade80", Constant: "#38bdf8",
   };
   const light: Record<string, string> = {
-    Function: "#2563eb", Class: "#7c3aed", Method: "#db2777",
-    Interface: "#0891b2", Trait: "#65a30d", Enum: "#d97706",
+    Function: "#0891b2", Class: "#7c3aed", Method: "#db2777",
+    Interface: "#0d9488", Trait: "#65a30d", Enum: "#d97706",
     Module: "#ea580c", Extension: "#e11d48", Note: "#7c3aed",
-    Section: "#57534e", Tag: "#16a34a",
+    Section: "#57534e", Tag: "#16a34a", Constant: "#0284c7",
   };
   return (isDark ? dark : light)[kind] ?? (isDark ? "#64748b" : "#6b7280");
 }
 
 export function kindToColor(kind: string): string {
   const isDark = document.documentElement.classList.contains("dark");
-  return kindColor(kind, isDark);
+  // API returns "Symbol/Function" — strip the prefix for color lookup
+  const short = kind.includes("/") ? kind.split("/").pop()! : kind;
+  return kindColor(short, isDark);
 }
 
 export function desaturate(hex: string, amount: number): string {

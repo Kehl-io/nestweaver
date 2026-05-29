@@ -60,10 +60,35 @@ impl CodeWatcher {
 
     /// Block until shutdown is requested or the underlying debouncer
     /// errors. Returns `Ok(())` on graceful shutdown.
+    ///
+    /// Opens its own `GraphStore` from `self.db_path`. For sharing a store
+    /// with the web server, use `run_with_store` instead.
     pub fn run(self) -> Result<(), anyhow::Error> {
-        let store = GraphStore::open_or_create(&self.db_path)
-            .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?;
+        let store = Arc::new(
+            GraphStore::open_or_create(&self.db_path)
+                .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?,
+        );
+        self.run_inner(store, None)
+    }
 
+    /// Like `run`, but uses a caller-provided `Arc<GraphStore>` and invokes
+    /// `on_change` after every batch that mutates the graph. The callback
+    /// also fires after the graph-generation counter is bumped so the web
+    /// server can emit an SSE event to connected clients.
+    pub fn run_with_store(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
+        self.run_inner(store, on_change)
+    }
+
+    /// Shared implementation used by both `run` and `run_with_store`.
+    fn run_inner(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
         let repo_url = format!("file://{}", self.repo_root.display());
         let r_uid = nestweaver_schema::repo_uid(&self.instance_id, &repo_url);
 
@@ -240,6 +265,16 @@ impl CodeWatcher {
                     files_processed,
                     duration.as_secs_f64()
                 );
+
+                // Bump the graph generation counter so consumers (e.g. the
+                // web server SSE handler) can detect that the graph changed.
+                // P0.2: also persist it to `<db>.generation` so short-lived
+                // processes (and the F16 cache) see the bump after restart.
+                let gen_sidecar = crate::sidecar_path(&self.db_path, ".generation");
+                store.bump_and_persist_graph_generation(&gen_sidecar);
+                if let Some(ref cb) = on_change {
+                    cb();
+                }
             }
         }
     }
@@ -305,7 +340,45 @@ fn reindex_file(
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
 
-    for raw_sym in &parsed.symbols {
+    // F2.0: populate framework_hint on re-indexed symbols too, so hints
+    // survive incremental watcher updates (matching the full-index path).
+    let mut hint_by_index: std::collections::HashMap<usize, nestweaver_schema::FrameworkHint> =
+        std::collections::HashMap::new();
+    if let Some(lang) = nestweaver_parser::detect_language(&abs_path)
+        && let Some(lang_str) = crate::contracts::framework_language_str(lang)
+    {
+        for (sym_idx, hint) in
+            nestweaver_parser::detect_frameworks(&parsed.symbols, &rel_str, lang_str)
+        {
+            hint_by_index.insert(sym_idx, hint);
+        }
+        // NestJS `@Controller` lives above the class and is not in the parsed
+        // signature; recover it from source (mirrors the full-index path).
+        if matches!(
+            lang,
+            nestweaver_schema::Language::TypeScript | nestweaver_schema::Language::JavaScript
+        ) {
+            let class_starts: Vec<(usize, u32)> = parsed
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
+                .map(|(i, s)| (i, s.start_line))
+                .collect();
+            if let Some(ctrl_idx) =
+                crate::contracts::detect_nestjs_controller_index(&source, &class_starts)
+            {
+                hint_by_index
+                    .entry(ctrl_idx)
+                    .or_insert_with(|| nestweaver_schema::FrameworkHint {
+                        framework: "nestjs".into(),
+                        role: "controller".into(),
+                    });
+            }
+        }
+    }
+
+    for (sym_idx, raw_sym) in parsed.symbols.iter().enumerate() {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let sym = Symbol {
             uid: s_uid.clone(),
@@ -314,6 +387,7 @@ fn reindex_file(
             repo_uid: r_uid.to_string(),
             file_path: rel_str.clone(),
             start_line: raw_sym.start_line,
+            end_line: raw_sym.end_line,
             signature: raw_sym.signature.clone(),
             summary: None,
             content_hash: raw_sym.content_hash.clone(),
@@ -323,7 +397,7 @@ fn reindex_file(
             entry_point_kind: raw_sym.entry_point_kind,
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
-            framework_hint: None,
+            framework_hint: hint_by_index.remove(&sym_idx),
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));

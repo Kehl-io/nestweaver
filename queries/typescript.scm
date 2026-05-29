@@ -68,6 +68,16 @@
     value: (_) @_val)
   (#not-match? @_val "^(\\(|function|class)")) @definition.const
 
+; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
+; describe('name', fn). Captured as a definition so the calls inside the
+; callback attach to this symbol (named after the test title).
+(call_expression
+  function: (identifier) @_runner
+  arguments: (arguments
+    (string) @name
+    [(arrow_function) (function_expression)])
+  (#match? @_runner "^(test|it|describe)$")) @definition.function
+
 ; Call expressions
 (call_expression
   function: (identifier) @name) @reference.call

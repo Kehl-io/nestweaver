@@ -7,11 +7,13 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
+nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
 nestweaver-parser = { workspace = true }
 nestweaver-resolver = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-storage = { workspace = true }
+rmp-serde = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -20,6 +22,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 toml = "1.1"
 serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
+openapiv3 = "2"
+protox-parse = "0.9"
+prost-types = "0.14"
+apollo-parser = "0.8"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 walkdir = "2"

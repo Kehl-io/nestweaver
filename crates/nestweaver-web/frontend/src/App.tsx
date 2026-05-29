@@ -10,6 +10,8 @@ import { CanvasView } from "./components/canvas/CanvasView";
 import { PresentationView } from "./components/presentation/PresentationView";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTheme } from "./hooks/useTheme";
+import { useDeepLink } from "./hooks/useDeepLink";
+import { useWasmEngine } from "./hooks/useWasmEngine";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useStore } from "./stores";
 
@@ -22,6 +24,8 @@ function ResizeHandle() {
 function AppContent() {
   useKeyboardShortcuts();
   useTheme();
+  useDeepLink();
+  useWasmEngine();
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);

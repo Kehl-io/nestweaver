@@ -1,5 +1,124 @@
 use nestweaver_schema::EntryPointKind;
 
+/// Determine whether a file path looks like a test file, based purely on
+/// filename and directory heuristics (no parsing, no symbol context).
+///
+/// This is the shared heuristic used by both entry-point detection and
+/// regression test selection (affected-tests). It recognizes the common
+/// per-language conventions:
+///
+///   - Go:       `*_test.go`
+///   - JS/TS:    `*.test.{ts,tsx,js,jsx,mjs,cjs}`, `*.spec.*`, `/__tests__/`
+///   - Python:   `test_*.py`, `*_test.py`
+///   - Java/C#:  `*Test.{java,cs}`, `*Tests.{java,cs}`
+///   - Kotlin:   `*Test.kt`
+///   - Scala/Groovy: `*Test.{scala,groovy}`, `*Spec.{scala,groovy}`
+///   - Rust:     `*.test.rs` (and any file under a `tests/` dir)
+///   - Elixir:   `*_test.exs`
+///   - Dart:     `*_test.dart`
+///   - Swift:    `*Tests.swift`
+///   - PHP/Ruby: `*Test.php`, `*_test.rb`, `*_spec.rb`
+///   - Generic:  any path segment that is `tests` or `__tests__`
+///
+/// The match is intentionally broad: a false positive here only means a
+/// non-test file is *considered* as possibly holding tests, which the
+/// downstream pipeline filters further by symbol presence.
+pub fn is_test_file(path: &str) -> bool {
+    // Normalize Windows separators so directory checks are portable.
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+
+    // ── Directory-based conventions ──
+    // Any path component equal to `tests` or `__tests__` (Jest/Rust/etc.).
+    if normalized
+        .split('/')
+        .any(|seg| seg == "tests" || seg == "__tests__")
+    {
+        return true;
+    }
+
+    // ── Filename-based conventions ──
+
+    // JS/TS: `.test.` or `.spec.` infix (foo.test.ts, foo.spec.tsx, ...).
+    if file_name.contains(".test.") || file_name.contains(".spec.") {
+        return true;
+    }
+
+    // Rust: foo.test.rs is covered above; explicit suffix too.
+    if file_name.ends_with(".test.rs") {
+        return true;
+    }
+
+    // Go: `*_test.go`.
+    if file_name.ends_with("_test.go") {
+        return true;
+    }
+
+    // Elixir: `*_test.exs`.
+    if file_name.ends_with("_test.exs") {
+        return true;
+    }
+
+    // Dart: `*_test.dart`.
+    if file_name.ends_with("_test.dart") {
+        return true;
+    }
+
+    // Python: `test_*.py` or `*_test.py`.
+    if file_name.ends_with(".py")
+        && (file_name.starts_with("test_") || ends_with_test_stem(file_name, ".py"))
+    {
+        return true;
+    }
+
+    // Ruby: `*_test.rb` or `*_spec.rb`.
+    if file_name.ends_with("_test.rb") || file_name.ends_with("_spec.rb") {
+        return true;
+    }
+
+    // Java / C#: `*Test.{java,cs}` or `*Tests.{java,cs}`.
+    for ext in [".java", ".cs"] {
+        if let Some(stem) = file_name.strip_suffix(ext)
+            && (stem.ends_with("Test") || stem.ends_with("Tests"))
+        {
+            return true;
+        }
+    }
+
+    // Kotlin: `*Test.kt`.
+    if file_name.ends_with("Test.kt") {
+        return true;
+    }
+
+    // Swift: `*Tests.swift`.
+    if file_name.ends_with("Tests.swift") {
+        return true;
+    }
+
+    // PHP: `*Test.php`.
+    if file_name.ends_with("Test.php") {
+        return true;
+    }
+
+    // Scala / Groovy: `*Test.{scala,groovy}` or `*Spec.{scala,groovy}`.
+    for ext in [".scala", ".groovy"] {
+        if let Some(stem) = file_name.strip_suffix(ext)
+            && (stem.ends_with("Test") || stem.ends_with("Spec"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Helper: does `file_name` end with `_test<ext>` (e.g. `foo_test.py`)?
+fn ends_with_test_stem(file_name: &str, ext: &str) -> bool {
+    file_name
+        .strip_suffix(ext)
+        .is_some_and(|stem| stem.ends_with("_test"))
+}
+
 /// Detect whether a symbol is an entry point based on its name, file path,
 /// kind (function/method/class), signature, and language.
 ///
@@ -72,13 +191,13 @@ fn detect_js_ts(
     // Any exported symbol in a test file is a test entry point. Covers:
     //   - __tests__/ directories (Jest convention)
     //   - *.test.{ts,js,tsx,jsx} and *.spec.{ts,js,tsx,jsx} files
-    if matches!(kind, "function" | "class" | "constant") {
-        let is_test_file = file_path.contains("/__tests__/")
+    if matches!(kind, "function" | "class" | "constant")
+        && (file_path.contains("/__tests__/")
             || file_name.contains(".test.")
-            || file_name.contains(".spec.");
-        if is_test_file && !name.starts_with('_') {
-            return Some(EntryPointKind::TestEntry);
-        }
+            || file_name.contains(".spec."))
+        && !name.starts_with('_')
+    {
+        return Some(EntryPointKind::TestEntry);
     }
 
     // ── Config files ──
@@ -1405,5 +1524,83 @@ mod tests {
             "typescript",
         );
         assert_eq!(result, None);
+    }
+
+    // ── is_test_file heuristics ──
+
+    #[test]
+    fn is_test_file_go() {
+        assert!(is_test_file("pkg/api/users_test.go"));
+        assert!(!is_test_file("pkg/api/users.go"));
+    }
+
+    #[test]
+    fn is_test_file_js_ts() {
+        assert!(is_test_file("src/auth.test.ts"));
+        assert!(is_test_file("src/components/Login.spec.tsx"));
+        assert!(is_test_file("src/__tests__/foo.ts"));
+        assert!(!is_test_file("src/auth.ts"));
+    }
+
+    #[test]
+    fn is_test_file_python() {
+        assert!(is_test_file("tests/test_auth.py"));
+        assert!(is_test_file("app/auth_test.py"));
+        assert!(!is_test_file("app/auth.py"));
+    }
+
+    #[test]
+    fn is_test_file_java_csharp() {
+        assert!(is_test_file("src/UserServiceTest.java"));
+        assert!(is_test_file("src/UserServiceTests.java"));
+        assert!(is_test_file("src/UserServiceTest.cs"));
+        assert!(!is_test_file("src/UserService.java"));
+    }
+
+    #[test]
+    fn is_test_file_scala_groovy() {
+        assert!(is_test_file("src/AuthSpec.scala"));
+        assert!(is_test_file("src/AuthTest.scala"));
+        assert!(is_test_file("src/AuthSpec.groovy"));
+        assert!(!is_test_file("src/Auth.scala"));
+    }
+
+    #[test]
+    fn is_test_file_rust() {
+        assert!(is_test_file("src/parser.test.rs"));
+        assert!(is_test_file("tests/integration.rs"));
+        assert!(!is_test_file("src/parser.rs"));
+    }
+
+    #[test]
+    fn is_test_file_elixir_dart() {
+        assert!(is_test_file("test/auth_test.exs"));
+        assert!(is_test_file("test/widget_test.dart"));
+        assert!(!is_test_file("lib/auth.ex"));
+    }
+
+    #[test]
+    fn is_test_file_kotlin_swift_php_ruby() {
+        assert!(is_test_file("src/GreeterTest.kt"));
+        assert!(is_test_file("Tests/AuthTests.swift"));
+        assert!(is_test_file("tests/UserTest.php"));
+        assert!(is_test_file("spec/user_spec.rb"));
+        assert!(is_test_file("test/user_test.rb"));
+        assert!(!is_test_file("src/Greeter.kt"));
+    }
+
+    #[test]
+    fn is_test_file_tests_dir_segment() {
+        assert!(is_test_file("a/tests/b/anything.xyz"));
+        assert!(is_test_file("__tests__/anything.xyz"));
+        // A directory merely *containing* "test" is not a match.
+        assert!(!is_test_file("src/contests/match.go"));
+        assert!(!is_test_file("src/latest/match.go"));
+    }
+
+    #[test]
+    fn is_test_file_windows_separators() {
+        assert!(is_test_file("src\\__tests__\\foo.ts"));
+        assert!(is_test_file("pkg\\api\\users_test.go"));
     }
 }

@@ -13,13 +13,16 @@ import type { ContentSlice } from "./contentSlice";
 import { createContentSlice } from "./contentSlice";
 import type { LlmSlice } from "./llmSlice";
 import { createLlmSlice } from "./llmSlice";
+import type { GraphDataSlice } from "./graphDataSlice";
+import { createGraphDataSlice } from "./graphDataSlice";
 
 export type StoreState = GraphSlice &
   PanelSlice &
   SearchSlice &
   AnalysisSlice &
   ContentSlice &
-  LlmSlice;
+  LlmSlice &
+  GraphDataSlice;
 
 export const useStore = create<StoreState>()(
   devtools(
@@ -31,6 +34,7 @@ export const useStore = create<StoreState>()(
         ...createAnalysisSlice(...a),
         ...createContentSlice(...a),
         ...createLlmSlice(...a),
+        ...createGraphDataSlice(...a),
       })),
       {
         name: "nestweaver-ui",
@@ -47,6 +51,7 @@ export const useStore = create<StoreState>()(
           communityOverlay: state.communityOverlay,
           tagsVisible: state.tagsVisible,
           minimapVisible: state.minimapVisible,
+          reducedEffects: state.reducedEffects,
         }),
       },
     ),

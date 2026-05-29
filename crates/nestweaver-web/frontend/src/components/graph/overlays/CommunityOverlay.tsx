@@ -1,27 +1,27 @@
-import { useEffect, useRef, useCallback, useState } from "react";
-import { useSigma } from "@react-sigma/core";
+import { useMemo } from "react";
+import { Shape, DoubleSide } from "three";
 import louvain from "graphology-communities-louvain";
 import { useStore } from "../../../stores";
 
-// Okabe-Ito colorblind-safe palette
 const COMMUNITY_COLORS = [
-  "#E69F00",
-  "#56B4E9",
-  "#009E73",
-  "#F0E442",
-  "#0072B2",
-  "#D55E00",
-  "#CC79A7",
-  "#999999",
+  "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+  "#0072B2", "#D55E00", "#CC79A7", "#999999",
 ];
+
+function hexToRgb(hex: string): [number, number, number] {
+  const c = hex.slice(1);
+  return [
+    parseInt(c.slice(0, 2), 16) / 255,
+    parseInt(c.slice(2, 4), 16) / 255,
+    parseInt(c.slice(4, 6), 16) / 255,
+  ];
+}
 
 type Point = { x: number; y: number };
 
 function computeConvexHull(points: Point[]): Point[] {
   if (points.length < 3) return points;
-
   const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
-
   const cross = (o: Point, a: Point, b: Point) =>
     (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
 
@@ -34,7 +34,6 @@ function computeConvexHull(points: Point[]): Point[] {
       lower.pop();
     lower.push(p);
   }
-
   const upper: Point[] = [];
   for (const p of [...sorted].reverse()) {
     while (
@@ -44,7 +43,6 @@ function computeConvexHull(points: Point[]): Point[] {
       upper.pop();
     upper.push(p);
   }
-
   upper.pop();
   lower.pop();
   return lower.concat(upper);
@@ -52,181 +50,93 @@ function computeConvexHull(points: Point[]): Point[] {
 
 function expandHull(hull: Point[], padding: number): Point[] {
   if (hull.length === 0) return hull;
-
-  const cx = hull.reduce((sum, p) => sum + p.x, 0) / hull.length;
-  const cy = hull.reduce((sum, p) => sum + p.y, 0) / hull.length;
-
+  const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
+  const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
   return hull.map((p) => {
     const dx = p.x - cx;
     const dy = p.y - cy;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist === 0) return { x: p.x + padding, y: p.y };
-    return {
-      x: p.x + (dx / dist) * padding,
-      y: p.y + (dy / dist) * padding,
-    };
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    return { x: p.x + (dx / dist) * padding, y: p.y + (dy / dist) * padding };
   });
 }
 
-function useIsDark(): boolean {
-  const theme = useStore((s) => s.theme);
-  const [isDark, setIsDark] = useState(() => {
-    if (theme === "dark") return true;
-    if (theme === "light") return false;
-    return window.matchMedia("(prefers-color-scheme: dark)").matches;
-  });
-
-  useEffect(() => {
-    if (theme === "dark") {
-      setIsDark(true);
-      return;
-    }
-    if (theme === "light") {
-      setIsDark(false);
-      return;
-    }
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    setIsDark(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setIsDark(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, [theme]);
-
-  return isDark;
-}
-
+/**
+ * Renders Louvain community convex hulls as 3D geometry inside the R3F Canvas.
+ * Hulls are placed at z=-0.5 (behind nodes and edges) using Three.js ShapeGeometry.
+ * Only rendered when communityOverlay is enabled in the store.
+ */
 export function CommunityOverlay() {
-  const sigma = useSigma();
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const communityOverlay = useStore((s) => s.communityOverlay);
-  const isDark = useIsDark();
+  const graphInstance = useStore((s) => s.graphInstance);
+  const graphVersion = useStore((s) => s.graphVersion);
 
-  // Memoize Louvain results — only recompute when graph topology changes
-  const communitiesRef = useRef<Record<string, number> | null>(null);
-  const lastOrderRef = useRef<number>(-1);
+  const hulls = useMemo(() => {
+    if (!communityOverlay || !graphInstance || graphInstance.order < 3) return [];
 
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const container = sigma.getContainer();
-    const width = container.clientWidth;
-    const height = container.clientHeight;
-
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
+    let communities: Record<string, number>;
+    try {
+      communities = louvain(graphInstance);
+    } catch {
+      return [];
     }
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, width, height);
-
-    const graph = sigma.getGraph();
-    if (graph.order === 0) return;
-
-    // Re-run Louvain only when node count changes (topology change)
-    if (communitiesRef.current === null || lastOrderRef.current !== graph.order) {
-      try {
-        communitiesRef.current = louvain(graph);
-        lastOrderRef.current = graph.order;
-      } catch {
-        return;
-      }
-    }
-
-    const communities = communitiesRef.current;
-
-    // Group nodes by community — reproject graph-space coords to screen-space each frame
+    // Group node positions by community id
     const groups = new Map<number, Point[]>();
-    graph.forEachNode((node) => {
-      const community = communities[node];
-      if (community === undefined) return;
-
-      const displayData = sigma.getNodeDisplayData(node);
-      if (!displayData) return;
-
-      // getNodeDisplayData returns graph-space coordinates; project to viewport pixels
-      const screenPos = sigma.graphToViewport({ x: displayData.x, y: displayData.y });
-
-      if (!groups.has(community)) {
-        groups.set(community, []);
-      }
-      groups.get(community)!.push({ x: screenPos.x, y: screenPos.y });
+    graphInstance.forEachNode((node, attrs) => {
+      const comm = communities[node];
+      if (comm === undefined) return;
+      const x = typeof attrs.x === "number" ? attrs.x : 0;
+      const y = typeof attrs.y === "number" ? attrs.y : 0;
+      if (!groups.has(comm)) groups.set(comm, []);
+      groups.get(comm)!.push({ x, y });
     });
 
-    // Theme-aware opacity
-    const fillAlpha = isDark ? 0.15 : 0.08;
-    const strokeAlpha = 0.4;
-
-    // Draw convex hull for each community
-    groups.forEach((points, community) => {
-      if (points.length < 2) return;
-
-      const color = COMMUNITY_COLORS[community % COMMUNITY_COLORS.length];
+    const result: Array<{ points: Point[]; color: string; communityId: number }> = [];
+    groups.forEach((points, communityId) => {
+      if (points.length < 3) return;
       const hull = computeConvexHull(points);
-      const expanded = expandHull(hull, 20);
-
-      if (expanded.length < 2) return;
-
-      ctx.beginPath();
-      ctx.moveTo(expanded[0].x, expanded[0].y);
-      for (let i = 1; i < expanded.length; i++) {
-        ctx.lineTo(expanded[i].x, expanded[i].y);
-      }
-      ctx.closePath();
-
-      ctx.globalAlpha = fillAlpha;
-      ctx.fillStyle = color;
-      ctx.fill();
-
-      ctx.globalAlpha = strokeAlpha;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-
-      ctx.globalAlpha = 1;
+      const expanded = expandHull(hull, 8);
+      if (expanded.length < 3) return;
+      result.push({
+        points: expanded,
+        color: COMMUNITY_COLORS[communityId % COMMUNITY_COLORS.length],
+        communityId,
+      });
     });
-  }, [sigma, isDark]);
 
-  useEffect(() => {
-    if (!communityOverlay) return;
+    return result;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [communityOverlay, graphInstance, graphVersion]);
 
-    // Reset memoized communities when overlay is toggled on
-    communitiesRef.current = null;
-    lastOrderRef.current = -1;
-
-    // Initial draw
-    draw();
-
-    // Redraw on every Sigma render (follows pan/zoom) — Louvain is skipped unless topology changed
-    sigma.on("afterRender", draw);
-
-    return () => {
-      sigma.off("afterRender", draw);
-      // Clear canvas on cleanup
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext("2d");
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
-    };
-  }, [communityOverlay, sigma, draw]);
-
-  if (!communityOverlay) return null;
+  if (hulls.length === 0) return null;
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        position: "absolute",
-        inset: 0,
-        width: "100%",
-        height: "100%",
-        pointerEvents: "none",
-        zIndex: 10,
-      }}
-    />
+    <group>
+      {hulls.map((hull) => {
+        const shape = new Shape();
+        shape.moveTo(hull.points[0].x, hull.points[0].y);
+        for (let i = 1; i < hull.points.length; i++) {
+          shape.lineTo(hull.points[i].x, hull.points[i].y);
+        }
+        shape.closePath();
+
+        const [r, g, b] = hexToRgb(hull.color);
+
+        return (
+          <mesh key={hull.communityId} position={[0, 0, -0.5]} renderOrder={-2}>
+            <shapeGeometry args={[shape]} />
+            <meshBasicMaterial
+              color={[r, g, b]}
+              transparent
+              opacity={0.12}
+              side={DoubleSide}
+              depthTest={false}
+              depthWrite={false}
+              toneMapped={false}
+            />
+          </mesh>
+        );
+      })}
+    </group>
   );
 }

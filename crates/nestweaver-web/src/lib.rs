@@ -27,6 +27,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
+        .route("/api/v1/version", get(routes::version::version))
         .route("/api/v1/search", get(routes::symbols::search))
         .route("/api/v1/symbol/{uid}", get(routes::symbols::symbol_by_uid))
         .route(
@@ -122,6 +123,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/export/svg", post(routes::export::export_svg))
         .route("/api/v1/export/png", post(routes::export::export_png))
         .route("/api/v1/export/html", post(routes::export::export_html))
+        // Snapshot
+        .route(
+            "/api/v1/snapshot.msgpack",
+            get(routes::snapshot::snapshot_msgpack),
+        )
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback_service(static_handler)

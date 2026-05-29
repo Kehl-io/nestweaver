@@ -78,6 +78,7 @@ fn arb_symbol() -> impl Strategy<Value = RawSymbol> {
             name,
             kind,
             start_line,
+            end_line: start_line,
             signature: String::new(),
             content_hash: String::new(),
             is_entry_point: false,

@@ -1,11 +1,11 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2356
 expression: "parsed_symbols(\"simple.lua\", &source)"
 ---
 - name: "Greeter:new"
   kind: Method
   start_line: 7
+  end_line: 11
   signature: "function Greeter:new(name)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -15,6 +15,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
 - name: "Greeter:greet"
   kind: Method
   start_line: 13
+  end_line: 15
   signature: "function Greeter:greet()"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
 - name: format_name
   kind: Function
   start_line: 18
+  end_line: 20
   signature: function format_name(name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -33,6 +35,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
 - name: helper
   kind: Function
   start_line: 23
+  end_line: 25
   signature: local function helper(input)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

@@ -144,6 +144,7 @@ pub struct Symbol {
     pub repo_uid: String,
     pub file_path: String,
     pub start_line: u32,
+    pub end_line: u32,
     pub signature: String,
     pub summary: Option<String>,
     pub content_hash: String,
@@ -280,4 +281,42 @@ pub struct Project {
     pub name: String,
     pub summary: Option<String>,
     pub instance_id: String,
+}
+
+/// An API contract surface — one HTTP route, one gRPC method, or one GraphQL
+/// operation. Contracts are derived two ways:
+///
+/// 1. **Declared** — parsed from a spec file (OpenAPI/Swagger, `.proto`,
+///    `.graphql`). `source_path` points at the spec.
+/// 2. **Code-derived** — minted from a framework handler (Spring/NestJS) when
+///    no spec declares it. `source_path` points at the handler's source file.
+///
+/// Contracts are treated as **hypotheses**, not ground truth — the
+/// `confidence` on the incident `IMPLEMENTS_CONTRACT` edge records match
+/// quality, and drift diagnostics surface the declared/implemented set diff.
+///
+/// `kind` is one of `http` | `grpc` | `graphql`. For HTTP, `verb` + `path`
+/// are populated and `operation_id` is the spec's `operationId` (if any).
+/// For gRPC/GraphQL, `operation_id` carries the fully-qualified identifier
+/// and `verb`/`path` are `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contract {
+    pub uid: String,
+    /// `http` | `grpc` | `graphql`.
+    pub kind: String,
+    /// HTTP verb (GET/POST/...), upper-cased. `None` for gRPC/GraphQL.
+    pub verb: Option<String>,
+    /// Normalized HTTP route path. `None` for gRPC/GraphQL.
+    pub path: Option<String>,
+    /// Spec `operationId` (HTTP) or fully-qualified method/operation
+    /// (gRPC/GraphQL).
+    pub operation_id: Option<String>,
+    /// Owning repo UID.
+    pub repo_uid: String,
+    /// Path to the spec file (declared) or handler source file (code-derived).
+    pub source_path: String,
+    /// Confidence the contract is real / correctly extracted. Declared
+    /// contracts are 1.0; code-derived contracts inherit the handler
+    /// match confidence.
+    pub confidence: f32,
 }

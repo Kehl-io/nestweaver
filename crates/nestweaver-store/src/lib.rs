@@ -1,7 +1,10 @@
+pub mod cache;
 pub mod db;
 pub mod error;
+pub mod generation;
 pub mod ranking;
 pub mod read;
+pub mod regex;
 pub mod search;
 pub mod tantivy_index;
 pub mod traverse;
@@ -9,10 +12,21 @@ pub mod write;
 
 pub use db::GraphStore;
 pub use error::StoreError;
-pub use ranking::{GraphScope, QueryIntent, ScopedEdgeQuery, detect_intent};
-pub use read::{BacklinkRow, CodeEdge, CodeGraph, CrossRepoRef, SymbolBasic};
+pub use ranking::{
+    DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
+    QueryIntent, ScopedEdgeQuery, detect_intent, git_activity_multiplier,
+};
+pub use read::{
+    BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
+};
+pub use regex::{
+    CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
+};
 pub use search::{EmbeddingIndex, SearchResult};
-pub use tantivy_index::{SearchHit, TantivyError, TantivyIndex};
+pub use tantivy_index::{
+    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
+    TantivyError, TantivyIndex,
+};
 pub use traverse::ImpactNode;
 
 #[cfg(test)]
@@ -51,6 +65,7 @@ mod tests {
             repo_uid: repo_uid.to_string(),
             file_path: file_path.to_string(),
             start_line: 10,
+            end_line: 25,
             signature: format!("fn {name}()"),
             summary: Some(format!("Does {name} things")),
             content_hash: "contenthash".to_string(),
@@ -102,6 +117,9 @@ mod tests {
         assert_eq!(found.name, "my_func");
         assert_eq!(found.kind, SymbolKind::Function);
         assert_eq!(found.repo_uid, "repo-1");
+        // P0.1: end_line round-trips independently of start_line.
+        assert_eq!(found.start_line, 10);
+        assert_eq!(found.end_line, 25);
     }
 
     #[test]
@@ -687,6 +705,48 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn clear_repo_derived_nodes_enables_idempotent_reindex() {
+        use nestweaver_schema::Contract;
+        let store = test_store();
+        let repo = make_repo("repo-clear-1");
+        store.insert_repo(&repo).unwrap();
+
+        // Simulate a first index: a Service node (plain CREATE, no upsert) and
+        // a Contract node, both with deterministic repo-derived UIDs.
+        let svc = make_service("svc:repo-clear-1:src", "repo-clear-1");
+        store.insert_service(&svc).unwrap();
+        let contract = Contract {
+            uid: "contract:repo-clear-1:get:/x".to_string(),
+            kind: "rest-endpoint".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some("/x".to_string()),
+            operation_id: None,
+            repo_uid: "repo-clear-1".to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 0.9,
+        };
+        store.insert_contract(&contract).unwrap();
+        assert_eq!(store.list_services(None).unwrap().len(), 1);
+
+        // Re-indexing the SAME service UID without clearing first would trip the
+        // primary-key uniqueness constraint. clear_repo_derived_nodes must make
+        // it idempotent.
+        store.clear_repo_derived_nodes("repo-clear-1").unwrap();
+        assert_eq!(store.list_services(None).unwrap().len(), 0);
+
+        // Second index pass: re-insert the same Service must now succeed.
+        store
+            .insert_service(&svc)
+            .expect("re-insert after clear must not collide on primary key");
+        assert_eq!(store.list_services(None).unwrap().len(), 1);
+
+        // Idempotent for repos with nothing to clear.
+        store
+            .clear_repo_derived_nodes("repo-does-not-exist")
+            .unwrap();
+    }
+
     // ── Upsert idempotency tests ─────────────────────────────────────
 
     #[test]
@@ -910,5 +970,58 @@ mod tests {
         let callees = store.callees_of("be-sym-0").unwrap();
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].uid, "be-sym-1");
+    }
+
+    #[test]
+    fn contract_round_trips_and_implements_edge() {
+        use nestweaver_schema::Contract;
+        let store = test_store();
+
+        let contract = Contract {
+            uid: "contract:http:POST:/v1/approvals".to_string(),
+            kind: "http".to_string(),
+            verb: Some("POST".to_string()),
+            path: Some("/v1/approvals".to_string()),
+            operation_id: Some("createApproval".to_string()),
+            repo_uid: "repo-1".to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 1.0,
+        };
+        store.insert_contract(&contract).unwrap();
+
+        // Read back (no filter, and repo-filtered).
+        let all = store.list_contracts(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].uid, "contract:http:POST:/v1/approvals");
+        assert_eq!(all[0].verb.as_deref(), Some("POST"));
+        assert_eq!(all[0].path.as_deref(), Some("/v1/approvals"));
+        assert_eq!(all[0].confidence, 1.0);
+        assert!(store.list_contracts(Some("repo-2")).unwrap().is_empty());
+
+        // Insert is idempotent (no duplicate after re-insert).
+        store.insert_contract(&contract).unwrap();
+        assert_eq!(store.list_contracts(None).unwrap().len(), 1);
+
+        // A handler symbol implements it.
+        store
+            .insert_symbol(&make_symbol(
+                "h1",
+                "create",
+                "repo-1",
+                "ApprovalsController.java",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "h1".to_string(),
+                target_uid: "contract:http:POST:/v1/approvals".to_string(),
+                edge_type: EdgeType::ImplementsContract,
+                confidence: 1.0,
+                link_type: None,
+            })
+            .unwrap();
+
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert_eq!(implemented, vec!["contract:http:POST:/v1/approvals"]);
     }
 }

@@ -1,7 +1,7 @@
 use lbug::Value;
 use nestweaver_schema::{
-    EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol, SymbolKind,
-    Tag, Vault, Visibility,
+    Contract, EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol,
+    SymbolKind, Tag, Vault, Visibility,
 };
 use serde::Serialize;
 
@@ -32,6 +32,31 @@ pub struct BacklinkRow {
     pub source_section_uid: String,
     pub confidence: f32,
     pub display: Option<String>,
+}
+
+/// A wikilink edge whose resolution is suspect (confidence below 1.0).
+/// Surfaced by `brain_broken_links` so the source note + link text are known
+/// without a follow-up read.
+#[derive(Debug, Clone, Serialize)]
+pub struct BrokenWikilinkRow {
+    pub source_uid: String,
+    pub source_path: String,
+    pub source_title: String,
+    pub wikilink_text: String,
+    pub confidence: f32,
+    /// The note UID this edge currently points at (the low-confidence target).
+    pub current_target_uid: String,
+}
+
+/// A lightweight note row used by orphan detection and topic clustering.
+/// Only the fields those queries need — no body load.
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteLite {
+    pub uid: String,
+    pub title: String,
+    pub file_path: String,
+    pub vault_uid: String,
+    pub pagerank_score: f64,
 }
 
 /// A cross-repo reference between two symbols.
@@ -140,7 +165,7 @@ fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
 }
 
 /// Build a Symbol from a query row with columns:
-/// uid, name, kind, repo_uid, file_path, start_line, signature, summary, content_hash, pagerank_score, is_entry_point, entry_point_kind
+/// uid, name, kind, repo_uid, file_path, start_line, end_line, signature, summary, content_hash, pagerank_score, is_entry_point, entry_point_kind
 pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     let uid = extract_string(row, 0)?;
     let name = extract_string(row, 1)?;
@@ -149,14 +174,21 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     let repo_uid = extract_string(row, 3)?;
     let file_path = extract_string(row, 4)?;
     let start_line = u32::try_from(extract_i64(row, 5)?).unwrap_or(0);
-    let signature = extract_string(row, 6)?;
-    let summary = extract_opt_string(row, 7)?;
-    let content_hash = extract_string(row, 8)?;
-    let pagerank_score = extract_f64(row, 9)?;
-    let iep_str = extract_string(row, 10).unwrap_or_default();
+    let end_line = u32::try_from(extract_i64(row, 6)?).unwrap_or(0);
+    let signature = extract_string(row, 7)?;
+    let summary = extract_opt_string(row, 8)?;
+    let content_hash = extract_string(row, 9)?;
+    let pagerank_score = extract_f64(row, 10)?;
+    let iep_str = extract_string(row, 11).unwrap_or_default();
     let is_entry_point = iep_str == "true";
-    let epk_str = extract_opt_string(row, 11).unwrap_or(None);
+    let epk_str = extract_opt_string(row, 12).unwrap_or(None);
     let entry_point_kind = epk_str.as_deref().and_then(parse_entry_point_kind);
+    // Column 13 (framework_hint) is optional: older queries that don't SELECT
+    // it leave the row short, in which case `get` returns None.
+    let framework_hint = row
+        .get(13)
+        .and_then(|_| extract_opt_string(row, 13).ok().flatten())
+        .and_then(|s| parse_framework_hint(&s));
 
     Ok(Symbol {
         uid,
@@ -165,6 +197,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         repo_uid,
         file_path,
         start_line,
+        end_line,
         signature,
         summary,
         content_hash,
@@ -174,12 +207,26 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         entry_point_kind,
         visibility: Visibility::Inferred,
         type_info: None,
-        framework_hint: None,
+        framework_hint,
     })
 }
 
-pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, \
-     s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind";
+/// Parse a `"framework:role"` string (as stored in the `framework_hint`
+/// column) back into a [`FrameworkHint`]. Empty / malformed values yield None.
+fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
+    let (framework, role) = s.split_once(':')?;
+    if framework.is_empty() {
+        return None;
+    }
+    Some(nestweaver_schema::FrameworkHint {
+        framework: framework.to_string(),
+        role: role.to_string(),
+    })
+}
+
+pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
+     s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
+     s.framework_hint";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
      n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
@@ -1257,6 +1304,89 @@ impl GraphStore {
             .collect()
     }
 
+    /// List all Contract nodes, optionally filtered to a single repo.
+    pub fn list_contracts(&self, repo_uid: Option<&str>) -> Result<Vec<Contract>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (c:Contract) RETURN c.uid, c.kind, c.verb, c.path, \
+                 c.operation_id, c.repo_uid, c.source_path, c.confidence";
+        let result = match conn.query(q) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("list_contracts: query skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let mut out: Vec<Contract> = Vec::new();
+        for row in result {
+            let c = Contract {
+                uid: extract_string(&row, 0)?,
+                kind: extract_string(&row, 1)?,
+                verb: extract_opt_string(&row, 2)?,
+                path: extract_opt_string(&row, 3)?,
+                operation_id: extract_opt_string(&row, 4)?,
+                repo_uid: extract_string(&row, 5)?,
+                source_path: extract_string(&row, 6)?,
+                confidence: extract_f64(&row, 7)? as f32,
+            };
+            if let Some(want) = repo_uid
+                && c.repo_uid != want
+            {
+                continue;
+            }
+            out.push(c);
+        }
+        Ok(out)
+    }
+
+    /// Return the (contract_uid, confidence) of every Contract a given handler
+    /// symbol implements via an `IMPLEMENTS_CONTRACT` edge.
+    pub fn contracts_implemented_by(
+        &self,
+        symbol_uid: &str,
+    ) -> Result<Vec<(String, f32)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (s:Symbol {uid: $uid})-[r:IMPLEMENTS_CONTRACT]->(c:Contract) \
+                 RETURN c.uid, r.confidence";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!("contracts_implemented_by: skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("uid", Value::String(symbol_uid.to_string()))],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("contracts_implemented_by: execute skipped: {e}");
+                return Ok(vec![]);
+            }
+        };
+        result
+            .map(|row| Ok((extract_string(&row, 0)?, extract_f64(&row, 1)? as f32)))
+            .collect()
+    }
+
+    /// Return the set of Contract UIDs that have at least one incident
+    /// `IMPLEMENTS_CONTRACT` edge (i.e. a handler claims to implement them).
+    /// Used by drift diagnostics to compute the declared/implemented diff.
+    pub fn list_implemented_contract_uids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (:Symbol)-[:IMPLEMENTS_CONTRACT]->(c:Contract) RETURN DISTINCT c.uid";
+        let result = match conn.query(q) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_implemented_contract_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        result.map(|row| extract_string(&row, 0)).collect()
+    }
+
     /// Look up a Project by name (case-insensitive).
     pub fn lookup_project_by_name(&self, name: &str) -> Result<Option<Project>, StoreError> {
         let all = self.list_projects()?;
@@ -1358,6 +1488,284 @@ impl GraphStore {
             .filter_map(|row| match row.first() {
                 Some(Value::String(s)) => Some(s.clone()),
                 _ => None,
+            })
+            .collect())
+    }
+
+    // ── Brain document-graph reads (Feature F9) ─────────────────────────────
+
+    /// Lightweight note rows for orphan detection and topic clustering.
+    /// Returns (uid, title, file_path, vault_uid, pagerank_score) per note,
+    /// optionally filtered to a single vault. Empty DB → empty vec.
+    pub fn list_notes_lite(&self, vault_uid: Option<&str>) -> Result<Vec<NoteLite>, StoreError> {
+        let conn = self.conn()?;
+        let cols = "n.uid, n.title, n.file_path, n.vault_uid, n.pagerank_score";
+        let result = if let Some(vid) = vault_uid {
+            let q = format!("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN {cols}");
+            let mut stmt = match conn.prepare(&q) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::trace!("list_notes_lite: query skipped (table may not exist): {e}");
+                    return Ok(vec![]);
+                }
+            };
+            match conn.execute(&mut stmt, vec![("vid", Value::String(vid.to_string()))]) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("list_notes_lite: execute skipped: {e}");
+                    return Ok(vec![]);
+                }
+            }
+        } else {
+            let q = format!("MATCH (n:Note) RETURN {cols}");
+            match conn.query(&q) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("list_notes_lite: query skipped (table may not exist): {e}");
+                    return Ok(vec![]);
+                }
+            }
+        };
+        result
+            .map(|row| {
+                Ok(NoteLite {
+                    uid: extract_string(&row, 0)?,
+                    title: extract_string(&row, 1)?,
+                    file_path: extract_string(&row, 2)?,
+                    vault_uid: extract_string(&row, 3)?,
+                    pagerank_score: extract_f64(&row, 4)?,
+                })
+            })
+            .collect()
+    }
+
+    /// All Note→Note wikilink edges, as (source_note_uid, target_note_uid).
+    ///
+    /// Traverses source Note → NOTE_HAS_SECTION → Section -[WIKILINK_TO_NOTE]→
+    /// target Note, collapsing the section hop so callers see a note-level
+    /// adjacency. Self-loops (a note linking to itself) are dropped. Empty DB
+    /// or a vault with no wikilinks → empty vec.
+    pub fn note_wikilink_edges(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(:Section)-[:WIKILINK_TO_NOTE]->(dst:Note) \
+                 RETURN src.uid, dst.uid";
+        let result = match conn.query(q) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("note_wikilink_edges: query skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let mut edges = Vec::new();
+        for row in result {
+            let src = extract_string(&row, 0)?;
+            let dst = extract_string(&row, 1)?;
+            if src != dst {
+                edges.push((src, dst));
+            }
+        }
+        Ok(edges)
+    }
+
+    /// All F11 typed Note→Note relationship edges, as `(source_uid,
+    /// target_uid, rel_table_name)` where `rel_table_name` is one of
+    /// `SUPERSEDES`, `DEPENDS_ON`, `CAUSED_BY`, `RELATES_TO`. Generic
+    /// wikilinks are NOT included. Empty DB / no typed edges → empty vec.
+    pub fn typed_note_edges(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let mut out = Vec::new();
+        for rel in ["SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "RELATES_TO"] {
+            let q = format!("MATCH (a:Note)-[:{rel}]->(b:Note) RETURN a.uid, b.uid");
+            let result = match conn.query(&q) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!("typed_note_edges {rel}: query skipped: {e}");
+                    continue;
+                }
+            };
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                out.push((src, dst, rel.to_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Wikilink edges whose resolution is suspect — confidence below 1.0.
+    ///
+    /// These are ambiguous or low-priority resolutions (the indexer splits
+    /// confidence 1/N across ambiguous title matches and assigns < 1.0 to
+    /// alias/same-folder matches). Unresolved links are not stored as edges,
+    /// so this surfaces the recoverable "broken-ish" links. Each row carries
+    /// the source note, the `display` link text, and the current target.
+    /// Empty DB → empty vec.
+    pub fn broken_wikilinks(&self) -> Result<Vec<BrokenWikilinkRow>, StoreError> {
+        let conn = self.conn()?;
+        // Preserve insertion order while de-duplicating: an ambiguous `[[Dup]]`
+        // emits one WIKILINK_TO_NOTE edge per candidate (all confidence < 1.0),
+        // which would otherwise surface as N near-identical rows. Collapse to
+        // one row per (source_uid, wikilink_text).
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashMap<(String, String), BrokenWikilinkRow> =
+            std::collections::HashMap::new();
+
+        // 1. Low-confidence / ambiguous resolved links.
+        let q = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(:Section)-[r:WIKILINK_TO_NOTE]->(dst:Note) \
+                 WHERE r.confidence < 1.0 \
+                 RETURN src.uid, src.file_path, src.title, r.display, r.confidence, dst.uid";
+        match conn.query(q) {
+            Ok(result) => {
+                for row in result {
+                    let source_uid = extract_string(&row, 0)?;
+                    let wikilink_text = extract_string(&row, 3)?;
+                    let key = (source_uid.clone(), wikilink_text.clone());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
+                    {
+                        order.push(key);
+                        slot.insert(BrokenWikilinkRow {
+                            source_uid,
+                            source_path: extract_string(&row, 1)?,
+                            source_title: extract_string(&row, 2)?,
+                            wikilink_text,
+                            confidence: extract_f64(&row, 4)? as f32,
+                            current_target_uid: extract_string(&row, 5)?,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::trace!(
+                    "broken_wikilinks: WIKILINK query skipped (table may not exist): {e}"
+                );
+            }
+        }
+
+        // 2. Genuinely-unresolved links (no target note → no edge exists).
+        //    These are the truly-broken links; confidence 0.0 and empty target.
+        let uq = "MATCH (u:UnresolvedWikilink) \
+                  RETURN u.source_note_uid, u.source_path, u.source_title, u.wikilink_text";
+        match conn.query(uq) {
+            Ok(result) => {
+                for row in result {
+                    let source_uid = extract_string(&row, 0)?;
+                    let wikilink_text = extract_string(&row, 3)?;
+                    let key = (source_uid.clone(), wikilink_text.clone());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
+                    {
+                        order.push(key);
+                        slot.insert(BrokenWikilinkRow {
+                            source_uid,
+                            source_path: extract_string(&row, 1)?,
+                            source_title: extract_string(&row, 2)?,
+                            wikilink_text,
+                            confidence: 0.0,
+                            current_target_uid: String::new(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::trace!(
+                    "broken_wikilinks: UnresolvedWikilink query skipped (table may not exist): {e}"
+                );
+            }
+        }
+
+        Ok(order.into_iter().filter_map(|k| seen.remove(&k)).collect())
+    }
+
+    /// Set of Note UIDs that have at least one OUTBOUND wikilink (to a note or
+    /// a heading). Used by orphan detection. Empty DB → empty set.
+    pub fn note_uids_with_outbound_wikilinks(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = std::collections::HashSet::new();
+        for rel in ["WIKILINK_TO_NOTE", "WIKILINK_TO_HEADING"] {
+            let q = format!(
+                "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(:Section)-[:{rel}]->() RETURN DISTINCT src.uid"
+            );
+            let result = match conn.query(&q) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!(
+                        "note_uids_with_outbound_wikilinks: {rel} skipped (table may not exist): {e}"
+                    );
+                    continue;
+                }
+            };
+            for row in result {
+                if let Ok(uid) = extract_string(&row, 0) {
+                    uids.insert(uid);
+                }
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Set of Note UIDs that are the target of at least one INBOUND wikilink.
+    /// Used by orphan detection. Empty DB → empty set.
+    pub fn note_uids_with_inbound_wikilinks(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = std::collections::HashSet::new();
+        // Direct note targets.
+        let q = "MATCH ()-[:WIKILINK_TO_NOTE]->(dst:Note) RETURN DISTINCT dst.uid";
+        if let Ok(result) = conn.query(q) {
+            for row in result {
+                if let Ok(uid) = extract_string(&row, 0) {
+                    uids.insert(uid);
+                }
+            }
+        }
+        // Heading targets count as inbound links to the heading's parent note.
+        let qh = "MATCH ()-[:WIKILINK_TO_HEADING]->(h:Heading) RETURN DISTINCT h.note_uid";
+        if let Ok(result) = conn.query(qh) {
+            for row in result {
+                if let Ok(uid) = extract_string(&row, 0) {
+                    uids.insert(uid);
+                }
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Tag co-occurrence: returns, per note, the set of tag names attached to
+    /// it (via NOTE_TAGGED_WITH, plus SECTION_TAGGED_WITH on its sections).
+    /// The caller computes co-occurrence counts. Empty DB → empty vec.
+    pub fn note_tag_sets(&self) -> Result<Vec<(String, Vec<String>)>, StoreError> {
+        let conn = self.conn()?;
+        let mut by_note: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+
+        // Note-level tags.
+        let qn = "MATCH (n:Note)-[:NOTE_TAGGED_WITH]->(t:Tag) RETURN n.uid, t.name";
+        if let Ok(result) = conn.query(qn) {
+            for row in result {
+                let note = extract_string(&row, 0)?;
+                let tag = extract_string(&row, 1)?;
+                by_note.entry(note).or_default().insert(tag);
+            }
+        }
+        // Section-level tags roll up to the parent note.
+        let qs = "MATCH (n:Note)-[:NOTE_HAS_SECTION]->(s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag) \
+                  RETURN n.uid, t.name";
+        if let Ok(result) = conn.query(qs) {
+            for row in result {
+                let note = extract_string(&row, 0)?;
+                let tag = extract_string(&row, 1)?;
+                by_note.entry(note).or_default().insert(tag);
+            }
+        }
+
+        Ok(by_note
+            .into_iter()
+            .map(|(note, tags)| {
+                let mut v: Vec<String> = tags.into_iter().collect();
+                v.sort();
+                (note, v)
             })
             .collect())
     }

@@ -1,12 +1,15 @@
 import { useCallback } from "react";
-import { useSigma } from "@react-sigma/core";
 import { UMAP } from "umap-js";
+import { useStore } from "../../../stores";
 
 export function useSemanticLayout() {
-  const sigma = useSigma();
+  const graphInstance = useStore((s) => s.graphInstance);
+  const setGraphData = useStore((s) => s.setGraphData);
 
   const applySemanticLayout = useCallback(() => {
-    const graph = sigma.getGraph();
+    if (!graphInstance) return;
+
+    const graph = graphInstance;
     const nodes: string[] = [];
     const embeddings: number[][] = [];
 
@@ -66,8 +69,9 @@ export function useSemanticLayout() {
       );
     }
 
-    sigma.refresh();
-  }, [sigma]);
+    // Signal that positions have changed so the bridge rebuilds buffers
+    setGraphData(graph);
+  }, [graphInstance, setGraphData]);
 
   return { applySemanticLayout };
 }
