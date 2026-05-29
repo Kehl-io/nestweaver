@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
 import { NodeListView } from "./NodeListView";
@@ -17,6 +17,154 @@ import { useFeaturesMode } from "./modes/useFeaturesMode";
 import { useLocalMode } from "./modes/useLocalMode";
 import { useSemanticLayout } from "./modes/useSemanticLayout";
 import { useStore } from "../../stores";
+
+/**
+ * Attaches keyboard navigation to the graph panel div.
+ *
+ * - Tab / Shift+Tab: cycle nodes ordered by PageRank relevance
+ * - Arrow keys: navigate to the connected neighbor closest in that direction
+ * - Enter: set selected node as seed
+ * - Escape: deselect
+ */
+function useGraphKeyboardNav(
+  panelRef: React.RefObject<HTMLDivElement | null>,
+) {
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const graphInstance = useStore((s) => s.graphInstance);
+  const graphVersion = useStore((s) => s.graphVersion);
+  const selectNode = useStore((s) => s.selectNode);
+  const setSeeds = useStore((s) => s.setSeeds);
+
+  // Keep a ref to a pagerank-sorted node list so the keydown handler is stable
+  const sortedNodesRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    if (!graphInstance) {
+      sortedNodesRef.current = [];
+      return;
+    }
+    // Sort nodes by their pagerank attribute descending (higher = more relevant)
+    const nodes = graphInstance.nodes();
+    nodes.sort((a, b) => {
+      const prA =
+        typeof graphInstance.getNodeAttribute(a, "pagerank") === "number"
+          ? (graphInstance.getNodeAttribute(a, "pagerank") as number)
+          : 0;
+      const prB =
+        typeof graphInstance.getNodeAttribute(b, "pagerank") === "number"
+          ? (graphInstance.getNodeAttribute(b, "pagerank") as number)
+          : 0;
+      return prB - prA;
+    });
+    sortedNodesRef.current = nodes;
+    // graphVersion is read to trigger a rebuild when the graph changes
+  }, [graphInstance, graphVersion]);
+
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const graph = useStore.getState().graphInstance;
+      const currentId = useStore.getState().selectedNodeId;
+      const sorted = sortedNodesRef.current;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        selectNode(null);
+        return;
+      }
+
+      if (e.key === "Enter") {
+        if (currentId) {
+          e.preventDefault();
+          setSeeds([currentId]);
+        }
+        return;
+      }
+
+      if (e.key === "Tab") {
+        e.preventDefault();
+        if (sorted.length === 0) return;
+        const idx = currentId ? sorted.indexOf(currentId) : -1;
+        const next = e.shiftKey
+          ? (idx <= 0 ? sorted.length - 1 : idx - 1)
+          : (idx >= sorted.length - 1 ? 0 : idx + 1);
+        const uid = sorted[next];
+        const kind =
+          graph?.hasNode(uid)
+            ? (graph.getNodeAttribute(uid, "kind") as string | null)
+            : null;
+        selectNode(uid, kind);
+        return;
+      }
+
+      if (
+        e.key === "ArrowUp" ||
+        e.key === "ArrowDown" ||
+        e.key === "ArrowLeft" ||
+        e.key === "ArrowRight"
+      ) {
+        if (!currentId || !graph) return;
+        e.preventDefault();
+
+        // Gather all neighbors (both directions)
+        const neighbors = graph.neighbors(currentId);
+        if (neighbors.length === 0) return;
+
+        const cx =
+          typeof graph.getNodeAttribute(currentId, "x") === "number"
+            ? (graph.getNodeAttribute(currentId, "x") as number)
+            : 0;
+        const cy =
+          typeof graph.getNodeAttribute(currentId, "y") === "number"
+            ? (graph.getNodeAttribute(currentId, "y") as number)
+            : 0;
+
+        // Direction vector for the pressed arrow key
+        const dirX =
+          e.key === "ArrowLeft" ? -1 : e.key === "ArrowRight" ? 1 : 0;
+        const dirY =
+          e.key === "ArrowUp" ? 1 : e.key === "ArrowDown" ? -1 : 0;
+
+        // Pick neighbor whose angle matches the pressed direction most closely
+        let bestUid: string | null = null;
+        let bestDot = -Infinity;
+
+        for (const uid of neighbors) {
+          const nx =
+            typeof graph.getNodeAttribute(uid, "x") === "number"
+              ? (graph.getNodeAttribute(uid, "x") as number)
+              : 0;
+          const ny =
+            typeof graph.getNodeAttribute(uid, "y") === "number"
+              ? (graph.getNodeAttribute(uid, "y") as number)
+              : 0;
+          const dx = nx - cx;
+          const dy = ny - cy;
+          const len = Math.sqrt(dx * dx + dy * dy);
+          if (len === 0) continue;
+          const dot = (dx / len) * dirX + (dy / len) * dirY;
+          if (dot > bestDot) {
+            bestDot = dot;
+            bestUid = uid;
+          }
+        }
+
+        if (bestUid) {
+          const kind =
+            graph.hasNode(bestUid)
+              ? (graph.getNodeAttribute(bestUid, "kind") as string | null)
+              : null;
+          selectNode(bestUid, kind);
+        }
+      }
+    };
+
+    el.addEventListener("keydown", handleKeyDown);
+    return () => el.removeEventListener("keydown", handleKeyDown);
+  }, [panelRef, selectNode, setSeeds]);
+}
 
 /**
  * Runs all mode hooks unconditionally — they no-op when their mode isn't active.
@@ -74,6 +222,9 @@ export function GraphPanel() {
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const viewMode = useStore((s) => s.viewMode);
 
+  const graphPanelRef = useRef<HTMLDivElement>(null);
+  useGraphKeyboardNav(graphPanelRef);
+
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -96,6 +247,7 @@ export function GraphPanel() {
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
+          ref={graphPanelRef}
           aria-label={viewMode === "list" ? "Node list view" : "Code knowledge graph"}
           role="application"
           tabIndex={0}
