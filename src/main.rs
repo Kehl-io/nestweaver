@@ -666,6 +666,15 @@ enum Commands {
         #[command(subcommand)]
         command: InteractionCommands,
     },
+    /// Inspect the API contract graph (F2-core).
+    ///
+    /// Contracts are HTTP routes / gRPC methods / GraphQL operations derived
+    /// from spec files and framework handlers. Links are HYPOTHESES, not
+    /// ground truth — see the confidence scores.
+    Contracts {
+        #[command(subcommand)]
+        command: ContractCommands,
+    },
     /// Generate an AGENTS.md codebase intelligence guide from the indexed graph.
     GenerateGuide {
         #[arg(
@@ -1583,6 +1592,35 @@ enum SnapshotCommands {
     Push {
         #[arg(long, help = "Instance ID to push snapshot for")]
         instance: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContractCommands {
+    /// List API contracts derived from spec files and framework handlers.
+    List {
+        #[arg(long, help = "Filter to a single repo by name or UID")]
+        repo: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Show contract drift: routes declared in a spec but not implemented,
+    /// and routes implemented by a handler but declared in no spec.
+    Drift {
+        #[arg(long, help = "Filter to a single repo by name or UID")]
+        repo: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -2768,6 +2806,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
         },
+
+        Commands::Contracts { command } => run_contracts(command),
 
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
@@ -6137,6 +6177,111 @@ fn run_embed(
         Ok(EXIT_ERROR)
     } else {
         Ok(EXIT_SUCCESS)
+    }
+}
+
+/// Resolve a `--repo` filter (display name or literal UID) to a repo UID.
+/// Returns `Ok(None)` when no filter was given, or an error when the filter
+/// matches no indexed repo.
+fn resolve_contract_repo_filter(
+    store: &GraphStore,
+    filter: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let repos = list_repos(store, None)?;
+    // Exact UID match first, then display-name (case-insensitive) match.
+    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
+        return Ok(Some(r.uid.clone()));
+    }
+    let needle = filter.to_lowercase();
+    if let Some(r) = repos
+        .iter()
+        .find(|r| nestweaver_engine::repo_display_name(r).to_lowercase() == needle)
+    {
+        return Ok(Some(r.uid.clone()));
+    }
+    anyhow::bail!("no indexed repo matches --repo '{filter}'")
+}
+
+fn run_contracts(command: ContractCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        ContractCommands::List { repo, json, db } => {
+            let store = open_store(db.as_deref())?;
+            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+            let mut contracts = store
+                .list_contracts(repo_uid.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            contracts.sort_by(|a, b| a.uid.cmp(&b.uid));
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&contracts)?);
+            } else if contracts.is_empty() {
+                println!(
+                    "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
+                     Spring/NestJS controllers first."
+                );
+            } else {
+                println!(
+                    "API contracts ({} total). NOTE: contract links are hypotheses, \
+                     not ground truth — see confidence.\n",
+                    contracts.len()
+                );
+                for c in &contracts {
+                    println!("{}", c.uid);
+                    println!("  kind:       {}", c.kind);
+                    if let Some(ref v) = c.verb {
+                        println!("  verb:       {v}");
+                    }
+                    if let Some(ref p) = c.path {
+                        println!("  path:       {p}");
+                    }
+                    if let Some(ref op) = c.operation_id {
+                        println!("  operation:  {op}");
+                    }
+                    println!("  source:     {}", c.source_path);
+                    println!("  confidence: {:.2}", c.confidence);
+                    println!();
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+        ContractCommands::Drift { repo, json, db } => {
+            let store = open_store(db.as_deref())?;
+            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+            let report = nestweaver_engine::contracts::drift_for_store(&store, repo_uid.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.is_clean() {
+                println!("No contract drift detected.");
+            } else {
+                println!("Contract drift (hypotheses, not ground truth):\n");
+                if !report.declared_not_implemented.is_empty() {
+                    println!(
+                        "Declared but NOT implemented ({}):",
+                        report.declared_not_implemented.len()
+                    );
+                    for f in &report.declared_not_implemented {
+                        println!("  - {}", f.uid);
+                    }
+                    println!();
+                }
+                if !report.implemented_not_declared.is_empty() {
+                    println!(
+                        "Implemented but NOT declared in any spec ({}):",
+                        report.implemented_not_declared.len()
+                    );
+                    for f in &report.implemented_not_declared {
+                        println!("  - {}", f.uid);
+                    }
+                    println!();
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
     }
 }
 
