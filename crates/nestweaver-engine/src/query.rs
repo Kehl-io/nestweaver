@@ -36,6 +36,16 @@ pub struct HybridSearchConfig {
     pub weight_semantic: f64,
     pub bm25_limit: usize,
     pub semantic_limit: usize,
+    /// Feature F7 (PRF half) — when `true`, the BM25 leg of hybrid retrieval
+    /// runs a two-pass pseudo-relevance-feedback expansion before fusion.
+    /// Off by default → identical behaviour to before.
+    ///
+    /// RRF CAVEAT: RRF fuses by *rank only*, so the PRF expansion weight
+    /// ([`nestweaver_store::PRF_EXPANSION_WEIGHT`] = 0.3) never appears in the
+    /// final fused score. PRF reaches the fused result purely by reordering
+    /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
+    /// the 0.3 boost to surface numerically in the output relevance.
+    pub prf: bool,
 }
 
 impl Default for HybridSearchConfig {
@@ -47,6 +57,7 @@ impl Default for HybridSearchConfig {
             weight_semantic: 0.0,
             bm25_limit: 500,
             semantic_limit: 200,
+            prf: false,
         }
     }
 }
@@ -378,6 +389,7 @@ mod promote_tests {
             seeds: vec![note("note:prd"), note("note:status")],
             connected: vec![symbol("sym:handler")],
             unresolved_seeds: vec![],
+            expansion_terms: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
             .into_iter()
@@ -404,6 +416,7 @@ mod promote_tests {
             seeds: vec![note("note:prd"), symbol("proj:x")],
             connected: vec![note("note:prd"), symbol("sym:handler")],
             unresolved_seeds: vec![],
+            expansion_terms: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
 
@@ -681,6 +694,12 @@ pub struct BrainContextResult {
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
     pub unresolved_seeds: Vec<String>,
+    /// Feature F7 (PRF half) — terms mined by pseudo-relevance feedback and
+    /// fed into the pass-2 BM25 query. Empty unless PRF was enabled. Surfaced
+    /// for `--debug` / response auditing. Omitted from JSON when empty so the
+    /// default (PRF-off) output is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expansion_terms: Vec<String>,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -957,11 +976,30 @@ pub fn build_brain_context_hybrid_with_aliases(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // ── Hybrid retrieval: fuse PPR + BM25 via Reciprocal Rank Fusion ───
+    //
+    // Feature F7 (PRF half): when `config.prf` is set, the BM25 leg runs a
+    // two-pass pseudo-relevance-feedback expansion (`search_prf`) instead of a
+    // single-pass `search`. The mined expansion terms are surfaced on the
+    // result for auditing. RRF is rank-only, so PRF affects the fused result
+    // solely via the reordered BM25 ranks (see `HybridSearchConfig::prf`).
+    let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
         let bm25_query = inputs.join(" ");
-        let bm25_hits = tantivy
-            .search(&bm25_query, config.bm25_limit)
-            .unwrap_or_default();
+        let bm25_hits = if config.prf {
+            match tantivy.search_prf(&bm25_query, config.bm25_limit, nestweaver_store_stoplist()) {
+                Ok((hits, terms)) => {
+                    expansion_terms = terms;
+                    hits
+                }
+                Err(_) => tantivy
+                    .search(&bm25_query, config.bm25_limit)
+                    .unwrap_or_default(),
+            }
+        } else {
+            tantivy
+                .search(&bm25_query, config.bm25_limit)
+                .unwrap_or_default()
+        };
         rrf_fuse(
             &ppr,
             &bm25_hits,
@@ -994,6 +1032,34 @@ pub fn build_brain_context_hybrid_with_aliases(
         seeds,
         connected,
         unresolved_seeds: unresolved,
+        expansion_terms,
+    })
+}
+
+/// The PRF stoplist: the engine's built-in cross-domain [`crate::cross_domain::STOPLIST`].
+///
+/// Reused here so the store crate (which owns the PRF term-mining but cannot
+/// depend on the engine) need not maintain a second stoplist — the engine
+/// threads this list into `TantivyIndex::search_prf`.
+pub fn nestweaver_store_stoplist() -> &'static [&'static str] {
+    // The cross-domain STOPLIST is code-identifier oriented; PRF mines prose
+    // (note/section text), so augment it with common English stopwords to keep
+    // them out of expansion terms (query-drift guard). Combined once, leaked.
+    static COMBINED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    COMBINED.get_or_init(|| {
+        const ENGLISH: &[&str] = &[
+            "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "but",
+            "not", "you", "your", "its", "into", "over", "per", "via", "has", "have", "had",
+            "will", "would", "can", "could", "should", "than", "then", "them", "they", "their",
+            "what", "when", "which", "while", "about", "also", "been", "being", "does", "done",
+            "each", "more", "most", "much", "such", "some", "only", "other", "these", "those",
+            "there", "here", "because", "between", "all", "any", "out", "use", "used", "uses",
+        ];
+        crate::cross_domain::STOPLIST
+            .iter()
+            .copied()
+            .chain(ENGLISH.iter().copied())
+            .collect()
     })
 }
 
@@ -1662,6 +1728,7 @@ mod ranking_prior_tests {
         let rules = RankingConfig {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1677,6 +1744,7 @@ mod ranking_prior_tests {
         let rules = RankingConfig {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 1.5)],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1694,6 +1762,7 @@ mod ranking_prior_tests {
         let rules = RankingConfig {
             dampen: vec![dampen("Projects/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 2.0)],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(
@@ -1710,6 +1779,7 @@ mod ranking_prior_tests {
         let rules_hi = RankingConfig {
             dampen: vec![],
             boost: vec![dampen("critical/**", 5.0)],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut high, &rules_hi);
         assert!(
@@ -1723,6 +1793,7 @@ mod ranking_prior_tests {
         let rules_lo = RankingConfig {
             dampen: vec![dampen("archive/**", 0.05)],
             boost: vec![],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut low, &rules_lo);
         assert!(
@@ -1739,6 +1810,7 @@ mod ranking_prior_tests {
         let rules = RankingConfig {
             dampen: vec![dampen("src/legacy/**", 0.5)],
             boost: vec![],
+            enable_prf: false,
         };
         apply_ranking_priors(&mut nodes, &rules);
         assert!(

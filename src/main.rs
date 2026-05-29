@@ -1248,6 +1248,14 @@ enum BrainCommands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
+        /// Feature F7: pseudo-relevance-feedback query expansion. Mines
+        /// high-IDF terms from the top hits and re-runs BM25 with them
+        /// down-weighted to improve recall. Off by default.
+        #[arg(
+            long = "prf",
+            help = "Enable pseudo-relevance-feedback query expansion (Feature F7)"
+        )]
+        prf: bool,
     },
     /// Unified PPR context across code + notes. Seeds may be note titles,
     /// tag names (with or without #), symbol names, or any UID
@@ -1359,6 +1367,14 @@ enum BrainCommands {
         /// ignore this.
         #[arg(long, help = "Repo root for inline Symbol bodies (default: cwd)")]
         root: Option<PathBuf>,
+        /// Feature F7: pseudo-relevance-feedback query expansion on the BM25
+        /// leg. Mines high-IDF terms from the top hits and re-runs BM25 with
+        /// them down-weighted to improve recall. Off by default.
+        #[arg(
+            long = "prf",
+            help = "Enable pseudo-relevance-feedback query expansion (Feature F7)"
+        )]
+        prf: bool,
     },
     /// List wikilinks whose target is ambiguous or low-confidence
     /// (confidence < 1.0), with suggested target notes for each.
@@ -4919,28 +4935,50 @@ fn run_brain(
             json,
             db,
             config,
+            prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            // Feature F6: per-path ranking priors from `[ranking]` in the
-            // instance config, if supplied. None → no-op.
-            let ranking_config = load_instance_config_opt(config.as_deref())
-                .map(|c| c.ranking)
+            // Parse the instance config once and reuse for ranking priors and
+            // the Feature F7 `[ranking] enable_prf` default.
+            let instance_cfg = load_instance_config_opt(config.as_deref());
+            // Feature F6: per-path ranking priors from `[ranking]`. None → no-op.
+            let ranking_config = instance_cfg
+                .as_ref()
+                .map(|c| c.ranking.clone())
                 .filter(|r| !r.is_empty());
+            // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
+            let prf_enabled = prf
+                || instance_cfg
+                    .as_ref()
+                    .map(|c| c.ranking.enable_prf)
+                    .unwrap_or(false);
 
             // Expand the query with taxonomy aliases for better recall.
             let aliases = load_alias_sidecar(&db_path);
             let query = expand_query_with_aliases(&raw_query, &aliases);
 
             // ── Vault note results ──────────────────────────────────────
+            let mut expansion_terms: Vec<String> = Vec::new();
             let (note_results, engine) = if let Some(ref idx) = tantivy {
                 let raw_limit = limit * 5;
-                let hits = idx
-                    .search(&query, raw_limit)
-                    .with_context(|| "tantivy search")?;
+                let hits = if prf_enabled {
+                    let (hits, terms) = idx
+                        .search_prf(
+                            &query,
+                            raw_limit,
+                            nestweaver_engine::query::nestweaver_store_stoplist(),
+                        )
+                        .with_context(|| "tantivy prf search")?;
+                    expansion_terms = terms;
+                    hits
+                } else {
+                    idx.search(&query, raw_limit)
+                        .with_context(|| "tantivy search")?
+                };
                 let grouped = group_bm25_hits_by_note(&store, &hits, limit);
                 (grouped, "bm25")
             } else {
@@ -5052,15 +5090,17 @@ fn run_brain(
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 results.truncate(limit);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "query": query,
-                        "engine": engine,
-                        "results": results,
-                        "total_matches": results.len(),
-                    }))?
-                );
+                let mut payload = serde_json::json!({
+                    "query": query,
+                    "engine": engine,
+                    "results": results,
+                    "total_matches": results.len(),
+                });
+                // Feature F7: surface PRF-mined expansion terms for auditing.
+                if !expansion_terms.is_empty() {
+                    payload["expansion_terms"] = serde_json::json!(expansion_terms);
+                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if note_results.is_empty() && code_results.is_empty() {
                 println!("No results for '{query}'.");
             } else {
@@ -5070,10 +5110,15 @@ fn run_brain(
                     "Brain search (substring fallback)"
                 };
                 println!(
-                    "{}: {} result(s)\n",
+                    "{}: {} result(s)",
                     header,
                     note_results.len() + code_results.len()
                 );
+                // Feature F7: show PRF-mined expansion terms for auditing.
+                if !expansion_terms.is_empty() {
+                    println!("  PRF expansion terms: {}", expansion_terms.join(", "));
+                }
+                println!();
                 for g in &note_results {
                     if g.matched_headings.is_empty() {
                         println!("  [{:.2}] {}", g.best_score, g.title);
@@ -5126,6 +5171,7 @@ fn run_brain(
             recency_half_life_days,
             inline_bodies,
             root,
+            prf,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
             let store = open_store(Some(&db_path))?;
@@ -5147,12 +5193,20 @@ fn run_brain(
                 .map(|c| c.ranking.clone())
                 .filter(|r| !r.is_empty());
 
+            // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
+            let prf_enabled = prf
+                || instance_cfg
+                    .as_ref()
+                    .map(|c| c.ranking.enable_prf)
+                    .unwrap_or(false);
+
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
             let defaults = HybridSearchConfig::default();
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
                 weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
+                prf: prf_enabled,
                 ..defaults
             };
 
@@ -5709,6 +5763,11 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
 }
 
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
+    // Feature F7: show PRF-mined expansion terms for auditing.
+    if !result.expansion_terms.is_empty() {
+        println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
+        println!();
+    }
     println!("Seeds ({} resolved):", result.seeds.len());
     for n in &result.seeds {
         if n.location.is_empty() {
@@ -5768,6 +5827,11 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+
+    // Feature F7: surface PRF-mined expansion terms for auditing.
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
 
     println!("{}", serde_json::to_string_pretty(&resp)?);

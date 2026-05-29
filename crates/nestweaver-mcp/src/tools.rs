@@ -579,6 +579,11 @@ fn tool_schema_brain_context() -> Value {
                 "root": {
                     "type": "string",
                     "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                },
+                "prf": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, run pseudo-relevance-feedback query expansion on the BM25 leg: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language seeds. Mined terms are returned under `expansion_terms`. Default false."
                 }
             },
             "required": ["seeds"]
@@ -659,10 +664,14 @@ fn tool_brain_context(
         } else {
             (weight_ppr, weight_bm25, weight_semantic)
         };
+    // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
+    // expansion on the BM25 leg via `prf: true`. Off by default.
+    let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
     let config = HybridSearchConfig {
         weight_ppr,
         weight_bm25,
         weight_semantic,
+        prf,
         ..defaults
     };
 
@@ -917,6 +926,12 @@ fn tool_brain_context(
         resp["unresolved_seeds"] = json!(result.unresolved_seeds);
     }
 
+    // Feature F7: surface the PRF-mined expansion terms for auditing. Only
+    // present when PRF was enabled and mined at least one term.
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = json!(result.expansion_terms);
+    }
+
     Ok(resp)
 }
 
@@ -1032,6 +1047,11 @@ fn tool_schema_brain_search() -> Value {
                 "root": {
                     "type": "string",
                     "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                },
+                "prf": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, run pseudo-relevance-feedback query expansion: mine high-IDF terms from the top hits and re-run BM25 with them down-weighted. Improves recall on natural-language queries. Mined terms are returned under `expansion_terms`. Default false."
                 }
             },
             "required": ["query"]
@@ -1061,14 +1081,30 @@ fn tool_brain_search(
     let aliases = load_alias_sidecar(&db_path);
     let query = expand_query_with_aliases(&raw_query, &aliases);
 
+    // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
+    // expansion via `prf: true`. Off by default.
+    let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
+
     // ── Vault note results ──────────────────────────────────────────────
 
+    let mut expansion_terms: Vec<String> = Vec::new();
     let (mut note_results, engine) = if let Some(idx) = tantivy {
         // Tantivy BM25 path (preferred).
         let raw_limit = limit * 5;
-        let hits = idx
-            .search(&query, raw_limit)
-            .map_err(|e| anyhow!("tantivy search: {e}"))?;
+        let hits = if prf {
+            let (hits, terms) = idx
+                .search_prf(
+                    &query,
+                    raw_limit,
+                    nestweaver_engine::query::nestweaver_store_stoplist(),
+                )
+                .map_err(|e| anyhow!("tantivy prf search: {e}"))?;
+            expansion_terms = terms;
+            hits
+        } else {
+            idx.search(&query, raw_limit)
+                .map_err(|e| anyhow!("tantivy search: {e}"))?
+        };
         let results = group_search_hits_by_note(store, &hits, limit, concise);
         (results, "bm25")
     } else {
@@ -1318,6 +1354,10 @@ fn tool_brain_search(
         response["engine_warning"] = json!(
             "tantivy_unavailable: BM25 index could not be opened (another process may hold the writer lock, or it has not been built yet). Results are substring matches only. Run `nestweaver brain reindex-search` to build the index."
         );
+    }
+    // Feature F7: surface the PRF-mined expansion terms for auditing.
+    if !expansion_terms.is_empty() {
+        response["expansion_terms"] = json!(expansion_terms);
     }
     Ok(response)
 }
