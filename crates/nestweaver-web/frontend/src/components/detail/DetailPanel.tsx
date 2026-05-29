@@ -21,7 +21,7 @@ export function DetailPanel() {
 
   if (!selectedNodeId) {
     return (
-      <div data-testid="detail-panel" className="flex h-full flex-col items-center justify-center gap-3 border-l border-[var(--color-border)] bg-[var(--color-surface)] p-6 text-center text-sm text-[var(--color-text-muted)]">
+      <div data-testid="detail-panel" className="glass-panel flex h-full flex-col items-center justify-center gap-3 border-l border-[var(--color-border)] bg-[var(--color-surface)] p-6 text-center text-sm text-[var(--color-text-muted)]">
         <p>Click a node in the graph to see its details here.</p>
         <div className="space-y-1 text-xs">
           <p>
@@ -45,7 +45,7 @@ export function DetailPanel() {
   const isNote = selectedNodeId.startsWith("note:") || (!isSymbol && selectedNodeKind !== "file");
 
   return (
-    <div data-testid="detail-panel" className="h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
+    <div data-testid="detail-panel" className="glass-panel h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
       {llmResult && <LlmResultDetail />}
       {diffActive && <DiffDetail />}
       {gapActive && <GapDetail />}
