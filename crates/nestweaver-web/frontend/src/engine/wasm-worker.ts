@@ -1,35 +1,30 @@
 import * as Comlink from "comlink";
+import init, { WasmGraph } from "../wasm/nestweaver_wasm.js";
 
-interface WasmEngine {
-  loadSnapshot(data: ArrayBuffer): Promise<void>;
-  ppr(seeds: string[], damping: number): Promise<Array<[string, number]>>;
-  nodeCount(): number;
-  edgeCount(): number;
-  generation(): number;
-}
-
-let engine: WasmEngine | null = null;
+let graph: WasmGraph | null = null;
+let initialized = false;
 
 const api = {
   async init(): Promise<boolean> {
+    if (initialized) return true;
     try {
-      // Dynamic import of the WASM module.
-      // This will fail until the WASM is actually built and placed at the right path.
-      // @ts-expect-error — WASM module not yet built
-      const wasm = await import("../../wasm/nestweaver_wasm.js");
-      await wasm.default(); // Initialize WASM
-      engine = wasm as WasmEngine;
+      await init();
+      initialized = true;
       return true;
     } catch (e) {
-      console.warn("[wasm-worker] WASM module not available:", e);
+      console.warn("[wasm-worker] WASM init failed:", e);
       return false;
     }
   },
 
-  async loadSnapshot(data: ArrayBuffer): Promise<boolean> {
-    if (!engine) return false;
+  loadSnapshot(data: ArrayBuffer): boolean {
+    if (!initialized) return false;
     try {
-      await engine.loadSnapshot(data);
+      if (graph) {
+        graph.free();
+        graph = null;
+      }
+      graph = new WasmGraph(new Uint8Array(data));
       return true;
     } catch (e) {
       console.error("[wasm-worker] Failed to load snapshot:", e);
@@ -37,21 +32,21 @@ const api = {
     }
   },
 
-  async ppr(seeds: string[], damping: number): Promise<Array<[string, number]>> {
-    if (!engine) return [];
-    return engine.ppr(seeds, damping);
+  ppr(seedsJson: string, damping: number): string {
+    if (!graph) return "[]";
+    return graph.ppr(seedsJson, damping);
   },
 
   nodeCount(): number {
-    return engine?.nodeCount() ?? 0;
+    return graph?.node_count() ?? 0;
   },
 
   edgeCount(): number {
-    return engine?.edgeCount() ?? 0;
+    return graph?.edge_count() ?? 0;
   },
 
   generation(): number {
-    return engine?.generation() ?? 0;
+    return Number(graph?.generation() ?? 0n);
   },
 };
 
