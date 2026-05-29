@@ -39,6 +39,7 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
         .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
 }
 
+pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
 pub mod blast_radius;
@@ -58,6 +59,7 @@ pub mod export_graph;
 pub mod extensions;
 pub mod git_activity;
 pub mod git_diff;
+pub mod guide_rules;
 pub mod html_to_md;
 pub mod hubs;
 pub mod index;
@@ -84,7 +86,11 @@ pub mod watcher;
 pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
 };
-pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
+pub use agent_guide::{
+    generate_agents_md, generate_agents_md_with_rules, generate_cursor_rule,
+    generate_cursor_rule_with_rules, generate_guide, generate_guide_with_rules, generate_skill,
+    generate_skill_with_rules,
+};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,
@@ -122,6 +128,10 @@ pub use export_graph::export_in_memory_graph;
 pub use extensions::{
     ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
     query_by_property, record_last_indexed_at, save_extensions, set_property,
+};
+pub use guide_rules::{
+    HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
+    render_rules_markdown,
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{

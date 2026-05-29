@@ -15,8 +15,9 @@ use nestweaver_engine::{
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md, generate_cursor_rule, generate_guide,
-    generate_repo_map, generate_skill, generate_summaries, get_last_indexed_at,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    generate_cursor_rule_with_rules, generate_guide_with_rules, generate_repo_map,
+    generate_skill_with_rules, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -714,6 +715,21 @@ enum Commands {
             help = "Output format: markdown (default), skill, cursor-rule, agents-md"
         )]
         format: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Override the built-in hard rules from a TOML ([[rules]]) or markdown file"
+        )]
+        rules_from: Option<PathBuf>,
+    },
+    /// Admin: subagent guidance instruction store and runtime hook installation.
+    ///
+    /// Injected guidance HELPS but is NOT enforcement — instruction-following
+    /// by an LLM is probabilistic (Geng et al. 2025, "Control Illusion"). Hook
+    /// JSON schemas are Claude-Code-specific.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
     },
     /// Manage graph snapshots (build, verify, push)
     Snapshot {
@@ -1674,6 +1690,50 @@ enum InstanceCommands {
 }
 
 #[derive(Subcommand)]
+enum AdminCommands {
+    /// Print or manage the agent instruction store.
+    ///
+    /// With no flag, prints the main instructions. The stores live at
+    /// `~/.nestweaver/instructions.md` and `~/.nestweaver/instructions.subagent.md`.
+    ///
+    /// NOTE: injected guidance helps but is NOT enforcement — an LLM follows
+    /// instructions probabilistically (Geng et al. 2025).
+    Instructions {
+        #[arg(
+            long,
+            help = "Print the subagent guidance to stdout (single clean output, hook-friendly)"
+        )]
+        for_subagent: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Install FILE as the instruction store (subagent store when --for-subagent is set)"
+        )]
+        set: Option<PathBuf>,
+        #[arg(long, help = "Reset both stores to the bundled defaults")]
+        reset: bool,
+    },
+    /// Install a runtime hook that injects subagent guidance.
+    ///
+    /// For the `claude` runtime, adds a PreToolUse hook on the `Task` matcher
+    /// that runs `nestweaver admin instructions --for-subagent`. Hook JSON
+    /// schemas are Claude-Code-specific.
+    InstallHook {
+        #[arg(
+            long,
+            default_value = "claude",
+            help = "Target runtime (only 'claude' is supported in this version)"
+        )]
+        runtime: String,
+        #[arg(
+            long,
+            help = "Print the JSON patch that would be applied, without writing"
+        )]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCommands {
     /// Build a snapshot from the current graph
     Build {
@@ -2511,6 +2571,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             output,
             config,
             format,
+            rules_from,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
@@ -2518,11 +2579,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .as_deref()
                 .map(nestweaver_engine::InstanceConfig::from_file)
                 .transpose()?;
+            // Optional hard-rule override loaded from a TOML/markdown file.
+            let override_rules = match &rules_from {
+                Some(path) => {
+                    let contents = std::fs::read_to_string(path)?;
+                    Some(nestweaver_engine::parse_rules_override(&contents)?)
+                }
+                None => None,
+            };
+            let rules_ref = override_rules.as_deref();
+            let cfg_ref = instance_config.as_ref();
             let output_str = match format.as_str() {
-                "skill" => generate_skill(&store, instance_config.as_ref())?,
-                "cursor-rule" => generate_cursor_rule(&store, instance_config.as_ref())?,
-                "agents-md" => generate_agents_md(&store, instance_config.as_ref())?,
-                _ => generate_guide(&store, instance_config.as_ref())?,
+                "skill" => generate_skill_with_rules(&store, cfg_ref, rules_ref)?,
+                "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
+                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref)?,
+                _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
             match output {
                 Some(path) => {
@@ -2533,6 +2604,69 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             Ok((EXIT_SUCCESS, None))
         }
+
+        Commands::Admin { command } => match command {
+            AdminCommands::Instructions {
+                for_subagent,
+                set,
+                reset,
+            } => {
+                use nestweaver_engine::admin;
+                if reset {
+                    admin::reset_instructions()?;
+                    out.status("Instruction stores reset to bundled defaults.");
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                if let Some(src) = set {
+                    let dst = if for_subagent {
+                        admin::set_subagent_instructions(&src)?
+                    } else {
+                        admin::set_main_instructions(&src)?
+                    };
+                    out.status(&format!("Installed instructions to {}", dst.display()));
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                // No flag (or only --for-subagent): print the relevant store.
+                // --for-subagent prints a single clean stdout payload for hooks.
+                let text = if for_subagent {
+                    admin::read_subagent_instructions()?
+                } else {
+                    admin::read_main_instructions()?
+                };
+                print!("{text}");
+                Ok((EXIT_SUCCESS, None))
+            }
+            AdminCommands::InstallHook { runtime, dry_run } => {
+                use nestweaver_engine::admin;
+                let rt = admin::Runtime::parse(&runtime)?;
+                let settings_path = admin::runtime_settings_path(rt);
+                let existing: serde_json::Value = if settings_path.exists() {
+                    let raw = std::fs::read_to_string(&settings_path)?;
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Null
+                };
+                let patched = admin::compute_hook_patch(rt, &existing)?;
+                if dry_run {
+                    // PRINT the patch that WOULD be applied; do not write.
+                    println!("{}", serde_json::to_string_pretty(&patched)?);
+                    eprintln!(
+                        "(dry-run) Would write the above to {}. Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
+                        settings_path.display()
+                    );
+                    return Ok((EXIT_SUCCESS, None));
+                }
+                if let Some(parent) = settings_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&patched)?)?;
+                out.status(&format!(
+                    "Hook installed (idempotent) to {}",
+                    settings_path.display()
+                ));
+                Ok((EXIT_SUCCESS, None))
+            }
+        },
 
         Commands::Hubs {
             top,
