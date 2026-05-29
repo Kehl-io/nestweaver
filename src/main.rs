@@ -1219,6 +1219,86 @@ enum Commands {
         #[command(subcommand)]
         command: RankingCommands,
     },
+    /// P0.3 — offline retrieval-quality evaluation harness.
+    ///
+    /// Scores retrieval (nDCG@10 / MRR / precision@5) over a JUDGED query set
+    /// so the off-by-default quality features (F6/F7/F1/F12/F17) can be
+    /// MEASURED before being trusted.
+    ///
+    /// HONEST FRAMING: meaningful evaluation needs REAL human relevance labels
+    /// over the actual corpus you index. The bundled sample file is a FORMAT
+    /// TEMPLATE, not a benchmark; metrics on a tiny/synthetic set are not
+    /// authoritative. Look at per-query win/loss + confidence and use
+    /// time/query-based splits — not just the mean — before trusting a small
+    /// delta.
+    #[command(
+        after_help = "Examples:\n  nestweaver eval run --queries ./eval-queries.jsonl\n  nestweaver eval run --queries ./eval-queries.jsonl --json --prf\n  nestweaver eval compare --queries ./eval-queries.jsonl --prf\n\nFormat template + guide: examples/eval/ (eval-queries.example.jsonl, README.md)"
+    )]
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommands,
+    },
+}
+
+/// Subcommands under `nestweaver eval`.
+#[derive(Subcommand)]
+enum EvalCommands {
+    /// Run the harness once over a judged query set and print metrics.
+    ///
+    /// Prints the aggregate (mean nDCG@10 / MRR / precision@5) plus a per-query
+    /// table. With `--json`, prints the full `EvalReport` instead.
+    Run {
+        /// Path to the judged-query file (JSON array or JSONL of
+        /// {query, intent?, relevance} objects). REQUIRED.
+        #[arg(long, help = "Judged-query file (JSON array or JSONL)")]
+        queries: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output the EvalReport as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Enable Feature F7 pseudo-relevance feedback on the BM25 leg (off by default)"
+        )]
+        prf: bool,
+        #[arg(
+            long,
+            help = "Enable Feature F17 reranking of the top-N before scoring (off by default)"
+        )]
+        rerank: bool,
+    },
+    /// Run the SAME judged set twice — baseline vs a toggled feature — and print
+    /// the mean nDCG@10 delta plus per-query win/loss counts.
+    ///
+    /// Pass `--prf` and/or `--rerank` to choose which feature to toggle ON in
+    /// the treatment run (baseline always has it OFF). Judge the result against
+    /// the >= 5% nDCG@10 gate — but remember a small mean delta on a small set
+    /// is NOT authoritative; inspect the win/loss counts too.
+    Compare {
+        /// Path to the judged-query file (JSON array or JSONL). REQUIRED.
+        #[arg(long, help = "Judged-query file (JSON array or JSONL)")]
+        queries: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Output the EvalComparison as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Toggle: compare PRF-on (treatment) vs PRF-off (baseline)"
+        )]
+        prf: bool,
+        #[arg(
+            long,
+            help = "Toggle: compare rerank-on (treatment) vs rerank-off (baseline)"
+        )]
+        rerank: bool,
+    },
 }
 
 /// Subcommands under `nestweaver ranking`.
@@ -3120,6 +3200,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Brain { command } => run_brain(*command, out, t0),
         Commands::Memory { command } => run_memory(*command, t0),
         Commands::Ranking { command } => run_ranking(command, t0),
+        Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
         Commands::Embed {
             db,
             endpoint,
@@ -4870,6 +4951,167 @@ fn ranking_location_for_uid(store: &nestweaver_store::GraphStore, uid: &str) -> 
         store.lookup_note(&h.note_uid).ok().map(|n| n.file_path)
     } else {
         None
+    }
+}
+
+/// Build a [`HybridSearchConfig`] for the eval harness with the given PRF
+/// toggle, otherwise defaults (identical to the product's default retrieval).
+fn eval_hybrid_config(prf: bool) -> HybridSearchConfig {
+    HybridSearchConfig {
+        prf,
+        ..HybridSearchConfig::default()
+    }
+}
+
+/// Print the per-query table and aggregate for an `EvalReport` (human form).
+fn print_eval_report(report: &nestweaver_engine::EvalReport) {
+    println!("Query                                              nDCG@10    MRR  P@5");
+    println!("{}", "-".repeat(78));
+    for row in &report.per_query {
+        let q: String = row.query.chars().take(48).collect();
+        println!(
+            "{q:<48}  {:>7.4}  {:>5.3}  {:>4.2}",
+            row.ndcg10, row.mrr, row.p_at_5
+        );
+    }
+    println!("{}", "-".repeat(78));
+    println!(
+        "MEAN over {} quer{}:  nDCG@10={:.4}  MRR={:.4}  P@5={:.4}",
+        report.n,
+        if report.n == 1 { "y" } else { "ies" },
+        report.mean_ndcg10,
+        report.mean_mrr,
+        report.mean_p5,
+    );
+}
+
+/// Dispatch an `eval` subcommand (P0.3 retrieval-quality harness).
+fn run_eval_cmd(command: EvalCommands) -> anyhow::Result<i32> {
+    // Honest-framing banner shown on every human-readable run.
+    const HONEST_NOTE: &str = "Note: meaningful evaluation requires REAL human relevance labels over your actual\n      corpus. A tiny/synthetic set is NOT authoritative — inspect per-query\n      win/loss and confidence, and use time/query-based splits, before trusting a\n      small mean delta.";
+
+    match command {
+        EvalCommands::Run {
+            queries,
+            db,
+            json,
+            prf,
+            rerank,
+        } => {
+            let queries_data = nestweaver_engine::load_judged_queries(&queries)?;
+            let db_path = resolve_db_with_config(db, None)?;
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let aliases = load_alias_sidecar(&db_path);
+
+            let cfg = eval_hybrid_config(prf);
+            let report = nestweaver_engine::run_eval(
+                &store,
+                tantivy.as_ref(),
+                &queries_data,
+                &cfg,
+                &aliases,
+                Some(&db_path),
+                rerank,
+            )?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_eval_report(&report);
+                println!("\n{HONEST_NOTE}");
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        EvalCommands::Compare {
+            queries,
+            db,
+            json,
+            prf,
+            rerank,
+        } => {
+            if !prf && !rerank {
+                anyhow::bail!("eval compare needs a feature to toggle: pass --prf and/or --rerank");
+            }
+            let queries_data = nestweaver_engine::load_judged_queries(&queries)?;
+            let db_path = resolve_db_with_config(db, None)?;
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let aliases = load_alias_sidecar(&db_path);
+
+            // Baseline: feature(s) OFF. Treatment: the chosen toggle(s) ON.
+            // PRF lives in the HybridSearchConfig; rerank is a run_eval flag.
+            let baseline_cfg = eval_hybrid_config(false);
+            let treatment_cfg = eval_hybrid_config(prf);
+
+            let run = |cfg: &HybridSearchConfig, do_rerank: bool| {
+                nestweaver_engine::run_eval(
+                    &store,
+                    tantivy.as_ref(),
+                    &queries_data,
+                    cfg,
+                    &aliases,
+                    Some(&db_path),
+                    do_rerank,
+                )
+            };
+            let baseline = run(&baseline_cfg, false)?;
+            let treatment = run(&treatment_cfg, rerank)?;
+
+            let mut toggles = Vec::new();
+            if prf {
+                toggles.push("prf");
+            }
+            if rerank {
+                toggles.push("rerank");
+            }
+            let label = toggles.join("+");
+            let cmp = nestweaver_engine::compare_reports(
+                format!("{label}-off"),
+                baseline,
+                format!("{label}-on"),
+                treatment,
+            );
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cmp)?);
+            } else {
+                println!(
+                    "Comparison: {} (baseline) vs {} (treatment) over {} quer{}",
+                    cmp.baseline_label,
+                    cmp.treatment_label,
+                    cmp.baseline.n,
+                    if cmp.baseline.n == 1 { "y" } else { "ies" },
+                );
+                println!("  baseline  mean nDCG@10 = {:.4}", cmp.baseline.mean_ndcg10);
+                println!(
+                    "  treatment mean nDCG@10 = {:.4}",
+                    cmp.treatment.mean_ndcg10
+                );
+                println!(
+                    "  delta = {:+.4}  ({:+.1}% relative)",
+                    cmp.mean_ndcg10_delta,
+                    cmp.mean_ndcg10_rel_delta * 100.0,
+                );
+                println!(
+                    "  per-query: {} win(s), {} loss(es), {} tie(s)",
+                    cmp.wins, cmp.losses, cmp.ties,
+                );
+                let gate = cmp.mean_ndcg10_rel_delta >= 0.05;
+                println!(
+                    "  >= 5% nDCG@10 gate: {}",
+                    if gate {
+                        "MET (mean only — confirm with per-query win/loss + a larger set)"
+                    } else {
+                        "NOT met"
+                    }
+                );
+                println!("\n{HONEST_NOTE}");
+            }
+            Ok(EXIT_SUCCESS)
+        }
     }
 }
 
