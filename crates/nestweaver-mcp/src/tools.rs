@@ -61,6 +61,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_bridge_nodes(),
         tool_schema_blast_radius(),
         tool_schema_get_summary(),
+        tool_schema_read_symbols(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -122,8 +123,81 @@ pub fn dispatch(
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
         "get_summary" => tool_get_summary(store, args),
+        "read_symbols" => tool_read_symbols(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+/// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
+/// FQNs, optionally includes adjacent symbols, and respects a token budget.
+fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let targets: Vec<String> = args
+        .get("targets")
+        .or_else(|| args.get("uids_or_fqns"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "'targets' must be a non-empty array of symbol UIDs, names, or FQNs"
+        ));
+    }
+    let neighbors = args
+        .get("include_neighbors")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u8::MAX as u64) as u8;
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let res = nestweaver_engine::read_symbols::read_symbols(
+        store,
+        &targets,
+        &root,
+        neighbors,
+        token_budget,
+    );
+    Ok(serde_json::to_value(res)?)
+}
+
+fn tool_schema_read_symbols() -> Value {
+    json!({
+        "name": "read_symbols",
+        "description": "Use when you need to READ a symbol's source — return just that symbol's span (start_line..end_line), not the whole file. Far cheaper in tokens than reading entire files. Accepts UIDs (sym:...), bare names, or FQNs; an ambiguous name returns candidate UIDs to disambiguate. Use include_neighbors to also return adjacent symbols in the same file, and token_budget to cap output. `root` is the repository root used to resolve file paths (defaults to the server's working directory).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                },
+                "include_neighbors": {
+                    "type": "integer",
+                    "description": "Include N adjacent symbols in the same file (default 0)."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Approximate token cap for the combined output."
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Repository root for resolving file paths (default: server working directory)."
+                }
+            },
+            "required": ["targets"]
+        }
+    })
 }
 
 /// Wrap a tool's structured output in MCP's `content` envelope. Returns

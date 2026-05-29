@@ -313,6 +313,39 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Read a symbol's source span (start_line..end_line) — just the symbol,
+    /// not the whole file. Optionally include adjacent symbols; token-budget aware.
+    #[command(
+        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
+    )]
+    ReadSymbols {
+        /// Symbol UIDs, names, or FQNs to read.
+        #[arg(required = true)]
+        targets: Vec<String>,
+        #[arg(
+            long,
+            default_value = "0",
+            help = "Include N adjacent symbols in the same file"
+        )]
+        neighbors: u8,
+        #[arg(
+            long = "token-budget",
+            help = "Approximate token budget for the combined output"
+        )]
+        token_budget: Option<usize>,
+        #[arg(
+            long,
+            help = "Repository root for resolving file paths (default: current dir)"
+        )]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Analyze blast radius: what depends on this symbol
     ///
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
@@ -2833,6 +2866,54 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             Ok((EXIT_SUCCESS, None))
         }
 
+        Commands::ReadSymbols {
+            targets,
+            neighbors,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let store = open_store(db.as_deref())?;
+            let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let res = nestweaver_engine::read_symbols::read_symbols(
+                &store,
+                &targets,
+                &root,
+                neighbors,
+                token_budget,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                for w in &res.symbols {
+                    let tag = if w.is_neighbor { " [neighbor]" } else { "" };
+                    println!(
+                        "\u{2500}\u{2500} {} ({}) {}:{}-{}{}",
+                        w.name, w.kind, w.path, w.start_line, w.end_line, tag
+                    );
+                    println!("{}", w.body);
+                    println!();
+                }
+                for nf in &res.not_found {
+                    eprintln!("not found: {nf}");
+                }
+                for a in &res.ambiguous {
+                    eprintln!(
+                        "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                        a.query,
+                        a.candidate_uids.len()
+                    );
+                }
+                if res.truncated {
+                    eprintln!(
+                        "truncated: {} symbol(s) dropped for token budget",
+                        res.dropped.len()
+                    );
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
         Commands::Symbol {
             name_or_uid,
             json,
