@@ -4,7 +4,9 @@ use serde::Serialize;
 
 use anyhow::Context;
 
-use crate::config::{FeatureConfig, LinkConfig};
+use crate::config::{
+    FeatureConfig, LinkConfig, RANKING_MULTIPLIER_MAX, RANKING_MULTIPLIER_MIN, RankingConfig,
+};
 use crate::repo_display_name;
 
 /// Tuning knobs for hybrid PPR + BM25 + semantic retrieval.
@@ -1177,6 +1179,113 @@ fn render_brain_node(
     }
 }
 
+/// Feature F6 — per-path dampen/boost ranking priors.
+///
+/// Apply a continuous, query-independent prior on result relevance keyed by
+/// file-path glob. For each node, the rule whose glob matches the node's
+/// `location` and appears **last** in the merged (dampen-then-boost) rule list
+/// wins (last-match-wins); the node's `relevance` is multiplied by that rule's
+/// multiplier and the **final product** is clamped to
+/// `[RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX]`. A node whose location
+/// matches no rule is left unchanged.
+///
+/// Must be applied AFTER fusion (RRF is rank-only, so applying before it
+/// no-ops) and BEFORE the caller's sort / truncation. Empty `rules` → no-op.
+///
+/// The matcher is rebuilt per call from `rules`; callers invoke this once per
+/// result set so the cost is negligible. Invalid globs are skipped (and warned)
+/// rather than failing the whole query.
+pub fn apply_ranking_priors(nodes: &mut [BrainNode], rules: &RankingConfig) {
+    if rules.is_empty() || nodes.is_empty() {
+        return;
+    }
+
+    // Compile each rule's glob into a matcher, preserving order. A rule whose
+    // glob fails to compile is dropped (logged) — one bad glob must not break
+    // ranking for the rest.
+    let ordered = rules.ordered_rules();
+    let compiled: Vec<(globset::GlobMatcher, f64)> = ordered
+        .iter()
+        .filter_map(|rule| match globset::Glob::new(&rule.glob) {
+            Ok(g) => Some((g.compile_matcher(), rule.multiplier)),
+            Err(e) => {
+                tracing::warn!(glob = %rule.glob, error = %e, "skipping invalid ranking glob");
+                None
+            }
+        })
+        .collect();
+    if compiled.is_empty() {
+        return;
+    }
+
+    for node in nodes.iter_mut() {
+        // `location` may carry a trailing `:line` (Symbol nodes render as
+        // `path:line`); strip it so the glob matches the path itself.
+        let path = node
+            .location
+            .rsplit_once(':')
+            .filter(|(_, line)| !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+            .map(|(p, _)| p)
+            .unwrap_or(node.location.as_str());
+
+        // Last-match-wins: scan in order and keep the multiplier of the last
+        // matching rule.
+        let mut chosen: Option<f64> = None;
+        for (matcher, multiplier) in &compiled {
+            if matcher.is_match(path) {
+                chosen = Some(*multiplier);
+            }
+        }
+
+        if let Some(multiplier) = chosen {
+            node.relevance =
+                (node.relevance * multiplier).clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX);
+        }
+    }
+}
+
+/// Dry-run companion to [`apply_ranking_priors`] for a single location.
+///
+/// Given a node's file-path `location` and the ranking `rules`, returns the
+/// last matching rule (its glob + multiplier, last-match-wins) — or `None` when
+/// nothing matches — alongside the `final_relevance` that
+/// [`apply_ranking_priors`] would produce from `base_relevance`. Used by the
+/// `nestweaver ranking explain` CLI dry-run so the binary need not depend on
+/// `globset` or duplicate the matching/clamping math.
+pub fn explain_ranking_prior(
+    location: &str,
+    base_relevance: f64,
+    rules: &RankingConfig,
+) -> (Option<(String, f64)>, f64) {
+    // Strip a trailing `:line` (Symbol locations render as `path:line`).
+    let path = location
+        .rsplit_once(':')
+        .filter(|(_, line)| !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+        .map(|(p, _)| p)
+        .unwrap_or(location);
+
+    let mut matched: Option<(String, f64)> = None;
+    for rule in rules.ordered_rules() {
+        match globset::Glob::new(&rule.glob) {
+            Ok(g) if g.compile_matcher().is_match(path) => {
+                matched = Some((rule.glob.clone(), rule.multiplier));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(glob = %rule.glob, error = %e, "skipping invalid ranking glob");
+            }
+        }
+    }
+
+    let final_relevance = match &matched {
+        Some((_, multiplier)) => {
+            (base_relevance * multiplier).clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX)
+        }
+        None => base_relevance,
+    };
+    (matched, final_relevance)
+}
+
 /// Feature F8 — tiered inline bodies.
 ///
 /// Populate `inline_body` on each node whose **normalized** relevance clears
@@ -1521,6 +1630,129 @@ mod render_brain_node_tests {
             node.title
         );
         assert_eq!(node.location, "notes/fallback.md");
+    }
+}
+
+#[cfg(test)]
+mod ranking_prior_tests {
+    use super::{BrainNode, apply_ranking_priors};
+    use crate::config::{GlobRule, RankingConfig};
+
+    fn node(uid: &str, location: &str, relevance: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Note".to_string(),
+            title: uid.to_string(),
+            location: location.to_string(),
+            relevance,
+            inline_body: None,
+        }
+    }
+
+    fn dampen(glob: &str, multiplier: f64) -> GlobRule {
+        GlobRule {
+            glob: glob.to_string(),
+            multiplier,
+        }
+    }
+
+    #[test]
+    fn dampen_rule_reduces_matching_node_relevance() {
+        let mut nodes = vec![node("note:old", "_logs/2020/jan.md", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("_logs/2020/**", 0.3)],
+            boost: vec![],
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.3).abs() < 1e-9,
+            "expected 1.0 * 0.3 = 0.3, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn node_matching_nothing_is_unchanged() {
+        let mut nodes = vec![node("note:keep", "src/main.rs", 0.7)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("_logs/2020/**", 0.3)],
+            boost: vec![dampen("Projects/*/sync.md", 1.5)],
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.7).abs() < 1e-9,
+            "non-matching node must be unchanged, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn last_matching_rule_wins() {
+        // Two rules both match; the later one (boost, 2.0) must win over the
+        // earlier dampen (0.3). dampen rules come first in the merged order.
+        let mut nodes = vec![node("note:x", "Projects/app/sync.md", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("Projects/**", 0.3)],
+            boost: vec![dampen("Projects/*/sync.md", 2.0)],
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 2.0).abs() < 1e-9,
+            "last matching rule (2.0) must win, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn final_product_is_clamped_to_bounds() {
+        // Boost product above the ceiling clamps to 5.0.
+        let mut high = vec![node("note:hi", "critical/x.md", 4.0)];
+        let rules_hi = RankingConfig {
+            dampen: vec![],
+            boost: vec![dampen("critical/**", 5.0)],
+        };
+        apply_ranking_priors(&mut high, &rules_hi);
+        assert!(
+            (high[0].relevance - 5.0).abs() < 1e-9,
+            "4.0 * 5.0 must clamp to 5.0, got {}",
+            high[0].relevance
+        );
+
+        // Dampen product below the floor clamps to 0.05.
+        let mut low = vec![node("note:lo", "archive/x.md", 0.1)];
+        let rules_lo = RankingConfig {
+            dampen: vec![dampen("archive/**", 0.05)],
+            boost: vec![],
+        };
+        apply_ranking_priors(&mut low, &rules_lo);
+        assert!(
+            (low[0].relevance - 0.05).abs() < 1e-9,
+            "0.1 * 0.05 = 0.005 must clamp up to 0.05, got {}",
+            low[0].relevance
+        );
+    }
+
+    #[test]
+    fn strips_trailing_line_number_from_symbol_location() {
+        // Symbol nodes render location as `path:line`; the glob matches the path.
+        let mut nodes = vec![node("sym:f", "src/legacy/foo.rs:42", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("src/legacy/**", 0.5)],
+            boost: vec![],
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.5).abs() < 1e-9,
+            "expected path glob to match despite :line suffix, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn empty_config_is_noop() {
+        let mut nodes = vec![node("note:x", "anything/here.md", 0.9)];
+        apply_ranking_priors(&mut nodes, &RankingConfig::default());
+        assert!((nodes[0].relevance - 0.9).abs() < 1e-9);
     }
 }
 
