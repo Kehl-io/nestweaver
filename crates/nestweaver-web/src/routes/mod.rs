@@ -15,3 +15,4 @@ pub mod repos;
 pub mod source;
 pub mod symbols;
 pub mod timeline;
+pub mod version;

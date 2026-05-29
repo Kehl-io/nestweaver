@@ -559,6 +559,10 @@ enum Commands {
 
         #[arg(long, help = "Do not open the browser automatically")]
         no_open: bool,
+
+        /// Enable live re-indexing watchers (file system watching)
+        #[arg(long)]
+        watch: bool,
     },
     /// Manage interaction memory
     Interactions {
@@ -2710,13 +2714,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             port,
             config: _config,
             no_open,
+            watch,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            let state = nestweaver_web::state::AppState::new(store, tantivy, db_path);
+            let state = if watch {
+                let store = std::sync::Arc::new(open_store(Some(&db_path))?);
+                nestweaver_web::state::AppState::new_with_store(
+                    store,
+                    tantivy,
+                    db_path.clone(),
+                )
+            } else {
+                let store = open_store(Some(&db_path))?;
+                nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
+            };
+
+            if watch {
+                let repo_root = detect_repo_root();
+                let code_store = state.store.clone();
+                let code_tx = state.event_tx.clone();
+                let code_db = db_path.clone();
+                let code_instance = "default".to_string();
+
+                std::thread::spawn(move || {
+                    let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
+                    let on_change = Box::new(move || {
+                        let _ = code_tx.send(nestweaver_web::state::GraphEvent {
+                            event_type: "graph:updated".to_string(),
+                            payload: serde_json::json!({"source": "code_watcher"}),
+                        });
+                    });
+                    if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
+                        tracing::error!("CodeWatcher failed: {e}");
+                    }
+                });
+            }
 
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
