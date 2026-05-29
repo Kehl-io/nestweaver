@@ -340,6 +340,88 @@ pub fn build_context_with_intent(
 // ── build_context tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod promote_tests {
+    use super::{BrainContextResult, BrainNode, promote_member_notes_into_connected};
+    use std::collections::HashSet;
+
+    fn note(uid: &str) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Note".to_string(),
+            title: uid.to_string(),
+            location: format!("Projects/x/{uid}.md"),
+            relevance: 0.9,
+        }
+    }
+
+    fn symbol(uid: &str) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol".to_string(),
+            title: uid.to_string(),
+            location: format!("src/{uid}.rs"),
+            relevance: 0.5,
+        }
+    }
+
+    // Bug #12: when a project declares repos, its member notes are seeded into
+    // PPR (to survive the min_score filter) and therefore land in `seeds`,
+    // which is disjoint from `connected` and never rendered. The notes must be
+    // surfaced into `connected` so project orientation actually shows them.
+    #[test]
+    fn promotes_member_notes_from_seeds_into_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![note("note:prd"), note("note:status")],
+            connected: vec![symbol("sym:handler")],
+            unresolved_seeds: vec![],
+        };
+        let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
+            .into_iter()
+            .collect();
+
+        promote_member_notes_into_connected(&mut result, &members);
+
+        let connected_uids: Vec<&str> = result.connected.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            connected_uids.contains(&"note:prd"),
+            "member note 'note:prd' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            connected_uids.contains(&"note:status"),
+            "member note 'note:status' must surface in connected; got {connected_uids:?}"
+        );
+    }
+
+    // Non-member seeds (e.g. the project node itself) stay out of connected,
+    // and a member note already present is not duplicated.
+    #[test]
+    fn does_not_duplicate_or_promote_non_members() {
+        let mut result = BrainContextResult {
+            seeds: vec![note("note:prd"), symbol("proj:x")],
+            connected: vec![note("note:prd"), symbol("sym:handler")],
+            unresolved_seeds: vec![],
+        };
+        let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
+
+        promote_member_notes_into_connected(&mut result, &members);
+
+        let prd_count = result
+            .connected
+            .iter()
+            .filter(|n| n.uid == "note:prd")
+            .count();
+        assert_eq!(
+            prd_count, 1,
+            "already-present member note must not be duplicated"
+        );
+        assert!(
+            !result.connected.iter().any(|n| n.uid == "proj:x"),
+            "non-member seed must not be promoted"
+        );
+    }
+}
+
+#[cfg(test)]
 mod context_tests {
     use std::fs;
 
@@ -575,7 +657,7 @@ pub fn build_feature_context(
 /// One ranked node in a brain-context result. Carries the kind discriminator
 /// so the caller can format / filter results by domain (Symbol vs Note vs
 /// Section vs Tag vs Heading).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BrainNode {
     pub uid: String,
     pub kind: String,
@@ -589,6 +671,33 @@ pub struct BrainContextResult {
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
     pub unresolved_seeds: Vec<String>,
+}
+
+/// Surface a project's curated member notes into the rendered `connected`
+/// list.
+///
+/// `project_context` seeds PPR from the project's member notes so they (a)
+/// survive the `min_score` filter in `personalized_pagerank` — which would
+/// otherwise drop them once the project node fans out across tens of
+/// thousands of `PROJECT_INCLUDES_SYMBOL` edges — and (b) let the walk
+/// explore their neighbourhoods. But seeded UIDs land in `seeds`, which is
+/// disjoint from `connected` and is *not* rendered by the CLI / MCP project
+/// responses. For project orientation the curated notes are the
+/// authoritative answer, so promote any member note that resolved as a seed
+/// (and isn't already present) into `connected`. De-duplicated by UID.
+pub fn promote_member_notes_into_connected(
+    result: &mut BrainContextResult,
+    member_note_uids: &std::collections::HashSet<String>,
+) {
+    let present: std::collections::HashSet<String> =
+        result.connected.iter().map(|n| n.uid.clone()).collect();
+    let promoted: Vec<BrainNode> = result
+        .seeds
+        .iter()
+        .filter(|n| member_note_uids.contains(&n.uid) && !present.contains(&n.uid))
+        .cloned()
+        .collect();
+    result.connected.extend(promoted);
 }
 
 /// Build a task-focused context subgraph using the unified scope (code +
