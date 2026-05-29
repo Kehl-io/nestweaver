@@ -3046,6 +3046,8 @@ dependencies = [
  "lbug",
  "nestweaver-algorithms",
  "nestweaver-schema",
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "tantivy",
