@@ -41,6 +41,7 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 
 pub mod agent_guide;
 pub mod blast_radius;
+pub mod brain_docgraph;
 pub mod brainignore;
 pub mod bridges;
 pub mod cluster_dispatch;
@@ -79,6 +80,10 @@ pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, 
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,
+};
+pub use brain_docgraph::{
+    BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
+    broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
 };
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
