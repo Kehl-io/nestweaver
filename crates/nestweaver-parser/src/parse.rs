@@ -60,6 +60,7 @@ pub struct RawSymbol {
     pub name: String,
     pub kind: SymbolKind,
     pub start_line: u32,
+    pub end_line: u32,
     pub signature: String,
     pub content_hash: String,
     pub is_entry_point: bool,
@@ -655,6 +656,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     name,
                     kind,
                     start_line,
+                    end_line: node.end_position().row as u32 + 1,
                     signature,
                     content_hash,
                     is_entry_point: ep_kind.is_some(),
@@ -799,6 +801,26 @@ mod tests {
             .collect();
         assert!(!functions.is_empty(), "should find function 'greet'");
         assert_eq!(functions[0].start_line, 5);
+    }
+
+    #[test]
+    fn symbol_end_line_spans_multiline_body() {
+        // P0.1: a multi-line function must record end_line past start_line.
+        let source = "function greet(name) {\n  return hello(name);\n}\n";
+        let parsed = parse_source(Path::new("t.js"), source).unwrap();
+        let greet = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("should find 'greet'");
+        assert_eq!(greet.start_line, 1);
+        assert!(
+            greet.end_line > greet.start_line,
+            "end_line ({}) should span past start_line ({})",
+            greet.end_line,
+            greet.start_line
+        );
+        assert_eq!(greet.end_line, 3, "the 3-line function body ends on line 3");
     }
 
     #[test]

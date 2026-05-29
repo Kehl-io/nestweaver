@@ -114,6 +114,7 @@ mod tests {
             repo_uid: "repo:test".into(),
             file_path: "src/auth.js".into(),
             start_line: 1,
+            end_line: 1,
             signature: "function auth()".into(),
             summary: None,
             content_hash: "abc".into(),

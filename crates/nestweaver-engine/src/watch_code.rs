@@ -346,6 +346,7 @@ fn reindex_file(
             repo_uid: r_uid.to_string(),
             file_path: rel_str.clone(),
             start_line: raw_sym.start_line,
+            end_line: raw_sym.end_line,
             signature: raw_sym.signature.clone(),
             summary: None,
             content_hash: raw_sym.content_hash.clone(),

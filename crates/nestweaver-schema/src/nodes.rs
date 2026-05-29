@@ -144,6 +144,7 @@ pub struct Symbol {
     pub repo_uid: String,
     pub file_path: String,
     pub start_line: u32,
+    pub end_line: u32,
     pub signature: String,
     pub summary: Option<String>,
     pub content_hash: String,

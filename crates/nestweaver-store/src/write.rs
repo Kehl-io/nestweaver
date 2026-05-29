@@ -92,7 +92,7 @@ impl GraphStore {
         exec_params(
             conn,
             "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
-             repo_uid: $repo, file_path: $fp, start_line: $sl, \
+             repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
              pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
             vec![
@@ -102,6 +102,7 @@ impl GraphStore {
                 ("repo", lbug::Value::String(symbol.repo_uid.clone())),
                 ("fp", lbug::Value::String(symbol.file_path.clone())),
                 ("sl", lbug::Value::Int64(symbol.start_line as i64)),
+                ("el", lbug::Value::Int64(symbol.end_line as i64)),
                 ("sig", lbug::Value::String(symbol.signature.clone())),
                 (
                     "summary",
@@ -149,7 +150,7 @@ impl GraphStore {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
-                 repo_uid: $repo, file_path: $fp, start_line: $sl, \
+                 repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
                  signature: $sig, summary: $summary, content_hash: $hash, \
                  pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
             )
@@ -164,6 +165,7 @@ impl GraphStore {
                     ("repo", lbug::Value::String(symbol.repo_uid.clone())),
                     ("fp", lbug::Value::String(symbol.file_path.clone())),
                     ("sl", lbug::Value::Int64(symbol.start_line as i64)),
+                    ("el", lbug::Value::Int64(symbol.end_line as i64)),
                     ("sig", lbug::Value::String(symbol.signature.clone())),
                     (
                         "summary",

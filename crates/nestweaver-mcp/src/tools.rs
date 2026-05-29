@@ -3174,6 +3174,7 @@ mod project_context_bug12_tests {
             repo_uid: repo_uid.to_string(),
             file_path: file_path.to_string(),
             start_line: 1,
+            end_line: 1,
             signature: format!("fn {name}()"),
             summary: None,
             content_hash: format!("hash-{uid}"),

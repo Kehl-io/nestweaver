@@ -352,6 +352,7 @@ mod tests {
             name: name.to_string(),
             kind: SymbolKind::Function,
             start_line: line,
+            end_line: line,
             signature: format!("function {name}()"),
             content_hash: String::new(),
             is_entry_point: false,
