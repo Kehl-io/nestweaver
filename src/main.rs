@@ -2690,16 +2690,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 } else {
                     serde_json::Value::Null
                 };
-                let patched = admin::compute_hook_patch(rt, &existing)?;
                 if dry_run {
-                    // PRINT the patch that WOULD be applied; do not write.
-                    println!("{}", serde_json::to_string_pretty(&patched)?);
+                    // PRINT only the minimal delta that WOULD be added — not the
+                    // whole merged settings document (which may contain unrelated
+                    // pre-existing permissions). Do not write.
+                    let delta = admin::compute_hook_delta(rt, &existing)?;
+                    println!("{}", serde_json::to_string_pretty(&delta)?);
                     eprintln!(
-                        "(dry-run) Would write the above to {}. Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
+                        "(dry-run) Would merge the above hook entry into {} (existing settings preserved). Injected guidance helps but is NOT enforcement (Geng et al. 2025); hook schema is Claude-Code-specific.",
                         settings_path.display()
                     );
                     return Ok((EXIT_SUCCESS, None));
                 }
+                let patched = admin::compute_hook_patch(rt, &existing)?;
                 if let Some(parent) = settings_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }

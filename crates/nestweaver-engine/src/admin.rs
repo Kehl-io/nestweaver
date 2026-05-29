@@ -217,6 +217,41 @@ pub fn compute_hook_patch(runtime: Runtime, existing: &Value) -> Result<Value, a
     }
 }
 
+/// Compute the *minimal delta* (Claude-Code shape) that `install-hook` would
+/// add to the existing settings — i.e. just the `hooks.PreToolUse` entries that
+/// are not already present. Unlike [`compute_claude_hook_patch`], this does NOT
+/// echo back unrelated pre-existing settings (permissions, other matchers): it
+/// is what `--dry-run` should print so the output is the addition, not the
+/// whole merged document.
+///
+/// When the `Task` matcher already exists the `PreToolUse` array is empty
+/// (nothing to add).
+pub fn compute_claude_hook_delta(existing: &Value) -> Value {
+    let already_present = existing
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|entry| entry.get("matcher").and_then(|m| m.as_str()) == Some("Task"))
+        });
+
+    let to_add = if already_present {
+        json!([])
+    } else {
+        json!([claude_task_hook_entry()])
+    };
+
+    json!({ "hooks": { "PreToolUse": to_add } })
+}
+
+/// Compute the minimal dry-run delta for the given runtime.
+pub fn compute_hook_delta(runtime: Runtime, existing: &Value) -> Result<Value, anyhow::Error> {
+    match runtime {
+        Runtime::Claude => Ok(compute_claude_hook_delta(existing)),
+    }
+}
+
 /// Default settings file path for a runtime, relative to the current repo.
 pub fn runtime_settings_path(runtime: Runtime) -> PathBuf {
     match runtime {
@@ -270,6 +305,60 @@ mod tests {
         assert_eq!(patch["permissions"]["allow"][0], "Bash");
         let arr = patch["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "existing Edit matcher kept, Task added");
+    }
+
+    #[test]
+    fn dry_run_delta_is_minimal_and_excludes_unrelated_settings() {
+        // QA bug C: --dry-run must print only the hook block being added, NOT
+        // the entire merged settings document (which may contain alarming
+        // pre-existing permissions like Bash(rm -rf ...)).
+        let existing = json!({
+            "permissions": { "allow": ["Bash(rm -rf /tmp/worktree-cleanup)"] },
+            "hooks": { "PreToolUse": [ { "matcher": "Edit", "hooks": [] } ] }
+        });
+        let delta = compute_claude_hook_delta(&existing);
+        let rendered = serde_json::to_string_pretty(&delta).unwrap();
+
+        // The delta carries the PreToolUse Task hook block.
+        let arr = delta["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("delta PreToolUse array");
+        assert_eq!(arr.len(), 1, "delta is just the added Task entry");
+        assert_eq!(arr[0]["matcher"], "Task");
+        assert!(rendered.contains("PreToolUse"));
+        assert!(rendered.contains("Task"));
+
+        // It must NOT echo unrelated pre-existing settings.
+        assert!(
+            delta.get("permissions").is_none(),
+            "delta must not include pre-existing permissions"
+        );
+        assert!(
+            !rendered.contains("rm -rf"),
+            "delta must not leak the unrelated rm -rf permission"
+        );
+        // It must NOT echo the pre-existing Edit matcher.
+        assert!(
+            !rendered.contains("Edit"),
+            "delta must not include the pre-existing Edit matcher"
+        );
+    }
+
+    #[test]
+    fn dry_run_delta_empty_when_already_installed() {
+        // If the Task matcher is already present, the delta adds nothing.
+        let existing = json!({
+            "hooks": { "PreToolUse": [ {
+                "matcher": "Task",
+                "hooks": [ { "type": "command", "command": HOOK_COMMAND } ]
+            } ] }
+        });
+        let delta = compute_claude_hook_delta(&existing);
+        let arr = delta["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            arr.is_empty(),
+            "nothing to add when Task matcher already present"
+        );
     }
 
     #[test]
