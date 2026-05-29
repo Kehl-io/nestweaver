@@ -24,6 +24,17 @@ pub struct GraphStore {
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
     pub(crate) interaction_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// Feature F12: optional git-activity recency scores keyed by repo-relative
+    /// file path (`path -> score ∈ [0, 1]`). When loaded, `pagerank_score` is
+    /// multiplied at *read* time by a clamped recency factor so dormant code is
+    /// demoted relative to actively-developed code. Absent file → neutral
+    /// (multiplier 1.0). Loaded from the `<db>.gitactivity.json` sidecar; never
+    /// affects the PPR fixpoint.
+    pub(crate) git_activity_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// Feature F12: the `[ranking] git_activity_weight` to use when applying the
+    /// recency multiplier. Defaults to [`crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT`]
+    /// (1.2); `set_git_activity_weight` overrides it from config.
+    pub(crate) git_activity_weight: Mutex<f64>,
 }
 
 impl GraphStore {
@@ -36,6 +47,8 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
         };
         store.init_schema()?;
         Ok(store)
@@ -52,6 +65,8 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
         };
         store.init_schema()?;
         Ok(store)
@@ -68,6 +83,8 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
         })
     }
 
@@ -107,6 +124,8 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
+            git_activity_cache: Mutex::new(None),
+            git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
         };
         store.init_schema()?;
         Ok(store)
@@ -142,6 +161,73 @@ impl GraphStore {
             .interaction_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Feature F12: load pre-computed git-activity recency scores
+    /// (`path -> score ∈ [0, 1]`) into the in-memory cache. When present,
+    /// `pagerank_score` is multiplied at read time by a clamped recency factor
+    /// (see [`git_activity_multiplier`]). Passing an empty map is equivalent to
+    /// not loading at all (every file → neutral).
+    pub fn load_git_activity_cache(&self, scores: HashMap<String, f64>) {
+        *self
+            .git_activity_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(scores);
+    }
+
+    /// Clear the git-activity recency cache (restores neutral ranking).
+    pub fn clear_git_activity_cache(&self) {
+        *self
+            .git_activity_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Load the git-activity sidecar (`path -> score` JSON) from `path` into the
+    /// in-memory cache. No-op when the file is absent or corrupt (neutral path).
+    pub fn load_git_activity_sidecar(&self, path: &Path) -> Result<(), StoreError> {
+        if path.exists() {
+            let json = std::fs::read_to_string(path)
+                .map_err(|e| StoreError::Query(format!("read: {e}")))?;
+            let scores: HashMap<String, f64> = serde_json::from_str(&json)
+                .map_err(|e| StoreError::Query(format!("deserialize: {e}")))?;
+            self.load_git_activity_cache(scores);
+        }
+        Ok(())
+    }
+
+    /// Return the git-activity recency score for a repo-relative file `path`,
+    /// or `None` when no score is loaded for it (→ neutral multiplier).
+    pub fn git_activity_score(&self, path: &str) -> Option<f64> {
+        self.git_activity_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|m| m.get(path).copied()))
+    }
+
+    /// True when git-activity recency scores are loaded (Feature F12 active).
+    pub fn has_git_activity(&self) -> bool {
+        self.git_activity_cache
+            .lock()
+            .ok()
+            .map(|g| g.as_ref().is_some_and(|m| !m.is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// Override the git-activity recency weight (from `[ranking] git_activity_weight`).
+    pub fn set_git_activity_weight(&self, weight: f64) {
+        *self
+            .git_activity_weight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = weight;
+    }
+
+    /// The currently-configured git-activity recency weight.
+    pub fn git_activity_weight(&self) -> f64 {
+        self.git_activity_weight
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT)
     }
 
     /// Internal: bump the generation counter. Called by `compute_pagerank`

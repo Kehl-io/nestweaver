@@ -68,13 +68,29 @@ pub fn find_hub_nodes(store: &GraphStore, top_n: usize) -> Result<Vec<HubNode>> 
     // Read PageRank scores from the in-memory cache.
     let pr_scores: HashMap<String, f64> = store.pagerank_scores();
 
+    // Feature F12: when git-activity recency scores are loaded, demote dormant
+    // code at read time. We apply the same clamped multiplier the store uses in
+    // `symbols_by_pagerank`, keyed by the symbol's file path. Files with no
+    // recency score → neutral (multiplier 1.0); when no cache is loaded, the
+    // multiplier is 1.0 for every file (no-op).
+    let ga_active = store.has_git_activity();
+    let ga_weight = store.git_activity_weight();
+
     // Build hub nodes.
     let mut hubs: Vec<HubNode> = symbols
         .iter()
         .enumerate()
         .map(|(i, sym)| {
             let total = in_degree[i] + out_degree[i];
-            let pagerank = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
+            let base = pr_scores.get(&sym.uid).copied().unwrap_or(0.0);
+            let pagerank = if ga_active {
+                base * nestweaver_store::git_activity_multiplier(
+                    store.git_activity_score(&sym.file_path),
+                    ga_weight,
+                )
+            } else {
+                base
+            };
             HubNode {
                 uid: sym.uid.clone(),
                 name: sym.name.clone(),
@@ -211,6 +227,41 @@ mod tests {
 
         let hubs = find_hub_nodes(&store, 3).unwrap();
         assert_eq!(hubs.len(), 3);
+    }
+
+    #[test]
+    fn git_activity_demotes_dormant_hub_pagerank() {
+        // Feature F12: two equally-connected symbols in different files. When
+        // git-activity marks one file dormant, its hub pagerank_score is
+        // demoted relative to the live one (degree-based ordering is unchanged,
+        // but the reported pagerank reflects the recency multiplier).
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("F", "fn_f", "src/fresh.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("S", "fn_s", "src/stale.rs"))
+            .unwrap();
+        store.insert_edge(&make_edge("F", "S")).unwrap();
+        store.insert_edge(&make_edge("S", "F")).unwrap();
+        store
+            .compute_pagerank(0.85, 30, &nestweaver_store::GraphScope::code_only())
+            .unwrap();
+
+        let mut ga = HashMap::new();
+        ga.insert("src/fresh.rs".to_string(), 0.95);
+        ga.insert("src/stale.rs".to_string(), 0.05);
+        store.load_git_activity_cache(ga);
+
+        let hubs = find_hub_nodes(&store, 10).unwrap();
+        let f = hubs.iter().find(|h| h.uid == "F").unwrap();
+        let s = hubs.iter().find(|h| h.uid == "S").unwrap();
+        assert!(
+            f.pagerank_score > s.pagerank_score,
+            "fresh hub ({:.6}) should outrank dormant hub ({:.6})",
+            f.pagerank_score,
+            s.pagerank_score
+        );
     }
 
     #[test]

@@ -10,7 +10,10 @@ pub mod write;
 
 pub use db::GraphStore;
 pub use error::StoreError;
-pub use ranking::{GraphScope, QueryIntent, ScopedEdgeQuery, detect_intent};
+pub use ranking::{
+    DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
+    QueryIntent, ScopedEdgeQuery, detect_intent, git_activity_multiplier,
+};
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
 };

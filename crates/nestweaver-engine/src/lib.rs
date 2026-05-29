@@ -56,6 +56,7 @@ pub mod embedding;
 pub mod export;
 pub mod export_graph;
 pub mod extensions;
+pub mod git_activity;
 pub mod git_diff;
 pub mod html_to_md;
 pub mod hubs;
