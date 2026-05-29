@@ -34,6 +34,12 @@ pub struct RankingConfig {
     pub dampen: Vec<GlobRule>,
     #[serde(default)]
     pub boost: Vec<GlobRule>,
+    /// Feature F7 (PRF half) — enable pseudo-relevance-feedback query
+    /// expansion on brain BM25 searches. Off by default; when `true`, a
+    /// two-pass term-mining expansion runs before fusion. The CLI `--prf`
+    /// flag and MCP `prf: true` argument override this per call.
+    #[serde(default)]
+    pub enable_prf: bool,
 }
 
 impl RankingConfig {
