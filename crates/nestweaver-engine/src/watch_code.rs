@@ -268,7 +268,10 @@ impl CodeWatcher {
 
                 // Bump the graph generation counter so consumers (e.g. the
                 // web server SSE handler) can detect that the graph changed.
-                store.bump_graph_generation();
+                // P0.2: also persist it to `<db>.generation` so short-lived
+                // processes (and the F16 cache) see the bump after restart.
+                let gen_sidecar = crate::sidecar_path(&self.db_path, ".generation");
+                store.bump_and_persist_graph_generation(&gen_sidecar);
                 if let Some(ref cb) = on_change {
                     cb();
                 }

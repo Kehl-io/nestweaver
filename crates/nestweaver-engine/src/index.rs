@@ -275,6 +275,12 @@ pub fn index_directory_with_options(
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
+    // P0.2: the one-shot `index` path mutated the graph; bump + persist the
+    // generation so later short-lived processes (MCP server, CLI queries) see
+    // that the graph changed and invalidate any F16 cache entries — without a
+    // running watcher daemon.
+    store.bump_and_persist_generation();
+
     Ok(result)
 }
 
@@ -1191,6 +1197,9 @@ pub fn incremental_index_with_name(
         tracing::warn!("failed to save pagerank cache: {e}");
     }
 
+    // P0.2: incremental index mutated the graph; bump + persist the generation.
+    store.bump_and_persist_generation();
+
     Ok(result)
 }
 
@@ -1390,6 +1399,9 @@ fn full_index_fallback(
     if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
+
+    // P0.2: full re-index mutated the graph; bump + persist the generation.
+    store.bump_and_persist_generation();
 
     Ok(IncrementalResult {
         fell_back_to_full: true,
