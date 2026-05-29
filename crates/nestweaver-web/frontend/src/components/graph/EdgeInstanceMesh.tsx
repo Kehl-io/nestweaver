@@ -14,8 +14,11 @@ export function EdgeInstanceMesh({ buffers }: Props) {
     if (!line) return;
 
     const geo = line.geometry;
-    geo.setAttribute("position", new Float32BufferAttribute(buffers.edgePositions, 3));
-    geo.setAttribute("color", new Float32BufferAttribute(buffers.edgeColors, 3));
+    const posAttr = new Float32BufferAttribute(buffers.edgePositions, 3);
+    const colAttr = new Float32BufferAttribute(buffers.edgeColors, 3);
+    geo.setAttribute("position", posAttr);
+    geo.setAttribute("color", colAttr);
+    geo.setDrawRange(0, buffers.edgeCount * 2);
     geo.computeBoundingSphere();
   }, [buffers]);
 
@@ -24,7 +27,7 @@ export function EdgeInstanceMesh({ buffers }: Props) {
   return (
     <lineSegments ref={lineRef} frustumCulled={false} renderOrder={-1}>
       <bufferGeometry />
-      <lineBasicMaterial vertexColors transparent opacity={0.5} depthTest={false} toneMapped={false} />
+      <lineBasicMaterial vertexColors transparent opacity={0.6} depthTest={false} toneMapped={false} linewidth={1} />
     </lineSegments>
   );
 }

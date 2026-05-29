@@ -33,7 +33,6 @@ type InMessage =
   | { type: "stop" }
   | { type: "kill" };
 
-// Declare worker-scope postMessage (not window.postMessage)
 declare function postMessage(message: unknown, transfer: Transferable[]): void;
 declare function postMessage(message: unknown): void;
 
@@ -61,12 +60,11 @@ self.onmessage = (event: MessageEvent<InMessage>) => {
       target: l.target,
     }));
 
-    const alphaDecay = 1 / (options.settling * 10);
-    const repulsionStrength = -options.repulsion * 100;
-    const gravityStrength = options.gravity * 0.1;
+    const repulsionStrength = -options.repulsion * 30;
+    const gravityStrength = options.gravity * 0.5;
 
     const simulation = forceSimulation<NodeDatum>(nodes, 2)
-      .alphaDecay(alphaDecay)
+      .alphaDecay(0.05)
       .force(
         "link",
         forceLink<NodeDatum, LinkDatum>(links)
@@ -75,25 +73,22 @@ self.onmessage = (event: MessageEvent<InMessage>) => {
       )
       .force("charge", forceManyBody<NodeDatum>().strength(repulsionStrength))
       .force("center", forceCenter<NodeDatum>(0, 0).strength(gravityStrength))
-      .stop();
+      .stop(); // don't auto-start — we run manually
 
     sim = simulation;
 
-    simulation.on("tick", () => {
-      const n = nodes.length;
-      const buf = new Float32Array(n * 2);
-      for (let i = 0; i < n; i++) {
-        buf[i * 2 + 0] = nodes[i].x ?? 0;
-        buf[i * 2 + 1] = nodes[i].y ?? 0;
-      }
-      postMessage({ type: "tick", positions: buf }, [buf.buffer]);
-    });
+    // Run simulation to completion synchronously (~60 ticks with alphaDecay=0.05)
+    simulation.tick(120);
 
-    simulation.on("end", () => {
-      postMessage({ type: "end" });
-    });
-
-    simulation.restart();
+    // Send final positions in one shot
+    const n = nodes.length;
+    const buf = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      buf[i * 2 + 0] = nodes[i].x ?? 0;
+      buf[i * 2 + 1] = nodes[i].y ?? 0;
+    }
+    postMessage({ type: "tick", positions: buf }, [buf.buffer]);
+    postMessage({ type: "end" });
     return;
   }
 
