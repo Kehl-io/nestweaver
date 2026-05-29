@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: SensorConfig
   kind: TypeAlias
   start_line: 4
+  end_line: 7
   signature: "typedef struct {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: id
   kind: Property
   start_line: 5
+  end_line: 5
   signature: int id;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: SensorType
   kind: Enum
   start_line: 9
+  end_line: 13
   signature: "enum SensorType {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -32,6 +35,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: TEMPERATURE
   kind: Constant
   start_line: 10
+  end_line: 10
   signature: TEMPERATURE
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,6 +45,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: HUMIDITY
   kind: Constant
   start_line: 11
+  end_line: 11
   signature: HUMIDITY
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -50,6 +55,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: PRESSURE
   kind: Constant
   start_line: 12
+  end_line: 12
   signature: PRESSURE
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -59,6 +65,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 15
+  end_line: 18
   signature: "struct SensorManager {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -68,6 +75,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: count
   kind: Property
   start_line: 16
+  end_line: 16
   signature: int count;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -77,6 +85,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 20
+  end_line: 20
   signature: struct SensorManager
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -86,6 +95,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: initialize
   kind: Function
   start_line: 20
+  end_line: 22
   signature: "void initialize(struct SensorManager* mgr) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -95,6 +105,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: calibrate
   kind: Function
   start_line: 24
+  end_line: 26
   signature: "static int calibrate(int sensor_id) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -104,6 +115,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: main
   kind: Function
   start_line: 28
+  end_line: 34
   signature: "int main(int argc, char** argv) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
@@ -113,6 +125,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: SensorManager
   kind: Class
   start_line: 29
+  end_line: 29
   signature: struct SensorManager
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -122,6 +135,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
 - name: val
   kind: Variable
   start_line: 31
+  end_line: 31
   signature: int val = calibrate(1);
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

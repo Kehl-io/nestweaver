@@ -176,6 +176,7 @@ mod tests {
             name: name.to_string(),
             kind: SymbolKind::Function,
             start_line: 1,
+            end_line: 1,
             signature: format!("function {name}()"),
             content_hash: String::new(),
             is_entry_point: false,

@@ -1,11 +1,11 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2028
 expression: "parsed_symbols(\"simple.rb\", &source)"
 ---
 - name: Greetings
   kind: Module
   start_line: 4
+  end_line: 22
   signature: module Greetings
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -15,6 +15,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: Greeter
   kind: Class
   start_line: 5
+  end_line: 15
   signature: class Greeter
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: greet
   kind: Method
   start_line: 6
+  end_line: 8
   signature: def greet(name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -33,6 +35,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: format_name
   kind: Method
   start_line: 12
+  end_line: 14
   signature: def format_name(name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: FormalGreeter
   kind: Class
   start_line: 17
+  end_line: 21
   signature: class FormalGreeter < Greeter
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -51,6 +55,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: greet
   kind: Method
   start_line: 18
+  end_line: 20
   signature: def greet(name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -60,6 +65,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
 - name: standalone_function
   kind: Method
   start_line: 24
+  end_line: 27
   signature: def standalone_function(input)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

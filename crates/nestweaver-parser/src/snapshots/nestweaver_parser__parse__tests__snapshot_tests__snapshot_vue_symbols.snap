@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
 - name: formatName
   kind: Function
   start_line: 12
+  end_line: 12
   signature: "export function formatName(name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
 - name: simple
   kind: Class
   start_line: 16
+  end_line: 16
   signature: "export default defineComponent({"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
 - name: handleClick
   kind: Function
   start_line: 25
+  end_line: 25
   signature: "function handleClick() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: Greeter
   kind: Class
   start_line: 5
+  end_line: 7
   signature: "interface Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: greet
   kind: Method
   start_line: 6
+  end_line: 6
   signature: "fun greet(name: String): String"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -26,6 +28,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: SimpleGreeter
   kind: Class
   start_line: 9
+  end_line: 17
   signature: "class SimpleGreeter : Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -35,6 +38,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: greet
   kind: Method
   start_line: 10
+  end_line: 12
   signature: "override fun greet(name: String): String {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -47,6 +51,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: logGreeting
   kind: Method
   start_line: 14
+  end_line: 16
   signature: "private fun logGreeting(message: String) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -56,6 +61,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: AppConfig
   kind: Module
   start_line: 19
+  end_line: 21
   signature: "object AppConfig {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -65,6 +71,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: defaultName
   kind: Property
   start_line: 20
+  end_line: 20
   signature: "val defaultName = \"World\""
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -74,6 +81,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: main
   kind: Function
   start_line: 23
+  end_line: 28
   signature: "fun main() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
@@ -83,6 +91,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: greeter
   kind: Property
   start_line: 24
+  end_line: 24
   signature: val greeter = SimpleGreeter()
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -92,6 +101,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
 - name: result
   kind: Property
   start_line: 25
+  end_line: 25
   signature: val result = greeter.greet(AppConfig.defaultName)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

@@ -235,6 +235,7 @@ impl GraphStore {
                 repo_uid STRING, \
                 file_path STRING, \
                 start_line INT64, \
+                end_line INT64, \
                 signature STRING, \
                 summary STRING, \
                 content_hash STRING, \
@@ -244,6 +245,10 @@ impl GraphStore {
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Migration: add `end_line` to pre-existing Symbol tables that lack it
+        // (P0.1). Old rows default to 0 until re-indexed with `index --force`.
+        let _ = conn.query("ALTER TABLE Symbol ADD end_line INT64 DEFAULT 0");
 
         // --- Relationship tables ---
         conn.query("CREATE REL TABLE IF NOT EXISTS REPO_HAS_FILE(FROM Repo TO File)")

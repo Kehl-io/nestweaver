@@ -100,6 +100,7 @@ fn setup_test_store() -> GraphStore {
         repo_uid: "repo:test".to_string(),
         file_path: "src/main.js".to_string(),
         start_line: 1,
+        end_line: 1,
         signature: "function greet(name)".to_string(),
         summary: None,
         content_hash: "hash123".to_string(),

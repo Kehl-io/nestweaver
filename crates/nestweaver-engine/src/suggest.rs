@@ -729,6 +729,7 @@ mod tests {
             repo_uid: repo_uid.to_string(),
             file_path: "src/lib.rs".to_string(),
             start_line: 1,
+            end_line: 1,
             signature: format!("fn {name}()"),
             summary: None,
             content_hash: "hash".to_string(),

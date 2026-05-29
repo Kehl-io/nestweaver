@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: MyApp.Models
   kind: Module
   start_line: 4
+  end_line: 40
   signature: namespace MyApp.Models
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: IGreeter
   kind: Interface
   start_line: 6
+  end_line: 9
   signature: public interface IGreeter
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Greet
   kind: Method
   start_line: 8
+  end_line: 8
   signature: string Greet(string name);
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -35,6 +38,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Priority
   kind: Enum
   start_line: 11
+  end_line: 16
   signature: public enum Priority
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -44,6 +48,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Low
   kind: Constant
   start_line: 13
+  end_line: 13
   signature: Low
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -53,6 +58,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Medium
   kind: Constant
   start_line: 14
+  end_line: 14
   signature: Medium
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -62,6 +68,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: High
   kind: Constant
   start_line: 15
+  end_line: 15
   signature: High
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -71,6 +78,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: SimpleGreeter
   kind: Class
   start_line: 18
+  end_line: 29
   signature: "public class SimpleGreeter : IGreeter"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -80,6 +88,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Greet
   kind: Method
   start_line: 20
+  end_line: 23
   signature: public string Greet(string name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -92,6 +101,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: LogGreeting
   kind: Method
   start_line: 25
+  end_line: 28
   signature: private void LogGreeting(string message)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -104,6 +114,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Program
   kind: Class
   start_line: 31
+  end_line: 39
   signature: public static class Program
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -113,6 +124,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
 - name: Main
   kind: Method
   start_line: 33
+  end_line: 38
   signature: "public static void Main(string[] args)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

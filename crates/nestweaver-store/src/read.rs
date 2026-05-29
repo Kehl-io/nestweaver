@@ -140,7 +140,7 @@ fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
 }
 
 /// Build a Symbol from a query row with columns:
-/// uid, name, kind, repo_uid, file_path, start_line, signature, summary, content_hash, pagerank_score, is_entry_point, entry_point_kind
+/// uid, name, kind, repo_uid, file_path, start_line, end_line, signature, summary, content_hash, pagerank_score, is_entry_point, entry_point_kind
 pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     let uid = extract_string(row, 0)?;
     let name = extract_string(row, 1)?;
@@ -149,13 +149,14 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     let repo_uid = extract_string(row, 3)?;
     let file_path = extract_string(row, 4)?;
     let start_line = u32::try_from(extract_i64(row, 5)?).unwrap_or(0);
-    let signature = extract_string(row, 6)?;
-    let summary = extract_opt_string(row, 7)?;
-    let content_hash = extract_string(row, 8)?;
-    let pagerank_score = extract_f64(row, 9)?;
-    let iep_str = extract_string(row, 10).unwrap_or_default();
+    let end_line = u32::try_from(extract_i64(row, 6)?).unwrap_or(0);
+    let signature = extract_string(row, 7)?;
+    let summary = extract_opt_string(row, 8)?;
+    let content_hash = extract_string(row, 9)?;
+    let pagerank_score = extract_f64(row, 10)?;
+    let iep_str = extract_string(row, 11).unwrap_or_default();
     let is_entry_point = iep_str == "true";
-    let epk_str = extract_opt_string(row, 11).unwrap_or(None);
+    let epk_str = extract_opt_string(row, 12).unwrap_or(None);
     let entry_point_kind = epk_str.as_deref().and_then(parse_entry_point_kind);
 
     Ok(Symbol {
@@ -165,6 +166,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         repo_uid,
         file_path,
         start_line,
+        end_line,
         signature,
         summary,
         content_hash,
@@ -178,7 +180,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     })
 }
 
-pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, \
+pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
