@@ -54,6 +54,7 @@ pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
 pub mod embedding;
+pub mod eval;
 pub mod export;
 pub mod export_graph;
 pub mod extensions;
@@ -123,6 +124,10 @@ pub use cross_domain::{
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
     detect_dead_code_with_confidence, detect_dead_code_with_manifests,
+};
+pub use eval::{
+    EvalComparison, EvalReport, JudgedQuery, PerQueryRow, compare_reports, load_judged_queries,
+    mrr, ndcg_at_k, precision_at_k, run_eval,
 };
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use export_graph::export_in_memory_graph;
