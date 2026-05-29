@@ -3,7 +3,7 @@ import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import { useNavigationHistory } from "./useNavigationHistory";
 
-const MODES: GraphMode[] = ["context", "impact", "repos", "features", "inspector"];
+const MODES: GraphMode[] = ["context", "impact", "repos", "features"];
 
 export function useKeyboardShortcuts() {
   const setMode = useStore((s) => s.setGraphMode);
@@ -20,7 +20,6 @@ export function useKeyboardShortcuts() {
   useHotkeys("2", () => setMode(MODES[1]));
   useHotkeys("3", () => setMode(MODES[2]));
   useHotkeys("4", () => setMode(MODES[3]));
-  useHotkeys("5", () => setMode(MODES[4]));
 
   useHotkeys("[", () => toggleLeft());
   useHotkeys("]", () => toggleRight());
