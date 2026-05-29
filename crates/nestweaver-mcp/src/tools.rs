@@ -12,15 +12,15 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
-    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
-    attach_cluster_ids, attach_communities, broken_links, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, detect_dead_code, doc_stats,
-    expand_query_with_aliases, filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide,
-    generate_summaries, get_all_properties, get_last_indexed_at, index_directory,
-    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
-    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
-    truncate_to_budget,
+    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, affected_tests,
+    analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
+    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
+    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
+    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
+    render_text, save_extensions, search_symbols, set_property, tag_graph, tag_graph_all,
+    topic_clusters, truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -71,6 +71,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_brain_topic_clusters(),
         tool_schema_brain_tag_graph(),
         tool_schema_brain_doc_stats(),
+        tool_schema_affected_tests(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -140,6 +141,7 @@ pub fn dispatch(
         "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
         "brain_tag_graph" => tool_brain_tag_graph(store, args),
         "brain_doc_stats" => tool_brain_doc_stats(store, args),
+        "affected_tests" => tool_affected_tests(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -2221,6 +2223,72 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
     }))
+}
+
+// ── 31. affected_tests ──────────────────────────────────────────────────────
+
+fn tool_schema_affected_tests() -> Value {
+    json!({
+        "name": "affected_tests",
+        "description": "Use to prioritize which test files an MR/PR should run for a set of code changes. Maps changed files to the symbols they define, reverse-traverses the call/import graph, and returns the test files that (transitively) depend on the changed code, bucketed into priority tiers: tier_1 = tests that directly reference a changed symbol, tier_2 = tests of a direct caller, tier_3 = transitively reachable tests.\n\nIMPORTANT — this is STATIC, call-graph-based regression test selection. It is a prioritized signal, NOT a provably-safe subset. It misses tests reached via reflection, dependency injection, codegen/macros, and data-driven or integration/e2e tests. \"No tests found\" does NOT mean it is safe to skip testing — keep a periodic full test run in CI. Treat the output as a ranked starting point, not a guarantee.\n\nDo NOT use for symbol-level blast radius — use brain_impact. Do NOT use for risk scoring of a change — use detect_changes.\n\nProvide either `changed_files` (repo-relative paths) or `base_ref` (a git ref such as \"main\"; runs `git diff --name-only base...HEAD` against the locally-indexed repo). Example: affected_tests(base_ref=\"main\") → {tier_1: [...], tier_2: [...], tier_3: [...], summary: \"3 tier-1, 2 tier-2, 0 tier-3 tests affected\"}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "changed_files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Changed file paths (repo-relative). Example: [\"src/auth/login.ts\"]."
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted; diffs the locally-indexed repo via git."
+                }
+            }
+        }
+    })
+}
+
+fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // Resolve the set of changed files: explicit list takes precedence over base_ref.
+    let mut changed_files: Vec<String> = args
+        .get("changed_files")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if changed_files.is_empty()
+        && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
+    {
+        let repo_path = first_local_repo_path(store).unwrap_or_else(|| ".".to_string());
+        let files =
+            nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
+                .context("git diff for base_ref")?;
+        changed_files = files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+    }
+
+    if changed_files.is_empty() {
+        return Err(anyhow!(
+            "provide either 'changed_files' (non-empty) or 'base_ref'"
+        ));
+    }
+
+    let result = affected_tests(store, &changed_files).context("affected_tests")?;
+    Ok(serde_json::to_value(&result)?)
+}
+
+/// Return the filesystem path of the first locally-indexed repo (file:// URL).
+fn first_local_repo_path(store: &GraphStore) -> Option<String> {
+    let repos = store.list_repos(None).unwrap_or_default();
+    repos
+        .iter()
+        .find_map(|r| r.url.strip_prefix("file://").map(|p| p.to_string()))
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────

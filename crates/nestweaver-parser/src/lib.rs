@@ -21,7 +21,7 @@ pub mod systemverilog;
 pub mod vue;
 pub mod zig;
 
-pub use entry_points::detect_entry_point;
+pub use entry_points::{detect_entry_point, is_test_file};
 pub use frameworks::detect_frameworks;
 pub use language::{detect_language, is_markdown};
 pub use markdown::{

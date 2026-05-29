@@ -9,7 +9,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
-    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
+    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel, affected_tests,
     analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
@@ -1011,6 +1011,38 @@ enum Commands {
         files: Option<String>,
         #[arg(long, default_value = "3", help = "Maximum traversal depth")]
         depth: u32,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// Select the test files an MR should run for a set of code changes (F13).
+    ///
+    /// Static, call-graph-based regression test selection: maps changed files
+    /// to their symbols, reverse-traverses CALLS/IMPORTS to depth 3, and buckets
+    /// dependent test files into priority tiers. This is a prioritized signal,
+    /// NOT a provably-safe subset — it misses reflection, DI, codegen, and
+    /// data-driven/integration tests. "No tests found" is NOT safe-to-skip.
+    #[command(
+        name = "affected-tests",
+        after_help = "Examples:\n  nestweaver affected-tests --files src/auth.rs,src/db.rs\n  nestweaver affected-tests --base-ref main\n  nestweaver affected-tests --base-ref main --json"
+    )]
+    AffectedTests {
+        #[arg(
+            long,
+            help = "Comma-separated changed file paths (repo-relative)",
+            conflicts_with = "base_ref"
+        )]
+        files: Option<String>,
+        #[arg(
+            long = "base-ref",
+            help = "Git ref to diff against (e.g. main); uses git diff --name-only base...HEAD"
+        )]
+        base_ref: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2882,6 +2914,93 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 result.risk_level,
                 format_elapsed(t0.elapsed())
             );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::AffectedTests {
+            files,
+            base_ref,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+
+            // Resolve changed files: explicit --files, else git diff against --base-ref.
+            let changed_files: Vec<String> = if let Some(files_str) = files {
+                files_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else if let Some(base) = base_ref {
+                let repo_root = detect_repo_root();
+                out.status(&format!("Detecting changed files via git diff {base}..."));
+                changed_files_from_git(&repo_root, Some(&base))
+                    .context("git diff")?
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            } else {
+                eprintln!("Error: provide either --files or --base-ref");
+                return Ok((EXIT_ERROR, None));
+            };
+
+            if changed_files.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "changed_files": [],
+                            "changed_symbols": [],
+                            "tier_1": [],
+                            "tier_2": [],
+                            "tier_3": [],
+                            "summary": "0 tier-1, 0 tier-2, 0 tier-3 tests affected",
+                        }))?
+                    );
+                } else {
+                    println!("No changed files detected.");
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            let result = affected_tests(&store, &changed_files)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.summary);
+                println!();
+                if !result.changed_symbols.is_empty() {
+                    println!("Changed symbols ({}):", result.changed_symbols.len());
+                    for s in &result.changed_symbols {
+                        println!("  {} — {}", s.name, s.file_path);
+                    }
+                    println!();
+                }
+                let print_tier = |label: &str, tier: &[nestweaver_engine::AffectedTestFile]| {
+                    if tier.is_empty() {
+                        return;
+                    }
+                    println!("{label} ({} file(s)):", tier.len());
+                    for f in tier {
+                        println!(
+                            "  {} (conf {:.2}) — {}",
+                            f.test_file,
+                            f.confidence,
+                            f.tests.join(", ")
+                        );
+                    }
+                    println!();
+                };
+                print_tier("Tier 1 (direct)", &result.tier_1);
+                print_tier("Tier 2 (caller's tests)", &result.tier_2);
+                print_tier("Tier 3 (transitive)", &result.tier_3);
+                println!("Note: {}", result.disclaimer);
+            }
+
+            let stats = format!("{} in {}", result.summary, format_elapsed(t0.elapsed()));
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 

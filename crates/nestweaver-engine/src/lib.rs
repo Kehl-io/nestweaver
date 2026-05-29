@@ -39,6 +39,7 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
         .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
 }
 
+pub mod affected_tests;
 pub mod agent_guide;
 pub mod blast_radius;
 pub mod brain_docgraph;
@@ -76,6 +77,9 @@ pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
 
+pub use affected_tests::{
+    AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
+};
 pub use agent_guide::{generate_agents_md, generate_cursor_rule, generate_guide, generate_skill};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
