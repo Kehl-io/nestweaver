@@ -51,6 +51,7 @@ export const useStore = create<StoreState>()(
           communityOverlay: state.communityOverlay,
           tagsVisible: state.tagsVisible,
           minimapVisible: state.minimapVisible,
+          reducedEffects: state.reducedEffects,
         }),
       },
     ),
