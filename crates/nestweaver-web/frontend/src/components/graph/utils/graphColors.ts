@@ -39,7 +39,9 @@ export function kindColor(kind: string, isDark: boolean): string {
 
 export function kindToColor(kind: string): string {
   const isDark = document.documentElement.classList.contains("dark");
-  return kindColor(kind, isDark);
+  // API returns "Symbol/Function" — strip the prefix for color lookup
+  const short = kind.includes("/") ? kind.split("/").pop()! : kind;
+  return kindColor(short, isDark);
 }
 
 export function desaturate(hex: string, amount: number): string {
