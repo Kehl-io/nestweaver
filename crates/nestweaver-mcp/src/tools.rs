@@ -442,6 +442,11 @@ fn tool_brain_context(
         intent,
     )?;
 
+    // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
+    // server holds no InstanceConfig at the call site (same as F8, which uses
+    // ResponseConfig::default()), so there is no `[ranking]` to load. Priors are
+    // applied on the CLI `brain context` / `brain search` paths instead.
+
     // RFC #2: apply post-PPR filters to seeds and connected lists.
     let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
         if let Some(ref kinds) = filter_kinds {
