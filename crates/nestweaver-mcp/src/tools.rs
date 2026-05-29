@@ -2339,10 +2339,14 @@ fn tool_project_context(
     };
 
     // 2. Collect member UIDs (notes + symbols) for the post-PPR boost.
+    //    Member note UIDs are tracked separately: they get seeded into PPR
+    //    and surfaced into `connected` (Bug #12).
     let mut member_uids: Vec<String> = Vec::new();
+    let mut member_note_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let note_uids = store
         .list_project_note_uids(&project.uid)
         .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
+    member_note_uids.extend(note_uids.iter().cloned());
     member_uids.extend(note_uids);
     let sym_uids = store
         .list_project_symbol_uids(&project.uid)
@@ -2359,6 +2363,7 @@ fn tool_project_context(
     };
     for comp_uid in &component_uids {
         let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+        member_note_uids.extend(comp_notes.iter().cloned());
         member_uids.extend(comp_notes);
         let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
         member_uids.extend(comp_syms);
@@ -2380,12 +2385,16 @@ fn tool_project_context(
         }));
     }
 
-    // 4. Seed PPR from the project node itself (not all member UIDs).
-    //    With ProjectContext intent the PROJECT_INCLUDES_* edges get a
-    //    5x weight boost, so the walk efficiently discovers all members
-    //    and places them in `connected` instead of `seeds`.
+    // 4. Seed PPR from the project node, its components, and — critically —
+    //    the project's member notes (Bug #12). Seeding the notes guarantees
+    //    they survive the `min_score` filter in PPR: when a project declares
+    //    repos, the project node's mass is split across tens of thousands of
+    //    PROJECT_INCLUDES_SYMBOL edges, leaving each PROJECT_INCLUDES_NOTE
+    //    target below threshold so it never reaches `connected`. Seeding also
+    //    lets the walk explore each note's neighbourhood (sections, links).
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
     ppr_seeds.extend(component_uids);
+    ppr_seeds.extend(member_note_uids.iter().cloned());
 
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
@@ -2408,7 +2417,13 @@ fn tool_project_context(
         Some(intent),
     )?;
 
-    // 4b. Post-PPR scope boost: multiply relevance for nodes that belong
+    // 4b. Surface the project's curated member notes into `connected`. They
+    //     were seeded above, so they live in `result.seeds` — which is
+    //     disjoint from `connected` and not rendered. For project orientation
+    //     the curated notes are the answer, so promote them (Bug #12).
+    nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+
+    // 4c. Post-PPR scope boost: multiply relevance for nodes that belong
     //     to the project (member UIDs are the authoritative membership signal).
     let member_set: std::collections::HashSet<&str> =
         member_uids.iter().map(|s| s.as_str()).collect();
@@ -3128,4 +3143,125 @@ fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Er
             .clone()
             .ok_or_else(|| anyhow!("database path not set on server"))
     })
+}
+
+#[cfg(test)]
+mod project_context_bug12_tests {
+    use super::*;
+    use nestweaver_schema::{Note, NoteKind, Project, Symbol, SymbolKind, Vault, Visibility};
+
+    fn mk_note(uid: &str, vault_uid: &str, file_path: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: vault_uid.to_string(),
+            file_path: file_path.to_string(),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 100,
+            content_hash: format!("hash-{uid}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        }
+    }
+
+    fn mk_symbol(uid: &str, repo_uid: &str, file_path: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+        }
+    }
+
+    // Bug #12: a project that declares repos (so it has a large
+    // PROJECT_INCLUDES_SYMBOL fan-out) must still surface its curated member
+    // notes through `project_context`. Notes are seeded into PPR — so they
+    // land in `seeds`, disjoint from the rendered `connected` list — and must
+    // be promoted into `connected`. This guards the wiring at the call site:
+    // removing the promote step leaves notes in `seeds` only and fails here.
+    #[test]
+    fn project_context_surfaces_member_notes_when_project_has_symbol_mass() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".into(),
+                name: "t".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+
+        let proj = Project {
+            uid: "proj:pp".into(),
+            name: "Parallel Paths".into(),
+            summary: None,
+            instance_id: "default".into(),
+        };
+        store.insert_project(&proj).unwrap();
+
+        let note_uids = ["note:prd", "note:status", "note:arch"];
+        for (i, n) in note_uids.iter().enumerate() {
+            store
+                .insert_note(&mk_note(
+                    n,
+                    "vlt:t",
+                    &format!("Projects/parallel-paths/doc{i}.md"),
+                    n,
+                ))
+                .unwrap();
+        }
+
+        // 50 symbols simulate an attached repo's code mass.
+        let mut sym_uids: Vec<String> = Vec::new();
+        for i in 0..50 {
+            let uid = format!("sym:s{i}");
+            store
+                .insert_symbol(&mk_symbol(
+                    &uid,
+                    "repo:r",
+                    &format!("src/f{i}.rs"),
+                    &format!("fn{i}"),
+                ))
+                .unwrap();
+            sym_uids.push(uid);
+        }
+
+        let note_edges: Vec<(&str, &str)> = note_uids.iter().map(|n| ("proj:pp", *n)).collect();
+        store.batch_insert_project_note_edges(&note_edges).unwrap();
+        store
+            .batch_insert_project_symbol_edges("proj:pp", &sym_uids, 1.0)
+            .unwrap();
+
+        let resp = tool_project_context(
+            &store,
+            None,
+            json!({ "project": "Parallel Paths", "token_budget": 5000 }),
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        let uids: Vec<&str> = connected.iter().filter_map(|n| n["uid"].as_str()).collect();
+        let hits = note_uids.iter().filter(|n| uids.contains(n)).count();
+        assert_eq!(
+            hits,
+            note_uids.len(),
+            "all {} member notes must surface in connected; got {uids:?}",
+            note_uids.len()
+        );
+    }
 }
