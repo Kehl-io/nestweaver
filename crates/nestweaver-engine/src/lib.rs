@@ -64,6 +64,7 @@ pub mod process;
 pub mod project;
 pub mod pull;
 pub mod query;
+pub mod read_symbols;
 pub mod recency;
 pub mod registry;
 pub mod snapshot;

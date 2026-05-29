@@ -439,10 +439,11 @@ mod tests {
                     "bridge_nodes",
                     "blast_radius",
                     "get_summary",
+                    "read_symbols",
                 ] {
                     assert!(names.contains(&expected), "missing tool: {expected}");
                 }
-                assert_eq!(tools.len(), 22, "expected 22 tools, got {}", tools.len());
+                assert_eq!(tools.len(), 23, "expected 23 tools, got {}", tools.len());
                 // Every tool has a description leading with usage guidance.
                 for tool in tools {
                     let desc = tool["description"].as_str().expect("description");
