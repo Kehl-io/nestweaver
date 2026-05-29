@@ -29,7 +29,6 @@ import { useStore } from "../../stores";
 function useGraphKeyboardNav(
   panelRef: React.RefObject<HTMLDivElement | null>,
 ) {
-  const selectedNodeId = useStore((s) => s.selectedNodeId);
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
   const selectNode = useStore((s) => s.selectNode);
