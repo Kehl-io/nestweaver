@@ -16,6 +16,10 @@ pub struct GraphStore {
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
     pub(crate) pagerank_generation: AtomicU64,
+    /// Monotonic counter that bumps whenever the graph data changes (nodes
+    /// or edges added/removed). Lets the web UI and other consumers detect
+    /// when their view of the graph is stale without diffing the full graph.
+    pub(crate) graph_generation: AtomicU64,
     /// Optional interaction memory scores keyed by node UID. When loaded,
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
@@ -30,6 +34,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
@@ -45,6 +50,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
@@ -60,6 +66,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
         })
     }
@@ -98,6 +105,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
         };
         store.init_schema()?;
@@ -140,6 +148,21 @@ impl GraphStore {
     /// after a successful re-rank.
     pub(crate) fn bump_pagerank_generation(&self) {
         self.pagerank_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Current graph data generation. Starts at 0; bumps once per successful
+    /// watcher batch that modifies the graph (nodes or edges added/removed).
+    /// Lets the web UI and other consumers detect staleness without diffing
+    /// the full graph.
+    pub fn graph_generation(&self) -> u64 {
+        self.graph_generation.load(Ordering::Acquire)
+    }
+
+    /// Bump the graph generation counter. Called by watchers after each batch
+    /// that modifies the graph. The web server can poll this to detect when to
+    /// push an SSE event to connected clients.
+    pub fn bump_graph_generation(&self) {
+        self.graph_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Return a new connection to the underlying database.
@@ -443,5 +466,22 @@ impl GraphStore {
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_generation_increments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(store.graph_generation(), 0);
+        store.bump_graph_generation();
+        assert_eq!(store.graph_generation(), 1);
+        store.bump_graph_generation();
+        assert_eq!(store.graph_generation(), 2);
     }
 }

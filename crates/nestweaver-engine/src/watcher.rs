@@ -164,14 +164,35 @@ impl BrainWatcher {
 
     /// Block until shutdown is requested or the underlying debouncer
     /// errors. Returns Ok on graceful shutdown.
+    ///
+    /// Opens its own `GraphStore` from `self.db_path`. For sharing a store
+    /// with the web server, use `run_with_store` instead.
     pub fn run(self) -> Result<(), anyhow::Error> {
-        // Open the GraphStore — held for the lifetime of the loop. The
-        // watcher is a writer, so only one BrainWatcher should run per
-        // DB. (MCP server integration is deferred until we verify lbug's
-        // multi-writer behaviour.)
-        let store = GraphStore::open_or_create(&self.db_path)
-            .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?;
+        let store = Arc::new(
+            GraphStore::open_or_create(&self.db_path)
+                .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?,
+        );
+        self.run_inner(store, None)
+    }
 
+    /// Like `run`, but uses a caller-provided `Arc<GraphStore>` and invokes
+    /// `on_change` after every batch that mutates the graph. The callback
+    /// also receives the graph-generation bump so the web server can emit
+    /// an SSE event to connected clients.
+    pub fn run_with_store(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
+        self.run_inner(store, on_change)
+    }
+
+    /// Shared implementation used by both `run` and `run_with_store`.
+    fn run_inner(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
         // Open the Tantivy index sidecar if configured. Best-effort: a
         // broken index logs a warning but doesn't block graph updates.
         let tantivy: Option<TantivyIndex> = match &self.tantivy_path {
@@ -313,6 +334,13 @@ impl BrainWatcher {
                 // shows the actual last-indexed time, not max(modified_at).
                 if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, &v_uid) {
                     tracing::warn!("failed to record last_indexed_at: {e}");
+                }
+
+                // Bump the graph generation counter so consumers (e.g. the
+                // web server SSE handler) can detect that the graph changed.
+                store.bump_graph_generation();
+                if let Some(ref cb) = on_change {
+                    cb();
                 }
             }
         }
