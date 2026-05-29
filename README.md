@@ -182,7 +182,7 @@ cargo build --release
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
-| `export` | Export the graph in Cypher, GraphML, or Mermaid format |
+| `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format |
 
 </details>
 

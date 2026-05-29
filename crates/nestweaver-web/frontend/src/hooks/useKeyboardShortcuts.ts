@@ -87,8 +87,6 @@ export function useKeyboardShortcuts() {
   );
 
   // e — export (no-op; export menu is UI-driven via toolbar button)
-  // f — fit to viewport (requires sigma ref, not available here;
-  //     implement via store action that GraphPanel reads)
-  // r — reset layout (requires ForceAtlas2 restart via sigma ref;
-  //     implement via store action that GraphPanel reads)
+  // f — fit to viewport (implement via store action that GraphPanel reads)
+  // r — reset layout (implement via store action that GraphPanel reads)
 }

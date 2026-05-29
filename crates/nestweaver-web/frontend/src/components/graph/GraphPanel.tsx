@@ -167,7 +167,7 @@ function useGraphKeyboardNav(
 
 /**
  * Runs all mode hooks unconditionally — they no-op when their mode isn't active.
- * These no longer need to be inside a Sigma context; they read/write via zustand.
+ * Hooks read and write graph state via zustand.
  */
 function GraphModeHooks() {
   useContextMode();
