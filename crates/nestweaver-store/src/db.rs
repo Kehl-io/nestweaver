@@ -242,6 +242,7 @@ impl GraphStore {
                 pagerank_score DOUBLE, \
                 is_entry_point STRING, \
                 entry_point_kind STRING, \
+                framework_hint STRING, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -249,6 +250,10 @@ impl GraphStore {
         // Migration: add `end_line` to pre-existing Symbol tables that lack it
         // (P0.1). Old rows default to 0 until re-indexed with `index --force`.
         let _ = conn.query("ALTER TABLE Symbol ADD end_line INT64 DEFAULT 0");
+
+        // Migration (F2.0): add `framework_hint` to pre-existing Symbol tables.
+        // Stored as "framework:role" (e.g. "spring:controller"); empty for none.
+        let _ = conn.query("ALTER TABLE Symbol ADD framework_hint STRING DEFAULT ''");
 
         // --- Relationship tables ---
         conn.query("CREATE REL TABLE IF NOT EXISTS REPO_HAS_FILE(FROM Repo TO File)")
@@ -467,6 +472,32 @@ impl GraphStore {
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS REFERENCES_CODE_SECTION_TO_SYMBOL(\
                 FROM Section TO Symbol, confidence FLOAT, source STRING)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // ── Contract extension (F2-core): API contract graph ────────────────
+        //
+        // A Contract is one HTTP route / gRPC method / GraphQL operation, derived
+        // from a spec file (declared) or a framework handler (code-derived).
+        // IMPLEMENTS_CONTRACT links a handler Symbol to the Contract it serves;
+        // confidence records match quality (1.0 exact, 0.8 base-path-inferred).
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS Contract(\
+                uid STRING, \
+                kind STRING, \
+                verb STRING, \
+                path STRING, \
+                operation_id STRING, \
+                repo_uid STRING, \
+                source_path STRING, \
+                confidence FLOAT, \
+                PRIMARY KEY(uid))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS_CONTRACT(\
+                FROM Symbol TO Contract, confidence FLOAT)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 

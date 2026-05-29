@@ -1,7 +1,7 @@
 use lbug::Value;
 use nestweaver_schema::{
-    EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol, SymbolKind,
-    Tag, Vault, Visibility,
+    Contract, EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol,
+    SymbolKind, Tag, Vault, Visibility,
 };
 use serde::Serialize;
 
@@ -183,6 +183,12 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
     let is_entry_point = iep_str == "true";
     let epk_str = extract_opt_string(row, 12).unwrap_or(None);
     let entry_point_kind = epk_str.as_deref().and_then(parse_entry_point_kind);
+    // Column 13 (framework_hint) is optional: older queries that don't SELECT
+    // it leave the row short, in which case `get` returns None.
+    let framework_hint = row
+        .get(13)
+        .and_then(|_| extract_opt_string(row, 13).ok().flatten())
+        .and_then(|s| parse_framework_hint(&s));
 
     Ok(Symbol {
         uid,
@@ -201,12 +207,26 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         entry_point_kind,
         visibility: Visibility::Inferred,
         type_info: None,
-        framework_hint: None,
+        framework_hint,
+    })
+}
+
+/// Parse a `"framework:role"` string (as stored in the `framework_hint`
+/// column) back into a [`FrameworkHint`]. Empty / malformed values yield None.
+fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
+    let (framework, role) = s.split_once(':')?;
+    if framework.is_empty() {
+        return None;
+    }
+    Some(nestweaver_schema::FrameworkHint {
+        framework: framework.to_string(),
+        role: role.to_string(),
     })
 }
 
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
-     s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind";
+     s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
+     s.framework_hint";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
      n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
@@ -1282,6 +1302,89 @@ impl GraphStore {
                 })
             })
             .collect()
+    }
+
+    /// List all Contract nodes, optionally filtered to a single repo.
+    pub fn list_contracts(&self, repo_uid: Option<&str>) -> Result<Vec<Contract>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (c:Contract) RETURN c.uid, c.kind, c.verb, c.path, \
+                 c.operation_id, c.repo_uid, c.source_path, c.confidence";
+        let result = match conn.query(q) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("list_contracts: query skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let mut out: Vec<Contract> = Vec::new();
+        for row in result {
+            let c = Contract {
+                uid: extract_string(&row, 0)?,
+                kind: extract_string(&row, 1)?,
+                verb: extract_opt_string(&row, 2)?,
+                path: extract_opt_string(&row, 3)?,
+                operation_id: extract_opt_string(&row, 4)?,
+                repo_uid: extract_string(&row, 5)?,
+                source_path: extract_string(&row, 6)?,
+                confidence: extract_f64(&row, 7)? as f32,
+            };
+            if let Some(want) = repo_uid
+                && c.repo_uid != want
+            {
+                continue;
+            }
+            out.push(c);
+        }
+        Ok(out)
+    }
+
+    /// Return the (contract_uid, confidence) of every Contract a given handler
+    /// symbol implements via an `IMPLEMENTS_CONTRACT` edge.
+    pub fn contracts_implemented_by(
+        &self,
+        symbol_uid: &str,
+    ) -> Result<Vec<(String, f32)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (s:Symbol {uid: $uid})-[r:IMPLEMENTS_CONTRACT]->(c:Contract) \
+                 RETURN c.uid, r.confidence";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!("contracts_implemented_by: skipped (table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("uid", Value::String(symbol_uid.to_string()))],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!("contracts_implemented_by: execute skipped: {e}");
+                return Ok(vec![]);
+            }
+        };
+        result
+            .map(|row| Ok((extract_string(&row, 0)?, extract_f64(&row, 1)? as f32)))
+            .collect()
+    }
+
+    /// Return the set of Contract UIDs that have at least one incident
+    /// `IMPLEMENTS_CONTRACT` edge (i.e. a handler claims to implement them).
+    /// Used by drift diagnostics to compute the declared/implemented diff.
+    pub fn list_implemented_contract_uids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (:Symbol)-[:IMPLEMENTS_CONTRACT]->(c:Contract) RETURN DISTINCT c.uid";
+        let result = match conn.query(q) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_implemented_contract_uids: query skipped (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        result.map(|row| extract_string(&row, 0)).collect()
     }
 
     /// Look up a Project by name (case-insensitive).

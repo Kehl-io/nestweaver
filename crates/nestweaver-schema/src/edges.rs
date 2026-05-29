@@ -17,6 +17,10 @@ pub enum EdgeType {
     ProjectIncludesNote,
     ProjectHasComponent,
     ProjectHasParent,
+    /// A code handler (Symbol) implements an API [`crate::nodes::Contract`].
+    /// Confidence records match quality: 1.0 for an exact verb+path match,
+    /// 0.8 for a base-path-inferred match.
+    ImplementsContract,
 }
 
 impl EdgeType {
@@ -41,6 +45,7 @@ impl EdgeType {
             EdgeType::ProjectIncludesNote => "PROJECT_INCLUDES_NOTE",
             EdgeType::ProjectHasComponent => "PROJECT_HAS_COMPONENT",
             EdgeType::ProjectHasParent => "PROJECT_HAS_PARENT",
+            EdgeType::ImplementsContract => "IMPLEMENTS_CONTRACT",
         }
     }
 }
@@ -62,6 +67,7 @@ impl fmt::Display for EdgeType {
             EdgeType::ProjectIncludesNote => write!(f, "PROJECT_INCLUDES_NOTE"),
             EdgeType::ProjectHasComponent => write!(f, "PROJECT_HAS_COMPONENT"),
             EdgeType::ProjectHasParent => write!(f, "PROJECT_HAS_PARENT"),
+            EdgeType::ImplementsContract => write!(f, "IMPLEMENTS_CONTRACT"),
         }
     }
 }

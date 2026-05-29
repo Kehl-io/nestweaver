@@ -13,6 +13,16 @@ use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+/// F2.2: data captured per Spring/NestJS controller file so handler →
+/// contract edges can be derived after the bulk symbol insert.
+struct HandlerFileData {
+    framework: String,
+    class_signature: String,
+    rel_path: String,
+    /// (symbol_uid, handler-symbol view) for every symbol in the file.
+    symbols: Vec<(String, crate::contracts::HandlerSymbol)>,
+}
+
 /// Result returned by the indexing functions.
 pub struct IndexResult {
     pub symbols_count: usize,
@@ -338,6 +348,9 @@ fn index_into_store(
     scan_pb.set_message("Scanning files...");
 
     let mut file_entries: Vec<(PathBuf, Language)> = Vec::new();
+    // F2.1: spec files (OpenAPI/Swagger/proto/GraphQL) collected separately —
+    // most have no detected source language so they fall outside `file_entries`.
+    let mut spec_files: Vec<PathBuf> = Vec::new();
 
     // SECURITY: do NOT follow symlinks (see index_md.rs for rationale).
     let walker = WalkDir::new(repo_path)
@@ -369,6 +382,11 @@ fn index_into_store(
         }
 
         let path = entry.path();
+
+        // F2.1: collect API spec files regardless of source language.
+        if crate::contracts::is_spec_file(&path.to_string_lossy()) {
+            spec_files.push(path.to_path_buf());
+        }
 
         // Only process files with a supported language extension.
         let lang = match detect_language(path) {
@@ -418,6 +436,10 @@ fn index_into_store(
             content_hash: String,
             symbols: Vec<RawSymbol>,
             references: Vec<RawReference>,
+            /// Full file source — retained only for languages whose parser does
+            /// not fold class/route decorators into symbol signatures (e.g.
+            /// TypeScript/NestJS), so framework detection can scan it.
+            source: Option<String>,
         },
     }
 
@@ -462,6 +484,12 @@ fn index_into_store(
             match parse_source(path, &source) {
                 Ok(parsed) => {
                     parse_pb.inc(1);
+                    // Retain source only for TS/JS, where NestJS class/method
+                    // decorators live above the declaration and are not in the
+                    // parsed signatures. Other languages don't need it.
+                    let retained_source =
+                        matches!(*lang, Language::TypeScript | Language::JavaScript)
+                            .then(|| source.clone());
                     ParseOutcome::Parsed {
                         rel_path: display_name,
                         lang: *lang,
@@ -469,6 +497,7 @@ fn index_into_store(
                         content_hash,
                         symbols: parsed.symbols,
                         references: parsed.references,
+                        source: retained_source,
                     }
                 }
                 Err(err) => {
@@ -492,6 +521,10 @@ fn index_into_store(
     let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
         Vec::new();
     let mut detected_languages: Vec<Language> = Vec::new();
+    // F2.2: per framework file, the controller class signature + the (uid,
+    // HandlerSymbol) of every symbol in the file, so handler detection can
+    // map matches back to symbol UIDs after the bulk symbol insert.
+    let mut handler_files: Vec<HandlerFileData> = Vec::new();
     let mut files_count = 0usize;
     let mut files_unchanged = 0usize;
     let mut symbols_count = 0usize;
@@ -518,6 +551,7 @@ fn index_into_store(
                 content_hash,
                 symbols: raw_symbols,
                 references: raw_references,
+                source,
             } => {
                 // Record in the new filemeta cache.
                 if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
@@ -537,8 +571,75 @@ fn index_into_store(
                 files_count += 1;
                 detected_languages.push(lang);
 
-                for raw_sym in &raw_symbols {
+                // F2.0: run the (previously dormant) framework detector and
+                // attach hints to the symbols it identifies. The detector keys
+                // off the lowercase language string + per-symbol signatures.
+                let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> =
+                    HashMap::new();
+                if let Some(lang_str) = crate::contracts::framework_language_str(lang) {
+                    for (sym_idx, hint) in
+                        nestweaver_parser::detect_frameworks(&raw_symbols, &rel_path, lang_str)
+                    {
+                        hint_by_index.insert(sym_idx, hint);
+                    }
+                }
+
+                // F2.2: NestJS controllers carry `@Controller(...)` as a
+                // decorator on the line *above* the class, which the TS parser
+                // does not fold into the class signature, so `detect_frameworks`
+                // misses it. Recover the controller from the retained source.
+                let class_starts: Vec<(usize, u32)> = raw_symbols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
+                    .map(|(i, s)| (i, s.start_line))
+                    .collect();
+                if let Some(src) = source.as_deref()
+                    && let Some(ctrl_idx) =
+                        crate::contracts::detect_nestjs_controller_index(src, &class_starts)
+                {
+                    hint_by_index.entry(ctrl_idx).or_insert_with(|| {
+                        nestweaver_schema::FrameworkHint {
+                            framework: "nestjs".into(),
+                            role: "controller".into(),
+                        }
+                    });
+                }
+
+                // F2.2: if this file has a Spring/NestJS controller, capture the
+                // data needed to derive IMPLEMENTS_CONTRACT edges later.
+                let controller_framework = hint_by_index
+                    .values()
+                    .find(|h| h.role == "controller")
+                    .map(|h| h.framework.clone());
+                let mut handler_file = controller_framework.map(|framework| {
+                    let class_signature = raw_symbols
+                        .iter()
+                        .zip(0..)
+                        .find(|(_, i)| hint_by_index.get(i).is_some_and(|h| h.role == "controller"))
+                        .map(|(s, _)| s.signature.clone())
+                        .unwrap_or_default();
+                    HandlerFileData {
+                        framework,
+                        class_signature,
+                        rel_path: rel_path.clone(),
+                        symbols: Vec::new(),
+                    }
+                });
+
+                for (sym_idx, raw_sym) in raw_symbols.iter().enumerate() {
                     let s_uid = symbol_uid(&r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
+
+                    if let Some(hf) = handler_file.as_mut() {
+                        hf.symbols.push((
+                            s_uid.clone(),
+                            crate::contracts::HandlerSymbol {
+                                name: raw_sym.name.clone(),
+                                signature: raw_sym.signature.clone(),
+                                start_line: raw_sym.start_line,
+                            },
+                        ));
+                    }
 
                     all_symbols.push(Symbol {
                         uid: s_uid.clone(),
@@ -557,11 +658,15 @@ fn index_into_store(
                         entry_point_kind: raw_sym.entry_point_kind,
                         visibility: raw_sym.visibility,
                         type_info: raw_sym.type_info.clone(),
-                        framework_hint: None,
+                        framework_hint: hint_by_index.remove(&sym_idx),
                     });
 
                     file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
                     symbols_count += 1;
+                }
+
+                if let Some(hf) = handler_file.take() {
+                    handler_files.push(hf);
                 }
 
                 parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references));
@@ -692,6 +797,14 @@ fn index_into_store(
 
     resolve_pb.finish_and_clear();
 
+    // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
+    // Best-effort: a malformed spec or unexpected store error here must not
+    // fail the whole index. Contracts are hypotheses layered on top of the
+    // code graph.
+    if let Err(e) = derive_contracts(store, repo_path, &r_uid, &spec_files, &handler_files) {
+        tracing::warn!("contract derivation failed (non-fatal): {e}");
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
     if files_unchanged > 0 {
@@ -741,6 +854,86 @@ fn index_into_store(
 /// Returns true if the given path has a supported language extension.
 fn is_parseable(path: &Path) -> bool {
     detect_language(path).is_some()
+}
+
+/// F2-core: build the API contract graph for one repo.
+///
+/// 1. Parse spec files into **declared** [`nestweaver_schema::Contract`] nodes
+///    (confidence 1.0).
+/// 2. For each Spring/NestJS controller file, match handlers to contracts. When
+///    a spec already declares the route, link to it (exact-match confidence);
+///    otherwise mint a **code-derived** contract and link to that.
+/// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
+///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
+fn derive_contracts(
+    store: &GraphStore,
+    repo_path: &Path,
+    r_uid: &str,
+    spec_files: &[PathBuf],
+    handler_files: &[HandlerFileData],
+) -> Result<(), anyhow::Error> {
+    use nestweaver_schema::{EdgeType, ResolvedEdge};
+    use std::collections::HashSet;
+
+    // 1. Declared contracts from specs.
+    let mut declared_uids: HashSet<String> = HashSet::new();
+    for spec_path in spec_files {
+        let rel = spec_path
+            .strip_prefix(repo_path)
+            .unwrap_or(spec_path)
+            .to_string_lossy()
+            .into_owned();
+        let source = match std::fs::read_to_string(spec_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("skip unreadable spec {rel}: {e}");
+                continue;
+            }
+        };
+        for sc in crate::contracts::parse_spec_file(&rel, &source) {
+            let contract = sc.into_contract(r_uid, &rel, 1.0);
+            declared_uids.insert(contract.uid.clone());
+            store.insert_contract(&contract)?;
+        }
+    }
+
+    // 2 + 3. Handler matches → contracts + IMPLEMENTS_CONTRACT edges.
+    let mut edges: Vec<ResolvedEdge> = Vec::new();
+    for hf in handler_files {
+        let handler_syms: Vec<crate::contracts::HandlerSymbol> =
+            hf.symbols.iter().map(|(_, hs)| hs.clone()).collect();
+        // The parsed class signature only keeps the first annotation, so the
+        // class-level base path (@RequestMapping / @Controller) is usually
+        // dropped. Read the raw source to recover it; fall back to the
+        // truncated signature if the file is unreadable.
+        let base_source = std::fs::read_to_string(repo_path.join(&hf.rel_path))
+            .unwrap_or_else(|_| hf.class_signature.clone());
+        let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
+        for m in matches {
+            let contract_uid = m.contract.uid();
+            // Mint a code-derived contract only when no spec declared this UID.
+            if !declared_uids.contains(&contract_uid) {
+                let contract = m
+                    .contract
+                    .clone()
+                    .into_contract(r_uid, &hf.rel_path, m.confidence);
+                store.insert_contract(&contract)?;
+            }
+            if let Some((sym_uid, _)) = hf.symbols.get(m.symbol_index) {
+                edges.push(ResolvedEdge {
+                    source_uid: sym_uid.clone(),
+                    target_uid: contract_uid,
+                    edge_type: EdgeType::ImplementsContract,
+                    confidence: m.confidence,
+                    link_type: None,
+                });
+            }
+        }
+    }
+    if !edges.is_empty() {
+        store.batch_insert_edges(&edges)?;
+    }
+    Ok(())
 }
 
 /// Returns true if the file looks like a minified bundle, webpack output,
@@ -1262,6 +1455,178 @@ function hello(name) { return "Hello " + name; }
         let (result, _store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         assert!(result.edges_count > 0, "expected CALLS edges, got 0");
+    }
+
+    #[test]
+    fn index_populates_framework_hint_for_spring_controller() {
+        // F2.0: detect_frameworks is wired into the pipeline, so a Spring
+        // @RestController class gets a framework_hint persisted on its Symbol.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("UserController.java"),
+            "@RestController\npublic class UserController {\n  public void get() {}\n}\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let matches = store.lookup_symbols_by_name("UserController").unwrap();
+        let ctrl = matches
+            .iter()
+            .find(|s| s.name == "UserController")
+            .expect("UserController symbol present");
+        let hint = ctrl
+            .framework_hint
+            .as_ref()
+            .expect("framework_hint should be populated for @RestController");
+        assert_eq!(hint.framework, "spring");
+        assert_eq!(hint.role, "controller");
+    }
+
+    #[test]
+    fn index_derives_contracts_and_implements_edges() {
+        // F2.1 + F2.2: a repo with an OpenAPI spec and a matching Spring
+        // controller produces declared Contract nodes plus an
+        // IMPLEMENTS_CONTRACT edge from the handler to the contract.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/approvals:\n    \
+             post:\n      \
+             operationId: createApproval\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("ApprovalsController.java"),
+            "@RestController\n\
+             @RequestMapping(\"/v1/approvals\")\n\
+             public class ApprovalsController {\n  \
+             @PostMapping\n  \
+             public void create() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        // Declared contract from the spec exists.
+        let contracts = store.list_contracts(None).unwrap();
+        assert!(
+            contracts
+                .iter()
+                .any(|c| c.uid == "contract:http:POST:/v1/approvals"),
+            "expected declared contract; got {:?}",
+            contracts.iter().map(|c| &c.uid).collect::<Vec<_>>()
+        );
+
+        // The handler implements it (base-path-inferred since @PostMapping has
+        // no sub-path; UID still matches the spec's POST /v1/approvals).
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert!(
+            implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
+            "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+    }
+
+    #[test]
+    fn index_drift_flags_declared_not_implemented() {
+        // F2.4: a spec declares GET /v1/items but no handler implements it.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/items:\n    \
+             get:\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let report = crate::contracts::drift_for_store(&store, None).unwrap();
+        assert_eq!(report.declared_not_implemented.len(), 1);
+        assert_eq!(
+            report.declared_not_implemented[0].uid,
+            "contract:http:GET:/v1/items"
+        );
+        assert!(report.implemented_not_declared.is_empty());
+    }
+
+    #[test]
+    fn index_links_nestjs_decorator_on_own_line() {
+        // F2-core correctness gap: with the decorator on the line ABOVE the
+        // method (`@Post('approvals')` over `createApproval()`), the parsed
+        // signature lacks the decorator. The handler must still link to the
+        // declared contract, and drift must NOT flag it as
+        // declared-not-implemented.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("src")).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: A, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/approvals:\n    \
+             post:\n      \
+             operationId: createApproval\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("src/approvals.controller.ts"),
+            "@Controller('v1')\n\
+             export class ApprovalsController {\n  \
+             @Post('approvals')\n  \
+             createApproval() { return {}; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        // The handler implements the spec-declared contract (exact verb+path).
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert!(
+            implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
+            "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+
+        // Drift must be clean — POST /v1/approvals is implemented.
+        let report = crate::contracts::drift_for_store(&store, None).unwrap();
+        assert!(
+            report.declared_not_implemented.is_empty(),
+            "POST /v1/approvals must not be declared-not-implemented; got {:?}",
+            report.declared_not_implemented
+        );
+
+        // The controller class carries a NestJS framework_hint.
+        let matches = store.lookup_symbols_by_name("ApprovalsController").unwrap();
+        let ctrl = matches
+            .iter()
+            .find(|s| s.name == "ApprovalsController")
+            .expect("ApprovalsController symbol present");
+        let hint = ctrl
+            .framework_hint
+            .as_ref()
+            .expect("framework_hint should be populated for @Controller");
+        assert_eq!(hint.framework, "nestjs");
     }
 
     #[test]
