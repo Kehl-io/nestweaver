@@ -166,6 +166,60 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     );
   }, [buffers]);
 
+  // Impact ripple: briefly highlight neighbors when a node is selected
+  useEffect(() => {
+    if (!selectedNodeId || !graphInstance) return;
+
+    const mesh = meshRef.current;
+    if (!mesh) return;
+
+    const highlightAttr = mesh.geometry.getAttribute("aHighlight") as InstancedBufferAttribute | undefined;
+    if (!highlightAttr) return;
+
+    const neighborUids: string[] = [];
+    try {
+      graphInstance.neighbors(selectedNodeId).forEach((n) => neighborUids.push(n));
+    } catch {
+      return;
+    }
+
+    if (neighborUids.length === 0) return;
+
+    // Apply partial glow to each neighbor
+    for (const uid of neighborUids) {
+      const idx = buffers.uidToIndex.get(uid);
+      if (idx !== undefined) {
+        // Ripple on top of any existing highlight value — use max so selected node keeps full 1.0
+        const current = highlightAttr.getX(idx);
+        highlightAttr.setX(idx, Math.max(current, 0.5));
+      }
+    }
+    highlightAttr.needsUpdate = true;
+
+    // Clear ripple after 300ms — the hover/selection effect will re-run and restore correct state
+    const timer = setTimeout(() => {
+      const m = meshRef.current;
+      if (!m) return;
+      const attr = m.geometry.getAttribute("aHighlight") as InstancedBufferAttribute | undefined;
+      if (!attr) return;
+      for (const uid of neighborUids) {
+        const idx = buffers.uidToIndex.get(uid);
+        if (idx !== undefined) {
+          // Only clear the ripple boost; if a neighbor is also the hovered/selected node keep 1.0
+          const { uidToIndex } = buffers;
+          const hovIdx = hoveredNodeId !== null ? (uidToIndex.get(hoveredNodeId) ?? -1) : -1;
+          const selIdx = selectedNodeId !== null ? (uidToIndex.get(selectedNodeId) ?? -1) : -1;
+          const keep = idx === hovIdx || idx === selIdx ? 1.0 : 0.0;
+          attr.setX(idx, keep);
+        }
+      }
+      attr.needsUpdate = true;
+    }, 300);
+
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNodeId]);
+
   // Update aColor, aSize, aHighlight when hover/selection changes
   useEffect(() => {
     const mesh = meshRef.current;
