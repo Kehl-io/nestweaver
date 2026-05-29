@@ -11,7 +11,9 @@ pub mod write;
 pub use db::GraphStore;
 pub use error::StoreError;
 pub use ranking::{GraphScope, QueryIntent, ScopedEdgeQuery, detect_intent};
-pub use read::{BacklinkRow, CodeEdge, CodeGraph, CrossRepoRef, SymbolBasic};
+pub use read::{
+    BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
+};
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
 };

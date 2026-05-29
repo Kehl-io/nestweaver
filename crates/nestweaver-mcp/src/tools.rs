@@ -13,13 +13,14 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, analyze_blast_radius,
-    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
-    compute_clusters, detect_changes_impact, detect_dead_code, expand_query_with_aliases,
-    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries,
-    get_all_properties, get_last_indexed_at, index_directory, index_markdown_directory,
-    load_alias_sidecar, load_clusters, load_extensions, parse_iso8601_to_epoch,
-    populate_inline_bodies, query_by_property, render_text, save_extensions, search_symbols,
-    set_property, truncate_to_budget,
+    attach_cluster_ids, attach_communities, broken_links, build_brain_context_hybrid_with_aliases,
+    compute_clusters, detect_changes_impact, detect_dead_code, doc_stats,
+    expand_query_with_aliases, filter_by_target, find_bridge_nodes, find_hub_nodes, generate_guide,
+    generate_summaries, get_all_properties, get_last_indexed_at, index_directory,
+    index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions, orphan_documents,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
+    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
+    truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -65,6 +66,11 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_read_symbols(),
         tool_schema_regex_search(),
         tool_schema_count_patterns(),
+        tool_schema_brain_broken_links(),
+        tool_schema_brain_orphan_documents(),
+        tool_schema_brain_topic_clusters(),
+        tool_schema_brain_tag_graph(),
+        tool_schema_brain_doc_stats(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -129,6 +135,11 @@ pub fn dispatch(
         "read_symbols" => tool_read_symbols(store, args),
         "regex_search" => tool_regex_search(store, args),
         "count_patterns" => tool_count_patterns(store, args),
+        "brain_broken_links" => tool_brain_broken_links(store, args),
+        "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
+        "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
+        "brain_tag_graph" => tool_brain_tag_graph(store, args),
+        "brain_doc_stats" => tool_brain_doc_stats(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -285,6 +296,144 @@ fn tool_schema_count_patterns() -> Value {
                 }
             },
             "required": ["patterns"]
+        }
+    })
+}
+
+// ── F9: document-graph tools ──────────────────────────────────────────────
+
+fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let max_suggestions = args
+        .get("max_suggestions")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(5);
+    let links = broken_links(store, max_suggestions)?;
+    Ok(json!({ "broken_links": serde_json::to_value(&links)?, "total": links.len() }))
+}
+
+fn tool_schema_brain_broken_links() -> Value {
+    json!({
+        "name": "brain_broken_links",
+        "description": "Use when auditing a markdown vault for wikilinks that did not resolve cleanly — links whose target is ambiguous or low-confidence (confidence < 1.0). For each, returns the source note, the link text, and suggested target note UIDs (fuzzy title match) so you can repair the link. Returns empty when there is no vault. Output: `{broken_links:[{source_uid, source_path, wikilink_text, confidence, suggested_target_uids:[...]}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_suggestions": {
+                    "type": "integer",
+                    "description": "Max suggested target UIDs per broken link (default 5).",
+                    "default": 5
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let vault = args.get("vault").and_then(|v| v.as_str());
+    let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+    let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
+    let orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
+    Ok(json!({ "orphans": serde_json::to_value(&orphans)?, "total": orphans.len() }))
+}
+
+fn tool_schema_brain_orphan_documents() -> Value {
+    json!({
+        "name": "brain_orphan_documents",
+        "description": "Use to find notes that are disconnected from the knowledge graph — notes with ZERO inbound and ZERO outbound wikilinks. These are candidates to link up or archive. Index/MOC notes are excluded via a configurable allowlist (default includes Projects.md, index.md, README.md, _brain/index.md, and any note whose path/title contains \"MOC\"). Optional `vault` and `path_prefix` filters. Returns empty when there is no vault. Output: `{orphans:[{uid, title, file_path}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vault": { "type": "string", "description": "Restrict to this vault UID." },
+                "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
+                "allowlist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let resolution = args
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+    let clusters = topic_clusters(store, resolution)?;
+    Ok(json!({ "clusters": serde_json::to_value(&clusters)?, "total": clusters.len() }))
+}
+
+fn tool_schema_brain_topic_clusters() -> Value {
+    json!({
+        "name": "brain_topic_clusters",
+        "description": "Use to discover the thematic structure of a markdown vault: runs Leiden community detection over the note-to-note wikilink graph and groups notes into topics. Each cluster is labelled by its most central member (highest PageRank, then highest link degree). Returns empty when there is no vault. Output: `{clusters:[{cluster_id, members:[note_uid], label}], total}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resolution": {
+                    "type": "number",
+                    "description": "Leiden resolution — higher yields more, smaller clusters (default 0.5).",
+                    "default": 0.5
+                }
+            }
+        }
+    })
+}
+
+fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // `tag` is optional. When present we accept only a string (reject other
+    // JSON types); when absent we return the whole tag co-occurrence graph.
+    match args.get("tag") {
+        Some(Value::Null) | None => {
+            let tags = tag_graph_all(store)?;
+            Ok(json!({ "tags": serde_json::to_value(&tags)? }))
+        }
+        Some(Value::String(tag)) => {
+            let tg = tag_graph(store, tag)?;
+            Ok(serde_json::to_value(&tg)?)
+        }
+        Some(_) => Err(anyhow!("'tag' must be a string")),
+    }
+}
+
+fn tool_schema_brain_tag_graph() -> Value {
+    json!({
+        "name": "brain_tag_graph",
+        "description": "Use to understand how tags relate to each other in a markdown vault. Two modes. (1) With `tag`: returns that focus tag's note count plus the tags that co-occur with it (appear on the same notes), ranked by shared-note count. Output: `{tag, count, co_occurring:[{tag, count}]}`. (2) Without `tag`: returns the WHOLE tag co-occurrence graph — one entry per distinct tag, sorted by note count descending then name — for taxonomy-drift detection. Output: `{tags:[{tag, count, co_occurring:[{tag, count}]}]}`. The `tag` argument may include or omit a leading `#`. Returns count 0 / empty when the tag or vault is absent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." }
+            }
+        }
+    })
+}
+
+fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let top_tags_limit = args
+        .get("top_tags_limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+    let stats = doc_stats(store, top_tags_limit)?;
+    Ok(serde_json::to_value(&stats)?)
+}
+
+fn tool_schema_brain_doc_stats() -> Value {
+    json!({
+        "name": "brain_doc_stats",
+        "description": "Use for a one-shot health summary of a markdown vault's document graph. Composes the other brain document tools plus counts. Returns all seven keys even on an empty vault (zeros / empty collections). Output: `{total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags:[{tag,count}], notes_by_year:{year:count}}`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top_tags_limit": {
+                    "type": "integer",
+                    "description": "Max entries in top_tags (default 10).",
+                    "default": 10
+                }
+            }
         }
     })
 }
