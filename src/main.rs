@@ -605,6 +605,13 @@ enum Commands {
         #[command(subcommand)]
         command: Box<BrainCommands>,
     },
+    /// F11 memory-bank operations over the vault: typed-relationship health
+    /// (`lint`), tier-promotion proposals (`consolidate`), and typed-edge
+    /// traversal (`related`).
+    Memory {
+        #[command(subcommand)]
+        command: Box<MemoryCommands>,
+    },
     /// Run the brain as a Model Context Protocol server on stdio.
     ///
     /// Intended to be launched by Claude Desktop / Claude Code / Cowork via
@@ -1543,6 +1550,64 @@ enum BrainCommands {
     DocStats {
         #[arg(long, default_value = "10", help = "Max entries in top_tags")]
         top_tags_limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Run the seven F11 memory-bank health checks over the vault: stale
+    /// notes, Supersedes contradictions, orphans, broken wikilinks,
+    /// supersession chains, schema drift, and dangling relationships.
+    Lint {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Propose tier promotions (daily logs → ideas → project files).
+    /// DRY-RUN by default; `--apply` is an explicit no-op stub for now.
+    Consolidate {
+        #[arg(
+            long,
+            help = "Opt into write-mode (currently a no-op stub that warns; default is dry-run)"
+        )]
+        apply: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
+    /// Walk the typed-relationship graph (Supersedes/DependsOn/CausedBy/
+    /// RelatesTo) from a note, excluding generic wikilinks.
+    Related {
+        /// Seed note UID to traverse from.
+        uid: String,
+        #[arg(
+            long = "edge-type",
+            help = "Edge type to follow (repeatable; default: all four)"
+        )]
+        edge_types: Vec<String>,
+        #[arg(long, default_value = "2", help = "Max BFS depth")]
+        depth: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2812,6 +2877,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0),
+        Commands::Memory { command } => run_memory(*command, t0),
         Commands::Ranking { command } => run_ranking(command, t0),
         Commands::Embed {
             db,
@@ -4591,6 +4657,133 @@ fn run_ranking(
 }
 
 /// Dispatch a `brain` subcommand.
+/// Current wall-clock time as Unix epoch seconds (f64).
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn run_memory(
+    command: MemoryCommands,
+    t0: std::time::Instant,
+) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        MemoryCommands::Lint { json, db, config } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let report = nestweaver_engine::memory_lint(&store, now_epoch_secs())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Memory lint:");
+                println!("  stale notes:           {}", report.stale.len());
+                println!("  contradictions:        {}", report.contradictions.len());
+                println!("  orphans:               {}", report.orphans.len());
+                println!("  broken wikilinks:      {}", report.broken_wikilinks.len());
+                println!(
+                    "  supersession chains:   {}",
+                    report.supersession_chains.len()
+                );
+                println!("  schema drift:          {}", report.schema_drift.len());
+                println!(
+                    "  dangling relationships: {}",
+                    report.dangling_relationships.len()
+                );
+                for s in &report.stale {
+                    println!("  stale: {} ({} days)", s.file_path, s.days_stale);
+                }
+                for c in &report.contradictions {
+                    println!("  contradiction cycle: {}", c.cycle.join(" → "));
+                }
+                for d in &report.dangling_relationships {
+                    println!(
+                        "  dangling: {} -[{}]-> {} (missing)",
+                        d.source_uid, d.edge_type, d.target_uid
+                    );
+                }
+            }
+            let issues = report.stale.len()
+                + report.contradictions.len()
+                + report.supersession_chains.len()
+                + report.schema_drift.len()
+                + report.dangling_relationships.len();
+            let stats = format!("{} issue(s) in {}", issues, format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        MemoryCommands::Consolidate {
+            apply,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let manifest = nestweaver_engine::memory_consolidate(&store, apply, now_epoch_secs())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            } else {
+                println!(
+                    "Consolidation ({}):",
+                    if manifest.dry_run { "dry-run" } else { "apply" }
+                );
+                for w in &manifest.warnings {
+                    println!("  warning: {w}");
+                }
+                if manifest.proposals.is_empty() {
+                    println!("  no promotion candidates.");
+                } else {
+                    for p in &manifest.proposals {
+                        println!("  promote {} → {}", p.source_path, p.promote_to);
+                        println!("    {}", p.rationale);
+                    }
+                }
+            }
+            let stats = format!(
+                "{} proposal(s) in {}",
+                manifest.proposals.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        MemoryCommands::Related {
+            uid,
+            edge_types,
+            depth,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let store = open_store(Some(&db_path))?;
+            let related =
+                nestweaver_engine::memory_related(&store, &uid, &edge_types, Some(depth))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&related)?);
+            } else if related.is_empty() {
+                println!("No typed neighbours found for {uid}.");
+            } else {
+                println!("Typed neighbours of {uid} ({}):", related.len());
+                for r in &related {
+                    println!(
+                        "  [{}] {} — {} (via {})",
+                        r.depth, r.title, r.file_path, r.via_edge
+                    );
+                }
+            }
+            let stats = format!(
+                "{} neighbour(s) in {}",
+                related.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+    }
+}
+
 fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,

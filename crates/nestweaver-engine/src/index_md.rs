@@ -16,7 +16,8 @@ use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
 use nestweaver_schema::{
-    Heading, Note, Section, Tag, Vault, heading_uid, note_uid, section_uid, tag_uid, vault_uid,
+    EdgeType, Heading, Note, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid, section_uid,
+    tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
 use sha2::{Digest, Sha256};
@@ -939,6 +940,18 @@ fn index_into_store(
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // F11: capture the lowercased heading text owning each section so the
+        // typed-edge derivation can group wikilinks by section heading.
+        let section_heading_text: Vec<Option<String>> = parsed
+            .sections
+            .iter()
+            .map(|sec| {
+                sec.heading_idx
+                    .and_then(|i| parsed.headings.get(i))
+                    .map(|h| h.text.to_lowercase())
+            })
+            .collect();
+
         note_contexts.push(NoteContext {
             note_uid: n_uid,
             rel_path,
@@ -950,6 +963,8 @@ fn index_into_store(
             section_uids,
             wikilinks: parsed.wikilinks.clone(),
             tags: parsed.tags.clone(),
+            frontmatter: parsed.frontmatter.clone(),
+            section_heading_text,
         });
 
         parse_pb.inc(1);
@@ -1164,6 +1179,17 @@ fn index_into_store(
 
     resolve_pb.finish_and_clear();
 
+    // ── Pass 3: F11 typed Note→Note relationships ──────────────────────────
+    // Derive Supersedes / DependsOn / CausedBy / RelatesTo edges from
+    // frontmatter keys and heading-grouped wikilinks. Generic ungrouped
+    // wikilinks are untouched (no regression on WIKILINK edges).
+    let typed_edges = derive_typed_edges(&note_contexts, &lookup);
+    if !typed_edges.is_empty()
+        && let Err(e) = store.batch_insert_edges(&typed_edges)
+    {
+        tracing::warn!("failed to insert typed relationship edges: {e}");
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
     eprintln!(
@@ -1213,6 +1239,12 @@ struct NoteContext {
     section_uids: Vec<String>,
     wikilinks: Vec<RawWikilink>,
     tags: Vec<RawTag>,
+    /// Parsed frontmatter (F11: source of `supersedes:`/`depends_on:` etc.).
+    frontmatter: serde_json::Value,
+    /// Lowercased heading text for each section index (F11: detects
+    /// "Supersedes" / "Depends on" / "See also" groups). `None` for the
+    /// preamble or a section with no owning heading.
+    section_heading_text: Vec<Option<String>>,
 }
 
 /// Candidate target of a wikilink resolution. Carries the priority-tier
@@ -1248,6 +1280,8 @@ struct WikilinkLookup<'a> {
     /// wikilink target match a sibling note by title OR by `note-name`
     /// even when no global title match exists.
     by_folder_name: HashMap<(String, String), Vec<&'a str>>,
+    /// All known note UIDs (F11: lets frontmatter reference a canonical UID).
+    known_uids: HashSet<&'a str>,
 }
 
 impl<'a> WikilinkLookup<'a> {
@@ -1258,8 +1292,10 @@ impl<'a> WikilinkLookup<'a> {
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
         let mut by_folder_name: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
+        let mut known_uids: HashSet<&'a str> = HashSet::new();
 
         for note in notes {
+            known_uids.insert(note.note_uid.as_str());
             // Path forms: "folder/note", "folder/note.md", normalised lowercase.
             let path_lc = note.rel_path.replace('\\', "/").to_lowercase();
             by_path.insert(path_lc.clone(), note.note_uid.as_str());
@@ -1317,6 +1353,7 @@ impl<'a> WikilinkLookup<'a> {
             folder_by_note,
             headings_by_note,
             by_folder_name,
+            known_uids,
         }
     }
 
@@ -1422,6 +1459,150 @@ impl<'a> WikilinkLookup<'a> {
     fn find_heading(&self, note_uid: &str, slug: &str) -> Option<String> {
         let headings = self.headings_by_note.get(note_uid)?;
         headings.get(slug).map(|s| s.to_string())
+    }
+
+    /// Resolve a single frontmatter reference (a note UID, a title, or a path)
+    /// to exactly one note UID. Used by F11 typed-edge derivation. Tries, in
+    /// order: exact known note UID, unique path match, unique title match.
+    /// Returns `None` when the reference is unknown or ambiguous.
+    fn resolve_one(&self, reference: &str) -> Option<String> {
+        let raw = reference.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        // 1. Direct note UID (frontmatter may carry the canonical UID).
+        if self.known_uids.contains(raw) {
+            return Some(raw.to_string());
+        }
+        let key = raw.replace('\\', "/").to_lowercase();
+        // 2. Path match (with/without extension).
+        if let Some(&uid) = self.by_path.get(&key) {
+            return Some(uid.to_string());
+        }
+        // 3. Unique title match.
+        if let Some(uids) = self.by_title.get(&key)
+            && uids.len() == 1
+        {
+            return Some(uids[0].to_string());
+        }
+        None
+    }
+}
+
+/// F11: derive typed Note→Note relationship edges from frontmatter keys and
+/// heading-grouped wikilinks.
+///
+/// Derivation rules:
+/// - Frontmatter list keys map directly to edge types (values are note UIDs or
+///   titles): `supersedes:` → [`EdgeType::Supersedes`], `depends_on:` →
+///   [`EdgeType::DependsOn`], `caused_by:` → [`EdgeType::CausedBy`],
+///   `relates_to:` → [`EdgeType::RelatesTo`].
+/// - A wikilink appearing under a section whose heading (case-insensitively)
+///   is "Supersedes" → [`EdgeType::Supersedes`]; "Depends on"/"Depends" →
+///   [`EdgeType::DependsOn`]; "See also"/"Related" → [`EdgeType::RelatesTo`].
+/// - Ungrouped wikilinks stay generic WIKILINK edges (untouched here).
+///
+/// Self-edges and duplicates are dropped. Confidence is 1.0 (explicit author
+/// intent). Frontmatter references that don't resolve to a unique note are
+/// skipped silently (surfaced later by `dangling_relationships` lint only when
+/// the edge was created with a known target).
+fn derive_typed_edges(notes: &[NoteContext], lookup: &WikilinkLookup<'_>) -> Vec<ResolvedEdge> {
+    use std::collections::HashSet;
+
+    let mut edges: Vec<ResolvedEdge> = Vec::new();
+    let mut seen: HashSet<(String, String, &'static str)> = HashSet::new();
+
+    let mut push_edge = |src: &str, tgt: &str, et: EdgeType, edges: &mut Vec<ResolvedEdge>| {
+        if src == tgt {
+            return;
+        }
+        let key = (src.to_string(), tgt.to_string(), et.rel_table_name());
+        if !seen.insert(key) {
+            return;
+        }
+        edges.push(ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: tgt.to_string(),
+            edge_type: et,
+            confidence: 1.0,
+            link_type: None,
+        });
+    };
+
+    for ctx in notes {
+        // (a) Frontmatter keys.
+        for (fm_key, edge_type) in [
+            ("supersedes", EdgeType::Supersedes),
+            ("depends_on", EdgeType::DependsOn),
+            ("caused_by", EdgeType::CausedBy),
+            ("relates_to", EdgeType::RelatesTo),
+        ] {
+            for reference in frontmatter_list(&ctx.frontmatter, fm_key) {
+                if let Some(target_uid) = lookup.resolve_one(&reference) {
+                    push_edge(&ctx.note_uid, &target_uid, edge_type, &mut edges);
+                }
+            }
+        }
+
+        // (b) Heading-grouped wikilinks.
+        for wl in &ctx.wikilinks {
+            let Some(heading) = ctx
+                .section_heading_text
+                .get(wl.section_idx)
+                .and_then(|h| h.as_deref())
+            else {
+                continue;
+            };
+            let Some(edge_type) = heading_to_edge_type(heading) else {
+                continue;
+            };
+            // Resolve the wikilink target to a note via the shared resolver.
+            if let ResolveOutcome::Resolved(candidates) = lookup.resolve(&wl.target, &ctx.folder)
+                && candidates.len() == 1
+            {
+                push_edge(
+                    &ctx.note_uid,
+                    &candidates[0].note_uid,
+                    edge_type,
+                    &mut edges,
+                );
+            }
+        }
+    }
+
+    edges
+}
+
+/// Map a (lowercased) section heading to a typed edge, or `None` if the heading
+/// is not a recognised relationship group.
+fn heading_to_edge_type(heading_lc: &str) -> Option<EdgeType> {
+    match heading_lc.trim() {
+        "supersedes" => Some(EdgeType::Supersedes),
+        "depends on" | "depends" | "dependencies" => Some(EdgeType::DependsOn),
+        "see also" | "related" => Some(EdgeType::RelatesTo),
+        _ => None,
+    }
+}
+
+/// Extract a frontmatter value as a list of strings. Accepts a YAML/JSON array
+/// (`supersedes: [A, B]`) or a single scalar (`supersedes: A`). Non-string
+/// elements are skipped. Returns empty when the key is absent.
+fn frontmatter_list(frontmatter: &serde_json::Value, key: &str) -> Vec<String> {
+    match frontmatter.get(key) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                vec![]
+            } else {
+                vec![t.to_string()]
+            }
+        }
+        _ => vec![],
     }
 }
 

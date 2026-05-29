@@ -21,6 +21,29 @@ pub enum EdgeType {
     /// Confidence records match quality: 1.0 for an exact verb+path match,
     /// 0.8 for a base-path-inferred match.
     ImplementsContract,
+    /// F11 memory-bank typed relationships over the markdown vault (Note→Note).
+    ///
+    /// These promote a generic [`Self::Calls`]-style wikilink into an explicit,
+    /// semantically-typed knowledge edge derived from frontmatter keys or
+    /// heading-grouped wikilinks. Each maps to a well-known vocabulary term so
+    /// the vault graph can interoperate with PROV-O / SKOS tooling:
+    ///
+    /// | EdgeType            | Vocabulary term                       |
+    /// |---------------------|---------------------------------------|
+    /// | [`Self::Supersedes`] | `prov:wasRevisionOf` (this revises the target) |
+    /// | [`Self::DependsOn`]  | `prov:wasInformedBy` / `dependsOn`    |
+    /// | [`Self::CausedBy`]   | `prov:wasDerivedFrom`                 |
+    /// | [`Self::RelatesTo`]  | `skos:related`                        |
+    ///
+    /// `Supersedes` is directional A→B meaning "A supersedes (replaces) B".
+    Supersedes,
+    /// F11: `A DependsOn B` — A relies on B. Maps to `prov:wasInformedBy`.
+    DependsOn,
+    /// F11: `A CausedBy B` — A was derived from / caused by B. Maps to
+    /// `prov:wasDerivedFrom`.
+    CausedBy,
+    /// F11: `A RelatesTo B` — a soft associative link. Maps to `skos:related`.
+    RelatesTo,
 }
 
 impl EdgeType {
@@ -46,6 +69,10 @@ impl EdgeType {
             EdgeType::ProjectHasComponent => "PROJECT_HAS_COMPONENT",
             EdgeType::ProjectHasParent => "PROJECT_HAS_PARENT",
             EdgeType::ImplementsContract => "IMPLEMENTS_CONTRACT",
+            EdgeType::Supersedes => "SUPERSEDES",
+            EdgeType::DependsOn => "DEPENDS_ON",
+            EdgeType::CausedBy => "CAUSED_BY",
+            EdgeType::RelatesTo => "RELATES_TO",
         }
     }
 }
@@ -68,6 +95,10 @@ impl fmt::Display for EdgeType {
             EdgeType::ProjectHasComponent => write!(f, "PROJECT_HAS_COMPONENT"),
             EdgeType::ProjectHasParent => write!(f, "PROJECT_HAS_PARENT"),
             EdgeType::ImplementsContract => write!(f, "IMPLEMENTS_CONTRACT"),
+            EdgeType::Supersedes => write!(f, "SUPERSEDES"),
+            EdgeType::DependsOn => write!(f, "DEPENDS_ON"),
+            EdgeType::CausedBy => write!(f, "CAUSED_BY"),
+            EdgeType::RelatesTo => write!(f, "RELATES_TO"),
         }
     }
 }

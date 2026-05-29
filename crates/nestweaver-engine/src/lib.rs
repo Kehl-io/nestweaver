@@ -43,6 +43,7 @@ pub mod affected_tests;
 pub mod agent_guide;
 pub mod blast_radius;
 pub mod brain_docgraph;
+pub mod brain_memory;
 pub mod brainignore;
 pub mod bridges;
 pub mod cluster_dispatch;
@@ -90,6 +91,11 @@ pub use blast_radius::{
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
     broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
+};
+pub use brain_memory::{
+    ConsolidationManifest, ConsolidationProposal, Contradiction, DanglingRelationship,
+    MemoryLintReport, RelatedNode, SchemaDrift, StaleNote, SupersessionChain, memory_consolidate,
+    memory_lint, memory_related,
 };
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
