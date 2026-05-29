@@ -697,6 +697,7 @@ mod tests {
             repo_uid: "repo-1".to_string(),
             file_path: "src/lib.rs".to_string(),
             start_line: 1,
+            end_line: 1,
             signature: format!("fn {name}()"),
             summary: None,
             content_hash: "hash".to_string(),
@@ -1731,7 +1732,7 @@ mod tests {
                 start_line: 1,
                 end_line: 5,
                 text_hash: format!("th{i}"),
-                text_content: format!("see [[Popular X]] and [[Popular Y]]"),
+                text_content: "see [[Popular X]] and [[Popular Y]]".to_string(),
                 word_count: 6,
                 pagerank_score: None,
             };

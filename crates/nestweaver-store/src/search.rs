@@ -274,6 +274,7 @@ mod tests {
             repo_uid: "r".to_string(),
             file_path: "a.js".to_string(),
             start_line: 1,
+            end_line: 1,
             signature: format!("function {name}()"),
             summary: None,
             content_hash: "x".to_string(),

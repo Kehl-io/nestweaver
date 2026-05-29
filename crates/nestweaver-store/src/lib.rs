@@ -51,6 +51,7 @@ mod tests {
             repo_uid: repo_uid.to_string(),
             file_path: file_path.to_string(),
             start_line: 10,
+            end_line: 25,
             signature: format!("fn {name}()"),
             summary: Some(format!("Does {name} things")),
             content_hash: "contenthash".to_string(),
@@ -102,6 +103,9 @@ mod tests {
         assert_eq!(found.name, "my_func");
         assert_eq!(found.kind, SymbolKind::Function);
         assert_eq!(found.repo_uid, "repo-1");
+        // P0.1: end_line round-trips independently of start_line.
+        assert_eq!(found.start_line, 10);
+        assert_eq!(found.end_line, 25);
     }
 
     #[test]

@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: Greeter
   kind: Interface
   start_line: 4
+  end_line: 4
   signature: "interface Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: greet
   kind: Method
   start_line: 5
+  end_line: 5
   signature: String greet(String name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -23,6 +25,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: Loggable
   kind: Trait
   start_line: 8
+  end_line: 8
   signature: "trait Loggable {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -32,6 +35,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: log
   kind: Method
   start_line: 9
+  end_line: 9
   signature: "void log(String message) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -41,6 +45,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: SimpleGreeter
   kind: Class
   start_line: 14
+  end_line: 14
   signature: "class SimpleGreeter implements Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -50,6 +55,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: greet
   kind: Method
   start_line: 21
+  end_line: 21
   signature: "String greet(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -59,6 +65,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: formatName
   kind: Method
   start_line: 26
+  end_line: 26
   signature: "private String formatName(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -68,6 +75,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: FormalGreeter
   kind: Class
   start_line: 31
+  end_line: 31
   signature: "class FormalGreeter extends SimpleGreeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -77,6 +85,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: Priority
   kind: Enum
   start_line: 37
+  end_line: 37
   signature: "enum Priority {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -86,6 +95,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: main
   kind: Function
   start_line: 41
+  end_line: 41
   signature: "def main(String[] args) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

@@ -1,11 +1,11 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2600
 expression: "parsed_symbols(\"simple.pas\", &source)"
 ---
 - name: Greeter
   kind: Module
   start_line: 1
+  end_line: 1
   signature: unit Greeter;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -15,6 +15,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: TAnimal
   kind: Class
   start_line: 8
+  end_line: 8
   signature: TAnimal = class
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Create
   kind: Method
   start_line: 13
+  end_line: 13
   signature: "constructor Create(AName, ASound: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -33,6 +35,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Speak
   kind: Function
   start_line: 14
+  end_line: 14
   signature: "function Speak: string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: TDog
   kind: Class
   start_line: 18
+  end_line: 18
   signature: TDog = class(TAnimal)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -51,6 +55,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Create
   kind: Method
   start_line: 20
+  end_line: 20
   signature: "constructor Create(AName: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -60,6 +65,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: PrintGreeting
   kind: Function
   start_line: 23
+  end_line: 23
   signature: "procedure PrintGreeting(const Name: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -69,6 +75,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: FormatName
   kind: Function
   start_line: 24
+  end_line: 24
   signature: "function FormatName(const First, Last: string): string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -78,6 +85,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Create
   kind: Method
   start_line: 28
+  end_line: 28
   signature: "constructor TAnimal.Create(AName, ASound: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -87,6 +95,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Speak
   kind: Method
   start_line: 34
+  end_line: 34
   signature: "function TAnimal.Speak: string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -96,6 +105,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: Create
   kind: Method
   start_line: 39
+  end_line: 39
   signature: "constructor TDog.Create(AName: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -105,6 +115,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: PrintGreeting
   kind: Function
   start_line: 44
+  end_line: 44
   signature: "procedure PrintGreeting(const Name: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -114,6 +125,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
 - name: FormatName
   kind: Function
   start_line: 49
+  end_line: 49
   signature: "function FormatName(const First, Last: string): string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

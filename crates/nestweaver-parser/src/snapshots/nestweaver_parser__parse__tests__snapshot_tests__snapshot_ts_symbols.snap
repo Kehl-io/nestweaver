@@ -5,6 +5,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: Greeter
   kind: Interface
   start_line: 3
+  end_line: 6
   signature: "interface Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,6 +15,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: greet
   kind: Method
   start_line: 4
+  end_line: 4
   signature: "greet(name: string): string"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -26,6 +28,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: farewell
   kind: Method
   start_line: 5
+  end_line: 5
   signature: "farewell(name: string): string"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -38,6 +41,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: Logger
   kind: Interface
   start_line: 8
+  end_line: 10
   signature: "interface Logger {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -47,6 +51,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: log
   kind: Method
   start_line: 9
+  end_line: 9
   signature: "log(message: string): void"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -59,6 +64,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: ConsoleGreeter
   kind: Class
   start_line: 12
+  end_line: 24
   signature: "class ConsoleGreeter implements Greeter, Logger {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -68,6 +74,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: greet
   kind: Method
   start_line: 13
+  end_line: 15
   signature: "greet(name: string): string {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -80,6 +87,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: farewell
   kind: Method
   start_line: 17
+  end_line: 19
   signature: "farewell(name: string): string {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -92,6 +100,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: log
   kind: Method
   start_line: 21
+  end_line: 23
   signature: "log(message: string): void {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -104,6 +113,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: VerboseGreeter
   kind: Class
   start_line: 26
+  end_line: 31
   signature: "class VerboseGreeter extends ConsoleGreeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -113,6 +123,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: greet
   kind: Method
   start_line: 27
+  end_line: 30
   signature: "greet(name: string): string {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -125,6 +136,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: createGreeter
   kind: Function
   start_line: 33
+  end_line: 35
   signature: "function createGreeter(): Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -137,6 +149,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
 - name: greeter
   kind: Constant
   start_line: 37
+  end_line: 37
   signature: const greeter = createGreeter();
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
