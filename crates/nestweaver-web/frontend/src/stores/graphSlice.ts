@@ -23,6 +23,8 @@ export interface GraphSlice {
   toggleReducedEffects: () => void;
   viewMode: "graph" | "list";
   toggleViewMode: () => void;
+  cameraZoom: number;
+  setCameraZoom: (zoom: number) => void;
   selectNode: (id: string | null, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
@@ -76,6 +78,7 @@ export const createGraphSlice: StateCreator<
   },
   reducedEffects: false,
   viewMode: "graph" as const,
+  cameraZoom: 1,
 
   toggleReducedEffects: () =>
     set((s) => {
@@ -85,6 +88,11 @@ export const createGraphSlice: StateCreator<
   toggleViewMode: () =>
     set((s) => {
       s.viewMode = s.viewMode === "graph" ? "list" : "graph";
+    }),
+
+  setCameraZoom: (zoom) =>
+    set((s) => {
+      s.cameraZoom = zoom;
     }),
 
   selectNode: (id, kind) =>
