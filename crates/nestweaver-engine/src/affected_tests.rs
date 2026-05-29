@@ -394,6 +394,54 @@ mod tests {
     }
 
     #[test]
+    fn jest_style_test_calling_changed_symbol_is_tier_1() {
+        // End-to-end: a Jest/Vitest-style `test('...', () => greet(...))` that
+        // imports + calls a changed source symbol must land in tier_1. This
+        // exercises the parser's test-runner symbol extraction → CALLS edge →
+        // reverse traversal in affected_tests.
+        use crate::index::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(
+            src.join("util.ts"),
+            "export function greet(name: string): string {\n  return name;\n}\n",
+        )
+        .expect("write util");
+        fs::write(
+            src.join("app.test.ts"),
+            "import { greet } from './util';\ntest('greets', () => {\n  expect(greet('x')).toBe('x');\n});\n",
+        )
+        .expect("write test");
+
+        let (_result, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .expect("index");
+
+        let result = affected_tests(&store, &["src/util.ts".to_string()]).expect("affected");
+
+        let t1_files: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert!(
+            t1_files.iter().any(|f| f.ends_with("app.test.ts")),
+            "app.test.ts should be in tier_1; tiers: t1={:?} t2={:?} t3={:?}, summary={}",
+            t1_files,
+            result
+                .tier_2
+                .iter()
+                .map(|f| &f.test_file)
+                .collect::<Vec<_>>(),
+            result
+                .tier_3
+                .iter()
+                .map(|f| &f.test_file)
+                .collect::<Vec<_>>(),
+            result.summary
+        );
+    }
+
+    #[test]
     fn editing_a_test_file_makes_it_tier_1() {
         let store = GraphStore::in_memory().expect("store");
         let test_sym = sym("sym:t", "checks_login", "src/auth.test.ts");
