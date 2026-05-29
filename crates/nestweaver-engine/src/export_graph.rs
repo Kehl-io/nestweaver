@@ -14,7 +14,9 @@ use nestweaver_store::GraphStore;
 /// an edge to be included (cross-repo orphan edges are silently dropped).
 pub fn export_in_memory_graph(store: &GraphStore) -> anyhow::Result<InMemoryGraph> {
     // ── 1. Nodes ──────────────────────────────────────────────────────────────
-    let symbols = store.list_all_symbols().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let symbols = store
+        .list_all_symbols()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut uids: Vec<String> = Vec::with_capacity(symbols.len());
     let mut nodes: Vec<NodeMeta> = Vec::with_capacity(symbols.len());
@@ -38,7 +40,9 @@ pub fn export_in_memory_graph(store: &GraphStore) -> anyhow::Result<InMemoryGrap
     // Edge type strings match the DB table names:
     //   CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, USES, ACCESSES,
     //   MEMBER_OF, INCLUDES_SYM
-    let typed_edges = store.load_typed_edges().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let typed_edges = store
+        .load_typed_edges()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut edges: Vec<(u32, u32, f32, EdgeKind)> = Vec::with_capacity(typed_edges.len());
 
     for (src_uid, tgt_uid, edge_type, confidence) in &typed_edges {

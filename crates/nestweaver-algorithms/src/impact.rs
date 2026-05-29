@@ -87,10 +87,7 @@ mod tests {
         }
     }
 
-    fn make_graph(
-        uids: Vec<&str>,
-        edges: Vec<(u32, u32, f32, EdgeKind)>,
-    ) -> InMemoryGraph {
+    fn make_graph(uids: Vec<&str>, edges: Vec<(u32, u32, f32, EdgeKind)>) -> InMemoryGraph {
         InMemoryGraph {
             uids: uids.iter().map(|s| s.to_string()).collect(),
             nodes: uids.iter().map(|s| make_node(s)).collect(),
@@ -120,10 +117,7 @@ mod tests {
         // A(0) -> B(1) -> C(2)
         let graph = make_graph(
             vec!["A", "B", "C"],
-            vec![
-                (0, 1, 1.0, EdgeKind::Calls),
-                (1, 2, 1.0, EdgeKind::Calls),
-            ],
+            vec![(0, 1, 1.0, EdgeKind::Calls), (1, 2, 1.0, EdgeKind::Calls)],
         );
         let results = impact_analysis(&graph, &["A".to_string()], 1, 0.0);
         assert_eq!(results.len(), 2);
@@ -139,10 +133,7 @@ mod tests {
         // A(0) -> B(1) -> C(2)
         let graph = make_graph(
             vec!["A", "B", "C"],
-            vec![
-                (0, 1, 1.0, EdgeKind::Calls),
-                (1, 2, 1.0, EdgeKind::Calls),
-            ],
+            vec![(0, 1, 1.0, EdgeKind::Calls), (1, 2, 1.0, EdgeKind::Calls)],
         );
         let results = impact_analysis(&graph, &["A".to_string()], 2, 0.0);
         assert_eq!(results.len(), 3);
@@ -158,10 +149,7 @@ mod tests {
         // A -> B at 0.3 confidence, A -> C at 0.9 confidence
         let graph = make_graph(
             vec!["A", "B", "C"],
-            vec![
-                (0, 1, 0.3, EdgeKind::Calls),
-                (0, 2, 0.9, EdgeKind::Calls),
-            ],
+            vec![(0, 1, 0.3, EdgeKind::Calls), (0, 2, 0.9, EdgeKind::Calls)],
         );
         // Threshold 0.5 should only traverse edge to C
         let results = impact_analysis(&graph, &["A".to_string()], 5, 0.5);
