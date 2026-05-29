@@ -21,6 +21,8 @@ export interface GraphSlice {
   activeStyleRules: Record<string, boolean>;
   reducedEffects: boolean;
   toggleReducedEffects: () => void;
+  viewMode: "graph" | "list";
+  toggleViewMode: () => void;
   selectNode: (id: string | null, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
@@ -73,10 +75,16 @@ export const createGraphSlice: StateCreator<
     highlightEntryPoints: false, highlightHighPageRank: false,
   },
   reducedEffects: false,
+  viewMode: "graph" as const,
 
   toggleReducedEffects: () =>
     set((s) => {
       s.reducedEffects = !s.reducedEffects;
+    }),
+
+  toggleViewMode: () =>
+    set((s) => {
+      s.viewMode = s.viewMode === "graph" ? "list" : "graph";
     }),
 
   selectNode: (id, kind) =>
