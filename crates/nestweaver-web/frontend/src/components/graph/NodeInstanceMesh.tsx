@@ -48,30 +48,30 @@ varying vec3 v_color;
 varying float v_highlight;
 
 void main() {
-    // Center the UV coordinates: [-0.5, 0.5]
     vec2 uv = v_uv - 0.5;
-    float dist = length(uv) * 2.0;  // 0 at center, 1 at quad edge
+    float dist = length(uv) * 2.0;
 
-    // SDF circle with anti-aliasing
-    float circle = 1.0 - smoothstep(0.85, 0.9, dist);
+    // SDF circle — crisp edge
+    float circle = 1.0 - smoothstep(0.82, 0.88, dist);
 
-    // Radial gradient: bright center -> darker rim
-    // dist/0.85 is 0 at center, 1 at circle edge
-    float t = clamp(dist / 0.85, 0.0, 1.0);
-    vec3 fillColor = v_color * mix(1.35, 0.85, t);
+    // Radial gradient: bright center → saturated rim (keeps color visible)
+    float t = clamp(dist / 0.82, 0.0, 1.0);
+    vec3 fillColor = v_color * mix(1.3, 0.85, t);
 
-    // Selection/hover highlight: boost above bloom luminance threshold
-    fillColor = fillColor * (1.0 + v_highlight * 0.8);
+    // Highlight: selected/hovered nodes burn brighter
+    fillColor *= (1.0 + v_highlight * 1.0);
 
-    // Outer glow: exponential falloff past circle edge
-    float glowDist = max(0.0, dist - 0.75);
-    float glow = exp(-6.0 * glowDist) * 0.25;
+    // Outer glow: wide, soft, vivid — the "fierce" halo
+    float glowDist = max(0.0, dist - 0.7);
+    float glow = exp(-4.5 * glowDist) * 0.35;
 
-    // Combine fill and glow
-    vec3 color = fillColor * circle + v_color * glow;
-    float alpha = max(circle, glow);
+    // Inner core bloom: adds depth, not overwhelming
+    float core = exp(-4.0 * dist) * 0.1;
 
-    if (alpha < 0.01) discard;
+    vec3 color = fillColor * circle + v_color * (glow + core);
+    float alpha = max(circle, max(glow, core));
+
+    if (alpha < 0.005) discard;
     gl_FragColor = vec4(color, alpha);
 }
 `;
@@ -96,7 +96,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
   const uniforms = useMemo(
     () => ({
       u_time: { value: 0 },
-      u_breatheAmp: { value: reducedMotion ? 0 : 0.015 },
+      u_breatheAmp: { value: reducedMotion ? 0 : 0.02 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -104,7 +104,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
   // Sync reducedMotion -> uniform
   useEffect(() => {
-    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.015;
+    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.02;
   }, [reducedMotion, uniforms]);
 
   // Tick u_time every frame
