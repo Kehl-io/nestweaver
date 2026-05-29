@@ -1,13 +1,11 @@
 import { useCallback, useEffect } from "react";
-import { useLoadGraph, useSigma } from "@react-sigma/core";
 import { useStore } from "../../../stores";
 import { api } from "../../../api/client";
 import { buildGraphFromImpact } from "../utils/buildGraphFromImpact";
 import { applyElkLayout } from "../utils/elkLayout";
 
 export function useImpactMode() {
-  const loadGraph = useLoadGraph();
-  const sigma = useSigma();
+  const setGraphData = useStore((s) => s.setGraphData);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const graphMode = useStore((s) => s.graphMode);
 
@@ -26,14 +24,11 @@ export function useImpactMode() {
 
       const graph = buildGraphFromImpact(selectedNodeId, targetName, nodes);
       await applyElkLayout(graph, "DOWN");
-      loadGraph(graph);
-      setTimeout(() => {
-        sigma.getCamera().animatedReset();
-      }, 100);
+      setGraphData(graph);
     } catch (err) {
       console.error("Failed to load impact:", err);
     }
-  }, [graphMode, selectedNodeId, loadGraph]);
+  }, [graphMode, selectedNodeId, setGraphData]);
 
   useEffect(() => {
     loadImpactData();
