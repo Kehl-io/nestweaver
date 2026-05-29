@@ -1,27 +1,18 @@
 import { useCallback, useEffect, useRef } from "react";
-import { useLoadGraph } from "@react-sigma/core";
-import { useWorkerLayoutForceAtlas2 } from "@react-sigma/layout-forceatlas2";
 import { useStore } from "../../../stores";
+import { useForceLayout } from "../../../hooks/useForceLayout";
 import { api } from "../../../api/client";
 import { buildGraphFromContext, finalizeNodeSizes } from "../utils/buildGraphFromContext";
 
 const MAX_LAYOUT_MS = 10_000;
 
 export function useContextMode() {
-  const loadGraph = useLoadGraph();
+  const setGraphData = useStore((s) => s.setGraphData);
   const seeds = useStore((s) => s.seeds);
   const graphMode = useStore((s) => s.graphMode);
-  const forceParams = useStore((s) => s.forceParams);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const { start, stop, kill, isRunning } = useWorkerLayoutForceAtlas2({
-    settings: {
-      slowDown: forceParams.settling,
-      gravity: forceParams.gravity,
-      scalingRatio: forceParams.repulsion,
-      barnesHutOptimize: true,
-    },
-  });
+  const { start, stop, kill, isRunning } = useForceLayout();
 
   const loadContextData = useCallback(async () => {
     if (graphMode !== "context" || seeds.length === 0) return;
@@ -65,7 +56,7 @@ export function useContextMode() {
       }
 
       finalizeNodeSizes(graph);
-      loadGraph(graph);
+      setGraphData(graph);
       start();
       // Stop after MAX_LAYOUT_MS as a safety ceiling
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
@@ -73,7 +64,7 @@ export function useContextMode() {
     } catch (err) {
       console.error("Failed to load context:", err);
     }
-  }, [graphMode, seeds, loadGraph, start, stop]);
+  }, [graphMode, seeds, setGraphData, start, stop]);
 
   // Stop the layout automatically when isRunning goes false (convergence detected)
   useEffect(() => {
