@@ -18,7 +18,10 @@ pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
 };
 pub use search::{EmbeddingIndex, SearchResult};
-pub use tantivy_index::{SearchHit, TantivyError, TantivyIndex};
+pub use tantivy_index::{
+    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
+    TantivyError, TantivyIndex,
+};
 pub use traverse::ImpactNode;
 
 #[cfg(test)]
