@@ -1602,28 +1602,77 @@ impl GraphStore {
     /// Empty DB → empty vec.
     pub fn broken_wikilinks(&self) -> Result<Vec<BrokenWikilinkRow>, StoreError> {
         let conn = self.conn()?;
+        // Preserve insertion order while de-duplicating: an ambiguous `[[Dup]]`
+        // emits one WIKILINK_TO_NOTE edge per candidate (all confidence < 1.0),
+        // which would otherwise surface as N near-identical rows. Collapse to
+        // one row per (source_uid, wikilink_text).
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashMap<(String, String), BrokenWikilinkRow> =
+            std::collections::HashMap::new();
+
+        // 1. Low-confidence / ambiguous resolved links.
         let q = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(:Section)-[r:WIKILINK_TO_NOTE]->(dst:Note) \
                  WHERE r.confidence < 1.0 \
                  RETURN src.uid, src.file_path, src.title, r.display, r.confidence, dst.uid";
-        let result = match conn.query(q) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::trace!("broken_wikilinks: query skipped (table may not exist): {e}");
-                return Ok(vec![]);
+        match conn.query(q) {
+            Ok(result) => {
+                for row in result {
+                    let source_uid = extract_string(&row, 0)?;
+                    let wikilink_text = extract_string(&row, 3)?;
+                    let key = (source_uid.clone(), wikilink_text.clone());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
+                    {
+                        order.push(key);
+                        slot.insert(BrokenWikilinkRow {
+                            source_uid,
+                            source_path: extract_string(&row, 1)?,
+                            source_title: extract_string(&row, 2)?,
+                            wikilink_text,
+                            confidence: extract_f64(&row, 4)? as f32,
+                            current_target_uid: extract_string(&row, 5)?,
+                        });
+                    }
+                }
             }
-        };
-        result
-            .map(|row| {
-                Ok(BrokenWikilinkRow {
-                    source_uid: extract_string(&row, 0)?,
-                    source_path: extract_string(&row, 1)?,
-                    source_title: extract_string(&row, 2)?,
-                    wikilink_text: extract_string(&row, 3)?,
-                    confidence: extract_f64(&row, 4)? as f32,
-                    current_target_uid: extract_string(&row, 5)?,
-                })
-            })
-            .collect()
+            Err(e) => {
+                tracing::trace!(
+                    "broken_wikilinks: WIKILINK query skipped (table may not exist): {e}"
+                );
+            }
+        }
+
+        // 2. Genuinely-unresolved links (no target note → no edge exists).
+        //    These are the truly-broken links; confidence 0.0 and empty target.
+        let uq = "MATCH (u:UnresolvedWikilink) \
+                  RETURN u.source_note_uid, u.source_path, u.source_title, u.wikilink_text";
+        match conn.query(uq) {
+            Ok(result) => {
+                for row in result {
+                    let source_uid = extract_string(&row, 0)?;
+                    let wikilink_text = extract_string(&row, 3)?;
+                    let key = (source_uid.clone(), wikilink_text.clone());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
+                    {
+                        order.push(key);
+                        slot.insert(BrokenWikilinkRow {
+                            source_uid,
+                            source_path: extract_string(&row, 1)?,
+                            source_title: extract_string(&row, 2)?,
+                            wikilink_text,
+                            confidence: 0.0,
+                            current_target_uid: String::new(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::trace!(
+                    "broken_wikilinks: UnresolvedWikilink query skipped (table may not exist): {e}"
+                );
+            }
+        }
+
+        Ok(order.into_iter().filter_map(|k| seen.remove(&k)).collect())
     }
 
     /// Set of Note UIDs that have at least one OUTBOUND wikilink (to a note or

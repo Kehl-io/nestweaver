@@ -690,6 +690,11 @@ fn index_into_store(
             // Remove old File node.
             let _ = store.delete_file_node(&file.uid);
         }
+        // BUG FIX: clear repo-scoped derived nodes (Service, Contract) before
+        // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID is
+        // derived deterministically from repo_uid + directory, so a forced
+        // re-index would otherwise collide on the primary key. Idempotent.
+        let _ = store.clear_repo_derived_nodes(&r_uid);
     }
 
     // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
@@ -1349,6 +1354,12 @@ fn delete_repo_all_data(
             .with_context(|| format!("delete_file_node {}", f_uid))?;
     }
 
+    // Clear repo-scoped derived nodes (Service, Contract) so a forced full
+    // re-index does not collide on their deterministic primary keys.
+    store
+        .clear_repo_derived_nodes(r_uid)
+        .with_context(|| "clear_repo_derived_nodes")?;
+
     store
         .delete_repo_node(r_uid)
         .with_context(|| "delete_repo_node")?;
@@ -1684,6 +1695,56 @@ function hello(name) { return "Hello " + name; }
             index_directory(&src, &db_path, "test", "https://example.com/repo", "abc123").unwrap();
         assert!(result.symbols_count >= 1, "expected >= 1 symbol");
         assert!(db_path.exists(), "db file should exist");
+    }
+
+    #[test]
+    fn force_reindex_is_idempotent_for_service_nodes() {
+        // BUG repro: a repo with a src/ dir yields a Service node. The first
+        // force-index succeeds; the second force-index must NOT crash with a
+        // duplicated primary key on the deterministic svc: UID.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(src.join("src")).unwrap();
+        fs::write(
+            src.join("src").join("main.js"),
+            "function greet(n) { return hello(n); } function hello(n) { return n; }",
+        )
+        .unwrap();
+
+        let first = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "abc123",
+            true,
+            None,
+        )
+        .expect("first force index");
+        assert!(first.symbols_count >= 2);
+
+        // Second force index over the same DB — previously this tripped
+        // "Found duplicated primary key value svc:...".
+        let second = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "abc123",
+            true,
+            None,
+        )
+        .expect("second force index must be idempotent (no duplicate-PK crash)");
+        assert!(second.symbols_count >= 2);
+
+        // Queries still work after the re-index.
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let services = store.list_services(None).unwrap();
+        assert!(
+            !services.is_empty(),
+            "expected at least one Service node after re-index"
+        );
     }
 
     // ── Tiered change detection tests ─────────────────────────────────────
