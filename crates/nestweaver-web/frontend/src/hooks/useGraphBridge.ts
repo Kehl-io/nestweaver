@@ -124,7 +124,7 @@ export function useGraphBridge(): GraphBuffers {
     const edgeColors = new Float32Array(edgeCount * 6);
 
     let ei = 0;
-    graph.forEachEdge((_edge, attrs, sourceUid, targetUid) => {
+    graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
       const si = uidToIndex.get(sourceUid);
       const ti = uidToIndex.get(targetUid);
 
