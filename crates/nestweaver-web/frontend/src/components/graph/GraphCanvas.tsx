@@ -78,6 +78,11 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
           lastY: e.clientY,
         };
         (e.target as HTMLElement).setPointerCapture(e.pointerId);
+        // Show "move" cursor while dragging a node
+        (e.target as HTMLElement).style.cursor = "move";
+      } else {
+        // Panning background — show "grabbing" cursor
+        (e.target as HTMLElement).style.cursor = "grabbing";
       }
 
       const now = Date.now();
@@ -155,9 +160,9 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       const result = pick(x, y, camera, size);
       hoverNode(result.nodeUid);
 
-      // Update cursor
+      // Update cursor: pointer on nodes, grab on background
       const canvas = e.target as HTMLElement;
-      canvas.style.cursor = result.nodeUid ? "pointer" : "default";
+      canvas.style.cursor = result.nodeUid ? "pointer" : "grab";
     },
     [pick, camera, size, hoverNode, setGraphData],
   );
@@ -169,6 +174,8 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
         (e.target as HTMLElement).releasePointerCapture(e.pointerId);
         dragRef.current = { isDragging: false, nodeUid: null, lastX: 0, lastY: 0 };
       }
+      // Restore default cursor — will be updated on next pointer move
+      (e.target as HTMLElement).style.cursor = "grab";
     },
     [],
   );
@@ -184,6 +191,31 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       <meshBasicMaterial transparent opacity={0} />
     </mesh>
   );
+}
+
+// ---- Click-to-focus camera animation ----
+
+/**
+ * When a node is selected, smoothly pans the camera to center on it.
+ * Uses OrbitControls' target with enableDamping for a natural transition.
+ */
+function CameraFocusController({ buffers }: { buffers: GraphBuffers }) {
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const controls = useThree((s) => s.controls);
+
+  useEffect(() => {
+    if (!selectedNodeId || !controls) return;
+    const idx = buffers.uidToIndex.get(selectedNodeId);
+    if (idx === undefined) return;
+
+    const targetX = buffers.positions[idx * 3];
+    const targetY = buffers.positions[idx * 3 + 1];
+
+    // OrbitControls with enableDamping will smoothly lerp to the new target
+    (controls as any).target.set(targetX, targetY, 0);
+  }, [selectedNodeId, buffers, controls]);
+
+  return null;
 }
 
 // ---- Main canvas ----
@@ -221,7 +253,9 @@ export function GraphCanvas() {
         </>
       )}
       <GraphInteraction buffers={buffers} />
+      <CameraFocusController buffers={buffers} />
       <OrbitControls
+        makeDefault
         enableRotate={false}
         enableDamping
         dampingFactor={0.1}
