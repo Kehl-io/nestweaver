@@ -101,6 +101,13 @@ nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlis
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
 nestweaver ui --watch                    # live re-indexing via filesystem watcher
+# Append ?engine=wasm to run graph algorithms client-side via WASM
+# Requires: wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm
+
+# Web API endpoints (when ui is running)
+# GET  /api/v1/version          → {"graph_generation": N, "pagerank_generation": N}
+# GET  /api/v1/snapshot.msgpack → MessagePack-encoded graph (X-Graph-Generation header)
+# GET  /api/v1/events           → SSE stream (graph:updated, pagerank:recomputed, full_refresh)
 
 # Global flags: --stats, --quiet, --verbose, --no-color, --plain
 ```
