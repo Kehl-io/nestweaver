@@ -77,17 +77,22 @@ self.onmessage = (event: MessageEvent<InMessage>) => {
 
     sim = simulation;
 
-    // Run simulation to completion synchronously (~60 ticks with alphaDecay=0.05)
-    simulation.tick(120);
-
-    // Send final positions in one shot
+    // Run simulation in batches, sending ~15 position updates for smooth settling animation
     const n = nodes.length;
-    const buf = new Float32Array(n * 2);
-    for (let i = 0; i < n; i++) {
-      buf[i * 2 + 0] = nodes[i].x ?? 0;
-      buf[i * 2 + 1] = nodes[i].y ?? 0;
+    const TOTAL_TICKS = 120;
+    const UPDATE_INTERVAL = 8;
+
+    for (let t = 0; t < TOTAL_TICKS; t++) {
+      simulation.tick(1);
+      if ((t + 1) % UPDATE_INTERVAL === 0 || t === TOTAL_TICKS - 1) {
+        const buf = new Float32Array(n * 2);
+        for (let i = 0; i < n; i++) {
+          buf[i * 2] = nodes[i].x ?? 0;
+          buf[i * 2 + 1] = nodes[i].y ?? 0;
+        }
+        postMessage({ type: "tick", positions: buf }, [buf.buffer]);
+      }
     }
-    postMessage({ type: "tick", positions: buf }, [buf.buffer]);
     postMessage({ type: "end" });
     return;
   }
