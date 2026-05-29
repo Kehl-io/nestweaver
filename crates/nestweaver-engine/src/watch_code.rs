@@ -60,10 +60,35 @@ impl CodeWatcher {
 
     /// Block until shutdown is requested or the underlying debouncer
     /// errors. Returns `Ok(())` on graceful shutdown.
+    ///
+    /// Opens its own `GraphStore` from `self.db_path`. For sharing a store
+    /// with the web server, use `run_with_store` instead.
     pub fn run(self) -> Result<(), anyhow::Error> {
-        let store = GraphStore::open_or_create(&self.db_path)
-            .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?;
+        let store = Arc::new(
+            GraphStore::open_or_create(&self.db_path)
+                .with_context(|| format!("open GraphStore at {}", self.db_path.display()))?,
+        );
+        self.run_inner(store, None)
+    }
 
+    /// Like `run`, but uses a caller-provided `Arc<GraphStore>` and invokes
+    /// `on_change` after every batch that mutates the graph. The callback
+    /// also fires after the graph-generation counter is bumped so the web
+    /// server can emit an SSE event to connected clients.
+    pub fn run_with_store(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
+        self.run_inner(store, on_change)
+    }
+
+    /// Shared implementation used by both `run` and `run_with_store`.
+    fn run_inner(
+        self,
+        store: Arc<GraphStore>,
+        on_change: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<(), anyhow::Error> {
         let repo_url = format!("file://{}", self.repo_root.display());
         let r_uid = nestweaver_schema::repo_uid(&self.instance_id, &repo_url);
 
@@ -240,6 +265,13 @@ impl CodeWatcher {
                     files_processed,
                     duration.as_secs_f64()
                 );
+
+                // Bump the graph generation counter so consumers (e.g. the
+                // web server SSE handler) can detect that the graph changed.
+                store.bump_graph_generation();
+                if let Some(ref cb) = on_change {
+                    cb();
+                }
             }
         }
     }
