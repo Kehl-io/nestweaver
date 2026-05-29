@@ -337,7 +337,45 @@ fn reindex_file(
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
 
-    for raw_sym in &parsed.symbols {
+    // F2.0: populate framework_hint on re-indexed symbols too, so hints
+    // survive incremental watcher updates (matching the full-index path).
+    let mut hint_by_index: std::collections::HashMap<usize, nestweaver_schema::FrameworkHint> =
+        std::collections::HashMap::new();
+    if let Some(lang) = nestweaver_parser::detect_language(&abs_path)
+        && let Some(lang_str) = crate::contracts::framework_language_str(lang)
+    {
+        for (sym_idx, hint) in
+            nestweaver_parser::detect_frameworks(&parsed.symbols, &rel_str, lang_str)
+        {
+            hint_by_index.insert(sym_idx, hint);
+        }
+        // NestJS `@Controller` lives above the class and is not in the parsed
+        // signature; recover it from source (mirrors the full-index path).
+        if matches!(
+            lang,
+            nestweaver_schema::Language::TypeScript | nestweaver_schema::Language::JavaScript
+        ) {
+            let class_starts: Vec<(usize, u32)> = parsed
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
+                .map(|(i, s)| (i, s.start_line))
+                .collect();
+            if let Some(ctrl_idx) =
+                crate::contracts::detect_nestjs_controller_index(&source, &class_starts)
+            {
+                hint_by_index
+                    .entry(ctrl_idx)
+                    .or_insert_with(|| nestweaver_schema::FrameworkHint {
+                        framework: "nestjs".into(),
+                        role: "controller".into(),
+                    });
+            }
+        }
+    }
+
+    for (sym_idx, raw_sym) in parsed.symbols.iter().enumerate() {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let sym = Symbol {
             uid: s_uid.clone(),
@@ -356,7 +394,7 @@ fn reindex_file(
             entry_point_kind: raw_sym.entry_point_kind,
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
-            framework_hint: None,
+            framework_hint: hint_by_index.remove(&sym_idx),
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));

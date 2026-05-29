@@ -76,6 +76,7 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_investigate(),
         tool_schema_investigate_expand(),
         tool_schema_investigate_hydrate(),
+        tool_schema_contract_drift(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -149,6 +150,7 @@ pub fn dispatch(
         "investigate" => tool_investigate(store, tantivy, args),
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
+        "contract_drift" => tool_contract_drift(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -1945,7 +1947,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         .cross_repo_links(&uid)
         .map_err(|e| anyhow!("cross_repo_links: {e}"))?;
 
-    let rows: Vec<Value> = refs
+    let mut rows: Vec<Value> = refs
         .iter()
         .map(|r| {
             json!({
@@ -1959,10 +1961,55 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         })
         .collect();
 
+    // F2-core: also surface API contracts this symbol implements (HTTP route /
+    // gRPC method / GraphQL operation). These are HYPOTHESES, not ground truth
+    // — the confidence reflects match quality (1.0 exact verb+path, 0.8
+    // base-path-inferred).
+    let contract_links = store
+        .contracts_implemented_by(&uid)
+        .map_err(|e| anyhow!("contracts_implemented_by: {e}"))?;
+    for (contract_uid, confidence) in &contract_links {
+        rows.push(json!({
+            "source_uid": uid,
+            "target_uid": contract_uid,
+            "link_type": "contract",
+            "confidence": confidence,
+        }));
+    }
+
     Ok(json!({
         "uid": uid,
         "count": rows.len(),
+        "note": "Links are hypotheses, not ground truth — check confidence. \
+                 link_type \"contract\" denotes an implemented API contract.",
         "contracts": rows,
+    }))
+}
+
+// ── 35. contract_drift ──────────────────────────────────────────────────────
+
+fn tool_schema_contract_drift() -> Value {
+    json!({
+        "name": "contract_drift",
+        "description": "Use to audit API contract drift in the indexed code graph: routes/methods/operations DECLARED in a spec file (OpenAPI/Swagger, .proto, GraphQL) but not implemented by any handler, and routes IMPLEMENTED by a Spring/NestJS handler but declared in no spec.\n\nContract links are HYPOTHESES, not ground truth — derived from spec parsing and framework handler heuristics (same-repo only). Use this to spot missing endpoints or undocumented APIs.\n\nOptional `repo` filters to a single repo by UID. Returns two buckets: declared_not_implemented and implemented_not_declared, each a list of contract UIDs (e.g. \"contract:http:POST:/v1/approvals\").",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." }
+            }
+        }
+    })
+}
+
+fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let repo = args.get("repo").and_then(|v| v.as_str());
+    let report = nestweaver_engine::contracts::drift_for_store(store, repo)
+        .map_err(|e| anyhow!("drift_for_store: {e}"))?;
+    Ok(json!({
+        "note": "Contract links are hypotheses, not ground truth.",
+        "declared_not_implemented": report.declared_not_implemented,
+        "implemented_not_declared": report.implemented_not_declared,
+        "clean": report.is_clean(),
     }))
 }
 

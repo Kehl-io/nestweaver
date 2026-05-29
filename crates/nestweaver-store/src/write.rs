@@ -1,10 +1,19 @@
 use nestweaver_schema::{
-    EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol, Tag,
-    Vault,
+    Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
+    Tag, Vault,
 };
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+
+/// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
+/// `framework_hint` column stores. Returns an empty string when absent.
+fn encode_framework_hint(symbol: &Symbol) -> String {
+    match &symbol.framework_hint {
+        Some(h) => format!("{}:{}", h.framework, h.role),
+        None => String::new(),
+    }
+}
 
 fn exec_params(
     conn: &lbug::Connection<'_>,
@@ -94,7 +103,8 @@ impl GraphStore {
             "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
              repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
-             pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
+             pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
+             framework_hint: $fh})",
             vec![
                 ("uid", lbug::Value::String(symbol.uid.clone())),
                 ("name", lbug::Value::String(symbol.name.clone())),
@@ -133,6 +143,7 @@ impl GraphStore {
                             .unwrap_or_default(),
                     ),
                 ),
+                ("fh", lbug::Value::String(encode_framework_hint(symbol))),
             ],
         )
     }
@@ -152,7 +163,8 @@ impl GraphStore {
                 "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
                  repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
                  signature: $sig, summary: $summary, content_hash: $hash, \
-                 pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
+                 pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
+                 framework_hint: $fh})",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for symbol in symbols {
@@ -196,6 +208,7 @@ impl GraphStore {
                                 .unwrap_or_default(),
                         ),
                     ),
+                    ("fh", lbug::Value::String(encode_framework_hint(symbol))),
                 ],
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
@@ -486,6 +499,16 @@ impl GraphStore {
                     ],
                 )
             }
+            EdgeType::ImplementsContract => exec_params(
+                conn,
+                "MATCH (a:Symbol {uid: $src}), (b:Contract {uid: $tgt}) \
+                 CREATE (a)-[:IMPLEMENTS_CONTRACT {confidence: $conf}]->(b)",
+                vec![
+                    ("src", lbug::Value::String(src)),
+                    ("tgt", lbug::Value::String(tgt)),
+                    ("conf", lbug::Value::Double(conf)),
+                ],
+            ),
             EdgeType::ProjectIncludesSymbol
             | EdgeType::ProjectIncludesNote
             | EdgeType::ProjectHasComponent
@@ -670,6 +693,16 @@ impl GraphStore {
                         ("tgt", lbug::Value::String(tgt)),
                         ("conf", lbug::Value::Double(conf)),
                         ("lt", lbug::Value::String(link_type)),
+                    ]);
+                }
+                EdgeType::ImplementsContract => {
+                    let key = "MATCH (a:Symbol {uid: $src}), (b:Contract {uid: $tgt}) \
+                               CREATE (a)-[:IMPLEMENTS_CONTRACT {confidence: $conf}]->(b)"
+                        .to_string();
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
                     ]);
                 }
                 EdgeType::ProjectIncludesSymbol
@@ -1081,6 +1114,42 @@ impl GraphStore {
                     lbug::Value::String(project.summary.clone().unwrap_or_default()),
                 ),
                 ("iid", lbug::Value::String(project.instance_id.clone())),
+            ],
+        )
+    }
+
+    /// Insert (or idempotently replace) a Contract node. Mirrors
+    /// `insert_project`: DETACH DELETE by UID first so re-indexing a spec
+    /// or handler does not accumulate duplicate Contract nodes.
+    pub fn insert_contract(&self, contract: &Contract) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (c:Contract {uid: $uid}) DETACH DELETE c",
+            vec![("uid", lbug::Value::String(contract.uid.clone()))],
+        )?;
+        exec_params(
+            &conn,
+            "CREATE (:Contract {uid: $uid, kind: $kind, verb: $verb, path: $path, \
+             operation_id: $op, repo_uid: $repo, source_path: $src, confidence: $conf})",
+            vec![
+                ("uid", lbug::Value::String(contract.uid.clone())),
+                ("kind", lbug::Value::String(contract.kind.clone())),
+                (
+                    "verb",
+                    lbug::Value::String(contract.verb.clone().unwrap_or_default()),
+                ),
+                (
+                    "path",
+                    lbug::Value::String(contract.path.clone().unwrap_or_default()),
+                ),
+                (
+                    "op",
+                    lbug::Value::String(contract.operation_id.clone().unwrap_or_default()),
+                ),
+                ("repo", lbug::Value::String(contract.repo_uid.clone())),
+                ("src", lbug::Value::String(contract.source_path.clone())),
+                ("conf", lbug::Value::Float(contract.confidence)),
             ],
         )
     }

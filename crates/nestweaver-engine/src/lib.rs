@@ -48,6 +48,7 @@ pub mod bridges;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod config;
+pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
 pub mod embedding;

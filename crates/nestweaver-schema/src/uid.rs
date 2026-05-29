@@ -71,6 +71,77 @@ pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
 }
 
+/// Canonical placeholder substituted for every path parameter slot when
+/// normalizing an HTTP route. The *name* of the slot is intentionally
+/// discarded so that `/v1/users/{id}` and `/v1/users/:userId` and
+/// `/v1/users/${uid}` and `/v1/users/<u>` all collapse to the same shape.
+pub const PATH_PLACEHOLDER: &str = "{}";
+
+/// Normalize an HTTP route path so that spec declarations and code-derived
+/// handler routes mint and match identical [`contract_uid`]s.
+///
+/// Rules:
+/// - Collapse every parameter slot to [`PATH_PLACEHOLDER`]. Recognised slot
+///   syntaxes: OpenAPI `{id}`, Express/NestJS `:id`, JS template `${id}`,
+///   and angle-bracket `<id>` (Flask/Rails-ish). The slot *name* is ignored.
+/// - Ensure a single leading slash.
+/// - Strip the trailing slash (except for the bare root `/`).
+/// - Collapse repeated internal slashes.
+pub fn normalize_http_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    out.push('/');
+    for raw_seg in trimmed.split('/') {
+        let seg = raw_seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let is_param = (seg.starts_with('{') && seg.ends_with('}'))
+            || (seg.starts_with("${") && seg.ends_with('}'))
+            || seg.starts_with(':')
+            || (seg.starts_with('<') && seg.ends_with('>'));
+        if is_param {
+            out.push_str(PATH_PLACEHOLDER);
+        } else {
+            out.push_str(seg);
+        }
+        out.push('/');
+    }
+    // Strip the trailing slash we always append, unless we are at root.
+    if out.len() > 1 {
+        out.pop();
+    }
+    out
+}
+
+/// Mint a deterministic UID for a [`crate::nodes::Contract`] node.
+///
+/// Schemes (per F2-core spec):
+/// - HTTP:    `contract:http:POST:/v1/approvals`  (verb upper-cased, path normalized)
+/// - gRPC:    `contract:grpc:approvals.v1.Approvals/Create`  (fully-qualified method)
+/// - GraphQL: `contract:graphql:Mutation.createApproval`     (operation id)
+///
+/// `verb`/`path` are only consulted for HTTP. For gRPC and GraphQL the
+/// `operation_id` carries the fully-qualified identifier.
+pub fn contract_uid(
+    kind: &str,
+    verb: Option<&str>,
+    path: Option<&str>,
+    operation_id: Option<&str>,
+) -> String {
+    match kind {
+        "http" => {
+            let v = verb.unwrap_or("ANY").to_ascii_uppercase();
+            let p = path.map(normalize_http_path).unwrap_or_else(|| "/".into());
+            format!("contract:http:{v}:{p}")
+        }
+        other => {
+            let op = operation_id.unwrap_or("");
+            format!("contract:{other}:{op}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +223,54 @@ mod tests {
         let ruid = repo_uid("local", "https://example.com/repo");
         let uid = service_uid(&ruid, "my-service");
         assert!(uid.starts_with("svc:"), "got: {uid}");
+    }
+
+    #[test]
+    fn normalize_http_path_collapses_param_syntaxes() {
+        // All four slot syntaxes collapse to the same canonical shape,
+        // ignoring slot names.
+        assert_eq!(normalize_http_path("/v1/users/{id}"), "/v1/users/{}");
+        assert_eq!(normalize_http_path("/v1/users/:userId"), "/v1/users/{}");
+        assert_eq!(normalize_http_path("/v1/users/${uid}"), "/v1/users/{}");
+        assert_eq!(normalize_http_path("/v1/users/<u>"), "/v1/users/{}");
+    }
+
+    #[test]
+    fn normalize_http_path_strips_trailing_and_dedups_slashes() {
+        assert_eq!(normalize_http_path("/v1/approvals/"), "/v1/approvals");
+        assert_eq!(normalize_http_path("v1//approvals"), "/v1/approvals");
+        assert_eq!(normalize_http_path("v1/approvals"), "/v1/approvals");
+        assert_eq!(normalize_http_path("/"), "/");
+        assert_eq!(normalize_http_path(""), "/");
+    }
+
+    #[test]
+    fn normalize_http_path_multi_param() {
+        assert_eq!(
+            normalize_http_path("/orgs/{orgId}/users/:userId"),
+            "/orgs/{}/users/{}"
+        );
+    }
+
+    #[test]
+    fn contract_uid_http_scheme() {
+        let uid = contract_uid("http", Some("post"), Some("/v1/approvals/"), None);
+        assert_eq!(uid, "contract:http:POST:/v1/approvals");
+        // Two differently-written-but-equivalent routes mint the same UID.
+        let a = contract_uid("http", Some("GET"), Some("/users/{id}"), None);
+        let b = contract_uid("http", Some("get"), Some("/users/:userId"), None);
+        assert_eq!(a, b, "equivalent routes must collide: {a} vs {b}");
+    }
+
+    #[test]
+    fn contract_uid_grpc_scheme() {
+        let uid = contract_uid("grpc", None, None, Some("approvals.v1.Approvals/Create"));
+        assert_eq!(uid, "contract:grpc:approvals.v1.Approvals/Create");
+    }
+
+    #[test]
+    fn contract_uid_graphql_scheme() {
+        let uid = contract_uid("graphql", None, None, Some("Mutation.createApproval"));
+        assert_eq!(uid, "contract:graphql:Mutation.createApproval");
     }
 }

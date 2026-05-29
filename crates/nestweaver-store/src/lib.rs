@@ -924,4 +924,57 @@ mod tests {
         assert_eq!(callees.len(), 1);
         assert_eq!(callees[0].uid, "be-sym-1");
     }
+
+    #[test]
+    fn contract_round_trips_and_implements_edge() {
+        use nestweaver_schema::Contract;
+        let store = test_store();
+
+        let contract = Contract {
+            uid: "contract:http:POST:/v1/approvals".to_string(),
+            kind: "http".to_string(),
+            verb: Some("POST".to_string()),
+            path: Some("/v1/approvals".to_string()),
+            operation_id: Some("createApproval".to_string()),
+            repo_uid: "repo-1".to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 1.0,
+        };
+        store.insert_contract(&contract).unwrap();
+
+        // Read back (no filter, and repo-filtered).
+        let all = store.list_contracts(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].uid, "contract:http:POST:/v1/approvals");
+        assert_eq!(all[0].verb.as_deref(), Some("POST"));
+        assert_eq!(all[0].path.as_deref(), Some("/v1/approvals"));
+        assert_eq!(all[0].confidence, 1.0);
+        assert!(store.list_contracts(Some("repo-2")).unwrap().is_empty());
+
+        // Insert is idempotent (no duplicate after re-insert).
+        store.insert_contract(&contract).unwrap();
+        assert_eq!(store.list_contracts(None).unwrap().len(), 1);
+
+        // A handler symbol implements it.
+        store
+            .insert_symbol(&make_symbol(
+                "h1",
+                "create",
+                "repo-1",
+                "ApprovalsController.java",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "h1".to_string(),
+                target_uid: "contract:http:POST:/v1/approvals".to_string(),
+                edge_type: EdgeType::ImplementsContract,
+                confidence: 1.0,
+                link_type: None,
+            })
+            .unwrap();
+
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert_eq!(implemented, vec!["contract:http:POST:/v1/approvals"]);
+    }
 }
