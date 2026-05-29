@@ -11,6 +11,33 @@ use crate::db::GraphStore;
 use crate::error::StoreError;
 use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
 
+/// Feature F12 default activity weight. With `score ∈ [0, 1]`, the factor
+/// `1 + w*(score - 0.5)` spans `[1 - w/2, 1 + w/2]`; `w = 1.2` is required for
+/// it to reach the intended `[0.4, 1.6]` clamp (the RFC's `0.6` only reaches
+/// `[0.7, 1.3]`). See `nestweaver_engine::git_activity` for the full rationale.
+pub const DEFAULT_GIT_ACTIVITY_WEIGHT: f64 = 1.2;
+
+/// Lower clamp bound for the git-activity rank-read multiplier.
+pub const GIT_ACTIVITY_MULT_MIN: f64 = 0.4;
+/// Upper clamp bound for the git-activity rank-read multiplier.
+pub const GIT_ACTIVITY_MULT_MAX: f64 = 1.6;
+
+/// Feature F12 rank-read multiplier applied to a `pagerank_score`.
+///
+/// - `score == None` → neutral `1.0` (no recency data for this file).
+/// - `score == Some(s)` → `clamp(1 + weight * (s - 0.5), 0.4, 1.6)`.
+///
+/// The result is always within `[0.4, 1.6]`. This is the source of truth the
+/// store applies; `nestweaver_engine::hubs` and the miner mirror the same
+/// formula (the engine crate sits above the store and cannot be depended on
+/// here, so the constant/formula is duplicated and kept in sync by tests).
+pub fn git_activity_multiplier(score: Option<f64>, weight: f64) -> f64 {
+    match score {
+        None => 1.0,
+        Some(s) => (1.0 + weight * (s - 0.5)).clamp(GIT_ACTIVITY_MULT_MIN, GIT_ACTIVITY_MULT_MAX),
+    }
+}
+
 /// Describes the intent behind a PPR query, allowing the algorithm to
 /// adapt its damping factor (alpha) and edge weights to produce more
 /// relevant results for different use cases.
@@ -609,11 +636,26 @@ impl GraphStore {
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // Feature F12: when git-activity recency scores are loaded, demote
+        // dormant code at read time by multiplying the base pagerank by a
+        // clamped per-file recency factor. Files with no score → neutral.
+        // The PPR fixpoint is untouched — this is purely a read-time rescale.
+        let git_activity = self.git_activity_cache.lock().ok().and_then(|g| g.clone());
+        let ga_weight = self.git_activity_weight();
+
         let mut symbols: Vec<Symbol> = result
             .filter_map(|row| row_to_symbol(&row).ok())
             .filter_map(|mut sym| {
                 scores.get(&sym.uid).copied().map(|score| {
-                    sym.pagerank_score = Some(score);
+                    let effective = match &git_activity {
+                        Some(ga) => {
+                            let mult =
+                                git_activity_multiplier(ga.get(&sym.file_path).copied(), ga_weight);
+                            score * mult
+                        }
+                        None => score,
+                    };
+                    sym.pagerank_score = Some(effective);
                     sym
                 })
             })
@@ -1837,6 +1879,123 @@ mod tests {
             project_ratio >= general_ratio,
             "ProjectContext member/popular ratio ({project_ratio:.4}) should be >= \
              GeneralContext ratio ({general_ratio:.4})"
+        );
+    }
+
+    // ── Feature F12: git-activity rank-read multiplier ───────────────────
+
+    #[test]
+    fn git_activity_multiplier_neutral_when_no_score() {
+        use super::git_activity_multiplier;
+        let m = git_activity_multiplier(None, super::DEFAULT_GIT_ACTIVITY_WEIGHT);
+        assert!((m - 1.0).abs() < f64::EPSILON, "absent score → neutral 1.0");
+    }
+
+    #[test]
+    fn git_activity_multiplier_within_clamp() {
+        use super::{GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, git_activity_multiplier};
+        let w = super::DEFAULT_GIT_ACTIVITY_WEIGHT;
+        assert!((git_activity_multiplier(Some(0.5), w) - 1.0).abs() < 1e-9);
+        assert!((git_activity_multiplier(Some(1.0), w) - 1.6).abs() < 1e-9);
+        assert!((git_activity_multiplier(Some(0.0), w) - 0.4).abs() < 1e-9);
+        for i in 0..=100 {
+            let s = i as f64 / 100.0;
+            let m = git_activity_multiplier(Some(s), 5.0);
+            assert!((GIT_ACTIVITY_MULT_MIN..=GIT_ACTIVITY_MULT_MAX).contains(&m));
+        }
+    }
+
+    #[test]
+    fn git_activity_demotes_stale_file_at_read_time() {
+        // Two symbols with identical structural position but different files.
+        // Both get the same base pagerank; loading git-activity scores that
+        // mark `fresh.rs` live (0.95) and `stale.rs` dormant (0.05) should
+        // make the fresh symbol outrank the stale one at read time, without
+        // touching the PPR fixpoint.
+        let store = test_store();
+        let mut fresh = make_symbol("F", "shared_name");
+        fresh.file_path = "src/fresh.rs".to_string();
+        let mut stale = make_symbol("S", "shared_name");
+        stale.file_path = "src/stale.rs".to_string();
+        store.insert_symbol(&fresh).unwrap();
+        store.insert_symbol(&stale).unwrap();
+        // Symmetric edges so PPR gives both the same base score.
+        store.insert_edge(&make_calls_edge("F", "S")).unwrap();
+        store.insert_edge(&make_calls_edge("S", "F")).unwrap();
+
+        store
+            .compute_pagerank(0.85, 30, &GraphScope::code_only())
+            .unwrap();
+
+        // Baseline (no git-activity loaded): scores should be ~equal.
+        let baseline = store.symbols_by_pagerank(None).unwrap();
+        let base_f = baseline.iter().find(|s| s.uid == "F").unwrap();
+        let base_s = baseline.iter().find(|s| s.uid == "S").unwrap();
+        assert!(
+            (base_f.pagerank_score.unwrap() - base_s.pagerank_score.unwrap()).abs() < 1e-9,
+            "symmetric graph → equal base pagerank"
+        );
+
+        // Load recency scores and re-read.
+        let mut ga = std::collections::HashMap::new();
+        ga.insert("src/fresh.rs".to_string(), 0.95);
+        ga.insert("src/stale.rs".to_string(), 0.05);
+        store.load_git_activity_cache(ga);
+
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        let f = ranked.iter().find(|s| s.uid == "F").unwrap();
+        let s = ranked.iter().find(|s| s.uid == "S").unwrap();
+        assert!(
+            f.pagerank_score.unwrap() > s.pagerank_score.unwrap(),
+            "actively-developed fresh.rs ({:.6}) should outrank dormant stale.rs ({:.6})",
+            f.pagerank_score.unwrap(),
+            s.pagerank_score.unwrap()
+        );
+        // Results stay sorted descending.
+        assert_eq!(ranked[0].uid, "F");
+    }
+
+    #[test]
+    fn git_activity_neutral_for_files_without_score() {
+        // A symbol whose file has no recency score must keep its base pagerank
+        // (multiplier 1.0) even when the cache is loaded for other files.
+        let store = test_store();
+        let mut a = make_symbol("A", "fn_a");
+        a.file_path = "src/scored.rs".to_string();
+        let mut b = make_symbol("B", "fn_b");
+        b.file_path = "src/unscored.rs".to_string();
+        store.insert_symbol(&a).unwrap();
+        store.insert_symbol(&b).unwrap();
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "A")).unwrap();
+        store
+            .compute_pagerank(0.85, 30, &GraphScope::code_only())
+            .unwrap();
+
+        let base_b = store
+            .symbols_by_pagerank(None)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.uid == "B")
+            .unwrap()
+            .pagerank_score
+            .unwrap();
+
+        let mut ga = std::collections::HashMap::new();
+        ga.insert("src/scored.rs".to_string(), 0.9); // only A's file
+        store.load_git_activity_cache(ga);
+
+        let after_b = store
+            .symbols_by_pagerank(None)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.uid == "B")
+            .unwrap()
+            .pagerank_score
+            .unwrap();
+        assert!(
+            (base_b - after_b).abs() < 1e-9,
+            "unscored file should keep base pagerank (neutral): {base_b} vs {after_b}"
         );
     }
 }
