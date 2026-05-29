@@ -163,6 +163,36 @@ pub struct InstanceConfig {
     /// multipliers on result relevance, keyed by file-path glob.
     #[serde(default)]
     pub ranking: RankingConfig,
+    /// Feature F16 — response cache tuning (`[cache]`).
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+/// `[cache]` — tuning for the F16 response cache (Feature F16).
+///
+/// The cache stores ZSTD-compressed responses of deterministic read tools in
+/// a `<db>.cache` sidecar. Correctness is key-based: an entry only hits when
+/// the persisted `graph_generation` and a filemeta scope digest both still
+/// match, so a reindex invalidates everything WITHOUT a background daemon.
+/// `max_size_mb` caps total stored size; LRU eviction trims the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Maximum total cache size in MiB before LRU eviction kicks in.
+    /// Default 256.
+    #[serde(default = "default_cache_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+fn default_cache_max_size_mb() -> u64 {
+    256
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_size_mb: default_cache_max_size_mb(),
+        }
+    }
 }
 
 /// `[response]` — tuning for tiered inline bodies (Feature F8).

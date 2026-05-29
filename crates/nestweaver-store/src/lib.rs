@@ -1,5 +1,7 @@
+pub mod cache;
 pub mod db;
 pub mod error;
+pub mod generation;
 pub mod ranking;
 pub mod read;
 pub mod regex;
