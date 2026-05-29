@@ -1653,6 +1653,67 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn index_links_all_nestjs_handlers_in_multi_method_controller() {
+        // QA bug A: a NestJS controller with MULTIPLE route methods, each
+        // decorator on its own line, must produce IMPLEMENTS_CONTRACT edges for
+        // EVERY handler — not just the first. The spec declares both routes;
+        // drift must flag neither as declared-not-implemented.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("src")).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: A, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/health:\n    \
+             get:\n      \
+             responses: { \"200\": { description: ok } }\n  \
+             /v1/users:\n    \
+             post:\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("src/api.controller.ts"),
+            "@Controller('v1')\n\
+             export class Api {\n  \
+             @Get('health')\n  \
+             health(): object {\n    \
+             return {};\n  \
+             }\n\n  \
+             @Post('users')\n  \
+             createUser(\n    \
+             @Body() body: CreateUserDto,\n  \
+             ): object {\n    \
+             return {};\n  \
+             }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert!(
+            implemented.contains(&"contract:http:GET:/v1/health".to_string()),
+            "GET /v1/health must be implemented; implemented: {implemented:?}"
+        );
+        assert!(
+            implemented.contains(&"contract:http:POST:/v1/users".to_string()),
+            "POST /v1/users must be implemented; implemented: {implemented:?}"
+        );
+
+        let report = crate::contracts::drift_for_store(&store, None).unwrap();
+        assert!(
+            report.declared_not_implemented.is_empty(),
+            "neither route may be declared-not-implemented; got {:?}",
+            report.declared_not_implemented
+        );
+    }
+
+    #[test]
     fn index_skips_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");

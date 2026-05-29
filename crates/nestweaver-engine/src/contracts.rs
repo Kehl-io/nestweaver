@@ -802,6 +802,82 @@ type Query {
     }
 
     #[test]
+    fn nestjs_multiple_handlers_each_on_own_line_all_match() {
+        // QA bug A: a controller with MULTIPLE route methods, each decorator on
+        // its own line, must yield an IMPLEMENTS_CONTRACT match for EVERY
+        // annotated method — not just the first one.
+        let source = "@Controller('v1')\n\
+                      export class Api {\n  \
+                      @Get('health')\n  \
+                      health() { return {}; }\n  \
+                      @Post('users')\n  \
+                      createUser() { return {}; }\n\
+                      }\n";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "health".into(),
+                signature: "health() { return {}; }".into(),
+                start_line: 4,
+            },
+            HandlerSymbol {
+                name: "createUser".into(),
+                signature: "createUser() { return {}; }".into(),
+                start_line: 6,
+            },
+        ];
+        let matches = detect_handlers("nestjs", source, &symbols);
+        assert_eq!(
+            matches.len(),
+            2,
+            "both handlers must match; got {matches:?}"
+        );
+        let uids: Vec<String> = matches.iter().map(|m| m.contract.uid()).collect();
+        assert!(
+            uids.contains(&"contract:http:GET:/v1/health".to_string()),
+            "GET /v1/health missing; uids: {uids:?}"
+        );
+        assert!(
+            uids.contains(&"contract:http:POST:/v1/users".to_string()),
+            "POST /v1/users missing; uids: {uids:?}"
+        );
+    }
+
+    #[test]
+    fn spring_multiple_handlers_each_on_own_line_all_match() {
+        // QA bug A (Spring side): multiple @*Mapping methods, annotations on
+        // their own lines, must ALL be detected.
+        let source = "@RestController\n\
+                      @RequestMapping(\"/v1\")\n\
+                      public class Api {\n  \
+                      @GetMapping(\"/health\")\n  \
+                      public Object health() { return null; }\n  \
+                      @PostMapping(\"/users\")\n  \
+                      public Object createUser() { return null; }\n\
+                      }\n";
+        let symbols = vec![
+            HandlerSymbol {
+                name: "health".into(),
+                signature: "public Object health() { return null; }".into(),
+                start_line: 5,
+            },
+            HandlerSymbol {
+                name: "createUser".into(),
+                signature: "public Object createUser() { return null; }".into(),
+                start_line: 7,
+            },
+        ];
+        let matches = detect_handlers("spring", source, &symbols);
+        assert_eq!(
+            matches.len(),
+            2,
+            "both handlers must match; got {matches:?}"
+        );
+        let uids: Vec<String> = matches.iter().map(|m| m.contract.uid()).collect();
+        assert!(uids.contains(&"contract:http:GET:/v1/health".to_string()));
+        assert!(uids.contains(&"contract:http:POST:/v1/users".to_string()));
+    }
+
+    #[test]
     fn spring_annotation_on_own_line_matches() {
         // Spring annotations on their own lines, with the class-level
         // @RequestMapping also on its own line above the class.

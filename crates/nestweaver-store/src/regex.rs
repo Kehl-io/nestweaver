@@ -83,6 +83,10 @@ struct Candidate {
     title: String,
     location: String,
     text: String,
+    /// 1-based line in the source file where this candidate's `text` begins.
+    /// Used to translate a match's line *within* `text` into a file line.
+    /// `1` when the node has no meaningful file offset (e.g. Note titles).
+    start_line: u32,
 }
 
 /// Lowercase 3-grams of `s`, deduplicated. Operates on Unicode scalar values
@@ -237,6 +241,7 @@ impl GraphStore {
                     title: String::new(),
                     location,
                     text: s.text_content,
+                    start_line: s.start_line,
                 });
             }
         }
@@ -258,6 +263,8 @@ impl GraphStore {
                     title: n.title.clone(),
                     location: n.file_path,
                     text: n.title,
+                    // A note's title has no meaningful file line offset.
+                    start_line: 1,
                 });
             }
         }
@@ -280,6 +287,7 @@ impl GraphStore {
                     title: sym.name,
                     location,
                     text: sym.signature,
+                    start_line: sym.start_line,
                 });
             }
         }
@@ -373,13 +381,17 @@ impl GraphStore {
                 break;
             }
             if let Some(m) = re.find(&c.text) {
-                let (line, snippet) = line_and_snippet(&c.text, m.start());
+                let (line_in_text, snippet) = line_and_snippet(&c.text, m.start());
+                // Translate the line *within* the node's text into a file line:
+                // the node's text starts at `c.start_line`, so the match on the
+                // first text line (line_in_text == 1) is at c.start_line.
+                let file_line = c.start_line.saturating_add(line_in_text.saturating_sub(1));
                 results.push(RegexMatch {
                     uid: c.uid.clone(),
                     kind: c.kind.clone(),
                     title: c.title.clone(),
                     location: c.location.clone(),
-                    line: Some(line),
+                    line: Some(file_line),
                     snippet,
                 });
                 if results.len() >= limit {
@@ -573,9 +585,10 @@ mod tests {
         assert!(uids.contains("sec:v:1:a"));
         assert!(uids.contains("sym:1"));
 
-        // Line/snippet metadata is populated.
+        // Line/snippet metadata is populated. The reported line is the symbol's
+        // real start_line in the file (42), not 1.
         let sym_hit = res.results.iter().find(|m| m.uid == "sym:1").unwrap();
-        assert_eq!(sym_hit.line, Some(1));
+        assert_eq!(sym_hit.line, Some(42));
         assert!(sym_hit.snippet.contains("authenticateUser"));
     }
 
@@ -619,6 +632,60 @@ mod tests {
             .unwrap();
         assert_eq!(counts_ci[0].total_matches, 2);
         assert_eq!(counts_ci[0].files_matched, 2);
+    }
+
+    #[test]
+    fn symbol_match_reports_real_start_line_not_one() {
+        // QA bug B: a Symbol's text is its signature, but the reported `line`
+        // must be the symbol's real start_line in the file, not 1.
+        let store = store_with_text();
+        let res = store
+            .regex_search(
+                "authenticateUser",
+                None,
+                Some(&["Symbol".to_string()]),
+                None,
+                None,
+            )
+            .unwrap();
+        let sym_hit = res
+            .results
+            .iter()
+            .find(|m| m.uid == "sym:1")
+            .expect("symbol match present");
+        // The symbol is defined at line 42 (see store_with_text()).
+        assert_eq!(
+            sym_hit.line,
+            Some(42),
+            "symbol match must report real start_line, not 1"
+        );
+    }
+
+    #[test]
+    fn section_match_reports_line_offset_by_section_start() {
+        // QA bug B: a Section body match reports the line *within the file*,
+        // offset by the section's start_line (5). The match is on the section's
+        // first body line, so the reported line should be 5.
+        let store = store_with_text();
+        let res = store
+            .regex_search(
+                "authenticateUser",
+                None,
+                Some(&["Section".to_string()]),
+                None,
+                None,
+            )
+            .unwrap();
+        let sec_hit = res
+            .results
+            .iter()
+            .find(|m| m.uid == "sec:v:1:a")
+            .expect("section match present");
+        assert_eq!(
+            sec_hit.line,
+            Some(5),
+            "section match must be offset by section start_line"
+        );
     }
 
     #[test]
