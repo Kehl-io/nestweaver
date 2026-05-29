@@ -129,7 +129,7 @@ export function GraphCanvas() {
     (theme === "system" &&
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
-  const bgColor = isDark ? "#0c0f1a" : "#fafbfc";
+  const bgColor = isDark ? "#06080f" : "#f8fafc";
 
   return (
     <Canvas
@@ -162,10 +162,10 @@ export function GraphCanvas() {
       {!reducedMotion && (
         <EffectComposer>
           <Bloom
-            luminanceThreshold={0.8}
+            luminanceThreshold={0.7}
             luminanceSmoothing={0.3}
-            intensity={0.5}
-            radius={0.4}
+            intensity={0.65}
+            radius={0.5}
           />
         </EffectComposer>
       )}

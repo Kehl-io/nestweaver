@@ -70,7 +70,7 @@ export function EdgeInstanceMesh({ buffers }: Props) {
       <meshBasicMaterial
         vertexColors
         transparent
-        opacity={0.35}
+        opacity={0.45}
         depthTest={false}
         depthWrite={false}
         toneMapped={false}
