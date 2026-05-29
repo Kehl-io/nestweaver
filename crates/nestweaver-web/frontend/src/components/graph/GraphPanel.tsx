@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
+import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
 import { NodeFilterBar } from "./NodeFilterBar";
@@ -220,6 +221,7 @@ export function GraphPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const viewMode = useStore((s) => s.viewMode);
+  const minimapVisible = useStore((s) => s.minimapVisible);
 
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
@@ -258,6 +260,11 @@ export function GraphPanel() {
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
         <GraphToolbar />
+        {minimapVisible && (
+          <div className="absolute top-2 right-12 z-10">
+            <GraphMinimap />
+          </div>
+        )}
         {contextMenu && (
           <ContextMenu
             x={contextMenu.x}

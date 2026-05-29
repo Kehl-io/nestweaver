@@ -68,12 +68,43 @@ function hashToPhase(uid: string): number {
 }
 
 /**
+ * Hash a string to a hue value in [0, 360).
+ */
+function hashStringToHue(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return ((h >>> 0) % 360);
+}
+
+/**
+ * Convert HSL (h in [0,1], s in [0,1], l in [0,1]) to RGB floats in [0,1].
+ */
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h * 6) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  const hd = h * 6;
+  if (hd < 1) { r = c; g = x; b = 0; }
+  else if (hd < 2) { r = x; g = c; b = 0; }
+  else if (hd < 3) { r = 0; g = c; b = x; }
+  else if (hd < 4) { r = 0; g = x; b = c; }
+  else if (hd < 5) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  return [r + m, g + m, b + m];
+}
+
+/**
  * Converts the current graphology instance from the store into typed Float32Array
  * buffers suitable for consumption by R3F InstancedMesh components.
  */
 export function useGraphBridge(): GraphBuffers {
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
+  const activeStyleRules = useStore((s) => s.activeStyleRules);
 
   return useMemo(() => {
     if (!graphInstance || graphInstance.order === 0) {
@@ -103,13 +134,33 @@ export function useGraphBridge(): GraphBuffers {
       positions[ni * 3 + 2] = typeof attrs.z === "number" ? attrs.z : 0;
 
       // Colors: parse hex color attribute, fall back to mid-gray
-      const [r, g, b] = hexToRgb(typeof attrs.color === "string" ? attrs.color : "");
+      let [r, g, b] = hexToRgb(typeof attrs.color === "string" ? attrs.color : "");
+
+      // Style rule: color by directory
+      if (activeStyleRules.colorByDir && typeof attrs.location === "string") {
+        const dir = attrs.location.split("/").slice(0, -1).join("/");
+        const hue = hashStringToHue(dir);
+        [r, g, b] = hslToRgb(hue / 360, 0.6, 0.55);
+      }
+
       colors[ni * 3 + 0] = r;
       colors[ni * 3 + 1] = g;
       colors[ni * 3 + 2] = b;
 
       // Size: use numeric size attribute, default 1
-      sizes[ni] = typeof attrs.size === "number" ? attrs.size : 1;
+      let nodeSize = typeof attrs.size === "number" ? attrs.size : 1;
+
+      // Style rule: boost size for entry points
+      if (activeStyleRules.highlightEntryPoints && attrs.isEntryPoint === true) {
+        nodeSize *= 2.0;
+      }
+
+      // Style rule: boost size for high-PageRank nodes
+      if (activeStyleRules.highlightHighPageRank && typeof attrs.relevance === "number" && attrs.relevance > 0.1) {
+        nodeSize *= 1.8;
+      }
+
+      sizes[ni] = nodeSize;
 
       // Phase: deterministic per-node float derived from UID
       phases[ni] = hashToPhase(uid);
@@ -164,5 +215,5 @@ export function useGraphBridge(): GraphBuffers {
       edgeCount,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphInstance, graphVersion]);
+  }, [graphInstance, graphVersion, activeStyleRules]);
 }

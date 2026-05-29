@@ -199,6 +199,5 @@ export type GraphMode =
   | "impact"
   | "repos"
   | "features"
-  | "local"
-  | "inspector";
+  | "local";
 export type ScopeFilter = "all" | "code_only" | "notes_only";
