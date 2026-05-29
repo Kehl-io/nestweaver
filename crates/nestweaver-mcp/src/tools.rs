@@ -17,10 +17,11 @@ use nestweaver_engine::{
     build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
     detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
-    index_directory, index_markdown_directory, load_alias_sidecar, load_clusters, load_extensions,
-    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
-    render_text, save_extensions, search_symbols, set_property, tag_graph, tag_graph_all,
-    topic_clusters, truncate_to_budget,
+    index_directory, index_markdown_directory, investigate, investigate_expand,
+    investigate_hydrate, load_alias_sidecar, load_clusters, load_extensions, orphan_documents,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
+    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
+    truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -72,6 +73,9 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_brain_tag_graph(),
         tool_schema_brain_doc_stats(),
         tool_schema_affected_tests(),
+        tool_schema_investigate(),
+        tool_schema_investigate_expand(),
+        tool_schema_investigate_hydrate(),
     ];
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
@@ -142,6 +146,9 @@ pub fn dispatch(
         "brain_tag_graph" => tool_brain_tag_graph(store, args),
         "brain_doc_stats" => tool_brain_doc_stats(store, args),
         "affected_tests" => tool_affected_tests(store, args),
+        "investigate" => tool_investigate(store, tantivy, args),
+        "investigate_expand" => tool_investigate_expand(store, args),
+        "investigate_hydrate" => tool_investigate_hydrate(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -3677,6 +3684,134 @@ pub fn set_track_interactions(track: bool) {
 
 pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
+}
+
+// ── F10: investigate bundle primitive ─────────────────────────────────────
+
+/// Resolve the source root for body reads: explicit `root` arg, else cwd.
+fn arg_root(args: &Value) -> std::path::PathBuf {
+    args.get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+fn tool_schema_investigate() -> Value {
+    json!({
+        "name": "investigate",
+        "description": "Use to orient yourself on an unfamiliar topic, feature, or subsystem in ONE call instead of a chain of searches. Runs hybrid PPR + BM25 retrieval (with pseudo-relevance feedback) for your query, groups the results into architectural domains (code directories + notes), inlines a few high-confidence source bodies, and returns a token-budgeted map plus a `bundle_id`. Drill into specific entries afterwards with `investigate_expand` (by asset_id) or fill in all remaining bodies with `investigate_hydrate`.\n\nScope: \"project:<slug>\" restricts seeds to a project's members, \"repo:<name>\" restricts results to a repo, \"vault\"/\"all\"/omitted = no restriction. Returns `{bundle_id, domains:[{label, entry_point, members}], entries:[{asset_id, uid, kind, title, location, summary, inline_body?, relevance}], more_available}`. `more_available` counts entries dropped by the token budget — raise `token_budget` to see them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
+                "scope": { "type": "string", "description": "Optional scope: \"project:<slug>\", \"repo:<name>\", or \"vault\"/\"all\" (default = no restriction)." },
+                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
+                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
+fn tool_investigate(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'query' must be a string"))?;
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("vault");
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = arg_root(&args);
+    let db_path = current_db_path(store).ok();
+    let result = investigate(
+        store,
+        tantivy,
+        db_path.as_deref(),
+        &root,
+        query,
+        scope,
+        token_budget,
+    )?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn tool_schema_investigate_expand() -> Value {
+    json!({
+        "name": "investigate_expand",
+        "description": "Use after `investigate` to drill into specific map entries. Given a `bundle_id` and one or more targets (each an `asset_id` from the map, or a raw node uid), returns each entry's full source body plus its immediate neighbors (callers/callees for symbols, wikilink sources for notes) and marks the entries expanded. Returns `{bundle_id, expanded:[entry], neighbors:[{of, uid, kind, title, relation}], unresolved:[target]}`. Bundles expire 24h after creation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
+                "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["bundle_id", "targets"]
+        }
+    })
+}
+
+fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let bundle_id = args
+        .get("bundle_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'bundle_id' must be a string"))?;
+    let targets: Vec<String> = args
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(anyhow!("'targets' must be a non-empty array"));
+    }
+    let root = arg_root(&args);
+    let db_path = current_db_path(store)?;
+    let result = investigate_expand(store, &db_path, &root, bundle_id, &targets)?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn tool_schema_investigate_hydrate() -> Value {
+    json!({
+        "name": "investigate_hydrate",
+        "description": "Use after `investigate` to fill in source bodies/summaries for every map entry that doesn't yet have one — the bulk version of `investigate_expand`, budget-bounded. Given a `bundle_id`, reads bodies for all un-hydrated entries up to the token budget. Returns `{bundle_id, hydrated, entries}`. Bundles expire 24h after creation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
+                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
+            },
+            "required": ["bundle_id"]
+        }
+    })
+}
+
+fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let bundle_id = args
+        .get("bundle_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'bundle_id' must be a string"))?;
+    let token_budget = args
+        .get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let root = arg_root(&args);
+    let db_path = current_db_path(store)?;
+    let result = investigate_hydrate(store, &db_path, &root, bundle_id, token_budget)?;
+    Ok(serde_json::to_value(result)?)
 }
 
 fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {

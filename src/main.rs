@@ -880,6 +880,86 @@ enum Commands {
         )]
         recency_half_life_days: f64,
     },
+    /// F10: orient on a topic in one call — architectural map + bundle_id
+    ///
+    /// Runs hybrid retrieval (PPR + BM25 + PRF) for the query, groups results into
+    /// architectural domains, inlines a few high-confidence bodies, and persists a
+    /// bundle (24h TTL). Drill in afterwards with `investigate-expand` /
+    /// `investigate-hydrate`.
+    #[command(
+        after_help = "Examples:\n  nestweaver investigate \"device pairing\"\n  nestweaver investigate \"how indexing works\" --scope repo:nestweaver --token-budget 8000 --json"
+    )]
+    Investigate {
+        /// Topic / feature / subsystem to orient on
+        query: String,
+        #[arg(
+            long,
+            help = "Scope: project:<slug>, repo:<name>, or vault/all (default = no restriction)"
+        )]
+        scope: Option<String>,
+        #[arg(
+            long,
+            default_value = "4000",
+            help = "Approximate token budget (chars/4)"
+        )]
+        token_budget: usize,
+        #[arg(long, help = "Filesystem root for inline bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// F10: drill into investigate bundle entries (full body + neighbors)
+    #[command(
+        after_help = "Examples:\n  nestweaver investigate-expand bndl_abc --targets a123,sym:foo"
+    )]
+    InvestigateExpand {
+        /// Bundle id returned by `investigate`
+        bundle_id: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated asset_ids (from the map) or node uids to expand"
+        )]
+        targets: Vec<String>,
+        #[arg(long, help = "Filesystem root for source bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
+    /// F10: fill in bodies/summaries for all un-hydrated bundle entries
+    #[command(after_help = "Examples:\n  nestweaver investigate-hydrate bndl_abc")]
+    InvestigateHydrate {
+        /// Bundle id returned by `investigate`
+        bundle_id: String,
+        #[arg(
+            long,
+            default_value = "4000",
+            help = "Approximate token budget (chars/4)"
+        )]
+        token_budget: usize,
+        #[arg(long, help = "Filesystem root for source bodies (default: repo root)")]
+        root: Option<PathBuf>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+
     /// Auto-detect and configure NestWeaver for installed AI coding tools
     ///
     /// Detects Claude Code, Cursor, Codex, Windsurf, JetBrains, VS Code, Gemini CLI,
@@ -3870,6 +3950,152 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_ERROR, None))
                 }
             }
+        }
+
+        Commands::Investigate {
+            query,
+            scope,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let tantivy_path = tantivy_sidecar_path_for(&db_path);
+            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+            let root = root.unwrap_or_else(detect_repo_root);
+            let scope = scope.unwrap_or_else(|| "vault".to_string());
+            let result = nestweaver_engine::investigate(
+                &store,
+                tantivy.as_ref(),
+                Some(&db_path),
+                &root,
+                &query,
+                &scope,
+                Some(token_budget),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Bundle: {}  (query: {:?})", result.bundle_id, result.query);
+                println!(
+                    "{} domain(s), {} entr{}{}",
+                    result.domains.len(),
+                    result.entries.len(),
+                    if result.entries.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    if result.more_available > 0 {
+                        format!(
+                            " ({} more available — raise --token-budget)",
+                            result.more_available
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                for d in &result.domains {
+                    println!("\n[{}]", d.label);
+                    for asset_id in &d.members {
+                        if let Some(e) = result.entries.iter().find(|e| &e.asset_id == asset_id) {
+                            let marker = if e.asset_id == d.entry_point {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!(
+                                "  {marker} {}  {} ({})  {}",
+                                e.asset_id, e.title, e.kind, e.location
+                            );
+                            if let Some(s) = &e.summary {
+                                println!("      {s}");
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
+                    result.bundle_id
+                );
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::InvestigateExpand {
+            bundle_id,
+            targets,
+            root,
+            json,
+            db,
+        } => {
+            if targets.is_empty() {
+                eprintln!("Error: --targets must list at least one asset_id or uid");
+                return Ok((EXIT_ERROR, None));
+            }
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let root = root.unwrap_or_else(detect_repo_root);
+            let result = nestweaver_engine::investigate_expand(
+                &store, &db_path, &root, &bundle_id, &targets,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                if !result.unresolved.is_empty() {
+                    println!("Unresolved targets: {}", result.unresolved.join(", "));
+                }
+                for e in &result.expanded {
+                    println!("\n=== {}  {} ({}) ===", e.asset_id, e.title, e.location);
+                    if let Some(body) = &e.inline_body {
+                        println!("{body}");
+                    }
+                    let neighbors: Vec<&nestweaver_engine::NeighborRef> = result
+                        .neighbors
+                        .iter()
+                        .filter(|n| n.of == e.asset_id)
+                        .collect();
+                    if !neighbors.is_empty() {
+                        println!("-- neighbors --");
+                        for n in neighbors {
+                            println!("  [{}] {} ({})", n.relation, n.title, n.uid);
+                        }
+                    }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::InvestigateHydrate {
+            bundle_id,
+            token_budget,
+            root,
+            json,
+            db,
+        } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let root = root.unwrap_or_else(detect_repo_root);
+            let result = nestweaver_engine::investigate_hydrate(
+                &store,
+                &db_path,
+                &root,
+                &bundle_id,
+                Some(token_budget),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Hydrated {} entr{} in bundle {}",
+                    result.hydrated,
+                    if result.hydrated == 1 { "y" } else { "ies" },
+                    result.bundle_id
+                );
+            }
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::MaterializeProjects { config, db } => {
