@@ -1,6 +1,98 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Bounds applied to a ranking-prior multiplier and to the final product
+/// after a prior is applied. A multiplier below the floor would erase a
+/// result; above the ceiling would let a prior dominate every other signal.
+pub const RANKING_MULTIPLIER_MIN: f64 = 0.05;
+pub const RANKING_MULTIPLIER_MAX: f64 = 5.0;
+
+/// A single path-glob ranking rule (Feature F6). `glob` is matched against a
+/// result's file-path location; `multiplier` scales that result's relevance.
+///
+/// A multiplier < 1.0 dampens (e.g. `_logs/2020/** → 0.3`); a multiplier > 1.0
+/// boosts (e.g. `Projects/*/sync.md → 1.5`). The multiplier is clamped to
+/// `[RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX]` on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobRule {
+    pub glob: String,
+    pub multiplier: f64,
+}
+
+/// `[ranking]` — query-independent path-glob priors on result relevance
+/// (Feature F6).
+///
+/// `dampen` and `boost` are just two ordered lists of [`GlobRule`]s; the
+/// distinction is documentation only (a `dampen` rule conventionally has a
+/// multiplier < 1.0 and a `boost` rule > 1.0, but neither is enforced — both
+/// are clamped to the same bounds). When several rules match a result, the
+/// **last** matching rule wins (last-match-wins), with `dampen` rules ordered
+/// before `boost` rules in the merged list. Empty config → no-op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankingConfig {
+    #[serde(default)]
+    pub dampen: Vec<GlobRule>,
+    #[serde(default)]
+    pub boost: Vec<GlobRule>,
+    /// Feature F7 (PRF half) — enable pseudo-relevance-feedback query
+    /// expansion on brain BM25 searches. Off by default; when `true`, a
+    /// two-pass term-mining expansion runs before fusion. The CLI `--prf`
+    /// flag and MCP `prf: true` argument override this per call.
+    #[serde(default)]
+    pub enable_prf: bool,
+    /// Feature F12 — git-activity-dampened CodeRank weight. Controls how
+    /// strongly the per-file recency score rescales `pagerank_score` at read
+    /// time via `clamp(1 + w*(score - 0.5), 0.4, 1.6)`.
+    ///
+    /// Default `1.2` (NOT `0.6`): with `score ∈ [0, 1]` the factor spans
+    /// `[1 - w/2, 1 + w/2]`, so only `w = 1.2` reaches the full `[0.4, 1.6]`
+    /// clamp; `0.6` would top out at `[0.7, 1.3]` and never bind the clamp.
+    /// This is only applied when a `<db>.gitactivity.json` sidecar is present
+    /// (populated via `index --with-git-activity`).
+    #[serde(default = "default_git_activity_weight")]
+    pub git_activity_weight: f64,
+}
+
+/// Default for [`RankingConfig::git_activity_weight`]. See the field doc and
+/// `nestweaver_engine::git_activity` for the clamp/weight rationale.
+fn default_git_activity_weight() -> f64 {
+    1.2
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        RankingConfig {
+            dampen: Vec::new(),
+            boost: Vec::new(),
+            enable_prf: false,
+            git_activity_weight: default_git_activity_weight(),
+        }
+    }
+}
+
+impl RankingConfig {
+    /// Clamp every rule's multiplier into the allowed bounds. Called on load so
+    /// downstream code can trust the values without re-validating.
+    pub fn clamp_multipliers(&mut self) {
+        for rule in self.dampen.iter_mut().chain(self.boost.iter_mut()) {
+            rule.multiplier = rule
+                .multiplier
+                .clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX);
+        }
+    }
+
+    /// Return the merged, ordered rule list used for last-match-wins matching:
+    /// all `dampen` rules first (in declaration order) then all `boost` rules.
+    pub fn ordered_rules(&self) -> Vec<&GlobRule> {
+        self.dampen.iter().chain(self.boost.iter()).collect()
+    }
+
+    /// True when there are no rules at all (the off / no-op path).
+    pub fn is_empty(&self) -> bool {
+        self.dampen.is_empty() && self.boost.is_empty()
+    }
+}
+
 /// Configuration for cross-domain link discovery (notes ↔ code bridging).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossDomainConfig {
@@ -44,6 +136,11 @@ pub struct FeatureConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InstanceConfig {
     pub instance_id: String,
+    /// Optional path to the graph database (`.lbug`) this instance reads.
+    /// Lets `--config` select a DB so read commands don't also need `--db`.
+    /// Absent → callers fall back to `--db` / `NESTWEAVER_DB` / the default.
+    #[serde(default)]
+    pub db: Option<String>,
     pub snapshot_storage: StorageConfig,
     pub workspace: WorkspaceConfig,
     pub inference: InferenceConfig,
@@ -58,6 +155,79 @@ pub struct InstanceConfig {
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Feature F8 — tiered inline bodies. Controls when brain_context /
+    /// brain_search may embed a result's source body inline.
+    #[serde(default)]
+    pub response: ResponseConfig,
+    /// Feature F6 — per-path dampen/boost ranking priors. Query-independent
+    /// multipliers on result relevance, keyed by file-path glob.
+    #[serde(default)]
+    pub ranking: RankingConfig,
+    /// Feature F16 — response cache tuning (`[cache]`).
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+/// `[cache]` — tuning for the F16 response cache (Feature F16).
+///
+/// The cache stores ZSTD-compressed responses of deterministic read tools in
+/// a `<db>.cache` sidecar. Correctness is key-based: an entry only hits when
+/// the persisted `graph_generation` and a filemeta scope digest both still
+/// match, so a reindex invalidates everything WITHOUT a background daemon.
+/// `max_size_mb` caps total stored size; LRU eviction trims the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Maximum total cache size in MiB before LRU eviction kicks in.
+    /// Default 256.
+    #[serde(default = "default_cache_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+fn default_cache_max_size_mb() -> u64 {
+    256
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_size_mb: default_cache_max_size_mb(),
+        }
+    }
+}
+
+/// `[response]` — tuning for tiered inline bodies (Feature F8).
+///
+/// Inline bodies are off by default; the caller must opt in (CLI
+/// `--inline-bodies`, MCP `include_bodies: true`). When opted in, a result's
+/// body is embedded only if its normalized relevance clears
+/// `inline_body_threshold`. Each body is truncated to `inline_max_body_tokens`
+/// (chars/4 estimate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseConfig {
+    /// Minimum normalized relevance (0.0–1.0) a result must reach before its
+    /// body is embedded inline. Default 0.75.
+    #[serde(default = "default_inline_body_threshold")]
+    pub inline_body_threshold: f64,
+    /// Per-body cap in estimated tokens (chars/4). Default 800.
+    #[serde(default = "default_inline_max_body_tokens")]
+    pub inline_max_body_tokens: usize,
+}
+
+fn default_inline_body_threshold() -> f64 {
+    0.75
+}
+
+fn default_inline_max_body_tokens() -> usize {
+    800
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            inline_body_threshold: default_inline_body_threshold(),
+            inline_max_body_tokens: default_inline_max_body_tokens(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -92,6 +262,11 @@ pub struct RepoConfig {
     pub url: String,
     pub sparse: Option<bool>,
     pub pin_sha: Option<String>,
+    /// Feature F12 — per-repo opt-out for git-activity-dampened CodeRank.
+    /// `None`/`Some(true)` → recency dampening applies when a sidecar exists;
+    /// `Some(false)` → this repo never has its CodeRank dampened by git
+    /// activity (e.g. a vendored/generated repo where commit recency is noise).
+    pub use_git_activity: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -155,9 +330,17 @@ pub struct McpServerConfig {
 }
 
 impl InstanceConfig {
+    /// The DB path declared by this instance, if any.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        self.db.as_ref().map(std::path::PathBuf::from)
+    }
+
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
-        let config: Self = toml::from_str(s)?;
+        let mut config: Self = toml::from_str(s)?;
+        // Feature F6: clamp ranking-prior multipliers into bounds on load so
+        // downstream code can trust the values without re-validating.
+        config.ranking.clamp_multipliers();
         if config.inference.endpoint.is_empty() {
             anyhow::bail!("inference.endpoint must be set (no global default allowed)");
         }
@@ -242,6 +425,25 @@ url = "https://github.com/example/repo"
         assert_eq!(cfg.repos.len(), 1);
         assert_eq!(cfg.repos[0].url, "https://github.com/example/repo");
         assert!(cfg.schema_extensions.is_none());
+    }
+
+    // Bug #19: `--config` should let a command select its DB. The config
+    // carries an optional `db` path; absent → None (backward compatible).
+    #[test]
+    fn parses_optional_db_path() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert_eq!(
+            cfg.db_path(),
+            None,
+            "absent db must stay None (backward compatible)"
+        );
+
+        let with_db = format!("db = \"/home/u/.nestweaver/main.lbug\"\n{MINIMAL_TOML}");
+        let cfg2 = InstanceConfig::from_toml_str(&with_db).expect("should parse");
+        assert_eq!(
+            cfg2.db_path(),
+            Some(std::path::PathBuf::from("/home/u/.nestweaver/main.lbug"))
+        );
     }
 
     #[test]
@@ -390,6 +592,96 @@ entry_points = ["syncData", "fetchRecords"]
         assert_eq!(features[0].name, "data-sync");
         assert_eq!(features[0].repos, vec!["app", "service"]);
         assert_eq!(features[0].entry_points, vec!["syncData", "fetchRecords"]);
+    }
+
+    // Feature F6: `[ranking]` parses into dampen/boost lists and multipliers
+    // are clamped to [0.05, 5.0] on load.
+    #[test]
+    fn parses_ranking_priors_and_clamps_multipliers() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[ranking]
+
+[[ranking.dampen]]
+glob = "_logs/2020/**"
+multiplier = 0.3
+
+[[ranking.dampen]]
+glob = "archive/**"
+multiplier = 0.0
+
+[[ranking.boost]]
+glob = "Projects/*/sync.md"
+multiplier = 1.5
+
+[[ranking.boost]]
+glob = "critical/**"
+multiplier = 100.0
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert_eq!(cfg.ranking.dampen.len(), 2);
+        assert_eq!(cfg.ranking.boost.len(), 2);
+        assert_eq!(cfg.ranking.dampen[0].glob, "_logs/2020/**");
+        assert!((cfg.ranking.dampen[0].multiplier - 0.3).abs() < 1e-9);
+        // 0.0 clamped up to the floor.
+        assert!((cfg.ranking.dampen[1].multiplier - RANKING_MULTIPLIER_MIN).abs() < 1e-9);
+        assert!((cfg.ranking.boost[0].multiplier - 1.5).abs() < 1e-9);
+        // 100.0 clamped down to the ceiling.
+        assert!((cfg.ranking.boost[1].multiplier - RANKING_MULTIPLIER_MAX).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ranking_defaults_to_empty_noop() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(cfg.ranking.is_empty(), "absent [ranking] must be a no-op");
+    }
+
+    // Feature F12: git_activity_weight defaults to 1.2 (the clamp-fix value, not
+    // the RFC's 0.6) and per-repo use_git_activity parses as an opt-out.
+    #[test]
+    fn git_activity_weight_defaults_to_1_2() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        assert!(
+            (cfg.ranking.git_activity_weight - 1.2).abs() < 1e-9,
+            "default git_activity_weight must be 1.2, got {}",
+            cfg.ranking.git_activity_weight
+        );
+    }
+
+    #[test]
+    fn git_activity_weight_override_and_repo_opt_out_parse() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[ranking]
+git_activity_weight = 0.8
+
+[[repos]]
+url = "https://github.com/example/live"
+
+[[repos]]
+url = "https://github.com/example/vendored"
+use_git_activity = false
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert!((cfg.ranking.git_activity_weight - 0.8).abs() < 1e-9);
+        let live = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/live")
+            .expect("live repo");
+        let vendored = cfg
+            .repos
+            .iter()
+            .find(|r| r.url == "https://github.com/example/vendored")
+            .expect("vendored repo");
+        assert_eq!(live.use_git_activity, None);
+        assert_eq!(vendored.use_git_activity, Some(false));
     }
 
     #[test]

@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { useStore } from "../stores";
 import { useLiveUpdates } from "../sse/useLiveUpdates";
+import { useWasmEngine } from "../hooks/useWasmEngine";
 import type { BrainStatus, Repo } from "../api/types";
 
 export function StatusBar() {
   useLiveUpdates();
+  const wasm = useWasmEngine();
 
   const [status, setStatus] = useState<BrainStatus | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -35,6 +37,22 @@ export function StatusBar() {
       >
         {sseConnected ? "● Live" : "○ Static"}
       </span>
+      {wasm.enabled && (
+        <span
+          className={
+            wasm.ready
+              ? "text-blue-400"
+              : "text-[var(--color-text-muted)]"
+          }
+          title={
+            wasm.ready
+              ? `WASM: ${wasm.nodeCount} nodes, ${wasm.edgeCount} edges`
+              : "WASM: initializing"
+          }
+        >
+          {wasm.ready ? `WASM: ready (${wasm.nodeCount}n)` : "WASM: loading…"}
+        </span>
+      )}
       <span className="ml-auto capitalize">{mode}</span>
     </footer>
   );

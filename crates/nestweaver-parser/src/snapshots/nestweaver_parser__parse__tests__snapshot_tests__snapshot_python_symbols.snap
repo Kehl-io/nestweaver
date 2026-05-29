@@ -1,11 +1,11 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 1888
 expression: "parsed_symbols(\"simple.py\", &source)"
 ---
 - name: standalone_function
   kind: Function
   start_line: 4
+  end_line: 5
   signature: "def standalone_function(name):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -15,6 +15,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: decorator_factory
   kind: Function
   start_line: 7
+  end_line: 12
   signature: "def decorator_factory(prefix):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: decorator
   kind: Function
   start_line: 8
+  end_line: 11
   signature: "def decorator(func):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -33,6 +35,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: wrapper
   kind: Function
   start_line: 9
+  end_line: 10
   signature: "def wrapper(*args, **kwargs):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: decorated_greet
   kind: Function
   start_line: 15
+  end_line: 16
   signature: "def decorated_greet(name):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -51,6 +55,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: Animal
   kind: Class
   start_line: 18
+  end_line: 23
   signature: "class Animal:"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -60,6 +65,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: __init__
   kind: Method
   start_line: 19
+  end_line: 20
   signature: "def __init__(self, name):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -69,6 +75,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: speak
   kind: Method
   start_line: 22
+  end_line: 23
   signature: "def speak(self):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -78,6 +85,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: Dog
   kind: Class
   start_line: 25
+  end_line: 27
   signature: "class Dog(Animal):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -87,6 +95,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: speak
   kind: Method
   start_line: 26
+  end_line: 27
   signature: "def speak(self):"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -96,6 +105,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
 - name: main
   kind: Function
   start_line: 29
+  end_line: 34
   signature: "def main():"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

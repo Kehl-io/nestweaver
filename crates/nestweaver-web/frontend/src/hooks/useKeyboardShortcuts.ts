@@ -1,8 +1,9 @@
 import { useHotkeys } from "react-hotkeys-hook";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
+import { useNavigationHistory } from "./useNavigationHistory";
 
-const MODES: GraphMode[] = ["context", "impact", "repos", "features", "inspector"];
+const MODES: GraphMode[] = ["context", "impact", "repos", "features"];
 
 export function useKeyboardShortcuts() {
   const setMode = useStore((s) => s.setGraphMode);
@@ -12,12 +13,13 @@ export function useKeyboardShortcuts() {
   const toggleMinimap = useStore((s) => s.toggleMinimap);
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
+  const toggleViewMode = useStore((s) => s.toggleViewMode);
+  const { undo, redo } = useNavigationHistory();
 
   useHotkeys("1", () => setMode(MODES[0]));
   useHotkeys("2", () => setMode(MODES[1]));
   useHotkeys("3", () => setMode(MODES[2]));
   useHotkeys("4", () => setMode(MODES[3]));
-  useHotkeys("5", () => setMode(MODES[4]));
 
   useHotkeys("[", () => toggleLeft());
   useHotkeys("]", () => toggleRight());
@@ -27,6 +29,26 @@ export function useKeyboardShortcuts() {
   useHotkeys("t", () => toggleTags());
 
   useHotkeys("escape", () => selectNode(null));
+
+  // mod+z — undo navigation
+  useHotkeys(
+    "mod+z",
+    (e) => {
+      e.preventDefault();
+      undo();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
+
+  // mod+shift+z — redo navigation
+  useHotkeys(
+    "mod+shift+z",
+    (e) => {
+      e.preventDefault();
+      redo();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
 
   // i — impact analysis for selected node
   useHotkeys("i", () => {
@@ -53,9 +75,17 @@ export function useKeyboardShortcuts() {
     { enableOnFormTags: ["INPUT"] },
   );
 
+  // mod+l — toggle between graph and list view
+  useHotkeys(
+    "mod+l",
+    (e) => {
+      e.preventDefault();
+      toggleViewMode();
+    },
+    { enableOnFormTags: ["INPUT"] },
+  );
+
   // e — export (no-op; export menu is UI-driven via toolbar button)
-  // f — fit to viewport (requires sigma ref, not available here;
-  //     implement via store action that GraphPanel reads)
-  // r — reset layout (requires ForceAtlas2 restart via sigma ref;
-  //     implement via store action that GraphPanel reads)
+  // f — fit to viewport (implement via store action that GraphPanel reads)
+  // r — reset layout (implement via store action that GraphPanel reads)
 }

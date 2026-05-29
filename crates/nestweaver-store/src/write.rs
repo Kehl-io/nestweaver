@@ -1,10 +1,19 @@
 use nestweaver_schema::{
-    EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol, Tag,
-    Vault,
+    Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
+    Tag, Vault,
 };
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+
+/// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
+/// `framework_hint` column stores. Returns an empty string when absent.
+fn encode_framework_hint(symbol: &Symbol) -> String {
+    match &symbol.framework_hint {
+        Some(h) => format!("{}:{}", h.framework, h.role),
+        None => String::new(),
+    }
+}
 
 fn exec_params(
     conn: &lbug::Connection<'_>,
@@ -92,9 +101,10 @@ impl GraphStore {
         exec_params(
             conn,
             "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
-             repo_uid: $repo, file_path: $fp, start_line: $sl, \
+             repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
-             pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
+             pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
+             framework_hint: $fh})",
             vec![
                 ("uid", lbug::Value::String(symbol.uid.clone())),
                 ("name", lbug::Value::String(symbol.name.clone())),
@@ -102,6 +112,7 @@ impl GraphStore {
                 ("repo", lbug::Value::String(symbol.repo_uid.clone())),
                 ("fp", lbug::Value::String(symbol.file_path.clone())),
                 ("sl", lbug::Value::Int64(symbol.start_line as i64)),
+                ("el", lbug::Value::Int64(symbol.end_line as i64)),
                 ("sig", lbug::Value::String(symbol.signature.clone())),
                 (
                     "summary",
@@ -132,6 +143,7 @@ impl GraphStore {
                             .unwrap_or_default(),
                     ),
                 ),
+                ("fh", lbug::Value::String(encode_framework_hint(symbol))),
             ],
         )
     }
@@ -149,9 +161,10 @@ impl GraphStore {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
-                 repo_uid: $repo, file_path: $fp, start_line: $sl, \
+                 repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
                  signature: $sig, summary: $summary, content_hash: $hash, \
-                 pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk})",
+                 pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
+                 framework_hint: $fh})",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for symbol in symbols {
@@ -164,6 +177,7 @@ impl GraphStore {
                     ("repo", lbug::Value::String(symbol.repo_uid.clone())),
                     ("fp", lbug::Value::String(symbol.file_path.clone())),
                     ("sl", lbug::Value::Int64(symbol.start_line as i64)),
+                    ("el", lbug::Value::Int64(symbol.end_line as i64)),
                     ("sig", lbug::Value::String(symbol.signature.clone())),
                     (
                         "summary",
@@ -194,6 +208,7 @@ impl GraphStore {
                                 .unwrap_or_default(),
                         ),
                     ),
+                    ("fh", lbug::Value::String(encode_framework_hint(symbol))),
                 ],
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
@@ -484,6 +499,36 @@ impl GraphStore {
                     ],
                 )
             }
+            EdgeType::ImplementsContract => exec_params(
+                conn,
+                "MATCH (a:Symbol {uid: $src}), (b:Contract {uid: $tgt}) \
+                 CREATE (a)-[:IMPLEMENTS_CONTRACT {confidence: $conf}]->(b)",
+                vec![
+                    ("src", lbug::Value::String(src)),
+                    ("tgt", lbug::Value::String(tgt)),
+                    ("conf", lbug::Value::Double(conf)),
+                ],
+            ),
+            EdgeType::Supersedes
+            | EdgeType::DependsOn
+            | EdgeType::CausedBy
+            | EdgeType::RelatesTo => {
+                // F11 typed Note→Note relationships.
+                let rel = edge.edge_type.rel_table_name();
+                let q = format!(
+                    "MATCH (a:Note {{uid: $src}}), (b:Note {{uid: $tgt}}) \
+                     CREATE (a)-[:{rel} {{confidence: $conf}}]->(b)"
+                );
+                exec_params(
+                    conn,
+                    &q,
+                    vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ],
+                )
+            }
             EdgeType::ProjectIncludesSymbol
             | EdgeType::ProjectIncludesNote
             | EdgeType::ProjectHasComponent
@@ -668,6 +713,32 @@ impl GraphStore {
                         ("tgt", lbug::Value::String(tgt)),
                         ("conf", lbug::Value::Double(conf)),
                         ("lt", lbug::Value::String(link_type)),
+                    ]);
+                }
+                EdgeType::ImplementsContract => {
+                    let key = "MATCH (a:Symbol {uid: $src}), (b:Contract {uid: $tgt}) \
+                               CREATE (a)-[:IMPLEMENTS_CONTRACT {confidence: $conf}]->(b)"
+                        .to_string();
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                    ]);
+                }
+                EdgeType::Supersedes
+                | EdgeType::DependsOn
+                | EdgeType::CausedBy
+                | EdgeType::RelatesTo => {
+                    // F11 typed Note→Note relationships.
+                    let rel = edge.edge_type.rel_table_name();
+                    let key = format!(
+                        "MATCH (a:Note {{uid: $src}}), (b:Note {{uid: $tgt}}) \
+                         CREATE (a)-[:{rel} {{confidence: $conf}}]->(b)"
+                    );
+                    groups.entry(key).or_default().push(vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
                     ]);
                 }
                 EdgeType::ProjectIncludesSymbol
@@ -1083,6 +1154,92 @@ impl GraphStore {
         )
     }
 
+    /// Record a genuinely-unresolved wikilink (`[[Target]]` with no matching
+    /// note) so the broken-links query can surface it. `uid` is derived from
+    /// the source section + link text by the caller so re-indexing the same
+    /// note replaces rather than duplicates. DETACH DELETE-by-uid first makes
+    /// the insert idempotent. Table may not exist on older DBs — caller treats
+    /// errors as best-effort.
+    pub fn insert_unresolved_wikilink(
+        &self,
+        uid: &str,
+        source_note_uid: &str,
+        source_path: &str,
+        source_title: &str,
+        wikilink_text: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (u:UnresolvedWikilink {uid: $uid}) DETACH DELETE u",
+            vec![("uid", lbug::Value::String(uid.to_string()))],
+        )?;
+        exec_params(
+            &conn,
+            "CREATE (:UnresolvedWikilink {uid: $uid, source_note_uid: $snu, \
+             source_path: $sp, source_title: $st, wikilink_text: $wt})",
+            vec![
+                ("uid", lbug::Value::String(uid.to_string())),
+                ("snu", lbug::Value::String(source_note_uid.to_string())),
+                ("sp", lbug::Value::String(source_path.to_string())),
+                ("st", lbug::Value::String(source_title.to_string())),
+                ("wt", lbug::Value::String(wikilink_text.to_string())),
+            ],
+        )
+    }
+
+    /// Remove all recorded unresolved wikilinks originating from `note_uid`.
+    /// Called from `delete_note_cascade` so stale rows do not linger after a
+    /// note is re-indexed (e.g. once its target note appears). Best-effort:
+    /// silently succeeds if the table does not exist.
+    pub fn delete_unresolved_wikilinks_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        if let Err(e) = exec_params(
+            &conn,
+            "MATCH (u:UnresolvedWikilink {source_note_uid: $uid}) DETACH DELETE u",
+            vec![("uid", lbug::Value::String(note_uid.to_string()))],
+        ) {
+            tracing::trace!("delete_unresolved_wikilinks_for_note skipped: {e}");
+        }
+        Ok(())
+    }
+
+    /// Insert (or idempotently replace) a Contract node. Mirrors
+    /// `insert_project`: DETACH DELETE by UID first so re-indexing a spec
+    /// or handler does not accumulate duplicate Contract nodes.
+    pub fn insert_contract(&self, contract: &Contract) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (c:Contract {uid: $uid}) DETACH DELETE c",
+            vec![("uid", lbug::Value::String(contract.uid.clone()))],
+        )?;
+        exec_params(
+            &conn,
+            "CREATE (:Contract {uid: $uid, kind: $kind, verb: $verb, path: $path, \
+             operation_id: $op, repo_uid: $repo, source_path: $src, confidence: $conf})",
+            vec![
+                ("uid", lbug::Value::String(contract.uid.clone())),
+                ("kind", lbug::Value::String(contract.kind.clone())),
+                (
+                    "verb",
+                    lbug::Value::String(contract.verb.clone().unwrap_or_default()),
+                ),
+                (
+                    "path",
+                    lbug::Value::String(contract.path.clone().unwrap_or_default()),
+                ),
+                (
+                    "op",
+                    lbug::Value::String(contract.operation_id.clone().unwrap_or_default()),
+                ),
+                ("repo", lbug::Value::String(contract.repo_uid.clone())),
+                ("src", lbug::Value::String(contract.source_path.clone())),
+                ("conf", lbug::Value::Float(contract.confidence)),
+            ],
+        )
+    }
+
     pub fn batch_insert_wikilink_to_note_edges(
         &self,
         edges: &[(&str, &str, f32, &str)],
@@ -1319,6 +1476,10 @@ impl GraphStore {
             "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
+
+        // 4. Drop any recorded unresolved-wikilink rows for this note so they
+        //    do not linger after re-index (e.g. once the target note appears).
+        self.delete_unresolved_wikilinks_for_note(note_uid)?;
 
         Ok(())
     }
@@ -1662,6 +1823,39 @@ impl GraphStore {
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         )?;
+        Ok(())
+    }
+
+    /// Delete all repo-scoped graph nodes that are NOT keyed off a stable,
+    /// re-derivable UID and therefore would collide on a forced full re-index.
+    ///
+    /// `bulk_index_write` plain-`CREATE`s `Service` nodes (whose UID is derived
+    /// from `repo_uid` + directory), and the contracts pass creates `Contract`
+    /// nodes. Re-running `index --force` regenerates the same UIDs, so without
+    /// clearing them first the second run trips LadybugDB's primary-key
+    /// uniqueness constraint (`Found duplicated primary key value svc:...`).
+    ///
+    /// `DETACH DELETE` also removes incident `SERVICE_HAS_SYMBOL`,
+    /// `IMPLEMENTS_CONTRACT`, and `SUPERSEDES`/`DEPENDS_ON`/`CAUSED_BY`/
+    /// `RELATES_TO` edges. `Symbol`/`File` nodes are cleared separately by the
+    /// per-file `delete_symbols_in_file` / `delete_file_node` path. Idempotent:
+    /// a no-op for repos with no services/contracts.
+    pub fn clear_repo_derived_nodes(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        // Service nodes for this repo.
+        exec_params(
+            &conn,
+            "MATCH (s:Service {repo_uid: $uid}) DETACH DELETE s",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        )?;
+        // Contract nodes for this repo (table may not exist on older DBs).
+        if let Err(e) = exec_params(
+            &conn,
+            "MATCH (c:Contract {repo_uid: $uid}) DETACH DELETE c",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        ) {
+            tracing::trace!("clear_repo_derived_nodes: Contract delete skipped: {e}");
+        }
         Ok(())
     }
 

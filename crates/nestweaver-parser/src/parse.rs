@@ -60,6 +60,7 @@ pub struct RawSymbol {
     pub name: String,
     pub kind: SymbolKind,
     pub start_line: u32,
+    pub end_line: u32,
     pub signature: String,
     pub content_hash: String,
     pub is_entry_point: bool,
@@ -641,13 +642,21 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     SymbolKind::TypeAlias => "type_alias",
                     SymbolKind::Variable => "variable",
                 };
-                let ep_kind = detect_entry_point(
-                    &name,
-                    &file_path_str,
-                    kind_label,
-                    Some(&signature),
-                    lang_str,
-                );
+                // A `definition.function` captured on a `call_expression` node is a
+                // JS/TS test-runner block (test/it/describe). The calls inside its
+                // callback attach to this symbol; mark it a test entry point so it
+                // is reachable by regression-test selection regardless of filename.
+                let ep_kind = if node.kind() == "call_expression" {
+                    Some(EntryPointKind::TestEntry)
+                } else {
+                    detect_entry_point(
+                        &name,
+                        &file_path_str,
+                        kind_label,
+                        Some(&signature),
+                        lang_str,
+                    )
+                };
 
                 let visibility = infer_visibility(&name, &node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
@@ -655,6 +664,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     name,
                     kind,
                     start_line,
+                    end_line: node.end_position().row as u32 + 1,
                     signature,
                     content_hash,
                     is_entry_point: ep_kind.is_some(),
@@ -802,6 +812,26 @@ mod tests {
     }
 
     #[test]
+    fn symbol_end_line_spans_multiline_body() {
+        // P0.1: a multi-line function must record end_line past start_line.
+        let source = "function greet(name) {\n  return hello(name);\n}\n";
+        let parsed = parse_source(Path::new("t.js"), source).unwrap();
+        let greet = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("should find 'greet'");
+        assert_eq!(greet.start_line, 1);
+        assert!(
+            greet.end_line > greet.start_line,
+            "end_line ({}) should span past start_line ({})",
+            greet.end_line,
+            greet.start_line
+        );
+        assert_eq!(greet.end_line, 3, "the 3-line function body ends on line 3");
+    }
+
+    #[test]
     fn parse_js_extracts_class_and_methods() {
         let source = fixture("js/simple.js");
         let parsed = parse_source(Path::new("simple.js"), &source).unwrap();
@@ -846,6 +876,68 @@ mod tests {
             calls.iter().any(|r| r.name == "greet"),
             "should find call to 'greet'; found: {:?}",
             calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Test-runner symbol extraction (Jest/Vitest/Mocha) ───────────────────
+
+    #[test]
+    fn parse_js_extracts_test_runner_call_as_symbol() {
+        // `test('name', () => foo())` should yield a symbol named after the test
+        // title, spanning the call so the inner call to `foo` attaches to it.
+        let source = "import { foo } from './x';\ntest('greets', () => { foo('a'); });\n";
+        let parsed = parse_source(Path::new("app.test.js"), source).unwrap();
+
+        let test_sym = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "greets")
+            .unwrap_or_else(|| {
+                panic!(
+                    "should find a symbol named 'greets'; got: {:?}",
+                    parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            matches!(test_sym.kind, SymbolKind::Function | SymbolKind::Method),
+            "test symbol should be a function/method; got {:?}",
+            test_sym.kind
+        );
+        assert_eq!(
+            test_sym.entry_point_kind,
+            Some(EntryPointKind::TestEntry),
+            "test symbol should be a TestEntry entry point"
+        );
+
+        // The call to `foo` must fall inside the test symbol's span so the
+        // resolver attaches it as a CALLS edge from the test.
+        let foo_call = parsed
+            .references
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Call && r.name == "foo")
+            .expect("should capture call to 'foo' inside the test callback");
+        assert!(
+            foo_call.start_line >= test_sym.start_line && foo_call.start_line <= test_sym.end_line,
+            "call to 'foo' (line {}) should be within test span {}..={}",
+            foo_call.start_line,
+            test_sym.start_line,
+            test_sym.end_line
+        );
+    }
+
+    #[test]
+    fn parse_ts_extracts_describe_and_it_as_symbols() {
+        let source =
+            "describe('suite', () => {\n  it('does a thing', () => {\n    work();\n  });\n});\n";
+        let parsed = parse_source(Path::new("app.test.ts"), source).unwrap();
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"suite"),
+            "should find describe-block symbol 'suite'; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"does a thing"),
+            "should find it-block symbol 'does a thing'; got: {names:?}"
         );
     }
 

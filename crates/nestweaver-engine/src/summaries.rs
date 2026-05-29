@@ -535,6 +535,7 @@ mod tests {
             repo_uid: "repo:test".to_string(),
             file_path: "src/main.js".to_string(),
             start_line: 10,
+            end_line: 10,
             signature: "function greet(name)".to_string(),
             summary: None,
             content_hash: "abc".to_string(),
@@ -566,6 +567,7 @@ mod tests {
             repo_uid: "repo:test".to_string(),
             file_path: "src/lib.rs".to_string(),
             start_line: 1,
+            end_line: 1,
             signature: "fn foo()".to_string(),
             summary: None,
             content_hash: "a".to_string(),
@@ -584,6 +586,7 @@ mod tests {
             repo_uid: "repo:test".to_string(),
             file_path: "src/lib.rs".to_string(),
             start_line: 20,
+            end_line: 20,
             signature: "class Bar".to_string(),
             summary: None,
             content_hash: "b".to_string(),
@@ -667,7 +670,7 @@ mod tests {
             content: "file summary".to_string(),
             token_estimate: 5,
         }];
-        let symbol_summaries = vec![Summary {
+        let symbol_summaries = [Summary {
             level: SummaryLevel::Symbol,
             target_uid: "sym:main".to_string(),
             target_name: "main".to_string(),

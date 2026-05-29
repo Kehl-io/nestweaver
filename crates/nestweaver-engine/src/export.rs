@@ -379,6 +379,7 @@ mod tests {
             repo_uid: "repo-1".to_string(),
             file_path: file_path.to_string(),
             start_line: 10,
+            end_line: 10,
             signature: format!("fn {name}()"),
             summary: None,
             content_hash: "hash".to_string(),

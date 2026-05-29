@@ -13,8 +13,12 @@ export function GraphToolbar() {
   const toggleCommunity = useStore((s) => s.toggleCommunityOverlay);
   const toggleTags = useStore((s) => s.toggleTags);
   const toggleMinimap = useStore((s) => s.toggleMinimap);
+  const reducedEffects = useStore((s) => s.reducedEffects);
+  const toggleReducedEffects = useStore((s) => s.toggleReducedEffects);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
+  const viewMode = useStore((s) => s.viewMode);
+  const toggleViewMode = useStore((s) => s.toggleViewMode);
 
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
 
@@ -28,10 +32,13 @@ export function GraphToolbar() {
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
   const gapActive = useStore((s) => s.gapActive);
 
+  const isListView = viewMode === "list";
+
   const buttons = [
     { label: "C", title: "Toggle community detection (c)", active: communityOverlay, onClick: toggleCommunity },
     { label: "#", title: "Toggle tag nodes (t)", active: tagsVisible, onClick: toggleTags },
     { label: "M", title: "Toggle minimap (m)", active: minimapVisible, onClick: toggleMinimap },
+    { label: "~", title: "Reduced effects — disable bloom and breathing animations", active: reducedEffects, onClick: toggleReducedEffects },
   ];
 
   const isZen = layoutMode === "zen";
@@ -52,6 +59,21 @@ export function GraphToolbar() {
           {b.label}
         </button>
       ))}
+
+      {/* List / graph view toggle */}
+      <button
+        onClick={toggleViewMode}
+        title={isListView ? "Switch to graph view (Ctrl+L)" : "Switch to list view (Ctrl+L)"}
+        aria-pressed={isListView}
+        aria-label={isListView ? "Switch to graph view" : "Switch to list view"}
+        className={`flex h-8 w-8 items-center justify-center rounded border text-xs transition-colors ${
+          isListView
+            ? "border-blue-300 bg-blue-100 text-blue-700"
+            : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)]"
+        }`}
+      >
+        {isListView ? "◉" : "☰"}
+      </button>
 
       {/* UMAP semantic layout */}
       <button

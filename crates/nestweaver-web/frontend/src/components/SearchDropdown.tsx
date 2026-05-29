@@ -1,4 +1,5 @@
 import { useStore } from "../stores";
+import { GlassPanel } from "./panels/GlassPanel";
 import { KindBadge } from "./shared/KindBadge";
 
 interface SearchDropdownProps {
@@ -16,7 +17,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const hasResults = symbols.length > 0 || notes.length > 0;
 
   return (
-    <div
+    <GlassPanel
       role="listbox"
       aria-label="Search results"
       aria-activedescendant={activeDescendant}
@@ -83,6 +84,6 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
           ))}
         </div>
       )}
-    </div>
+    </GlassPanel>
   );
 }

@@ -1,11 +1,11 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2370
 expression: "parsed_symbols(\"simple.sh\", &source)"
 ---
 - name: greet
   kind: Function
   start_line: 6
+  end_line: 9
   signature: "greet() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -15,6 +15,7 @@ expression: "parsed_symbols(\"simple.sh\", &source)"
 - name: format_name
   kind: Function
   start_line: 12
+  end_line: 14
   signature: "format_name() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.sh\", &source)"
 - name: main
   kind: Function
   start_line: 17
+  end_line: 21
   signature: "main() {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

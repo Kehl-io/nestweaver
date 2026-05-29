@@ -4,7 +4,9 @@ use serde::Serialize;
 
 use anyhow::Context;
 
-use crate::config::{FeatureConfig, LinkConfig};
+use crate::config::{
+    FeatureConfig, LinkConfig, RANKING_MULTIPLIER_MAX, RANKING_MULTIPLIER_MIN, RankingConfig,
+};
 use crate::repo_display_name;
 
 /// Tuning knobs for hybrid PPR + BM25 + semantic retrieval.
@@ -34,6 +36,16 @@ pub struct HybridSearchConfig {
     pub weight_semantic: f64,
     pub bm25_limit: usize,
     pub semantic_limit: usize,
+    /// Feature F7 (PRF half) — when `true`, the BM25 leg of hybrid retrieval
+    /// runs a two-pass pseudo-relevance-feedback expansion before fusion.
+    /// Off by default → identical behaviour to before.
+    ///
+    /// RRF CAVEAT: RRF fuses by *rank only*, so the PRF expansion weight
+    /// ([`nestweaver_store::PRF_EXPANSION_WEIGHT`] = 0.3) never appears in the
+    /// final fused score. PRF reaches the fused result purely by reordering
+    /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
+    /// the 0.3 boost to surface numerically in the output relevance.
+    pub prf: bool,
 }
 
 impl Default for HybridSearchConfig {
@@ -45,6 +57,7 @@ impl Default for HybridSearchConfig {
             weight_semantic: 0.0,
             bm25_limit: 500,
             semantic_limit: 200,
+            prf: false,
         }
     }
 }
@@ -340,6 +353,92 @@ pub fn build_context_with_intent(
 // ── build_context tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod promote_tests {
+    use super::{BrainContextResult, BrainNode, promote_member_notes_into_connected};
+    use std::collections::HashSet;
+
+    fn note(uid: &str) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Note".to_string(),
+            title: uid.to_string(),
+            location: format!("Projects/x/{uid}.md"),
+            relevance: 0.9,
+            inline_body: None,
+        }
+    }
+
+    fn symbol(uid: &str) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Symbol".to_string(),
+            title: uid.to_string(),
+            location: format!("src/{uid}.rs"),
+            relevance: 0.5,
+            inline_body: None,
+        }
+    }
+
+    // Bug #12: when a project declares repos, its member notes are seeded into
+    // PPR (to survive the min_score filter) and therefore land in `seeds`,
+    // which is disjoint from `connected` and never rendered. The notes must be
+    // surfaced into `connected` so project orientation actually shows them.
+    #[test]
+    fn promotes_member_notes_from_seeds_into_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![note("note:prd"), note("note:status")],
+            connected: vec![symbol("sym:handler")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
+            .into_iter()
+            .collect();
+
+        promote_member_notes_into_connected(&mut result, &members);
+
+        let connected_uids: Vec<&str> = result.connected.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            connected_uids.contains(&"note:prd"),
+            "member note 'note:prd' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            connected_uids.contains(&"note:status"),
+            "member note 'note:status' must surface in connected; got {connected_uids:?}"
+        );
+    }
+
+    // Non-member seeds (e.g. the project node itself) stay out of connected,
+    // and a member note already present is not duplicated.
+    #[test]
+    fn does_not_duplicate_or_promote_non_members() {
+        let mut result = BrainContextResult {
+            seeds: vec![note("note:prd"), symbol("proj:x")],
+            connected: vec![note("note:prd"), symbol("sym:handler")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
+
+        promote_member_notes_into_connected(&mut result, &members);
+
+        let prd_count = result
+            .connected
+            .iter()
+            .filter(|n| n.uid == "note:prd")
+            .count();
+        assert_eq!(
+            prd_count, 1,
+            "already-present member note must not be duplicated"
+        );
+        assert!(
+            !result.connected.iter().any(|n| n.uid == "proj:x"),
+            "non-member seed must not be promoted"
+        );
+    }
+}
+
+#[cfg(test)]
 mod context_tests {
     use std::fs;
 
@@ -575,13 +674,19 @@ pub fn build_feature_context(
 /// One ranked node in a brain-context result. Carries the kind discriminator
 /// so the caller can format / filter results by domain (Symbol vs Note vs
 /// Section vs Tag vs Heading).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BrainNode {
     pub uid: String,
     pub kind: String,
     pub title: String,
     pub location: String,
     pub relevance: f64,
+    /// Feature F8 (tiered inline bodies): the node's source body, populated
+    /// only when the caller opted in *and* the node's normalized relevance
+    /// cleared the configured threshold. `None` (and omitted from JSON) by
+    /// default so existing callers see unchanged output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_body: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -589,6 +694,39 @@ pub struct BrainContextResult {
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
     pub unresolved_seeds: Vec<String>,
+    /// Feature F7 (PRF half) — terms mined by pseudo-relevance feedback and
+    /// fed into the pass-2 BM25 query. Empty unless PRF was enabled. Surfaced
+    /// for `--debug` / response auditing. Omitted from JSON when empty so the
+    /// default (PRF-off) output is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expansion_terms: Vec<String>,
+}
+
+/// Surface a project's curated member notes into the rendered `connected`
+/// list.
+///
+/// `project_context` seeds PPR from the project's member notes so they (a)
+/// survive the `min_score` filter in `personalized_pagerank` — which would
+/// otherwise drop them once the project node fans out across tens of
+/// thousands of `PROJECT_INCLUDES_SYMBOL` edges — and (b) let the walk
+/// explore their neighbourhoods. But seeded UIDs land in `seeds`, which is
+/// disjoint from `connected` and is *not* rendered by the CLI / MCP project
+/// responses. For project orientation the curated notes are the
+/// authoritative answer, so promote any member note that resolved as a seed
+/// (and isn't already present) into `connected`. De-duplicated by UID.
+pub fn promote_member_notes_into_connected(
+    result: &mut BrainContextResult,
+    member_note_uids: &std::collections::HashSet<String>,
+) {
+    let present: std::collections::HashSet<String> =
+        result.connected.iter().map(|n| n.uid.clone()).collect();
+    let promoted: Vec<BrainNode> = result
+        .seeds
+        .iter()
+        .filter(|n| member_note_uids.contains(&n.uid) && !present.contains(&n.uid))
+        .cloned()
+        .collect();
+    result.connected.extend(promoted);
 }
 
 /// Build a task-focused context subgraph using the unified scope (code +
@@ -838,11 +976,30 @@ pub fn build_brain_context_hybrid_with_aliases(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // ── Hybrid retrieval: fuse PPR + BM25 via Reciprocal Rank Fusion ───
+    //
+    // Feature F7 (PRF half): when `config.prf` is set, the BM25 leg runs a
+    // two-pass pseudo-relevance-feedback expansion (`search_prf`) instead of a
+    // single-pass `search`. The mined expansion terms are surfaced on the
+    // result for auditing. RRF is rank-only, so PRF affects the fused result
+    // solely via the reordered BM25 ranks (see `HybridSearchConfig::prf`).
+    let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
         let bm25_query = inputs.join(" ");
-        let bm25_hits = tantivy
-            .search(&bm25_query, config.bm25_limit)
-            .unwrap_or_default();
+        let bm25_hits = if config.prf {
+            match tantivy.search_prf(&bm25_query, config.bm25_limit, nestweaver_store_stoplist()) {
+                Ok((hits, terms)) => {
+                    expansion_terms = terms;
+                    hits
+                }
+                Err(_) => tantivy
+                    .search(&bm25_query, config.bm25_limit)
+                    .unwrap_or_default(),
+            }
+        } else {
+            tantivy
+                .search(&bm25_query, config.bm25_limit)
+                .unwrap_or_default()
+        };
         rrf_fuse(
             &ppr,
             &bm25_hits,
@@ -875,6 +1032,34 @@ pub fn build_brain_context_hybrid_with_aliases(
         seeds,
         connected,
         unresolved_seeds: unresolved,
+        expansion_terms,
+    })
+}
+
+/// The PRF stoplist: the engine's built-in cross-domain [`crate::cross_domain::STOPLIST`].
+///
+/// Reused here so the store crate (which owns the PRF term-mining but cannot
+/// depend on the engine) need not maintain a second stoplist — the engine
+/// threads this list into `TantivyIndex::search_prf`.
+pub fn nestweaver_store_stoplist() -> &'static [&'static str] {
+    // The cross-domain STOPLIST is code-identifier oriented; PRF mines prose
+    // (note/section text), so augment it with common English stopwords to keep
+    // them out of expansion terms (query-drift guard). Combined once, leaked.
+    static COMBINED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    COMBINED.get_or_init(|| {
+        const ENGLISH: &[&str] = &[
+            "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "but",
+            "not", "you", "your", "its", "into", "over", "per", "via", "has", "have", "had",
+            "will", "would", "can", "could", "should", "than", "then", "them", "they", "their",
+            "what", "when", "which", "while", "about", "also", "been", "being", "does", "done",
+            "each", "more", "most", "much", "such", "some", "only", "other", "these", "those",
+            "there", "here", "because", "between", "all", "any", "out", "use", "used", "uses",
+        ];
+        crate::cross_domain::STOPLIST
+            .iter()
+            .copied()
+            .chain(ENGLISH.iter().copied())
+            .collect()
     })
 }
 
@@ -961,6 +1146,7 @@ fn render_brain_node(
                 title: s.name,
                 location: format!("{}:{}", s.file_path, s.start_line),
                 relevance: score,
+                inline_body: None,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -973,6 +1159,7 @@ fn render_brain_node(
                 title: n.title,
                 location: n.file_path,
                 relevance: score,
+                inline_body: None,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -995,6 +1182,7 @@ fn render_brain_node(
             title,
             location,
             relevance: score,
+            inline_body: None,
         }))
     } else if uid.starts_with("sec:") {
         // Look up the Section node and derive a readable title from the
@@ -1041,6 +1229,7 @@ fn render_brain_node(
             title,
             location,
             relevance: score,
+            inline_body: None,
         }))
     } else if uid.starts_with("tag:") {
         Ok(Some(BrainNode {
@@ -1049,10 +1238,214 @@ fn render_brain_node(
             title: uid.to_string(),
             location: String::new(),
             relevance: score,
+            inline_body: None,
         }))
     } else {
         Ok(None)
     }
+}
+
+/// Feature F6 — per-path dampen/boost ranking priors.
+///
+/// Apply a continuous, query-independent prior on result relevance keyed by
+/// file-path glob. For each node, the rule whose glob matches the node's
+/// `location` and appears **last** in the merged (dampen-then-boost) rule list
+/// wins (last-match-wins); the node's `relevance` is multiplied by that rule's
+/// multiplier and the **final product** is clamped to
+/// `[RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX]`. A node whose location
+/// matches no rule is left unchanged.
+///
+/// Must be applied AFTER fusion (RRF is rank-only, so applying before it
+/// no-ops) and BEFORE the caller's sort / truncation. Empty `rules` → no-op.
+///
+/// The matcher is rebuilt per call from `rules`; callers invoke this once per
+/// result set so the cost is negligible. Invalid globs are skipped (and warned)
+/// rather than failing the whole query.
+pub fn apply_ranking_priors(nodes: &mut [BrainNode], rules: &RankingConfig) {
+    if rules.is_empty() || nodes.is_empty() {
+        return;
+    }
+
+    // Compile each rule's glob into a matcher, preserving order. A rule whose
+    // glob fails to compile is dropped (logged) — one bad glob must not break
+    // ranking for the rest.
+    let ordered = rules.ordered_rules();
+    let compiled: Vec<(globset::GlobMatcher, f64)> = ordered
+        .iter()
+        .filter_map(|rule| match globset::Glob::new(&rule.glob) {
+            Ok(g) => Some((g.compile_matcher(), rule.multiplier)),
+            Err(e) => {
+                tracing::warn!(glob = %rule.glob, error = %e, "skipping invalid ranking glob");
+                None
+            }
+        })
+        .collect();
+    if compiled.is_empty() {
+        return;
+    }
+
+    for node in nodes.iter_mut() {
+        // `location` may carry a trailing `:line` (Symbol nodes render as
+        // `path:line`); strip it so the glob matches the path itself.
+        let path = node
+            .location
+            .rsplit_once(':')
+            .filter(|(_, line)| !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+            .map(|(p, _)| p)
+            .unwrap_or(node.location.as_str());
+
+        // Last-match-wins: scan in order and keep the multiplier of the last
+        // matching rule.
+        let mut chosen: Option<f64> = None;
+        for (matcher, multiplier) in &compiled {
+            if matcher.is_match(path) {
+                chosen = Some(*multiplier);
+            }
+        }
+
+        if let Some(multiplier) = chosen {
+            node.relevance =
+                (node.relevance * multiplier).clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX);
+        }
+    }
+}
+
+/// Dry-run companion to [`apply_ranking_priors`] for a single location.
+///
+/// Given a node's file-path `location` and the ranking `rules`, returns the
+/// last matching rule (its glob + multiplier, last-match-wins) — or `None` when
+/// nothing matches — alongside the `final_relevance` that
+/// [`apply_ranking_priors`] would produce from `base_relevance`. Used by the
+/// `nestweaver ranking explain` CLI dry-run so the binary need not depend on
+/// `globset` or duplicate the matching/clamping math.
+pub fn explain_ranking_prior(
+    location: &str,
+    base_relevance: f64,
+    rules: &RankingConfig,
+) -> (Option<(String, f64)>, f64) {
+    // Strip a trailing `:line` (Symbol locations render as `path:line`).
+    let path = location
+        .rsplit_once(':')
+        .filter(|(_, line)| !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+        .map(|(p, _)| p)
+        .unwrap_or(location);
+
+    let mut matched: Option<(String, f64)> = None;
+    for rule in rules.ordered_rules() {
+        match globset::Glob::new(&rule.glob) {
+            Ok(g) if g.compile_matcher().is_match(path) => {
+                matched = Some((rule.glob.clone(), rule.multiplier));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(glob = %rule.glob, error = %e, "skipping invalid ranking glob");
+            }
+        }
+    }
+
+    let final_relevance = match &matched {
+        Some((_, multiplier)) => {
+            (base_relevance * multiplier).clamp(RANKING_MULTIPLIER_MIN, RANKING_MULTIPLIER_MAX)
+        }
+        None => base_relevance,
+    };
+    (matched, final_relevance)
+}
+
+/// Feature F8 — tiered inline bodies.
+///
+/// Populate `inline_body` on each node whose **normalized** relevance clears
+/// `threshold`. Relevance is normalized against the maximum relevance in
+/// `nodes`, so the threshold (e.g. 0.75) is meaningful regardless of the raw
+/// PPR/RRF score scale. Bodies are truncated to `max_body_tokens`
+/// (chars/4 estimate) and, when `token_budget` is `Some`, charged against the
+/// budget in rank order: once the budget would be exceeded, lower-ranked nodes
+/// are left metadata-only (`inline_body = None`) — the node itself is never
+/// dropped.
+///
+/// Source of the body by kind:
+/// - `Section` → the stored `text_content`.
+/// - `Note` → the concatenated text of its sections.
+/// - `Symbol/*` → the symbol's source span, read from `root` via the
+///   `read_symbols` span logic.
+/// - other kinds (Heading, Tag) → no inline body.
+///
+/// Callers opt in by calling this at all; it is never invoked on the
+/// default (off) path.
+pub fn populate_inline_bodies(
+    store: &GraphStore,
+    nodes: &mut [BrainNode],
+    root: &std::path::Path,
+    threshold: f64,
+    max_body_tokens: usize,
+    token_budget: Option<usize>,
+) {
+    let max_relevance = nodes.iter().map(|n| n.relevance).fold(0.0_f64, f64::max);
+    if max_relevance <= 0.0 {
+        return;
+    }
+    let max_body_chars = max_body_tokens.saturating_mul(4);
+    let mut used_tokens = 0usize;
+
+    for node in nodes.iter_mut() {
+        let normalized = node.relevance / max_relevance;
+        if normalized < threshold {
+            continue;
+        }
+        let Some(mut body) = fetch_node_body(store, &node.uid, root) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        // Truncate to the per-body cap (chars/4 estimate). Respect char
+        // boundaries so we never split a UTF-8 codepoint.
+        if body.chars().count() > max_body_chars {
+            body = body.chars().take(max_body_chars).collect();
+        }
+        // Token-budget gate: charge inline bodies ahead of metadata. The first
+        // qualifying node is always allowed (mirrors read_symbols), so a single
+        // oversized body never starves the whole result.
+        if let Some(budget) = token_budget {
+            let cost = estimate_tokens(&body);
+            if used_tokens > 0 && used_tokens + cost > budget {
+                continue;
+            }
+            used_tokens += cost;
+        }
+        node.inline_body = Some(body);
+    }
+}
+
+/// Resolve a node UID to its source body for inline embedding. Returns `None`
+/// for kinds without a meaningful body (Heading, Tag) or on lookup failure.
+fn fetch_node_body(store: &GraphStore, uid: &str, root: &std::path::Path) -> Option<String> {
+    if uid.starts_with("sym:") {
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        return res.symbols.into_iter().next().map(|w| w.body);
+    }
+    if uid.starts_with("sec:") {
+        return store.lookup_section(uid).ok().map(|s| s.text_content);
+    }
+    if uid.starts_with("note:") {
+        let sections = store.sections_in_note(uid).ok()?;
+        if sections.is_empty() {
+            return None;
+        }
+        let mut combined: Vec<(u32, String)> = sections
+            .into_iter()
+            .map(|s| (s.start_line, s.text_content))
+            .collect();
+        combined.sort_by_key(|(line, _)| *line);
+        return Some(
+            combined
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+    }
+    None
 }
 
 // ── List helpers ──────────────────────────────────────────────────────────────
@@ -1303,6 +1696,289 @@ mod render_brain_node_tests {
             node.title
         );
         assert_eq!(node.location, "notes/fallback.md");
+    }
+}
+
+#[cfg(test)]
+mod ranking_prior_tests {
+    use super::{BrainNode, apply_ranking_priors};
+    use crate::config::{GlobRule, RankingConfig};
+
+    fn node(uid: &str, location: &str, relevance: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: "Note".to_string(),
+            title: uid.to_string(),
+            location: location.to_string(),
+            relevance,
+            inline_body: None,
+        }
+    }
+
+    fn dampen(glob: &str, multiplier: f64) -> GlobRule {
+        GlobRule {
+            glob: glob.to_string(),
+            multiplier,
+        }
+    }
+
+    #[test]
+    fn dampen_rule_reduces_matching_node_relevance() {
+        let mut nodes = vec![node("note:old", "_logs/2020/jan.md", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("_logs/2020/**", 0.3)],
+            boost: vec![],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.3).abs() < 1e-9,
+            "expected 1.0 * 0.3 = 0.3, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn node_matching_nothing_is_unchanged() {
+        let mut nodes = vec![node("note:keep", "src/main.rs", 0.7)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("_logs/2020/**", 0.3)],
+            boost: vec![dampen("Projects/*/sync.md", 1.5)],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.7).abs() < 1e-9,
+            "non-matching node must be unchanged, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn last_matching_rule_wins() {
+        // Two rules both match; the later one (boost, 2.0) must win over the
+        // earlier dampen (0.3). dampen rules come first in the merged order.
+        let mut nodes = vec![node("note:x", "Projects/app/sync.md", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("Projects/**", 0.3)],
+            boost: vec![dampen("Projects/*/sync.md", 2.0)],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 2.0).abs() < 1e-9,
+            "last matching rule (2.0) must win, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn final_product_is_clamped_to_bounds() {
+        // Boost product above the ceiling clamps to 5.0.
+        let mut high = vec![node("note:hi", "critical/x.md", 4.0)];
+        let rules_hi = RankingConfig {
+            dampen: vec![],
+            boost: vec![dampen("critical/**", 5.0)],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut high, &rules_hi);
+        assert!(
+            (high[0].relevance - 5.0).abs() < 1e-9,
+            "4.0 * 5.0 must clamp to 5.0, got {}",
+            high[0].relevance
+        );
+
+        // Dampen product below the floor clamps to 0.05.
+        let mut low = vec![node("note:lo", "archive/x.md", 0.1)];
+        let rules_lo = RankingConfig {
+            dampen: vec![dampen("archive/**", 0.05)],
+            boost: vec![],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut low, &rules_lo);
+        assert!(
+            (low[0].relevance - 0.05).abs() < 1e-9,
+            "0.1 * 0.05 = 0.005 must clamp up to 0.05, got {}",
+            low[0].relevance
+        );
+    }
+
+    #[test]
+    fn strips_trailing_line_number_from_symbol_location() {
+        // Symbol nodes render location as `path:line`; the glob matches the path.
+        let mut nodes = vec![node("sym:f", "src/legacy/foo.rs:42", 1.0)];
+        let rules = RankingConfig {
+            dampen: vec![dampen("src/legacy/**", 0.5)],
+            boost: vec![],
+            enable_prf: false,
+            git_activity_weight: 1.2,
+        };
+        apply_ranking_priors(&mut nodes, &rules);
+        assert!(
+            (nodes[0].relevance - 0.5).abs() < 1e-9,
+            "expected path glob to match despite :line suffix, got {}",
+            nodes[0].relevance
+        );
+    }
+
+    #[test]
+    fn empty_config_is_noop() {
+        let mut nodes = vec![node("note:x", "anything/here.md", 0.9)];
+        apply_ranking_priors(&mut nodes, &RankingConfig::default());
+        assert!((nodes[0].relevance - 0.9).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod inline_body_tests {
+    use super::{BrainNode, populate_inline_bodies};
+    use nestweaver_schema::{Note, NoteKind, Section};
+    use nestweaver_store::GraphStore;
+    use std::fs;
+
+    fn node(uid: &str, kind: &str, relevance: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: uid.to_string(),
+            location: String::new(),
+            relevance,
+            inline_body: None,
+        }
+    }
+
+    fn store_with_section() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let note = Note {
+            uid: "note:n".to_string(),
+            vault_uid: "vault:v".to_string(),
+            file_path: "notes/n.md".to_string(),
+            title: "N".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 10,
+            content_hash: "h".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.insert_note(&note).unwrap();
+        let sec = Section {
+            uid: "sec:high".to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 0,
+            end_line: 2,
+            text_hash: "th".to_string(),
+            text_content: "THE BODY OF THE HIGH RELEVANCE SECTION".to_string(),
+            word_count: 7,
+            pagerank_score: None,
+        };
+        store.insert_section(&sec).unwrap();
+        let sec_lo = Section {
+            uid: "sec:low".to_string(),
+            note_uid: "note:n".to_string(),
+            heading_uid: None,
+            start_line: 3,
+            end_line: 5,
+            text_hash: "tl".to_string(),
+            text_content: "low relevance body".to_string(),
+            word_count: 3,
+            pagerank_score: None,
+        };
+        store.insert_section(&sec_lo).unwrap();
+        store
+    }
+
+    #[test]
+    fn populates_above_threshold_only() {
+        let store = store_with_section();
+        // Max relevance is 1.0 → sec:high normalizes to 1.0 (>= 0.75),
+        // sec:low normalizes to 0.5 (< 0.75).
+        let mut nodes = vec![
+            node("sec:high", "Section", 1.0),
+            node("sec:low", "Section", 0.5),
+        ];
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, None);
+        assert_eq!(
+            nodes[0].inline_body.as_deref(),
+            Some("THE BODY OF THE HIGH RELEVANCE SECTION"),
+            "above-threshold node should have inline body"
+        );
+        assert!(
+            nodes[1].inline_body.is_none(),
+            "below-threshold node should NOT have inline body"
+        );
+    }
+
+    #[test]
+    fn off_by_default_no_call_means_none() {
+        // Sanity: constructing a node leaves inline_body None; the populate
+        // path is the only thing that sets it.
+        let n = node("sec:high", "Section", 1.0);
+        assert!(n.inline_body.is_none());
+    }
+
+    #[test]
+    fn token_budget_leaves_lower_ranked_metadata_only() {
+        let store = store_with_section();
+        let mut nodes = vec![
+            node("sec:high", "Section", 1.0),
+            node("sec:low", "Section", 0.9),
+        ];
+        // Both normalize above threshold (1.0 and 0.9). Budget only fits the
+        // first body (~10 tokens for 38 chars). The lower-ranked node keeps
+        // its slot but gets no inline body.
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, Some(11));
+        assert!(nodes[0].inline_body.is_some(), "top node fits the budget");
+        assert!(
+            nodes[1].inline_body.is_none(),
+            "lower-ranked node should be metadata-only once budget exhausts"
+        );
+        // Node itself is never dropped.
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn truncates_to_max_body_tokens() {
+        let store = store_with_section();
+        let mut nodes = vec![node("sec:high", "Section", 1.0)];
+        // max_body_tokens = 2 → 8 chars.
+        let root = std::env::temp_dir();
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 2, None);
+        let body = nodes[0].inline_body.as_deref().unwrap();
+        assert!(
+            body.len() <= 8,
+            "body should be truncated to ~8 chars, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_body_read_from_disk() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let sym = store.lookup_symbols_by_name("greet").unwrap();
+        let uid = sym[0].uid.clone();
+        let mut nodes = vec![node(&uid, "Symbol/Function", 1.0)];
+        populate_inline_bodies(&store, &mut nodes, &src, 0.75, 800, None);
+        let body = nodes[0].inline_body.as_deref().expect("symbol body");
+        assert!(body.contains("function greet"), "got: {body:?}");
     }
 }
 

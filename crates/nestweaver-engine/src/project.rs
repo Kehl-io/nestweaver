@@ -555,7 +555,7 @@ mod tests {
     fn no_false_positive_on_content_mentioning_error_handling() {
         // Real wiki content that discusses error handling should not be
         // rejected as long as it's long enough to be real content.
-        let content = "# Error Handling Guide\n\n\
+        let _content = "# Error Handling Guide\n\n\
             This document describes how the application handles errors \
             across all subsystems. The error propagation strategy uses \
             Result types throughout, with thiserror for library crates \

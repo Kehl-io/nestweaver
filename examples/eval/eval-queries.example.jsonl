@@ -1,0 +1,4 @@
+{"query": "user authentication", "intent": "general-context", "relevance": {"sym:repo/src/auth.rs::authenticate_user": 3, "sym:repo/src/auth.rs::verify_password": 2, "note:auth-design": 2, "sym:repo/src/db.rs::get_user_by_email": 1}}
+{"query": "parse markdown frontmatter", "intent": "find-definition", "relevance": {"sym:repo/src/md.rs::parse_frontmatter": 3, "sym:repo/src/md.rs::strip_yaml_block": 2, "sym:repo/src/md.rs::tokenize": 1}}
+{"query": "graph pagerank ranking", "intent": "understand-architecture", "relevance": {"sym:repo/src/rank.rs::personalized_pagerank": 3, "sym:repo/src/rank.rs::power_iterate": 2, "note:ranking-notes": 1}}
+{"query": "impact of changing the indexer", "intent": "analyze-impact", "relevance": {"sym:repo/src/index.rs::index_directory": 3, "sym:repo/src/index.rs::index_into_store": 2, "sym:repo/src/main.rs::run_index": 1}}
