@@ -9,6 +9,8 @@ import { NodeLabels } from "./NodeLabels";
 import { useGraphBridge, type GraphBuffers } from "../../hooks/useGraphBridge";
 import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
+import { CameraZoomBridge } from "./CameraZoomBridge";
+import { CommunityOverlay } from "./overlays/CommunityOverlay";
 
 // ---- Reduced motion hook ----
 
@@ -137,8 +139,10 @@ export function GraphCanvas() {
     >
       <color attach="background" args={[bgColor]} />
       <ambientLight intensity={1} />
+      <CameraZoomBridge />
       {buffers.nodeCount > 0 && (
         <>
+          <CommunityOverlay />
           <EdgeInstanceMesh buffers={buffers} />
           {!reducedMotion && <EdgeParticles buffers={buffers} />}
           <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
