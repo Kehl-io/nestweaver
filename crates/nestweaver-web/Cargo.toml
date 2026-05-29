@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+nestweaver-algorithms = { workspace = true }
 nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
+rmp-serde = "1"
 axum = { workspace = true }
 axum-embed = { workspace = true }
 rust-embed = { workspace = true }

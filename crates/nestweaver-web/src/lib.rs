@@ -123,6 +123,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/export/svg", post(routes::export::export_svg))
         .route("/api/v1/export/png", post(routes::export::export_png))
         .route("/api/v1/export/html", post(routes::export::export_html))
+        // Snapshot
+        .route(
+            "/api/v1/snapshot.msgpack",
+            get(routes::snapshot::snapshot_msgpack),
+        )
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback_service(static_handler)

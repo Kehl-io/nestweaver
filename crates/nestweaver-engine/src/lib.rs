@@ -50,6 +50,7 @@ pub mod cross_domain;
 pub mod dead_code;
 pub mod embedding;
 pub mod export;
+pub mod export_graph;
 pub mod extensions;
 pub mod git_diff;
 pub mod html_to_md;
@@ -98,6 +99,7 @@ pub use dead_code::{
     detect_dead_code_with_confidence, detect_dead_code_with_manifests,
 };
 pub use export::{export_cypher, export_graphml, export_mermaid};
+pub use export_graph::export_in_memory_graph;
 pub use extensions::{
     ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
     query_by_property, record_last_indexed_at, save_extensions, set_property,

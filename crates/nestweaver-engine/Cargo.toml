@@ -7,11 +7,13 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
+nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
 nestweaver-parser = { workspace = true }
 nestweaver-resolver = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-storage = { workspace = true }
+rmp-serde = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
