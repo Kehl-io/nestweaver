@@ -20,7 +20,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
       role="listbox"
       aria-label="Search results"
       aria-activedescendant={activeDescendant}
-      className="absolute top-full left-0 right-0 z-50 mt-1 max-h-80 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg"
+      className="glass-panel absolute top-full left-0 right-0 z-50 mt-1 max-h-80 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg"
     >
       {searchLoading && (
         <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">
