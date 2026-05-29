@@ -119,7 +119,7 @@ Sidecar files written alongside the database:
 
 ## Architecture
 
-Cargo workspace with 8 crates + root binary:
+Cargo workspace with 10 crates + root binary:
 
 ```
 nestweaver/                     # CLI entry point (src/main.rs)
@@ -130,8 +130,10 @@ crates/
   nestweaver-store/             # LadybugDB graph store, PageRank, hybrid search (BM25 + vector)
   nestweaver-storage/           # pluggable snapshot storage backends (local, S3, GitLab)
   nestweaver-engine/            # indexing pipeline, query dispatch, config, registry, snapshots, LLM pipelines
+  nestweaver-algorithms/        # pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible
   nestweaver-mcp/               # optional MCP wrapper (feature-gated, delegates to engine)
-  nestweaver-web/               # optional web UI and API backend (Axum + React)
+  nestweaver-web/               # web UI (Three.js/R3F + Axum API) with GPU-accelerated graph rendering
+  nestweaver-wasm/              # browser-side WASM module wrapping nestweaver-algorithms
 ```
 
 ### Edge types and weighting
@@ -146,12 +148,14 @@ The graph has four edge kinds: **CALLS** (function calls + JSX `<Component />` u
 ### Dependency flow
 
 ```
-schema          (zero internal deps)
+schema              (zero internal deps)
   <- parser
   <- resolver
   <- store
-storage         (zero internal deps)
-       <- engine <- (parser, resolver, store, storage)
+algorithms          (zero internal deps — WASM target)
+  <- wasm
+storage             (zero internal deps)
+       <- engine <- (parser, resolver, store, storage, algorithms)
             <- mcp
             <- web
 ```
