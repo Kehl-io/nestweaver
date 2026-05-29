@@ -1,0 +1,18 @@
+[package]
+name = "nestweaver-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nestweaver-algorithms = { workspace = true }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+serde_json = { workspace = true }
+rmp-serde = "1"
+js-sys = "0.3"
