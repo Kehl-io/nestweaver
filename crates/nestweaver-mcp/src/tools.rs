@@ -26,6 +26,63 @@ use nestweaver_engine::{
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 
+// ── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Resolve a symbol name to a UID. When multiple symbols share the name,
+/// pick the most likely canonical definition using a composite heuristic:
+/// PageRank score (if computed), then source-path priority (src/ over tests/),
+/// then lowest start line (definitions before re-imports).
+fn resolve_symbol_uid(store: &GraphStore, name_or_uid: &str) -> Result<String, anyhow::Error> {
+    if name_or_uid.contains(':') {
+        return Ok(name_or_uid.to_string());
+    }
+    let matches = store
+        .lookup_symbols_by_name(name_or_uid)
+        .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+    match matches.len() {
+        0 => Err(anyhow!("no symbol found: '{name_or_uid}'")),
+        1 => Ok(matches.into_iter().next().unwrap().uid),
+        _ => {
+            let best = matches
+                .into_iter()
+                .max_by(|a, b| {
+                    // Prefer symbols with PageRank scores (computed by hubs)
+                    let pr_a = a.pagerank_score.unwrap_or(0.0);
+                    let pr_b = b.pagerank_score.unwrap_or(0.0);
+                    if (pr_a - pr_b).abs() > f64::EPSILON {
+                        return pr_a.partial_cmp(&pr_b).unwrap_or(std::cmp::Ordering::Equal);
+                    }
+                    // Prefer src/ over tests/test/__tests__/migrations/
+                    let non_src = |p: &str| {
+                        let lp = p.to_lowercase();
+                        lp.starts_with("test")
+                            || lp.contains("__tests__")
+                            || lp.starts_with("migrations")
+                    };
+                    let a_test = non_src(&a.file_path);
+                    let b_test = non_src(&b.file_path);
+                    if a_test != b_test {
+                        return b_test.cmp(&a_test);
+                    }
+                    // Prefer lower start line (definition site)
+                    b.start_line.cmp(&a.start_line)
+                })
+                .unwrap();
+            Ok(best.uid)
+        }
+    }
+}
+
+/// Build a map from repo UID → display name for repo filter matching.
+fn build_repo_name_map(store: &GraphStore) -> std::collections::HashMap<String, String> {
+    store
+        .list_repos(None)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
+        .collect()
+}
+
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
 const LITE_TOOLS: &[&str] = &[
@@ -966,6 +1023,13 @@ fn tool_brain_context(
     // ResponseConfig::default()), so there is no `[ranking]` to load. Priors are
     // applied on the CLI `brain context` / `brain search` paths instead.
 
+    // Build repo name map once if a repos filter is present.
+    let repo_names = if filter_repos.is_some() {
+        build_repo_name_map(store)
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // RFC #2: apply post-PPR filters to seeds and connected lists.
     let apply_filters = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
         if let Some(ref kinds) = filter_kinds {
@@ -976,9 +1040,29 @@ fn tool_brain_context(
         }
         if let Some(ref repos) = filter_repos {
             nodes.retain(|n| {
-                repos
-                    .iter()
-                    .any(|r| n.uid.contains(r.as_str()) || n.location.contains(r.as_str()))
+                let filter_lower: Vec<String> = repos.iter().map(|r| r.to_lowercase()).collect();
+                // Extract repo_uid from symbol UIDs (sym:repo:{inst}:{hash}:...)
+                let node_repo_uid = if n.uid.starts_with("sym:") {
+                    let parts: Vec<&str> = n.uid[4..].splitn(4, ':').collect();
+                    if parts.len() >= 3 {
+                        Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                filter_lower.iter().any(|r| {
+                    // Match by repo display name
+                    if let Some(ref repo_uid) = node_repo_uid
+                        && let Some(name) = repo_names.get(repo_uid)
+                        && name.to_lowercase().contains(r)
+                    {
+                        return true;
+                    }
+                    // Fallback: UID or location substring
+                    n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)
+                })
             });
         }
         if let Some(ref vaults) = filter_vaults {
@@ -2282,17 +2366,10 @@ fn tool_schema_cross_repo_contracts() -> Value {
 }
 
 fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // Resolve the UID: either directly supplied or looked up by name.
     let uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
         uid.to_string()
     } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        let matches = store
-            .lookup_symbols_by_name(name)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-        match matches.into_iter().next() {
-            Some(sym) => sym.uid,
-            None => return Err(anyhow!("no symbol found with name '{name}'")),
-        }
+        resolve_symbol_uid(store, name)?
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
     };
@@ -2398,18 +2475,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
     let concise = is_concise(&args);
 
-    // Resolve symbol — try UID first (contains ':'), then name lookup.
-    let uid = if symbol.contains(':') {
-        symbol.to_string()
-    } else {
-        let matches = store
-            .lookup_symbols_by_name(symbol)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-        match matches.into_iter().next() {
-            Some(s) => s.uid,
-            None => return Err(anyhow!("no symbol found: '{symbol}'")),
-        }
-    };
+    let uid = resolve_symbol_uid(store, symbol)?;
 
     let nodes = store.impact(&uid, depth, 0.0)?;
 
@@ -2501,20 +2567,8 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .unwrap_or(10);
     let concise = is_concise(&args);
 
-    // Resolve symbol — try UID first (contains ':'), then name lookup.
-    let resolved_uid = if symbol.contains(':') {
-        symbol.to_string()
-    } else {
-        let matches = store
-            .lookup_symbols_by_name(symbol)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
-        match matches.into_iter().next() {
-            Some(s) => s.uid,
-            None => return Err(anyhow!("no symbol found: '{symbol}'")),
-        }
-    };
+    let resolved_uid = resolve_symbol_uid(store, symbol)?;
 
-    // Verify root symbol exists.
     let root = store
         .lookup_symbol(&resolved_uid)
         .map_err(|_| anyhow!("symbol '{symbol}' not found"))?;
