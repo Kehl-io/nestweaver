@@ -123,28 +123,214 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
 
-    // ── Indexing (stubs — implemented in Task 3) ────────────────────
+    // ── Indexing ─────────────────────────────────────────────────────
 
     type IndexRepoStream = ProgressStream;
 
     async fn index_repo(
         &self,
-        _request: Request<IndexRepoRequest>,
+        request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
-        Err(Status::unimplemented(
-            "IndexRepo is not yet implemented — see Task 3",
-        ))
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let repo_path = PathBuf::from(&req.repo_path);
+        let db_path = self.state.db_path.clone();
+        let instance_id = self.state.instance_id.clone();
+        let force = req.force;
+        let name = if req.name.is_empty() {
+            None
+        } else {
+            Some(req.name.clone())
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
+
+        tokio::task::spawn_blocking(move || {
+            let repo_url = format!("file://{}", repo_path.display());
+
+            // DISCOVERING phase
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Discovering as i32,
+                message: format!("Scanning {}", repo_path.display()),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            // Index the repository
+            match nestweaver_engine::index_directory_with_options(
+                &repo_path,
+                &db_path,
+                &instance_id,
+                &repo_url,
+                "local",
+                force,
+                name.as_deref(),
+            ) {
+                Ok(result) => {
+                    // WRITING phase
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Writing as i32,
+                        message: format!(
+                            "Indexed {} files, {} symbols",
+                            result.files_count, result.symbols_count
+                        ),
+                        files_processed: result.files_count as u64,
+                        files_total: result.files_count as u64,
+                        symbols_found: result.symbols_count as u64,
+                    }));
+
+                    // PAGERANK phase — reopen the store for post-index operations
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Pagerank as i32,
+                        message: "Computing PageRank".into(),
+                        files_processed: result.files_count as u64,
+                        files_total: result.files_count as u64,
+                        symbols_found: result.symbols_count as u64,
+                    }));
+
+                    match nestweaver_store::GraphStore::open_or_readonly(&db_path) {
+                        Ok(store) => {
+                            let scope = nestweaver_store::GraphScope::code_only();
+                            if let Err(e) = store.compute_pagerank(0.85, 20, &scope) {
+                                tracing::warn!("PageRank computation failed: {e}");
+                            }
+                            let pr_path =
+                                nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+                            if let Err(e) = store.save_pagerank_cache(&pr_path) {
+                                tracing::warn!("PageRank cache save failed: {e}");
+                            }
+                            store.bump_and_persist_generation();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not reopen store for PageRank: {e}");
+                        }
+                    }
+
+                    // DONE phase
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: format!(
+                            "Done — {} files, {} symbols, {} edges",
+                            result.files_count, result.symbols_count, result.edges_count
+                        ),
+                        files_processed: result.files_count as u64,
+                        files_total: result.files_count as u64,
+                        symbols_found: result.symbols_count as u64,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("IndexRepo failed: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     type IndexVaultStream = ProgressStream;
 
     async fn index_vault(
         &self,
-        _request: Request<IndexVaultRequest>,
+        request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
-        Err(Status::unimplemented(
-            "IndexVault is not yet implemented — see Task 3",
-        ))
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let vault_path = PathBuf::from(&req.vault_path);
+        let vault_name = req.vault_name.clone();
+        let extra_patterns = req.extra_ignore_patterns.clone();
+        let db_path = self.state.db_path.clone();
+        let instance_id = self.state.instance_id.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
+
+        tokio::task::spawn_blocking(move || {
+            // DISCOVERING phase
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Discovering as i32,
+                message: format!("Scanning vault {}", vault_path.display()),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            let index_result = if extra_patterns.is_empty() {
+                nestweaver_engine::index_markdown_directory(
+                    &vault_path,
+                    &db_path,
+                    &instance_id,
+                    &vault_name,
+                )
+            } else {
+                nestweaver_engine::index_markdown_directory_with_ignore(
+                    &vault_path,
+                    &db_path,
+                    &instance_id,
+                    &vault_name,
+                    &extra_patterns,
+                )
+            };
+
+            match index_result {
+                Ok(result) => {
+                    // WRITING phase
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Writing as i32,
+                        message: format!(
+                            "Indexed {} notes, {} headings, {} sections",
+                            result.notes_count, result.headings_count, result.sections_count
+                        ),
+                        files_processed: result.notes_count as u64,
+                        files_total: result.notes_count as u64,
+                        symbols_found: result.headings_count as u64,
+                    }));
+
+                    // Bump generation on the store that was just written
+                    match nestweaver_store::GraphStore::open_or_readonly(&db_path) {
+                        Ok(store) => {
+                            store.bump_and_persist_generation();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not reopen store to bump generation: {e}");
+                        }
+                    }
+
+                    // DONE phase
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: format!(
+                            "Done — {} notes, {} headings, {} sections, {} tags",
+                            result.notes_count,
+                            result.headings_count,
+                            result.sections_count,
+                            result.tags_count
+                        ),
+                        files_processed: result.notes_count as u64,
+                        files_total: result.notes_count as u64,
+                        symbols_found: result.headings_count as u64,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("IndexVault failed: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     type RefreshBrainStream = ProgressStream;
@@ -154,7 +340,7 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<RefreshBrainRequest>,
     ) -> Result<Response<Self::RefreshBrainStream>, Status> {
         Err(Status::unimplemented(
-            "RefreshBrain is not yet implemented — see Task 3",
+            "RefreshBrain is not yet implemented",
         ))
     }
 
