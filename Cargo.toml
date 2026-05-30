@@ -12,6 +12,7 @@ members = [
     "crates/nestweaver-web",
     "crates/nestweaver-wasm",
     "crates/nestweaver-proto",
+    "crates/nestweaver-daemon",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ nestweaver-mcp = { path = "crates/nestweaver-mcp" }
 nestweaver-web = { path = "crates/nestweaver-web" }
 nestweaver-wasm = { path = "crates/nestweaver-wasm" }
 nestweaver-proto = { path = "crates/nestweaver-proto" }
+nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 tonic = "0.13"
 prost = "0.13"
 tonic-build = "0.13"

@@ -2998,6 +2998,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nestweaver-daemon"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "libc",
+ "nestweaver-engine",
+ "nestweaver-mcp",
+ "nestweaver-proto",
+ "nestweaver-schema",
+ "nestweaver-store",
+ "prost 0.13.5",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "nestweaver-engine"
 version = "0.11.0"
 dependencies = [
