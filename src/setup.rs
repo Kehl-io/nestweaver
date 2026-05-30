@@ -160,24 +160,18 @@ fn which_exists(cmd: &str) -> bool {
 
 // ── Per-tool setup ────────────────────────────────────────────────────────────
 
-fn mcp_args(db_str: &str, allow_writes: bool) -> serde_json::Value {
-    let mut args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
-    if allow_writes {
-        args.push("--allow-mcp-add-sources".to_string());
-    }
+fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
+    let args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
     serde_json::json!(args)
 }
 
-fn mcp_args_lite(db_str: &str, allow_writes: bool) -> serde_json::Value {
-    let mut args = vec![
+fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
+    let args = vec![
         "mcp".to_string(),
         "--lite".to_string(),
         "--db".to_string(),
         db_str.to_string(),
     ];
-    if allow_writes {
-        args.push("--allow-mcp-add-sources".to_string());
-    }
     serde_json::json!(args)
 }
 
