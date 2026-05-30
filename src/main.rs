@@ -659,6 +659,10 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
+        /// Use daemon mode — proxy all tool calls through the daemon gRPC
+        /// service instead of opening the database directly.
+        #[arg(long)]
+        daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -3724,6 +3728,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
+            daemon,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
@@ -3732,13 +3737,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            nestweaver_mcp::run_stdio_server(
-                &db_path,
-                allow_mcp_add_sources,
-                lite,
-                track_interactions,
-            )
-            .context("mcp server")?;
+            if daemon {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("create tokio runtime for daemon proxy")?;
+                let daemon_client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path))
+                    .context("connect to daemon")?;
+                // Extract the inner tonic gRPC client to avoid the
+                // nestweaver-client → nestweaver-daemon cycle in nestweaver-mcp.
+                let grpc_client = daemon_client.into_inner();
+                nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
+                    .context("mcp server (daemon mode)")?;
+            } else {
+                nestweaver_mcp::run_stdio_server(
+                    &db_path,
+                    allow_mcp_add_sources,
+                    lite,
+                    track_interactions,
+                )
+                .context("mcp server")?;
+            }
             Ok((EXIT_SUCCESS, None))
         }
 

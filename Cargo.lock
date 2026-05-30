@@ -2981,6 +2981,7 @@ dependencies = [
  "dirs",
  "libc",
  "miette",
+ "nestweaver-client",
  "nestweaver-daemon",
  "nestweaver-engine",
  "nestweaver-mcp",
@@ -3091,12 +3092,16 @@ version = "0.11.0"
 dependencies = [
  "anyhow",
  "nestweaver-engine",
+ "nestweaver-proto",
  "nestweaver-schema",
  "nestweaver-store",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
 ]
 
