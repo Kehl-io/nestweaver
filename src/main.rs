@@ -1238,6 +1238,33 @@ enum Commands {
         #[command(subcommand)]
         command: EvalCommands,
     },
+    /// Manage the NestWeaver daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+        /// Path to the database file
+        #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (usually auto-started on first use)
+    Start {
+        /// Idle timeout in seconds
+        #[arg(long, default_value = "3600")]
+        idle_timeout: u64,
+    },
+    /// Stop the running daemon
+    Stop,
+    /// Show daemon status
+    Status,
+    /// Stop and restart the daemon
+    Restart {
+        #[arg(long, default_value = "3600")]
+        idle_timeout: u64,
+    },
 }
 
 /// Subcommands under `nestweaver eval`.
@@ -4736,6 +4763,179 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::Daemon { action, db } => {
+            let db_path = db
+                .or_else(|| {
+                    std::env::var("NESTWEAVER_DB")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No database path provided. Use --db or set NESTWEAVER_DB."
+                    )
+                })?;
+            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
+            let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+            let runtime_dir = nestweaver_daemon::runtime_dir(&instance_id);
+            let log_dir = nestweaver_daemon::log_dir(&instance_id);
+            let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+            let socket = nestweaver_daemon::socket_path(&instance_id);
+            let log_file = nestweaver_daemon::log_path(&instance_id);
+
+            match action {
+                DaemonAction::Start { idle_timeout } => {
+                    // Check if already running.
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            let alive = unsafe { libc::kill(pid, 0) } == 0;
+                            if alive {
+                                eprintln!("Daemon already running (PID {pid}).");
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+                        }
+                        // Stale pidfile — remove it.
+                        let _ = std::fs::remove_file(&pidfile);
+                    }
+
+                    std::fs::create_dir_all(&runtime_dir)
+                        .with_context(|| format!("create runtime dir: {}", runtime_dir.display()))?;
+                    std::fs::create_dir_all(&log_dir)
+                        .with_context(|| format!("create log dir: {}", log_dir.display()))?;
+
+                    let stdout_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_file)
+                        .with_context(|| format!("open log file: {}", log_file.display()))?;
+                    let stderr_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_file)
+                        .with_context(|| format!("open log file for stderr: {}", log_file.display()))?;
+
+                    eprintln!(
+                        "Starting daemon for {} (instance {instance_id})...",
+                        db_path.display()
+                    );
+                    eprintln!("  PID file: {}", pidfile.display());
+                    eprintln!("  Socket:   {}", socket.display());
+                    eprintln!("  Log:      {}", log_file.display());
+
+                    let daemonize = daemonize::Daemonize::new()
+                        .pid_file(&pidfile)
+                        .stdout(stdout_file)
+                        .stderr(stderr_file)
+                        .working_directory(".");
+
+                    match daemonize.start() {
+                        Ok(()) => {
+                            // We are now the daemon process.
+                            let idle = if idle_timeout > 0 {
+                                Some(std::time::Duration::from_secs(idle_timeout))
+                            } else {
+                                None
+                            };
+                            let rt = tokio::runtime::Runtime::new()
+                                .expect("failed to create tokio runtime");
+                            rt.block_on(async {
+                                if let Err(e) =
+                                    nestweaver_daemon::run_server(&db_path, idle).await
+                                {
+                                    eprintln!("Daemon error: {e:#}");
+                                    std::process::exit(1);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            anyhow::bail!("Failed to daemonize: {e}");
+                        }
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Stop => {
+                    let pid_str = std::fs::read_to_string(&pidfile)
+                        .with_context(|| format!("read pidfile: {}", pidfile.display()))?;
+                    let pid: i32 = pid_str
+                        .trim()
+                        .parse()
+                        .with_context(|| "parse PID from pidfile")?;
+
+                    eprintln!("Stopping daemon (PID {pid})...");
+                    unsafe { libc::kill(pid, libc::SIGTERM); }
+
+                    // Poll for up to 5 seconds.
+                    for _ in 0..50 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if unsafe { libc::kill(pid, 0) } != 0 {
+                            eprintln!("Daemon stopped.");
+                            let _ = std::fs::remove_file(&pidfile);
+                            let _ = std::fs::remove_file(&socket);
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                    }
+
+                    // Force kill.
+                    eprintln!("Daemon did not exit; sending SIGKILL...");
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = std::fs::remove_file(&pidfile);
+                    let _ = std::fs::remove_file(&socket);
+                    eprintln!("Daemon killed.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Status => {
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            let alive = unsafe { libc::kill(pid, 0) } == 0;
+                            if alive {
+                                println!("Daemon is running (PID {pid})");
+                                println!("  DB:     {}", db_path.display());
+                                println!("  Socket: {}", socket.display());
+                                println!("  Log:    {}", log_file.display());
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+                        }
+                    }
+                    println!("Daemon is not running.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Restart { idle_timeout } => {
+                    // Stop if running.
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            let alive = unsafe { libc::kill(pid, 0) } == 0;
+                            if alive {
+                                eprintln!("Stopping daemon (PID {pid})...");
+                                unsafe { libc::kill(pid, libc::SIGTERM); }
+                                for _ in 0..50 {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    if unsafe { libc::kill(pid, 0) } != 0 {
+                                        break;
+                                    }
+                                }
+                                if unsafe { libc::kill(pid, 0) } == 0 {
+                                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                let _ = std::fs::remove_file(&pidfile);
+                                let _ = std::fs::remove_file(&socket);
+                                eprintln!("Daemon stopped.");
+                            }
+                        }
+                    }
+
+                    // Now start — re-enter via exec so the new daemon gets its own daemonize.
+                    eprintln!("Run `nestweaver daemon start --db {} --idle-timeout {idle_timeout}` to start.", db_path.display());
+                    Ok((EXIT_SUCCESS, None))
+                }
+            }
         }
     }
 }
