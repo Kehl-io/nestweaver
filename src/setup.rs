@@ -183,13 +183,13 @@ fn mcp_args_lite(db_str: &str, allow_writes: bool) -> serde_json::Value {
 
 fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".claude")?;
-    let settings_path = Path::new(".claude/settings.json");
+    let mcp_path = Path::new(".mcp.json");
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(settings_path, "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(mcp_path, "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".claude/skills/nestweaver")?;
     std::fs::write(
@@ -201,7 +201,7 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::E
         "Claude Code",
         &[
             (
-                ".claude/settings.json",
+                ".mcp.json",
                 if merged {
                     "MCP server configured"
                 } else {
