@@ -618,8 +618,10 @@ impl GraphStore {
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
     ///
     /// Scores are read from the in-memory cache populated by `compute_pagerank`.
+    /// If the cache is empty it is computed lazily on first access.
     /// If `limit` is `None`, all symbols are returned.
     pub fn symbols_by_pagerank(&self, limit: Option<usize>) -> Result<Vec<Symbol>, StoreError> {
+        self.ensure_pagerank_loaded();
         let cache = self
             .pagerank_cache
             .lock()
@@ -714,11 +716,32 @@ impl GraphStore {
     /// cache is not loaded. Used by downstream crates (engine) that need
     /// per-UID score lookups without loading full Symbol objects.
     pub fn pagerank_scores(&self) -> HashMap<String, f64> {
+        self.ensure_pagerank_loaded();
         self.pagerank_cache
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    /// Ensure the in-memory PageRank cache is populated.
+    ///
+    /// If the cache is already loaded (from a sidecar file or a previous
+    /// computation), this is a no-op.  Otherwise it computes PageRank on
+    /// demand so callers never see an empty cache after a fresh index.
+    pub fn ensure_pagerank_loaded(&self) {
+        let already_loaded = self
+            .pagerank_cache
+            .lock()
+            .map(|c| c.is_some())
+            .unwrap_or(false);
+        if already_loaded {
+            return;
+        }
+        tracing::info!("PageRank cache empty — computing lazily");
+        if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
+            tracing::warn!("lazy PageRank computation failed: {e}");
+        }
     }
 }
 

@@ -178,23 +178,8 @@ impl NestWeaverDaemon for DaemonService {
                         symbols_found: result.symbols_count as u64,
                     }));
 
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Pagerank as i32,
-                        message: "Computing PageRank".into(),
-                        files_processed: result.files_count as u64,
-                        files_total: result.files_count as u64,
-                        symbols_found: result.symbols_count as u64,
-                    }));
-
-                    let scope = nestweaver_store::GraphScope::code_only();
-                    if let Err(e) = state.store.compute_pagerank(0.85, 20, &scope) {
-                        tracing::warn!("PageRank computation failed: {e}");
-                    }
-                    let pr_path =
-                        nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-                    if let Err(e) = state.store.save_pagerank_cache(&pr_path) {
-                        tracing::warn!("PageRank cache save failed: {e}");
-                    }
+                    // PageRank is deferred to first query (lazy evaluation
+                    // in GraphStore::ensure_pagerank_loaded).
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
