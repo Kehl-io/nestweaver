@@ -9,7 +9,7 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
    nestweaver index --repo .
    ```
 
-2. Add NestWeaver as an MCP server in `.claude/settings.json`:
+2. Add NestWeaver as an MCP server in `.mcp.json` (project root):
    ```json
    {
      "mcpServers": {
@@ -27,7 +27,7 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
    cat integrations/claude-code/settings.json
    ```
 
-> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config and hooks into your project's `.claude/settings.json`.
+> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`) and skill (`.claude/skills/nestweaver/SKILL.md`).
 
 ## Hooks
 
