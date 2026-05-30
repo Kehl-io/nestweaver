@@ -125,4 +125,9 @@ impl DaemonClient {
     pub fn inner(&self) -> &NestWeaverDaemonClient<Channel> {
         &self.inner
     }
+
+    /// Consumes self and returns the underlying gRPC client.
+    pub fn into_inner(self) -> NestWeaverDaemonClient<Channel> {
+        self.inner
+    }
 }

@@ -4194,6 +4194,168 @@ pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
 }
 
+// ── Daemon proxy dispatch ─────────────────────────────────────────────────
+
+/// The tonic-generated gRPC client type for the `NestWeaverDaemon` service.
+/// Re-exported so callers (e.g. `main.rs`) can construct it and pass it in
+/// without depending on `nestweaver-proto` directly.
+#[cfg(feature = "daemon")]
+pub type DaemonGrpcClient =
+    nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>;
+
+/// Dispatch an MCP tool call through the daemon gRPC service instead of
+/// opening the DB directly. Maps each MCP tool name to the corresponding
+/// gRPC RPC on the `NestWeaverDaemon` service.
+///
+/// The caller is responsible for connecting the gRPC client (typically via
+/// `nestweaver_client::DaemonClient`) and passing the inner tonic client.
+#[cfg(feature = "daemon")]
+pub fn dispatch_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    use nestweaver_proto::JsonRequest;
+
+    let args_json = serde_json::to_string(&args)?;
+
+    // brain_add_source is special: it maps to IndexRepo or IndexVault
+    // (streaming RPCs) depending on the path content.
+    if name == "brain_add_source" {
+        return dispatch_add_source_via_daemon(client, rt, args);
+    }
+
+    let result_json = rt.block_on(async {
+        let req = tonic::Request::new(JsonRequest {
+            args_json: args_json.clone(),
+        });
+
+        let resp = match name {
+            "brain_search" => client.search(req).await,
+            "brain_context" => client.get_context(req).await,
+            "project_context" => client.get_project_context(req).await,
+            "note_get" => client.get_note(req).await,
+            "backlinks" => client.get_backlinks(req).await,
+            "brain_status" => client.brain_status(req).await,
+            "brain_impact" => client.impact(req).await,
+            "brain_guide" => client.brain_guide(req).await,
+            "flow_trace" => client.flow_trace(req).await,
+            "blast_radius" => client.blast_radius(req).await,
+            "detect_changes" => client.detect_changes(req).await,
+            "brain_diff" => client.brain_diff(req).await,
+            "read_symbols" => client.read_symbols(req).await,
+            "regex_search" => client.regex_search(req).await,
+            "count_patterns" => client.count_patterns(req).await,
+            "cross_repo_contracts" => client.cross_repo_contracts(req).await,
+            "contract_drift" => client.contract_drift(req).await,
+            "dead_code" => client.dead_code(req).await,
+            "brain_broken_links" => client.brain_broken_links(req).await,
+            "brain_orphan_documents" => client.brain_orphan_documents(req).await,
+            "brain_topic_clusters" => client.brain_topic_clusters(req).await,
+            "brain_tag_graph" => client.brain_tag_graph(req).await,
+            "brain_doc_stats" => client.brain_doc_stats(req).await,
+            "brain_memory_lint" => client.brain_memory_lint(req).await,
+            "brain_memory_consolidate" => client.brain_memory_consolidate(req).await,
+            "brain_memory_related" => client.brain_memory_related(req).await,
+            "affected_tests" => client.affected_tests(req).await,
+            "clusters" => client.clusters(req).await,
+            "stale_check" => client.stale_check(req).await,
+            "hub_nodes" => client.hub_nodes(req).await,
+            "bridge_nodes" => client.bridge_nodes(req).await,
+            "get_summary" => client.get_summary(req).await,
+            "investigate" => client.investigate(req).await,
+            "investigate_expand" => client.investigate_expand(req).await,
+            "investigate_hydrate" => client.investigate_hydrate(req).await,
+            "set_extension" => client.set_extension(req).await,
+            "query_extensions" => client.query_extensions(req).await,
+            other => {
+                return Err(anyhow::anyhow!("unknown tool for daemon dispatch: {other}"));
+            }
+        };
+
+        let resp = resp.map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+        Ok(resp.into_inner().result_json)
+    })?;
+
+    serde_json::from_str(&result_json).map_err(Into::into)
+}
+
+/// Handle `brain_add_source` by routing to `IndexRepo` or `IndexVault`
+/// streaming RPCs based on whether the path contains `.obsidian/`.
+#[cfg(feature = "daemon")]
+fn dispatch_add_source_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    use tokio_stream::StreamExt;
+
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
+        .to_string();
+
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Determine if this is a vault (has .obsidian/) or a repo.
+    let resolved = std::path::Path::new(&path);
+    let is_vault = resolved.join(".obsidian").exists();
+
+    rt.block_on(async {
+        if is_vault {
+            let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
+                vault_path: path.clone(),
+                vault_name: name,
+                extra_ignore_patterns: vec![],
+            });
+            let mut stream = client.index_vault(req).await
+                .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
+                .into_inner();
+
+            let mut last_msg = String::new();
+            while let Some(progress) = stream.next().await {
+                let progress = progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                last_msg = progress.message;
+            }
+            Ok(serde_json::json!({
+                "status": "indexed",
+                "path": path,
+                "type": "vault",
+                "message": last_msg,
+            }))
+        } else {
+            let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
+                repo_path: path.clone(),
+                name,
+                force: false,
+                with_trigrams: false,
+                with_git_activity: false,
+            });
+            let mut stream = client.index_repo(req).await
+                .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
+                .into_inner();
+
+            let mut last_msg = String::new();
+            while let Some(progress) = stream.next().await {
+                let progress = progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                last_msg = progress.message;
+            }
+            Ok(serde_json::json!({
+                "status": "indexed",
+                "path": path,
+                "type": "repo",
+                "message": last_msg,
+            }))
+        }
+    })
+}
+
 // ── F10: investigate bundle primitive ─────────────────────────────────────
 
 /// Resolve the source root for body reads: explicit `root` arg, else cwd.
