@@ -44,6 +44,10 @@ pub fn ensure_daemon(db_path: &Path) -> Result<PathBuf> {
             if let Some(pid) = read_pid_from_file(&mut file) {
                 debug!(pid, "daemon already running (lock held)");
             }
+            // Wait for the socket to appear if the daemon is still starting.
+            if !sock.exists() {
+                wait_for_socket(&sock)?;
+            }
             return Ok(sock);
         }
         bail!("flock on pidfile failed: {}", err);
