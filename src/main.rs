@@ -163,6 +163,10 @@ struct Cli {
     /// Alias for --no-color (plain text output)
     #[arg(long, global = true)]
     plain: bool,
+
+    /// Route commands through the daemon instead of direct DB access
+    #[arg(long, global = true)]
+    daemon: bool,
 }
 
 // ── Output configuration ─────────────────────────────────────────────────────
@@ -2259,6 +2263,7 @@ fn main() {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
+    let use_daemon = cli.daemon;
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -4645,6 +4650,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => detect_repo_root(),
             };
             let db_path = resolve_index_db_path(db, &repo_path);
+
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+
+                let req = nestweaver_proto::IndexRepoRequest {
+                    repo_path: repo_path.display().to_string(),
+                    name: name.unwrap_or_default(),
+                    force,
+                    with_trigrams,
+                    with_git_activity,
+                };
+
+                rt.block_on(async {
+                    let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
+                    while let Some(progress) = stream.message().await? {
+                        let phase_name = match progress.phase {
+                            0 => "Discovering",
+                            1 => "Parsing",
+                            2 => "Resolving",
+                            3 => "Writing",
+                            4 => "PageRank",
+                            5 => "Done",
+                            6 => "Error",
+                            _ => "Unknown",
+                        };
+                        eprintln!("[{phase_name}] {}", progress.message);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })?;
+
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let instance_id = instance.as_deref().unwrap_or("default");
 
             let repo_url = format!("file://{}", repo_path.display());
