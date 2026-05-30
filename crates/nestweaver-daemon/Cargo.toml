@@ -1,0 +1,23 @@
+[package]
+name = "nestweaver-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gRPC daemon for NestWeaver — serves read RPCs over a Unix domain socket"
+
+[dependencies]
+nestweaver-proto = { workspace = true }
+nestweaver-engine = { workspace = true }
+nestweaver-store = { workspace = true }
+nestweaver-schema = { workspace = true }
+nestweaver-mcp = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tower = "0.5"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+dirs = "6"
