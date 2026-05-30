@@ -164,9 +164,9 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// Route commands through the daemon instead of direct DB access
+    /// Skip the daemon and open the database directly (not recommended)
     #[arg(long, global = true)]
-    daemon: bool,
+    no_daemon: bool,
 }
 
 // ── Output configuration ─────────────────────────────────────────────────────
@@ -663,10 +663,9 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
-        /// Use daemon mode — proxy all tool calls through the daemon gRPC
-        /// service instead of opening the database directly.
+        /// Skip the daemon and open the database directly (not recommended)
         #[arg(long)]
-        daemon: bool,
+        no_daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -2263,7 +2262,7 @@ fn main() {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
-    let use_daemon = cli.daemon;
+    let use_daemon = !cli.no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -3733,7 +3732,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
-            daemon,
+            no_daemon,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
@@ -3742,14 +3741,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            if daemon {
+            let use_daemon_mcp = !no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
+            if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
                 let daemon_client = rt
                     .block_on(nestweaver_client::DaemonClient::connect(&db_path))
                     .context("connect to daemon")?;
-                // Extract the inner tonic gRPC client to avoid the
-                // nestweaver-client → nestweaver-daemon cycle in nestweaver-mcp.
                 let grpc_client = daemon_client.into_inner();
                 nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
                     .context("mcp server (daemon mode)")?;
