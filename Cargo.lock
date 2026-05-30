@@ -3010,6 +3010,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nestweaver-client"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "hyper-util",
+ "libc",
+ "nestweaver-daemon",
+ "nestweaver-proto",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "nestweaver-daemon"
 version = "0.11.0"
 dependencies = [
