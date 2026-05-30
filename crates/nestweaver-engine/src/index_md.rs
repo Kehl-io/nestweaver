@@ -86,10 +86,21 @@ pub fn index_markdown_directory_with_ignore(
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
-    let result = index_into_store(vault_root, &store, instance_id, vault_name, &ignore_set)?;
+    index_markdown_directory_with_store(&store, vault_root, db_path, instance_id, vault_name, extra_ignore_patterns)
+}
 
-    // Write taxonomy alias sidecar if a taxonomy file exists.
+/// Index a markdown vault using an existing GraphStore (for daemon mode).
+pub fn index_markdown_directory_with_store(
+    store: &GraphStore,
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
+    let result = index_into_store(vault_root, store, instance_id, vault_name, &ignore_set)?;
+
     let aliases = load_taxonomy_aliases(vault_root);
     if !aliases.is_empty() {
         let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
