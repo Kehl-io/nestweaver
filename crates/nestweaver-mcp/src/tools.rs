@@ -83,6 +83,16 @@ fn build_repo_name_map(store: &GraphStore) -> std::collections::HashMap<String, 
         .collect()
 }
 
+/// Build a map from vault UID → display name for vault filter matching.
+fn build_vault_name_map(store: &GraphStore) -> std::collections::HashMap<String, String> {
+    store
+        .list_vaults(None)
+        .unwrap_or_default()
+        .iter()
+        .map(|v| (v.uid.clone(), v.name.clone()))
+        .collect()
+}
+
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
 const LITE_TOOLS: &[&str] = &[
@@ -1023,9 +1033,14 @@ fn tool_brain_context(
     // ResponseConfig::default()), so there is no `[ranking]` to load. Priors are
     // applied on the CLI `brain context` / `brain search` paths instead.
 
-    // Build repo name map once if a repos filter is present.
+    // Build name maps once if filters are present.
     let repo_names = if filter_repos.is_some() {
         build_repo_name_map(store)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let vault_names = if filter_vaults.is_some() {
+        build_vault_name_map(store)
     } else {
         std::collections::HashMap::new()
     };
@@ -1067,9 +1082,37 @@ fn tool_brain_context(
         }
         if let Some(ref vaults) = filter_vaults {
             nodes.retain(|n| {
-                vaults
-                    .iter()
-                    .any(|v| n.uid.contains(v.as_str()) || n.location.contains(v.as_str()))
+                let filter_lower: Vec<String> = vaults.iter().map(|v| v.to_lowercase()).collect();
+                // Extract vault_uid from note UIDs (note:vlt:{inst}:{hash}:...)
+                // or section/heading UIDs (sec:note:vlt:... / head:note:vlt:...)
+                let node_vault_uid = {
+                    let search = if n.uid.starts_with("note:") {
+                        Some(&n.uid[5..])
+                    } else if n.uid.starts_with("sec:note:") {
+                        Some(&n.uid[9..])
+                    } else if n.uid.starts_with("head:note:") {
+                        Some(&n.uid[10..])
+                    } else {
+                        None
+                    };
+                    search.and_then(|s| {
+                        let parts: Vec<&str> = s.splitn(4, ':').collect();
+                        if parts.len() >= 3 {
+                            Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+                        } else {
+                            None
+                        }
+                    })
+                };
+                filter_lower.iter().any(|v| {
+                    if let Some(ref vault_uid) = node_vault_uid
+                        && let Some(name) = vault_names.get(vault_uid)
+                        && name.to_lowercase().contains(v)
+                    {
+                        return true;
+                    }
+                    n.uid.to_lowercase().contains(v) || n.location.to_lowercase().contains(v)
+                })
             });
         }
         if let Some(ref prefix) = path_prefix {
