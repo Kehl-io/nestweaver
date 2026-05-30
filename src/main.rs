@@ -24,7 +24,7 @@ use nestweaver_engine::{
     save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
-use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex};
+use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
 const EXIT_SUCCESS: i32 = 0;
@@ -4751,22 +4751,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // Compute PageRank after indexing so the repo-map is immediately usable.
-            // (incremental_index already computes PageRank internally, but recomputing
-            // here is cheap and ensures the sidecar is always up to date for the full path.)
-            out.status("Computing PageRank...");
-            let store = GraphStore::open(&db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-            store
-                .compute_pagerank(0.85, 20, &GraphScope::code_only())
-                .with_context(|| "compute_pagerank")?;
-
-            // Save PageRank cache alongside the DB for use by subsequent commands.
-            let pr_path = db_path.with_extension("pagerank.json");
-            store
-                .save_pagerank_cache(&pr_path)
-                .with_context(|| "save_pagerank_cache")?;
-            out.status("PageRank complete.");
+            // PageRank is deferred to first query (lazy evaluation in
+            // GraphStore::ensure_pagerank_loaded) so the index path stays fast.
+            out.status("PageRank will be computed on first query.");
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -4804,6 +4791,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if with_trigrams {
                 out.status("Building trigram index...");
+                let store = GraphStore::open(&db_path)
+                    .with_context(|| format!("failed to open database at {}", db_path.display()))?;
                 let postings = store
                     .build_trigram_index()
                     .with_context(|| "build_trigram_index")?;
