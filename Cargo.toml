@@ -72,7 +72,7 @@ nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-storage = { workspace = true }
 nestweaver-schema = { workspace = true }
-nestweaver-mcp = { workspace = true }
+nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
 rmp-serde = "1"
 clap = { version = "4", features = ["derive"] }
@@ -89,6 +89,7 @@ tokio = { version = "1", features = ["full"] }
 dirs = "6"
 signal-hook = "0.3"
 nestweaver-daemon = { workspace = true }
+nestweaver-client = { workspace = true }
 daemonize = "0.5"
 libc = "0.2"
 

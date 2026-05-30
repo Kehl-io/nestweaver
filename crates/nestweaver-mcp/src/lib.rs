@@ -217,6 +217,209 @@ pub fn run_stdio_server(
     }
 }
 
+/// Run the brain server in daemon proxy mode: instead of opening the DB
+/// directly, all tool calls are forwarded to the daemon via gRPC. The
+/// `tools/list`, `initialize`, and `ping` methods are handled locally.
+///
+/// The caller must provide a connected `DaemonGrpcClient` (the inner tonic
+/// client from `nestweaver_client::DaemonClient::inner_mut()`) and a tokio
+/// `Runtime`. This avoids a dependency cycle: the MCP crate does not depend
+/// on `nestweaver-client` (which depends on `nestweaver-daemon` which
+/// depends on this crate).
+#[cfg(feature = "daemon")]
+pub fn run_stdio_server_daemon(
+    mut grpc_client: tools::DaemonGrpcClient,
+    rt: tokio::runtime::Runtime,
+    lite: bool,
+) -> Result<(), anyhow::Error> {
+    tools::set_lite_mode(lite);
+
+    tracing::info!(
+        "brain MCP server ready on stdio (daemon proxy mode)"
+    );
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+    let mut line = String::new();
+    let mut reader = stdin.lock();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            tracing::info!("client closed stdin; shutting down (daemon proxy)");
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = error(
+                    Value::Null,
+                    error_code::PARSE_ERROR,
+                    format!("invalid JSON: {e}"),
+                );
+                write_response(&mut stdout, &Frame::Error(resp))?;
+                continue;
+            }
+        };
+
+        if let Value::Array(arr) = parsed {
+            if arr.is_empty() {
+                let resp = error(
+                    Value::Null,
+                    error_code::INVALID_REQUEST,
+                    "empty batch array",
+                );
+                write_response(&mut stdout, &Frame::Error(resp))?;
+                continue;
+            }
+            let mut responses: Vec<Value> = Vec::new();
+            for item in arr {
+                let req: protocol::Request = match serde_json::from_value(item) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        responses.push(serde_json::to_value(error(
+                            Value::Null,
+                            error_code::INVALID_REQUEST,
+                            format!("invalid request in batch: {e}"),
+                        ))?);
+                        continue;
+                    }
+                };
+                let is_notification = req.id.is_none();
+                let outcome = dispatch_method_daemon(
+                    &mut grpc_client, &rt, &req,
+                );
+                if is_notification {
+                    if let Frame::Error(e) = outcome {
+                        tracing::warn!(
+                            "batch notification {} produced error: {}",
+                            req.method,
+                            e.error.message
+                        );
+                    }
+                    continue;
+                }
+                let val = match outcome {
+                    Frame::Success(r) => serde_json::to_value(r)?,
+                    Frame::Error(e) => serde_json::to_value(e)?,
+                };
+                responses.push(val);
+            }
+            if !responses.is_empty() {
+                let serialized = serde_json::to_string(&responses)?;
+                stdout.write_all(serialized.as_bytes())?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+        } else {
+            let req: protocol::Request = match serde_json::from_value(parsed) {
+                Ok(r) => r,
+                Err(e) => {
+                    let resp = error(
+                        Value::Null,
+                        error_code::INVALID_REQUEST,
+                        format!("invalid request: {e}"),
+                    );
+                    write_response(&mut stdout, &Frame::Error(resp))?;
+                    continue;
+                }
+            };
+            let is_notification = req.id.is_none();
+            let outcome = dispatch_method_daemon(
+                &mut grpc_client, &rt, &req,
+            );
+            if is_notification {
+                if let Frame::Error(e) = outcome {
+                    tracing::warn!(
+                        "notification {} produced error: {}",
+                        req.method,
+                        e.error.message
+                    );
+                }
+                continue;
+            }
+            write_response(&mut stdout, &outcome)?;
+        }
+    }
+}
+
+#[cfg(feature = "daemon")]
+fn dispatch_method_daemon(
+    client: &mut tools::DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    req: &protocol::Request,
+) -> Frame {
+    let id = req.id.clone().unwrap_or(Value::Null);
+
+    match req.method.as_str() {
+        "initialize" => Frame::Success(success(
+            id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": SERVER_VERSION,
+                }
+            }),
+        )),
+
+        "notifications/initialized" | "initialized" => {
+            Frame::Success(success(id, Value::Null))
+        }
+
+        "tools/list" => {
+            let lite = tools::is_lite_mode();
+            Frame::Success(success(id, tools::tool_list(lite)))
+        }
+
+        "tools/call" => {
+            let params = req.params.clone().unwrap_or(Value::Null);
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+
+            let Some(name) = name else {
+                return Frame::Error(error(
+                    id,
+                    error_code::INVALID_PARAMS,
+                    "tools/call: 'name' is required",
+                ));
+            };
+
+            match tools::dispatch_via_daemon(client, rt, &name, arguments) {
+                Ok(result) => {
+                    Frame::Success(success(id, tools::wrap_tool_result(result)))
+                }
+                Err(e) => {
+                    Frame::Success(success(id, tools::wrap_tool_error(&e.to_string())))
+                }
+            }
+        }
+
+        "ping" => Frame::Success(success(id, json!({}))),
+
+        other => Frame::Error(error(
+            id,
+            error_code::METHOD_NOT_FOUND,
+            format!("method not implemented: {other}"),
+        )),
+    }
+}
+
 enum Frame {
     Success(Response),
     Error(ErrorResponse),
