@@ -292,6 +292,18 @@ impl BrainWatcher {
             // refresh doesn't re-query the DB for every file.
             let symbol_index = crate::cross_domain::build_symbol_index(&store).ok();
 
+            // Pre-build the wikilink title lookup once per batch so
+            // reinsert_note doesn't re-query all notes for every file.
+            let mut title_lookup: HashMap<String, Vec<String>> = {
+                let mut map: HashMap<String, Vec<String>> = HashMap::new();
+                for n in store.list_notes(None).unwrap_or_default() {
+                    map.entry(n.title.to_lowercase())
+                        .or_default()
+                        .push(n.uid.clone());
+                }
+                map
+            };
+
             let mut any_change = false;
             for event in batch {
                 match self.handle_event(
@@ -300,6 +312,7 @@ impl BrainWatcher {
                     &v_uid,
                     event,
                     symbol_index.as_ref(),
+                    &mut title_lookup,
                 ) {
                     Ok(outcome) => {
                         if matches!(
@@ -356,6 +369,7 @@ impl BrainWatcher {
         v_uid: &str,
         event: DebouncedEvent,
         symbol_index: Option<&crate::cross_domain::SymbolIndex>,
+        title_lookup: &mut HashMap<String, Vec<String>>,
     ) -> Result<UpdateOutcome, anyhow::Error> {
         let path = event.path;
 
@@ -478,7 +492,13 @@ impl BrainWatcher {
         let parsed = parse_markdown(&rel_path, &source)?;
 
         let (headings, sections, wikilinks_count, tags_count) =
-            reinsert_note(store, v_uid, &n_uid, &path, &rel_path, &parsed, event.kind)?;
+            reinsert_note(store, v_uid, &n_uid, &path, &rel_path, &parsed, event.kind, title_lookup)?;
+
+        // Update the title lookup for subsequent notes in this batch.
+        title_lookup
+            .entry(parsed.title.to_lowercase())
+            .or_default()
+            .push(n_uid.clone());
 
         // Refresh cross-domain (Note↔Symbol) edges for this note. The
         // store's delete_note_cascade already DETACH-deleted any prior
@@ -638,6 +658,7 @@ fn reinsert_note(
     rel_path: &str,
     parsed: &ParsedNote,
     _event_kind: DebouncedEventKind,
+    title_lookup: &HashMap<String, Vec<String>>,
 ) -> Result<(usize, usize, usize, usize), anyhow::Error> {
     // ── Note + VAULT_HAS_NOTE ───────────────────────────────────────────
     let frontmatter_json = if parsed
@@ -815,18 +836,8 @@ fn reinsert_note(
     store.batch_insert_section_tag_edges(&st_refs)?;
     let tags_count = local_tag_uids.len();
 
-    // ── Wikilinks (per-file: resolve against the in-DB note list) ───────
+    // ── Wikilinks (per-file: resolve against the pre-built title lookup) ─
     let mut wl_resolved = 0usize;
-    let all_notes = store.list_notes(None).unwrap_or_default();
-    let title_lookup: HashMap<String, Vec<String>> = {
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for n in &all_notes {
-            map.entry(n.title.to_lowercase())
-                .or_default()
-                .push(n.uid.clone());
-        }
-        map
-    };
     let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
     let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
 
