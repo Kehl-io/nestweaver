@@ -11,6 +11,7 @@ members = [
     "crates/nestweaver-mcp",
     "crates/nestweaver-web",
     "crates/nestweaver-wasm",
+    "crates/nestweaver-proto",
 ]
 
 [workspace.package]
@@ -33,6 +34,10 @@ nestweaver-engine = { path = "crates/nestweaver-engine" }
 nestweaver-mcp = { path = "crates/nestweaver-mcp" }
 nestweaver-web = { path = "crates/nestweaver-web" }
 nestweaver-wasm = { path = "crates/nestweaver-wasm" }
+nestweaver-proto = { path = "crates/nestweaver-proto" }
+tonic = "0.13"
+prost = "0.13"
+tonic-build = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
