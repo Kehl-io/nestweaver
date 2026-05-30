@@ -1673,6 +1673,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "float-cmp"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2220,6 +2226,19 @@ dependencies = [
  "rustls-native-certs",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tower-service",
+]
+
+[[package]]
+name = "hyper-timeout"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
+dependencies = [
+ "hyper 1.10.0",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
  "tower-service",
 ]
 
@@ -2929,6 +2948,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "multimap"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
 name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2936,7 +2961,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2966,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -2974,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -2991,7 +3016,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "openapiv3",
- "prost-types",
+ "prost-types 0.14.3",
  "protox-parse",
  "rand 0.10.1",
  "rayon",
@@ -3013,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "nestweaver-engine",
@@ -3028,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "comrak",
  "hex",
@@ -3064,8 +3089,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nestweaver-proto"
+version = "0.11.0"
+dependencies = [
+ "prost 0.13.5",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "nestweaver-resolver"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "glob",
  "insta",
@@ -3081,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "hex",
  "serde",
@@ -3092,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3107,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3127,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
@@ -3438,6 +3472,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "petgraph"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+dependencies = [
+ "fixedbitset",
+ "indexmap",
+]
+
+[[package]]
 name = "phf"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3512,6 +3556,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -3657,12 +3721,55 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.3",
+]
+
+[[package]]
+name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck",
+ "itertools 0.14.0",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph",
+ "prettyplease",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "regex",
+ "syn",
+ "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -3680,11 +3787,20 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+dependencies = [
+ "prost 0.13.5",
+]
+
+[[package]]
+name = "prost-types"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost",
+ "prost 0.14.3",
 ]
 
 [[package]]
@@ -3695,7 +3811,7 @@ checksum = "072eee358134396a4643dff81cfff1c255c9fbd3fb296be14bdb6a26f9156366"
 dependencies = [
  "logos",
  "miette",
- "prost-types",
+ "prost-types 0.14.3",
  "thiserror 2.0.18",
 ]
 
@@ -5183,6 +5299,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
+name = "tonic"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "h2 0.4.14",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.0",
+ "hyper-timeout",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "prost 0.13.5",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic-build"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build",
+ "prost-types 0.13.5",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5190,9 +5349,12 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap",
  "pin-project-lite",
+ "slab",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

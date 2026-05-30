@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package nestweaver.daemon.v1;
+
+// ─── Lifecycle ───────────────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string version = 1;
+  string instance_id = 2;
+  string db_path = 3;
+  uint64 uptime_seconds = 4;
+  uint32 active_connections = 5;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {
+  bool ok = 1;
+}
+
+// ─── Indexing ────────────────────────────────────────────────────────
+
+message IndexRepoRequest {
+  string repo_path = 1;
+  string name = 2;
+  bool force = 3;
+  bool with_trigrams = 4;
+  bool with_git_activity = 5;
+}
+
+message IndexVaultRequest {
+  string vault_path = 1;
+  string vault_name = 2;
+  repeated string extra_ignore_patterns = 3;
+}
+
+message RefreshBrainRequest {}
+
+enum Phase {
+  DISCOVERING = 0;
+  PARSING = 1;
+  RESOLVING = 2;
+  WRITING = 3;
+  PAGERANK = 4;
+  DONE = 5;
+  ERROR = 6;
+}
+
+message IndexProgress {
+  Phase phase = 1;
+  string message = 2;
+  uint64 files_processed = 3;
+  uint64 files_total = 4;
+  uint64 symbols_found = 5;
+}
+
+// ─── JSON pass-through for read RPCs ─────────────────────────────────
+
+message JsonRequest {
+  string args_json = 1;
+}
+
+message JsonResponse {
+  string result_json = 1;
+}
+
+// ─── Service ─────────────────────────────────────────────────────────
+
+service NestWeaverDaemon {
+  // Lifecycle
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Indexing (server-streaming)
+  rpc IndexRepo(IndexRepoRequest) returns (stream IndexProgress);
+  rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
+  rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
+
+  // Read RPCs — JSON pass-through
+  rpc Search(JsonRequest) returns (JsonResponse);
+  rpc GetContext(JsonRequest) returns (JsonResponse);
+  rpc GetProjectContext(JsonRequest) returns (JsonResponse);
+  rpc GetNote(JsonRequest) returns (JsonResponse);
+  rpc GetBacklinks(JsonRequest) returns (JsonResponse);
+  rpc FlowTrace(JsonRequest) returns (JsonResponse);
+  rpc BlastRadius(JsonRequest) returns (JsonResponse);
+  rpc Impact(JsonRequest) returns (JsonResponse);
+  rpc BrainStatus(JsonRequest) returns (JsonResponse);
+  rpc BrainGuide(JsonRequest) returns (JsonResponse);
+  rpc BrainDiff(JsonRequest) returns (JsonResponse);
+  rpc ReadSymbols(JsonRequest) returns (JsonResponse);
+  rpc RegexSearch(JsonRequest) returns (JsonResponse);
+  rpc CountPatterns(JsonRequest) returns (JsonResponse);
+  rpc CrossRepoContracts(JsonRequest) returns (JsonResponse);
+  rpc ContractDrift(JsonRequest) returns (JsonResponse);
+  rpc DeadCode(JsonRequest) returns (JsonResponse);
+  rpc BrainBrokenLinks(JsonRequest) returns (JsonResponse);
+  rpc BrainOrphanDocuments(JsonRequest) returns (JsonResponse);
+  rpc BrainTopicClusters(JsonRequest) returns (JsonResponse);
+  rpc BrainTagGraph(JsonRequest) returns (JsonResponse);
+  rpc BrainDocStats(JsonRequest) returns (JsonResponse);
+  rpc BrainMemoryLint(JsonRequest) returns (JsonResponse);
+  rpc BrainMemoryConsolidate(JsonRequest) returns (JsonResponse);
+  rpc BrainMemoryRelated(JsonRequest) returns (JsonResponse);
+  rpc DetectChanges(JsonRequest) returns (JsonResponse);
+  rpc AffectedTests(JsonRequest) returns (JsonResponse);
+  rpc Clusters(JsonRequest) returns (JsonResponse);
+  rpc StaleCheck(JsonRequest) returns (JsonResponse);
+  rpc HubNodes(JsonRequest) returns (JsonResponse);
+  rpc BridgeNodes(JsonRequest) returns (JsonResponse);
+  rpc GetSummary(JsonRequest) returns (JsonResponse);
+  rpc Investigate(JsonRequest) returns (JsonResponse);
+  rpc InvestigateExpand(JsonRequest) returns (JsonResponse);
+  rpc InvestigateHydrate(JsonRequest) returns (JsonResponse);
+  rpc SetExtension(JsonRequest) returns (JsonResponse);
+  rpc QueryExtensions(JsonRequest) returns (JsonResponse);
+}
