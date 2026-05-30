@@ -29,6 +29,7 @@ pub struct DaemonState {
     pub start_time: Instant,
     pub active_connections: AtomicU32,
     pub idle_notify: Arc<Notify>,
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -43,33 +44,39 @@ impl DaemonService {
 
     /// Generic JSON pass-through dispatch. Maps every read RPC to the
     /// corresponding MCP tool via `nestweaver_mcp::tools::dispatch`.
-    fn dispatch_json_tool(
+    /// Runs the blocking dispatch on a dedicated thread to avoid
+    /// starving the tokio runtime.
+    async fn dispatch_json_tool(
         &self,
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
-        // Reset idle timer.
         self.state.idle_notify.notify_one();
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
 
-        let result = (|| -> Result<String, Status> {
-            let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| {
+        let state = self.state.clone();
+        let tool_name = tool_name.to_string();
+        let args_json = args_json.to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            let args: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
                 Status::invalid_argument(format!("invalid JSON in args_json: {e}"))
             })?;
 
-            // Thread-locals required by some tools.
-            nestweaver_mcp::tools::set_current_db_path(self.state.db_path.clone());
+            nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
 
             let value =
-                nestweaver_mcp::tools::dispatch(&self.state.store, self.state.tantivy.as_ref(), tool_name, args)
+                nestweaver_mcp::tools::dispatch(&state.store, state.tantivy.as_ref(), &tool_name, args)
                     .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
 
             serde_json::to_string(&value)
                 .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))
-        })();
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
 
         self.state
             .active_connections
@@ -85,7 +92,7 @@ impl DaemonService {
 macro_rules! json_rpc {
     ($self:ident, $request:ident, $tool:expr) => {{
         let req = $request.into_inner();
-        $self.dispatch_json_tool($tool, &req.args_json)
+        $self.dispatch_json_tool($tool, &req.args_json).await
     }};
 }
 
@@ -115,10 +122,10 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
         tracing::info!("shutdown requested via gRPC");
-        // Spawn a delayed exit so the response can be sent first.
-        tokio::spawn(async {
+        let tx = self.state.shutdown_tx.clone();
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            std::process::exit(0);
+            let _ = tx.send(true);
         });
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
@@ -562,9 +569,13 @@ pub async fn run_server(
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
 
-    // Open the graph store.
-    let store = GraphStore::open_or_readonly(&db_path)
-        .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
+    // Open the graph store with write access — the daemon is the sole DB owner.
+    let store = GraphStore::open_or_create(&db_path)
+        .with_context(|| format!(
+            "open GraphStore at {} — another process may hold the write lock. \
+             Stop it or use --no-daemon.",
+            db_path.display()
+        ))?;
 
     // Load sidecars (PageRank, interaction scores).
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
@@ -610,6 +621,7 @@ pub async fn run_server(
     };
 
     let idle_notify = Arc::new(Notify::new());
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let state = Arc::new(DaemonState {
         store,
@@ -619,6 +631,7 @@ pub async fn run_server(
         start_time: Instant::now(),
         active_connections: AtomicU32::new(0),
         idle_notify: idle_notify.clone(),
+        shutdown_tx: shutdown_tx.clone(),
     });
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()));
@@ -629,10 +642,8 @@ pub async fn run_server(
         .with_context(|| format!("create runtime dir: {}", sock_dir.display()))?;
 
     let sock_path = lifecycle::socket_path(&instance_id);
-    // Remove stale socket if present.
     let _ = std::fs::remove_file(&sock_path);
 
-    // Write PID file.
     let pid_path = lifecycle::pidfile_path(&instance_id);
     std::fs::write(&pid_path, std::process::id().to_string())
         .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
@@ -643,42 +654,46 @@ pub async fn run_server(
         "daemon starting"
     );
 
-    // Idle timeout task.
+    // Idle timeout: signal shutdown instead of process::exit.
     if let Some(timeout) = idle_timeout {
         let notify = idle_notify.clone();
         let active = state.clone();
+        let tx = shutdown_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = notify.notified() => {
-                        // Activity detected — restart the timer.
-                        continue;
-                    }
+                    _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
                         if active.active_connections.load(Ordering::Relaxed) == 0 {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
                             );
-                            std::process::exit(0);
+                            let _ = tx.send(true);
+                            return;
                         }
-                        // Still active connections — wait again.
                     }
                 }
             }
         });
     }
 
-    // Bind and serve.
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_incoming(uds_stream)
+        .serve_with_incoming_shutdown(uds_stream, async move {
+            let _ = shutdown_rx.changed().await;
+        })
         .await
         .context("gRPC server error")?;
+
+    // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
+    tracing::info!("daemon shutting down, cleaning up");
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
 
     Ok(())
 }
