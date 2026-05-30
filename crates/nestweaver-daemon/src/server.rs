@@ -181,6 +181,17 @@ impl NestWeaverDaemon for DaemonService {
                     // PageRank is deferred to first query (lazy evaluation
                     // in GraphStore::ensure_pagerank_loaded).
 
+                    // Rebuild Tantivy search index so BM25 search reflects
+                    // the freshly indexed repo content.
+                    if let Some(ref tantivy) = state.tantivy {
+                        if tantivy.has_writer() {
+                            match tantivy.reindex_from_store(&state.store) {
+                                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after repo indexing"),
+                                Err(e) => tracing::warn!(error = %e, "Tantivy reindex failed after repo indexing"),
+                            }
+                        }
+                    }
+
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
@@ -254,6 +265,17 @@ impl NestWeaverDaemon for DaemonService {
                         files_total: result.notes_count as u64,
                         symbols_found: result.headings_count as u64,
                     }));
+
+                    // Rebuild Tantivy search index so BM25 search reflects
+                    // the freshly indexed vault content.
+                    if let Some(ref tantivy) = state.tantivy {
+                        if tantivy.has_writer() {
+                            match tantivy.reindex_from_store(&state.store) {
+                                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault indexing"),
+                                Err(e) => tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing"),
+                            }
+                        }
+                    }
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -553,24 +575,38 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
 
-    // Open Tantivy index (reader-only).
+    // Open Tantivy index with a writer so the daemon can update the
+    // search index after indexing operations (vault/repo).  Fall back to
+    // reader-only when the writer lock is held by another process (e.g. a
+    // running brain watcher), and finally to None when the index doesn't
+    // exist at all.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-    let tantivy = match TantivyIndex::open_reader_only(&tantivy_path) {
+    let tantivy = match TantivyIndex::open_or_create(&tantivy_path) {
         Ok(idx) => {
             tracing::info!(
                 docs = idx.doc_count(),
                 path = %tantivy_path.display(),
-                "Tantivy index open (reader-only)"
+                "Tantivy index open (read-write)"
             );
             Some(idx)
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not open Tantivy index — search will use substring fallback"
-            );
-            None
-        }
+        Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
+            Ok(idx) => {
+                tracing::info!(
+                    docs = idx.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (reader-only fallback)"
+                );
+                Some(idx)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not open Tantivy index — search will use substring fallback"
+                );
+                None
+            }
+        },
     };
 
     let idle_notify = Arc::new(Notify::new());
