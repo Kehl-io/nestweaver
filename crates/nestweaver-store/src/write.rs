@@ -1773,14 +1773,12 @@ impl GraphStore {
     /// This method updates the in-graph Symbol node so that `list_all_symbols`
     /// can return embeddings without a separate sidecar.
     pub fn update_symbol_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        use crate::read::row_to_symbol;
+        use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
 
         let conn = self.conn()?;
 
         // Read the existing symbol.
-        let cols = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, \
-                    s.signature, s.summary, s.content_hash, s.pagerank_score";
-        let q = format!("MATCH (s:Symbol {{uid: $uid}}) RETURN {cols}");
+        let q = format!("MATCH (s:Symbol {{uid: $uid}}) RETURN {SYMBOL_COLUMNS}");
         let mut stmt = conn
             .prepare(&q)
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
