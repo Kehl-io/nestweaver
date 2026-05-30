@@ -135,8 +135,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
-        let db_path = self.state.db_path.clone();
-        let instance_id = self.state.instance_id.clone();
+        let state = self.state.clone();
         let force = req.force;
         let name = if req.name.is_empty() {
             None
@@ -149,7 +148,6 @@ impl NestWeaverDaemon for DaemonService {
         tokio::task::spawn_blocking(move || {
             let repo_url = format!("file://{}", repo_path.display());
 
-            // DISCOVERING phase
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning {}", repo_path.display()),
@@ -158,18 +156,17 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            // Index the repository
-            match nestweaver_engine::index_directory_with_options(
+            match nestweaver_engine::index_directory_with_store(
+                &state.store,
                 &repo_path,
-                &db_path,
-                &instance_id,
+                &state.db_path,
+                &state.instance_id,
                 &repo_url,
                 "local",
                 force,
                 name.as_deref(),
             ) {
                 Ok(result) => {
-                    // WRITING phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Writing as i32,
                         message: format!(
@@ -181,7 +178,6 @@ impl NestWeaverDaemon for DaemonService {
                         symbols_found: result.symbols_count as u64,
                     }));
 
-                    // PAGERANK phase — reopen the store for post-index operations
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Pagerank as i32,
                         message: "Computing PageRank".into(),
@@ -190,22 +186,14 @@ impl NestWeaverDaemon for DaemonService {
                         symbols_found: result.symbols_count as u64,
                     }));
 
-                    match nestweaver_store::GraphStore::open_or_readonly(&db_path) {
-                        Ok(store) => {
-                            let scope = nestweaver_store::GraphScope::code_only();
-                            if let Err(e) = store.compute_pagerank(0.85, 20, &scope) {
-                                tracing::warn!("PageRank computation failed: {e}");
-                            }
-                            let pr_path =
-                                nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
-                            if let Err(e) = store.save_pagerank_cache(&pr_path) {
-                                tracing::warn!("PageRank cache save failed: {e}");
-                            }
-                            store.bump_and_persist_generation();
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not reopen store for PageRank: {e}");
-                        }
+                    let scope = nestweaver_store::GraphScope::code_only();
+                    if let Err(e) = state.store.compute_pagerank(0.85, 20, &scope) {
+                        tracing::warn!("PageRank computation failed: {e}");
+                    }
+                    let pr_path =
+                        nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+                    if let Err(e) = state.store.save_pagerank_cache(&pr_path) {
+                        tracing::warn!("PageRank cache save failed: {e}");
                     }
 
                     // DONE phase
@@ -247,13 +235,11 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
-        let db_path = self.state.db_path.clone();
-        let instance_id = self.state.instance_id.clone();
+        let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         tokio::task::spawn_blocking(move || {
-            // DISCOVERING phase
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning vault {}", vault_path.display()),
@@ -262,26 +248,17 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            let index_result = if extra_patterns.is_empty() {
-                nestweaver_engine::index_markdown_directory(
-                    &vault_path,
-                    &db_path,
-                    &instance_id,
-                    &vault_name,
-                )
-            } else {
-                nestweaver_engine::index_markdown_directory_with_ignore(
-                    &vault_path,
-                    &db_path,
-                    &instance_id,
-                    &vault_name,
-                    &extra_patterns,
-                )
-            };
+            let index_result = nestweaver_engine::index_markdown_directory_with_store(
+                &state.store,
+                &vault_path,
+                &state.db_path,
+                &state.instance_id,
+                &vault_name,
+                &extra_patterns,
+            );
 
             match index_result {
                 Ok(result) => {
-                    // WRITING phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Writing as i32,
                         message: format!(
@@ -292,16 +269,6 @@ impl NestWeaverDaemon for DaemonService {
                         files_total: result.notes_count as u64,
                         symbols_found: result.headings_count as u64,
                     }));
-
-                    // Bump generation on the store that was just written
-                    match nestweaver_store::GraphStore::open_or_readonly(&db_path) {
-                        Ok(store) => {
-                            store.bump_and_persist_generation();
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not reopen store to bump generation: {e}");
-                        }
-                    }
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
