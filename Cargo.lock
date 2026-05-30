@@ -2985,6 +2985,7 @@ dependencies = [
  "nestweaver-daemon",
  "nestweaver-engine",
  "nestweaver-mcp",
+ "nestweaver-proto",
  "nestweaver-schema",
  "nestweaver-storage",
  "nestweaver-store",
