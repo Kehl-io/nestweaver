@@ -32,21 +32,28 @@ pub fn ensure_daemon(db_path: &Path) -> Result<PathBuf> {
         .open(&pidfile)
         .with_context(|| format!("failed to open pidfile {}", pidfile.display()))?;
 
-    // Acquire exclusive flock.
+    // Try a non-blocking exclusive flock. The `daemonize` crate holds
+    // LOCK_EX on the pidfile for the daemon's entire lifetime, so if we
+    // can't acquire it the daemon is definitely running.
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
-        bail!(
-            "flock on pidfile failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            // Lock held by the running daemon — it's alive.
+            if let Some(pid) = read_pid_from_file(&mut file) {
+                debug!(pid, "daemon already running (lock held)");
+            }
+            return Ok(sock);
+        }
+        bail!("flock on pidfile failed: {}", err);
     }
 
-    // Check for an existing live daemon.
+    // We acquired the lock, so no daemon holds it. Check if a process
+    // from the pidfile is still alive (shouldn't be, but be safe).
     if let Some(pid) = read_pid_from_file(&mut file) {
         if is_process_alive(pid) {
             debug!(pid, "daemon already running");
-            // Release lock before returning.
             unsafe { libc::flock(fd, libc::LOCK_UN) };
             return Ok(sock);
         }
