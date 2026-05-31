@@ -100,6 +100,8 @@ predicates = "3"
 tempfile = "3"
 serde_json = { workspace = true }
 criterion = { version = "0.8", default-features = false }
+nestweaver-daemon = { workspace = true }
+libc = "0.2"
 
 [[bench]]
 name = "brain_benchmarks"
