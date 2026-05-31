@@ -634,7 +634,9 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
     });
 
-    let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()));
+    let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     // Prepare the socket path.
     let sock_dir = lifecycle::runtime_dir(&instance_id);
