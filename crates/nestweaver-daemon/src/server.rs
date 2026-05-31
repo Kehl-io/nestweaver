@@ -569,13 +569,59 @@ pub async fn run_server(
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
 
+    // Rotate the daemon log if over 10MB.
+    let log_dir_path = lifecycle::log_dir(&instance_id);
+    std::fs::create_dir_all(&log_dir_path).ok();
+    let log_path = lifecycle::log_path(&instance_id);
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 10 * 1024 * 1024 {
+            let rotated = log_path.with_extension("log.1");
+            let _ = std::fs::rename(&log_path, &rotated);
+        }
+    }
+
+    // After daemonize's double-fork, stderr is redirected to the log file.
+    // The parent's tracing subscriber (WARN level, stderr writer) is inherited
+    // and will write to the log file. Emit key lifecycle events via eprintln!
+    // as well, since they're guaranteed to reach the log regardless of tracing
+    // configuration.
+    eprintln!("[daemon] starting for {} (instance {instance_id})", db_path.display());
+
     // Open the graph store with write access — the daemon is the sole DB owner.
-    let store = GraphStore::open_or_create(&db_path)
-        .with_context(|| format!(
-            "open GraphStore at {} — another process may hold the write lock. \
-             Stop it or use --no-daemon.",
-            db_path.display()
-        ))?;
+    let store = match GraphStore::open_or_create(&db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Check if a watcher is holding the lock (writes PID to <db>.lock).
+            let lock_path = {
+                let mut s = db_path.as_os_str().to_owned();
+                s.push(".lock");
+                std::path::PathBuf::from(s)
+            };
+            let mut hint = String::new();
+            if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    if unsafe { libc::kill(pid, 0) } == 0 {
+                        hint = format!(
+                            "\n\nA brain watcher (PID {pid}) is holding the database lock.\n\
+                             Stop it with: nestweaver brain watch-stop --db {}\n\
+                             Or use --no-daemon to bypass the daemon.",
+                            db_path.display()
+                        );
+                    }
+                }
+            }
+            if hint.is_empty() {
+                hint = format!(
+                    "\n\nAnother process may hold the write lock on {}.\n\
+                     Check for running nestweaver processes and stop them, or use --no-daemon.",
+                    db_path.display()
+                );
+            }
+            return Err(e).with_context(|| format!(
+                "failed to open database with write access{hint}"
+            ));
+        }
+    };
 
     // Load sidecars (PageRank, interaction scores).
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
@@ -705,6 +751,7 @@ pub async fn run_server(
         .context("gRPC server error")?;
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
+    eprintln!("[daemon] shutting down, cleaning up");
     tracing::info!("daemon shutting down, cleaning up");
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
