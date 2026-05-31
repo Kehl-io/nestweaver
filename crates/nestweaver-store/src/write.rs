@@ -1613,36 +1613,36 @@ impl GraphStore {
         file_path: &str,
     ) -> Result<usize, StoreError> {
         let conn = self.conn()?;
-        // Collect UIDs first (LadybugDB does not support compound WHERE
-        // parameterization, so we format the lookup query the same way
-        // `delete_cross_domain_edges_for_note` does for its section query).
-        let symbol_uids: Vec<String> = {
-            // LadybugDB does not support parameterized compound WHERE
-            // clauses. Sanitize user-derived values by escaping single
-            // quotes to prevent Cypher injection.
-            let safe_repo_uid = repo_uid.replace('\'', "\\'");
-            let safe_file_path = file_path.replace('\'', "\\'");
+        // LadybugDB does not support parameterized compound WHERE clauses.
+        // Sanitize user-derived values by escaping single quotes.
+        let safe_repo_uid = repo_uid.replace('\'', "\\'");
+        let safe_file_path = file_path.replace('\'', "\\'");
+
+        // Count first so we can report how many were deleted.
+        let count: usize = {
             let rows = conn
                 .query(&format!(
-                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN s.uid"
+                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' RETURN count(s)"
                 ))
-                .map_err(|e| StoreError::Query(format!("query symbols: {e}")))?;
+                .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
-                    lbug::Value::String(s) => Some(s.clone()),
+                    lbug::Value::Int64(n) => Some(*n as usize),
                     _ => None,
                 })
             })
-            .collect()
+            .next()
+            .unwrap_or(0)
         };
-        let count = symbol_uids.len();
-        for uid in &symbol_uids {
-            exec_params(
-                &conn,
-                "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
-                vec![("uid", lbug::Value::String(uid.clone()))],
-            )?;
+
+        if count > 0 {
+            // Single bulk DETACH DELETE instead of per-UID queries.
+            conn.query(&format!(
+                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo_uid}' AND s.file_path = '{safe_file_path}' DETACH DELETE s"
+            ))
+            .map_err(|e| StoreError::Query(format!("delete symbols in file: {e}")))?;
         }
+
         Ok(count)
     }
 
