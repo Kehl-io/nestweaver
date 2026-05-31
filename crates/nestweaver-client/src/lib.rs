@@ -94,17 +94,19 @@ impl DaemonClient {
                 info!(pid, "sending SIGTERM to old daemon");
                 unsafe { libc::kill(pid, libc::SIGTERM) };
 
-                // Wait up to 1s for it to exit.
+                // Poll for exit with 5s timeout, then SIGKILL.
                 let start = std::time::Instant::now();
-                while start.elapsed() < std::time::Duration::from_secs(1) {
+                while start.elapsed() < std::time::Duration::from_secs(5) {
                     if !autostart::is_process_alive(pid) {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
 
                 if autostart::is_process_alive(pid) {
-                    warn!(pid, "daemon did not exit after SIGTERM, continuing anyway");
+                    warn!(pid, "daemon did not exit after SIGTERM, sending SIGKILL");
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
         }
