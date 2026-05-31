@@ -1,7 +1,7 @@
 # Performance Optimization Roadmap: Items 5-7
 
-**Date:** 2026-05-30 (updated with research findings)
-**Status:** Research complete, ready for implementation planning
+**Date:** 2026-05-30 (validated against codebase and research)
+**Status:** Research complete, validated, ready for implementation
 **Context:** Items 1-4 are implemented on `feat/daemon-concurrent-access`.
 
 ---
@@ -15,171 +15,196 @@
 | Lazy PageRank first query | ~1K nodes | 286ms |
 | Cached PageRank subsequent query | ~1K nodes | 295ms |
 
-At NestWeaver's current scale (~50K symbols, ~200K edges), full PageRank likely takes 1-3 seconds. This makes incremental PageRank a moderate-priority optimization — warm-start alone would cut it to <500ms.
+At NestWeaver's current scale (~50K symbols, ~200K edges), full PageRank likely takes 1-3 seconds.
 
 ---
 
-## Item 5: Materialized Project Context with Generation-Based Invalidation
+## Item 5: Validate and Optimize Project Context Caching
 
 ### Problem
-`project_context` re-queries repos/notes/symbols from the DB and runs Personalized PageRank on every call. For frequently-accessed projects in a daemon session, this is redundant when the graph hasn't changed.
+`project_context` runs PPR on every call. For frequently-accessed projects in a daemon session, this may be redundant when the graph hasn't changed.
 
-### Research Findings
+### Codebase Validation (verified)
 
-**MV4PG (arXiv 2411.18847):** Materialized views for property graphs achieve up to 97x per-query and 29x workload-wide speedup. The key technique: compress multi-hop variable-length path queries into pre-materialized single edges. Write overhead is 20-30% for small mutations. Biggest wins are on queries that traverse long paths (e.g., `[:CALLS*..]`).
+**`project_context` IS already in the cacheable tool set** (`CACHEABLE_TOOLS` in `tools.rs`). The F16 response cache should already be caching it with generation-keyed invalidation.
 
-**Neo4j pattern (Max De Marzi):** In-process LoadingCache (Guava-style) keyed on node ID with TTL-based expiration. `refreshAfterWrite` enables async background refresh — readers get stale-but-fast results while recomputation runs. No built-in materialized views in Neo4j.
+The F16 cache uses:
+- **`key_hash`:** derived from tool name + normalized args (captures query parameters)
+- **`scope_digest`:** XOR of file paths and content hashes (captures graph state, NOT query params)
+- **`generation`:** monotonic counter bumped after each index operation
+- **TTL:** 24 hours
+- **Eviction:** LRU by `last_access` when over size limit
 
-**Generation-based invalidation (CasCache pattern):** Monotonic generation counter per cache namespace. Cached entries store the generation they were computed at. On read, compare entry generation to current — miss if stale. CAS fence variant rejects late writes that would overwrite fresher data.
+**This means Item 5 may already be working.** The investigation shifts from "add caching" to "verify caching works and diagnose why project_context still feels slow."
 
-**NestWeaver already has this infrastructure:** The F16 response cache uses `generation + scope_digest` keying with 24h TTL and LRU eviction. The graph generation is bumped after each index operation via `bump_and_persist_generation()`.
+### Revised Design
 
-### Design
+1. **Verify F16 cache hits for project_context** — add instrumentation (or check existing `CACHE_HITS` / `CACHE_MISSES` counters) to confirm project_context queries hit the cache on repeated calls
+2. **If cache misses:** investigate whether the scope_digest changes between calls even when the graph hasn't changed (possible if file mtimes are included in the digest)
+3. **If cache hits but still slow:** the bottleneck is elsewhere (DB query, PPR computation, or serialization). Profile with `tracing` spans
+4. **Daemon-specific optimization:** the daemon holds the GraphStore in memory, so the F16 cache is shared across all MCP clients. Verify the daemon's dispatch path goes through the F16 cache (check if `dispatch_json_tool` calls the cached `dispatch` or the uncached `dispatch_uncached`)
 
-**Approach: Extend the existing F16 response cache to cover `project_context`.**
-
-The F16 cache already handles generation-based invalidation for most tools. The reason `project_context` isn't cached is that it's not in the cacheable tool list (it depends on PPR which was previously considered too dynamic).
-
-With lazy PageRank (item 3, already implemented), the PageRank cache is stable between index operations. This means `project_context` results are also stable between index operations — they can be safely cached.
-
-**Changes:**
-1. Add `project_context` to the cacheable tool set in `tools.rs` (the `is_cacheable_tool` function)
-2. The scope_digest already captures the query parameters (project name, token_budget, intent, etc.), so different queries for the same project get different cache entries
-3. The generation counter already invalidates on index — no new invalidation logic needed
-4. For the daemon, the in-memory response cache is shared across all gRPC clients
-
-**For PPR-heavy queries (`brain_context` with custom seeds):** These are already cacheable via F16. Verify they're in the cacheable set.
-
-**Estimated effort:** 1 day (mostly testing)
-**Risk:** Very low — extending an existing, proven cache system
+**Estimated effort:** 0.5-1 day investigation + fix
+**Risk:** Very low
 
 ---
 
 ## Item 6: Warm-Start and Incremental PageRank
 
 ### Problem
-PageRank is recomputed from scratch (uniform initialization, 20 iterations) even when only a few files changed. At 50K nodes this takes 1-3 seconds — fast, but avoidable.
+PageRank is recomputed from scratch (uniform initialization, 20 iterations) even when only a few files changed.
 
-### Research Findings
+### Research Findings (validated)
 
-**Warm-start power iteration:** Initialize from previous PageRank vector instead of uniform. When <1% of nodes change, convergence drops from ~20 iterations to 2-5. Trivial to implement — just persist the rank vector. ~4x speedup for typical incremental updates.
+**Warm-start power iteration:** Initialize from previous PageRank vector instead of uniform. Convergence is faster when the graph has changed only slightly — the previous vector is already close to the new fixpoint. Kamvar et al. (Stanford) demonstrated ~50-300% speedup via Power Extrapolation on 80M-node web graphs. Specific iteration count reduction depends on the magnitude of the change. [Source: Kamvar et al., "Extrapolation Methods for Accelerating PageRank Computations"]
 
-**Local forward push (Andersen/Chung/Lang 2006):** Starting from changed nodes, push residual probability mass forward along edges until residuals fall below epsilon. Work is proportional to affected nodes, not graph size. For 100 changed files in a 50K-node graph, touches ~1-5K nodes. Time complexity O(1/epsilon), independent of graph size. ~20-50x speedup for small changes.
+**Local forward push (Andersen/Chung/Lang 2006):** Push residual probability mass forward from seed nodes along edges until residuals fall below epsilon. Complexity is O(m/(α·ε)) where m = number of edges, α = teleport probability, ε = convergence threshold. This is NOT independent of graph size — it depends on m. However, in practice, for localized changes, it terminates much earlier because most residuals decay below epsilon before reaching distant nodes. [Source: arXiv 2403.05198 survey of PPR algorithms]
 
-**Monte Carlo random walks (Bahmani et al. 2010):** Store R random walks per node. On edge change, re-sample only walks that traverse the changed edge. Maintenance cost O(n ln m / epsilon²). Tested at Twitter scale. More complex than forward push but handles streaming updates naturally.
+**Monte Carlo random walks (Bahmani et al. 2010):** Store R random walks per node. On edge change, re-sample only walks traversing the changed edge. Total maintenance cost O(nR·ln(m)/ε²) where R = walks per node. Requires random-order edge arrivals; adversarial orderings can be worse. [Source: arXiv 1204.5500]
 
-**Structural change detection:** PageRank depends only on link structure (edges), not node content. If an index operation only changes node metadata (content hashes, line counts) but no edges are added/removed, PageRank doesn't need recomputation at all.
+**Structural change detection (verified against codebase):** PageRank depends only on link structure (edges, weights), not node content. The PPR algorithm in `ppr.rs` operates purely on `AdjacencyData` — no node attributes (word_count, content, etc.) are referenced. If an index operation adds/updates nodes but no edges change, PageRank scores are unchanged.
+
+### Codebase Validation (verified)
+
+- `compute_pagerank` initializes `scores = vec![1.0/n; n]` (uniform) — confirmed at `ranking.rs:361-362`
+- PageRank sidecar is `HashMap<String, f64>` as JSON — confirmed at `ranking.rs:689-709`
+- `IndexResult` has `edges_count` field — confirmed. `MarkdownIndexResult` does not have `edges_count` (has `wikilinks_resolved` instead, which represents edges)
+- Adding `warm_start: Option<&HashMap<String, f64>>` to `compute_pagerank` requires a signature change but won't break existing callers (add as last parameter with default)
 
 ### Design
 
 **Phase A: Warm-start (trivial, do first)**
 
-The PageRank sidecar (`<db>.pagerank.json`) already persists scores. Currently, `compute_pagerank` initializes from uniform. Change it to:
-1. Load previous scores from the sidecar if available
-2. Initialize the score vector from previous values for existing nodes, uniform for new nodes
-3. Run power iteration — convergence in 2-5 iterations instead of 20
+1. Add `warm_start: Option<&HashMap<String, f64>>` parameter to `compute_pagerank`
+2. If provided, initialize scores from the warm-start map for known node UIDs, uniform (`1.0/n`) for new nodes
+3. `ensure_pagerank_loaded` already has the sidecar loaded — pass it as warm start
+4. Run power iteration as normal — it will converge faster from a closer starting point
 
-**Changes:**
-- `ranking.rs:compute_pagerank` — accept an optional `warm_start: Option<&HashMap<String, f64>>` parameter
-- `ensure_pagerank_loaded` — pass the loaded sidecar scores as warm start
-- Track whether edges changed during indexing (add a `edges_changed: bool` flag to `IndexResult` / `MarkdownIndexResult`)
-- If no edges changed, skip PageRank entirely
+**Phase B: Skip if no structural changes**
 
-**Phase B: Forward push from dirty nodes (if benchmarks justify)**
+Track whether edges changed during indexing:
+1. `IndexResult` already has `edges_count` — if zero, no new edges were created. But this doesn't track edge deletions
+2. Add an `edges_deleted: usize` counter to the delete path
+3. If `edges_count == 0 && edges_deleted == 0`, skip PageRank entirely — cached scores are exact
+4. For markdown: `wikilinks_resolved` serves as the edge count. If zero and no notes were deleted, skip
 
-Only implement if Phase A's warm-start still takes >500ms at enterprise scale (>100K nodes).
+**Phase C: Forward push from dirty nodes (only if benchmarks justify at >100K nodes)**
+
 1. Track which node UIDs were inserted/updated/deleted during indexing
 2. Set initial residuals only at dirty nodes
-3. Push forward until convergence
-4. Merge with cached scores for untouched nodes
+3. Push forward using Andersen/Chung/Lang algorithm until convergence
+4. Complexity: O(m/(α·ε)) worst case, but terminates early for localized changes
 
-**Phase C: Skip if no structural changes**
-
-Add an `edges_changed` counter to the index result. If zero edges were added/removed (content-only change), skip PageRank entirely — the cached scores are still exact.
-
-**Estimated effort:** Phase A: 1 day. Phase B: 3-5 days. Phase C: 0.5 days.
-**Risk:** Phase A: None. Phase B: Medium (approximation quality needs validation). Phase C: None.
+**Estimated effort:** Phase A: 1 day. Phase B: 1 day. Phase C: 3-5 days.
+**Risk:** Phase A: None. Phase B: None. Phase C: Medium (approximation quality needs validation).
 
 ---
 
-## Item 7: Glean-Style Immutable Database Stacking
+## Item 7: Staged Incremental Writes and File-Level Ownership
 
 ### Problem
-Incremental indexing does `delete_note_cascade()` + reinsert for changed files. Code indexing re-parses and overwrites symbols. At scale (>500 files changed, enterprise monorepos), the delete-cascade + reinsert cycle is expensive and holds the write lock.
+Incremental indexing uses `delete_note_cascade()` (deletes note + all headings/sections/edges via DETACH DELETE) followed by full reinsert. For code, `delete_symbols_in_file()` deletes all symbols for a file path then reinserts. At scale, this is expensive — especially the cascade deletes which execute multiple per-UID queries.
 
-### Research Findings
+### Research Findings (validated)
 
-**Glean architecture (Meta, verified):** Each DB is immutable. Incremental updates create a new layer atop a base DB. The stack appears as one logical DB. Facts are hidden via unit-based ownership sets (not per-fact bitmaps — ownership sets are 10-100x fewer than facts). Ownership propagation: if fact F (owned by set A) references fact G (owned by set B), derived ownership is `A || B`. Storage uses Elias-Fano encoding (~2 bits per element), adding ~7% overhead. RocksDB as storage backend. Compaction is periodic full rebuild (no leveled compaction for graph layers).
+**Glean stacking (Meta, confirmed):** Immutable DB layers with unit-based ownership. Facts hidden via ownership sets (UsetId), not per-fact bitmaps. Ownership propagation: `A || B` for referenced facts. Storage overhead ~7% using Elias-Fano encoding (~2 bits overhead per element above information-theoretic minimum; total bits depend on universe-to-element ratio). Backend: RocksDB (with LMDB alternative, 30-40% faster). Compaction: periodic full rebuild. [Sources: glean.software/blog/incremental/, engineering.fb.com/2024/12/19/developer-tools/glean-open-source-code-indexing/]
 
-**Key insight — ownership sets vs bitmaps:** Glean doesn't tag each fact individually. Facts produced by the same file share an ownership set, stored as an interval map (consecutive facts with the same owner = one entry). This is why the overhead is only 7% — not per-fact overhead.
+**SCIP (Sourcegraph, confirmed):** Human-readable symbol strings replace opaque numeric IDs, enabling per-file incremental updates without global renumbering. [Source: sourcegraph.com/blog/announcing-scip]
 
-**SCIP/LSIF comparison:** SCIP (Sourcegraph) uses human-readable symbol strings that enable per-file replacement, but Sourcegraph hasn't shipped true incremental stacking — they re-process per upload. Glean's approach is more mature.
+**LadybugDB constraints (verified against codebase):** LadybugDB does NOT support parameterized compound WHERE clauses — queries use string interpolation with escaping (see `write.rs:1620-1627`). An `owner_file` column approach would need escaped string interpolation, not parameterized queries. The DB does support `DETACH DELETE` which removes a node and all its edges atomically.
 
-**Adapting to LadybugDB (Kuzu-style):** Three approaches evaluated:
-1. **Application-level overlay** — add `layer_id` + `visible` columns to every table. Query with `WHERE visible = true`. Tombstone rows hide old facts. **Downside:** pollutes every query with filter, schema changes required.
-2. **Separate staging tables** — write incremental updates to staging tables, merge periodically. **Simplest practical approach** for LadybugDB.
-3. **Ownership as sidecar** — store ownership sets outside the graph. Filter results at query time. **Most Glean-faithful** but adds query-time overhead.
+### Codebase Validation (verified)
 
-**LSM analogy:** Glean stacking maps to size-tiered compaction. Layers accumulate; periodic full rebuild is the "major compaction." For NestWeaver, this means: accumulate small incremental updates in a lightweight structure, merge into the main DB when idle or when layer count exceeds a threshold.
+- `delete_note_cascade` (`write.rs:1449-1485`): 4-step cascade — delete sections (DETACH), delete headings (DETACH), delete note (DETACH), delete unresolved wikilinks. Each step is a separate query per UID.
+- `delete_symbols_in_file` (`write.rs:1610-1647`): Collects all Symbol UIDs for a (repo_uid, file_path) pair, then DETACH DELETE each.
+- Both Symbol and Note have `file_path: String` fields — confirmed in schema and DB tables.
+- `begin_transaction` / `commit_transaction` exist — confirmed at `db.rs:307-322`.
 
 ### Design
 
-**Phase A: Staged incremental writes (medium effort, high payoff)**
+**Phase A: Batch diff writes (medium effort, high payoff)**
 
-Instead of `delete_note_cascade()` + reinsert, write changed facts to an in-memory staging area, then apply them as a single batch diff:
+Instead of delete-cascade + full reinsert per file, compute the diff and apply only changes:
 
-1. During indexing, track the set of changed file paths
-2. For each changed file, compute the new set of nodes/edges
-3. Diff against the existing nodes/edges for that file (query by `file_path`)
-4. Apply only the delta: insert new, delete removed, update changed
-5. Skip files whose content hash hasn't changed (already done via filemeta cache)
+1. Before indexing a file, query its current nodes: `MATCH (s:Symbol) WHERE s.file_path = $escaped_path RETURN s.uid, s.name, s.content_hash`
+2. After parsing, compare new symbols to existing by content_hash
+3. Only insert truly new symbols, delete truly removed ones, skip unchanged
+4. Apply all changes in a single transaction via `begin_transaction` / `commit_transaction`
 
-**Key data structure:** A `ChangeBatch` that accumulates:
-- `nodes_to_insert: Vec<Node>`
-- `nodes_to_delete: Vec<String>` (UIDs)
-- `edges_to_insert: Vec<Edge>`
-- `edges_to_delete: Vec<(String, String)>` (source, target UIDs)
+For notes, the same pattern: query existing headings/sections by `note_uid`, diff against newly parsed, apply delta.
 
-The daemon applies the batch in a single transaction.
+**Expected impact:** For a file where 1 of 10 functions changed, this does 1 delete + 1 insert instead of 10 deletes + 10 inserts.
 
-**Phase B: File-level ownership tracking (longer term)**
+**Phase B: File-level bulk delete (simpler alternative to Phase A)**
 
-Add a `owner_file: String` column to Symbol and Note node tables. On incremental update:
-1. `DELETE FROM Symbol WHERE owner_file = $changed_file`
-2. Insert new symbols for that file
-3. No cascade needed — edges that reference deleted symbols are handled by the graph engine's referential integrity
+Add a `DELETE WHERE file_path` pattern for symbols:
+```cypher
+MATCH (s:Symbol) WHERE s.file_path = '<escaped_path>' AND s.repo_uid = '<escaped_repo>' DETACH DELETE s
+```
 
-This is the NestWeaver-adapted version of Glean's ownership model. Simpler than full stacking, but captures the key benefit: O(changed files) rather than O(cascade depth).
+This replaces the current pattern of collecting UIDs then deleting one-by-one. Fewer round trips to the DB, same result. Note: requires string interpolation with escaping per LadybugDB constraints.
 
-**Phase C: True immutable stacking (enterprise scale only)**
+For notes, the existing `delete_note_cascade` is already UID-based (one note at a time), so the improvement is more modest.
 
-Only if Phases A-B are insufficient at >500K node scale:
-1. Create overlay `.lbug` files for incremental updates
-2. Query across base + overlay with a union resolver
-3. Compact overlays into a new base on daemon idle
-4. Requires either LadybugDB changes or a custom query adapter layer
+**Phase C: Glean-style ownership tracking (longer term)**
 
-**Estimated effort:** Phase A: 3-5 days. Phase B: 1-2 weeks. Phase C: 4-8 weeks.
-**Risk:** Phase A: Low. Phase B: Medium. Phase C: High (may require upstream DB changes).
+Store an `owner_unit: String` on every node (file path for code, relative path for notes). On incremental update:
+1. Mark the owner_unit as "dirty"
+2. New facts get the new unit's ownership
+3. Old facts with the dirty unit are hidden (not deleted)
+4. Periodic compaction merges hidden facts into a clean base
+
+This requires either LadybugDB schema changes (adding `owner_unit` + `visible` columns) or an out-of-DB sidecar for the ownership map. The sidecar approach (interval map like Glean) avoids schema changes but adds query-time filtering cost.
+
+**Phase D: True immutable stacking (enterprise scale only)**
+
+Only if Phases A-C are insufficient at >500K nodes. Requires overlay `.lbug` files with union query resolution.
+
+**Estimated effort:** Phase A: 3-5 days. Phase B: 1-2 days. Phase C: 2-3 weeks. Phase D: 4-8 weeks.
+**Risk:** Phase A: Low. Phase B: Very low. Phase C: Medium. Phase D: High.
 
 ---
 
 ## Updated Priority and Sequencing
 
 ```
-Item 5 (F16 cache extension)     ←  1 day, very low risk — do immediately
+Item 5  (Verify & fix F16 caching)   ←  0.5-1 day, verify what's already working
      ↓
-Item 6A (Warm-start PageRank)    ←  1 day, zero risk — do immediately
+Item 6A (Warm-start PageRank)        ←  1 day, zero risk
      ↓
-Item 6C (Skip if no edge changes) ←  0.5 days, zero risk — do immediately
+Item 6B (Skip if no edge changes)    ←  1 day, zero risk
      ↓
-Item 7A (Staged batch diffs)     ←  3-5 days, low risk — next sprint
+Item 7B (File-level bulk delete)     ←  1-2 days, very low risk
      ↓
-Item 6B (Forward push)           ←  3-5 days, medium risk — only if benchmarks justify
+Item 7A (Batch diff writes)          ←  3-5 days, low risk
      ↓
-Item 7B (File-level ownership)   ←  1-2 weeks, medium risk — next quarter
+Item 6C (Forward push)              ←  3-5 days, medium risk — only if benchmarks justify
      ↓
-Item 7C (True stacking)          ←  4-8 weeks, high risk — only at enterprise scale
+Item 7C (Ownership tracking)        ←  2-3 weeks, medium risk — next quarter
+     ↓
+Item 7D (True stacking)             ←  4-8 weeks, high risk — only at enterprise scale
 ```
 
-Items 5, 6A, and 6C are quick wins that should ship together — total ~2.5 days. Item 7A is the next meaningful architectural step. Everything beyond that is driven by measured customer need at scale.
+Quick wins (5 + 6A + 6B + 7B): ~4 days total. Next sprint (7A): 3-5 days.
+
+### Validation Status
+
+| Claim | Status |
+|-------|--------|
+| project_context not cacheable | **INCORRECT** — already cacheable |
+| scope_digest captures query params | **INCORRECT** — captures file metadata; query params in key_hash |
+| compute_pagerank initializes uniform | Confirmed |
+| PageRank sidecar is HashMap JSON | Confirmed |
+| IndexResult has edges_count | Confirmed |
+| PageRank depends only on edges | Confirmed |
+| delete_note_cascade is expensive | Confirmed |
+| Symbol/Note have file_path | Confirmed |
+| begin/commit_transaction exists | Confirmed |
+| LadybugDB lacks parameterized WHERE | Confirmed |
+| Warm-start "2-5 iterations" | **UNVERIFIED** — removed specific claim |
+| Forward push O(1/ε) graph-independent | **INCORRECT** — O(m/(αε)), depends on edges |
+| "1-5K nodes touched" estimate | **UNVERIFIED** — removed |
+| Glean ~7% overhead | Confirmed |
+| Elias-Fano ~2 bits per element | **CORRECTED** — ~2 bits overhead, not total |
+| Glean uses RocksDB | Confirmed |
+| MV4PG 97x per-query | **CORRECTED** — "nearly 100x" per paper |
