@@ -4282,7 +4282,9 @@ pub fn dispatch_via_daemon(
 }
 
 /// Handle `brain_add_source` by routing to `IndexRepo` or `IndexVault`
-/// streaming RPCs based on whether the path contains `.obsidian/`.
+/// streaming RPCs. Detection order matches the non-daemon path:
+/// 1. `.git/` present → code repo (IndexRepo)
+/// 2. `.obsidian/` present OR contains `.md` files → vault/markdown (IndexVault)
 #[cfg(feature = "daemon")]
 fn dispatch_add_source_via_daemon(
     client: &mut DaemonGrpcClient,
@@ -4303,12 +4305,20 @@ fn dispatch_add_source_via_daemon(
         .unwrap_or("")
         .to_string();
 
-    // Determine if this is a vault (has .obsidian/) or a repo.
     let resolved = std::path::Path::new(&path);
-    let is_vault = resolved.join(".obsidian").exists();
+    let is_repo = resolved.join(".git").exists();
+    let is_vault = !is_repo
+        && (resolved.join(".obsidian").exists()
+            || std::fs::read_dir(resolved)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                })
+                .unwrap_or(false));
 
     rt.block_on(async {
-        if is_vault {
+        if is_vault || !is_repo {
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
                 vault_name: name,
