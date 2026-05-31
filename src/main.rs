@@ -1036,8 +1036,8 @@ enum Commands {
         /// Force-configure all tools even if not detected
         #[arg(long)]
         all: bool,
-        /// Include --allow-mcp-add-sources in generated configs (enables set_extension writes)
-        #[arg(long)]
+        /// Deprecated: daemon mode always allows writes. Kept for backward compatibility.
+        #[arg(long, hide = true)]
         allow_writes: bool,
         /// Path to the NestWeaver database
         #[arg(
