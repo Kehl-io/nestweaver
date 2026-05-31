@@ -84,6 +84,39 @@ impl DaemonService {
 
         result.map(|json| Response::new(JsonResponse { result_json: json }))
     }
+
+    /// Dispatch a tool by name with a pre-built JSON args value, returning the
+    /// raw `serde_json::Value` result. Used by typed RPC handlers that convert
+    /// protobuf → JSON on input and JSON → protobuf on output.
+    async fn dispatch_tool_json(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.state.clone();
+        let tool_name = tool_name.to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
+            nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
+            nestweaver_mcp::tools::set_lite_mode(false);
+
+            nestweaver_mcp::tools::dispatch(&state.store, state.tantivy.as_ref(), &tool_name, args)
+                .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+
+        result
+    }
 }
 
 // ── Trait impl ──────────────────────────────────────────────────────
@@ -317,26 +350,217 @@ impl NestWeaverDaemon for DaemonService {
         ))
     }
 
-    // ── Read RPCs — JSON pass-through ───────────────────────────────
+    // ── Read RPCs — typed hot-path ─────────────────────────────────
 
-    async fn search(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "brain_search")
+    async fn search(
+        &self,
+        r: Request<BrainSearchRequest>,
+    ) -> Result<Response<BrainSearchResponse>, Status> {
+        let req = r.into_inner();
+        let mut args = serde_json::json!({
+            "query": req.query,
+            "include_bodies": req.include_bodies,
+            "prf": req.prf,
+            "rerank": req.rerank,
+        });
+        if req.limit > 0 {
+            args["limit"] = serde_json::json!(req.limit);
+        }
+        if !req.response_format.is_empty() {
+            args["response_format"] = serde_json::json!(req.response_format);
+        }
+        if !req.root.is_empty() {
+            args["root"] = serde_json::json!(req.root);
+        }
+
+        let value = self.dispatch_tool_json("brain_search", args).await?;
+
+        // Parse JSON result into typed response.
+        let query_echo = value.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let engine = value.get("engine").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let total_matches = value.get("total_matches").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+        let results = value.get("results")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|item| SearchResultItem {
+                    uid: item.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    kind: item.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    score: item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    location: item.get("location").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    matched_headings: item.get("matched_headings")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
+                    inline_body: item.get("inline_body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Response::new(BrainSearchResponse {
+            query: query_echo,
+            engine,
+            total_matches,
+            results,
+        }))
     }
 
-    async fn get_context(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "brain_context")
+    async fn get_context(
+        &self,
+        r: Request<BrainContextRequest>,
+    ) -> Result<Response<BrainContextResponse>, Status> {
+        let req = r.into_inner();
+        let mut args = serde_json::json!({
+            "seeds": req.seeds,
+            "include_seeds": req.include_seeds,
+            "include_bodies": req.include_bodies,
+            "prf": req.prf,
+            "rerank": req.rerank,
+        });
+        if req.token_budget > 0 {
+            args["token_budget"] = serde_json::json!(req.token_budget);
+        }
+        if !req.response_format.is_empty() {
+            args["response_format"] = serde_json::json!(req.response_format);
+        }
+        if !req.repos.is_empty() {
+            args["repos"] = serde_json::json!(req.repos);
+        }
+        if !req.vaults.is_empty() {
+            args["vaults"] = serde_json::json!(req.vaults);
+        }
+        if !req.kinds.is_empty() {
+            args["kinds"] = serde_json::json!(req.kinds);
+        }
+        if !req.path_prefix.is_empty() {
+            args["path_prefix"] = serde_json::json!(req.path_prefix);
+        }
+        if !req.tags.is_empty() {
+            args["tags"] = serde_json::json!(req.tags);
+        }
+        if !req.exclude_tags.is_empty() {
+            args["exclude_tags"] = serde_json::json!(req.exclude_tags);
+        }
+        if req.weight_ppr != 0.0 {
+            args["weight_ppr"] = serde_json::json!(req.weight_ppr);
+        }
+        if req.weight_bm25 != 0.0 {
+            args["weight_bm25"] = serde_json::json!(req.weight_bm25);
+        }
+        if !req.intent.is_empty() {
+            args["intent"] = serde_json::json!(req.intent);
+        }
+        if !req.root.is_empty() {
+            args["root"] = serde_json::json!(req.root);
+        }
+
+        let value = self.dispatch_tool_json("brain_context", args).await?;
+        let result_json = serde_json::to_string(&value)
+            .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+
+        Ok(Response::new(BrainContextResponse { result_json }))
     }
 
     async fn get_project_context(
         &self,
-        r: Request<JsonRequest>,
-    ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "project_context")
+        r: Request<ProjectContextRequest>,
+    ) -> Result<Response<ProjectContextResponse>, Status> {
+        let req = r.into_inner();
+        let mut args = serde_json::json!({
+            "project": req.project,
+            "include_components": req.include_components,
+            "include_seeds": req.include_seeds,
+        });
+        if req.token_budget > 0 {
+            args["token_budget"] = serde_json::json!(req.token_budget);
+        }
+        if !req.kinds.is_empty() {
+            args["kinds"] = serde_json::json!(req.kinds);
+        }
+        if !req.intent.is_empty() {
+            args["intent"] = serde_json::json!(req.intent);
+        }
+
+        let value = self.dispatch_tool_json("project_context", args).await?;
+        let result_json = serde_json::to_string(&value)
+            .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+
+        Ok(Response::new(ProjectContextResponse { result_json }))
     }
 
-    async fn get_note(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "note_get")
+    async fn get_note(
+        &self,
+        r: Request<NoteGetRequest>,
+    ) -> Result<Response<NoteGetResponse>, Status> {
+        let req = r.into_inner();
+        let mut args = serde_json::json!({
+            "include_body": req.include_body,
+        });
+        if !req.uid.is_empty() {
+            args["uid"] = serde_json::json!(req.uid);
+        }
+        if !req.title.is_empty() {
+            args["title"] = serde_json::json!(req.title);
+        }
+        if !req.sections.is_empty() {
+            args["sections"] = serde_json::json!(req.sections);
+        }
+
+        let value = self.dispatch_tool_json("note_get", args).await?;
+
+        Ok(Response::new(NoteGetResponse {
+            uid: value.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            title: value.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            path: value.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            note_kind: value.get("note_kind").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            word_count: value.get("word_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            body: value.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            section_count: value.get("section_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        }))
     }
+
+    async fn brain_status(
+        &self,
+        _r: Request<BrainStatusRequest>,
+    ) -> Result<Response<BrainStatusResponse>, Status> {
+        let args = serde_json::json!({});
+        let value = self.dispatch_tool_json("brain_status", args).await?;
+
+        Ok(Response::new(BrainStatusResponse {
+            vault_count: value.get("vault_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            notes: value.get("notes").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            headings: value.get("headings").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            sections: value.get("sections").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            tags: value.get("tags").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            wikilinks: value.get("wikilinks").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            repo_count: value.get("repo_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            tantivy_available: value.get("tantivy_available").and_then(|v| v.as_bool()).unwrap_or(false),
+            tantivy_doc_count: value.get("tantivy_doc_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        }))
+    }
+
+    async fn hub_nodes(
+        &self,
+        r: Request<HubNodesRequest>,
+    ) -> Result<Response<HubNodesResponse>, Status> {
+        let req = r.into_inner();
+        let mut args = serde_json::json!({});
+        if req.top_n > 0 {
+            args["top_n"] = serde_json::json!(req.top_n);
+        }
+        if !req.response_format.is_empty() {
+            args["response_format"] = serde_json::json!(req.response_format);
+        }
+
+        let value = self.dispatch_tool_json("hub_nodes", args).await?;
+        let result_json = serde_json::to_string(&value)
+            .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+
+        Ok(Response::new(HubNodesResponse { result_json }))
+    }
+
+    // ── Read RPCs — JSON pass-through ───────────────────────────────
 
     async fn get_backlinks(
         &self,
@@ -360,13 +584,6 @@ impl NestWeaverDaemon for DaemonService {
         json_rpc!(self, r, "brain_impact")
     }
 
-    async fn brain_status(
-        &self,
-        r: Request<JsonRequest>,
-    ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "brain_status")
-    }
-
     async fn brain_guide(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "brain_guide")
     }
@@ -374,6 +591,7 @@ impl NestWeaverDaemon for DaemonService {
     async fn brain_diff(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "brain_diff")
     }
+
 
     async fn read_symbols(
         &self,
@@ -493,10 +711,6 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "stale_check")
-    }
-
-    async fn hub_nodes(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "hub_nodes")
     }
 
     async fn bridge_nodes(
