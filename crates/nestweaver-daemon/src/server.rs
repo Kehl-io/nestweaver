@@ -644,9 +644,9 @@ pub async fn run_server(
     let sock_path = lifecycle::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
 
+    // PID file is written by the `daemonize` crate during the double-fork.
+    // We only need the path for cleanup on shutdown.
     let pid_path = lifecycle::pidfile_path(&instance_id);
-    std::fs::write(&pid_path, std::process::id().to_string())
-        .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
 
     tracing::info!(
         socket = %sock_path.display(),
