@@ -2,16 +2,34 @@
 
 use std::path::{Path, PathBuf};
 
-/// Derive a stable instance ID from a database path.
+/// Derive a stable, short instance ID from a database path.
 ///
-/// Extracts the parent directory name — e.g. `my-brain` from
-/// `~/.local/share/nestweaver/my-brain/brain.lbug`.
+/// Uses an 8-character hex hash of the canonical path to avoid:
+/// - Collisions when two DBs share the same parent directory name
+/// - macOS 104-byte `sun_path` limit for Unix domain sockets
+///
+/// Falls back to the parent directory name if available, for human
+/// readability in log paths and status output.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    db_path
+    // Try to canonicalize for a stable hash; fall back to the raw path.
+    let canonical = std::fs::canonicalize(db_path)
+        .unwrap_or_else(|_| db_path.to_path_buf());
+
+    // Human-readable prefix from the parent dir name (e.g., "my-brain").
+    let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "default".to_string())
+        .unwrap_or_else(|| "nw".to_string());
+
+    // 8-char hex hash of the full canonical path for uniqueness.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
+
+    format!("{}-{}", prefix, hash)
 }
 
 /// Runtime directory for the daemon socket and pidfile.
@@ -65,15 +83,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_id_extraction() {
+    fn instance_id_contains_parent_dir_name() {
         let path = Path::new("/home/user/.local/share/nestweaver/my-brain/brain.lbug");
-        assert_eq!(instance_id_from_db_path(path), "my-brain");
+        let id = instance_id_from_db_path(path);
+        assert!(id.starts_with("my-brain-"), "expected 'my-brain-<hash>', got '{id}'");
+        assert!(id.len() <= 30, "instance_id should be short for socket paths");
+    }
+
+    #[test]
+    fn instance_id_different_for_different_paths() {
+        let id_a = instance_id_from_db_path(Path::new("/a/foo/brain.lbug"));
+        let id_b = instance_id_from_db_path(Path::new("/b/foo/brain.lbug"));
+        assert_ne!(id_a, id_b, "different paths with same dir name must produce different IDs");
     }
 
     #[test]
     fn instance_id_fallback() {
         let path = Path::new("brain.lbug");
-        // No parent directory → falls back to "default"
         let id = instance_id_from_db_path(path);
         assert!(!id.is_empty());
     }
