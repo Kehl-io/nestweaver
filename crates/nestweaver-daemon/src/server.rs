@@ -561,22 +561,25 @@ pub async fn run_server(
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
 
-    // Rotate the daemon log if over 10MB.
+    // Set up daily-rolling log file via tracing-appender. This replaces
+    // the manual rotate-at-startup approach and handles rotation while the
+    // daemon is running. Max 3 log files retained.
     let log_dir_path = lifecycle::log_dir(&instance_id);
     std::fs::create_dir_all(&log_dir_path).ok();
-    let log_path = lifecycle::log_path(&instance_id);
-    if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() > 10 * 1024 * 1024 {
-            let rotated = log_path.with_extension("log.1");
-            let _ = std::fs::rename(&log_path, &rotated);
-        }
-    }
+    let file_appender = tracing_appender::rolling::daily(&log_dir_path, "daemon.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
-    // After daemonize's double-fork, stderr is redirected to the log file.
-    // The parent's tracing subscriber (WARN level, stderr writer) is inherited
-    // and will write to the log file. Emit key lifecycle events via eprintln!
-    // as well, since they're guaranteed to reach the log regardless of tracing
-    // configuration.
+    tracing::info!(
+        db = %db_path.display(),
+        instance = %instance_id,
+        "daemon process starting"
+    );
     eprintln!("[daemon] starting for {} (instance {instance_id})", db_path.display());
 
     // Open the graph store with write access — the daemon is the sole DB owner.
