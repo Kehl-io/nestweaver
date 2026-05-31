@@ -2277,7 +2277,7 @@ fn tool_brain_status(
 fn tool_schema_brain_add_source() -> Value {
     json!({
         "name": "brain_add_source",
-        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first. This tool requires the MCP server to be started with --allow-mcp-add-sources; it will return an error if that flag was not set.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
+        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2295,8 +2295,8 @@ fn tool_schema_brain_add_source() -> Value {
 fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     if !ALLOW_ADD_SOURCES.with(|c| c.get()) {
         return Err(anyhow!(
-            "brain_add_source is disabled. Start the MCP server with \
-             --allow-mcp-add-sources to enable runtime source indexing."
+            "brain_add_source is disabled in --no-daemon mode. \
+             Use daemon mode (the default) or pass --allow-mcp-add-sources."
         ));
     }
     let raw_path = args
