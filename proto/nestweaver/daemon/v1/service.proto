@@ -66,6 +66,105 @@ message JsonResponse {
   string result_json = 1;
 }
 
+// ─── Typed messages for hot-path RPCs ────────────────────────────────
+
+// brain_search
+message BrainSearchRequest {
+  string query = 1;
+  int32 limit = 2;
+  string response_format = 3;
+  bool include_bodies = 4;
+  bool prf = 5;
+  bool rerank = 6;
+  string root = 7;
+}
+message BrainSearchResponse {
+  string query = 1;
+  string engine = 2;
+  int32 total_matches = 3;
+  repeated SearchResultItem results = 4;
+}
+message SearchResultItem {
+  string uid = 1;
+  string kind = 2;
+  string title = 3;
+  double score = 4;
+  string location = 5;
+  repeated string matched_headings = 6;
+  string inline_body = 7;
+}
+
+// brain_status
+message BrainStatusRequest {}
+message BrainStatusResponse {
+  int32 vault_count = 1;
+  int32 notes = 2;
+  int32 headings = 3;
+  int32 sections = 4;
+  int32 tags = 5;
+  int32 wikilinks = 6;
+  int32 repo_count = 7;
+  bool tantivy_available = 8;
+  int32 tantivy_doc_count = 9;
+}
+
+// note_get
+message NoteGetRequest {
+  string uid = 1;
+  string title = 2;
+  bool include_body = 3;
+  repeated string sections = 4;
+}
+message NoteGetResponse {
+  string uid = 1;
+  string title = 2;
+  string path = 3;
+  string note_kind = 4;
+  int32 word_count = 5;
+  string body = 6;
+  int32 section_count = 7;
+}
+
+// brain_context (typed request, JSON response)
+message BrainContextRequest {
+  repeated string seeds = 1;
+  int32 token_budget = 2;
+  string response_format = 3;
+  repeated string repos = 4;
+  repeated string vaults = 5;
+  repeated string kinds = 6;
+  string path_prefix = 7;
+  repeated string tags = 8;
+  repeated string exclude_tags = 9;
+  double weight_ppr = 10;
+  double weight_bm25 = 11;
+  string intent = 12;
+  bool include_seeds = 13;
+  bool include_bodies = 14;
+  string root = 15;
+  bool prf = 16;
+  bool rerank = 17;
+}
+message BrainContextResponse { string result_json = 1; }
+
+// project_context (typed request, JSON response)
+message ProjectContextRequest {
+  string project = 1;
+  int32 token_budget = 2;
+  repeated string kinds = 3;
+  bool include_components = 4;
+  string intent = 5;
+  bool include_seeds = 6;
+}
+message ProjectContextResponse { string result_json = 1; }
+
+// hub_nodes (typed request, JSON response)
+message HubNodesRequest {
+  int32 top_n = 1;
+  string response_format = 2;
+}
+message HubNodesResponse { string result_json = 1; }
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -78,16 +177,19 @@ service NestWeaverDaemon {
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
 
+  // Read RPCs — typed hot-path
+  rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
+  rpc GetContext(BrainContextRequest) returns (BrainContextResponse);
+  rpc GetProjectContext(ProjectContextRequest) returns (ProjectContextResponse);
+  rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
+  rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
+  rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);
+
   // Read RPCs — JSON pass-through
-  rpc Search(JsonRequest) returns (JsonResponse);
-  rpc GetContext(JsonRequest) returns (JsonResponse);
-  rpc GetProjectContext(JsonRequest) returns (JsonResponse);
-  rpc GetNote(JsonRequest) returns (JsonResponse);
   rpc GetBacklinks(JsonRequest) returns (JsonResponse);
   rpc FlowTrace(JsonRequest) returns (JsonResponse);
   rpc BlastRadius(JsonRequest) returns (JsonResponse);
   rpc Impact(JsonRequest) returns (JsonResponse);
-  rpc BrainStatus(JsonRequest) returns (JsonResponse);
   rpc BrainGuide(JsonRequest) returns (JsonResponse);
   rpc BrainDiff(JsonRequest) returns (JsonResponse);
   rpc ReadSymbols(JsonRequest) returns (JsonResponse);
@@ -108,7 +210,6 @@ service NestWeaverDaemon {
   rpc AffectedTests(JsonRequest) returns (JsonResponse);
   rpc Clusters(JsonRequest) returns (JsonResponse);
   rpc StaleCheck(JsonRequest) returns (JsonResponse);
-  rpc HubNodes(JsonRequest) returns (JsonResponse);
   rpc BridgeNodes(JsonRequest) returns (JsonResponse);
   rpc GetSummary(JsonRequest) returns (JsonResponse);
   rpc Investigate(JsonRequest) returns (JsonResponse);
