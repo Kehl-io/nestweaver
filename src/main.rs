@@ -4869,13 +4869,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("  Socket:   {}", socket.display());
                     eprintln!("  Log:      {}", log_file.display());
 
-                    let daemonize = daemonize::Daemonize::new()
+                    let daemonize = daemonize2::Daemonize::new()
                         .pid_file(&pidfile)
                         .stdout(stdout_file)
                         .stderr(stderr_file)
                         .working_directory(".");
 
-                    match daemonize.start() {
+                    match unsafe { daemonize.start() } {
                         Ok(()) => {
                             // We are now the daemon process.
                             let idle = if idle_timeout > 0 {
