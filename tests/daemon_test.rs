@@ -18,7 +18,9 @@ use std::time::Duration;
 /// `NESTWEAVER_NO_DAEMON`. This is the key difference from `cli_test.rs`'s
 /// `nestweaver_cmd()` — we want the daemon path exercised.
 fn daemon_cmd() -> Command {
-    Command::cargo_bin("nestweaver").unwrap()
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env_remove("NESTWEAVER_NO_DAEMON");
+    cmd
 }
 
 /// Helper: build a `Command` with `NESTWEAVER_NO_DAEMON=1` for initial DB
