@@ -103,15 +103,16 @@ pub fn is_process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Spawn `nestweaver daemon start --db <path>` as a detached child.
+/// Spawn `nestweaver daemon --db <path> start` as a detached child.
 fn spawn_daemon(db_path: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
     std::process::Command::new(&exe)
-        .args(["daemon", "start", "--db"])
+        .args(["daemon", "--db"])
         .arg(db_path)
+        .arg("start")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -123,10 +124,12 @@ fn spawn_daemon(db_path: &Path) -> Result<()> {
 
 /// Poll for the socket file to appear with exponential backoff.
 ///
-/// Initial delay: 50ms, max delay: 500ms, total timeout: 2s.
+/// Initial delay: 50ms, max delay: 500ms, total timeout: 5s.
+/// Larger databases need more time to open the DB, load sidecars,
+/// and bind the socket.
 fn wait_for_socket(sock: &Path) -> Result<()> {
     let start = Instant::now();
-    let timeout = Duration::from_secs(2);
+    let timeout = Duration::from_secs(5);
     let mut delay = Duration::from_millis(50);
     let max_delay = Duration::from_millis(500);
 
