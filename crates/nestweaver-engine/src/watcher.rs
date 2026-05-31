@@ -494,7 +494,11 @@ impl BrainWatcher {
         let (headings, sections, wikilinks_count, tags_count) =
             reinsert_note(store, v_uid, &n_uid, &path, &rel_path, &parsed, event.kind, title_lookup)?;
 
-        // Update the title lookup for subsequent notes in this batch.
+        // Remove stale title→UID mapping (handles renames) then add the
+        // current title so subsequent notes in this batch resolve correctly.
+        for uids in title_lookup.values_mut() {
+            uids.retain(|u| u != &n_uid);
+        }
         title_lookup
             .entry(parsed.title.to_lowercase())
             .or_default()
