@@ -680,6 +680,18 @@ pub async fn run_server(
         });
     }
 
+    // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("register SIGTERM handler");
+            sig.recv().await;
+            tracing::info!("received SIGTERM — shutting down");
+            let _ = tx.send(true);
+        });
+    }
+
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
