@@ -4975,8 +4975,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
 
-                    // Now start — re-enter via exec so the new daemon gets its own daemonize.
-                    eprintln!("Run `nestweaver daemon start --db {} --idle-timeout {idle_timeout}` to start.", db_path.display());
+                    // Re-exec ourselves to start the daemon fresh.
+                    let exe = std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let status = std::process::Command::new(&exe)
+                        .args([
+                            "daemon",
+                            "--db",
+                            &db_path.display().to_string(),
+                            "start",
+                            "--idle-timeout",
+                            &idle_timeout.to_string(),
+                        ])
+                        .status()
+                        .with_context(|| "failed to restart daemon")?;
+                    if !status.success() {
+                        anyhow::bail!("daemon start failed with {status}");
+                    }
                     Ok((EXIT_SUCCESS, None))
                 }
             }
