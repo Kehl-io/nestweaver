@@ -188,16 +188,8 @@ impl NestWeaverDaemon for DaemonService {
                     // PageRank is deferred to first query (lazy evaluation
                     // in GraphStore::ensure_pagerank_loaded).
 
-                    // Rebuild Tantivy search index so BM25 search reflects
-                    // the freshly indexed repo content.
-                    if let Some(ref tantivy) = state.tantivy {
-                        if tantivy.has_writer() {
-                            match tantivy.reindex_from_store(&state.store) {
-                                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after repo indexing"),
-                                Err(e) => tracing::warn!(error = %e, "Tantivy reindex failed after repo indexing"),
-                            }
-                        }
-                    }
+                    // Tantivy indexes notes/markdown only, not code symbols.
+                    // No Tantivy update needed after code repo indexing.
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
