@@ -18,6 +18,8 @@ tokio-stream = { workspace = true, features = ["net"] }
 tower = "0.5"
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 serde_json = { workspace = true }
 libc = "0.2"
 dirs = "6"
