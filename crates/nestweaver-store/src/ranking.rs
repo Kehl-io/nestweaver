@@ -352,6 +352,20 @@ impl GraphStore {
         iterations: u32,
         scope: &GraphScope,
     ) -> Result<(), StoreError> {
+        self.compute_pagerank_warm(damping, iterations, scope, None)
+    }
+
+    /// Compute PageRank with optional warm-start from previous scores.
+    /// When `warm_start` is provided, known nodes initialize from their
+    /// previous score instead of uniform — convergence is faster when only
+    /// a small fraction of nodes/edges changed.
+    pub fn compute_pagerank_warm(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+        warm_start: Option<&HashMap<String, f64>>,
+    ) -> Result<(), StoreError> {
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
@@ -359,7 +373,36 @@ impl GraphStore {
         }
 
         let init = 1.0f64 / n as f64;
-        let mut scores: Vec<f64> = vec![init; n];
+        let mut scores: Vec<f64> = match warm_start {
+            Some(prev) => {
+                let mut s = Vec::with_capacity(n);
+                let mut warm_count = 0usize;
+                for uid in &uids {
+                    if let Some(&prev_score) = prev.get(uid) {
+                        s.push(prev_score);
+                        warm_count += 1;
+                    } else {
+                        s.push(init);
+                    }
+                }
+                if warm_count > 0 {
+                    // Normalize so scores sum to 1.0 (graph size may have changed).
+                    let sum: f64 = s.iter().sum();
+                    if sum > 0.0 {
+                        for v in s.iter_mut() {
+                            *v /= sum;
+                        }
+                    }
+                    tracing::info!(
+                        warm_count,
+                        total = n,
+                        "PageRank warm-started from {warm_count}/{n} previous scores"
+                    );
+                }
+                s
+            }
+            None => vec![init; n],
+        };
         let teleport = (1.0 - damping) / n as f64;
 
         for _ in 0..iterations {
