@@ -33,7 +33,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -55,7 +55,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -81,7 +81,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -125,7 +125,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo

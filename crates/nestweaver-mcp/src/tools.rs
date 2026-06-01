@@ -4230,21 +4230,24 @@ pub fn dispatch_via_daemon(
     let str_array = |key: &str| -> Vec<String> {
         args.get(key)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let str_field = |key: &str| -> String {
-        args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
-    let i32_field = |key: &str| -> i32 {
-        args.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
-    };
-    let bool_field = |key: &str| -> bool {
-        args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
-    };
-    let f64_field = |key: &str| -> f64 {
-        args.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0)
-    };
+    let i32_field =
+        |key: &str| -> i32 { args.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+    let bool_field =
+        |key: &str| -> bool { args.get(key).and_then(|v| v.as_bool()).unwrap_or(false) };
+    let f64_field = |key: &str| -> f64 { args.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) };
 
     let result_json: String = rt.block_on(async {
         match name {
@@ -4260,24 +4263,30 @@ pub fn dispatch_via_daemon(
                     rerank: bool_field("rerank"),
                     root: str_field("root"),
                 });
-                let resp = client.search(req).await
+                let resp = client
+                    .search(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 let inner = resp.into_inner();
                 // Serialize the typed response back to JSON.
-                let results: Vec<serde_json::Value> = inner.results.iter().map(|r| {
-                    let mut obj = serde_json::json!({
-                        "uid": r.uid,
-                        "kind": r.kind,
-                        "title": r.title,
-                        "score": r.score,
-                        "location": r.location,
-                        "matched_headings": r.matched_headings,
-                    });
-                    if !r.inline_body.is_empty() {
-                        obj["inline_body"] = serde_json::json!(r.inline_body);
-                    }
-                    obj
-                }).collect();
+                let results: Vec<serde_json::Value> = inner
+                    .results
+                    .iter()
+                    .map(|r| {
+                        let mut obj = serde_json::json!({
+                            "uid": r.uid,
+                            "kind": r.kind,
+                            "title": r.title,
+                            "score": r.score,
+                            "location": r.location,
+                            "matched_headings": r.matched_headings,
+                        });
+                        if !r.inline_body.is_empty() {
+                            obj["inline_body"] = serde_json::json!(r.inline_body);
+                        }
+                        obj
+                    })
+                    .collect();
                 let value = serde_json::json!({
                     "query": inner.query,
                     "engine": inner.engine,
@@ -4307,7 +4316,9 @@ pub fn dispatch_via_daemon(
                     prf: bool_field("prf"),
                     rerank: bool_field("rerank"),
                 });
-                let resp = client.get_context(req).await
+                let resp = client
+                    .get_context(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 Ok(resp.into_inner().result_json)
             }
@@ -4321,7 +4332,9 @@ pub fn dispatch_via_daemon(
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
                 });
-                let resp = client.get_project_context(req).await
+                let resp = client
+                    .get_project_context(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 Ok(resp.into_inner().result_json)
             }
@@ -4333,7 +4346,9 @@ pub fn dispatch_via_daemon(
                     include_body: bool_field("include_body"),
                     sections: str_array("sections"),
                 });
-                let resp = client.get_note(req).await
+                let resp = client
+                    .get_note(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 let inner = resp.into_inner();
                 let mut value = serde_json::json!({
@@ -4352,7 +4367,9 @@ pub fn dispatch_via_daemon(
             "brain_status" => {
                 use nestweaver_proto::BrainStatusRequest;
                 let req = tonic::Request::new(BrainStatusRequest {});
-                let resp = client.brain_status(req).await
+                let resp = client
+                    .brain_status(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 let inner = resp.into_inner();
                 let value = serde_json::json!({
@@ -4374,7 +4391,9 @@ pub fn dispatch_via_daemon(
                     top_n: i32_field("top_n"),
                     response_format: str_field("response_format"),
                 });
-                let resp = client.hub_nodes(req).await
+                let resp = client
+                    .hub_nodes(req)
+                    .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 Ok(resp.into_inner().result_json)
             }
@@ -4416,7 +4435,9 @@ pub fn dispatch_via_daemon(
                     "set_extension" => client.set_extension(req).await,
                     "query_extensions" => client.query_extensions(req).await,
                     unknown => {
-                        return Err(anyhow::anyhow!("unknown tool for daemon dispatch: {unknown}"));
+                        return Err(anyhow::anyhow!(
+                            "unknown tool for daemon dispatch: {unknown}"
+                        ));
                     }
                 };
                 let resp = resp.map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
@@ -4471,13 +4492,16 @@ fn dispatch_add_source_via_daemon(
                 vault_name: name,
                 extra_ignore_patterns: vec![],
             });
-            let mut stream = client.index_vault(req).await
+            let mut stream = client
+                .index_vault(req)
+                .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
 
             let mut last_msg = String::new();
             while let Some(progress) = stream.next().await {
-                let progress = progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                let progress =
+                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
                 last_msg = progress.message;
             }
             Ok(serde_json::json!({
@@ -4494,13 +4518,16 @@ fn dispatch_add_source_via_daemon(
                 with_trigrams: false,
                 with_git_activity: false,
             });
-            let mut stream = client.index_repo(req).await
+            let mut stream = client
+                .index_repo(req)
+                .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
 
             let mut last_msg = String::new();
             while let Some(progress) = stream.next().await {
-                let progress = progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                let progress =
+                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
                 last_msg = progress.message;
             }
             Ok(serde_json::json!({
