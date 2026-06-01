@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use nestweaver_parser::RawSymbol;
-use nestweaver_schema::{ResolvedType, SymbolKind};
+use nestweaver_schema::{Language, ResolvedType, SymbolKind};
+
+use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings};
 
 /// Tier 1: Infer types from constructor calls.
 /// When a Call reference resolves to a Class symbol, the call site's variable
@@ -70,6 +72,133 @@ pub fn propagate_types(
         }
     }
     iterations
+}
+
+/// Per-file type environment: maps (variable_name, scope_line) → type_name.
+/// Built by running all four inference tiers, then the fixpoint loop.
+pub struct TypeEnvironment {
+    bindings: HashMap<(String, u32), TypeBinding>,
+}
+
+impl TypeEnvironment {
+    /// Build a type environment for a single file.
+    pub fn build(source: &str, language: Language, symbols: &[RawSymbol]) -> Self {
+        // Tiers 0-2: annotations, constructors, self/this
+        let mut bindings = extract_bindings(source, language, symbols);
+
+        // Tier 3: Assignment chain fixpoint
+        let assignments = extract_assignments(source);
+        propagate_assignments(&mut bindings, &assignments, 10);
+
+        Self { bindings }
+    }
+
+    /// Look up the type of a variable at a given scope.
+    /// Searches backwards from `at_line` for the nearest binding.
+    pub fn lookup(&self, variable: &str, at_line: u32) -> Option<&TypeBinding> {
+        // Exact match first
+        if let Some(binding) = self.bindings.get(&(variable.to_string(), at_line)) {
+            return Some(binding);
+        }
+        // Search backwards for nearest binding
+        self.bindings
+            .iter()
+            .filter(|((name, line), _)| name == variable && *line <= at_line)
+            .max_by_key(|((_, line), _)| *line)
+            .map(|(_, binding)| binding)
+    }
+
+    /// Look up self/this type at a given line.
+    pub fn lookup_self(&self, at_line: u32) -> Option<&TypeBinding> {
+        for keyword in &["self", "this", "$this"] {
+            if let Some(b) = self.lookup(keyword, at_line) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+}
+
+/// Extract simple assignment patterns from source.
+fn extract_assignments(source: &str) -> Vec<((String, u32), (String, u32))> {
+    let mut assignments = Vec::new();
+    for (line_num, line) in source.lines().enumerate() {
+        let line_num = (line_num + 1) as u32;
+        let trimmed = line.trim();
+        if let Some(eq_pos) = trimmed.find('=') {
+            // Skip ==, !=, <=, >=, =>
+            if eq_pos > 0 {
+                let prev = trimmed.as_bytes()[eq_pos - 1];
+                if matches!(prev, b'!' | b'<' | b'>' | b'=') {
+                    continue;
+                }
+            }
+            if trimmed.as_bytes().get(eq_pos + 1) == Some(&b'=')
+                || trimmed.as_bytes().get(eq_pos + 1) == Some(&b'>')
+            {
+                continue;
+            }
+            let lhs = trimmed[..eq_pos]
+                .trim()
+                .trim_start_matches("let ")
+                .trim_start_matches("mut ")
+                .trim_start_matches("const ")
+                .trim_start_matches("var ")
+                .trim();
+            let rhs = trimmed[eq_pos + 1..].trim().trim_end_matches(';');
+            // Only simple identifier-to-identifier assignments
+            if !lhs.is_empty()
+                && !rhs.is_empty()
+                && rhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !lhs.contains(':')
+            {
+                assignments.push(((lhs.to_string(), line_num), (rhs.to_string(), line_num)));
+            }
+        }
+    }
+    assignments
+}
+
+/// Propagate type bindings through assignment chains (fixpoint).
+fn propagate_assignments(
+    bindings: &mut HashMap<(String, u32), TypeBinding>,
+    assignments: &[((String, u32), (String, u32))],
+    max_iterations: usize,
+) {
+    for _ in 0..max_iterations {
+        let mut changed = false;
+        for ((target_name, target_line), (source_name, _)) in assignments {
+            let target_key = (target_name.clone(), *target_line);
+            if bindings.contains_key(&target_key) {
+                continue;
+            }
+            let source_type = bindings
+                .iter()
+                .filter(|((name, line), _)| name == source_name && *line <= *target_line)
+                .max_by_key(|((_, line), _)| *line)
+                .map(|(_, b)| b.clone());
+            if let Some(src) = source_type {
+                bindings.insert(
+                    target_key,
+                    TypeBinding {
+                        type_name: src.type_name,
+                        line: *target_line,
+                        confidence: (src.confidence - 0.05).max(0.0),
+                        source: BindingSource::Assignment,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,5 +300,47 @@ mod tests {
             "should stop after 1 iteration with no changes"
         );
         assert!(types.is_empty());
+    }
+
+    // ── TypeEnvironment tests ──────────────────────────────────────────
+
+    #[test]
+    fn type_env_rust_annotation_lookup() {
+        let source = "fn main() {\n    let store: GraphStore = GraphStore::new();\n    store.compute_pagerank();\n}\n";
+        let symbols = vec![make_function("main")];
+        let env = TypeEnvironment::build(source, Language::Rust, &symbols);
+        let binding = env.lookup("store", 3);
+        assert!(binding.is_some(), "should find 'store' binding");
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn type_env_self_lookup() {
+        let mut method = make_function("compute_pagerank");
+        method.kind = SymbolKind::Method;
+        method.parent_name = Some("GraphStore".to_string());
+        method.start_line = 5;
+        let env = TypeEnvironment::build("", Language::Rust, &[method]);
+        let binding = env.lookup_self(6);
+        assert!(binding.is_some());
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert_eq!(binding.unwrap().confidence, 1.0);
+    }
+
+    #[test]
+    fn type_env_assignment_propagation() {
+        let source = "let store = GraphStore::new();\nlet alias = store;\n";
+        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        let binding = env.lookup("alias", 2);
+        assert!(binding.is_some(), "alias should get store's type");
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert!(binding.unwrap().confidence < 0.90);
+    }
+
+    #[test]
+    fn type_env_binding_count() {
+        let source = "let x: Foo = Foo::new();\nlet y: Bar = Bar::new();\n";
+        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        assert!(env.binding_count() >= 2);
     }
 }
