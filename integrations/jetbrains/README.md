@@ -20,3 +20,5 @@ Or manually create `.junie/mcp/mcp.json`:
   }
 }
 ```
+
+All 38 NestWeaver MCP tools are available, including type-aware context, confidence-weighted impact analysis, investigation bundles, and vault/notes integration.

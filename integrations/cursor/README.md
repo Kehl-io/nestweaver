@@ -23,7 +23,7 @@ Restart Cursor to detect the MCP server.
 
 Cursor has a 40-tool cap across all MCP servers. NestWeaver uses `--lite` mode by default for Cursor, exposing 6 core tools: `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, `detect_changes`.
 
-To use all 17 tools, edit `.cursor/mcp.json` and remove `--lite` from the args.
+To use all 38 tools, edit `.cursor/mcp.json` and remove `--lite` from the args.
 
 ## Environment Variables
 
