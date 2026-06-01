@@ -1039,6 +1039,9 @@ enum Commands {
         /// Deprecated: daemon mode always allows writes. Kept for backward compatibility.
         #[arg(long, hide = true)]
         allow_writes: bool,
+        /// Overwrite existing skill/guide files even if customized
+        #[arg(long)]
+        force: bool,
         /// Path to the NestWeaver database
         #[arg(
             long,
@@ -3121,10 +3124,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             tool,
             all,
             allow_writes,
+            force,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes)?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force)?;
             Ok((EXIT_SUCCESS, None))
         }
 
