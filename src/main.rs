@@ -3738,6 +3738,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             track_interactions,
             no_daemon,
         } => {
+            if allow_mcp_add_sources {
+                eprintln!(
+                    "warning: --allow-mcp-add-sources is deprecated and will be removed in a future release; \
+                     remove it from your MCP config"
+                );
+            }
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());

@@ -1,6 +1,8 @@
 use std::io::Write as IoWrite;
 use std::path::Path;
 
+const DEPRECATED_MCP_ARGS: &[&str] = &["--allow-mcp-add-sources"];
+
 struct ToolSetup {
     name: &'static str,
     detected: bool,
@@ -650,24 +652,60 @@ fn merge_json_mcp(
         serde_json::json!({})
     };
 
-    let servers = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?
-        .entry("mcpServers")
-        .or_insert(serde_json::json!({}));
+    {
+        let servers = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?
+            .entry("mcpServers")
+            .or_insert(serde_json::json!({}));
 
-    if servers.get(server_name).is_some() {
-        return Ok(false); // already configured
+        if servers.get(server_name).is_none() {
+            servers
+                .as_object_mut()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mcpServers is not an object in {}", path.display())
+                })?
+                .insert(server_name.to_string(), config.clone());
+
+            // Drop borrow of root before serializing
+            let json = serde_json::to_string_pretty(&root)?;
+            std::fs::write(path, json)?;
+            return Ok(true);
+        }
     }
 
-    servers
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcpServers is not an object in {}", path.display()))?
-        .insert(server_name.to_string(), config.clone());
+    // Server already exists — check for and strip deprecated args.
+    let mut stripped: Vec<String> = Vec::new();
+    {
+        let root_obj = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?;
+        if let Some(server_entry) = root_obj
+            .get_mut("mcpServers")
+            .and_then(|s| s.as_object_mut())
+            .and_then(|s| s.get_mut(server_name))
+            && let Some(args) = server_entry.get_mut("args").and_then(|a| a.as_array_mut())
+        {
+            args.retain(|arg| {
+                let arg_str = arg.as_str().unwrap_or("");
+                let is_deprecated = DEPRECATED_MCP_ARGS.contains(&arg_str);
+                if is_deprecated {
+                    stripped.push(arg_str.to_string());
+                }
+                !is_deprecated
+            });
+        }
+    }
 
-    let json = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, json)?;
-    Ok(true)
+    if !stripped.is_empty() {
+        let json = serde_json::to_string_pretty(&root)?;
+        std::fs::write(path, json)?;
+        for flag in &stripped {
+            eprintln!("  (stripped deprecated flag: {flag})");
+        }
+    }
+
+    Ok(false)
 }
 
 /// Append a TOML section to a file only if the section marker is not already present.
