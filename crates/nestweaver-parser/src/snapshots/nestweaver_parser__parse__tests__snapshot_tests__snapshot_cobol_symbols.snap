@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: Main
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: INITIALIZE-DATA
   kind: Function
   start_line: 18
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: PROCESS-GREETING
   kind: Function
   start_line: 21
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: DISPLAY-RESULT
   kind: Function
   start_line: 27
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: CALL-EXTERNAL
   kind: Module
   start_line: 30
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: COPY-SECTION
   kind: Module
   start_line: 33
@@ -62,3 +67,4 @@ expression: "parsed_symbols(\"simple.cbl\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~

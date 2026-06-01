@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: sensors
   kind: Property
   start_line: 5
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: SensorKind
   kind: Enum
   start_line: 8
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Readable
   kind: Interface
   start_line: 13
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SensorManager
   kind: Class
   start_line: 18
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: read
   kind: Method
   start_line: 19
@@ -65,6 +70,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: f64
+  parent_name: SensorManager
 - name: calibrate
   kind: Method
   start_line: 23
@@ -75,6 +81,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: SensorManager
 - name: SensorManager
   kind: Class
   start_line: 28
@@ -85,6 +92,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: new
   kind: Method
   start_line: 29
@@ -98,6 +106,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: Self
+  parent_name: SensorManager
 - name: get_primary
   kind: Method
   start_line: 35
@@ -111,6 +120,7 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: "&Sensor"
+  parent_name: SensorManager
 - name: initialize
   kind: Function
   start_line: 40
@@ -124,3 +134,4 @@ expression: "parsed_symbols(\"simple.rs\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: SensorManager
+  parent_name: ~

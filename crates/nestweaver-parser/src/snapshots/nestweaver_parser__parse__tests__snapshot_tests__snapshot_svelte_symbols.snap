@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Function
   start_line: 5
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: count
   kind: Function
   start_line: 9
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: handleClick
   kind: Function
   start_line: 11
@@ -42,3 +45,4 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

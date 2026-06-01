@@ -92,6 +92,7 @@ pub fn parse_julia(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -108,6 +109,7 @@ pub fn parse_julia(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -124,6 +126,7 @@ pub fn parse_julia(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -140,6 +143,7 @@ pub fn parse_julia(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -157,6 +161,7 @@ pub fn parse_julia(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }

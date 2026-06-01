@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Function
   start_line: 5
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: add
   kind: Function
   start_line: 9
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: Animal
   kind: Class
   start_line: 11
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: constructor
   kind: Method
   start_line: 12
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: Animal
 - name: speak
   kind: Method
   start_line: 16
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: Animal
 - name: Dog
   kind: Class
   start_line: 21
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: speak
   kind: Method
   start_line: 22
@@ -82,6 +89,7 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: Dog
 - name: dog
   kind: Constant
   start_line: 27
@@ -92,3 +100,4 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

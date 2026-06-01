@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: instance_type
   kind: Function
   start_line: 7
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: aws_ami.ubuntu
   kind: Class
   start_line: 13
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: aws_instance.web
   kind: Class
   start_line: 23
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: aws_security_group.web_sg
   kind: Class
   start_line: 32
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: vpc
   kind: Module
   start_line: 44
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: instance_ip
   kind: Function
   start_line: 52
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: vpc_id
   kind: Function
   start_line: 57
@@ -82,3 +89,4 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~

@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: ConsoleGreeter
   kind: Class
   start_line: 13
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Prefix
   kind: Property
   start_line: 14
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Greet
   kind: Method
   start_line: 17
@@ -45,6 +48,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: ~
 - name: Farewell
   kind: Method
   start_line: 21
@@ -58,6 +62,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: ~
 - name: NewGreeter
   kind: Function
   start_line: 25
@@ -71,6 +76,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: Greeter
+  parent_name: ~
 - name: main
   kind: Function
   start_line: 29
@@ -81,3 +87,4 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

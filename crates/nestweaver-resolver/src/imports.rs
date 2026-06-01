@@ -183,6 +183,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Inferred,
             type_info: None,
+            parent_name: None,
         }
     }
 
