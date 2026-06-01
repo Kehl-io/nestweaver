@@ -17,11 +17,11 @@ use nestweaver_engine::{
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_rules, generate_repo_map,
-    generate_summaries, get_last_indexed_at,
-    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
-    lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
-    save_summaries, search_symbols, suggest_links, truncate_to_budget,
+    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
+    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
+    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, materialize_projects,
+    record_last_indexed_at, render_text, save_clusters, save_summaries, search_symbols,
+    suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
