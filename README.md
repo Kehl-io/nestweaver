@@ -57,7 +57,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 </td>
 <td width="50%" valign="top">
 
-**22-Tool MCP Server**<br>
+**38-Tool MCP Server**<br>
 Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
@@ -208,7 +208,7 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (22 tools, or 6 in lite mode; auto-starts daemon) |
+| `mcp` | Start the MCP server (38 tools, or 6 in lite mode; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported) |
@@ -282,7 +282,7 @@ nestweaver context --feature device-pairing --config ./nestweaver-instance.toml 
 
 ## MCP Server
 
-NestWeaver exposes 22 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes 38 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug

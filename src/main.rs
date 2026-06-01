@@ -2754,7 +2754,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let output_str = match format.as_str() {
                 "skill" => generate_skill_with_rules(&store, cfg_ref, rules_ref)?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
-                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref)?,
+                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
             match output {
