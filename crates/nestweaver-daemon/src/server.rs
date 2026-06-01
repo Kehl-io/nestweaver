@@ -60,6 +60,7 @@ impl DaemonService {
         let tool_name = tool_name.to_string();
         let args_json = args_json.to_string();
 
+        #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
             let args: serde_json::Value = serde_json::from_str(&args_json)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
@@ -104,6 +105,7 @@ impl DaemonService {
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
 
+        #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
@@ -305,16 +307,15 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Rebuild Tantivy search index so BM25 search reflects
                     // the freshly indexed vault content.
-                    if let Some(ref tantivy) = state.tantivy {
-                        if tantivy.has_writer() {
-                            match tantivy.reindex_from_store(&state.store) {
-                                Ok(n) => tracing::info!(
-                                    docs = n,
-                                    "Tantivy reindexed after vault indexing"
-                                ),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing")
-                                }
+                    if let Some(ref tantivy) = state.tantivy
+                        && tantivy.has_writer()
+                    {
+                        match tantivy.reindex_from_store(&state.store) {
+                            Ok(n) => {
+                                tracing::info!(docs = n, "Tantivy reindexed after vault indexing")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing")
                             }
                         }
                     }
@@ -890,17 +891,16 @@ pub async fn run_server(
                 std::path::PathBuf::from(s)
             };
             let mut hint = String::new();
-            if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    if unsafe { libc::kill(pid, 0) } == 0 {
-                        hint = format!(
-                            "\n\nA brain watcher (PID {pid}) is holding the database lock.\n\
-                             Stop it with: nestweaver brain watch-stop --db {}\n\
-                             Or use --no-daemon to bypass the daemon.",
-                            db_path.display()
-                        );
-                    }
-                }
+            if let Ok(pid_str) = std::fs::read_to_string(&lock_path)
+                && let Ok(pid) = pid_str.trim().parse::<i32>()
+                && unsafe { libc::kill(pid, 0) } == 0
+            {
+                hint = format!(
+                    "\n\nA brain watcher (PID {pid}) is holding the database lock.\n\
+                     Stop it with: nestweaver brain watch-stop --db {}\n\
+                     Or use --no-daemon to bypass the daemon.",
+                    db_path.display()
+                );
             }
             if hint.is_empty() {
                 hint = format!(

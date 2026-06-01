@@ -61,6 +61,7 @@ impl DaemonClient {
     }
 
     /// Connect to an existing socket without auto-start or version check.
+    #[allow(clippy::ptr_arg)]
     async fn connect_to_socket(sock_path: &PathBuf) -> Result<Self> {
         let path = sock_path.clone();
         let channel = Endpoint::try_from("http://[::]:50051")
@@ -87,25 +88,25 @@ impl DaemonClient {
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
-        if let Some(pid) = autostart::read_pid(&pidfile) {
+        if let Some(pid) = autostart::read_pid(&pidfile)
+            && autostart::is_process_alive(pid)
+        {
+            info!(pid, "sending SIGTERM to old daemon");
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+
+            // Poll for exit with 5s timeout, then SIGKILL.
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) {
+                if !autostart::is_process_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
             if autostart::is_process_alive(pid) {
-                info!(pid, "sending SIGTERM to old daemon");
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-
-                // Poll for exit with 5s timeout, then SIGKILL.
-                let start = std::time::Instant::now();
-                while start.elapsed() < std::time::Duration::from_secs(5) {
-                    if !autostart::is_process_alive(pid) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                if autostart::is_process_alive(pid) {
-                    warn!(pid, "daemon did not exit after SIGTERM, sending SIGKILL");
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
+                warn!(pid, "daemon did not exit after SIGTERM, sending SIGKILL");
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
 
