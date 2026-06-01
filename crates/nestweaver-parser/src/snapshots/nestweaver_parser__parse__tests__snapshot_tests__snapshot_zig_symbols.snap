@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: math
   kind: Constant
   start_line: 2
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: SensorKind
   kind: Class
   start_line: 4
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SensorConfig
   kind: Class
   start_line: 10
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: InternalState
   kind: Class
   start_line: 16
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: initialize
   kind: Function
   start_line: 21
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: calibrate
   kind: Function
   start_line: 26
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: main
   kind: Function
   start_line: 30
@@ -82,6 +89,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: Main
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: config
   kind: Constant
   start_line: 31
@@ -92,3 +100,4 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

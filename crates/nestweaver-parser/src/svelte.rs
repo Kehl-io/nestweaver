@@ -104,6 +104,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
         entry_point_kind: None,
         visibility: Visibility::Public,
         type_info: None,
+        parent_name: None,
     });
 
     // Find <script> block(s)
@@ -137,6 +138,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Public,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 
@@ -156,6 +158,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Private,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 

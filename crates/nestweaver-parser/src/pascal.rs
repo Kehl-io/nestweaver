@@ -87,6 +87,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -103,6 +104,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: Some(nestweaver_schema::EntryPointKind::Main),
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -119,6 +121,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -136,6 +139,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
 
             // Extract parent class as extends reference
@@ -163,6 +167,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -184,6 +189,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -205,6 +211,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }

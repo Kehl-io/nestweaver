@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.astro\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: getStaticPaths
   kind: Function
   start_line: 5
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.astro\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: formatTitle
   kind: Function
   start_line: 12
@@ -32,3 +34,4 @@ expression: "parsed_symbols(\"simple.astro\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

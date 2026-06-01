@@ -79,6 +79,7 @@ pub fn parse_objc(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -97,6 +98,7 @@ pub fn parse_objc(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -118,6 +120,7 @@ pub fn parse_objc(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -147,6 +150,7 @@ pub fn parse_objc(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -171,6 +175,7 @@ pub fn parse_objc(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
