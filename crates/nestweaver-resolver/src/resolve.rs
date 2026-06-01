@@ -30,16 +30,27 @@ pub fn resolve_references(
     language: Language,
     repo_uid: &str,
 ) -> Vec<ResolvedEdge> {
-    resolve_references_with_context(files, language, repo_uid, &WorkspaceContext::default())
+    resolve_references_with_context(
+        files,
+        language,
+        repo_uid,
+        &WorkspaceContext::default(),
+        None,
+    )
 }
 
 /// Like `resolve_references` but with an explicit `WorkspaceContext` for
 /// monorepo workspace package and tsconfig path alias resolution.
+///
+/// When `type_envs` is `Some`, per-file `TypeEnvironment` data is available
+/// for type-aware call resolution. Passing `None` preserves the previous
+/// behaviour.
 pub fn resolve_references_with_context(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
     repo_uid: &str,
     workspace_ctx: &WorkspaceContext,
+    _type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
 ) -> Vec<ResolvedEdge> {
     let graph = build_import_graph(files, language, workspace_ctx);
 

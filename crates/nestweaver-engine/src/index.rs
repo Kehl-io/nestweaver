@@ -806,7 +806,7 @@ fn index_into_store(
     };
 
     // Build type environments per file for type-aware resolution.
-    let _type_envs: std::collections::HashMap<String, nestweaver_resolver::types::TypeEnvironment> = {
+    let type_envs: std::collections::HashMap<String, nestweaver_resolver::types::TypeEnvironment> = {
         let mut envs = std::collections::HashMap::new();
         for (file_path, symbols, _references) in &parsed_files_for_resolver {
             let full_path = repo_path.join(file_path);
@@ -831,6 +831,7 @@ fn index_into_store(
         language,
         &r_uid,
         &workspace_ctx,
+        Some(&type_envs),
     );
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
@@ -1359,7 +1360,8 @@ fn process_added_or_modified_file(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges = resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx);
+    let resolved_edges =
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
