@@ -32,7 +32,7 @@ pub fn ensure_daemon(db_path: &Path) -> Result<PathBuf> {
         .open(&pidfile)
         .with_context(|| format!("failed to open pidfile {}", pidfile.display()))?;
 
-    // Try a non-blocking exclusive flock. The `daemonize` crate holds
+    // Try a non-blocking exclusive flock. The `daemonize2` crate holds
     // LOCK_EX on the pidfile for the daemon's entire lifetime, so if we
     // can't acquire it the daemon is definitely running.
     let fd = file.as_raw_fd();
