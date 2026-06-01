@@ -146,15 +146,6 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(
-        // Recover db_path from socket path for the log hint.
-        &std::path::PathBuf::new(),
-    );
-    let log_hint = nestweaver_daemon::lifecycle::log_path(
-        &nestweaver_daemon::lifecycle::instance_id_from_db_path(
-            &sock.parent().unwrap_or(std::path::Path::new(".")).join("db"),
-        ),
-    );
     bail!(
         "daemon did not create socket at {} within {:.1}s.\n\
          Check the daemon log for errors: {}\n\
