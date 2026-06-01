@@ -4803,6 +4803,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            // Co-change mining (piggybacks on --with-git-activity)
+            if with_git_activity && !repo_opted_out {
+                out.status("Mining co-changes...");
+                match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
+                    Ok(edges) => {
+                        let cochange_path =
+                            nestweaver_engine::sidecar_path(&db_path, ".cochange.json");
+                        if let Err(e) =
+                            nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path)
+                        {
+                            tracing::warn!("failed to save co-change sidecar: {e}");
+                        }
+                        out.status(&format!("Found {} co-change pairs.", edges.len()));
+                    }
+                    Err(e) => {
+                        tracing::warn!("co-change mining failed: {e}");
+                    }
+                }
+            }
+
             if with_trigrams {
                 out.status("Building trigram index...");
                 let store = GraphStore::open(&db_path)
