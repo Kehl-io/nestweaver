@@ -366,6 +366,7 @@ impl BrainWatcher {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_event(
         &self,
         store: &GraphStore,
@@ -508,12 +509,12 @@ impl BrainWatcher {
         )?;
 
         // Update bidirectional title lookup: O(1) removal via reverse map.
-        if let Some(old_title) = title_reverse.remove(&n_uid) {
-            if let Some(uids) = title_forward.get_mut(&old_title) {
-                uids.retain(|u| u != &n_uid);
-                if uids.is_empty() {
-                    title_forward.remove(&old_title);
-                }
+        if let Some(old_title) = title_reverse.remove(&n_uid)
+            && let Some(uids) = title_forward.get_mut(&old_title)
+        {
+            uids.retain(|u| u != &n_uid);
+            if uids.is_empty() {
+                title_forward.remove(&old_title);
             }
         }
         let new_title = parsed.title.to_lowercase();

@@ -832,6 +832,7 @@ fn index_into_store(
         note_context: NoteContext,
     }
 
+    #[allow(clippy::large_enum_variant)]
     enum NoteOutcome {
         Parsed(NoteParseOutcome),
         Skipped(SkippedFile),

@@ -4938,17 +4938,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Status => {
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                            let alive = unsafe { libc::kill(pid, 0) } == 0;
-                            if alive {
-                                println!("Daemon is running (PID {pid})");
-                                println!("  DB:     {}", db_path.display());
-                                println!("  Socket: {}", socket.display());
-                                println!("  Log:    {}", log_file.display());
-                                return Ok((EXIT_SUCCESS, None));
-                            }
-                        }
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+                        && let Ok(pid) = pid_str.trim().parse::<i32>()
+                        && unsafe { libc::kill(pid, 0) } == 0
+                    {
+                        println!("Daemon is running (PID {pid})");
+                        println!("  DB:     {}", db_path.display());
+                        println!("  Socket: {}", socket.display());
+                        println!("  Log:    {}", log_file.display());
+                        return Ok((EXIT_SUCCESS, None));
                     }
                     println!("Daemon is not running.");
                     Ok((EXIT_SUCCESS, None))
@@ -4956,31 +4954,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 DaemonAction::Restart { idle_timeout } => {
                     // Stop if running.
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                            let alive = unsafe { libc::kill(pid, 0) } == 0;
-                            if alive {
-                                eprintln!("Stopping daemon (PID {pid})...");
-                                unsafe {
-                                    libc::kill(pid, libc::SIGTERM);
-                                }
-                                for _ in 0..50 {
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                    if unsafe { libc::kill(pid, 0) } != 0 {
-                                        break;
-                                    }
-                                }
-                                if unsafe { libc::kill(pid, 0) } == 0 {
-                                    unsafe {
-                                        libc::kill(pid, libc::SIGKILL);
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(200));
-                                }
-                                let _ = std::fs::remove_file(&pidfile);
-                                let _ = std::fs::remove_file(&socket);
-                                eprintln!("Daemon stopped.");
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+                        && let Ok(pid) = pid_str.trim().parse::<i32>()
+                        && unsafe { libc::kill(pid, 0) } == 0
+                    {
+                        eprintln!("Stopping daemon (PID {pid})...");
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                        for _ in 0..50 {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            if unsafe { libc::kill(pid, 0) } != 0 {
+                                break;
                             }
                         }
+                        if unsafe { libc::kill(pid, 0) } == 0 {
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        let _ = std::fs::remove_file(&pidfile);
+                        let _ = std::fs::remove_file(&socket);
+                        eprintln!("Daemon stopped.");
                     }
 
                     // Re-exec ourselves to start the daemon fresh.
