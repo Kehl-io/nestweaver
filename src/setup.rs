@@ -11,6 +11,7 @@ pub fn run_setup(
     db_path: &Path,
     force_all: bool,
     allow_writes: bool,
+    force_overwrite: bool,
 ) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
 
@@ -41,8 +42,8 @@ pub fn run_setup(
 
         any_configured = true;
         match t.name {
-            "claude-code" => setup_claude_code(db_path, allow_writes)?,
-            "cursor" => setup_cursor(db_path, allow_writes)?,
+            "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite)?,
+            "cursor" => setup_cursor(db_path, allow_writes, force_overwrite)?,
             "codex" => setup_codex(db_path, allow_writes)?,
             "windsurf" => setup_windsurf(db_path, allow_writes)?,
             "jetbrains" => setup_jetbrains(db_path, allow_writes)?,
@@ -175,7 +176,7 @@ fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
     serde_json::json!(args)
 }
 
-fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_claude_code(db_path: &Path, allow_writes: bool, force_overwrite: bool) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".claude")?;
     let mcp_path = Path::new(".mcp.json");
     let db_str = db_path.to_string_lossy();
@@ -186,10 +187,13 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::E
     let merged = merge_json_mcp(mcp_path, "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".claude/skills/nestweaver")?;
-    std::fs::write(
-        ".claude/skills/nestweaver/SKILL.md",
-        generate_skill_content(),
-    )?;
+    let skill_path = Path::new(".claude/skills/nestweaver/SKILL.md");
+    let skill_status = if skill_path.exists() && !force_overwrite {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(skill_path, generate_skill_content())?;
+        "skill written"
+    };
 
     print_result(
         "Claude Code",
@@ -202,13 +206,13 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::E
                     "already configured"
                 },
             ),
-            (".claude/skills/nestweaver/SKILL.md", "skill written"),
+            (".claude/skills/nestweaver/SKILL.md", skill_status),
         ],
     );
     Ok(())
 }
 
-fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_cursor(db_path: &Path, allow_writes: bool, force_overwrite: bool) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".cursor")?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
@@ -218,10 +222,13 @@ fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
     let merged = merge_json_mcp(Path::new(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".cursor/rules")?;
-    std::fs::write(
-        ".cursor/rules/nestweaver.mdc",
-        generate_cursor_rule_content(),
-    )?;
+    let rule_path = Path::new(".cursor/rules/nestweaver.mdc");
+    let rule_status = if rule_path.exists() && !force_overwrite {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(rule_path, generate_cursor_rule_content())?;
+        "agent rules written"
+    };
 
     print_result(
         "Cursor",
@@ -234,7 +241,7 @@ fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
                     "already configured"
                 },
             ),
-            (".cursor/rules/nestweaver.mdc", "agent rules written"),
+            (".cursor/rules/nestweaver.mdc", rule_status),
         ],
     );
     Ok(())
