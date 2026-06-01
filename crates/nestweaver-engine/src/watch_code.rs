@@ -439,7 +439,8 @@ fn reindex_file(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges = resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx);
+    let resolved_edges =
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))

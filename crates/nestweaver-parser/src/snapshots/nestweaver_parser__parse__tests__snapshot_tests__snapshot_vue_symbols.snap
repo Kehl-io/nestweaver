@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: simple
   kind: Class
   start_line: 16
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: handleClick
   kind: Function
   start_line: 25
@@ -32,3 +34,4 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

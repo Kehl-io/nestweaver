@@ -1,49 +1,60 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2404
+assertion_line: 4059
 expression: "parsed_references(\"simple.ex\", &source)"
 ---
 - name: moduledoc
   kind: Call
   start_line: 2
   context: "@moduledoc \"A simple greeter module\""
+  receiver: ~
 - name: GenServer
   kind: Uses
   start_line: 4
   context: do
+  receiver: ~
 - name: Enum
   kind: Import
   start_line: 5
   context: do
+  receiver: ~
 - name: Greeter.Formatter
   kind: Import
   start_line: 6
   context: do
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 8
   context: greet(name)
+  receiver: ~
 - name: format_name
   kind: Call
   start_line: 9
   context: "#{format_name(name)}"
+  receiver: ~
 - name: format_name
   kind: Call
   start_line: 12
   context: format_name(name)
+  receiver: ~
 - name: capitalize
   kind: Call
   start_line: 13
   context: do
+  receiver: ~
 - name: greeting_macro
   kind: Call
   start_line: 16
   context: greeting_macro(name)
+  receiver: ~
 - name: format
   kind: Call
   start_line: 24
   context: format(text)
+  receiver: ~
 - name: trim
   kind: Call
   start_line: 25
   context: do
+  receiver: ~

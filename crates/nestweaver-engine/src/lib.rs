@@ -49,6 +49,7 @@ pub mod brainignore;
 pub mod bridges;
 pub mod cluster_dispatch;
 pub mod clustering;
+pub mod cochange;
 pub mod config;
 pub mod contracts;
 pub mod cross_domain;
@@ -111,6 +112,7 @@ pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};
 pub use cluster_dispatch::{
     ClusterMember, ClusteringOutput, CommunityInfo, compute_clusters, load_clusters, save_clusters,
 };
+pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
     CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
     InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,

@@ -249,6 +249,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Public,
             type_info: None,
+            parent_name: None,
         }
     }
 
@@ -264,6 +265,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Public,
             type_info: None,
+            parent_name: None,
         }
     }
 

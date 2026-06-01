@@ -83,6 +83,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -106,6 +107,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -129,6 +131,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -152,6 +155,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -175,6 +179,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             // Don't continue — fall through to reference detection so
             // `const std = @import("std")` also emits the import ref.
@@ -188,6 +193,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Import,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
         }
 
@@ -219,6 +225,7 @@ pub fn parse_zig(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Call,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
         }
     }

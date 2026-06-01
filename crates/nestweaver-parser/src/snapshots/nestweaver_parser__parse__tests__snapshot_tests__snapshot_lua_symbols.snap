@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: "Greeter:greet"
   kind: Method
   start_line: 13
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: format_name
   kind: Function
   start_line: 18
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: helper
   kind: Function
   start_line: 23
@@ -42,3 +45,4 @@ expression: "parsed_symbols(\"simple.lua\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

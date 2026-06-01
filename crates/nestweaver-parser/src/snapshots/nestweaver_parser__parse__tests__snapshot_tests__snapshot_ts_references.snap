@@ -1,60 +1,75 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 3821
 expression: "parsed_references(\"simple.ts\", &source)"
 ---
 - name: events
   kind: Import
   start_line: 1
   context: "import { EventEmitter } from 'events';"
+  receiver: ~
 - name: Greeter
   kind: Implements
   start_line: 12
   context: "implements Greeter, Logger"
+  receiver: ~
 - name: Logger
   kind: Implements
   start_line: 12
   context: "implements Greeter, Logger"
+  receiver: ~
 - name: log
   kind: Call
   start_line: 22
   context: console.log(message);
+  receiver: console
 - name: log
   kind: ReadAccess
   start_line: 22
   context: console.log(message)
+  receiver: ~
 - name: ConsoleGreeter
   kind: Extends
   start_line: 26
   context: "class VerboseGreeter extends ConsoleGreeter {"
+  receiver: ~
 - name: log
   kind: Call
   start_line: 28
   context: "this.log(`Greeting ${name}`);"
+  receiver: this
 - name: log
   kind: ReadAccess
   start_line: 28
   context: "this.log(`Greeting ${name}`)"
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 29
   context: return super.greet(name);
+  receiver: super
 - name: greet
   kind: ReadAccess
   start_line: 29
   context: super.greet(name)
+  receiver: ~
 - name: Greeter
   kind: TypeRef
   start_line: 33
   context: "import { EventEmitter } from 'events';"
+  receiver: ~
 - name: createGreeter
   kind: Call
   start_line: 37
   context: greeter = createGreeter()
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 38
   context: "greeter.greet('world');"
+  receiver: greeter
 - name: greet
   kind: ReadAccess
   start_line: 38
   context: "greeter.greet('world')"
+  receiver: ~

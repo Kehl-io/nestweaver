@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Vector3D
   kind: Class
   start_line: 4
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: add_vectors
   kind: Function
   start_line: 10
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: normalize
   kind: Function
   start_line: 18
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: main
   kind: Module
   start_line: 31
@@ -52,3 +56,4 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   entry_point_kind: Main
   visibility: Public
   type_info: ~
+  parent_name: ~

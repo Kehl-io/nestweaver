@@ -95,6 +95,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -112,6 +113,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -142,6 +144,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -169,6 +172,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: ep_kind,
                     visibility: Visibility::Public,
                     type_info: None,
+                    parent_name: None,
                 });
                 continue;
             }
@@ -194,6 +198,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility: Visibility::Public,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -206,6 +211,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Import,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
             continue;
         }
@@ -216,6 +222,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Includes,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
             continue;
         }
@@ -232,6 +239,7 @@ pub fn parse_powershell(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Call,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
         }
     }

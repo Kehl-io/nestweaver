@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SimpleGreeter
   kind: Class
   start_line: 7
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Function
   start_line: 8
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: formatName
   kind: Function
   start_line: 12
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: AppConfig
   kind: Module
   start_line: 17
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: defaultGreeting
   kind: Constant
   start_line: 18
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: createGreeter
   kind: Function
   start_line: 20
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: main
   kind: Function
   start_line: 25
@@ -82,6 +89,7 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: Main
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greeter
   kind: Constant
   start_line: 26
@@ -92,3 +100,4 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
