@@ -3,10 +3,15 @@ use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
+fn nestweaver_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd
+}
+
 #[test]
 fn cli_ui_shows_help() {
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["ui", "--help"])
         .assert()
         .success()
@@ -17,8 +22,7 @@ fn cli_ui_shows_help() {
 fn cli_shows_version() {
     // Assert against the actual package version so this test survives release
     // bumps (release-please advances the workspace version on `main`).
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .arg("--version")
         .assert()
         .success()
@@ -27,8 +31,7 @@ fn cli_shows_version() {
 
 #[test]
 fn cli_help_lists_commands() {
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .arg("--help")
         .assert()
         .success()
@@ -50,8 +53,7 @@ fn cli_index_and_search() {
     .unwrap();
 
     // Index
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -63,8 +65,7 @@ fn cli_index_and_search() {
         .success();
 
     // Search
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "search",
             "greet",
@@ -84,8 +85,7 @@ fn cli_symbol_not_found_exit_2() {
     // Create empty db via index of empty dir
     let repo_dir = dir.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -96,8 +96,7 @@ fn cli_symbol_not_found_exit_2() {
         .assert()
         .success();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "symbol",
             "nonexistent",
@@ -121,8 +120,7 @@ fn cli_index_then_symbol_lookup() {
     .unwrap();
 
     // Index
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -134,8 +132,7 @@ fn cli_index_then_symbol_lookup() {
         .success();
 
     // Symbol lookup returns success and prints name
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "symbol",
             "myFunc",
@@ -154,8 +151,7 @@ fn cli_instance_list_empty() {
     // We can't easily override the config dir in a subprocess, but we can at
     // minimum confirm the command exits successfully (it just reads or creates
     // the registry file in the default location).
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["instance", "list"])
         .assert()
         .success();
@@ -163,8 +159,7 @@ fn cli_instance_list_empty() {
 
 #[test]
 fn cli_snapshot_verify_nonexistent() {
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["snapshot", "verify", "/nonexistent/path/to/snapshot"])
         .assert()
         .failure();
@@ -172,8 +167,7 @@ fn cli_snapshot_verify_nonexistent() {
 
 #[test]
 fn cli_snapshot_build_exits_error() {
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["snapshot", "build"])
         .assert()
         .failure()
@@ -182,8 +176,7 @@ fn cli_snapshot_build_exits_error() {
 
 #[test]
 fn cli_snapshot_push_exits_error() {
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["snapshot", "push"])
         .assert()
         .failure()
@@ -197,8 +190,7 @@ fn cli_service_summary_not_found() {
     let db_path = dir.path().join("test.lbug");
     std::fs::create_dir_all(&repo_dir).unwrap();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -209,8 +201,7 @@ fn cli_service_summary_not_found() {
         .assert()
         .success();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "service-summary",
             "nonexistent-service",
@@ -228,8 +219,7 @@ fn cli_cross_repo_refs_symbol_not_found() {
     let db_path = dir.path().join("test.lbug");
     std::fs::create_dir_all(&repo_dir).unwrap();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -240,8 +230,7 @@ fn cli_cross_repo_refs_symbol_not_found() {
         .assert()
         .success();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "cross-repo-refs",
             "nosuchsymbol",
@@ -264,8 +253,7 @@ fn cli_cross_repo_refs_empty_for_known_symbol() {
     )
     .unwrap();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -277,8 +265,7 @@ fn cli_cross_repo_refs_empty_for_known_symbol() {
         .success();
 
     // myFunc is indexed but has no cross-repo links → success + "No cross-repo references"
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "cross-repo-refs",
             "myFunc",
@@ -331,8 +318,7 @@ module.exports = { greet };
     .unwrap();
 
     // Index
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -344,8 +330,7 @@ module.exports = { greet };
         .success();
 
     // Search finds symbols
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "search",
             "greet",
@@ -358,8 +343,7 @@ module.exports = { greet };
         .stdout(contains("greet"));
 
     // Symbol lookup works
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "symbol",
             "App",
@@ -372,8 +356,7 @@ module.exports = { greet };
         .stdout(contains("App"));
 
     // Symbol not found gives exit code 2
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "symbol",
             "nonexistent_xyz",
@@ -384,8 +367,7 @@ module.exports = { greet };
         .code(2);
 
     // Impact analysis works
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "impact",
             "greet",
@@ -397,15 +379,13 @@ module.exports = { greet };
         .success();
 
     // Repo-map works
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["repo-map", "--json", "--db", &db_path.display().to_string()])
         .assert()
         .success();
 
     // List-repos works
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "list-repos",
             "--json",
@@ -435,8 +415,7 @@ fn setup_context_db(dir: &tempfile::TempDir) -> std::path::PathBuf {
     )
     .unwrap();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -455,8 +434,7 @@ fn cli_context_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = setup_context_db(&dir);
 
-    let output = Command::cargo_bin("nestweaver")
-        .unwrap()
+    let output = nestweaver_cmd()
         .args(["context", "greet", "--db", &db_path.display().to_string()])
         .assert()
         .success()
@@ -480,8 +458,7 @@ fn cli_context_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = setup_context_db(&dir);
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "context",
             "zzz_no_such_symbol_xyz",
@@ -497,8 +474,7 @@ fn cli_context_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = setup_context_db(&dir);
 
-    let output = Command::cargo_bin("nestweaver")
-        .unwrap()
+    let output = nestweaver_cmd()
         .args([
             "context",
             "greet",
@@ -537,8 +513,7 @@ fn cli_impact_on_empty_db_exits_not_found() {
     std::fs::create_dir_all(&repo_dir).unwrap();
 
     // Create an empty DB
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -549,8 +524,7 @@ fn cli_impact_on_empty_db_exits_not_found() {
         .assert()
         .success();
 
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "impact",
             "noSuchSymbol",
@@ -588,8 +562,7 @@ fn cli_incremental_index_picks_up_new_symbol() {
     git(&["commit", "-m", "initial"]);
 
     // First index run — no prior DB, so this is a full index.
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -606,8 +579,7 @@ fn cli_incremental_index_picks_up_new_symbol() {
     git(&["commit", "-m", "add world"]);
 
     // Second index run — should be incremental.
-    let output = Command::cargo_bin("nestweaver")
-        .unwrap()
+    let output = nestweaver_cmd()
         .args([
             "index",
             "--repo",
@@ -628,8 +600,7 @@ fn cli_incremental_index_picks_up_new_symbol() {
     );
 
     // The new symbol `world` should now be searchable.
-    Command::cargo_bin("nestweaver")
-        .unwrap()
+    nestweaver_cmd()
         .args(["search", "world", "--db", &db_path.display().to_string()])
         .assert()
         .success()

@@ -33,7 +33,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -55,7 +55,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -66,6 +66,8 @@ jobs:
           sleep 2
           cargo build --tests
       - run: cargo test --no-fail-fast
+        env:
+          NESTWEAVER_NO_DAEMON: "1"
 
   coverage:
     name: Coverage
@@ -81,7 +83,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -93,6 +95,8 @@ jobs:
           cargo build --tests
       - name: Generate coverage
         run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info
+        env:
+          NESTWEAVER_NO_DAEMON: "1"
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -125,7 +129,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -139,7 +143,7 @@ jobs:
           sleep 2
           cargo build
       - name: Index test data
-        run: ./target/debug/nestweaver index --repo testdata/js --db /tmp/test.lbug
+        run: ./target/debug/nestweaver --no-daemon index --repo testdata/js --db /tmp/test.lbug
       - name: Install Playwright browsers
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright install --with-deps chromium

@@ -227,16 +227,40 @@ pub fn index_directory_with_options(
 ) -> Result<IndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
+    index_directory_with_store(
+        &store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+    )
+}
 
+/// Index a directory using an existing GraphStore (for daemon mode where the
+/// store is already open). Same as `index_directory_with_options` but skips
+/// opening the database.
+#[allow(clippy::too_many_arguments)]
+pub fn index_directory_with_store(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+) -> Result<IndexResult, anyhow::Error> {
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let mut new_filemeta = FileMetaCache::new();
 
     let result = if force {
-        // --force: skip tiered detection, re-index everything.
         index_into_store(
             repo_path,
-            &store,
+            store,
             instance_id,
             repo_url,
             indexed_sha,
@@ -245,11 +269,10 @@ pub fn index_directory_with_options(
             name,
         )?
     } else {
-        // Normal path: load the filemeta sidecar for tiered change detection.
         let filemeta_cache = load_filemeta_cache(&filemeta_path);
         index_into_store(
             repo_path,
-            &store,
+            store,
             instance_id,
             repo_url,
             indexed_sha,
@@ -259,12 +282,10 @@ pub fn index_directory_with_options(
         )?
     };
 
-    // Persist the updated filemeta sidecar.
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
     }
 
-    // Parse the manifest and update the sidecar cache alongside the DB.
     let manifest = crate::manifest::parse_manifest(repo_path);
     crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
     let cache_path = crate::sidecar_path(db_path, ".manifests.json");
@@ -275,10 +296,6 @@ pub fn index_directory_with_options(
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
-    // P0.2: the one-shot `index` path mutated the graph; bump + persist the
-    // generation so later short-lived processes (MCP server, CLI queries) see
-    // that the graph changed and invalidate any F16 cache entries — without a
-    // running watcher daemon.
     store.bump_and_persist_generation();
 
     Ok(result)

@@ -69,5 +69,8 @@ nestweaver brain status
 
 ```bash
 nestweaver mcp --db ./nestweaver.lbug
-# The server runs on stdio, ready for AI tool connections
+# Auto-starts a background daemon on first use (~1s startup delay)
+# The server runs on stdio, proxying queries through the daemon
 ```
+
+The daemon owns the database exclusively, enabling concurrent access from multiple AI tools and CLI commands. Daemon logs are at `~/.local/state/nestweaver/<instance>/daemon.log`.

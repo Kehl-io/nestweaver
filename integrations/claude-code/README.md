@@ -15,11 +15,13 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
      "mcpServers": {
        "nestweaver": {
          "command": "nestweaver",
-         "args": ["mcp", "--db", "./nestweaver.lbug", "--allow-mcp-add-sources"]
+         "args": ["mcp", "--db", "./nestweaver.lbug"]
        }
      }
    }
    ```
+
+   The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers and CLI commands can share the same database concurrently — no lock contention.
 
 3. (Optional) Enable hooks for enriched context:
    ```bash
@@ -49,7 +51,7 @@ When configured as an MCP server, NestWeaver exposes:
 - **brain_impact** — Blast radius analysis for any symbol (accepts name or UID)
 - **brain_status** — Database and vault status with per-vault staleness
 - **brain_guide** — Auto-generated codebase intelligence guide with repos, features, links, and projects
-- **brain_add_source** — Index new vaults or repos at runtime (enabled by default)
+- **brain_add_source** — Index new vaults or repos at runtime (always available via daemon)
 - **brain_diff** — Show what changed in the graph since a given SHA
 - **flow_trace** — Forward execution flow from entry points (accepts name or UID)
 - **detect_changes** — Map file changes to affected processes and risk
@@ -66,3 +68,18 @@ When configured as an MCP server, NestWeaver exposes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NESTWEAVER_DB` | `./nestweaver.lbug` | Path to the NestWeaver database |
+| `NESTWEAVER_NO_DAEMON` | unset | If set, bypass daemon and open the DB directly |
+| `NESTWEAVER_DAEMON_IDLE_TIMEOUT` | `3600` | Seconds before an idle daemon exits |
+
+## Daemon
+
+NestWeaver uses a background daemon process that exclusively owns the database and serves all queries via gRPC over a Unix domain socket. The daemon auto-starts on first use and exits after 1 hour of inactivity.
+
+```bash
+nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
+nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon
+```
+
+Daemon logs are written to `~/.local/state/nestweaver/<instance>/daemon.log`.
+
+For CI or environments where the daemon can't run, set `NESTWEAVER_NO_DAEMON=1` or pass `--no-daemon`.

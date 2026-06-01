@@ -1,0 +1,18 @@
+[package]
+name = "nestweaver-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client for NestWeaver daemon — auto-start, connect, call RPCs"
+
+[dependencies]
+nestweaver-proto = { workspace = true }
+nestweaver-daemon = { workspace = true }
+tonic = { workspace = true }
+tokio = { version = "1", features = ["net", "time", "rt"] }
+tokio-stream = { workspace = true }
+tower = "0.5"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+hyper-util = "0.1"
+libc = "0.2"
