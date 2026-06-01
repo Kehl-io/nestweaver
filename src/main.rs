@@ -17,7 +17,7 @@ use nestweaver_engine::{
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_rules, generate_repo_map,
-    generate_skill_with_rules, generate_summaries, get_last_indexed_at,
+    generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
     lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
@@ -1882,6 +1882,9 @@ enum SnapshotCommands {
     Build {
         #[arg(long, help = "Instance ID to build snapshot for")]
         instance: Option<String>,
+        /// Path to the database file
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Verify snapshot integrity (checksum, schema, version)
     Verify {
@@ -2755,8 +2758,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let rules_ref = override_rules.as_deref();
             let cfg_ref = instance_config.as_ref();
+            // Build tool docs from the live MCP registry for dynamic guide generation
+            let tool_docs: Vec<nestweaver_engine::ToolDocEntry> =
+                nestweaver_mcp::tools::tool_doc_entries()
+                    .into_iter()
+                    .map(
+                        |(name, category, purpose, params)| nestweaver_engine::ToolDocEntry {
+                            name,
+                            category,
+                            purpose,
+                            key_params: params,
+                        },
+                    )
+                    .collect();
+
             let output_str = match format.as_str() {
-                "skill" => generate_skill_with_rules(&store, cfg_ref, rules_ref)?,
+                "skill" => nestweaver_engine::generate_skill_with_tools(
+                    &store, cfg_ref, rules_ref, &tool_docs,
+                )?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
                 "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
@@ -3240,7 +3259,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
-        Commands::Brain { command } => run_brain(*command, out, t0),
+        Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
         Commands::Memory { command } => run_memory(*command, t0),
         Commands::Ranking { command } => run_ranking(command, t0),
         Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
@@ -4600,10 +4619,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .with_context(|| format!("failed to load config from {}", config_path.display()))?;
             let instance_id = &instance_config.instance_id;
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // Materialize requires direct write access — stop the daemon
+            // temporarily if it's running on this DB.
+            let daemon_instance = nestweaver_daemon::instance_id_from_db_path(&db_path);
+            let daemon_pid_path = nestweaver_daemon::pidfile_path(&daemon_instance);
+            let daemon_was_running = daemon_pid_path.exists()
+                && nestweaver_client::autostart::read_pid(&daemon_pid_path)
+                    .is_some_and(nestweaver_client::autostart::is_process_alive);
+            if daemon_was_running && !cli.no_daemon {
+                eprintln!("Stopping daemon for materialize-projects (will restart after)...");
+                if let Some(pid) = nestweaver_client::autostart::read_pid(&daemon_pid_path) {
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    for _ in 0..50 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if !nestweaver_client::autostart::is_process_alive(pid) {
+                            break;
+                        }
+                    }
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
 
             let result = materialize_projects(&store, &instance_config, instance_id, &db_path)
                 .context("materialize_projects")?;
+
+            // Release DB lock before restarting daemon
+            drop(store);
 
             println!(
                 "Materialized {} project(s): {} note edges, {} symbol edges, \
@@ -4615,6 +4658,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 result.wiki_notes_ingested,
                 result.wiki_fetch_errors,
             );
+
+            // Restart daemon if we stopped it
+            if daemon_was_running && !cli.no_daemon {
+                eprintln!("Restarting daemon...");
+                let _ = nestweaver_client::autostart::ensure_daemon(&db_path);
+            }
 
             Ok((EXIT_SUCCESS, None))
         }
@@ -4854,7 +4903,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
                 })?;
-            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
+            // Don't pre-canonicalize — instance_id_from_db_path handles it
+            // internally with consistent fallback for non-existent files.
             let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
             let runtime_dir = nestweaver_daemon::runtime_dir(&instance_id);
             let log_dir = nestweaver_daemon::log_dir(&instance_id);
@@ -5690,6 +5740,7 @@ fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
     t0: std::time::Instant,
+    use_daemon: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         BrainCommands::Add {
@@ -5732,6 +5783,35 @@ fn run_brain(
             ));
 
             let extra_patterns = parse_ignore_flag(&ignore);
+
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let req = nestweaver_proto::IndexVaultRequest {
+                    vault_path: path.display().to_string(),
+                    vault_name: vault_name.clone(),
+                    extra_ignore_patterns: extra_patterns.clone(),
+                };
+                rt.block_on(async {
+                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    while let Some(progress) = stream.message().await? {
+                        let phase_name = match progress.phase {
+                            0 => "Discovering",
+                            1 => "Parsing",
+                            2 => "Resolving",
+                            3 => "Writing",
+                            4 => "PageRank",
+                            5 => "Done",
+                            6 => "Error",
+                            _ => "Unknown",
+                        };
+                        eprintln!("[{phase_name}] {}", progress.message);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })?;
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let result = index_markdown_directory_with_ignore(
                 &path,
                 &db_path,
@@ -6146,6 +6226,30 @@ fn run_brain(
             // Compute vault UID for recording last_indexed_at.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
+
+            if use_daemon && since.is_none() {
+                // Route full refresh through daemon's IndexVault RPC
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let req = nestweaver_proto::IndexVaultRequest {
+                    vault_path: path.display().to_string(),
+                    vault_name: vault_name.clone(),
+                    extra_ignore_patterns: extra_patterns.clone(),
+                };
+                rt.block_on(async {
+                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    while let Some(progress) = stream.message().await? {
+                        let phase_name = match progress.phase {
+                            5 => "Done",
+                            6 => "Error",
+                            _ => "Progress",
+                        };
+                        eprintln!("[{phase_name}] {}", progress.message);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })?;
+                return Ok((EXIT_SUCCESS, None));
+            }
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -7452,7 +7556,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
 
 fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
     match command {
-        SnapshotCommands::Build { .. } => {
+        SnapshotCommands::Build { instance: _, db: _ } => {
             eprintln!(
                 "Use 'nestweaver index' to build a database, then package it with snapshot build"
             );
