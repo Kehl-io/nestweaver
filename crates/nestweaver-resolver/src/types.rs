@@ -122,6 +122,43 @@ impl TypeEnvironment {
         self.bindings.len()
     }
 
+    /// Seed bindings from cross-file return type information.
+    /// For each call `let x = foo()` where foo's return type is known,
+    /// bind x to that return type.
+    pub fn seed_return_types(
+        &mut self,
+        source: &str,
+        symbols_by_name: &std::collections::HashMap<&str, &RawSymbol>,
+    ) {
+        for (line_num, line) in source.lines().enumerate() {
+            let line_num = (line_num + 1) as u32;
+            let trimmed = line.trim();
+
+            if let Some((var_name, callee)) = extract_call_assignment(trimmed) {
+                let key = (var_name.to_string(), line_num);
+                if self.bindings.contains_key(&key) {
+                    continue;
+                }
+
+                if let Some(sym) = symbols_by_name.get(callee.as_str()) {
+                    if let Some(ref ti) = sym.type_info {
+                        if let Some(ref ret) = ti.return_type {
+                            self.bindings.insert(
+                                key,
+                                TypeBinding {
+                                    type_name: ret.clone(),
+                                    line: line_num,
+                                    confidence: 0.85,
+                                    source: BindingSource::ReturnType,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Construct a `TypeEnvironment` from pre-built bindings (for testing).
     pub fn from_bindings(entries: Vec<(String, u32, TypeBinding)>) -> Self {
         let mut bindings = HashMap::new();
@@ -208,6 +245,49 @@ fn propagate_assignments(
             break;
         }
     }
+}
+
+/// Extract a `(variable_name, callee_name)` pair from a line like
+/// `let result = someFunction(args)` or `const x = obj.method()`.
+fn extract_call_assignment(line: &str) -> Option<(&str, String)> {
+    let eq_pos = line.find('=')?;
+    // Skip ==, !=, <=, >=, =>
+    if eq_pos > 0 && matches!(line.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>' | b'=') {
+        return None;
+    }
+    if line.as_bytes().get(eq_pos + 1) == Some(&b'=')
+        || line.as_bytes().get(eq_pos + 1) == Some(&b'>')
+    {
+        return None;
+    }
+
+    let lhs = line[..eq_pos]
+        .trim()
+        .trim_start_matches("let ")
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ")
+        .trim_start_matches("var ")
+        .trim();
+    if lhs.contains(':') || lhs.is_empty() {
+        return None;
+    }
+    if !lhs.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    let rhs = line[eq_pos + 1..].trim();
+    let paren = rhs.find('(')?;
+    // Extract the last identifier before the paren (handles obj.method() → method)
+    let before_paren = &rhs[..paren];
+    let callee = before_paren
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()?
+        .trim();
+    if callee.is_empty() {
+        return None;
+    }
+
+    Some((lhs, callee.to_string()))
 }
 
 #[cfg(test)]
@@ -344,6 +424,29 @@ mod tests {
         assert!(binding.is_some(), "alias should get store's type");
         assert_eq!(binding.unwrap().type_name, "GraphStore");
         assert!(binding.unwrap().confidence < 0.90);
+    }
+
+    #[test]
+    fn seed_return_types_binds_call_result() {
+        let source = "let store = open_store();\nstore.query();\n";
+        let mut sym = make_function("open_store");
+        sym.type_info = Some(nestweaver_schema::TypeInfo {
+            declared_type: None,
+            parameter_types: vec![],
+            return_type: Some("GraphStore".to_string()),
+        });
+        let symbols: HashMap<&str, &RawSymbol> = HashMap::from([("open_store", &sym)]);
+
+        let mut env = TypeEnvironment::build(source, Language::Rust, &[]);
+        env.seed_return_types(source, &symbols);
+
+        let binding = env.lookup("store", 2);
+        assert!(
+            binding.is_some(),
+            "should find 'store' binding via return type"
+        );
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert_eq!(binding.unwrap().source, BindingSource::ReturnType);
     }
 
     #[test]
