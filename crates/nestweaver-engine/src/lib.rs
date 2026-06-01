@@ -89,9 +89,9 @@ pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
 };
 pub use agent_guide::{
-    generate_agents_md, generate_agents_md_with_rules, generate_cursor_rule,
+    ToolDocEntry, generate_agents_md, generate_agents_md_with_rules, generate_cursor_rule,
     generate_cursor_rule_with_rules, generate_guide, generate_guide_with_rules, generate_skill,
-    generate_skill_with_rules,
+    generate_skill_with_rules, generate_skill_with_tools,
 };
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
