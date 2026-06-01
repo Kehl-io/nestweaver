@@ -5119,7 +5119,11 @@ mod tool_doc_tests {
     fn all_tools_have_doc_categories() {
         let entries = tool_doc_entries();
         let tool_count = tool_list(false)["tools"].as_array().unwrap().len();
-        assert_eq!(entries.len(), tool_count, "doc entries must cover all tools");
+        assert_eq!(
+            entries.len(),
+            tool_count,
+            "doc entries must cover all tools"
+        );
         for (name, cat, _, _) in &entries {
             assert_ne!(cat, "Other", "tool {name} is missing a category assignment");
         }

@@ -1253,7 +1253,11 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
         /// Path to the database file
-        #[arg(long, global = true, help = "Path to the database file [env: NESTWEAVER_DB]")]
+        #[arg(
+            long,
+            global = true,
+            help = "Path to the database file [env: NESTWEAVER_DB]"
+        )]
         db: Option<PathBuf>,
     },
 }

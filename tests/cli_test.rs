@@ -650,7 +650,13 @@ fn setup_force_overwrites_existing_skill_file() {
     std::fs::write(&db_path, "").unwrap();
 
     std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .args(["setup", "--db", db_path.to_str().unwrap(), "--all", "--force"])
+        .args([
+            "setup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .output()
@@ -682,7 +688,10 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
         .unwrap();
 
     let content = std::fs::read_to_string(&rule_path).unwrap();
-    assert_eq!(content, "custom cursor rule content", "cursor rule must not be overwritten");
+    assert_eq!(
+        content, "custom cursor rule content",
+        "cursor rule must not be overwritten"
+    );
 }
 
 #[test]
@@ -725,7 +734,9 @@ fn setup_strips_deprecated_args_from_existing_config() {
         .as_array()
         .unwrap();
     assert!(
-        !args.iter().any(|a| a.as_str() == Some("--allow-mcp-add-sources")),
+        !args
+            .iter()
+            .any(|a| a.as_str() == Some("--allow-mcp-add-sources")),
         "deprecated flag should be removed from config, got: {args:?}"
     );
 }

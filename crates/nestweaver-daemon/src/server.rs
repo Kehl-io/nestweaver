@@ -1057,7 +1057,12 @@ pub async fn run_server(
 // ── Process title helper ────────────────────────────────────────────────
 
 #[cfg(all(
-    any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"),
+    any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ),
     not(target_os = "macos")
 ))]
 unsafe extern "C" {
@@ -1073,19 +1078,18 @@ fn set_process_title(title: &str) {
         if let Ok(c_title) = std::ffi::CString::new(title) {
             unsafe {
                 // PR_SET_NAME is limited to 15 bytes + NUL on Linux
-                let _ = libc::prctl(
-                    libc::PR_SET_NAME,
-                    c_title.as_ptr() as libc::c_long,
-                    0,
-                    0,
-                    0,
-                );
+                let _ = libc::prctl(libc::PR_SET_NAME, c_title.as_ptr() as libc::c_long, 0, 0, 0);
             }
         }
     }
 
     #[cfg(all(
-        any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"),
+        any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ),
         not(target_os = "macos")
     ))]
     {
@@ -1097,7 +1101,13 @@ fn set_process_title(title: &str) {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
     {
         let _ = title; // Suppress unused warning on unsupported platforms (macOS, etc.)
         // Note: macOS doesn't provide setproctitle in the C library, so the daemon

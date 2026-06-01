@@ -890,8 +890,7 @@ mod tests {
     #[test]
     fn generate_agents_md_accepts_custom_tool_count() {
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
-        let agents_md =
-            generate_agents_md_with_rules(&store, None, None, Some(42)).unwrap();
+        let agents_md = generate_agents_md_with_rules(&store, None, None, Some(42)).unwrap();
         assert!(
             agents_md.contains("42 MCP tools"),
             "AGENTS.md should use the provided tool count"
