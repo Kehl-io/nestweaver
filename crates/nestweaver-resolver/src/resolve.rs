@@ -178,9 +178,8 @@ pub fn resolve_references_with_context(
                                         {
                                             let target_uid =
                                                 symbol_uid(repo_uid, cf, &sym.name, sym.start_line);
-                                            let conf = (binding.confidence
-                                                - 0.05 * (depth + 1) as f32)
-                                                .max(0.50);
+                                            let conf = binding.confidence
+                                                * 0.95_f32.powi((depth + 1) as i32);
                                             edges.push(ResolvedEdge {
                                                 source_uid: source_uid.clone(),
                                                 target_uid,
@@ -1263,10 +1262,10 @@ mod tests {
             "should resolve to BaseClass::save via MRO walk"
         );
 
-        // Confidence should decay: 0.9 - 0.05 * 1 = 0.85
+        // Confidence should decay multiplicatively: 0.9 * 0.95 = 0.855
         assert!(
-            (edge.confidence - 0.85).abs() < f32::EPSILON,
-            "confidence should be 0.85 (decayed by one hop), got {}",
+            (edge.confidence - 0.855).abs() < 0.01,
+            "confidence should be ~0.855 (0.9 * 0.95 for one hop), got {}",
             edge.confidence
         );
     }

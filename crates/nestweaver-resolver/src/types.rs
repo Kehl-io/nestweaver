@@ -60,7 +60,7 @@ pub fn propagate_types(
             if !initial_types.contains_key(target)
                 && let Some(source_type) = initial_types.get(source).cloned()
             {
-                let confidence = (source_type.confidence - 0.05).max(0.0);
+                let confidence = source_type.confidence * 0.95;
                 initial_types.insert(
                     target.clone(),
                     ResolvedType {
@@ -239,7 +239,7 @@ fn propagate_assignments(
                     TypeBinding {
                         type_name: src.type_name,
                         line: *target_line,
-                        confidence: (src.confidence - 0.05).max(0.0),
+                        confidence: src.confidence * 0.95,
                         source: BindingSource::Assignment,
                     },
                 );
@@ -375,9 +375,11 @@ mod tests {
         assert_eq!(types.len(), 3);
         assert_eq!(types["b"].type_name, "Foo");
         assert_eq!(types["b"].resolution_tier, 2);
-        assert!((types["b"].confidence - 0.80).abs() < f32::EPSILON);
+        // Multiplicative decay: 0.85 * 0.95 = 0.8075
+        assert!((types["b"].confidence - 0.8075).abs() < 0.01);
         assert_eq!(types["c"].type_name, "Foo");
-        assert!((types["c"].confidence - 0.75).abs() < f32::EPSILON);
+        // Two hops: 0.85 * 0.95 * 0.95 = 0.767
+        assert!((types["c"].confidence - 0.767).abs() < 0.01);
     }
 
     #[test]
