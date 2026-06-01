@@ -69,7 +69,7 @@ pub fn resolve_references_with_context(
     let mut edges: Vec<ResolvedEdge> = Vec::new();
 
     for (file_path, symbols, references) in files {
-        for reference in references {
+        'ref_loop: for reference in references {
             let edge_type = match reference.kind {
                 ReferenceKind::Call => EdgeType::Calls,
                 ReferenceKind::Extends => EdgeType::Extends,
@@ -89,6 +89,55 @@ pub fn resolve_references_with_context(
                     continue;
                 }
             };
+
+            // ── Type-aware resolution for member calls with known receiver type ──
+            if edge_type == EdgeType::Calls {
+                if let Some(ref receiver) = reference.receiver {
+                    if let Some(ref envs) = _type_envs {
+                        if let Some(env) = envs.get(file_path.as_str()) {
+                            let receiver_type = if receiver == "self"
+                                || receiver == "this"
+                                || receiver == "$this"
+                            {
+                                env.lookup_self(reference.start_line)
+                            } else {
+                                env.lookup(receiver, reference.start_line)
+                            };
+
+                            if let Some(binding) = receiver_type {
+                                let method_name = &reference.name;
+                                let type_name = &binding.type_name;
+
+                                if let Some(candidates) = symbol_map.get(method_name.as_str()) {
+                                    if let Some((candidate_file, sym)) =
+                                        candidates.iter().find(|(_, s)| {
+                                            s.parent_name.as_deref() == Some(type_name.as_str())
+                                        })
+                                    {
+                                        let target_uid = symbol_uid(
+                                            repo_uid,
+                                            candidate_file,
+                                            &sym.name,
+                                            sym.start_line,
+                                        );
+                                        let confidence = binding.confidence.min(0.95);
+                                        edges.push(ResolvedEdge {
+                                            source_uid: source_uid.clone(),
+                                            target_uid,
+                                            edge_type,
+                                            confidence,
+                                            link_type: None,
+                                        });
+                                        continue 'ref_loop;
+                                    }
+                                }
+                                // Type was known but method not found on that type.
+                                // Fall through to name-based resolution.
+                            }
+                        }
+                    }
+                }
+            }
 
             let name = &reference.name;
 
@@ -852,5 +901,232 @@ mod tests {
             )];
             assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
         }
+    }
+
+    #[test]
+    fn type_aware_resolves_member_call_via_receiver_type() {
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        use crate::types::TypeEnvironment;
+
+        // File A: class Foo with method bar
+        let mut foo_bar = make_symbol("bar", 5);
+        foo_bar.parent_name = Some("Foo".to_string());
+        foo_bar.kind = SymbolKind::Function;
+
+        let foo_class = RawSymbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 20,
+            signature: "class Foo".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+
+        // File B: class Baz with method bar (different parent)
+        let mut baz_bar = make_symbol("bar", 5);
+        baz_bar.parent_name = Some("Baz".to_string());
+
+        let baz_class = RawSymbol {
+            name: "Baz".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 20,
+            signature: "class Baz".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+
+        // File C: caller that does foo_instance.bar()
+        let caller = make_symbol("caller", 1);
+        let bar_call = RawReference {
+            name: "bar".to_string(),
+            kind: ReferenceKind::Call,
+            start_line: 3,
+            context: String::new(),
+            receiver: Some("foo_instance".to_string()),
+        };
+
+        let files = vec![
+            ("src/foo.ts".to_string(), vec![foo_class, foo_bar], vec![]),
+            ("src/baz.ts".to_string(), vec![baz_class, baz_bar], vec![]),
+            ("src/main.ts".to_string(), vec![caller], vec![bar_call]),
+        ];
+
+        // Build a type environment for main.ts: foo_instance has type Foo at line 2
+        let mut type_envs = std::collections::HashMap::new();
+        let env = TypeEnvironment::from_bindings(vec![(
+            "foo_instance".to_string(),
+            2,
+            TypeBinding {
+                type_name: "Foo".to_string(),
+                line: 2,
+                confidence: 0.9,
+                source: BindingSource::Constructor,
+            },
+        )]);
+        type_envs.insert("src/main.ts".to_string(), env);
+
+        let edges = resolve_references_with_context(
+            &files,
+            Language::TypeScript,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&type_envs),
+        );
+
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(call_edges.len(), 1, "should have exactly one call edge");
+
+        let edge = &call_edges[0];
+        let expected_target = symbol_uid("repo:test:abc", "src/foo.ts", "bar", 5);
+        let wrong_target = symbol_uid("repo:test:abc", "src/baz.ts", "bar", 5);
+        assert_eq!(
+            edge.target_uid, expected_target,
+            "should resolve to Foo::bar in foo.ts"
+        );
+        assert_ne!(
+            edge.target_uid, wrong_target,
+            "should NOT resolve to Baz::bar"
+        );
+        assert!(
+            (edge.confidence - 0.9).abs() < f32::EPSILON,
+            "confidence should be min(0.9, 0.95) = 0.9, got {}",
+            edge.confidence
+        );
+    }
+
+    #[test]
+    fn type_aware_self_receiver_resolves_to_own_class() {
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        use crate::types::TypeEnvironment;
+
+        // Class MyClass with method helper
+        let mut helper = make_symbol("helper", 5);
+        helper.parent_name = Some("MyClass".to_string());
+
+        // Method doWork that calls this.helper()
+        let mut do_work = make_symbol("doWork", 10);
+        do_work.parent_name = Some("MyClass".to_string());
+
+        let this_call = RawReference {
+            name: "helper".to_string(),
+            kind: ReferenceKind::Call,
+            start_line: 12,
+            context: String::new(),
+            receiver: Some("this".to_string()),
+        };
+
+        let files = vec![(
+            "src/myclass.ts".to_string(),
+            vec![
+                RawSymbol {
+                    name: "MyClass".to_string(),
+                    kind: SymbolKind::Class,
+                    start_line: 1,
+                    end_line: 30,
+                    signature: "class MyClass".to_string(),
+                    content_hash: String::new(),
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    parent_name: None,
+                },
+                helper,
+                do_work,
+            ],
+            vec![this_call],
+        )];
+
+        let mut type_envs = std::collections::HashMap::new();
+        let env = TypeEnvironment::from_bindings(vec![(
+            "this".to_string(),
+            10,
+            TypeBinding {
+                type_name: "MyClass".to_string(),
+                line: 10,
+                confidence: 0.95,
+                source: BindingSource::SelfThis,
+            },
+        )]);
+        type_envs.insert("src/myclass.ts".to_string(), env);
+
+        let edges = resolve_references_with_context(
+            &files,
+            Language::TypeScript,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&type_envs),
+        );
+
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(call_edges.len(), 1, "should have exactly one call edge");
+
+        let edge = &call_edges[0];
+        let expected_target = symbol_uid("repo:test:abc", "src/myclass.ts", "helper", 5);
+        assert_eq!(
+            edge.target_uid, expected_target,
+            "should resolve to helper method"
+        );
+        assert!(
+            (edge.confidence - 0.95).abs() < f32::EPSILON,
+            "confidence should be capped at 0.95, got {}",
+            edge.confidence
+        );
+    }
+
+    #[test]
+    fn type_aware_falls_back_to_name_based_when_no_type_env() {
+        // Same setup as type_aware test but without type_envs
+        // Should fall through to name-based resolution
+        let mut foo_bar = make_symbol("bar", 5);
+        foo_bar.parent_name = Some("Foo".to_string());
+
+        let caller = make_symbol("caller", 1);
+        let bar_call = RawReference {
+            name: "bar".to_string(),
+            kind: ReferenceKind::Call,
+            start_line: 3,
+            context: String::new(),
+            receiver: Some("foo_instance".to_string()),
+        };
+
+        let files = vec![
+            ("src/foo.ts".to_string(), vec![foo_bar], vec![]),
+            ("src/main.ts".to_string(), vec![caller], vec![bar_call]),
+        ];
+
+        // No type_envs → passes None
+        let edges = resolve_references_with_context(
+            &files,
+            Language::TypeScript,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            None,
+        );
+
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert!(
+            !call_edges.is_empty(),
+            "should still produce edges via name-based fallback"
+        );
     }
 }
