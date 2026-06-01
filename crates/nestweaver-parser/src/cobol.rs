@@ -132,6 +132,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: ep_kind,
                     visibility: Visibility::Inferred,
                     type_info: None,
+                    parent_name: None,
                 });
                 continue; // sections can't also be paragraphs
             }
@@ -158,6 +159,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: ep_kind,
                     visibility: Visibility::Inferred,
                     type_info: None,
+                    parent_name: None,
                 });
             }
         }

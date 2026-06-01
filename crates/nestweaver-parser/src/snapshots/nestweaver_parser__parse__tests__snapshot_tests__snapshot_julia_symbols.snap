@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: LivingThing
   kind: Interface
   start_line: 5
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Animal
   kind: Class
   start_line: 7
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Counter
   kind: Class
   start_line: 12
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Function
   start_line: 16
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: process
   kind: Function
   start_line: 20
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: log_call
   kind: Function
   start_line: 26
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: main
   kind: Function
   start_line: 33
@@ -82,3 +89,4 @@ expression: "parsed_symbols(\"simple.jl\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~

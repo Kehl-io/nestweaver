@@ -67,6 +67,9 @@ pub struct RawSymbol {
     pub entry_point_kind: Option<EntryPointKind>,
     pub visibility: Visibility,
     pub type_info: Option<TypeInfo>,
+    /// The name of the enclosing class/struct/impl/trait for method symbols.
+    /// `None` for top-level functions and non-method symbols.
+    pub parent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,6 +496,50 @@ fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
     }
 }
 
+// ── parent name extraction ────────────────────────────────────────────────
+
+/// Walk the tree-sitter AST parent chain from `node` to find the enclosing
+/// class, struct, impl, trait, or interface. Returns the parent type/class name
+/// (e.g. `"GraphStore"` for a method inside `impl GraphStore { ... }`).
+fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            // Rust: impl Type { ... }
+            "impl_item" => {
+                return parent
+                    .child_by_field_name("type")
+                    .and_then(|t| t.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // JS/TS/Java/C#/Dart/PHP/Python/Ruby: class Name { ... }
+            "class_declaration" | "class_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // TS/Java: interface Name { ... }
+            "interface_declaration" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // Rust: trait Name { ... }
+            "trait_item" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 // ── core parse ─────────────────────────────────────────────────────────────
 
 /// Parse a single source file and extract symbols and references.
@@ -663,6 +710,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
                 let visibility = infer_visibility(&name, &node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
+                let parent_name = if kind == SymbolKind::Method {
+                    find_parent_name(&node, source_bytes)
+                } else {
+                    None
+                };
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -674,6 +726,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     entry_point_kind: ep_kind,
                     visibility,
                     type_info,
+                    parent_name,
                 });
             } else if let Some(kind_str) = capture_name.strip_prefix("reference.") {
                 let kind = match kind_str {
@@ -4329,6 +4382,82 @@ arr.map(x => x + 1);
             call_refs[0].receiver.as_deref(),
             Some("arr"),
             "receiver should be 'arr'"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_rust_impl_method() {
+        let source = r#"
+struct GraphStore;
+impl GraphStore {
+    fn compute_pagerank(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute_pagerank")
+            .expect("should find compute_pagerank symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("GraphStore".to_string()),
+            "method inside impl GraphStore should have parent_name = GraphStore"
+        );
+    }
+
+    #[test]
+    fn top_level_function_has_no_parent() {
+        let source = "fn main() {}";
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let func = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("should find main symbol");
+        assert_eq!(
+            func.parent_name, None,
+            "top-level function should have no parent_name"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_ts_class_method() {
+        let source = r#"
+class UserService {
+    fetchUser(id: string) { return null; }
+}
+"#;
+        let parsed = parse_source(Path::new("t.ts"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "fetchUser")
+            .expect("should find fetchUser symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("UserService".to_string()),
+            "method inside class UserService should have parent_name = UserService"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_rust_trait_method() {
+        let source = r#"
+trait Drawable {
+    fn draw(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "draw")
+            .expect("should find draw symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("Drawable".to_string()),
+            "method inside trait Drawable should have parent_name = Drawable"
         );
     }
 }

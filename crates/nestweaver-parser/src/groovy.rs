@@ -113,6 +113,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
 
             // Check for extends/implements on the same line
@@ -153,6 +154,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -173,6 +175,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -191,6 +194,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: None,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }
@@ -228,6 +232,7 @@ pub fn parse_groovy(path: &Path, source: &str) -> ParsedFile {
                 entry_point_kind: ep_kind,
                 visibility,
                 type_info: None,
+                parent_name: None,
             });
             continue;
         }

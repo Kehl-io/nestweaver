@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: decorator_factory
   kind: Function
   start_line: 7
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: decorator
   kind: Function
   start_line: 8
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: wrapper
   kind: Function
   start_line: 9
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: decorated_greet
   kind: Function
   start_line: 15
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: Animal
   kind: Class
   start_line: 18
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: __init__
   kind: Method
   start_line: 19
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: Animal
 - name: speak
   kind: Method
   start_line: 22
@@ -82,6 +89,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: Animal
 - name: Dog
   kind: Class
   start_line: 25
@@ -92,6 +100,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
 - name: speak
   kind: Method
   start_line: 26
@@ -102,6 +111,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: Dog
 - name: main
   kind: Function
   start_line: 29
@@ -112,3 +122,4 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   entry_point_kind: Main
   visibility: Inferred
   type_info: ~
+  parent_name: ~

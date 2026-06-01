@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Loggable
   kind: Trait
   start_line: 8
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: log
   kind: Method
   start_line: 9
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SimpleGreeter
   kind: Class
   start_line: 14
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Method
   start_line: 16
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: SimpleGreeter
 - name: _formatName
   kind: Method
   start_line: 21
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: SimpleGreeter
 - name: Priority
   kind: Enum
   start_line: 26
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: main
   kind: Function
   start_line: 28
@@ -82,3 +89,4 @@ expression: "parsed_symbols(\"simple.dart\", &source)"
   entry_point_kind: Main
   visibility: Public
   type_info: ~
+  parent_name: ~

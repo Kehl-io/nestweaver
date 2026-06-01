@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: initialize
   kind: Method
   start_line: 6
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: readTemperature
   kind: Method
   start_line: 7
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: sensorId
   kind: Property
   start_line: 9
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: initialize
   kind: Method
   start_line: 12
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: readTemperature
   kind: Method
   start_line: 16
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SensorConfig
   kind: Class
   start_line: 20
@@ -72,6 +78,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: pin
   kind: Property
   start_line: 21
@@ -82,6 +89,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: threshold
   kind: Property
   start_line: 22
@@ -92,6 +100,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: SensorType
   kind: Enum
   start_line: 25
@@ -102,6 +111,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: TEMPERATURE
   kind: Constant
   start_line: 26
@@ -112,6 +122,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: HUMIDITY
   kind: Constant
   start_line: 27
@@ -122,6 +133,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: PRESSURE
   kind: Constant
   start_line: 28
@@ -132,6 +144,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: setup
   kind: Function
   start_line: 31
@@ -142,6 +155,7 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: temp
   kind: Variable
   start_line: 34
@@ -152,3 +166,4 @@ expression: "parsed_symbols(\"simple.cpp\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
