@@ -121,6 +121,15 @@ impl TypeEnvironment {
     pub fn binding_count(&self) -> usize {
         self.bindings.len()
     }
+
+    /// Construct a `TypeEnvironment` from pre-built bindings (for testing).
+    pub fn from_bindings(entries: Vec<(String, u32, TypeBinding)>) -> Self {
+        let mut bindings = HashMap::new();
+        for (name, line, binding) in entries {
+            bindings.insert((name, line), binding);
+        }
+        Self { bindings }
+    }
 }
 
 /// Extract simple assignment patterns from source.
