@@ -1,6 +1,7 @@
 use nestweaver_parser::{RawReference, RawSymbol, ReferenceKind};
 use nestweaver_schema::{
-    EdgeType, Language, MatchType, ResolvedEdge, Visibility, confidence_score, symbol_uid,
+    EdgeType, Language, MatchType, ResolvedEdge, SymbolKind, Visibility, confidence_score,
+    symbol_uid,
 };
 
 use crate::imports::build_import_graph;
@@ -65,6 +66,33 @@ pub fn resolve_references_with_context(
                 .push((file_path.as_str(), sym));
         }
     }
+
+    // Build a parent-type lookup from Extends references for MRO walk.
+    // Maps child type name → list of parent type names.
+    let extends_map: std::collections::HashMap<String, Vec<String>> = {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (_, symbols, references) in files {
+            for reference in references {
+                if reference.kind == ReferenceKind::Extends {
+                    if let Some(sym) = find_enclosing_symbol(symbols, reference.start_line) {
+                        if matches!(
+                            sym.kind,
+                            SymbolKind::Class
+                                | SymbolKind::Enum
+                                | SymbolKind::Interface
+                                | SymbolKind::Trait
+                        ) {
+                            map.entry(sym.name.clone())
+                                .or_default()
+                                .push(reference.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        map
+    };
 
     let mut edges: Vec<ResolvedEdge> = Vec::new();
 
@@ -131,7 +159,60 @@ pub fn resolve_references_with_context(
                                         continue 'ref_loop;
                                     }
                                 }
-                                // Type was known but method not found on that type.
+                                // MRO walk: check parent types via inheritance chain
+                                {
+                                    let mut current_types = vec![type_name.clone()];
+                                    let mut visited = std::collections::HashSet::new();
+                                    visited.insert(type_name.clone());
+                                    let mut depth = 0u32;
+
+                                    while depth < 5 && !current_types.is_empty() {
+                                        let mut next_types = Vec::new();
+                                        for t in &current_types {
+                                            if let Some(parents) = extends_map.get(t.as_str()) {
+                                                for parent in parents {
+                                                    if visited.contains(parent) {
+                                                        continue; // cycle guard
+                                                    }
+                                                    visited.insert(parent.clone());
+
+                                                    if let Some(candidates) =
+                                                        symbol_map.get(method_name.as_str())
+                                                    {
+                                                        if let Some((cf, sym)) =
+                                                            candidates.iter().find(|(_, s)| {
+                                                                s.parent_name.as_deref()
+                                                                    == Some(parent.as_str())
+                                                            })
+                                                        {
+                                                            let target_uid = symbol_uid(
+                                                                repo_uid,
+                                                                cf,
+                                                                &sym.name,
+                                                                sym.start_line,
+                                                            );
+                                                            let conf = (binding.confidence
+                                                                - 0.05 * (depth + 1) as f32)
+                                                                .max(0.50);
+                                                            edges.push(ResolvedEdge {
+                                                                source_uid: source_uid.clone(),
+                                                                target_uid,
+                                                                edge_type,
+                                                                confidence: conf,
+                                                                link_type: None,
+                                                            });
+                                                            continue 'ref_loop;
+                                                        }
+                                                    }
+                                                    next_types.push(parent.clone());
+                                                }
+                                            }
+                                        }
+                                        current_types = next_types;
+                                        depth += 1;
+                                    }
+                                }
+                                // Type was known but method not found on that type or ancestors.
                                 // Fall through to name-based resolution.
                             }
                         }
@@ -1086,6 +1167,123 @@ mod tests {
         assert!(
             (edge.confidence - 0.95).abs() < f32::EPSILON,
             "confidence should be capped at 0.95, got {}",
+            edge.confidence
+        );
+    }
+
+    #[test]
+    fn mro_walk_finds_inherited_method() {
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        use crate::types::TypeEnvironment;
+
+        // BaseClass has method "save" at line 5
+        let mut save_method = make_symbol("save", 5);
+        save_method.parent_name = Some("BaseClass".to_string());
+
+        let base_class = RawSymbol {
+            name: "BaseClass".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 20,
+            signature: "class BaseClass".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+
+        // ChildClass extends BaseClass (no "save" method of its own)
+        let child_class = RawSymbol {
+            name: "ChildClass".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 30,
+            end_line: 50,
+            signature: "class ChildClass extends BaseClass".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+
+        let extends_ref = RawReference {
+            name: "BaseClass".to_string(),
+            kind: ReferenceKind::Extends,
+            start_line: 30,
+            context: String::new(),
+            receiver: None,
+        };
+
+        // Caller file: child_instance.save()
+        let caller = make_symbol("caller", 1);
+        let save_call = RawReference {
+            name: "save".to_string(),
+            kind: ReferenceKind::Call,
+            start_line: 5,
+            context: String::new(),
+            receiver: Some("child_instance".to_string()),
+        };
+
+        let files = vec![
+            (
+                "src/base.ts".to_string(),
+                vec![base_class, save_method],
+                vec![],
+            ),
+            (
+                "src/child.ts".to_string(),
+                vec![child_class],
+                vec![extends_ref],
+            ),
+            ("src/main.ts".to_string(), vec![caller], vec![save_call]),
+        ];
+
+        // Type environment: child_instance has type ChildClass
+        let mut type_envs = std::collections::HashMap::new();
+        let env = TypeEnvironment::from_bindings(vec![(
+            "child_instance".to_string(),
+            2,
+            TypeBinding {
+                type_name: "ChildClass".to_string(),
+                line: 2,
+                confidence: 0.9,
+                source: BindingSource::Constructor,
+            },
+        )]);
+        type_envs.insert("src/main.ts".to_string(), env);
+
+        let edges = resolve_references_with_context(
+            &files,
+            Language::TypeScript,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&type_envs),
+        );
+
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "should have exactly one call edge; got: {call_edges:?}"
+        );
+
+        let edge = &call_edges[0];
+        let expected_target = symbol_uid("repo:test:abc", "src/base.ts", "save", 5);
+        assert_eq!(
+            edge.target_uid, expected_target,
+            "should resolve to BaseClass::save via MRO walk"
+        );
+
+        // Confidence should decay: 0.9 - 0.05 * 1 = 0.85
+        assert!(
+            (edge.confidence - 0.85).abs() < f32::EPSILON,
+            "confidence should be 0.85 (decayed by one hop), got {}",
             edge.confidence
         );
     }
