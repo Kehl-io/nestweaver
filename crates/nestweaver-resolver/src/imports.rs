@@ -183,6 +183,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Inferred,
             type_info: None,
+            parent_name: None,
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
             kind: ReferenceKind::Import,
             start_line: 1,
             context: String::new(),
+            receiver: None,
         }
     }
 

@@ -2,7 +2,15 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use nestweaver_parser::RawSymbol;
-use nestweaver_schema::{ResolvedType, SymbolKind};
+use nestweaver_schema::{Language, ResolvedType, SymbolKind};
+
+use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings};
+
+/// A variable binding key: (variable_name, line_number).
+type BindingKey = (String, u32);
+
+/// An assignment pair: (target_key, source_key).
+type Assignment = (BindingKey, BindingKey);
 
 /// Tier 1: Infer types from constructor calls.
 /// When a Call reference resolves to a Class symbol, the call site's variable
@@ -52,7 +60,7 @@ pub fn propagate_types(
             if !initial_types.contains_key(target)
                 && let Some(source_type) = initial_types.get(source).cloned()
             {
-                let confidence = (source_type.confidence - 0.05).max(0.0);
+                let confidence = source_type.confidence * 0.95;
                 initial_types.insert(
                     target.clone(),
                     ResolvedType {
@@ -72,6 +80,221 @@ pub fn propagate_types(
     iterations
 }
 
+/// Per-file type environment: maps (variable_name, scope_line) → type_name.
+/// Built by running all four inference tiers, then the fixpoint loop.
+pub struct TypeEnvironment {
+    bindings: HashMap<(String, u32), TypeBinding>,
+}
+
+impl TypeEnvironment {
+    /// Build a type environment for a single file.
+    pub fn build(source: &str, language: Language, symbols: &[RawSymbol]) -> Self {
+        // Tiers 0-2: annotations, constructors, self/this
+        let mut bindings = extract_bindings(source, language, symbols);
+
+        // Tier 3: Assignment chain fixpoint
+        let assignments = extract_assignments(source);
+        propagate_assignments(&mut bindings, &assignments, 10);
+
+        Self { bindings }
+    }
+
+    /// Look up the type of a variable at a given scope.
+    /// Searches backwards from `at_line` for the nearest binding.
+    pub fn lookup(&self, variable: &str, at_line: u32) -> Option<&TypeBinding> {
+        // Exact match first
+        if let Some(binding) = self.bindings.get(&(variable.to_string(), at_line)) {
+            return Some(binding);
+        }
+        // Search backwards for nearest binding
+        self.bindings
+            .iter()
+            .filter(|((name, line), _)| name == variable && *line <= at_line)
+            .max_by_key(|((_, line), _)| *line)
+            .map(|(_, binding)| binding)
+    }
+
+    /// Look up self/this type at a given line.
+    pub fn lookup_self(&self, at_line: u32) -> Option<&TypeBinding> {
+        for keyword in &["self", "this", "$this"] {
+            if let Some(b) = self.lookup(keyword, at_line) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Seed bindings from cross-file return type information.
+    /// For each call `let x = foo()` where foo's return type is known,
+    /// bind x to that return type.
+    pub fn seed_return_types(
+        &mut self,
+        source: &str,
+        symbols_by_name: &std::collections::HashMap<&str, &RawSymbol>,
+    ) {
+        for (line_num, line) in source.lines().enumerate() {
+            let line_num = (line_num + 1) as u32;
+            let trimmed = line.trim();
+
+            if let Some((var_name, callee)) = extract_call_assignment(trimmed) {
+                let key = (var_name.to_string(), line_num);
+                if self.bindings.contains_key(&key) {
+                    continue;
+                }
+
+                if let Some(sym) = symbols_by_name.get(callee.as_str())
+                    && let Some(ref ti) = sym.type_info
+                    && let Some(ref ret) = ti.return_type
+                {
+                    self.bindings.insert(
+                        key,
+                        TypeBinding {
+                            type_name: ret.clone(),
+                            line: line_num,
+                            confidence: 0.85,
+                            source: BindingSource::ReturnType,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Construct a `TypeEnvironment` from pre-built bindings (for testing).
+    pub fn from_bindings(entries: Vec<(String, u32, TypeBinding)>) -> Self {
+        let mut bindings = HashMap::new();
+        for (name, line, binding) in entries {
+            bindings.insert((name, line), binding);
+        }
+        Self { bindings }
+    }
+}
+
+/// Extract simple assignment patterns from source.
+fn extract_assignments(source: &str) -> Vec<Assignment> {
+    let mut assignments = Vec::new();
+    for (line_num, line) in source.lines().enumerate() {
+        let line_num = (line_num + 1) as u32;
+        let trimmed = line.trim();
+        if let Some(eq_pos) = trimmed.find('=') {
+            // Skip ==, !=, <=, >=, =>
+            if eq_pos > 0 {
+                let prev = trimmed.as_bytes()[eq_pos - 1];
+                if matches!(prev, b'!' | b'<' | b'>' | b'=') {
+                    continue;
+                }
+            }
+            if trimmed.as_bytes().get(eq_pos + 1) == Some(&b'=')
+                || trimmed.as_bytes().get(eq_pos + 1) == Some(&b'>')
+            {
+                continue;
+            }
+            let lhs = trimmed[..eq_pos]
+                .trim()
+                .trim_start_matches("let ")
+                .trim_start_matches("mut ")
+                .trim_start_matches("const ")
+                .trim_start_matches("var ")
+                .trim();
+            let rhs = trimmed[eq_pos + 1..].trim().trim_end_matches(';');
+            // Only simple identifier-to-identifier assignments
+            if !lhs.is_empty()
+                && !rhs.is_empty()
+                && rhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !lhs.contains(':')
+            {
+                assignments.push(((lhs.to_string(), line_num), (rhs.to_string(), line_num)));
+            }
+        }
+    }
+    assignments
+}
+
+/// Propagate type bindings through assignment chains (fixpoint).
+fn propagate_assignments(
+    bindings: &mut HashMap<(String, u32), TypeBinding>,
+    assignments: &[Assignment],
+    max_iterations: usize,
+) {
+    for _ in 0..max_iterations {
+        let mut changed = false;
+        for ((target_name, target_line), (source_name, _)) in assignments {
+            let target_key = (target_name.clone(), *target_line);
+            if bindings.contains_key(&target_key) {
+                continue;
+            }
+            let source_type = bindings
+                .iter()
+                .filter(|((name, line), _)| name == source_name && *line <= *target_line)
+                .max_by_key(|((_, line), _)| *line)
+                .map(|(_, b)| b.clone());
+            if let Some(src) = source_type {
+                bindings.insert(
+                    target_key,
+                    TypeBinding {
+                        type_name: src.type_name,
+                        line: *target_line,
+                        confidence: src.confidence * 0.95,
+                        source: BindingSource::Assignment,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Extract a `(variable_name, callee_name)` pair from a line like
+/// `let result = someFunction(args)` or `const x = obj.method()`.
+fn extract_call_assignment(line: &str) -> Option<(&str, String)> {
+    let eq_pos = line.find('=')?;
+    // Skip ==, !=, <=, >=, =>
+    if eq_pos > 0 && matches!(line.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>' | b'=') {
+        return None;
+    }
+    if line.as_bytes().get(eq_pos + 1) == Some(&b'=')
+        || line.as_bytes().get(eq_pos + 1) == Some(&b'>')
+    {
+        return None;
+    }
+
+    let lhs = line[..eq_pos]
+        .trim()
+        .trim_start_matches("let ")
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ")
+        .trim_start_matches("var ")
+        .trim();
+    if lhs.contains(':') || lhs.is_empty() {
+        return None;
+    }
+    if !lhs.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    let rhs = line[eq_pos + 1..].trim();
+    let paren = rhs.find('(')?;
+    // Extract the last identifier before the paren (handles obj.method() → method)
+    let before_paren = &rhs[..paren];
+    let callee = before_paren
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()?
+        .trim();
+    if callee.is_empty() {
+        return None;
+    }
+
+    Some((lhs, callee.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +312,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Public,
             type_info: None,
+            parent_name: None,
         }
     }
 
@@ -104,6 +328,7 @@ mod tests {
             entry_point_kind: None,
             visibility: Visibility::Public,
             type_info: None,
+            parent_name: None,
         }
     }
 
@@ -150,9 +375,11 @@ mod tests {
         assert_eq!(types.len(), 3);
         assert_eq!(types["b"].type_name, "Foo");
         assert_eq!(types["b"].resolution_tier, 2);
-        assert!((types["b"].confidence - 0.80).abs() < f32::EPSILON);
+        // Multiplicative decay: 0.85 * 0.95 = 0.8075
+        assert!((types["b"].confidence - 0.8075).abs() < 0.01);
         assert_eq!(types["c"].type_name, "Foo");
-        assert!((types["c"].confidence - 0.75).abs() < f32::EPSILON);
+        // Two hops: 0.85 * 0.95 * 0.95 = 0.767
+        assert!((types["c"].confidence - 0.767).abs() < 0.01);
     }
 
     #[test]
@@ -169,5 +396,70 @@ mod tests {
             "should stop after 1 iteration with no changes"
         );
         assert!(types.is_empty());
+    }
+
+    // ── TypeEnvironment tests ──────────────────────────────────────────
+
+    #[test]
+    fn type_env_rust_annotation_lookup() {
+        let source = "fn main() {\n    let store: GraphStore = GraphStore::new();\n    store.compute_pagerank();\n}\n";
+        let symbols = vec![make_function("main")];
+        let env = TypeEnvironment::build(source, Language::Rust, &symbols);
+        let binding = env.lookup("store", 3);
+        assert!(binding.is_some(), "should find 'store' binding");
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn type_env_self_lookup() {
+        let mut method = make_function("compute_pagerank");
+        method.kind = SymbolKind::Method;
+        method.parent_name = Some("GraphStore".to_string());
+        method.start_line = 5;
+        let env = TypeEnvironment::build("", Language::Rust, &[method]);
+        let binding = env.lookup_self(6);
+        assert!(binding.is_some());
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert_eq!(binding.unwrap().confidence, 1.0);
+    }
+
+    #[test]
+    fn type_env_assignment_propagation() {
+        let source = "let store = GraphStore::new();\nlet alias = store;\n";
+        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        let binding = env.lookup("alias", 2);
+        assert!(binding.is_some(), "alias should get store's type");
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert!(binding.unwrap().confidence < 0.90);
+    }
+
+    #[test]
+    fn seed_return_types_binds_call_result() {
+        let source = "let store = open_store();\nstore.query();\n";
+        let mut sym = make_function("open_store");
+        sym.type_info = Some(nestweaver_schema::TypeInfo {
+            declared_type: None,
+            parameter_types: vec![],
+            return_type: Some("GraphStore".to_string()),
+        });
+        let symbols: HashMap<&str, &RawSymbol> = HashMap::from([("open_store", &sym)]);
+
+        let mut env = TypeEnvironment::build(source, Language::Rust, &[]);
+        env.seed_return_types(source, &symbols);
+
+        let binding = env.lookup("store", 2);
+        assert!(
+            binding.is_some(),
+            "should find 'store' binding via return type"
+        );
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+        assert_eq!(binding.unwrap().source, BindingSource::ReturnType);
+    }
+
+    #[test]
+    fn type_env_binding_count() {
+        let source = "let x: Foo = Foo::new();\nlet y: Bar = Bar::new();\n";
+        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        assert!(env.binding_count() >= 2);
     }
 }

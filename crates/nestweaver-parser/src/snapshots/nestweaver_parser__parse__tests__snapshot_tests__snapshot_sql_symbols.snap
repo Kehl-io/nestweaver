@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: orders
   kind: Class
   start_line: 8
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: active_users
   kind: Class
   start_line: 15
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: calculate_total
   kind: Function
   start_line: 20
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: update_status
   kind: Function
   start_line: 27
@@ -52,3 +56,4 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~

@@ -85,6 +85,7 @@ fn arb_symbol() -> impl Strategy<Value = RawSymbol> {
             entry_point_kind: None,
             visibility,
             type_info: None,
+            parent_name: None,
         })
 }
 
@@ -95,6 +96,7 @@ fn arb_reference() -> impl Strategy<Value = RawReference> {
             kind,
             start_line,
             context: String::new(),
+            receiver: None,
         },
     )
 }

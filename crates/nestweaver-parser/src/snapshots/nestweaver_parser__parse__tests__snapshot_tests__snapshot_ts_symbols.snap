@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Method
   start_line: 4
@@ -25,6 +26,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: Greeter
 - name: farewell
   kind: Method
   start_line: 5
@@ -38,6 +40,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: Greeter
 - name: Logger
   kind: Interface
   start_line: 8
@@ -48,6 +51,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: log
   kind: Method
   start_line: 9
@@ -61,6 +65,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: void
+  parent_name: Logger
 - name: ConsoleGreeter
   kind: Class
   start_line: 12
@@ -71,6 +76,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Method
   start_line: 13
@@ -84,6 +90,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: ConsoleGreeter
 - name: farewell
   kind: Method
   start_line: 17
@@ -97,6 +104,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: ConsoleGreeter
 - name: log
   kind: Method
   start_line: 21
@@ -110,6 +118,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: void
+  parent_name: ConsoleGreeter
 - name: VerboseGreeter
   kind: Class
   start_line: 26
@@ -120,6 +129,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Method
   start_line: 27
@@ -133,6 +143,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: string
+  parent_name: VerboseGreeter
 - name: createGreeter
   kind: Function
   start_line: 33
@@ -146,6 +157,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: Greeter
+  parent_name: ~
 - name: greeter
   kind: Constant
   start_line: 37
@@ -156,3 +168,4 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~

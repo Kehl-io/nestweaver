@@ -1,21 +1,25 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2578
+assertion_line: 4157
 expression: "parsed_references(\"simple.tf\", &source)"
 ---
 - name: data.aws_ami.ubuntu.id
   kind: Call
   start_line: 24
   context: ami           = data.aws_ami.ubuntu.id
+  receiver: ~
 - name: var.instance_type
   kind: Call
   start_line: 25
   context: instance_type = var.instance_type
+  receiver: ~
 - name: terraform-aws-modules/vpc/aws
   kind: Import
   start_line: 45
   context: "source  = \"terraform-aws-modules/vpc/aws\""
+  receiver: ~
 - name: module.vpc.vpc_id
   kind: Call
   start_line: 59
   context: value       = module.vpc.vpc_id
+  receiver: ~

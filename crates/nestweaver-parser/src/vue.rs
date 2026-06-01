@@ -130,6 +130,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Public,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 
@@ -146,6 +147,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Public,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 
@@ -163,6 +165,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Public,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 
@@ -182,6 +185,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     entry_point_kind: None,
                     visibility: Visibility::Private,
                     type_info: None,
+                    parent_name: None,
                 });
             }
 
@@ -194,6 +198,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     kind: ReferenceKind::Import,
                     start_line: line_no,
                     context: trimmed.to_string(),
+                    receiver: None,
                 });
             } else if let Some(cap) = RE_IMPORT_SIDE.captures(trimmed) {
                 references.push(RawReference {
@@ -201,6 +206,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                     kind: ReferenceKind::Import,
                     start_line: line_no,
                     context: trimmed.to_string(),
+                    receiver: None,
                 });
             }
 
@@ -217,6 +223,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                             kind: ReferenceKind::Call,
                             start_line: line_no,
                             context: trimmed.to_string(),
+                            receiver: None,
                         });
                     }
                 }
