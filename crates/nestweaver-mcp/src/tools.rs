@@ -2603,6 +2603,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                 json!({
                     "name": n.name,
                     "depth": n.depth,
+                    "impact_score": n.impact_score,
                 })
             } else {
                 json!({
@@ -2613,6 +2614,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                     "edge_type": n.edge_type,
                     "confidence": n.confidence,
                     "depth": n.depth,
+                    "impact_score": n.impact_score,
                 })
             }
         })
@@ -4017,6 +4019,7 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                 "depth": s.depth,
                 "edge_type": s.edge_type,
                 "confidence": s.confidence,
+                "impact_score": s.impact_score,
             })
         })
         .collect();
