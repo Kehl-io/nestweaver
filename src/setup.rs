@@ -178,7 +178,11 @@ fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
     serde_json::json!(args)
 }
 
-fn setup_claude_code(db_path: &Path, allow_writes: bool, force_overwrite: bool) -> Result<(), anyhow::Error> {
+fn setup_claude_code(
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".claude")?;
     let mcp_path = Path::new(".mcp.json");
     let db_str = db_path.to_string_lossy();
@@ -214,7 +218,11 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool, force_overwrite: bool) 
     Ok(())
 }
 
-fn setup_cursor(db_path: &Path, allow_writes: bool, force_overwrite: bool) -> Result<(), anyhow::Error> {
+fn setup_cursor(
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".cursor")?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
@@ -735,12 +743,14 @@ fn generate_skill_content() -> String {
     let entries = nestweaver_mcp::tools::tool_doc_entries();
     let tool_docs: Vec<nestweaver_engine::ToolDocEntry> = entries
         .into_iter()
-        .map(|(name, category, purpose, key_params)| nestweaver_engine::ToolDocEntry {
-            name,
-            category,
-            purpose,
-            key_params,
-        })
+        .map(
+            |(name, category, purpose, key_params)| nestweaver_engine::ToolDocEntry {
+                name,
+                category,
+                purpose,
+                key_params,
+            },
+        )
         .collect();
 
     // We don't have a GraphStore here (setup runs before indexing), so use

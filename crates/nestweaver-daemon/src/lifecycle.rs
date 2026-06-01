@@ -88,7 +88,11 @@ mod tests {
     fn instance_id_is_8_hex_chars() {
         let path = Path::new("/home/user/.local/share/nestweaver/my-brain/brain.lbug");
         let id = instance_id_from_db_path(path);
-        assert_eq!(id.len(), 8, "instance_id should be exactly 8 hex chars, got '{id}'");
+        assert_eq!(
+            id.len(),
+            8,
+            "instance_id should be exactly 8 hex chars, got '{id}'"
+        );
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
             "instance_id should be hex only, got '{id}'"
@@ -151,18 +155,21 @@ mod tests {
 
     #[test]
     fn runtime_dir_uses_xdg_when_set() {
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000"); }
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        }
         let dir = runtime_dir("abcd1234");
-        assert_eq!(
-            dir,
-            PathBuf::from("/run/user/1000/nestweaver/abcd1234")
-        );
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR"); }
+        assert_eq!(dir, PathBuf::from("/run/user/1000/nestweaver/abcd1234"));
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 
     #[test]
     fn socket_path_is_under_runtime_dir() {
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR"); }
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
         let sock = socket_path("test1234");
         assert!(sock.ends_with("daemon.sock"));
         assert!(sock.starts_with(runtime_dir("test1234")));
