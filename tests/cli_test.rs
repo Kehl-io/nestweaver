@@ -684,3 +684,48 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
     let content = std::fs::read_to_string(&rule_path).unwrap();
     assert_eq!(content, "custom cursor rule content", "cursor rule must not be overwritten");
 }
+
+#[test]
+fn setup_strips_deprecated_args_from_existing_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    let mcp_path = dir.path().join(".mcp.json");
+    std::fs::write(
+        &mcp_path,
+        serde_json::json!({
+            "mcpServers": {
+                "nestweaver": {
+                    "command": "nestweaver",
+                    "args": ["mcp", "--db", "test.lbug", "--allow-mcp-add-sources"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
+        .current_dir(dir.path())
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripped deprecated"),
+        "should report stripping deprecated flag on stderr, got: {stderr}"
+    );
+
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+    let args = config["mcpServers"]["nestweaver"]["args"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !args.iter().any(|a| a.as_str() == Some("--allow-mcp-add-sources")),
+        "deprecated flag should be removed from config, got: {args:?}"
+    );
+}
