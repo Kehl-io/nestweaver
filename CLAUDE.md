@@ -87,7 +87,7 @@ nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tra
 nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
 nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
 
-# MCP server (23 tools, or 6 in lite mode for Cursor)
+# MCP server (38 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
@@ -197,7 +197,7 @@ storage             (zero internal deps)
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nestweaver** (5698 symbols, 12740 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nestweaver** (8036 symbols, 17663 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

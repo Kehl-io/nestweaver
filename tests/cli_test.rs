@@ -606,3 +606,156 @@ fn cli_incremental_index_picks_up_new_symbol() {
         .success()
         .stdout(contains("world"));
 }
+
+#[test]
+fn setup_does_not_overwrite_existing_skill_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/nestweaver");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, "# My custom skill content\n").unwrap();
+
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
+        .current_dir(dir.path())
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("already exists"),
+        "should report skill file already exists, got: {stdout}"
+    );
+
+    let content = std::fs::read_to_string(&skill_path).unwrap();
+    assert_eq!(
+        content, "# My custom skill content\n",
+        "existing skill file must not be overwritten"
+    );
+}
+
+#[test]
+fn setup_force_overwrites_existing_skill_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".claude/skills/nestweaver");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, "# My custom skill content\n").unwrap();
+
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "setup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .current_dir(dir.path())
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let content = std::fs::read_to_string(&skill_path).unwrap();
+    assert_ne!(
+        content, "# My custom skill content\n",
+        "with --force, skill file should be regenerated"
+    );
+}
+
+#[test]
+fn setup_does_not_overwrite_existing_cursor_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let rule_dir = dir.path().join(".cursor/rules");
+    std::fs::create_dir_all(&rule_dir).unwrap();
+    let rule_path = rule_dir.join("nestweaver.mdc");
+    std::fs::write(&rule_path, "custom cursor rule content").unwrap();
+
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
+        .current_dir(dir.path())
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let content = std::fs::read_to_string(&rule_path).unwrap();
+    assert_eq!(
+        content, "custom cursor rule content",
+        "cursor rule must not be overwritten"
+    );
+}
+
+#[test]
+fn setup_strips_deprecated_args_from_existing_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    let mcp_path = dir.path().join(".mcp.json");
+    std::fs::write(
+        &mcp_path,
+        serde_json::json!({
+            "mcpServers": {
+                "nestweaver": {
+                    "command": "nestweaver",
+                    "args": ["mcp", "--db", "test.lbug", "--allow-mcp-add-sources"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
+        .current_dir(dir.path())
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripped deprecated"),
+        "should report stripping deprecated flag on stderr, got: {stderr}"
+    );
+
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+    let args = config["mcpServers"]["nestweaver"]["args"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.as_str() == Some("--allow-mcp-add-sources")),
+        "deprecated flag should be removed from config, got: {args:?}"
+    );
+}
+
+#[test]
+fn daemon_status_accepts_db_after_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "status", "--db", db_path.to_str().unwrap()])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "daemon status should accept --db after subcommand, got: {stderr}"
+    );
+}

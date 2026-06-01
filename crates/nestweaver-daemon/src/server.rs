@@ -855,6 +855,7 @@ pub async fn run_server(
         .with_context(|| format!("canonicalize db path: {}", db_path.display()))?;
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+    let instance_label = lifecycle::instance_label_from_db_path(&db_path);
 
     // Set up daily-rolling log file via tracing-appender. This replaces
     // the manual rotate-at-startup approach and handles rotation while the
@@ -872,11 +873,11 @@ pub async fn run_server(
 
     tracing::info!(
         db = %db_path.display(),
-        instance = %instance_id,
+        instance = %instance_label,
         "daemon process starting"
     );
     eprintln!(
-        "[daemon] starting for {} (instance {instance_id})",
+        "[daemon] starting for {} (instance {instance_label})",
         db_path.display()
     );
 
@@ -989,7 +990,7 @@ pub async fn run_server(
 
     tracing::info!(
         socket = %sock_path.display(),
-        instance = %instance_id,
+        instance = %instance_label,
         "daemon starting"
     );
 
@@ -1033,6 +1034,9 @@ pub async fn run_server(
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
+    // Set process title for easier identification via pgrep.
+    set_process_title(&format!("nestweaver-daemon-{instance_id}"));
+
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve_with_incoming_shutdown(uds_stream, async move {
@@ -1048,4 +1052,66 @@ pub async fn run_server(
     let _ = std::fs::remove_file(&pid_path);
 
     Ok(())
+}
+
+// ── Process title helper ────────────────────────────────────────────────
+
+#[cfg(all(
+    any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ),
+    not(target_os = "macos")
+))]
+unsafe extern "C" {
+    fn setproctitle(fmt: *const libc::c_char, ...);
+}
+
+/// Set the process title for easier identification via pgrep.
+/// Works on Linux (via prctl) and BSD systems (via setproctitle).
+/// On macOS and other unsupported platforms, this is a no-op.
+fn set_process_title(title: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(c_title) = std::ffi::CString::new(title) {
+            unsafe {
+                // PR_SET_NAME is limited to 15 bytes + NUL on Linux
+                let _ = libc::prctl(libc::PR_SET_NAME, c_title.as_ptr() as libc::c_long, 0, 0, 0);
+            }
+        }
+    }
+
+    #[cfg(all(
+        any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ),
+        not(target_os = "macos")
+    ))]
+    {
+        if let Ok(c_title) = std::ffi::CString::new(title) {
+            unsafe {
+                // setproctitle accepts a format string and arguments like printf
+                setproctitle(b"-%s\0".as_ptr() as *const libc::c_char, c_title.as_ptr());
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        let _ = title; // Suppress unused warning on unsupported platforms (macOS, etc.)
+        // Note: macOS doesn't provide setproctitle in the C library, so the daemon
+        // process title cannot be modified on macOS. Users can identify the daemon
+        // via pgrep using the socket path instead.
+    }
 }

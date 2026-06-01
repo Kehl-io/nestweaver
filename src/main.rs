@@ -1039,6 +1039,9 @@ enum Commands {
         /// Deprecated: daemon mode always allows writes. Kept for backward compatibility.
         #[arg(long, hide = true)]
         allow_writes: bool,
+        /// Overwrite existing skill/guide files even if customized
+        #[arg(long)]
+        force: bool,
         /// Path to the NestWeaver database
         #[arg(
             long,
@@ -1250,7 +1253,11 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
         /// Path to the database file
-        #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
+        #[arg(
+            long,
+            global = true,
+            help = "Path to the database file [env: NESTWEAVER_DB]"
+        )]
         db: Option<PathBuf>,
     },
 }
@@ -2751,7 +2758,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let output_str = match format.as_str() {
                 "skill" => generate_skill_with_rules(&store, cfg_ref, rules_ref)?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
-                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref)?,
+                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
             match output {
@@ -3121,10 +3128,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             tool,
             all,
             allow_writes,
+            force,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes)?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -3734,6 +3742,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             track_interactions,
             no_daemon,
         } => {
+            if allow_mcp_add_sources {
+                eprintln!(
+                    "warning: --allow-mcp-add-sources is deprecated and will be removed in a future release; \
+                     remove it from your MCP config"
+                );
+            }
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
