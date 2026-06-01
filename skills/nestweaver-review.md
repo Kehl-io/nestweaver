@@ -6,10 +6,12 @@ description: Review code changes with full codebase context from NestWeaver.
 When reviewing a PR or set of changes:
 
 1. Get the list of changed files from git diff
-2. Call `detect_changes` with the changed file list for an overall risk assessment
-3. For each changed file, call `brain_context` with the file path as seed
-4. Use `blast_radius` on modified public symbols to see risk-scored impact
-5. Call `dead_code` to check if the changes introduce or interact with unreachable code
-6. Check for vault notes that mention modified symbols
-7. Identify cross-repo impacts via `cross_repo_contracts` for any modified public APIs
-8. Report: what each change affects, any missing test coverage, and relevant design decisions from notes
+2. Call `blast_radius` with the changed files — review the `impact_score` on each affected symbol to prioritize review effort
+3. Call `affected_tests` to identify which tests cover the changed code and should be run
+4. Call `detect_changes` with the changed file list for process-level risk assessment
+5. For each high-impact changed file, call `brain_context` with the file path as seed for surrounding context
+6. Call `contract_drift` if the changes touch public API boundaries
+7. Call `dead_code` to check if the changes introduce or interact with unreachable code
+8. Check for vault notes that mention modified symbols via `backlinks`
+9. Identify cross-repo impacts via `cross_repo_contracts` for any modified public APIs
+10. Report: what each change affects (sorted by impact_score), test coverage gaps, API contract risks, and relevant design decisions from notes

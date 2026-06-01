@@ -44,24 +44,51 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
 ## MCP Tools
 
-When configured as an MCP server, NestWeaver exposes:
+When configured as an MCP server, NestWeaver exposes 38 tools across these categories:
 
-- **brain_context** — Task-focused subgraph via Personalized PageRank (supports filters: repos, vaults, kinds, tags, path_prefix; tunable hybrid weights)
+**Context & Search:**
+- **brain_context** — Task-focused subgraph via Personalized PageRank with type-aware resolution
 - **brain_search** — Full-text BM25 search across code and notes
-- **brain_impact** — Blast radius analysis for any symbol (accepts name or UID)
-- **brain_status** — Database and vault status with per-vault staleness
-- **brain_guide** — Auto-generated codebase intelligence guide with repos, features, links, and projects
-- **brain_add_source** — Index new vaults or repos at runtime (always available via daemon)
-- **brain_diff** — Show what changed in the graph since a given SHA
-- **flow_trace** — Forward execution flow from entry points (accepts name or UID)
-- **detect_changes** — Map file changes to affected processes and risk
-- **clusters** — Community detection results (Leiden algorithm)
-- **stale_check** — Check if the index needs refreshing (supports SSH/HTTPS URLs)
-- **cross_repo_contracts** — Cross-repository symbol relationships
 - **project_context** — Project-scoped retrieval across notes, symbols, and components
+- **brain_guide** — Auto-generated codebase intelligence guide
+
+**Analysis:**
+- **brain_impact** — Confidence-weighted blast radius analysis (impact_score decays through edges)
+- **blast_radius** — File-level change impact with affected symbols and clusters
+- **flow_trace** — Forward execution flow from entry points
+- **detect_changes** — Map file changes to affected processes and risk
+- **affected_tests** — Test-impact analysis for regression test selection
+- **dead_code** — Confidence-aware unreachable code detection
+- **contract_drift** — API contract drift detection across repos
+
+**Graph Structure:**
+- **hub_nodes** / **bridge_nodes** — Centrality analysis (PageRank, betweenness)
+- **clusters** — Community detection (Leiden algorithm)
+- **cross_repo_contracts** — Cross-repository symbol relationships
+
+**Investigation:**
+- **investigate** — Deep-dive bundle for focused code exploration
+- **investigate_expand** — Expand investigation context
+- **investigate_hydrate** — Load full source for investigation targets
+
+**Vault & Notes:**
 - **note_get** — Retrieve a note with optional section filtering
 - **backlinks** — Find notes that link to a target note
-- **set_extension** / **query_extensions** — Attach and query custom metadata on any node
+- **brain_tag_graph** / **brain_doc_stats** — Vault structure analysis
+- **brain_broken_links** / **brain_orphan_documents** — Vault health checks
+- **brain_memory_lint** / **brain_memory_consolidate** / **brain_memory_related** — Memory bank tools
+
+**Code Reading:**
+- **read_symbols** — Read symbol source code by name or UID
+- **regex_search** — Regex search across indexed code
+- **count_patterns** — Count pattern occurrences
+
+**Admin:**
+- **brain_status** — Database and vault status
+- **brain_add_source** — Index new vaults or repos at runtime
+- **brain_diff** — Show graph changes since a given SHA
+- **stale_check** — Check if the index needs refreshing
+- **set_extension** / **query_extensions** — Custom metadata on any node
 
 ## Environment Variables
 
