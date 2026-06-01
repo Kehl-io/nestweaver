@@ -234,9 +234,7 @@ pub fn run_stdio_server_daemon(
 ) -> Result<(), anyhow::Error> {
     tools::set_lite_mode(lite);
 
-    tracing::info!(
-        "brain MCP server ready on stdio (daemon proxy mode)"
-    );
+    tracing::info!("brain MCP server ready on stdio (daemon proxy mode)");
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -292,9 +290,7 @@ pub fn run_stdio_server_daemon(
                     }
                 };
                 let is_notification = req.id.is_none();
-                let outcome = dispatch_method_daemon(
-                    &mut grpc_client, &rt, &req,
-                );
+                let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req);
                 if is_notification {
                     if let Frame::Error(e) = outcome {
                         tracing::warn!(
@@ -331,9 +327,7 @@ pub fn run_stdio_server_daemon(
                 }
             };
             let is_notification = req.id.is_none();
-            let outcome = dispatch_method_daemon(
-                &mut grpc_client, &rt, &req,
-            );
+            let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req);
             if is_notification {
                 if let Frame::Error(e) = outcome {
                     tracing::warn!(
@@ -372,9 +366,7 @@ fn dispatch_method_daemon(
             }),
         )),
 
-        "notifications/initialized" | "initialized" => {
-            Frame::Success(success(id, Value::Null))
-        }
+        "notifications/initialized" | "initialized" => Frame::Success(success(id, Value::Null)),
 
         "tools/list" => {
             let lite = tools::is_lite_mode();
@@ -401,12 +393,8 @@ fn dispatch_method_daemon(
             };
 
             match tools::dispatch_via_daemon(client, rt, &name, arguments) {
-                Ok(result) => {
-                    Frame::Success(success(id, tools::wrap_tool_result(result)))
-                }
-                Err(e) => {
-                    Frame::Success(success(id, tools::wrap_tool_error(&e.to_string())))
-                }
+                Ok(result) => Frame::Success(success(id, tools::wrap_tool_result(result))),
+                Err(e) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
             }
         }
 

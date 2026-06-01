@@ -227,7 +227,16 @@ pub fn index_directory_with_options(
 ) -> Result<IndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    index_directory_with_store(&store, repo_path, db_path, instance_id, repo_url, indexed_sha, force, name)
+    index_directory_with_store(
+        &store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+    )
 }
 
 /// Index a directory using an existing GraphStore (for daemon mode where the

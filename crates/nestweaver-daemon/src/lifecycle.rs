@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 /// readability in log paths and status output.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
     // Try to canonicalize for a stable hash; fall back to the raw path.
-    let canonical = std::fs::canonicalize(db_path)
-        .unwrap_or_else(|_| db_path.to_path_buf());
+    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
 
     // Human-readable prefix from the parent dir name (e.g., "kory-brain").
     let prefix = canonical
@@ -86,15 +85,24 @@ mod tests {
     fn instance_id_contains_parent_dir_name() {
         let path = Path::new("/home/user/.local/share/nestweaver/kory-brain/brain.lbug");
         let id = instance_id_from_db_path(path);
-        assert!(id.starts_with("kory-brain-"), "expected 'kory-brain-<hash>', got '{id}'");
-        assert!(id.len() <= 30, "instance_id should be short for socket paths");
+        assert!(
+            id.starts_with("kory-brain-"),
+            "expected 'kory-brain-<hash>', got '{id}'"
+        );
+        assert!(
+            id.len() <= 30,
+            "instance_id should be short for socket paths"
+        );
     }
 
     #[test]
     fn instance_id_different_for_different_paths() {
         let id_a = instance_id_from_db_path(Path::new("/a/foo/brain.lbug"));
         let id_b = instance_id_from_db_path(Path::new("/b/foo/brain.lbug"));
-        assert_ne!(id_a, id_b, "different paths with same dir name must produce different IDs");
+        assert_ne!(
+            id_a, id_b,
+            "different paths with same dir name must produce different IDs"
+        );
     }
 
     #[test]

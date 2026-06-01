@@ -6,7 +6,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
 /// Ensure a daemon is running for the given DB and return the socket path.
@@ -153,10 +153,12 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
         sock.display(),
         timeout.as_secs_f64(),
         nestweaver_daemon::lifecycle::log_path(
-            &sock.parent()
+            &sock
+                .parent()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
                 .unwrap_or_else(|| "default".to_string())
-        ).display()
+        )
+        .display()
     );
 }

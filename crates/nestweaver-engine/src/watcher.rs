@@ -300,7 +300,10 @@ impl BrainWatcher {
             let mut title_reverse: HashMap<String, String> = HashMap::new();
             for n in store.list_notes(None).unwrap_or_default() {
                 let key = n.title.to_lowercase();
-                title_forward.entry(key.clone()).or_default().push(n.uid.clone());
+                title_forward
+                    .entry(key.clone())
+                    .or_default()
+                    .push(n.uid.clone());
                 title_reverse.insert(n.uid.clone(), key);
             }
 
@@ -493,8 +496,16 @@ impl BrainWatcher {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed = parse_markdown(&rel_path, &source)?;
 
-        let (headings, sections, wikilinks_count, tags_count) =
-            reinsert_note(store, v_uid, &n_uid, &path, &rel_path, &parsed, event.kind, title_forward)?;
+        let (headings, sections, wikilinks_count, tags_count) = reinsert_note(
+            store,
+            v_uid,
+            &n_uid,
+            &path,
+            &rel_path,
+            &parsed,
+            event.kind,
+            title_forward,
+        )?;
 
         // Update bidirectional title lookup: O(1) removal via reverse map.
         if let Some(old_title) = title_reverse.remove(&n_uid) {

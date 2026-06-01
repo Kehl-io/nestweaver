@@ -4818,9 +4818,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .map(PathBuf::from)
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No database path provided. Use --db or set NESTWEAVER_DB."
-                    )
+                    anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
                 })?;
             let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
             let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
@@ -4845,8 +4843,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = std::fs::remove_file(&pidfile);
                     }
 
-                    std::fs::create_dir_all(&runtime_dir)
-                        .with_context(|| format!("create runtime dir: {}", runtime_dir.display()))?;
+                    std::fs::create_dir_all(&runtime_dir).with_context(|| {
+                        format!("create runtime dir: {}", runtime_dir.display())
+                    })?;
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
 
@@ -4859,7 +4858,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .create(true)
                         .append(true)
                         .open(&log_file)
-                        .with_context(|| format!("open log file for stderr: {}", log_file.display()))?;
+                        .with_context(|| {
+                            format!("open log file for stderr: {}", log_file.display())
+                        })?;
 
                     eprintln!(
                         "Starting daemon for {} (instance {instance_id})...",
@@ -4886,8 +4887,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let rt = tokio::runtime::Runtime::new()
                                 .expect("failed to create tokio runtime");
                             rt.block_on(async {
-                                if let Err(e) =
-                                    nestweaver_daemon::run_server(&db_path, idle).await
+                                if let Err(e) = nestweaver_daemon::run_server(&db_path, idle).await
                                 {
                                     eprintln!("Daemon error: {e:#}");
                                     std::process::exit(1);
@@ -4910,7 +4910,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .with_context(|| "parse PID from pidfile")?;
 
                     eprintln!("Stopping daemon (PID {pid})...");
-                    unsafe { libc::kill(pid, libc::SIGTERM); }
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
 
                     // Poll for up to 5 seconds.
                     for _ in 0..50 {
@@ -4925,7 +4927,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     // Force kill.
                     eprintln!("Daemon did not exit; sending SIGKILL...");
-                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     let _ = std::fs::remove_file(&pidfile);
                     let _ = std::fs::remove_file(&socket);
@@ -4957,7 +4961,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let alive = unsafe { libc::kill(pid, 0) } == 0;
                             if alive {
                                 eprintln!("Stopping daemon (PID {pid})...");
-                                unsafe { libc::kill(pid, libc::SIGTERM); }
+                                unsafe {
+                                    libc::kill(pid, libc::SIGTERM);
+                                }
                                 for _ in 0..50 {
                                     std::thread::sleep(std::time::Duration::from_millis(100));
                                     if unsafe { libc::kill(pid, 0) } != 0 {
@@ -4965,7 +4971,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     }
                                 }
                                 if unsafe { libc::kill(pid, 0) } == 0 {
-                                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                                    unsafe {
+                                        libc::kill(pid, libc::SIGKILL);
+                                    }
                                     std::thread::sleep(std::time::Duration::from_millis(200));
                                 }
                                 let _ = std::fs::remove_file(&pidfile);
@@ -4976,8 +4984,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
 
                     // Re-exec ourselves to start the daemon fresh.
-                    let exe = std::env::current_exe()
-                        .unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let exe =
+                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
                     let status = std::process::Command::new(&exe)
                         .args([
                             "daemon",
