@@ -805,6 +805,27 @@ fn index_into_store(
         Default::default()
     };
 
+    // Build type environments per file for type-aware resolution.
+    let _type_envs: std::collections::HashMap<String, nestweaver_resolver::types::TypeEnvironment> = {
+        let mut envs = std::collections::HashMap::new();
+        for (file_path, symbols, _references) in &parsed_files_for_resolver {
+            let full_path = repo_path.join(file_path);
+            if let Ok(source) = std::fs::read_to_string(&full_path) {
+                let env =
+                    nestweaver_resolver::types::TypeEnvironment::build(&source, language, symbols);
+                if env.binding_count() > 0 {
+                    envs.insert(file_path.clone(), env);
+                }
+            }
+        }
+        tracing::info!(
+            files_with_bindings = envs.len(),
+            total_bindings = envs.values().map(|e| e.binding_count()).sum::<usize>(),
+            "type environments built"
+        );
+        envs
+    };
+
     let resolved_edges = resolve_references_with_context(
         &parsed_files_for_resolver,
         language,
