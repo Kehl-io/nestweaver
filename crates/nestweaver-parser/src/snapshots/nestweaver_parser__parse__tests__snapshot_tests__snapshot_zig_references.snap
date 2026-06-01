@@ -1,32 +1,40 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4073
 expression: "parsed_references(\"simple.zig\", &source)"
 ---
 - name: import
   kind: Call
   start_line: 1
   context: "const std = @import(\"std\");"
+  receiver: ~
 - name: std
   kind: Import
   start_line: 1
   context: "const std = @import(\"std\");"
+  receiver: ~
 - name: import
   kind: Call
   start_line: 2
   context: "const math = @import(\"math.zig\");"
+  receiver: ~
 - name: math.zig
   kind: Import
   start_line: 2
   context: "const math = @import(\"math.zig\");"
+  receiver: ~
 - name: print
   kind: Call
   start_line: 22
   context: "std.debug.print(\"Initializing sensor: {s}\\n\", .{config.name});"
+  receiver: ~
 - name: calibrate
   kind: Call
   start_line: 23
   context: calibrate(config);
+  receiver: ~
 - name: initialize
   kind: Call
   start_line: 36
   context: initialize(config);
+  receiver: ~

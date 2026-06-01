@@ -192,6 +192,7 @@ mod tests {
             kind: ReferenceKind::Import,
             start_line: 1,
             context: String::new(),
+            receiver: None,
         }
     }
 

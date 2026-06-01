@@ -368,6 +368,7 @@ mod tests {
             kind,
             start_line: line,
             context: String::new(),
+            receiver: None,
         }
     }
 

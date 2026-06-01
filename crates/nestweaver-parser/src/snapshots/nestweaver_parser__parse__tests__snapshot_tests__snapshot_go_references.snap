@@ -1,108 +1,135 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 3863
 expression: "parsed_references(\"simple.go\", &source)"
 ---
 - name: fmt
   kind: Import
   start_line: 4
   context: (
+  receiver: ~
 - name: strings
   kind: Import
   start_line: 5
   context: (
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 9
   context: (name string)
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 10
   context: (name string)
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 14
   context: "{"
+  receiver: ~
 - name: ConsoleGreeter
   kind: TypeRef
   start_line: 17
   context: g *ConsoleGreeter
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 17
   context: (name string)
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 17
   context: package main
+  receiver: ~
 - name: Prefix
   kind: ReadAccess
   start_line: 18
   context: "(\"%s Hello, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: Sprintf
   kind: Call
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: Sprintf
   kind: ReadAccess
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: ConsoleGreeter
   kind: TypeRef
   start_line: 21
   context: g *ConsoleGreeter
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 21
   context: (name string)
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 21
   context: package main
+  receiver: ~
 - name: Prefix
   kind: ReadAccess
   start_line: 22
   context: "(\"%s Goodbye, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: Sprintf
   kind: Call
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: Sprintf
   kind: ReadAccess
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
+  receiver: ~
 - name: Greeter
   kind: TypeRef
   start_line: 25
   context: package main
+  receiver: ~
 - name: string
   kind: TypeRef
   start_line: 25
   context: (prefix string)
+  receiver: ~
 - name: TrimSpace
   kind: Call
   start_line: 26
   context: strings.TrimSpace(prefix)
+  receiver: ~
 - name: TrimSpace
   kind: ReadAccess
   start_line: 26
   context: strings.TrimSpace(prefix)
+  receiver: ~
 - name: NewGreeter
   kind: Call
   start_line: 30
   context: "NewGreeter(\">>>\")"
+  receiver: ~
 - name: Greet
   kind: Call
   start_line: 31
   context: "greeter.Greet(\"world\")"
+  receiver: ~
 - name: Greet
   kind: ReadAccess
   start_line: 31
   context: "greeter.Greet(\"world\")"
+  receiver: ~
 - name: Println
   kind: Call
   start_line: 32
   context: fmt.Println(result)
+  receiver: ~
 - name: Println
   kind: ReadAccess
   start_line: 32
   context: fmt.Println(result)
+  receiver: ~

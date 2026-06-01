@@ -1,88 +1,110 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 3933
 expression: "parsed_references(\"Simple.java\", &source)"
 ---
 - name: java.util.List
   kind: Import
   start_line: 1
   context: import java.util.List;
+  receiver: ~
 - name: java.util.ArrayList
   kind: Import
   start_line: 2
   context: import java.util.List;
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 5
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 5
   context: (String name)
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 6
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 6
   context: (String name)
+  receiver: ~
 - name: Greeter
   kind: Implements
   start_line: 9
   context: "public class SimpleGreeter implements Greeter {"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 10
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 12
   context: (String prefix)
+  receiver: ~
 - name: prefix
   kind: ReadAccess
   start_line: 13
   context: this.prefix = prefix
+  receiver: ~
 - name: Override
   kind: Call
   start_line: 16
   context: "@Override"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 16
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 17
   context: (String name)
+  receiver: ~
 - name: Override
   kind: Call
   start_line: 21
   context: "@Override"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 21
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 22
   context: (String name)
+  receiver: ~
 - name: SimpleGreeter
   kind: TypeRef
   start_line: 27
   context: "{"
+  receiver: ~
 - name: String
   kind: TypeRef
   start_line: 28
   context: "{"
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 28
   context: "result = greeter.greet(\"world\")"
+  receiver: ~
 - name: out
   kind: ReadAccess
   start_line: 29
   context: System.out.println(result)
+  receiver: ~
 - name: println
   kind: Call
   start_line: 29
   context: System.out.println(result);
+  receiver: ~

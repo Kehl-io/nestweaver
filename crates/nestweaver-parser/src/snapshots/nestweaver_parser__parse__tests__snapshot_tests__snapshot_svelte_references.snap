@@ -1,32 +1,40 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4213
 expression: "parsed_references(\"simple.svelte\", &source)"
 ---
 - name: svelte
   kind: Import
   start_line: 2
   context: "import { onMount } from 'svelte'"
+  receiver: ~
 - name: "./Counter.svelte"
   kind: Import
   start_line: 3
   context: "import Counter from './Counter.svelte'"
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 5
   context: "export function greet(name) {"
+  receiver: ~
 - name: handleClick
   kind: Call
   start_line: 11
   context: "function handleClick() {"
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 13
   context: "greet('World')"
+  receiver: ~
 - name: onMount
   kind: Call
   start_line: 16
   context: "onMount(() => {"
+  receiver: ~
 - name: log
   kind: Call
   start_line: 17
   context: "console.log('Component mounted')"
+  receiver: ~

@@ -170,6 +170,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Call,
                 start_line: line_no,
                 context: line.trim().to_string(),
+                receiver: None,
             });
         }
 
@@ -179,6 +180,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Call,
                 start_line: line_no,
                 context: line.trim().to_string(),
+                receiver: None,
             });
         }
 
@@ -188,6 +190,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Includes,
                 start_line: line_no,
                 context: line.trim().to_string(),
+                receiver: None,
             });
         }
     }
