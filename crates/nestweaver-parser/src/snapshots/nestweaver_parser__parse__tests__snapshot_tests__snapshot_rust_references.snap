@@ -1,112 +1,140 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 3849
 expression: "parsed_references(\"simple.rs\", &source)"
 ---
 - name: "std::collections::HashMap"
   kind: Import
   start_line: 1
   context: "use std::collections::HashMap;"
+  receiver: ~
 - name: "crate::config::Settings"
   kind: Import
   start_line: 2
   context: "use std::collections::HashMap;"
+  receiver: ~
 - name: HashMap
   kind: TypeRef
   start_line: 5
   context: "sensors: HashMap<String, Sensor>"
+  receiver: ~
 - name: Readable
   kind: Extends
   start_line: 18
   context: "use std::collections::HashMap;"
+  receiver: ~
 - name: get_primary
   kind: Call
   start_line: 20
   context: self.get_primary().value
+  receiver: self
 - name: get_primary
   kind: ReadAccess
   start_line: 20
   context: self.get_primary()
+  receiver: ~
 - name: value
   kind: Call
   start_line: 20
   context: "{"
+  receiver: self.get_primary()
 - name: value
   kind: ReadAccess
   start_line: 20
   context: self.get_primary().value()
+  receiver: ~
 - name: for_each
   kind: Call
   start_line: 24
   context: self.sensors.values_mut().for_each(|s| s.reset());
+  receiver: self.sensors.values_mut()
 - name: for_each
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut().for_each(|s| s.reset())
+  receiver: ~
 - name: reset
   kind: Call
   start_line: 24
   context: "|s| s.reset()"
+  receiver: s
 - name: reset
   kind: ReadAccess
   start_line: 24
   context: s.reset()
+  receiver: ~
 - name: sensors
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut
+  receiver: ~
 - name: values_mut
   kind: Call
   start_line: 24
   context: self.sensors.values_mut().for_each
+  receiver: self.sensors
 - name: values_mut
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut()
+  receiver: ~
 - name: Self
   kind: TypeRef
   start_line: 29
   context: "{"
+  receiver: ~
 - name: new
   kind: Call
   start_line: 31
   context: "sensors: HashMap::new()"
+  receiver: ~
 - name: Sensor
   kind: TypeRef
   start_line: 35
   context: "fn get_primary(&self) -> &Sensor {"
+  receiver: ~
 - name: get
   kind: Call
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap"
+  receiver: self.sensors
 - name: get
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\")"
+  receiver: ~
 - name: sensors
   kind: ReadAccess
   start_line: 36
   context: self.sensors.get
+  receiver: ~
 - name: unwrap
   kind: Call
   start_line: 36
   context: "{"
+  receiver: "self.sensors.get(\"primary\")"
 - name: unwrap
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap()"
+  receiver: ~
 - name: SensorManager
   kind: TypeRef
   start_line: 40
   context: "use std::collections::HashMap;"
+  receiver: ~
 - name: Settings
   kind: TypeRef
   start_line: 40
   context: "config: &Settings"
+  receiver: ~
 - name: new
   kind: Call
   start_line: 41
   context: "let mgr = SensorManager::new();"
+  receiver: ~
 - name: println
   kind: Call
   start_line: 42
   context: "println!(\"Initialized with {:?}\", config);"
+  receiver: ~

@@ -145,6 +145,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                     kind: ReferenceKind::Extends,
                     start_line: line_no,
                     context: trimmed.to_string(),
+                    receiver: None,
                 });
             }
             continue;
@@ -220,6 +221,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                         kind: ReferenceKind::Import,
                         start_line: line_no,
                         context: trimmed.to_string(),
+                        receiver: None,
                     });
                 }
             }
@@ -232,6 +234,7 @@ pub fn parse_pascal(path: &Path, source: &str) -> ParsedFile {
                 kind: ReferenceKind::Call,
                 start_line: line_no,
                 context: trimmed.to_string(),
+                receiver: None,
             });
         }
     }

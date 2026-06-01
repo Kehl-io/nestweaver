@@ -75,6 +75,9 @@ pub struct RawReference {
     pub kind: ReferenceKind,
     pub start_line: u32,
     pub context: String,
+    /// The receiver of a method call: `"store"` in `store.method()`,
+    /// `"self"` in `self.method()`, `None` for free function calls.
+    pub receiver: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,11 +711,33 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     continue;
                 }
 
+                // Extract receiver for method calls: in `obj.method()`,
+                // the captured `@reference.call` node is the call_expression.
+                // Its `function` child may be a field_expression (Rust) or
+                // member_expression (JS/TS/Java) containing the receiver as
+                // `value` (Rust) or `object` (JS/TS/Java/Go/etc.).
+                let receiver = if kind == ReferenceKind::Call {
+                    node.child_by_field_name("function")
+                        .filter(|f| {
+                            let k = f.kind();
+                            k.contains("field") || k.contains("member")
+                        })
+                        .and_then(|f| {
+                            f.child_by_field_name("object")
+                                .or_else(|| f.child_by_field_name("value"))
+                        })
+                        .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
                 references.push(RawReference {
                     name,
                     kind,
                     start_line,
                     context,
+                    receiver,
                 });
             }
             // Skip "name" captures — used via find_name_capture above
@@ -4215,5 +4240,95 @@ mod tests {
             let source = fixture("systemverilog/simple.sv");
             assert_yaml_snapshot!(parsed_references("simple.sv", &source));
         }
+    }
+
+    // ── Receiver extraction tests ───────────────────────────────────────────
+
+    #[test]
+    fn extracts_receiver_from_method_call() {
+        let source = r#"
+fn main() {
+    let store = Store::new();
+    store.get_item("key");
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "get_item")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'get_item'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("store"),
+            "receiver should be 'store'"
+        );
+    }
+
+    #[test]
+    fn extracts_self_receiver() {
+        let source = r#"
+struct Foo;
+impl Foo {
+    fn bar(&self) {
+        self.baz();
+    }
+    fn baz(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "baz")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'baz'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("self"),
+            "receiver should be 'self'"
+        );
+    }
+
+    #[test]
+    fn free_function_has_no_receiver() {
+        let source = r#"
+fn helper() {}
+fn main() {
+    helper();
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'helper'");
+        assert_eq!(
+            call_refs[0].receiver, None,
+            "free function should have no receiver"
+        );
+    }
+
+    #[test]
+    fn js_method_call_receiver() {
+        let source = r#"
+const arr = [1, 2, 3];
+arr.map(x => x + 1);
+"#;
+        let parsed = parse_source(Path::new("t.js"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "map")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'map'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("arr"),
+            "receiver should be 'arr'"
+        );
     }
 }
