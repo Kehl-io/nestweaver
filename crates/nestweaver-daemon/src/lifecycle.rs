@@ -4,41 +4,45 @@ use std::path::{Path, PathBuf};
 
 /// Derive a stable, short instance ID from a database path.
 ///
-/// Uses an 8-character hex hash of the canonical path to avoid:
-/// - Collisions when two DBs share the same parent directory name
-/// - macOS 104-byte `sun_path` limit for Unix domain sockets
+/// Returns ONLY the 8-character hex hash of the canonical path.
+/// This keeps socket paths well under the macOS 104-byte `sun_path` limit.
 ///
-/// Falls back to the parent directory name if available, for human
-/// readability in log paths and status output.
+/// For a human-readable label (parent-dir + hash), use
+/// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    // Try to canonicalize for a stable hash; fall back to the raw path.
     let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
+}
 
-    // Human-readable prefix from the parent dir name (e.g., "my-brain").
+/// Human-readable label for logging: `<parent-dir>-<hash>`.
+///
+/// Never use this in path construction — use [`instance_id_from_db_path`]
+/// (the bare 8-char hash) to keep socket paths short.
+pub fn instance_label_from_db_path(db_path: &Path) -> String {
+    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
     let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "nw".to_string());
-
-    // 8-char hex hash of the full canonical path for uniqueness.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    let hash = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
-
-    format!("{}-{}", prefix, hash)
+    let hash = instance_id_from_db_path(db_path);
+    format!("{prefix}-{hash}")
 }
 
 /// Runtime directory for the daemon socket and pidfile.
 ///
-/// Prefers `$XDG_RUNTIME_DIR/nestweaver-<instance>/`, falling back to
-/// `$TMPDIR/nestweaver-<uid>/nestweaver-<instance>/` or
-/// `/tmp/nestweaver-<uid>/nestweaver-<instance>/`.
+/// Prefers `$XDG_RUNTIME_DIR/nestweaver/<instance>/`, falling back to
+/// `$TMPDIR/nw-<uid>/<instance>/` or `/tmp/nw-<uid>/<instance>/`.
+///
+/// The short `nw-` prefix (vs the old `nestweaver-`) is intentional:
+/// macOS limits `sun_path` to 104 bytes and `$TMPDIR` can be ~51 chars.
 pub fn runtime_dir(instance_id: &str) -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg).join(format!("nestweaver-{instance_id}"));
+        return PathBuf::from(xdg).join("nestweaver").join(instance_id);
     }
 
     let uid = unsafe { libc::getuid() };
@@ -46,8 +50,7 @@ pub fn runtime_dir(instance_id: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-    base.join(format!("nestweaver-{uid}"))
-        .join(format!("nestweaver-{instance_id}"))
+    base.join(format!("nw-{uid}")).join(instance_id)
 }
 
 /// Path to the Unix domain socket for the given instance.
@@ -82,16 +85,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_id_contains_parent_dir_name() {
+    fn instance_id_is_8_hex_chars() {
         let path = Path::new("/home/user/.local/share/nestweaver/my-brain/brain.lbug");
         let id = instance_id_from_db_path(path);
+        assert_eq!(id.len(), 8, "instance_id should be exactly 8 hex chars, got '{id}'");
         assert!(
-            id.starts_with("my-brain-"),
-            "expected 'my-brain-<hash>', got '{id}'"
-        );
-        assert!(
-            id.len() <= 30,
-            "instance_id should be short for socket paths"
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "instance_id should be hex only, got '{id}'"
         );
     }
 
@@ -106,22 +106,71 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_fallback() {
+    fn instance_id_stable_for_same_path() {
+        let path = Path::new("/some/stable/path/brain.lbug");
+        let id1 = instance_id_from_db_path(path);
+        let id2 = instance_id_from_db_path(path);
+        assert_eq!(id1, id2, "same path must produce same ID");
+    }
+
+    #[test]
+    fn instance_id_fallback_for_bare_filename() {
         let path = Path::new("brain.lbug");
         let id = instance_id_from_db_path(path);
-        assert!(!id.is_empty());
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn instance_label_includes_parent_dir() {
+        let path = Path::new("/home/user/.local/share/nestweaver/my-brain/brain.lbug");
+        let label = instance_label_from_db_path(path);
+        assert!(
+            label.starts_with("my-brain-"),
+            "label should include parent dir name, got '{label}'"
+        );
+        assert!(label.len() <= 30, "label should be short, got '{label}'");
+    }
+
+    #[test]
+    fn socket_path_under_sun_len_with_long_tmpdir() {
+        let long_tmpdir = "/var/folders/0h/z2kcwz1j0mld0cbrkt15n7w80000gq/T";
+        unsafe {
+            std::env::set_var("TMPDIR", long_tmpdir);
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let id = "a1b2c3d4"; // 8-char hash
+        let sock = socket_path(id);
+        let path_len = sock.as_os_str().len();
+        assert!(
+            path_len < 104,
+            "socket path must be < 104 bytes for macOS, got {path_len}: {}",
+            sock.display()
+        );
+    }
+
+    #[test]
+    fn runtime_dir_uses_xdg_when_set() {
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000"); }
+        let dir = runtime_dir("abcd1234");
+        assert_eq!(
+            dir,
+            PathBuf::from("/run/user/1000/nestweaver/abcd1234")
+        );
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR"); }
     }
 
     #[test]
     fn socket_path_is_under_runtime_dir() {
-        let sock = socket_path("test");
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR"); }
+        let sock = socket_path("test1234");
         assert!(sock.ends_with("daemon.sock"));
-        assert!(sock.starts_with(runtime_dir("test")));
+        assert!(sock.starts_with(runtime_dir("test1234")));
     }
 
     #[test]
     fn log_path_ends_with_daemon_log() {
-        let lp = log_path("test");
+        let lp = log_path("test1234");
         assert!(lp.ends_with("daemon.log"));
     }
 }
