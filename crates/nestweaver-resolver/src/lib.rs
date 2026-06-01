@@ -4,6 +4,7 @@ pub mod cross_repo;
 pub mod imports;
 pub mod lang;
 pub mod resolve;
+pub mod type_extractors;
 pub mod types;
 pub mod util;
 pub mod workspace;
