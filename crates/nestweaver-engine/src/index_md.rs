@@ -86,7 +86,14 @@ pub fn index_markdown_directory_with_ignore(
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    index_markdown_directory_with_store(&store, vault_root, db_path, instance_id, vault_name, extra_ignore_patterns)
+    index_markdown_directory_with_store(
+        &store,
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+    )
 }
 
 /// Index a markdown vault using an existing GraphStore (for daemon mode).

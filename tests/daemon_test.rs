@@ -35,12 +35,7 @@ fn no_daemon_cmd() -> Command {
 ///   `nestweaver daemon --db <path> <action> [extra_args...]`
 fn daemon_action_cmd(db_path: &Path, action: &str) -> Command {
     let mut cmd = daemon_cmd();
-    cmd.args([
-        "daemon",
-        "--db",
-        &db_path.display().to_string(),
-        action,
-    ]);
+    cmd.args(["daemon", "--db", &db_path.display().to_string(), action]);
     cmd
 }
 
@@ -52,11 +47,7 @@ fn write_test_repo(dir: &Path) {
         .current_dir(dir)
         .output()
         .unwrap();
-    std::fs::write(
-        dir.join("main.js"),
-        "function greet(name) { return name; }",
-    )
-    .unwrap();
+    std::fs::write(dir.join("main.js"), "function greet(name) { return name; }").unwrap();
     StdCommand::new("git")
         .args(["add", "."])
         .current_dir(dir)
@@ -320,7 +311,10 @@ fn daemon_crash_recovery() {
     let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
     let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
     let pid_str = std::fs::read_to_string(&pidfile).expect("pidfile should exist");
-    let pid: i32 = pid_str.trim().parse().expect("pidfile should contain a PID");
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
+        .expect("pidfile should contain a PID");
 
     unsafe {
         libc::kill(pid, libc::SIGKILL);
@@ -365,12 +359,10 @@ fn daemon_concurrent_mcp() {
     let db1 = db_path.clone();
     let db2 = db_path.clone();
 
-    let handle1 = std::thread::spawn(move || {
-        mcp_tool_call(&db1, "brain_status", serde_json::json!({}))
-    });
-    let handle2 = std::thread::spawn(move || {
-        mcp_tool_call(&db2, "brain_status", serde_json::json!({}))
-    });
+    let handle1 =
+        std::thread::spawn(move || mcp_tool_call(&db1, "brain_status", serde_json::json!({})));
+    let handle2 =
+        std::thread::spawn(move || mcp_tool_call(&db2, "brain_status", serde_json::json!({})));
 
     let result1 = handle1.join().expect("thread 1 should not panic");
     let result2 = handle2.join().expect("thread 2 should not panic");
@@ -423,9 +415,7 @@ fn daemon_mcp_brain_add_source() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|v| v.get("id") == Some(&serde_json::json!(2)))
-        .unwrap_or_else(|| {
-            panic!("brain_add_source should return a response; got: {add_output}")
-        });
+        .unwrap_or_else(|| panic!("brain_add_source should return a response; got: {add_output}"));
 
     // Should not be an error.
     assert!(

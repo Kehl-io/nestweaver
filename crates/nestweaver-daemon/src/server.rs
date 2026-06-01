@@ -5,8 +5,8 @@
 //! business logic.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -61,16 +61,19 @@ impl DaemonService {
         let args_json = args_json.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
-            let args: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
-                Status::invalid_argument(format!("invalid JSON in args_json: {e}"))
-            })?;
+            let args: serde_json::Value = serde_json::from_str(&args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
 
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
 
-            let value =
-                nestweaver_mcp::tools::dispatch(&state.store, state.tantivy.as_ref(), &tool_name, args)
-                    .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            let value = nestweaver_mcp::tools::dispatch(
+                &state.store,
+                state.tantivy.as_ref(),
+                &tool_name,
+                args,
+            )
+            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
 
             serde_json::to_string(&value)
                 .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))
@@ -248,7 +251,9 @@ impl NestWeaverDaemon for DaemonService {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type IndexVaultStream = ProgressStream;
@@ -303,8 +308,13 @@ impl NestWeaverDaemon for DaemonService {
                     if let Some(ref tantivy) = state.tantivy {
                         if tantivy.has_writer() {
                             match tantivy.reindex_from_store(&state.store) {
-                                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault indexing"),
-                                Err(e) => tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing"),
+                                Ok(n) => tracing::info!(
+                                    docs = n,
+                                    "Tantivy reindexed after vault indexing"
+                                ),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Tantivy reindex failed after vault indexing")
+                                }
                             }
                         }
                     }
@@ -336,7 +346,9 @@ impl NestWeaverDaemon for DaemonService {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type RefreshBrainStream = ProgressStream;
@@ -345,9 +357,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<RefreshBrainRequest>,
     ) -> Result<Response<Self::RefreshBrainStream>, Status> {
-        Err(Status::unimplemented(
-            "RefreshBrain is not yet implemented",
-        ))
+        Err(Status::unimplemented("RefreshBrain is not yet implemented"))
     }
 
     // ── Read RPCs — typed hot-path ─────────────────────────────────
@@ -376,25 +386,64 @@ impl NestWeaverDaemon for DaemonService {
         let value = self.dispatch_tool_json("brain_search", args).await?;
 
         // Parse JSON result into typed response.
-        let query_echo = value.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let engine = value.get("engine").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let total_matches = value.get("total_matches").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let query_echo = value
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let engine = value
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let total_matches = value
+            .get("total_matches")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
 
-        let results = value.get("results")
+        let results = value
+            .get("results")
             .and_then(|v| v.as_array())
             .map(|arr| {
-                arr.iter().map(|item| SearchResultItem {
-                    uid: item.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    kind: item.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    score: item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    location: item.get("location").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    matched_headings: item.get("matched_headings")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-                        .unwrap_or_default(),
-                    inline_body: item.get("inline_body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                }).collect()
+                arr.iter()
+                    .map(|item| SearchResultItem {
+                        uid: item
+                            .get("uid")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        kind: item
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        title: item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        score: item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        location: item
+                            .get("location")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        matched_headings: item
+                            .get("matched_headings")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|s| s.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        inline_body: item
+                            .get("inline_body")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -510,13 +559,39 @@ impl NestWeaverDaemon for DaemonService {
         let value = self.dispatch_tool_json("note_get", args).await?;
 
         Ok(Response::new(NoteGetResponse {
-            uid: value.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            title: value.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            path: value.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            note_kind: value.get("note_kind").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            word_count: value.get("word_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-            body: value.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            section_count: value.get("section_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            uid: value
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            title: value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            path: value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            note_kind: value
+                .get("note_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            word_count: value
+                .get("word_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
+            body: value
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            section_count: value
+                .get("section_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
         }))
     }
 
@@ -528,15 +603,27 @@ impl NestWeaverDaemon for DaemonService {
         let value = self.dispatch_tool_json("brain_status", args).await?;
 
         Ok(Response::new(BrainStatusResponse {
-            vault_count: value.get("vault_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            vault_count: value
+                .get("vault_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
             notes: value.get("notes").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             headings: value.get("headings").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             sections: value.get("sections").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             tags: value.get("tags").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             wikilinks: value.get("wikilinks").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-            repo_count: value.get("repo_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-            tantivy_available: value.get("tantivy_available").and_then(|v| v.as_bool()).unwrap_or(false),
-            tantivy_doc_count: value.get("tantivy_doc_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            repo_count: value
+                .get("repo_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
+            tantivy_available: value
+                .get("tantivy_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            tantivy_doc_count: value
+                .get("tantivy_doc_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
         }))
     }
 
@@ -591,7 +678,6 @@ impl NestWeaverDaemon for DaemonService {
     async fn brain_diff(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "brain_diff")
     }
-
 
     async fn read_symbols(
         &self,
@@ -706,10 +792,7 @@ impl NestWeaverDaemon for DaemonService {
         json_rpc!(self, r, "clusters")
     }
 
-    async fn stale_check(
-        &self,
-        r: Request<JsonRequest>,
-    ) -> Result<Response<JsonResponse>, Status> {
+    async fn stale_check(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "stale_check")
     }
 
@@ -724,10 +807,7 @@ impl NestWeaverDaemon for DaemonService {
         json_rpc!(self, r, "get_summary")
     }
 
-    async fn investigate(
-        &self,
-        r: Request<JsonRequest>,
-    ) -> Result<Response<JsonResponse>, Status> {
+    async fn investigate(&self, r: Request<JsonRequest>) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "investigate")
     }
 
@@ -794,7 +874,10 @@ pub async fn run_server(
         instance = %instance_id,
         "daemon process starting"
     );
-    eprintln!("[daemon] starting for {} (instance {instance_id})", db_path.display());
+    eprintln!(
+        "[daemon] starting for {} (instance {instance_id})",
+        db_path.display()
+    );
 
     // Open the graph store with write access — the daemon is the sole DB owner.
     let store = match GraphStore::open_or_create(&db_path) {
@@ -826,9 +909,8 @@ pub async fn run_server(
                     db_path.display()
                 );
             }
-            return Err(e).with_context(|| format!(
-                "failed to open database with write access{hint}"
-            ));
+            return Err(e)
+                .with_context(|| format!("failed to open database with write access{hint}"));
         }
     };
 
