@@ -855,6 +855,7 @@ pub async fn run_server(
         .with_context(|| format!("canonicalize db path: {}", db_path.display()))?;
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+    let instance_label = lifecycle::instance_label_from_db_path(&db_path);
 
     // Set up daily-rolling log file via tracing-appender. This replaces
     // the manual rotate-at-startup approach and handles rotation while the
@@ -872,11 +873,11 @@ pub async fn run_server(
 
     tracing::info!(
         db = %db_path.display(),
-        instance = %instance_id,
+        instance = %instance_label,
         "daemon process starting"
     );
     eprintln!(
-        "[daemon] starting for {} (instance {instance_id})",
+        "[daemon] starting for {} (instance {instance_label})",
         db_path.display()
     );
 
@@ -989,7 +990,7 @@ pub async fn run_server(
 
     tracing::info!(
         socket = %sock_path.display(),
-        instance = %instance_id,
+        instance = %instance_label,
         "daemon starting"
     );
 
