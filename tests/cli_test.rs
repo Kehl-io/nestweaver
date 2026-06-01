@@ -729,3 +729,22 @@ fn setup_strips_deprecated_args_from_existing_config() {
         "deprecated flag should be removed from config, got: {args:?}"
     );
 }
+
+#[test]
+fn daemon_status_accepts_db_after_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    std::fs::write(&db_path, "").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["daemon", "status", "--db", db_path.to_str().unwrap()])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "daemon status should accept --db after subcommand, got: {stderr}"
+    );
+}
