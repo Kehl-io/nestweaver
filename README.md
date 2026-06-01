@@ -57,7 +57,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 </td>
 <td width="50%" valign="top">
 
-**22-Tool MCP Server**<br>
+**38-Tool MCP Server**<br>
 Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
@@ -107,6 +107,7 @@ nestweaver watch
 ```sh
 # Configure for your AI tool (16 supported: Claude Code, Cursor, Codex, Gemini CLI, and more)
 nestweaver setup
+nestweaver setup --force   # regenerate skill/guide files even if customized
 ```
 
 Run `nestweaver --help` for the full command list. All commands support `--json` for machine-readable output.
@@ -208,10 +209,10 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (22 tools, or 6 in lite mode; auto-starts daemon) |
+| `mcp` | Start the MCP server (38 tools, or 6 in lite mode; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
 | `ui` | Launch the interactive web UI |
-| `setup` | Auto-detect and configure AI tools (16 supported) |
+| `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
 | `embed` | Generate vector embeddings for indexed symbols |
@@ -282,7 +283,7 @@ nestweaver context --feature device-pairing --config ./nestweaver-instance.toml 
 
 ## MCP Server
 
-NestWeaver exposes 22 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes 38 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
@@ -295,6 +296,7 @@ The MCP server automatically starts a background daemon that owns the database. 
 ```sh
 nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
 nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
+pgrep -a nestweaver-daemon                        # find running daemons (Linux)
 ```
 
 Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Use `--tools` to expose only the tools you need. Point any MCP client at the server to get started.

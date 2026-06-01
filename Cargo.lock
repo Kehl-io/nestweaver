@@ -2971,7 +2971,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "nestweaver-engine",
@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "comrak",
  "hex",
@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-proto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "prost 0.13.5",
  "tonic",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "glob",
  "insta",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hex",
  "serde",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3219,7 +3219,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
