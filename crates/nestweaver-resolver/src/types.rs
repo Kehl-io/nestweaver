@@ -6,6 +6,12 @@ use nestweaver_schema::{Language, ResolvedType, SymbolKind};
 
 use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings};
 
+/// A variable binding key: (variable_name, line_number).
+type BindingKey = (String, u32);
+
+/// An assignment pair: (target_key, source_key).
+type Assignment = (BindingKey, BindingKey);
+
 /// Tier 1: Infer types from constructor calls.
 /// When a Call reference resolves to a Class symbol, the call site's variable
 /// has the type of that class.
@@ -140,20 +146,19 @@ impl TypeEnvironment {
                     continue;
                 }
 
-                if let Some(sym) = symbols_by_name.get(callee.as_str()) {
-                    if let Some(ref ti) = sym.type_info {
-                        if let Some(ref ret) = ti.return_type {
-                            self.bindings.insert(
-                                key,
-                                TypeBinding {
-                                    type_name: ret.clone(),
-                                    line: line_num,
-                                    confidence: 0.85,
-                                    source: BindingSource::ReturnType,
-                                },
-                            );
-                        }
-                    }
+                if let Some(sym) = symbols_by_name.get(callee.as_str())
+                    && let Some(ref ti) = sym.type_info
+                    && let Some(ref ret) = ti.return_type
+                {
+                    self.bindings.insert(
+                        key,
+                        TypeBinding {
+                            type_name: ret.clone(),
+                            line: line_num,
+                            confidence: 0.85,
+                            source: BindingSource::ReturnType,
+                        },
+                    );
                 }
             }
         }
@@ -170,7 +175,7 @@ impl TypeEnvironment {
 }
 
 /// Extract simple assignment patterns from source.
-fn extract_assignments(source: &str) -> Vec<((String, u32), (String, u32))> {
+fn extract_assignments(source: &str) -> Vec<Assignment> {
     let mut assignments = Vec::new();
     for (line_num, line) in source.lines().enumerate() {
         let line_num = (line_num + 1) as u32;
@@ -213,7 +218,7 @@ fn extract_assignments(source: &str) -> Vec<((String, u32), (String, u32))> {
 /// Propagate type bindings through assignment chains (fixpoint).
 fn propagate_assignments(
     bindings: &mut HashMap<(String, u32), TypeBinding>,
-    assignments: &[((String, u32), (String, u32))],
+    assignments: &[Assignment],
     max_iterations: usize,
 ) {
     for _ in 0..max_iterations {
