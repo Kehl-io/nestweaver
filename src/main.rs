@@ -24,7 +24,7 @@ use nestweaver_engine::{
     save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
-use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex};
+use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
 const EXIT_SUCCESS: i32 = 0;
@@ -163,6 +163,10 @@ struct Cli {
     /// Alias for --no-color (plain text output)
     #[arg(long, global = true)]
     plain: bool,
+
+    /// Skip the daemon and open the database directly (not recommended)
+    #[arg(long, global = true)]
+    no_daemon: bool,
 }
 
 // ── Output configuration ─────────────────────────────────────────────────────
@@ -659,6 +663,9 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
+        /// Skip the daemon and open the database directly (not recommended)
+        #[arg(long)]
+        no_daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
     Ui {
@@ -1029,8 +1036,8 @@ enum Commands {
         /// Force-configure all tools even if not detected
         #[arg(long)]
         all: bool,
-        /// Include --allow-mcp-add-sources in generated configs (enables set_extension writes)
-        #[arg(long)]
+        /// Deprecated: daemon mode always allows writes. Kept for backward compatibility.
+        #[arg(long, hide = true)]
         allow_writes: bool,
         /// Path to the NestWeaver database
         #[arg(
@@ -1237,6 +1244,33 @@ enum Commands {
     Eval {
         #[command(subcommand)]
         command: EvalCommands,
+    },
+    /// Manage the NestWeaver daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+        /// Path to the database file
+        #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (usually auto-started on first use)
+    Start {
+        /// Idle timeout in seconds
+        #[arg(long, default_value = "3600")]
+        idle_timeout: u64,
+    },
+    /// Stop the running daemon
+    Stop,
+    /// Show daemon status
+    Status,
+    /// Stop and restart the daemon
+    Restart {
+        #[arg(long, default_value = "3600")]
+        idle_timeout: u64,
     },
 }
 
@@ -2228,6 +2262,7 @@ fn main() {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
+    let use_daemon = !cli.no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -3697,6 +3732,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
+            no_daemon,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             if let Some(ref allowed) = tool_allowlist {
@@ -3705,13 +3741,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            nestweaver_mcp::run_stdio_server(
-                &db_path,
-                allow_mcp_add_sources,
-                lite,
-                track_interactions,
-            )
-            .context("mcp server")?;
+            let use_daemon_mcp = !no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
+            if use_daemon_mcp {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("create tokio runtime for daemon proxy")?;
+                let daemon_client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path))
+                    .context("connect to daemon")?;
+                let grpc_client = daemon_client.into_inner();
+                nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
+                    .context("mcp server (daemon mode)")?;
+            } else {
+                nestweaver_mcp::run_stdio_server(
+                    &db_path,
+                    allow_mcp_add_sources,
+                    lite,
+                    track_interactions,
+                )
+                .context("mcp server")?;
+            }
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -4600,6 +4648,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => detect_repo_root(),
             };
             let db_path = resolve_index_db_path(db, &repo_path);
+
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+
+                let req = nestweaver_proto::IndexRepoRequest {
+                    repo_path: repo_path.display().to_string(),
+                    name: name.unwrap_or_default(),
+                    force,
+                    with_trigrams,
+                    with_git_activity,
+                };
+
+                rt.block_on(async {
+                    let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
+                    while let Some(progress) = stream.message().await? {
+                        let phase_name = match progress.phase {
+                            0 => "Discovering",
+                            1 => "Parsing",
+                            2 => "Resolving",
+                            3 => "Writing",
+                            4 => "PageRank",
+                            5 => "Done",
+                            6 => "Error",
+                            _ => "Unknown",
+                        };
+                        eprintln!("[{phase_name}] {}", progress.message);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })?;
+
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let instance_id = instance.as_deref().unwrap_or("default");
 
             let repo_url = format!("file://{}", repo_path.display());
@@ -4669,22 +4751,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // Compute PageRank after indexing so the repo-map is immediately usable.
-            // (incremental_index already computes PageRank internally, but recomputing
-            // here is cheap and ensures the sidecar is always up to date for the full path.)
-            out.status("Computing PageRank...");
-            let store = GraphStore::open(&db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-            store
-                .compute_pagerank(0.85, 20, &GraphScope::code_only())
-                .with_context(|| "compute_pagerank")?;
-
-            // Save PageRank cache alongside the DB for use by subsequent commands.
-            let pr_path = db_path.with_extension("pagerank.json");
-            store
-                .save_pagerank_cache(&pr_path)
-                .with_context(|| "save_pagerank_cache")?;
-            out.status("PageRank complete.");
+            // PageRank is deferred to first query (lazy evaluation in
+            // GraphStore::ensure_pagerank_loaded) so the index path stays fast.
+            out.status("PageRank will be computed on first query.");
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -4722,6 +4791,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if with_trigrams {
                 out.status("Building trigram index...");
+                let store = GraphStore::open(&db_path)
+                    .with_context(|| format!("failed to open database at {}", db_path.display()))?;
                 let postings = store
                     .build_trigram_index()
                     .with_context(|| "build_trigram_index")?;
@@ -4736,6 +4807,194 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::Daemon { action, db } => {
+            let db_path = db
+                .or_else(|| {
+                    std::env::var("NESTWEAVER_DB")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No database path provided. Use --db or set NESTWEAVER_DB.")
+                })?;
+            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
+            let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+            let runtime_dir = nestweaver_daemon::runtime_dir(&instance_id);
+            let log_dir = nestweaver_daemon::log_dir(&instance_id);
+            let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+            let socket = nestweaver_daemon::socket_path(&instance_id);
+            let log_file = nestweaver_daemon::log_path(&instance_id);
+
+            match action {
+                DaemonAction::Start { idle_timeout } => {
+                    // Check if already running.
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            let alive = unsafe { libc::kill(pid, 0) } == 0;
+                            if alive {
+                                eprintln!("Daemon already running (PID {pid}).");
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+                        }
+                        // Stale pidfile — remove it.
+                        let _ = std::fs::remove_file(&pidfile);
+                    }
+
+                    std::fs::create_dir_all(&runtime_dir).with_context(|| {
+                        format!("create runtime dir: {}", runtime_dir.display())
+                    })?;
+                    std::fs::create_dir_all(&log_dir)
+                        .with_context(|| format!("create log dir: {}", log_dir.display()))?;
+
+                    let stdout_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_file)
+                        .with_context(|| format!("open log file: {}", log_file.display()))?;
+                    let stderr_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_file)
+                        .with_context(|| {
+                            format!("open log file for stderr: {}", log_file.display())
+                        })?;
+
+                    eprintln!(
+                        "Starting daemon for {} (instance {instance_id})...",
+                        db_path.display()
+                    );
+                    eprintln!("  PID file: {}", pidfile.display());
+                    eprintln!("  Socket:   {}", socket.display());
+                    eprintln!("  Log:      {}", log_file.display());
+
+                    let daemonize = daemonize2::Daemonize::new()
+                        .pid_file(&pidfile)
+                        .stdout(stdout_file)
+                        .stderr(stderr_file)
+                        .working_directory(".");
+
+                    match unsafe { daemonize.start() } {
+                        Ok(()) => {
+                            // We are now the daemon process.
+                            let idle = if idle_timeout > 0 {
+                                Some(std::time::Duration::from_secs(idle_timeout))
+                            } else {
+                                None
+                            };
+                            let rt = tokio::runtime::Runtime::new()
+                                .expect("failed to create tokio runtime");
+                            rt.block_on(async {
+                                if let Err(e) = nestweaver_daemon::run_server(&db_path, idle).await
+                                {
+                                    eprintln!("Daemon error: {e:#}");
+                                    std::process::exit(1);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            anyhow::bail!("Failed to daemonize: {e}");
+                        }
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Stop => {
+                    let pid_str = std::fs::read_to_string(&pidfile)
+                        .with_context(|| format!("read pidfile: {}", pidfile.display()))?;
+                    let pid: i32 = pid_str
+                        .trim()
+                        .parse()
+                        .with_context(|| "parse PID from pidfile")?;
+
+                    eprintln!("Stopping daemon (PID {pid})...");
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+
+                    // Poll for up to 5 seconds.
+                    for _ in 0..50 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if unsafe { libc::kill(pid, 0) } != 0 {
+                            eprintln!("Daemon stopped.");
+                            let _ = std::fs::remove_file(&pidfile);
+                            let _ = std::fs::remove_file(&socket);
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                    }
+
+                    // Force kill.
+                    eprintln!("Daemon did not exit; sending SIGKILL...");
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = std::fs::remove_file(&pidfile);
+                    let _ = std::fs::remove_file(&socket);
+                    eprintln!("Daemon killed.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Status => {
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+                        && let Ok(pid) = pid_str.trim().parse::<i32>()
+                        && unsafe { libc::kill(pid, 0) } == 0
+                    {
+                        println!("Daemon is running (PID {pid})");
+                        println!("  DB:     {}", db_path.display());
+                        println!("  Socket: {}", socket.display());
+                        println!("  Log:    {}", log_file.display());
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    println!("Daemon is not running.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Restart { idle_timeout } => {
+                    // Stop if running.
+                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+                        && let Ok(pid) = pid_str.trim().parse::<i32>()
+                        && unsafe { libc::kill(pid, 0) } == 0
+                    {
+                        eprintln!("Stopping daemon (PID {pid})...");
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                        for _ in 0..50 {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            if unsafe { libc::kill(pid, 0) } != 0 {
+                                break;
+                            }
+                        }
+                        if unsafe { libc::kill(pid, 0) } == 0 {
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        let _ = std::fs::remove_file(&pidfile);
+                        let _ = std::fs::remove_file(&socket);
+                        eprintln!("Daemon stopped.");
+                    }
+
+                    // Re-exec ourselves to start the daemon fresh.
+                    let exe =
+                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let status = std::process::Command::new(&exe)
+                        .args([
+                            "daemon",
+                            "--db",
+                            &db_path.display().to_string(),
+                            "start",
+                            "--idle-timeout",
+                            &idle_timeout.to_string(),
+                        ])
+                        .status()
+                        .with_context(|| "failed to restart daemon")?;
+                    if !status.success() {
+                        anyhow::bail!("daemon start failed with {status}");
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                }
+            }
         }
     }
 }

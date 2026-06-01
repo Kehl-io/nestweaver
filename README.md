@@ -58,7 +58,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 <td width="50%" valign="top">
 
 **22-Tool MCP Server**<br>
-Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor.
+Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
 </tr>
@@ -208,7 +208,8 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (22 tools, or 6 in lite mode) |
+| `mcp` | Start the MCP server (22 tools, or 6 in lite mode; auto-starts daemon) |
+| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported) |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md) |
@@ -286,6 +287,14 @@ NestWeaver exposes 22 tools via the [Model Context Protocol](https://modelcontex
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
+nestweaver mcp --no-daemon --db ./nestweaver.lbug                     # bypass daemon (CI/testing)
+```
+
+The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.
+
+```sh
+nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
+nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 ```
 
 Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Use `--tools` to expose only the tools you need. Point any MCP client at the server to get started.
@@ -339,7 +348,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ## Architecture
 
 <details>
-<summary>Cargo workspace with 10 crates compiling to a single static binary + optional WASM module</summary>
+<summary>Cargo workspace with 13 crates compiling to a single static binary + optional WASM module</summary>
 
 | Crate | Description |
 |-------|-------------|
@@ -350,7 +359,10 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
 | `nestweaver-engine` | Indexing pipeline, query dispatch, config, snapshots, LLM integration |
 | `nestweaver-algorithms` | Pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible, no I/O |
-| `nestweaver-mcp` | Optional MCP server for non-shell AI clients |
+| `nestweaver-proto` | gRPC service definition (protobuf) for daemon IPC |
+| `nestweaver-daemon` | Background daemon — owns the database, serves gRPC over Unix socket |
+| `nestweaver-client` | Daemon client with auto-start, flock-based race prevention, version check |
+| `nestweaver-mcp` | MCP server — proxies tool calls through the daemon |
 | `nestweaver-web` | Web UI (Three.js/R3F) and Axum API backend |
 | `nestweaver-wasm` | Browser-side WASM module wrapping nestweaver-algorithms |
 
@@ -362,8 +374,11 @@ schema              (zero internal deps)
 algorithms          (zero internal deps — WASM target)
   <- wasm
 storage             (zero internal deps)
+proto               (generated gRPC types)
        <- engine <- (parser, resolver, store, storage, algorithms)
-            <- mcp
+            <- daemon <- (engine, store, mcp, proto)
+            <- client <- (proto, daemon)
+            <- mcp    <- (client, proto)  [daemon proxy mode]
             <- web
 ```
 

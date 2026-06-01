@@ -10,11 +10,18 @@ repository.workspace = true
 nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
+nestweaver-proto = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio-stream = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+daemon = ["dep:nestweaver-proto", "dep:tonic", "dep:tokio", "dep:tokio-stream"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -143,13 +143,14 @@ pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
     CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
     incremental_index_with_name, index_directory, index_directory_in_memory,
-    index_directory_with_options, load_filemeta_cache, save_filemeta_cache,
+    index_directory_with_options, index_directory_with_store, load_filemeta_cache,
+    save_filemeta_cache,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
     index_markdown_directory_in_memory, index_markdown_directory_since,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
-    load_alias_sidecar,
+    index_markdown_directory_with_store, load_alias_sidecar,
 };
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
