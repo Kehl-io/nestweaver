@@ -1,41 +1,50 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2362
+assertion_line: 4017
 expression: "parsed_references(\"simple.lua\", &source)"
 ---
 - name: require
   kind: Call
   start_line: 1
   context: "require(\"json\")"
+  receiver: ~
 - name: setmetatable
   kind: Call
   start_line: 8
   context: "setmetatable({}, Greeter)"
+  receiver: ~
 - name: upper
   kind: Call
   start_line: 19
   context: string.upper(name)
+  receiver: ~
 - name: lower
   kind: Call
   start_line: 24
   context: "input:lower()"
+  receiver: ~
 - name: new
   kind: Call
   start_line: 28
   context: "Greeter:new(\"World\")"
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 29
   context: "(g:greet())"
+  receiver: ~
 - name: print
   kind: Call
   start_line: 29
   context: "local json = require(\"json\")"
+  receiver: ~
 - name: format_name
   kind: Call
   start_line: 30
   context: "(format_name(\"test\"))"
+  receiver: ~
 - name: print
   kind: Call
   start_line: 30
   context: "local json = require(\"json\")"
+  receiver: ~

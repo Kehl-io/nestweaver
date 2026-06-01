@@ -95,6 +95,7 @@ fn arb_reference() -> impl Strategy<Value = RawReference> {
             kind,
             start_line,
             context: String::new(),
+            receiver: None,
         },
     )
 }
