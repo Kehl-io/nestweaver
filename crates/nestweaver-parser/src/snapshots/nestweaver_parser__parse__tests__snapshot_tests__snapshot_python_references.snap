@@ -1,64 +1,80 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 3835
 expression: "parsed_references(\"simple.py\", &source)"
 ---
 - name: ".utils"
   kind: Import
   start_line: 1
   context: from .utils import helper
+  receiver: ~
 - name: os
   kind: Import
   start_line: 2
   context: from .utils import helper
+  receiver: ~
 - name: func
   kind: Call
   start_line: 10
   context: "prefix + func(*args, **kwargs)"
+  receiver: ~
 - name: decorator_factory
   kind: Call
   start_line: 14
   context: "@decorator_factory(\">>> \")"
+  receiver: ~
 - name: name
   kind: ReadAccess
   start_line: 20
   context: self.name = name
+  receiver: ~
 - name: name
   kind: ReadAccess
   start_line: 23
   context: "{self.name}"
+  receiver: ~
 - name: Animal
   kind: Extends
   start_line: 25
   context: from .utils import helper
+  receiver: ~
 - name: name
   kind: ReadAccess
   start_line: 27
   context: "{self.name}"
+  receiver: ~
 - name: Dog
   kind: Call
   start_line: 30
   context: "dog = Dog(\"Rex\")"
+  receiver: ~
 - name: speak
   kind: Call
   start_line: 31
   context: result = dog.speak()
+  receiver: ~
 - name: speak
   kind: ReadAccess
   start_line: 31
   context: dog.speak()
+  receiver: ~
 - name: standalone_function
   kind: Call
   start_line: 32
   context: "standalone_function(\"world\")"
+  receiver: ~
 - name: getcwd
   kind: Call
   start_line: 33
   context: os.getcwd()
+  receiver: ~
 - name: getcwd
   kind: ReadAccess
   start_line: 33
   context: os.getcwd()
+  receiver: ~
 - name: main
   kind: Call
   start_line: 37
   context: main()
+  receiver: ~

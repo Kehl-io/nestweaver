@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Method
   start_line: 5
@@ -25,6 +26,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: String
+  parent_name: Greeter
 - name: farewell
   kind: Method
   start_line: 6
@@ -38,6 +40,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: String
+  parent_name: Greeter
 - name: SimpleGreeter
   kind: Class
   start_line: 9
@@ -48,6 +51,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: prefix
   kind: Property
   start_line: 10
@@ -58,6 +62,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: SimpleGreeter
   kind: Method
   start_line: 12
@@ -68,6 +73,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: SimpleGreeter
 - name: greet
   kind: Method
   start_line: 16
@@ -78,6 +84,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: SimpleGreeter
 - name: farewell
   kind: Method
   start_line: 21
@@ -88,6 +95,7 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: SimpleGreeter
 - name: main
   kind: Method
   start_line: 26
@@ -101,3 +109,4 @@ expression: "parsed_symbols(\"Simple.java\", &source)"
     declared_type: ~
     parameter_types: []
     return_type: void
+  parent_name: SimpleGreeter

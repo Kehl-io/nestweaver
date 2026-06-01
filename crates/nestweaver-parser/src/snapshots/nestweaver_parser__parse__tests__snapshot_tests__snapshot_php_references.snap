@@ -1,29 +1,35 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 2020
+assertion_line: 3961
 expression: "parsed_references(\"simple.php\", &source)"
 ---
 - name: "App\\Contracts\\Greeter"
   kind: Uses
   start_line: 5
   context: "<?php"
+  receiver: ~
 - name: "App\\Services\\Logger"
   kind: Uses
   start_line: 6
   context: "<?php"
+  receiver: ~
 - name: GreeterInterface
   kind: Implements
   start_line: 21
   context: class SimpleGreeter implements GreeterInterface
+  receiver: ~
 - name: log
   kind: Call
   start_line: 27
   context: "$this->log(\"Greeting $name\");"
+  receiver: ~
 - name: ucfirst
   kind: Call
   start_line: 33
   context: return ucfirst($name);
+  receiver: ~
 - name: greet
   kind: Call
   start_line: 47
   context: return $greeter->greet($input);
+  receiver: ~

@@ -12,6 +12,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: moduledoc
   kind: Constant
   start_line: 2
@@ -22,6 +23,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: greet
   kind: Function
   start_line: 8
@@ -32,6 +34,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: format_name
   kind: Function
   start_line: 12
@@ -42,6 +45,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Private
   type_info: ~
+  parent_name: ~
 - name: greeting_macro
   kind: Function
   start_line: 16
@@ -52,6 +56,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: Greeter.Formatter
   kind: Module
   start_line: 23
@@ -62,6 +67,7 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~
 - name: format
   kind: Function
   start_line: 24
@@ -72,3 +78,4 @@ expression: "parsed_symbols(\"simple.ex\", &source)"
   entry_point_kind: ~
   visibility: Public
   type_info: ~
+  parent_name: ~

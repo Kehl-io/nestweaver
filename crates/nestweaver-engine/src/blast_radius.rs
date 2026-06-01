@@ -33,6 +33,10 @@ pub struct AffectedSymbol {
     pub depth: u32,
     pub edge_type: String,
     pub confidence: f32,
+    /// Confidence-weighted impact score (1.0 = direct high-confidence edge,
+    /// decays multiplicatively through the graph). Used for sorting results
+    /// so the most-affected symbols appear first.
+    pub impact_score: f64,
 }
 
 /// A cluster (community) that contains affected symbols.
@@ -120,10 +124,19 @@ pub fn analyze_blast_radius(
                     depth: node.depth,
                     edge_type: node.edge_type,
                     confidence: node.confidence,
+                    impact_score: node.impact_score,
                 });
             }
         }
     }
+
+    // Sort affected symbols by impact_score (highest first).
+    affected_symbols.sort_by(|a, b| {
+        b.impact_score
+            .partial_cmp(&a.impact_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.uid.cmp(&b.uid))
+    });
 
     // Step 3: Group by clusters if cluster data is available.
     let mut affected_clusters: Vec<AffectedCluster> = Vec::new();
@@ -437,5 +450,148 @@ mod tests {
         // fn_a has pagerank_score=0.5 (high centrality), which boosts
         // the risk from Low to Medium even with only 1 affected symbol.
         assert_eq!(result.risk_level, RiskLevel::Medium);
+
+        // Verify impact_score is populated: sym_b calls sym_a with confidence 0.9,
+        // so impact_score should be 1.0 * 0.9 = 0.9.
+        let score = result.affected_symbols[0].impact_score;
+        assert!(
+            (score - 0.9).abs() < 1e-6,
+            "expected impact_score ~0.9, got {score}"
+        );
+    }
+
+    #[test]
+    fn impact_score_decays_through_chain() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        // Build chain: C --0.8--> B --0.9--> A
+        // Changing A should affect B (score 0.9) and C (score 0.9 * 0.8 = 0.72).
+        let make_sym = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+        };
+
+        for (uid, name, file) in [
+            ("sym:a", "fn_a", "src/a.rs"),
+            ("sym:b", "fn_b", "src/b.rs"),
+            ("sym:c", "fn_c", "src/c.rs"),
+        ] {
+            store.insert_symbol(&make_sym(uid, name, file)).unwrap();
+        }
+
+        // B calls A (confidence 0.9)
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:b".to_string(),
+                target_uid: "sym:a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+            })
+            .unwrap();
+
+        // C calls B (confidence 0.8)
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:c".to_string(),
+                target_uid: "sym:b".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.8,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 5, None).unwrap();
+
+        assert_eq!(result.affected_symbols.len(), 2);
+        // Results should be sorted by impact_score descending.
+        assert_eq!(result.affected_symbols[0].name, "fn_b");
+        assert!((result.affected_symbols[0].impact_score - 0.9).abs() < 1e-6);
+        assert_eq!(result.affected_symbols[1].name, "fn_c");
+        assert!((result.affected_symbols[1].impact_score - 0.72).abs() < 1e-6);
+    }
+
+    #[test]
+    fn low_confidence_chain_pruned_below_threshold() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        // Build chain: C --0.2--> B --0.3--> A
+        // B's score = 0.3, C's candidate score = 0.3 * 0.2 = 0.06 < 0.10 threshold.
+        // So C should be pruned.
+        let make_sym = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+        };
+
+        for (uid, name, file) in [
+            ("sym:a", "fn_a", "src/a.rs"),
+            ("sym:b", "fn_b", "src/b.rs"),
+            ("sym:c", "fn_c", "src/c.rs"),
+        ] {
+            store.insert_symbol(&make_sym(uid, name, file)).unwrap();
+        }
+
+        // B calls A (confidence 0.3)
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:b".to_string(),
+                target_uid: "sym:a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.3,
+                link_type: None,
+            })
+            .unwrap();
+
+        // C calls B (confidence 0.2)
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym:c".to_string(),
+                target_uid: "sym:b".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.2,
+                link_type: None,
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 5, None).unwrap();
+
+        // B is included (score 0.3 >= 0.10), but C is pruned (score 0.06 < 0.10).
+        assert_eq!(result.affected_symbols.len(), 1);
+        assert_eq!(result.affected_symbols[0].name, "fn_b");
+        assert!((result.affected_symbols[0].impact_score - 0.3).abs() < 1e-6);
     }
 }

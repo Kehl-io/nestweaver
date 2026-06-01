@@ -805,11 +805,71 @@ fn index_into_store(
         Default::default()
     };
 
+    // Build type environments per file for type-aware resolution.
+    let mut type_envs: std::collections::HashMap<
+        String,
+        nestweaver_resolver::types::TypeEnvironment,
+    > = {
+        let mut envs = std::collections::HashMap::new();
+        for (file_path, symbols, _references) in &parsed_files_for_resolver {
+            let full_path = repo_path.join(file_path);
+            if let Ok(source) = std::fs::read_to_string(&full_path) {
+                let env =
+                    nestweaver_resolver::types::TypeEnvironment::build(&source, language, symbols);
+                if env.binding_count() > 0 {
+                    envs.insert(file_path.clone(), env);
+                }
+            }
+        }
+        tracing::info!(
+            files_with_bindings = envs.len(),
+            total_bindings = envs.values().map(|e| e.binding_count()).sum::<usize>(),
+            "type environments built"
+        );
+        envs
+    };
+
+    // Cross-file return type propagation: seed bindings from known function return types
+    {
+        let all_symbols_with_returns: std::collections::HashMap<
+            &str,
+            &nestweaver_parser::RawSymbol,
+        > = parsed_files_for_resolver
+            .iter()
+            .flat_map(|(_, syms, _)| syms.iter())
+            .filter(|s| {
+                s.type_info
+                    .as_ref()
+                    .and_then(|ti| ti.return_type.as_ref())
+                    .is_some()
+            })
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+
+        if !all_symbols_with_returns.is_empty() {
+            let mut seeded = 0usize;
+            for (file_path, _symbols, _refs) in &parsed_files_for_resolver {
+                if let Some(env) = type_envs.get_mut(file_path) {
+                    let full_path = repo_path.join(file_path);
+                    if let Ok(source) = std::fs::read_to_string(&full_path) {
+                        let before = env.binding_count();
+                        env.seed_return_types(&source, &all_symbols_with_returns);
+                        seeded += env.binding_count() - before;
+                    }
+                }
+            }
+            if seeded > 0 {
+                tracing::info!(new_bindings = seeded, "cross-file return type propagation");
+            }
+        }
+    }
+
     let resolved_edges = resolve_references_with_context(
         &parsed_files_for_resolver,
         language,
         &r_uid,
         &workspace_ctx,
+        Some(&type_envs),
     );
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
@@ -1338,7 +1398,8 @@ fn process_added_or_modified_file(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges = resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx);
+    let resolved_edges =
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))

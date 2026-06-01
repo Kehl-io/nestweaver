@@ -67,6 +67,9 @@ pub struct RawSymbol {
     pub entry_point_kind: Option<EntryPointKind>,
     pub visibility: Visibility,
     pub type_info: Option<TypeInfo>,
+    /// The name of the enclosing class/struct/impl/trait for method symbols.
+    /// `None` for top-level functions and non-method symbols.
+    pub parent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +78,9 @@ pub struct RawReference {
     pub kind: ReferenceKind,
     pub start_line: u32,
     pub context: String,
+    /// The receiver of a method call: `"store"` in `store.method()`,
+    /// `"self"` in `self.method()`, `None` for free function calls.
+    pub receiver: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +496,50 @@ fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
     }
 }
 
+// ── parent name extraction ────────────────────────────────────────────────
+
+/// Walk the tree-sitter AST parent chain from `node` to find the enclosing
+/// class, struct, impl, trait, or interface. Returns the parent type/class name
+/// (e.g. `"GraphStore"` for a method inside `impl GraphStore { ... }`).
+fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            // Rust: impl Type { ... }
+            "impl_item" => {
+                return parent
+                    .child_by_field_name("type")
+                    .and_then(|t| t.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // JS/TS/Java/C#/Dart/PHP/Python/Ruby: class Name { ... }
+            "class_declaration" | "class_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // TS/Java: interface Name { ... }
+            "interface_declaration" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            // Rust: trait Name { ... }
+            "trait_item" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 // ── core parse ─────────────────────────────────────────────────────────────
 
 /// Parse a single source file and extract symbols and references.
@@ -660,6 +710,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
                 let visibility = infer_visibility(&name, &node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
+                let parent_name = if kind == SymbolKind::Method {
+                    find_parent_name(&node, source_bytes)
+                } else {
+                    None
+                };
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -671,6 +726,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     entry_point_kind: ep_kind,
                     visibility,
                     type_info,
+                    parent_name,
                 });
             } else if let Some(kind_str) = capture_name.strip_prefix("reference.") {
                 let kind = match kind_str {
@@ -708,11 +764,33 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     continue;
                 }
 
+                // Extract receiver for method calls: in `obj.method()`,
+                // the captured `@reference.call` node is the call_expression.
+                // Its `function` child may be a field_expression (Rust) or
+                // member_expression (JS/TS/Java) containing the receiver as
+                // `value` (Rust) or `object` (JS/TS/Java/Go/etc.).
+                let receiver = if kind == ReferenceKind::Call {
+                    node.child_by_field_name("function")
+                        .filter(|f| {
+                            let k = f.kind();
+                            k.contains("field") || k.contains("member")
+                        })
+                        .and_then(|f| {
+                            f.child_by_field_name("object")
+                                .or_else(|| f.child_by_field_name("value"))
+                        })
+                        .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
                 references.push(RawReference {
                     name,
                     kind,
                     start_line,
                     context,
+                    receiver,
                 });
             }
             // Skip "name" captures — used via find_name_capture above
@@ -4215,5 +4293,171 @@ mod tests {
             let source = fixture("systemverilog/simple.sv");
             assert_yaml_snapshot!(parsed_references("simple.sv", &source));
         }
+    }
+
+    // ── Receiver extraction tests ───────────────────────────────────────────
+
+    #[test]
+    fn extracts_receiver_from_method_call() {
+        let source = r#"
+fn main() {
+    let store = Store::new();
+    store.get_item("key");
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "get_item")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'get_item'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("store"),
+            "receiver should be 'store'"
+        );
+    }
+
+    #[test]
+    fn extracts_self_receiver() {
+        let source = r#"
+struct Foo;
+impl Foo {
+    fn bar(&self) {
+        self.baz();
+    }
+    fn baz(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "baz")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'baz'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("self"),
+            "receiver should be 'self'"
+        );
+    }
+
+    #[test]
+    fn free_function_has_no_receiver() {
+        let source = r#"
+fn helper() {}
+fn main() {
+    helper();
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'helper'");
+        assert_eq!(
+            call_refs[0].receiver, None,
+            "free function should have no receiver"
+        );
+    }
+
+    #[test]
+    fn js_method_call_receiver() {
+        let source = r#"
+const arr = [1, 2, 3];
+arr.map(x => x + 1);
+"#;
+        let parsed = parse_source(Path::new("t.js"), source).unwrap();
+        let call_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "map")
+            .collect();
+        assert!(!call_refs.is_empty(), "should find call to 'map'");
+        assert_eq!(
+            call_refs[0].receiver.as_deref(),
+            Some("arr"),
+            "receiver should be 'arr'"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_rust_impl_method() {
+        let source = r#"
+struct GraphStore;
+impl GraphStore {
+    fn compute_pagerank(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute_pagerank")
+            .expect("should find compute_pagerank symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("GraphStore".to_string()),
+            "method inside impl GraphStore should have parent_name = GraphStore"
+        );
+    }
+
+    #[test]
+    fn top_level_function_has_no_parent() {
+        let source = "fn main() {}";
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let func = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("should find main symbol");
+        assert_eq!(
+            func.parent_name, None,
+            "top-level function should have no parent_name"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_ts_class_method() {
+        let source = r#"
+class UserService {
+    fetchUser(id: string) { return null; }
+}
+"#;
+        let parsed = parse_source(Path::new("t.ts"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "fetchUser")
+            .expect("should find fetchUser symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("UserService".to_string()),
+            "method inside class UserService should have parent_name = UserService"
+        );
+    }
+
+    #[test]
+    fn extracts_parent_name_for_rust_trait_method() {
+        let source = r#"
+trait Drawable {
+    fn draw(&self) {}
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let method = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "draw")
+            .expect("should find draw symbol");
+        assert_eq!(
+            method.parent_name,
+            Some("Drawable".to_string()),
+            "method inside trait Drawable should have parent_name = Drawable"
+        );
     }
 }
