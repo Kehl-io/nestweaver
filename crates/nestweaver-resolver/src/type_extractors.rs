@@ -121,10 +121,8 @@ fn extract_ts_annotation(line: &str) -> Option<(String, String)> {
         r
     } else if let Some(r) = line.strip_prefix("let ") {
         r
-    } else if let Some(r) = line.strip_prefix("var ") {
-        r
     } else {
-        return None;
+        line.strip_prefix("var ")?
     };
 
     let colon_pos = rest.find(':')?;
@@ -156,7 +154,7 @@ fn extract_java_annotation(line: &str) -> Option<(String, String)> {
     if !type_candidate
         .chars()
         .next()
-        .map_or(false, |c| c.is_ascii_uppercase())
+        .is_some_and(|c| c.is_ascii_uppercase())
     {
         return None;
     }
@@ -240,7 +238,7 @@ fn extract_go_annotation(line: &str) -> Option<(String, String)> {
 
     // Go type: could start with * (pointer), [] (slice), map[, etc.
     // For simplicity, extract the base type identifier
-    let type_str = after_name.split(|c: char| c == '=' || c == '\n').next()?;
+    let type_str = after_name.split(['=', '\n']).next()?;
     let type_str = type_str.trim();
 
     if type_str.is_empty() {
@@ -291,17 +289,12 @@ fn extract_constructors(
         if let Some((var_name, type_name)) = result {
             let key = (var_name, line_num);
             // Don't overwrite a Tier 0 annotation with a Tier 1 constructor
-            if !bindings.contains_key(&key) {
-                bindings.insert(
-                    key,
-                    TypeBinding {
-                        type_name,
-                        line: line_num,
-                        confidence: 0.90,
-                        source: BindingSource::Constructor,
-                    },
-                );
-            }
+            bindings.entry(key).or_insert(TypeBinding {
+                type_name,
+                line: line_num,
+                confidence: 0.90,
+                source: BindingSource::Constructor,
+            });
         }
     }
 }

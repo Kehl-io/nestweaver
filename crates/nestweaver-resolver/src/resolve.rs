@@ -74,20 +74,19 @@ pub fn resolve_references_with_context(
             std::collections::HashMap::new();
         for (_, symbols, references) in files {
             for reference in references {
-                if reference.kind == ReferenceKind::Extends {
-                    if let Some(sym) = find_enclosing_symbol(symbols, reference.start_line) {
-                        if matches!(
-                            sym.kind,
-                            SymbolKind::Class
-                                | SymbolKind::Enum
-                                | SymbolKind::Interface
-                                | SymbolKind::Trait
-                        ) {
-                            map.entry(sym.name.clone())
-                                .or_default()
-                                .push(reference.name.clone());
-                        }
-                    }
+                if reference.kind == ReferenceKind::Extends
+                    && let Some(sym) = find_enclosing_symbol(symbols, reference.start_line)
+                    && matches!(
+                        sym.kind,
+                        SymbolKind::Class
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+                {
+                    map.entry(sym.name.clone())
+                        .or_default()
+                        .push(reference.name.clone());
                 }
             }
         }
@@ -119,104 +118,88 @@ pub fn resolve_references_with_context(
             };
 
             // ── Type-aware resolution for member calls with known receiver type ──
-            if edge_type == EdgeType::Calls {
-                if let Some(ref receiver) = reference.receiver {
-                    if let Some(ref envs) = _type_envs {
-                        if let Some(env) = envs.get(file_path.as_str()) {
-                            let receiver_type = if receiver == "self"
-                                || receiver == "this"
-                                || receiver == "$this"
-                            {
-                                env.lookup_self(reference.start_line)
-                            } else {
-                                env.lookup(receiver, reference.start_line)
-                            };
+            if edge_type == EdgeType::Calls
+                && let Some(ref receiver) = reference.receiver
+                && let Some(envs) = _type_envs
+                && let Some(env) = envs.get(file_path.as_str())
+            {
+                let receiver_type =
+                    if receiver == "self" || receiver == "this" || receiver == "$this" {
+                        env.lookup_self(reference.start_line)
+                    } else {
+                        env.lookup(receiver, reference.start_line)
+                    };
 
-                            if let Some(binding) = receiver_type {
-                                let method_name = &reference.name;
-                                let type_name = &binding.type_name;
+                if let Some(binding) = receiver_type {
+                    let method_name = &reference.name;
+                    let type_name = &binding.type_name;
 
-                                if let Some(candidates) = symbol_map.get(method_name.as_str()) {
-                                    if let Some((candidate_file, sym)) =
-                                        candidates.iter().find(|(_, s)| {
-                                            s.parent_name.as_deref() == Some(type_name.as_str())
-                                        })
-                                    {
-                                        let target_uid = symbol_uid(
-                                            repo_uid,
-                                            candidate_file,
-                                            &sym.name,
-                                            sym.start_line,
-                                        );
-                                        let confidence = binding.confidence.min(0.95);
-                                        edges.push(ResolvedEdge {
-                                            source_uid: source_uid.clone(),
-                                            target_uid,
-                                            edge_type,
-                                            confidence,
-                                            link_type: None,
-                                        });
-                                        continue 'ref_loop;
-                                    }
-                                }
-                                // MRO walk: check parent types via inheritance chain
-                                {
-                                    let mut current_types = vec![type_name.clone()];
-                                    let mut visited = std::collections::HashSet::new();
-                                    visited.insert(type_name.clone());
-                                    let mut depth = 0u32;
+                    if let Some(candidates) = symbol_map.get(method_name.as_str())
+                        && let Some((candidate_file, sym)) = candidates
+                            .iter()
+                            .find(|(_, s)| s.parent_name.as_deref() == Some(type_name.as_str()))
+                    {
+                        let target_uid =
+                            symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
+                        let confidence = binding.confidence.min(0.95);
+                        edges.push(ResolvedEdge {
+                            source_uid: source_uid.clone(),
+                            target_uid,
+                            edge_type,
+                            confidence,
+                            link_type: None,
+                        });
+                        continue 'ref_loop;
+                    }
+                    // MRO walk: check parent types via inheritance chain
+                    {
+                        let mut current_types = vec![type_name.clone()];
+                        let mut visited = std::collections::HashSet::new();
+                        visited.insert(type_name.clone());
+                        let mut depth = 0u32;
 
-                                    while depth < 5 && !current_types.is_empty() {
-                                        let mut next_types = Vec::new();
-                                        for t in &current_types {
-                                            if let Some(parents) = extends_map.get(t.as_str()) {
-                                                for parent in parents {
-                                                    if visited.contains(parent) {
-                                                        continue; // cycle guard
-                                                    }
-                                                    visited.insert(parent.clone());
-
-                                                    if let Some(candidates) =
-                                                        symbol_map.get(method_name.as_str())
-                                                    {
-                                                        if let Some((cf, sym)) =
-                                                            candidates.iter().find(|(_, s)| {
-                                                                s.parent_name.as_deref()
-                                                                    == Some(parent.as_str())
-                                                            })
-                                                        {
-                                                            let target_uid = symbol_uid(
-                                                                repo_uid,
-                                                                cf,
-                                                                &sym.name,
-                                                                sym.start_line,
-                                                            );
-                                                            let conf = (binding.confidence
-                                                                - 0.05 * (depth + 1) as f32)
-                                                                .max(0.50);
-                                                            edges.push(ResolvedEdge {
-                                                                source_uid: source_uid.clone(),
-                                                                target_uid,
-                                                                edge_type,
-                                                                confidence: conf,
-                                                                link_type: None,
-                                                            });
-                                                            continue 'ref_loop;
-                                                        }
-                                                    }
-                                                    next_types.push(parent.clone());
-                                                }
-                                            }
+                        while depth < 5 && !current_types.is_empty() {
+                            let mut next_types = Vec::new();
+                            for t in &current_types {
+                                if let Some(parents) = extends_map.get(t.as_str()) {
+                                    for parent in parents {
+                                        if visited.contains(parent) {
+                                            continue; // cycle guard
                                         }
-                                        current_types = next_types;
-                                        depth += 1;
+                                        visited.insert(parent.clone());
+
+                                        if let Some(candidates) =
+                                            symbol_map.get(method_name.as_str())
+                                            && let Some((cf, sym)) =
+                                                candidates.iter().find(|(_, s)| {
+                                                    s.parent_name.as_deref()
+                                                        == Some(parent.as_str())
+                                                })
+                                        {
+                                            let target_uid =
+                                                symbol_uid(repo_uid, cf, &sym.name, sym.start_line);
+                                            let conf = (binding.confidence
+                                                - 0.05 * (depth + 1) as f32)
+                                                .max(0.50);
+                                            edges.push(ResolvedEdge {
+                                                source_uid: source_uid.clone(),
+                                                target_uid,
+                                                edge_type,
+                                                confidence: conf,
+                                                link_type: None,
+                                            });
+                                            continue 'ref_loop;
+                                        }
+                                        next_types.push(parent.clone());
                                     }
                                 }
-                                // Type was known but method not found on that type or ancestors.
-                                // Fall through to name-based resolution.
                             }
+                            current_types = next_types;
+                            depth += 1;
                         }
                     }
+                    // Type was known but method not found on that type or ancestors.
+                    // Fall through to name-based resolution.
                 }
             }
 
