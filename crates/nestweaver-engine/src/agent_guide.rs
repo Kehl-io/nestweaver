@@ -3,6 +3,16 @@ use nestweaver_store::GraphStore;
 use crate::config::InstanceConfig;
 use crate::guide_rules::{self, OwnedRule};
 
+/// Structured metadata for a single MCP tool, used to dynamically generate
+/// tool documentation tables in skills and guides. Created in the MCP crate
+/// (which owns the tool registry) and bridged into engine via the binary crate.
+pub struct ToolDocEntry {
+    pub name: String,
+    pub category: String,
+    pub purpose: String,
+    pub key_params: Vec<String>,
+}
+
 /// Emit the canonical hard-rule block, honoring an optional runtime override.
 ///
 /// Built-in rules are *helpful, not enforced* (see [`crate::guide_rules`]):
@@ -372,6 +382,20 @@ pub fn generate_skill_with_rules(
     config: Option<&InstanceConfig>,
     rules: Option<&[OwnedRule]>,
 ) -> Result<String, anyhow::Error> {
+    generate_skill_with_tools(store, config, rules, &[])
+}
+
+/// Like [`generate_skill_with_rules`] but accepts dynamic tool metadata.
+///
+/// When `tool_docs` is non-empty the "Available MCP tools" section is generated
+/// dynamically from the provided entries. When empty, falls back to the legacy
+/// hardcoded tables for backward compatibility.
+pub fn generate_skill_with_tools(
+    store: &GraphStore,
+    config: Option<&InstanceConfig>,
+    rules: Option<&[OwnedRule]>,
+    tool_docs: &[ToolDocEntry],
+) -> Result<String, anyhow::Error> {
     let mut out = String::new();
 
     // ── YAML frontmatter ─────────────────────────────────────────────────
@@ -421,50 +445,11 @@ pub fn generate_skill_with_rules(
     out.push_str("- **Token budget**: Approximate output cap in tokens (chars / 4). Controls how much context is returned.\n\n");
 
     // ── MCP tools ────────────────────────────────────────────────────────
-    out.push_str("## Available MCP tools\n\n");
-
-    out.push_str("### Core retrieval\n\n");
-    out.push_str("| Tool | Purpose | Key parameters |\n");
-    out.push_str("|------|---------|----------------|\n");
-    out.push_str("| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. | `seeds` (required), `token_budget`, `kinds`, `repos`, `vaults`, `tags`, `since`, `recency_weight` |\n");
-    out.push_str("| `brain_search` | BM25 full-text search across notes, headings, sections, and tags. Use for keyword lookup. | `query`, `limit` |\n");
-    out.push_str("| `project_context` | PPR-ranked context scoped to a named project and its components. | `project`, `token_budget`, `kinds`, `include_components` |\n");
-    out.push_str("| `note_get` | Full markdown body of a specific note, with frontmatter and outline. | `uid` or `title`, `sections`, `include_body` |\n");
-    out.push_str(
-        "| `backlinks` | All notes that wikilink TO a target note. | `uid` or `title` |\n\n",
-    );
-
-    out.push_str("### Analysis\n\n");
-    out.push_str("| Tool | Purpose | Key parameters |\n");
-    out.push_str("|------|---------|----------------|\n");
-    out.push_str("| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. | `symbol`, `depth` |\n");
-    out.push_str("| `flow_trace` | Forward call chain from a symbol (what it calls, transitively). | `symbol`, `depth` |\n");
-    out.push_str("| `detect_changes` | Risk assessment for a list of changed files. Maps files to affected flows. | `files` |\n");
-    out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol` |\n");
-    out.push_str("| `clusters` | Functional communities detected by the Leiden algorithm. | `min_size`, `repo` |\n\n");
-
-    out.push_str("### Status and maintenance\n\n");
-    out.push_str("| Tool | Purpose |\n");
-    out.push_str("|------|---------|\n");
-    out.push_str(
-        "| `brain_status` | Counts of vaults, notes, symbols, repos. Call to verify indexing. |\n",
-    );
-    out.push_str("| `stale_check` | Compare indexed SHA to current git HEAD. Shows if re-indexing is needed. |\n");
-    out.push_str("| `brain_diff` | Files and symbols changed since a given SHA. Useful before code review. |\n");
-    out.push_str(
-        "| `brain_guide` | Auto-generated architecture overview of the indexed codebase. |\n",
-    );
-    out.push_str(
-        "| `brain_add_source` | Index a new repo or vault at runtime. Pass an absolute path. |\n\n",
-    );
-
-    out.push_str("### Extensions\n\n");
-    out.push_str("| Tool | Purpose |\n");
-    out.push_str("|------|---------|\n");
-    out.push_str("| `set_extension` | Attach custom metadata (e.g. `team_owner`, `deprecated`) to any node. |\n");
-    out.push_str(
-        "| `query_extensions` | Find nodes with a specific extension property value. |\n\n",
-    );
+    if !tool_docs.is_empty() {
+        render_dynamic_tool_tables(&mut out, tool_docs);
+    } else {
+        render_legacy_tool_tables(&mut out);
+    }
 
     // ── Workflows ────────────────────────────────────────────────────────
     out.push_str("## Common workflows\n\n");
@@ -612,6 +597,105 @@ pub fn generate_skill_with_rules(
     Ok(out)
 }
 
+// ── Tool table rendering helpers ─────────────────────────────────────────────
+
+/// Render MCP tool tables dynamically from `ToolDocEntry` metadata.
+fn render_dynamic_tool_tables(out: &mut String, tool_docs: &[ToolDocEntry]) {
+    out.push_str("## Available MCP tools\n\n");
+
+    // Group tools by category, preserving a stable order.
+    let category_order = [
+        "Core retrieval",
+        "Analysis",
+        "Investigation",
+        "Code search",
+        "Status & maintenance",
+        "Extensions",
+        "Vault health",
+        "Memory",
+    ];
+    let mut by_category: std::collections::BTreeMap<String, Vec<&ToolDocEntry>> =
+        std::collections::BTreeMap::new();
+    for doc in tool_docs {
+        by_category
+            .entry(doc.category.clone())
+            .or_default()
+            .push(doc);
+    }
+
+    for category in &category_order {
+        if let Some(tools) = by_category.get(*category) {
+            out.push_str(&format!("### {category}\n\n"));
+            out.push_str("| Tool | Purpose | Key parameters |\n");
+            out.push_str("|------|---------|----------------|\n");
+            for tool in tools {
+                let params = if tool.key_params.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    tool.key_params.join(", ")
+                };
+                // Truncate purpose to first ~120 chars for table readability
+                let purpose_short: String = tool.purpose.chars().take(120).collect();
+                out.push_str(&format!(
+                    "| `{}` | {} | {} |\n",
+                    tool.name, purpose_short, params
+                ));
+            }
+            out.push('\n');
+        }
+    }
+}
+
+/// Render the legacy hardcoded tool tables (used when no dynamic metadata is available).
+fn render_legacy_tool_tables(out: &mut String) {
+    out.push_str("## Available MCP tools\n\n");
+
+    out.push_str("### Core retrieval\n\n");
+    out.push_str("| Tool | Purpose | Key parameters |\n");
+    out.push_str("|------|---------|----------------|\n");
+    out.push_str("| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. | `seeds` (required), `token_budget`, `kinds`, `repos`, `vaults`, `tags`, `since`, `recency_weight` |\n");
+    out.push_str("| `brain_search` | BM25 full-text search across notes, headings, sections, and tags. Use for keyword lookup. | `query`, `limit` |\n");
+    out.push_str("| `project_context` | PPR-ranked context scoped to a named project and its components. | `project`, `token_budget`, `kinds`, `include_components` |\n");
+    out.push_str("| `note_get` | Full markdown body of a specific note, with frontmatter and outline. | `uid` or `title`, `sections`, `include_body` |\n");
+    out.push_str(
+        "| `backlinks` | All notes that wikilink TO a target note. | `uid` or `title` |\n\n",
+    );
+
+    out.push_str("### Analysis\n\n");
+    out.push_str("| Tool | Purpose | Key parameters |\n");
+    out.push_str("|------|---------|----------------|\n");
+    out.push_str("| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. | `symbol`, `depth` |\n");
+    out.push_str("| `flow_trace` | Forward call chain from a symbol (what it calls, transitively). | `symbol`, `depth` |\n");
+    out.push_str("| `detect_changes` | Risk assessment for a list of changed files. Maps files to affected flows. | `files` |\n");
+    out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol` |\n");
+    out.push_str(
+        "| `clusters` | Functional communities detected by the Leiden algorithm. | `min_size`, `repo` |\n\n",
+    );
+
+    out.push_str("### Status and maintenance\n\n");
+    out.push_str("| Tool | Purpose |\n");
+    out.push_str("|------|---------|\n");
+    out.push_str(
+        "| `brain_status` | Counts of vaults, notes, symbols, repos. Call to verify indexing. |\n",
+    );
+    out.push_str("| `stale_check` | Compare indexed SHA to current git HEAD. Shows if re-indexing is needed. |\n");
+    out.push_str("| `brain_diff` | Files and symbols changed since a given SHA. Useful before code review. |\n");
+    out.push_str(
+        "| `brain_guide` | Auto-generated architecture overview of the indexed codebase. |\n",
+    );
+    out.push_str(
+        "| `brain_add_source` | Index a new repo or vault at runtime. Pass an absolute path. |\n\n",
+    );
+
+    out.push_str("### Extensions\n\n");
+    out.push_str("| Tool | Purpose |\n");
+    out.push_str("|------|---------|\n");
+    out.push_str("| `set_extension` | Attach custom metadata (e.g. `team_owner`, `deprecated`) to any node. |\n");
+    out.push_str(
+        "| `query_extensions` | Find nodes with a specific extension property value. |\n\n",
+    );
+}
+
 /// Generate a Cursor rule file with MDC frontmatter.
 ///
 /// Returns content suitable for writing to `.cursor/rules/nestweaver.mdc`.
@@ -658,20 +742,25 @@ pub fn generate_agents_md(
     store: &GraphStore,
     config: Option<&InstanceConfig>,
 ) -> Result<String, anyhow::Error> {
-    generate_agents_md_with_rules(store, config, None)
+    generate_agents_md_with_rules(store, config, None, None)
 }
 
-/// Like [`generate_agents_md`] but allows overriding the built-in hard rules.
+/// Like [`generate_agents_md`] but allows overriding the built-in hard rules
+/// and the tool count in the header.
+///
+/// When `tool_count` is `None`, defaults to 38 (the current registry size).
 pub fn generate_agents_md_with_rules(
     store: &GraphStore,
     config: Option<&InstanceConfig>,
     rules: Option<&[OwnedRule]>,
+    tool_count: Option<usize>,
 ) -> Result<String, anyhow::Error> {
     let mut out = String::new();
 
+    let count = tool_count.unwrap_or(38);
     out.push_str("# AGENTS.md — Codebase Intelligence Guide\n\n");
     out.push_str("> Auto-generated by NestWeaver. This file helps AI agents understand the codebase structure.\n");
-    out.push_str("> NestWeaver provides 17 MCP tools for code intelligence. Run `nestweaver mcp` to start the server.\n\n");
+    out.push_str(&format!("> NestWeaver provides {count} MCP tools for code intelligence. Run `nestweaver mcp` to start the server.\n\n"));
 
     let guide = generate_guide_with_rules(store, config, rules)?;
     out.push_str(&guide);
@@ -790,7 +879,65 @@ mod tests {
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
         let agents_md = generate_agents_md(&store, None).unwrap();
         assert!(agents_md.starts_with("# AGENTS.md"));
-        assert!(agents_md.contains("17 MCP tools"));
+        // Default tool count is 38 (current registry size).
+        assert!(
+            agents_md.contains("38 MCP tools"),
+            "AGENTS.md should reflect current tool count (38)"
+        );
         assert!(agents_md.contains("# Codebase Intelligence Guide"));
+    }
+
+    #[test]
+    fn generate_agents_md_accepts_custom_tool_count() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let agents_md = generate_agents_md_with_rules(&store, None, None, Some(42)).unwrap();
+        assert!(
+            agents_md.contains("42 MCP tools"),
+            "AGENTS.md should use the provided tool count"
+        );
+    }
+
+    #[test]
+    fn generate_skill_with_tools_renders_dynamic_tables() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let tool_docs = vec![
+            ToolDocEntry {
+                name: "brain_context".to_string(),
+                category: "Core retrieval".to_string(),
+                purpose: "PPR-ranked context from seeds.".to_string(),
+                key_params: vec!["seeds".to_string()],
+            },
+            ToolDocEntry {
+                name: "brain_impact".to_string(),
+                category: "Analysis".to_string(),
+                purpose: "Blast radius analysis.".to_string(),
+                key_params: vec!["symbol".to_string()],
+            },
+            ToolDocEntry {
+                name: "investigate".to_string(),
+                category: "Investigation".to_string(),
+                purpose: "Automated investigation.".to_string(),
+                key_params: vec!["question".to_string()],
+            },
+        ];
+        let skill = generate_skill_with_tools(&store, None, None, &tool_docs).unwrap();
+        // Dynamic tables should be present
+        assert!(skill.contains("### Core retrieval"));
+        assert!(skill.contains("### Analysis"));
+        assert!(skill.contains("### Investigation"));
+        assert!(skill.contains("| `brain_context` |"));
+        assert!(skill.contains("| `brain_impact` |"));
+        assert!(skill.contains("| `investigate` |"));
+        // Legacy-only categories should NOT be present since we didn't provide them
+        assert!(!skill.contains("### Extensions"));
+    }
+
+    #[test]
+    fn generate_skill_with_empty_tools_falls_back_to_legacy() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let skill = generate_skill_with_tools(&store, None, None, &[]).unwrap();
+        // Legacy tables include Extensions section
+        assert!(skill.contains("### Extensions"));
+        assert!(skill.contains("set_extension"));
     }
 }

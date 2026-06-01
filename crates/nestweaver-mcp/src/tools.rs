@@ -163,6 +163,80 @@ pub fn tool_list(lite: bool) -> Value {
     json!({ "tools": tools })
 }
 
+/// Returns structured documentation metadata for every registered tool.
+///
+/// Each entry is `(name, category, purpose, key_params)`. The category mapping
+/// is maintained here alongside the tool schemas so it stays in sync with
+/// `tool_list()`. The binary crate bridges these entries into the engine's
+/// `ToolDocEntry` for dynamic guide generation.
+pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
+    let categories: &[(&str, &str)] = &[
+        ("brain_context", "Core retrieval"),
+        ("brain_search", "Core retrieval"),
+        ("note_get", "Core retrieval"),
+        ("backlinks", "Core retrieval"),
+        ("project_context", "Core retrieval"),
+        ("brain_impact", "Analysis"),
+        ("flow_trace", "Analysis"),
+        ("detect_changes", "Analysis"),
+        ("cross_repo_contracts", "Analysis"),
+        ("clusters", "Analysis"),
+        ("dead_code", "Analysis"),
+        ("hub_nodes", "Analysis"),
+        ("bridge_nodes", "Analysis"),
+        ("blast_radius", "Analysis"),
+        ("affected_tests", "Analysis"),
+        ("contract_drift", "Analysis"),
+        ("investigate", "Investigation"),
+        ("investigate_expand", "Investigation"),
+        ("investigate_hydrate", "Investigation"),
+        ("brain_status", "Status & maintenance"),
+        ("stale_check", "Status & maintenance"),
+        ("brain_diff", "Status & maintenance"),
+        ("brain_guide", "Status & maintenance"),
+        ("brain_add_source", "Status & maintenance"),
+        ("get_summary", "Status & maintenance"),
+        ("read_symbols", "Code search"),
+        ("regex_search", "Code search"),
+        ("count_patterns", "Code search"),
+        ("set_extension", "Extensions"),
+        ("query_extensions", "Extensions"),
+        ("brain_broken_links", "Vault health"),
+        ("brain_orphan_documents", "Vault health"),
+        ("brain_topic_clusters", "Vault health"),
+        ("brain_tag_graph", "Vault health"),
+        ("brain_doc_stats", "Vault health"),
+        ("brain_memory_lint", "Memory"),
+        ("brain_memory_consolidate", "Memory"),
+        ("brain_memory_related", "Memory"),
+    ];
+
+    let cat_map: std::collections::HashMap<&str, &str> = categories.iter().copied().collect();
+
+    let tools_json = tool_list(false);
+    let tools = tools_json["tools"].as_array().unwrap();
+
+    tools
+        .iter()
+        .map(|t| {
+            let name = t["name"].as_str().unwrap().to_string();
+            let desc = t["description"].as_str().unwrap_or("");
+            // Take just the first sentence/line as purpose
+            let purpose = desc.split('\n').next().unwrap_or(desc).to_string();
+            let category = cat_map.get(name.as_str()).unwrap_or(&"Other").to_string();
+            let key_params: Vec<String> = t["inputSchema"]["required"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, category, purpose, key_params)
+        })
+        .collect()
+}
+
 /// Dispatch a `tools/call` to the named tool. The optional `tantivy`
 /// index, when present, drives hybrid retrieval in `brain_context` and
 /// upgrades `brain_search` from substring to BM25.
@@ -5034,5 +5108,24 @@ mod cache_dispatch_tests {
             cache.is_empty(),
             "write tools must never populate the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_doc_tests {
+    use super::*;
+
+    #[test]
+    fn all_tools_have_doc_categories() {
+        let entries = tool_doc_entries();
+        let tool_count = tool_list(false)["tools"].as_array().unwrap().len();
+        assert_eq!(
+            entries.len(),
+            tool_count,
+            "doc entries must cover all tools"
+        );
+        for (name, cat, _, _) in &entries {
+            assert_ne!(cat, "Other", "tool {name} is missing a category assignment");
+        }
     }
 }

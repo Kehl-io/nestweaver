@@ -1,6 +1,8 @@
 use std::io::Write as IoWrite;
 use std::path::Path;
 
+const DEPRECATED_MCP_ARGS: &[&str] = &["--allow-mcp-add-sources"];
+
 struct ToolSetup {
     name: &'static str,
     detected: bool,
@@ -11,6 +13,7 @@ pub fn run_setup(
     db_path: &Path,
     force_all: bool,
     allow_writes: bool,
+    force_overwrite: bool,
 ) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
 
@@ -41,8 +44,8 @@ pub fn run_setup(
 
         any_configured = true;
         match t.name {
-            "claude-code" => setup_claude_code(db_path, allow_writes)?,
-            "cursor" => setup_cursor(db_path, allow_writes)?,
+            "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite)?,
+            "cursor" => setup_cursor(db_path, allow_writes, force_overwrite)?,
             "codex" => setup_codex(db_path, allow_writes)?,
             "windsurf" => setup_windsurf(db_path, allow_writes)?,
             "jetbrains" => setup_jetbrains(db_path, allow_writes)?,
@@ -175,7 +178,11 @@ fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
     serde_json::json!(args)
 }
 
-fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_claude_code(
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".claude")?;
     let mcp_path = Path::new(".mcp.json");
     let db_str = db_path.to_string_lossy();
@@ -186,10 +193,13 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::E
     let merged = merge_json_mcp(mcp_path, "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".claude/skills/nestweaver")?;
-    std::fs::write(
-        ".claude/skills/nestweaver/SKILL.md",
-        generate_skill_content(),
-    )?;
+    let skill_path = Path::new(".claude/skills/nestweaver/SKILL.md");
+    let skill_status = if skill_path.exists() && !force_overwrite {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(skill_path, generate_skill_content())?;
+        "skill written"
+    };
 
     print_result(
         "Claude Code",
@@ -202,13 +212,17 @@ fn setup_claude_code(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::E
                     "already configured"
                 },
             ),
-            (".claude/skills/nestweaver/SKILL.md", "skill written"),
+            (".claude/skills/nestweaver/SKILL.md", skill_status),
         ],
     );
     Ok(())
 }
 
-fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_cursor(
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".cursor")?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
@@ -218,10 +232,13 @@ fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
     let merged = merge_json_mcp(Path::new(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
     std::fs::create_dir_all(".cursor/rules")?;
-    std::fs::write(
-        ".cursor/rules/nestweaver.mdc",
-        generate_cursor_rule_content(),
-    )?;
+    let rule_path = Path::new(".cursor/rules/nestweaver.mdc");
+    let rule_status = if rule_path.exists() && !force_overwrite {
+        "already exists (not overwritten)"
+    } else {
+        std::fs::write(rule_path, generate_cursor_rule_content())?;
+        "agent rules written"
+    };
 
     print_result(
         "Cursor",
@@ -234,7 +251,7 @@ fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
                     "already configured"
                 },
             ),
-            (".cursor/rules/nestweaver.mdc", "agent rules written"),
+            (".cursor/rules/nestweaver.mdc", rule_status),
         ],
     );
     Ok(())
@@ -643,24 +660,60 @@ fn merge_json_mcp(
         serde_json::json!({})
     };
 
-    let servers = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?
-        .entry("mcpServers")
-        .or_insert(serde_json::json!({}));
+    {
+        let servers = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?
+            .entry("mcpServers")
+            .or_insert(serde_json::json!({}));
 
-    if servers.get(server_name).is_some() {
-        return Ok(false); // already configured
+        if servers.get(server_name).is_none() {
+            servers
+                .as_object_mut()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mcpServers is not an object in {}", path.display())
+                })?
+                .insert(server_name.to_string(), config.clone());
+
+            // Drop borrow of root before serializing
+            let json = serde_json::to_string_pretty(&root)?;
+            std::fs::write(path, json)?;
+            return Ok(true);
+        }
     }
 
-    servers
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcpServers is not an object in {}", path.display()))?
-        .insert(server_name.to_string(), config.clone());
+    // Server already exists — check for and strip deprecated args.
+    let mut stripped: Vec<String> = Vec::new();
+    {
+        let root_obj = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config at {} is not a JSON object", path.display()))?;
+        if let Some(server_entry) = root_obj
+            .get_mut("mcpServers")
+            .and_then(|s| s.as_object_mut())
+            .and_then(|s| s.get_mut(server_name))
+            && let Some(args) = server_entry.get_mut("args").and_then(|a| a.as_array_mut())
+        {
+            args.retain(|arg| {
+                let arg_str = arg.as_str().unwrap_or("");
+                let is_deprecated = DEPRECATED_MCP_ARGS.contains(&arg_str);
+                if is_deprecated {
+                    stripped.push(arg_str.to_string());
+                }
+                !is_deprecated
+            });
+        }
+    }
 
-    let json = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, json)?;
-    Ok(true)
+    if !stripped.is_empty() {
+        let json = serde_json::to_string_pretty(&root)?;
+        std::fs::write(path, json)?;
+        for flag in &stripped {
+            eprintln!("  (stripped deprecated flag: {flag})");
+        }
+    }
+
+    Ok(false)
 }
 
 /// Append a TOML section to a file only if the section marker is not already present.
@@ -685,127 +738,28 @@ fn append_toml_if_missing(
 // ── Content generators ────────────────────────────────────────────────────────
 
 fn generate_skill_content() -> String {
-    "\
----
-name: nestweaver
-description: |
-  Use when exploring codebase structure, understanding dependencies, analyzing
-  change impact, navigating architecture, or retrieving knowledge-vault notes.
-  Do NOT use for simple text search, file reading, or tasks unrelated to code
-  structure and project knowledge.
----
+    // Build tool documentation dynamically from the MCP tool registry so
+    // newly added tools automatically appear in the generated SKILL.md.
+    let entries = nestweaver_mcp::tools::tool_doc_entries();
+    let tool_docs: Vec<nestweaver_engine::ToolDocEntry> = entries
+        .into_iter()
+        .map(
+            |(name, category, purpose, key_params)| nestweaver_engine::ToolDocEntry {
+                name,
+                category,
+                purpose,
+                key_params,
+            },
+        )
+        .collect();
 
-## When to activate
-
-Activate this skill when the task involves:
-
-- Understanding how a function, module, or file fits into the codebase
-- Checking what will break before modifying a symbol (blast radius)
-- Tracing call chains or execution flow from an entry point
-- Navigating cross-repository dependencies or shared contracts
-- Retrieving project knowledge from Obsidian vaults or markdown notes
-- Getting a structural overview of the architecture
-- Assessing risk of a set of changed files before commit
-- Detecting dead or unused code
-- Finding architectural hotspots or chokepoints
-
-Do NOT activate when:
-
-- The user just wants to read a specific file (use normal file reading)
-- The task is plain text search with no structural intent (use grep/ripgrep)
-- The question is about runtime behavior, logs, or deployment
-
-## Key concepts
-
-- **Seeds**: Starting points for a graph walk. Can be symbol names, note titles, tag names (with or without `#`), free-text terms, or UIDs (`sym:`, `note:`, `head:`, `sec:`, `tag:`).
-- **PPR (Personalized PageRank)**: Walks the code+notes graph from seeds and scores every reachable node by structural proximity.
-- **Intent**: The `intent` parameter on `brain_context`/`project_context` tunes PPR edge weights for specific query types (e.g. `find-definition`, `find-callers`).
-- **Context**: A token-budgeted, PPR-ranked list of symbols, notes, and sections relevant to given seeds.
-- **Brain**: The unified graph combining code symbols and markdown vault notes.
-- **Vault**: An indexed collection of markdown notes (e.g. an Obsidian vault). Use `.brainignore` for glob exclusion patterns.
-- **Edge types**: CALLS (function calls), IMPORTS, USES (type references), ACCESSES (field access). PPR weights each differently.
-- **Confidence**: A 0.0\u{2013}1.0 score on edges indicating resolver certainty about a relationship.
-
-## Available MCP tools
-
-### Core retrieval
-
-| Tool | Purpose |
-|------|---------|
-| `brain_context` | PPR-ranked context from seeds. **Call this first** for any structural question. Supports `intent` parameter. |
-| `brain_search` | BM25 full-text search across code symbols, notes, headings, sections, and tags. |
-| `project_context` | PPR-ranked context scoped to a named project. Supports `intent` parameter. |
-| `note_get` | Full markdown body of a specific note. |
-| `backlinks` | All notes that wikilink TO a target note. |
-| `get_summary` | Hierarchical code summaries at symbol, file, or cluster level. Token-efficient overview. |
-
-### Analysis
-
-| Tool | Purpose |
-|------|---------|
-| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. |
-| `flow_trace` | Forward call chain from a symbol. |
-| `detect_changes` | Risk assessment for a list of changed files. |
-| `blast_radius` | Analyze blast radius of a symbol change with risk scoring. |
-| `dead_code` | Detect unreachable symbols via entry point reachability analysis. |
-| `hub_nodes` | Most connected hub nodes by degree centrality and PageRank. |
-| `bridge_nodes` | Architectural chokepoints by betweenness centrality. |
-| `cross_repo_contracts` | Symbols shared across repositories. |
-| `clusters` | Functional communities detected by the Leiden algorithm. |
-
-### Status and maintenance
-
-| Tool | Purpose |
-|------|---------|
-| `brain_status` | Counts of vaults, notes, symbols, repos. Includes interaction tracking status when enabled. |
-| `interactions_status` | Show interaction memory stats (query count, top accessed symbols, memory age). Requires `--track-interactions`. |
-| `interactions_clear` | Wipe all interaction memory data. Requires `--track-interactions`. |
-| `stale_check` | Compare indexed SHA to current git HEAD. |
-| `brain_diff` | Files and symbols changed since a given SHA. |
-| `brain_guide` | Auto-generated architecture overview. |
-| `brain_add_source` | Index a new repo or vault at runtime. |
-| `set_extension` | Attach custom metadata to graph nodes. |
-| `query_extensions` | Query custom metadata on graph nodes. |
-
-## Common workflows
-
-### Understanding a function
-
-1. `brain_context` with the function name as a seed.
-2. `flow_trace` for forward call chain.
-3. `brain_impact` for callers/dependents.
-
-### Before modifying code
-
-1. `brain_impact` on the symbol you plan to change.
-2. `detect_changes` with the list of files you expect to modify.
-3. `cross_repo_contracts` if the symbol may be shared across services.
-
-### Assessing dead code
-
-1. `dead_code` to find unreachable symbols across the codebase.
-2. `brain_context` on flagged symbols to verify they are truly unused.
-3. Remove confirmed dead code with confidence.
-
-### Architecture overview
-
-1. `hub_nodes` to identify the most connected symbols.
-2. `bridge_nodes` to find architectural chokepoints.
-3. `clusters` to see functional groupings.
-4. `get_summary` at cluster or file level for a token-efficient overview.
-
-## Tips
-
-- **Multi-repo indexing**: Use `nestweaver index --repo ./path --name my-repo` to assign a custom repo name. This keeps repos distinct when indexing multiple repositories into one database.
-- **External MCP servers**: Configure `timeout_secs` in your instance config (default 30s):
-  ```toml
-  [[mcp_servers]]
-  name = \"wiki-mcp\"
-  command = \"wiki-mcp\"
-  timeout_secs = 60
-  ```
-"
-    .to_string()
+    // We don't have a GraphStore here (setup runs before indexing), so use
+    // an in-memory store. The skill content doesn't depend on indexed data —
+    // only tool metadata and static prose.
+    let store = nestweaver_store::GraphStore::in_memory()
+        .expect("in-memory GraphStore should always succeed");
+    nestweaver_engine::generate_skill_with_tools(&store, None, None, &tool_docs)
+        .expect("generate_skill_with_tools should not fail on empty store")
 }
 
 fn generate_cursor_rule_content() -> String {
@@ -821,35 +775,46 @@ If using many MCP servers, pass `--tools` to the NestWeaver server to allowlist 
 }
 
 fn generate_copilot_instructions() -> String {
-    "# Copilot Instructions — NestWeaver\n\n\
+    let entries = nestweaver_mcp::tools::tool_doc_entries();
+    let tool_count = entries.len();
+
+    let mut out = format!(
+        "# Copilot Instructions — NestWeaver\n\n\
     > Auto-generated by NestWeaver. Provides codebase intelligence via MCP.\n\n\
-    ## Available MCP Tools (22)\n\n\
-    ### Core retrieval\n\
-    - **brain_context** — PPR-ranked context from seeds (supports `intent` parameter)\n\
-    - **brain_search** — BM25 full-text search across code symbols, notes, headings, sections, and tags\n\
-    - **project_context** — Project-scoped PPR context (supports `intent` parameter)\n\
-    - **note_get** — Full markdown body of a specific note\n\
-    - **backlinks** — Notes that wikilink to a target note\n\
-    - **get_summary** — Hierarchical code summaries (symbol/file/cluster level)\n\n\
-    ### Analysis\n\
-    - **brain_impact** — Reverse dependency blast radius, grouped by depth\n\
-    - **flow_trace** — Forward call chain from a symbol\n\
-    - **detect_changes** — Risk assessment for a list of changed files\n\
-    - **blast_radius** — Symbol change blast radius with risk scoring\n\
-    - **dead_code** — Detect unreachable symbols via entry point reachability\n\
-    - **hub_nodes** — Most connected nodes by degree centrality and PageRank\n\
-    - **bridge_nodes** — Architectural chokepoints by betweenness centrality\n\
-    - **cross_repo_contracts** — Symbols shared across repositories\n\
-    - **clusters** — Functional communities (Leiden algorithm)\n\n\
-    ### Status and maintenance\n\
-    - **brain_status** — Vault, note, symbol, and repo counts (includes interaction tracking status when enabled)\n\
-    - **stale_check** — Compare indexed SHA to current git HEAD\n\
-    - **brain_diff** — Files and symbols changed since a given SHA\n\
-    - **brain_guide** — Auto-generated architecture overview\n\
-    - **brain_add_source** — Index a new repo or vault at runtime\n\
-    - **set_extension** — Attach custom metadata to graph nodes\n\
-    - **query_extensions** — Query custom metadata on graph nodes\n\n\
-    ## When to Use\n\n\
+    ## Available MCP Tools ({tool_count})\n\n"
+    );
+
+    // Group by category for the copilot instructions
+    let category_order = [
+        "Core retrieval",
+        "Analysis",
+        "Investigation",
+        "Code search",
+        "Status & maintenance",
+        "Extensions",
+        "Vault health",
+        "Memory",
+    ];
+    type DocEntry = (String, String, String, Vec<String>);
+    let mut by_category: std::collections::BTreeMap<String, Vec<&DocEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in &entries {
+        by_category.entry(entry.1.clone()).or_default().push(entry);
+    }
+
+    for category in &category_order {
+        if let Some(tools) = by_category.get(*category) {
+            out.push_str(&format!("    ### {category}\n"));
+            for (name, _cat, purpose, _params) in tools {
+                let short: String = purpose.chars().take(80).collect();
+                out.push_str(&format!("    - **{name}** — {short}\n"));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str(
+        "    ## When to Use\n\n\
     - Starting a task: call `brain_context` with task keywords\n\
     - Before modifying code: call `brain_impact` on the function\n\
     - Exploring unfamiliar code: call `brain_search`\n\
@@ -859,42 +824,31 @@ fn generate_copilot_instructions() -> String {
     When the MCP server is started with `--track-interactions`, NestWeaver learns from agent \
     query patterns to improve retrieval ranking over time. Opt-in, local-only, records UIDs \
     and timestamps only — no content is captured. Use `interactions status` to view memory stats \
-    and `interactions clear` to wipe interaction data.\n"
-        .to_string()
+    and `interactions clear` to wipe interaction data.\n",
+    );
+    out
 }
 
 fn generate_agents_md_content() -> String {
-    "# AGENTS.md — Codebase Intelligence Guide\n\n\
+    let entries = nestweaver_mcp::tools::tool_doc_entries();
+    let tool_count = entries.len();
+
+    let mut out = format!(
+        "# AGENTS.md — Codebase Intelligence Guide\n\n\
 > Auto-generated by NestWeaver. This file helps AI agents understand the codebase structure.\n\
-> NestWeaver provides 22 MCP tools for code intelligence. Run `nestweaver mcp` to start the server.\n\
+> NestWeaver provides {tool_count} MCP tools for code intelligence. Run `nestweaver mcp` to start the server.\n\
 > Run `nestweaver setup` to configure MCP for your AI tool.\n\n\
 ## Available Tools\n\n\
 | Tool | Description |\n\
-|------|-------------|\n\
-| brain_context | PPR-ranked context for a task |\n\
-| brain_search | Full-text search across code symbols, notes, headings, sections, and tags |\n\
-| brain_impact | Blast radius analysis |\n\
-| brain_guide | Architecture overview |\n\
-| project_context | Project-scoped retrieval |\n\
-| detect_changes | Risk assessment for changes |\n\
-| brain_status | Index status and staleness |\n\
-| interactions status | Show interaction memory stats |\n\
-| interactions clear | Wipe interaction memory data |\n\
-| stale_check | Check if re-indexing is needed |\n\
-| flow_trace | Execution flow tracing |\n\
-| note_get | Retrieve vault notes |\n\
-| backlinks | Find notes linking to a target |\n\
-| brain_diff | Graph change detection |\n\
-| clusters | Community detection results |\n\
-| cross_repo_contracts | Cross-repo relationships |\n\
-| brain_add_source | Index new sources at runtime |\n\
-| set_extension | Attach custom metadata |\n\
-| query_extensions | Query custom metadata |\n\
-| dead_code | Detect unreachable symbols via entry point reachability |\n\
-| hub_nodes | Show most connected hub nodes by degree centrality |\n\
-| bridge_nodes | Show architectural bridge/chokepoint nodes |\n\
-| blast_radius | Analyze blast radius of a symbol change |\n\
-| get_summary | Retrieve hierarchical code summaries |\n".to_string()
+|------|-------------|\n"
+    );
+
+    for (name, _category, purpose, _key_params) in &entries {
+        // Take just the first sentence for the table
+        let short: String = purpose.chars().take(80).collect();
+        out.push_str(&format!("| {name} | {short} |\n"));
+    }
+    out
 }
 
 // ── Display helpers ───────────────────────────────────────────────────────────
