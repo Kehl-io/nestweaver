@@ -2277,7 +2277,7 @@ fn tool_brain_status(
 fn tool_schema_brain_add_source() -> Value {
     json!({
         "name": "brain_add_source",
-        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first. This tool requires the MCP server to be started with --allow-mcp-add-sources; it will return an error if that flag was not set.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
+        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2295,8 +2295,8 @@ fn tool_schema_brain_add_source() -> Value {
 fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     if !ALLOW_ADD_SOURCES.with(|c| c.get()) {
         return Err(anyhow!(
-            "brain_add_source is disabled. Start the MCP server with \
-             --allow-mcp-add-sources to enable runtime source indexing."
+            "brain_add_source is disabled in --no-daemon mode. \
+             Use daemon mode (the default) or pass --allow-mcp-add-sources."
         ));
     }
     let raw_path = args
@@ -4192,6 +4192,352 @@ pub fn set_track_interactions(track: bool) {
 
 pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
+}
+
+// ── Daemon proxy dispatch ─────────────────────────────────────────────────
+
+/// The tonic-generated gRPC client type for the `NestWeaverDaemon` service.
+/// Re-exported so callers (e.g. `main.rs`) can construct it and pass it in
+/// without depending on `nestweaver-proto` directly.
+#[cfg(feature = "daemon")]
+pub type DaemonGrpcClient =
+    nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>;
+
+/// Dispatch an MCP tool call through the daemon gRPC service instead of
+/// opening the DB directly. Maps each MCP tool name to the corresponding
+/// gRPC RPC on the `NestWeaverDaemon` service.
+///
+/// The caller is responsible for connecting the gRPC client (typically via
+/// `nestweaver_client::DaemonClient`) and passing the inner tonic client.
+#[cfg(feature = "daemon")]
+pub fn dispatch_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    use nestweaver_proto::JsonRequest;
+
+    let args_json = serde_json::to_string(&args)?;
+
+    // brain_add_source is special: it maps to IndexRepo or IndexVault
+    // (streaming RPCs) depending on the path content.
+    if name == "brain_add_source" {
+        return dispatch_add_source_via_daemon(client, rt, args);
+    }
+
+    // Helper to parse string arrays from JSON args.
+    let str_array = |key: &str| -> Vec<String> {
+        args.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let str_field = |key: &str| -> String {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let i32_field =
+        |key: &str| -> i32 { args.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+    let bool_field =
+        |key: &str| -> bool { args.get(key).and_then(|v| v.as_bool()).unwrap_or(false) };
+    let f64_field = |key: &str| -> f64 { args.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) };
+
+    let result_json: String = rt.block_on(async {
+        match name {
+            // ── Typed hot-path RPCs ──────────────────────────────────
+            "brain_search" => {
+                use nestweaver_proto::BrainSearchRequest;
+                let req = tonic::Request::new(BrainSearchRequest {
+                    query: str_field("query"),
+                    limit: i32_field("limit"),
+                    response_format: str_field("response_format"),
+                    include_bodies: bool_field("include_bodies"),
+                    prf: bool_field("prf"),
+                    rerank: bool_field("rerank"),
+                    root: str_field("root"),
+                });
+                let resp = client
+                    .search(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let inner = resp.into_inner();
+                // Serialize the typed response back to JSON.
+                let results: Vec<serde_json::Value> = inner
+                    .results
+                    .iter()
+                    .map(|r| {
+                        let mut obj = serde_json::json!({
+                            "uid": r.uid,
+                            "kind": r.kind,
+                            "title": r.title,
+                            "score": r.score,
+                            "location": r.location,
+                            "matched_headings": r.matched_headings,
+                        });
+                        if !r.inline_body.is_empty() {
+                            obj["inline_body"] = serde_json::json!(r.inline_body);
+                        }
+                        obj
+                    })
+                    .collect();
+                let value = serde_json::json!({
+                    "query": inner.query,
+                    "engine": inner.engine,
+                    "total_matches": inner.total_matches,
+                    "results": results,
+                });
+                Ok(serde_json::to_string(&value)?)
+            }
+            "brain_context" => {
+                use nestweaver_proto::BrainContextRequest;
+                let req = tonic::Request::new(BrainContextRequest {
+                    seeds: str_array("seeds"),
+                    token_budget: i32_field("token_budget"),
+                    response_format: str_field("response_format"),
+                    repos: str_array("repos"),
+                    vaults: str_array("vaults"),
+                    kinds: str_array("kinds"),
+                    path_prefix: str_field("path_prefix"),
+                    tags: str_array("tags"),
+                    exclude_tags: str_array("exclude_tags"),
+                    weight_ppr: f64_field("weight_ppr"),
+                    weight_bm25: f64_field("weight_bm25"),
+                    intent: str_field("intent"),
+                    include_seeds: bool_field("include_seeds"),
+                    include_bodies: bool_field("include_bodies"),
+                    root: str_field("root"),
+                    prf: bool_field("prf"),
+                    rerank: bool_field("rerank"),
+                });
+                let resp = client
+                    .get_context(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                Ok(resp.into_inner().result_json)
+            }
+            "project_context" => {
+                use nestweaver_proto::ProjectContextRequest;
+                let req = tonic::Request::new(ProjectContextRequest {
+                    project: str_field("project"),
+                    token_budget: i32_field("token_budget"),
+                    kinds: str_array("kinds"),
+                    include_components: bool_field("include_components"),
+                    intent: str_field("intent"),
+                    include_seeds: bool_field("include_seeds"),
+                });
+                let resp = client
+                    .get_project_context(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                Ok(resp.into_inner().result_json)
+            }
+            "note_get" => {
+                use nestweaver_proto::NoteGetRequest;
+                let req = tonic::Request::new(NoteGetRequest {
+                    uid: str_field("uid"),
+                    title: str_field("title"),
+                    include_body: bool_field("include_body"),
+                    sections: str_array("sections"),
+                });
+                let resp = client
+                    .get_note(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let inner = resp.into_inner();
+                let mut value = serde_json::json!({
+                    "uid": inner.uid,
+                    "title": inner.title,
+                    "path": inner.path,
+                    "note_kind": inner.note_kind,
+                    "word_count": inner.word_count,
+                    "section_count": inner.section_count,
+                });
+                if !inner.body.is_empty() {
+                    value["body"] = serde_json::json!(inner.body);
+                }
+                Ok(serde_json::to_string(&value)?)
+            }
+            "brain_status" => {
+                use nestweaver_proto::BrainStatusRequest;
+                let req = tonic::Request::new(BrainStatusRequest {});
+                let resp = client
+                    .brain_status(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let inner = resp.into_inner();
+                let value = serde_json::json!({
+                    "vault_count": inner.vault_count,
+                    "notes": inner.notes,
+                    "headings": inner.headings,
+                    "sections": inner.sections,
+                    "tags": inner.tags,
+                    "wikilinks": inner.wikilinks,
+                    "repo_count": inner.repo_count,
+                    "tantivy_available": inner.tantivy_available,
+                    "tantivy_doc_count": inner.tantivy_doc_count,
+                });
+                Ok(serde_json::to_string(&value)?)
+            }
+            "hub_nodes" => {
+                use nestweaver_proto::HubNodesRequest;
+                let req = tonic::Request::new(HubNodesRequest {
+                    top_n: i32_field("top_n"),
+                    response_format: str_field("response_format"),
+                });
+                let resp = client
+                    .hub_nodes(req)
+                    .await
+                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                Ok(resp.into_inner().result_json)
+            }
+            // ── JSON pass-through RPCs ───────────────────────────────
+            other => {
+                let req = tonic::Request::new(JsonRequest {
+                    args_json: args_json.clone(),
+                });
+                let resp = match other {
+                    "backlinks" => client.get_backlinks(req).await,
+                    "brain_impact" => client.impact(req).await,
+                    "brain_guide" => client.brain_guide(req).await,
+                    "flow_trace" => client.flow_trace(req).await,
+                    "blast_radius" => client.blast_radius(req).await,
+                    "detect_changes" => client.detect_changes(req).await,
+                    "brain_diff" => client.brain_diff(req).await,
+                    "read_symbols" => client.read_symbols(req).await,
+                    "regex_search" => client.regex_search(req).await,
+                    "count_patterns" => client.count_patterns(req).await,
+                    "cross_repo_contracts" => client.cross_repo_contracts(req).await,
+                    "contract_drift" => client.contract_drift(req).await,
+                    "dead_code" => client.dead_code(req).await,
+                    "brain_broken_links" => client.brain_broken_links(req).await,
+                    "brain_orphan_documents" => client.brain_orphan_documents(req).await,
+                    "brain_topic_clusters" => client.brain_topic_clusters(req).await,
+                    "brain_tag_graph" => client.brain_tag_graph(req).await,
+                    "brain_doc_stats" => client.brain_doc_stats(req).await,
+                    "brain_memory_lint" => client.brain_memory_lint(req).await,
+                    "brain_memory_consolidate" => client.brain_memory_consolidate(req).await,
+                    "brain_memory_related" => client.brain_memory_related(req).await,
+                    "affected_tests" => client.affected_tests(req).await,
+                    "clusters" => client.clusters(req).await,
+                    "stale_check" => client.stale_check(req).await,
+                    "bridge_nodes" => client.bridge_nodes(req).await,
+                    "get_summary" => client.get_summary(req).await,
+                    "investigate" => client.investigate(req).await,
+                    "investigate_expand" => client.investigate_expand(req).await,
+                    "investigate_hydrate" => client.investigate_hydrate(req).await,
+                    "set_extension" => client.set_extension(req).await,
+                    "query_extensions" => client.query_extensions(req).await,
+                    unknown => {
+                        return Err(anyhow::anyhow!(
+                            "unknown tool for daemon dispatch: {unknown}"
+                        ));
+                    }
+                };
+                let resp = resp.map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                Ok(resp.into_inner().result_json)
+            }
+        }
+    })?;
+
+    serde_json::from_str(&result_json).map_err(Into::into)
+}
+
+/// Handle `brain_add_source` by routing to `IndexRepo` or `IndexVault`
+/// streaming RPCs. Detection order matches the non-daemon path:
+/// 1. `.git/` present → code repo (IndexRepo)
+/// 2. `.obsidian/` present OR contains `.md` files → vault/markdown (IndexVault)
+#[cfg(feature = "daemon")]
+fn dispatch_add_source_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    use tokio_stream::StreamExt;
+
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
+        .to_string();
+
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let resolved = std::path::Path::new(&path);
+    let is_repo = resolved.join(".git").exists();
+    let is_vault = !is_repo
+        && (resolved.join(".obsidian").exists()
+            || std::fs::read_dir(resolved)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                })
+                .unwrap_or(false));
+
+    rt.block_on(async {
+        if is_vault || !is_repo {
+            let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
+                vault_path: path.clone(),
+                vault_name: name,
+                extra_ignore_patterns: vec![],
+            });
+            let mut stream = client
+                .index_vault(req)
+                .await
+                .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
+                .into_inner();
+
+            let mut last_msg = String::new();
+            while let Some(progress) = stream.next().await {
+                let progress =
+                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                last_msg = progress.message;
+            }
+            Ok(serde_json::json!({
+                "status": "indexed",
+                "path": path,
+                "type": "vault",
+                "message": last_msg,
+            }))
+        } else {
+            let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
+                repo_path: path.clone(),
+                name,
+                force: false,
+                with_trigrams: false,
+                with_git_activity: false,
+            });
+            let mut stream = client
+                .index_repo(req)
+                .await
+                .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
+                .into_inner();
+
+            let mut last_msg = String::new();
+            while let Some(progress) = stream.next().await {
+                let progress =
+                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
+                last_msg = progress.message;
+            }
+            Ok(serde_json::json!({
+                "status": "indexed",
+                "path": path,
+                "type": "repo",
+                "message": last_msg,
+            }))
+        }
+    })
 }
 
 // ── F10: investigate bundle primitive ─────────────────────────────────────

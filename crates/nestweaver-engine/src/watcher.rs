@@ -292,6 +292,21 @@ impl BrainWatcher {
             // refresh doesn't re-query the DB for every file.
             let symbol_index = crate::cross_domain::build_symbol_index(&store).ok();
 
+            // Pre-build the wikilink title lookup once per batch so
+            // reinsert_note doesn't re-query all notes for every file.
+            // Uses a bidirectional map: title→UIDs (forward) + UID→title
+            // (reverse) for O(1) removal on rename.
+            let mut title_forward: HashMap<String, Vec<String>> = HashMap::new();
+            let mut title_reverse: HashMap<String, String> = HashMap::new();
+            for n in store.list_notes(None).unwrap_or_default() {
+                let key = n.title.to_lowercase();
+                title_forward
+                    .entry(key.clone())
+                    .or_default()
+                    .push(n.uid.clone());
+                title_reverse.insert(n.uid.clone(), key);
+            }
+
             let mut any_change = false;
             for event in batch {
                 match self.handle_event(
@@ -300,6 +315,8 @@ impl BrainWatcher {
                     &v_uid,
                     event,
                     symbol_index.as_ref(),
+                    &mut title_forward,
+                    &mut title_reverse,
                 ) {
                     Ok(outcome) => {
                         if matches!(
@@ -349,6 +366,7 @@ impl BrainWatcher {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_event(
         &self,
         store: &GraphStore,
@@ -356,6 +374,8 @@ impl BrainWatcher {
         v_uid: &str,
         event: DebouncedEvent,
         symbol_index: Option<&crate::cross_domain::SymbolIndex>,
+        title_forward: &mut HashMap<String, Vec<String>>,
+        title_reverse: &mut HashMap<String, String>,
     ) -> Result<UpdateOutcome, anyhow::Error> {
         let path = event.path;
 
@@ -477,8 +497,32 @@ impl BrainWatcher {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed = parse_markdown(&rel_path, &source)?;
 
-        let (headings, sections, wikilinks_count, tags_count) =
-            reinsert_note(store, v_uid, &n_uid, &path, &rel_path, &parsed, event.kind)?;
+        let (headings, sections, wikilinks_count, tags_count) = reinsert_note(
+            store,
+            v_uid,
+            &n_uid,
+            &path,
+            &rel_path,
+            &parsed,
+            event.kind,
+            title_forward,
+        )?;
+
+        // Update bidirectional title lookup: O(1) removal via reverse map.
+        if let Some(old_title) = title_reverse.remove(&n_uid)
+            && let Some(uids) = title_forward.get_mut(&old_title)
+        {
+            uids.retain(|u| u != &n_uid);
+            if uids.is_empty() {
+                title_forward.remove(&old_title);
+            }
+        }
+        let new_title = parsed.title.to_lowercase();
+        title_forward
+            .entry(new_title.clone())
+            .or_default()
+            .push(n_uid.clone());
+        title_reverse.insert(n_uid.clone(), new_title);
 
         // Refresh cross-domain (Note↔Symbol) edges for this note. The
         // store's delete_note_cascade already DETACH-deleted any prior
@@ -638,6 +682,7 @@ fn reinsert_note(
     rel_path: &str,
     parsed: &ParsedNote,
     _event_kind: DebouncedEventKind,
+    title_lookup: &HashMap<String, Vec<String>>,
 ) -> Result<(usize, usize, usize, usize), anyhow::Error> {
     // ── Note + VAULT_HAS_NOTE ───────────────────────────────────────────
     let frontmatter_json = if parsed
@@ -815,18 +860,8 @@ fn reinsert_note(
     store.batch_insert_section_tag_edges(&st_refs)?;
     let tags_count = local_tag_uids.len();
 
-    // ── Wikilinks (per-file: resolve against the in-DB note list) ───────
+    // ── Wikilinks (per-file: resolve against the pre-built title lookup) ─
     let mut wl_resolved = 0usize;
-    let all_notes = store.list_notes(None).unwrap_or_default();
-    let title_lookup: HashMap<String, Vec<String>> = {
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for n in &all_notes {
-            map.entry(n.title.to_lowercase())
-                .or_default()
-                .push(n.uid.clone());
-        }
-        map
-    };
     let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
     let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
 

@@ -352,6 +352,20 @@ impl GraphStore {
         iterations: u32,
         scope: &GraphScope,
     ) -> Result<(), StoreError> {
+        self.compute_pagerank_warm(damping, iterations, scope, None)
+    }
+
+    /// Compute PageRank with optional warm-start from previous scores.
+    /// When `warm_start` is provided, known nodes initialize from their
+    /// previous score instead of uniform — convergence is faster when only
+    /// a small fraction of nodes/edges changed.
+    pub fn compute_pagerank_warm(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+        warm_start: Option<&HashMap<String, f64>>,
+    ) -> Result<(), StoreError> {
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
@@ -359,7 +373,36 @@ impl GraphStore {
         }
 
         let init = 1.0f64 / n as f64;
-        let mut scores: Vec<f64> = vec![init; n];
+        let mut scores: Vec<f64> = match warm_start {
+            Some(prev) => {
+                let mut s = Vec::with_capacity(n);
+                let mut warm_count = 0usize;
+                for uid in &uids {
+                    if let Some(&prev_score) = prev.get(uid) {
+                        s.push(prev_score);
+                        warm_count += 1;
+                    } else {
+                        s.push(init);
+                    }
+                }
+                if warm_count > 0 {
+                    // Normalize so scores sum to 1.0 (graph size may have changed).
+                    let sum: f64 = s.iter().sum();
+                    if sum > 0.0 {
+                        for v in s.iter_mut() {
+                            *v /= sum;
+                        }
+                    }
+                    tracing::info!(
+                        warm_count,
+                        total = n,
+                        "PageRank warm-started from {warm_count}/{n} previous scores"
+                    );
+                }
+                s
+            }
+            None => vec![init; n],
+        };
         let teleport = (1.0 - damping) / n as f64;
 
         for _ in 0..iterations {
@@ -618,8 +661,10 @@ impl GraphStore {
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
     ///
     /// Scores are read from the in-memory cache populated by `compute_pagerank`.
+    /// If the cache is empty it is computed lazily on first access.
     /// If `limit` is `None`, all symbols are returned.
     pub fn symbols_by_pagerank(&self, limit: Option<usize>) -> Result<Vec<Symbol>, StoreError> {
+        self.ensure_pagerank_loaded();
         let cache = self
             .pagerank_cache
             .lock()
@@ -714,11 +759,32 @@ impl GraphStore {
     /// cache is not loaded. Used by downstream crates (engine) that need
     /// per-UID score lookups without loading full Symbol objects.
     pub fn pagerank_scores(&self) -> HashMap<String, f64> {
+        self.ensure_pagerank_loaded();
         self.pagerank_cache
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    /// Ensure the in-memory PageRank cache is populated.
+    ///
+    /// If the cache is already loaded (from a sidecar file or a previous
+    /// computation), this is a no-op.  Otherwise it computes PageRank on
+    /// demand so callers never see an empty cache after a fresh index.
+    pub fn ensure_pagerank_loaded(&self) {
+        let already_loaded = self
+            .pagerank_cache
+            .lock()
+            .map(|c| c.is_some())
+            .unwrap_or(false);
+        if already_loaded {
+            return;
+        }
+        tracing::info!("PageRank cache empty — computing lazily");
+        if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
+            tracing::warn!("lazy PageRank computation failed: {e}");
+        }
     }
 }
 

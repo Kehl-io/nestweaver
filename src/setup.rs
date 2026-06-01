@@ -160,24 +160,18 @@ fn which_exists(cmd: &str) -> bool {
 
 // ── Per-tool setup ────────────────────────────────────────────────────────────
 
-fn mcp_args(db_str: &str, allow_writes: bool) -> serde_json::Value {
-    let mut args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
-    if allow_writes {
-        args.push("--allow-mcp-add-sources".to_string());
-    }
+fn mcp_args(db_str: &str, _allow_writes: bool) -> serde_json::Value {
+    let args = vec!["mcp".to_string(), "--db".to_string(), db_str.to_string()];
     serde_json::json!(args)
 }
 
-fn mcp_args_lite(db_str: &str, allow_writes: bool) -> serde_json::Value {
-    let mut args = vec![
+fn mcp_args_lite(db_str: &str, _allow_writes: bool) -> serde_json::Value {
+    let args = vec![
         "mcp".to_string(),
         "--lite".to_string(),
         "--db".to_string(),
         db_str.to_string(),
     ];
-    if allow_writes {
-        args.push("--allow-mcp-add-sources".to_string());
-    }
     serde_json::json!(args)
 }
 
@@ -246,18 +240,13 @@ fn setup_cursor(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn setup_codex(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_codex(db_path: &Path, _allow_writes: bool) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(".codex")?;
     let db_str = db_path.to_string_lossy();
     let config_path = Path::new(".codex/config.toml");
-    let allow_writes_arg = if allow_writes {
-        ", \"--allow-mcp-add-sources\"".to_string()
-    } else {
-        String::new()
-    };
     let toml_section = format!(
-        "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"{}\"{}]\n",
-        db_str, allow_writes_arg
+        "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"{}\"]\n",
+        db_str
     );
     let merged = append_toml_if_missing(config_path, "mcp_servers.nestweaver", &toml_section)?;
 
@@ -426,26 +415,21 @@ fn setup_copilot(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error
     Ok(())
 }
 
-fn setup_aider(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_aider(db_path: &Path, _allow_writes: bool) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let config_path = Path::new(".aider.conf.yml");
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
     let merged = if existing.contains("nestweaver") {
         false
     } else {
-        let allow_writes_arg = if allow_writes {
-            " --allow-mcp-add-sources"
-        } else {
-            ""
-        };
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(config_path)?;
         file.write_all(
             format!(
-                "\n# NestWeaver code intelligence\nrepo-map: nestweaver mcp --db {}{}\n",
-                db_str, allow_writes_arg
+                "\n# NestWeaver code intelligence\nrepo-map: nestweaver mcp --db {}\n",
+                db_str
             )
             .as_bytes(),
         )?;
