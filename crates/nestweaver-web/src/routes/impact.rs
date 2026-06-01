@@ -43,6 +43,7 @@ pub async fn impact(
                 "edge_type": n.edge_type,
                 "confidence": n.confidence,
                 "depth": n.depth,
+                "impact_score": n.impact_score,
             })
         })
         .collect();

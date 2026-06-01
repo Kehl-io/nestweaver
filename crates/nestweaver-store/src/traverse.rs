@@ -1,7 +1,11 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+
+/// Minimum impact score for a node to be included in traversal results.
+/// Edges below this threshold are pruned during BFS.
+const DEFAULT_IMPACT_THRESHOLD: f64 = 0.10;
 
 /// A node returned by the impact analysis traversal.
 #[derive(Debug, Clone)]
@@ -13,6 +17,9 @@ pub struct ImpactNode {
     pub edge_type: String,
     pub confidence: f32,
     pub depth: u32,
+    /// Confidence-weighted impact score. The changed symbol starts at 1.0;
+    /// each traversal step multiplies by the edge confidence. Ranges 0.0–1.0.
+    pub impact_score: f64,
 }
 
 /// A row representing caller + edge metadata returned from the BFS query.
@@ -28,49 +35,88 @@ struct CallerRow {
 impl GraphStore {
     /// Find all symbols that directly or transitively call/import/extend/implement `target_uid`.
     ///
-    /// Performs iterative BFS up to `max_depth` levels following incoming edges of type
-    /// CALLS, IMPORTS, EXTENDS_SYM, and IMPLEMENTS_SYM. Results with confidence below
-    /// `min_confidence` are excluded.
+    /// Performs confidence-weighted BFS up to `max_depth` levels following incoming
+    /// edges of type CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, and INCLUDES_SYM.
+    ///
+    /// Each node receives an `impact_score` that starts at 1.0 for the seed and
+    /// decays multiplicatively through each edge's confidence value. Traversal is
+    /// pruned when a node's score falls below `DEFAULT_IMPACT_THRESHOLD` (0.10).
+    /// The `min_confidence` parameter provides an additional per-edge filter.
+    ///
+    /// Results are sorted by `impact_score` descending (highest impact first).
     pub fn impact(
         &self,
         target_uid: &str,
         max_depth: u32,
         min_confidence: f32,
     ) -> Result<Vec<ImpactNode>, StoreError> {
-        let mut visited: HashSet<String> = HashSet::new();
-        visited.insert(target_uid.to_string());
+        // Track the best impact score seen so far for each node.
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        scores.insert(target_uid.to_string(), 1.0);
 
+        // Queue entries: (uid, depth)
         let mut queue: VecDeque<(String, u32)> = VecDeque::new();
         queue.push_back((target_uid.to_string(), 0));
 
-        let mut results: Vec<ImpactNode> = Vec::new();
+        // Store result nodes keyed by uid so we can update scores if a
+        // better path is found.
+        let mut result_map: HashMap<String, ImpactNode> = HashMap::new();
 
         while let Some((current_uid, depth)) = queue.pop_front() {
             if depth >= max_depth {
                 continue;
             }
 
+            let parent_score = scores.get(&current_uid).copied().unwrap_or(0.0);
+
             let callers = self.direct_callers_of(&current_uid, min_confidence)?;
 
             for row in callers {
-                if visited.contains(&row.uid) {
+                // Skip the seed node itself.
+                if row.uid == target_uid {
                     continue;
                 }
-                visited.insert(row.uid.clone());
 
-                let node = ImpactNode {
-                    uid: row.uid.clone(),
-                    name: row.name,
-                    file_path: row.file_path,
-                    start_line: row.start_line,
-                    edge_type: row.edge_type,
-                    confidence: row.confidence,
-                    depth: depth + 1,
-                };
-                results.push(node);
-                queue.push_back((row.uid, depth + 1));
+                let candidate_score = parent_score * row.confidence as f64;
+
+                // Prune paths that fall below the impact threshold.
+                if candidate_score < DEFAULT_IMPACT_THRESHOLD {
+                    continue;
+                }
+
+                let prev_score = scores.get(&row.uid).copied().unwrap_or(0.0);
+
+                if candidate_score > prev_score {
+                    scores.insert(row.uid.clone(), candidate_score);
+
+                    let node = ImpactNode {
+                        uid: row.uid.clone(),
+                        name: row.name,
+                        file_path: row.file_path,
+                        start_line: row.start_line,
+                        edge_type: row.edge_type,
+                        confidence: row.confidence,
+                        depth: depth + 1,
+                        impact_score: candidate_score,
+                    };
+                    result_map.insert(row.uid.clone(), node);
+
+                    // Re-enqueue so downstream nodes can pick up the
+                    // improved score. This is safe because scores only
+                    // increase (like Dijkstra with max instead of min).
+                    queue.push_back((row.uid, depth + 1));
+                }
             }
         }
+
+        let mut results: Vec<ImpactNode> = result_map.into_values().collect();
+        // Sort by impact_score descending; break ties by uid for determinism.
+        results.sort_by(|a, b| {
+            b.impact_score
+                .partial_cmp(&a.impact_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.uid.cmp(&b.uid))
+        });
 
         Ok(results)
     }
