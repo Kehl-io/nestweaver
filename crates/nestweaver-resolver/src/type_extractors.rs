@@ -337,7 +337,15 @@ fn extract_rust_constructor(line: &str) -> Option<(String, String)> {
     let before = &line[..constructor_pos];
     let type_start = before
         .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .map(|p| p + 1)
+        .map(|p| {
+            // Advance past the matched character (may be multi-byte: em-dash, smart quotes, etc.)
+            let ch = before[p..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            p + ch
+        })
         .unwrap_or(0);
     let type_name = &before[type_start..];
 
@@ -373,7 +381,14 @@ fn extract_callable_constructor(
     // Extract the last identifier before '('
     let call_start = before_paren
         .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .map(|p| p + 1)
+        .map(|p| {
+            let ch = before_paren[p..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            p + ch
+        })
         .unwrap_or(0);
     let call_name = &before_paren[call_start..];
 
@@ -403,7 +418,15 @@ fn extract_go_constructor(line: &str) -> Option<(String, String)> {
     let type_region = before_brace.trim_end_matches('&');
     let type_start = type_region
         .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
-        .map(|p| p + 1)
+        .map(|p| {
+            // Advance past the matched character (may be multi-byte: em-dash, smart quotes, etc.)
+            let ch = type_region[p..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            p + ch
+        })
         .unwrap_or(0);
     let type_name = &type_region[type_start..];
 
