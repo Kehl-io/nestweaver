@@ -94,9 +94,14 @@ pub struct BrainWatcher {
     /// When set, manifest file changes (Cargo.toml, package.json, …) trigger
     /// a re-parse and sidecar update.
     manifests_path: Option<PathBuf>,
+    /// Debounce interval in milliseconds for filesystem events.
+    debounce_ms: u64,
     /// Compiled `.brainignore` glob patterns. Loaded once at construction
     /// from the vault root's `.brainignore` file (or built-in defaults).
     ignore_set: GlobSet,
+    /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
+    /// `run_inner` uses this instead of opening its own from `tantivy_path`.
+    external_tantivy: Option<TantivyIndex>,
 }
 
 impl BrainWatcher {
@@ -122,7 +127,9 @@ impl BrainWatcher {
             stop_flag: Arc::new(AtomicBool::new(false)),
             tantivy_path: None,
             manifests_path: None,
+            debounce_ms: 200,
             ignore_set,
+            external_tantivy: None,
         }
     }
 
@@ -140,6 +147,20 @@ impl BrainWatcher {
     /// update the sidecar at this path.
     pub fn with_manifests_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifests_path = Some(path.into());
+        self
+    }
+
+    /// Use a pre-opened TantivyIndex instead of opening one from
+    /// `tantivy_path`. Used when the daemon spawns the watcher and
+    /// already holds the Tantivy writer.
+    pub fn with_external_tantivy(mut self, tantivy: TantivyIndex) -> Self {
+        self.external_tantivy = Some(tantivy);
+        self
+    }
+
+    /// Set the debounce interval for filesystem events.
+    pub fn with_debounce_ms(mut self, ms: u64) -> Self {
+        self.debounce_ms = ms;
         self
     }
 
@@ -189,25 +210,28 @@ impl BrainWatcher {
 
     /// Shared implementation used by both `run` and `run_with_store`.
     fn run_inner(
-        self,
+        mut self,
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
-        // Open the Tantivy index sidecar if configured. Best-effort: a
-        // broken index logs a warning but doesn't block graph updates.
-        let tantivy: Option<TantivyIndex> = match &self.tantivy_path {
-            Some(p) => match TantivyIndex::open_or_create(p) {
-                Ok(idx) => Some(idx),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %p.display(),
-                        error = %e,
-                        "BrainWatcher: Tantivy index unavailable; BM25 search will fall behind"
-                    );
-                    None
-                }
-            },
-            None => None,
+        // Use external Tantivy if provided (daemon mode), otherwise open from path.
+        let tantivy: Option<TantivyIndex> = if let Some(ext) = self.external_tantivy.take() {
+            Some(ext)
+        } else {
+            match &self.tantivy_path {
+                Some(p) => match TantivyIndex::open_or_create(p) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "BrainWatcher: Tantivy index unavailable; BM25 search will fall behind"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
         };
 
         // Make sure the Vault node exists — first-time runs (no prior
@@ -224,7 +248,7 @@ impl BrainWatcher {
         // Channel from the debouncer into our loop.
         let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
         let mut debouncer = new_debouncer(
-            Duration::from_millis(200),
+            Duration::from_millis(self.debounce_ms),
             move |res: Result<Vec<DebouncedEvent>, notify::Error>| {
                 let _ = tx.send(res);
             },

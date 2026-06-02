@@ -171,6 +171,9 @@ cargo build --release
 | `brain status` | Show vault counts, per-vault staleness, and index health |
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
+| `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
+| `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files) |
+| `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.) |
 
 </details>
 
@@ -218,7 +221,7 @@ cargo build --release
 | `embed` | Generate vector embeddings for indexed symbols |
 | `pull` | Pull a snapshot from a remote storage backend |
 | `instance` | Manage instance configuration |
-| `snapshot` | Create or restore database snapshots |
+| `snapshot` | Manage graph snapshots (build, verify, push) |
 | `list-repos` | List all indexed repositories |
 | `list-services` | List all detected services |
 | `service-summary` | Display a summary of a specific service |

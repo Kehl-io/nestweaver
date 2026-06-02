@@ -22,7 +22,7 @@ use crate::lifecycle;
 
 /// Shared state held by the daemon process.
 pub struct DaemonState {
-    pub store: GraphStore,
+    pub store: Arc<GraphStore>,
     pub tantivy: Option<TantivyIndex>,
     pub db_path: PathBuf,
     pub instance_id: String,
@@ -30,6 +30,7 @@ pub struct DaemonState {
     pub active_connections: AtomicU32,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -160,12 +161,143 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
         tracing::info!("shutdown requested via gRPC");
+
+        // Stop the file watcher if one is running.
+        if let Ok(mut guard) = self.state.watcher_stop.lock()
+            && let Some(handle) = guard.take()
+        {
+            tracing::info!("stopping active watcher before shutdown");
+            handle.stop();
+        }
+
         let tx = self.state.shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = tx.send(true);
         });
         Ok(Response::new(ShutdownResponse { ok: true }))
+    }
+
+    // ── Watching ─────────────────────────────────────────────────────
+
+    async fn watch_vault(
+        &self,
+        request: Request<WatchVaultRequest>,
+    ) -> Result<Response<WatchVaultResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let vault_path = PathBuf::from(&req.vault_path);
+        let vault_name = req.vault_name.clone();
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+        let extra_patterns = req.extra_ignore_patterns.clone();
+
+        if !vault_path.exists() || !vault_path.is_dir() {
+            return Ok(Response::new(WatchVaultResponse {
+                ok: false,
+                message: format!("vault path is not a directory: {}", vault_path.display()),
+            }));
+        }
+
+        let db_path = self.state.db_path.clone();
+        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+        let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
+
+        // Build the watcher. Use the daemon's Tantivy index if it has a
+        // writer; otherwise let the watcher open from the path.
+        let mut watcher =
+            nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
+                .with_manifests_path(&manifests_path)
+                .with_extra_ignore_patterns(&extra_patterns);
+
+        if self.state.tantivy.as_ref().is_some_and(|t| t.has_writer()) {
+            // Open a reader-only handle for the watcher — the daemon's
+            // writer handle owns the lock, so open_or_create would fail.
+            // The watcher uses this for search queries; writes go through
+            // the daemon's writer via the shared store.
+            match TantivyIndex::open_reader_only(&tantivy_path) {
+                Ok(idx) => watcher = watcher.with_external_tantivy(idx),
+                Err(_) => watcher = watcher.with_tantivy_index(&tantivy_path),
+            }
+        } else {
+            watcher = watcher.with_tantivy_index(&tantivy_path);
+        }
+
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Hold the lock across check + store to prevent TOCTOU race.
+        {
+            let mut guard = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            if guard.is_some() {
+                return Ok(Response::new(WatchVaultResponse {
+                    ok: false,
+                    message: "A watcher is already running. Stop it first with StopWatch."
+                        .to_string(),
+                }));
+            }
+            *guard = Some(shutdown_handle);
+        }
+
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.state.clone();
+        let store = self.state.store.clone();
+
+        tokio::task::spawn_blocking(move || {
+            tracing::info!(vault = %vault_path.display(), "watcher thread started");
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher.run_with_store(store, None)
+            }));
+
+            match result {
+                Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
+                Ok(Err(e)) => tracing::error!(error = %e, "watcher exited with error"),
+                Err(_) => tracing::error!("watcher thread panicked"),
+            }
+
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut guard) = state.watcher_stop.lock() {
+                *guard = None;
+            }
+        });
+
+        Ok(Response::new(WatchVaultResponse {
+            ok: true,
+            message: format!(
+                "Watcher started for {} (vault: {})",
+                req.vault_path, vault_name
+            ),
+        }))
+    }
+
+    async fn stop_watch(
+        &self,
+        _request: Request<StopWatchRequest>,
+    ) -> Result<Response<StopWatchResponse>, Status> {
+        let mut guard = self
+            .state
+            .watcher_stop
+            .lock()
+            .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+
+        if let Some(handle) = guard.take() {
+            tracing::info!("stop_watch: stopping active watcher");
+            handle.stop();
+            Ok(Response::new(StopWatchResponse { ok: true }))
+        } else {
+            Ok(Response::new(StopWatchResponse { ok: false }))
+        }
     }
 
     // ── Indexing ─────────────────────────────────────────────────────
@@ -892,33 +1024,13 @@ pub async fn run_server(
     let store = match GraphStore::open_or_create(&db_path) {
         Ok(s) => s,
         Err(e) => {
-            // Check if a watcher is holding the lock (writes PID to <db>.lock).
-            let lock_path = {
-                let mut s = db_path.as_os_str().to_owned();
-                s.push(".lock");
-                std::path::PathBuf::from(s)
-            };
-            let mut hint = String::new();
-            if let Ok(pid_str) = std::fs::read_to_string(&lock_path)
-                && let Ok(pid) = pid_str.trim().parse::<i32>()
-                && unsafe { libc::kill(pid, 0) } == 0
-            {
-                hint = format!(
-                    "\n\nA brain watcher (PID {pid}) is holding the database lock.\n\
-                     Stop it with: nestweaver brain watch-stop --db {}\n\
-                     Or use --no-daemon to bypass the daemon.",
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to open database with write access at {}; \
+                     another process may hold the write lock",
                     db_path.display()
-                );
-            }
-            if hint.is_empty() {
-                hint = format!(
-                    "\n\nAnother process may hold the write lock on {}.\n\
-                     Check for running nestweaver processes and stop them, or use --no-daemon.",
-                    db_path.display()
-                );
-            }
-            return Err(e)
-                .with_context(|| format!("failed to open database with write access{hint}"));
+                )
+            });
         }
     };
 
@@ -969,7 +1081,7 @@ pub async fn run_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let state = Arc::new(DaemonState {
-        store,
+        store: Arc::new(store),
         tantivy,
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
@@ -977,6 +1089,7 @@ pub async fn run_server(
         active_connections: AtomicU32::new(0),
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
+        watcher_stop: std::sync::Mutex::new(None),
     });
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))

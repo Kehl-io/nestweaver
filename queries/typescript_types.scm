@@ -47,3 +47,9 @@
 (public_field_definition
   name: (property_identifier) @var.name
   type: (type_annotation (_) @var.type))
+
+; Class property with new: class Foo { prop = new Bar() }
+(public_field_definition
+  name: (property_identifier) @ctor.name
+  value: (new_expression
+    constructor: (identifier) @ctor.type))
