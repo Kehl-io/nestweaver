@@ -66,7 +66,7 @@ Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mod
 <td width="50%" valign="top">
 
 **PR Impact & Dead Code**<br>
-PR blast radius with risk scoring; confidence-aware dead code detection with type exclusion and manifest-driven entry points; hub/bridge analysis and graph export.
+Confidence-weighted blast radius with `impact_score` decay through edges; co-change mining from git history (Jaccard-scored file pairs); type-aware call resolution via AST-extracted type bindings; dead code detection with type exclusion and manifest-driven entry points; hub/bridge analysis and graph export.
 
 </td>
 <td width="50%" valign="top">
@@ -299,7 +299,14 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 pgrep -a nestweaver-daemon                        # find running daemons (Linux)
 ```
 
-Tools include symbol lookup, impact analysis, context generation, search, repo-map, brain queries, project scoping, and more. Use `--tools` to expose only the tools you need. Point any MCP client at the server to get started.
+38 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need.
+
+### Key capabilities
+
+- **Type-aware call resolution** — AST-extracted type bindings (annotations, constructors, self/this, return types) resolve `obj.method()` calls to the correct target class
+- **Confidence-weighted blast radius** — `impact_score` decays multiplicatively through edges; low-confidence paths are pruned
+- **Co-change mining** — Jaccard-scored file pairs from git history surface files that always change together
+- **MRO walk** — inherited methods resolved via class hierarchy traversal (depth 5, cycle-safe)
 
 External MCP servers can be configured in your instance config with `timeout_secs` (default 30):
 
