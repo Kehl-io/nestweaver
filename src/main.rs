@@ -6125,8 +6125,7 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
                 let req = nestweaver_proto::WatchVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6157,9 +6156,7 @@ fn run_brain(
                 let _ = rx.recv();
 
                 let stop_req = nestweaver_proto::StopWatchRequest {};
-                let _ = rt.block_on(async {
-                    client.inner_mut().stop_watch(stop_req).await
-                });
+                let _ = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await });
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
             }
