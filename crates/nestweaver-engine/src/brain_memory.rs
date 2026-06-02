@@ -979,10 +979,8 @@ fn rewrite_wikilinks(
         let updated = content
             .replace(&old_link, &new_link)
             .replace(&old_link_prefix, &new_link_prefix);
-        if updated != content {
-            if std::fs::write(&path, &updated).is_ok() {
-                count += 1;
-            }
+        if updated != content && std::fs::write(&path, &updated).is_ok() {
+            count += 1;
         }
     }
     count
