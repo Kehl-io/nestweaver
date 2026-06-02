@@ -229,7 +229,11 @@ mod tests {
         let dest_dir = tempfile::tempdir().unwrap();
 
         // Create a nested directory structure similar to what tantivy produces
-        let seg_dir = src_dir.path().join("tantivy").join("segments").join("seg_0");
+        let seg_dir = src_dir
+            .path()
+            .join("tantivy")
+            .join("segments")
+            .join("seg_0");
         std::fs::create_dir_all(&seg_dir).unwrap();
         std::fs::write(seg_dir.join("postings.idx"), b"postings data").unwrap();
         std::fs::write(seg_dir.join("fieldnorm.idx"), b"fieldnorm data").unwrap();
@@ -249,7 +253,11 @@ mod tests {
         assert!(dest_dir.path().join("graph.lbug").exists());
 
         // Full nested directory tree must survive
-        let dest_seg = dest_dir.path().join("tantivy").join("segments").join("seg_0");
+        let dest_seg = dest_dir
+            .path()
+            .join("tantivy")
+            .join("segments")
+            .join("seg_0");
         assert!(dest_seg.exists(), "seg_0 directory should exist after pull");
         assert!(dest_seg.join("postings.idx").exists());
         assert!(dest_seg.join("fieldnorm.idx").exists());
