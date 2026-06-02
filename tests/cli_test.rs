@@ -249,12 +249,63 @@ fn cli_snapshot_build_and_verify() {
 }
 
 #[test]
-fn cli_snapshot_push_exits_error() {
+fn cli_snapshot_push_succeeds() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let snap_dir = dir.path().join("snapshot");
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::create_dir_all(&storage_dir).unwrap();
+
+    // Minimal valid snapshot files
+    let graph_bytes = b"fake-graph-data";
+    let manifest_bytes = b"{\"repos\":[]}";
+    let stamp_bytes = br#"{
+        "instance_id": "push-test",
+        "engine_version": "0.1.0",
+        "min_compatible_engine": "0.1.0",
+        "schema_hash_core": "c",
+        "schema_hash_extensions": "e",
+        "schema_hash_effective": "eff",
+        "embedding_model_id": "model",
+        "embedding_dimension": 0,
+        "built_at": "2026-06-01T00:00:00Z",
+        "repos": []
+    }"#;
+
+    std::fs::write(snap_dir.join("graph.lbug"), graph_bytes).unwrap();
+    std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
+    std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
+
+    // Compute checksum: SHA-256 of graph.lbug + manifest.json + stamp.json (in that order)
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(graph_bytes);
+    hasher.update(manifest_bytes);
+    hasher.update(stamp_bytes);
+    let checksum = hex::encode(hasher.finalize());
+    std::fs::write(snap_dir.join("checksum.sha256"), &checksum).unwrap();
+
     nestweaver_cmd()
-        .args(["snapshot", "push"])
+        .args([
+            "snapshot",
+            "push",
+            "--snapshot-dir",
+            &snap_dir.display().to_string(),
+            "--backend",
+            "local",
+            "--backend-path",
+            &storage_dir.display().to_string(),
+        ])
         .assert()
-        .failure()
-        .stderr(contains("Not yet implemented"));
+        .success()
+        .stdout(contains("Snapshot pushed"));
+
+    // A versioned directory v0.1.0 should exist in the storage dir
+    assert!(
+        storage_dir.join("v0.1.0").exists(),
+        "expected versioned snapshot directory v0.1.0 in storage"
+    );
 }
 
 #[test]
