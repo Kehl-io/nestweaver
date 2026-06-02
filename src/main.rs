@@ -7680,7 +7680,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
             let stamp = nestweaver_engine::Stamp {
                 instance_id: instance_id.clone(),
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
-                min_compatible_engine: env!("CARGO_PKG_VERSION").to_string(),
+                min_compatible_engine: nestweaver_engine::MIN_SNAPSHOT_READER_VERSION.to_string(),
                 schema_hash_core: core_hash,
                 schema_hash_extensions: ext_hash,
                 schema_hash_effective: effective_hash,
