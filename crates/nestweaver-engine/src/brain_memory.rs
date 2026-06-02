@@ -30,6 +30,7 @@
 //! | RelatesTo   | `skos:related`        |
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use anyhow::Result;
 use nestweaver_store::GraphStore;
@@ -922,11 +923,69 @@ fn apply_proposals(
         };
 
         if moved {
-            summaries.push(format!("MOVED: {} → {}", src.display(), dest.display(),));
+            summaries.push(format!("MOVED: {} → {}", src.display(), dest.display()));
+
+            // Rewrite path-based wikilinks in notes that reference this file.
+            let old_stem = Path::new(&p.source_path)
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let new_rel = dest
+                .strip_prefix(vault_root)
+                .unwrap_or(&dest)
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if old_stem != new_rel {
+                let rewrite_count =
+                    rewrite_wikilinks(vault_root, &note_by_uid, &p.evidence, &old_stem, &new_rel);
+                if rewrite_count > 0 {
+                    summaries.push(format!(
+                        "  REWRITE: updated [[{old_stem}]] → [[{new_rel}]] in {rewrite_count} file(s)"
+                    ));
+                }
+            }
         }
     }
 
     Ok((all_ok, summaries))
+}
+
+/// Rewrite `[[old_stem]]` → `[[new_stem]]` in the files identified by `evidence_uids`.
+/// Returns the number of files actually modified.
+fn rewrite_wikilinks(
+    vault_root: &Path,
+    note_by_uid: &HashMap<&str, &nestweaver_schema::Note>,
+    evidence_uids: &[String],
+    old_stem: &str,
+    new_stem: &str,
+) -> usize {
+    let old_link = format!("[[{old_stem}]]");
+    let new_link = format!("[[{new_stem}]]");
+    // Also handle display-text links: [[path|display]]
+    let old_link_prefix = format!("[[{old_stem}|");
+    let new_link_prefix = format!("[[{new_stem}|");
+
+    let mut count = 0;
+    for uid in evidence_uids {
+        let Some(note) = note_by_uid.get(uid.as_str()) else {
+            continue;
+        };
+        let path = vault_root.join(&note.file_path);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let updated = content
+            .replace(&old_link, &new_link)
+            .replace(&old_link_prefix, &new_link_prefix);
+        if updated != content {
+            if std::fs::write(&path, &updated).is_ok() {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// True when `path_lc` (lowercased, forward-slash) is inside a directory named
@@ -1295,6 +1354,17 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("re-index") || w.contains("Re-index")),
             "should warn user to re-index after apply"
+        );
+
+        // Wikilinks should have been rewritten from [[_logs/2025-01-01]] to [[_ideas/2025-01-01]]
+        let idea_a = fs::read_to_string(root.join("_ideas/idea-a.md")).unwrap();
+        assert!(
+            idea_a.contains("[[_ideas/2025-01-01]]"),
+            "idea-a.md should have updated wikilink, got: {idea_a}"
+        );
+        assert!(
+            !idea_a.contains("[[_logs/2025-01-01]]"),
+            "idea-a.md should not have old wikilink"
         );
     }
 
