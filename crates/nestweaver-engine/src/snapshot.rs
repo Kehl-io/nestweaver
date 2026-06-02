@@ -63,26 +63,7 @@ fn compute_checksum(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Recursively copy a directory tree from `src` to `dst`.
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| anyhow::anyhow!("create_dir_all {}: {e}", dst.display()))?;
-    for entry in
-        std::fs::read_dir(src).map_err(|e| anyhow::anyhow!("read_dir {}: {e}", src.display()))?
-    {
-        let entry = entry.map_err(|e| anyhow::anyhow!("read_dir entry: {e}"))?;
-        let ty = entry
-            .file_type()
-            .map_err(|e| anyhow::anyhow!("file_type: {e}"))?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))
-                .map_err(|e| anyhow::anyhow!("copy {}: {e}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
+use nestweaver_storage::copy_dir_all;
 
 /// Build a snapshot in `output_dir`.
 ///
