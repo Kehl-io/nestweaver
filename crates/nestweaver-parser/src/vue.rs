@@ -235,6 +235,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
         path: path_str,
         symbols,
         references,
+        type_bindings: Vec::new(),
     }
 }
 
