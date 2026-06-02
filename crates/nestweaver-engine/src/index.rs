@@ -4,7 +4,9 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
-use nestweaver_parser::{RawReference, RawSymbol, SkippedFile, detect_language, parse_source};
+use nestweaver_parser::{
+    AstTypeBinding, RawReference, RawSymbol, SkippedFile, detect_language, parse_source,
+};
 use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, file_uid, repo_uid, service_uid, symbol_uid,
@@ -459,6 +461,7 @@ fn index_into_store(
             content_hash: String,
             symbols: Vec<RawSymbol>,
             references: Vec<RawReference>,
+            type_bindings: Vec<AstTypeBinding>,
             /// Full file source — retained only for languages whose parser does
             /// not fold class/route decorators into symbol signatures (e.g.
             /// TypeScript/NestJS), so framework detection can scan it.
@@ -520,6 +523,7 @@ fn index_into_store(
                         content_hash,
                         symbols: parsed.symbols,
                         references: parsed.references,
+                        type_bindings: parsed.type_bindings,
                         source: retained_source,
                     }
                 }
@@ -543,6 +547,7 @@ fn index_into_store(
     let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
     let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
         Vec::new();
+    let mut ast_bindings_by_file: HashMap<String, Vec<AstTypeBinding>> = HashMap::new();
     let mut detected_languages: Vec<Language> = Vec::new();
     // F2.2: per framework file, the controller class signature + the (uid,
     // HandlerSymbol) of every symbol in the file, so handler detection can
@@ -574,6 +579,7 @@ fn index_into_store(
                 content_hash,
                 symbols: raw_symbols,
                 references: raw_references,
+                type_bindings: raw_type_bindings,
                 source,
             } => {
                 // Record in the new filemeta cache.
@@ -692,6 +698,9 @@ fn index_into_store(
                     handler_files.push(hf);
                 }
 
+                if !raw_type_bindings.is_empty() {
+                    ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
+                }
                 parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references));
             }
         }
@@ -814,8 +823,16 @@ fn index_into_store(
         for (file_path, symbols, _references) in &parsed_files_for_resolver {
             let full_path = repo_path.join(file_path);
             if let Ok(source) = std::fs::read_to_string(&full_path) {
-                let env =
-                    nestweaver_resolver::types::TypeEnvironment::build(&source, language, symbols);
+                let empty_bindings = Vec::new();
+                let file_ast_bindings = ast_bindings_by_file
+                    .get(file_path)
+                    .unwrap_or(&empty_bindings);
+                let env = nestweaver_resolver::types::TypeEnvironment::build(
+                    &source,
+                    language,
+                    symbols,
+                    file_ast_bindings,
+                );
                 if env.binding_count() > 0 {
                     envs.insert(file_path.clone(), env);
                 }

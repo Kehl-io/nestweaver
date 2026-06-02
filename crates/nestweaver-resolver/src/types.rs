@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use nestweaver_parser::RawSymbol;
 use nestweaver_schema::{Language, ResolvedType, SymbolKind};
 
-use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings};
+use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings, extract_self_bindings};
 
 /// A variable binding key: (variable_name, line_number).
 type BindingKey = (String, u32);
@@ -88,9 +88,47 @@ pub struct TypeEnvironment {
 
 impl TypeEnvironment {
     /// Build a type environment for a single file.
-    pub fn build(source: &str, language: Language, symbols: &[RawSymbol]) -> Self {
-        // Tiers 0-2: annotations, constructors, self/this
-        let mut bindings = extract_bindings(source, language, symbols);
+    ///
+    /// When `ast_bindings` is non-empty, those AST-extracted annotations are
+    /// used as the primary (Tier 0) source, and regex extraction is skipped.
+    /// Regex remains as a fallback for languages without AST queries.
+    pub fn build(
+        source: &str,
+        language: Language,
+        symbols: &[RawSymbol],
+        ast_bindings: &[nestweaver_parser::AstTypeBinding],
+    ) -> Self {
+        let mut bindings = HashMap::new();
+
+        // Tier 0: AST-extracted annotations (highest quality — from tree-sitter walk)
+        for ab in ast_bindings {
+            let source_kind = match ab.kind {
+                nestweaver_parser::AstBindingKind::Annotation => BindingSource::Annotation,
+                nestweaver_parser::AstBindingKind::Constructor => BindingSource::Constructor,
+                nestweaver_parser::AstBindingKind::ReturnType => BindingSource::ReturnType,
+                nestweaver_parser::AstBindingKind::Parameter => BindingSource::Annotation,
+            };
+            bindings.entry((ab.var_name.clone(), ab.line)).or_insert(
+                crate::type_extractors::TypeBinding {
+                    type_name: ab.type_name.clone(),
+                    line: ab.line,
+                    confidence: 0.95,
+                    source: source_kind,
+                },
+            );
+        }
+
+        // Tier 0b: Regex fallback for languages without AST queries
+        if ast_bindings.is_empty() {
+            extract_bindings(source, language, symbols)
+                .into_iter()
+                .for_each(|(k, v)| {
+                    bindings.entry(k).or_insert(v);
+                });
+        }
+
+        // Tier 2: Self/this (from symbols with parent_name — still needed)
+        extract_self_bindings(language, symbols, &mut bindings);
 
         // Tier 3: Assignment chain fixpoint
         let assignments = extract_assignments(source);
@@ -404,7 +442,7 @@ mod tests {
     fn type_env_rust_annotation_lookup() {
         let source = "fn main() {\n    let store: GraphStore = GraphStore::new();\n    store.compute_pagerank();\n}\n";
         let symbols = vec![make_function("main")];
-        let env = TypeEnvironment::build(source, Language::Rust, &symbols);
+        let env = TypeEnvironment::build(source, Language::Rust, &symbols, &[]);
         let binding = env.lookup("store", 3);
         assert!(binding.is_some(), "should find 'store' binding");
         assert_eq!(binding.unwrap().type_name, "GraphStore");
@@ -416,7 +454,7 @@ mod tests {
         method.kind = SymbolKind::Method;
         method.parent_name = Some("GraphStore".to_string());
         method.start_line = 5;
-        let env = TypeEnvironment::build("", Language::Rust, &[method]);
+        let env = TypeEnvironment::build("", Language::Rust, &[method], &[]);
         let binding = env.lookup_self(6);
         assert!(binding.is_some());
         assert_eq!(binding.unwrap().type_name, "GraphStore");
@@ -426,7 +464,7 @@ mod tests {
     #[test]
     fn type_env_assignment_propagation() {
         let source = "let store = GraphStore::new();\nlet alias = store;\n";
-        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        let env = TypeEnvironment::build(source, Language::Rust, &[], &[]);
         let binding = env.lookup("alias", 2);
         assert!(binding.is_some(), "alias should get store's type");
         assert_eq!(binding.unwrap().type_name, "GraphStore");
@@ -444,7 +482,7 @@ mod tests {
         });
         let symbols: HashMap<&str, &RawSymbol> = HashMap::from([("open_store", &sym)]);
 
-        let mut env = TypeEnvironment::build(source, Language::Rust, &[]);
+        let mut env = TypeEnvironment::build(source, Language::Rust, &[], &[]);
         env.seed_return_types(source, &symbols);
 
         let binding = env.lookup("store", 2);
@@ -459,7 +497,24 @@ mod tests {
     #[test]
     fn type_env_binding_count() {
         let source = "let x: Foo = Foo::new();\nlet y: Bar = Bar::new();\n";
-        let env = TypeEnvironment::build(source, Language::Rust, &[]);
+        let env = TypeEnvironment::build(source, Language::Rust, &[], &[]);
         assert!(env.binding_count() >= 2);
+    }
+
+    #[test]
+    fn type_env_prefers_ast_bindings_over_regex() {
+        use nestweaver_parser::{AstBindingKind, AstTypeBinding};
+
+        let source = "let store: GraphStore = GraphStore::new();\n";
+        let ast_bindings = vec![AstTypeBinding {
+            var_name: "store".to_string(),
+            type_name: "GraphStore".to_string(),
+            line: 1,
+            kind: AstBindingKind::Annotation,
+        }];
+        let env = TypeEnvironment::build(source, Language::Rust, &[], &ast_bindings);
+        let binding = env.lookup("store", 1);
+        assert!(binding.is_some());
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
     }
 }
