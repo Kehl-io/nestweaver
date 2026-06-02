@@ -135,9 +135,9 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
             if line.is_empty() {
                 continue;
             }
-            let (expected_hash, filename) = line.split_once("  ").ok_or_else(|| {
-                anyhow::anyhow!("malformed checksum line: {line}")
-            })?;
+            let (expected_hash, filename) = line
+                .split_once("  ")
+                .ok_or_else(|| anyhow::anyhow!("malformed checksum line: {line}"))?;
             let file_path = snapshot_dir.join(filename);
             if !file_path.exists() {
                 anyhow::bail!("checksum references missing file: {filename}");
