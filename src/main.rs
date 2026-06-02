@@ -6121,6 +6121,16 @@ fn run_brain(
                 ));
             }
 
+            // Respect watch.enabled config when --config is provided.
+            if let Some(cfg) = load_instance_config_opt(config.as_deref())
+                && !cfg.watch.enabled
+            {
+                out.status(
+                    "Watching disabled in instance config ([watch] enabled = false). Exiting.",
+                );
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let extra_patterns = parse_ignore_flag(&ignore);
 
             if use_daemon {
@@ -6148,15 +6158,37 @@ fn run_brain(
                     path.display()
                 ));
 
-                // Block until Ctrl-C, then send StopWatch to the daemon.
+                // Block until Ctrl-C or daemon death, then send StopWatch.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let _ = ctrlc_handler(move || {
                     let _ = tx.send(());
                 });
-                let _ = rx.recv();
+
+                // Periodic health check so we notice daemon death.
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let health = rt.block_on(async {
+                                client
+                                    .inner_mut()
+                                    .health_check(nestweaver_proto::HealthCheckRequest {})
+                                    .await
+                            });
+                            if health.is_err() {
+                                eprintln!("Daemon is no longer running.");
+                                return Ok((EXIT_ERROR, None));
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
 
                 let stop_req = nestweaver_proto::StopWatchRequest {};
-                let _ = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await });
+                if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
+                {
+                    eprintln!("Warning: failed to stop watcher: {e}");
+                }
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
             }

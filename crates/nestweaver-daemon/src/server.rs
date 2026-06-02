@@ -186,9 +186,52 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<WatchVaultResponse>, Status> {
         self.state.idle_notify.notify_one();
 
-        // Check if a watcher is already running.
+        let req = request.into_inner();
+        let vault_path = PathBuf::from(&req.vault_path);
+        let vault_name = req.vault_name.clone();
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+        let extra_patterns = req.extra_ignore_patterns.clone();
+
+        if !vault_path.exists() || !vault_path.is_dir() {
+            return Ok(Response::new(WatchVaultResponse {
+                ok: false,
+                message: format!("vault path is not a directory: {}", vault_path.display()),
+            }));
+        }
+
+        let db_path = self.state.db_path.clone();
+        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+        let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
+
+        // Build the watcher. Use the daemon's Tantivy index if it has a
+        // writer; otherwise let the watcher open from the path.
+        let mut watcher =
+            nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
+                .with_manifests_path(&manifests_path)
+                .with_extra_ignore_patterns(&extra_patterns);
+
+        if self.state.tantivy.as_ref().is_some_and(|t| t.has_writer()) {
+            // Open a reader-only handle for the watcher — the daemon's
+            // writer handle owns the lock, so open_or_create would fail.
+            // The watcher uses this for search queries; writes go through
+            // the daemon's writer via the shared store.
+            match TantivyIndex::open_reader_only(&tantivy_path) {
+                Ok(idx) => watcher = watcher.with_external_tantivy(idx),
+                Err(_) => watcher = watcher.with_tantivy_index(&tantivy_path),
+            }
+        } else {
+            watcher = watcher.with_tantivy_index(&tantivy_path);
+        }
+
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Hold the lock across check + store to prevent TOCTOU race.
         {
-            let guard = self
+            let mut guard = self
                 .state
                 .watcher_stop
                 .lock()
@@ -200,58 +243,9 @@ impl NestWeaverDaemon for DaemonService {
                         .to_string(),
                 }));
             }
-        }
-
-        let req = request.into_inner();
-        let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
-        let extra_patterns = req.extra_ignore_patterns.clone();
-
-        // Validate vault path.
-        if !vault_path.exists() || !vault_path.is_dir() {
-            return Ok(Response::new(WatchVaultResponse {
-                ok: false,
-                message: format!("vault path is not a directory: {}", vault_path.display()),
-            }));
-        }
-
-        let db_path = self.state.db_path.clone();
-        let vault_path_display = vault_path.display().to_string();
-
-        // Build the watcher with Tantivy support.
-        let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-        let tantivy_idx = TantivyIndex::open_or_create(&tantivy_path).ok();
-        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
-
-        let mut watcher =
-            nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
-                .with_manifests_path(&manifests_path)
-                .with_extra_ignore_patterns(&extra_patterns);
-
-        if let Some(idx) = tantivy_idx {
-            watcher = watcher.with_external_tantivy(idx);
-        } else {
-            watcher = watcher.with_tantivy_index(&tantivy_path);
-        }
-
-        let shutdown_handle = watcher.shutdown_handle();
-
-        // Store the shutdown handle so StopWatch and shutdown can use it.
-        {
-            let mut guard = self
-                .state
-                .watcher_stop
-                .lock()
-                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
             *guard = Some(shutdown_handle);
         }
 
-        // Increment active connections to prevent idle timeout.
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -260,18 +254,18 @@ impl NestWeaverDaemon for DaemonService {
         let store = self.state.store.clone();
 
         tokio::task::spawn_blocking(move || {
-            tracing::info!(
-                vault = %vault_path.display(),
-                "watcher thread started"
-            );
+            tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
-            if let Err(e) = watcher.run_with_store(store, None) {
-                tracing::error!(error = %e, "watcher exited with error");
-            } else {
-                tracing::info!("watcher exited cleanly");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher.run_with_store(store, None)
+            }));
+
+            match result {
+                Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
+                Ok(Err(e)) => tracing::error!(error = %e, "watcher exited with error"),
+                Err(_) => tracing::error!("watcher thread panicked"),
             }
 
-            // Cleanup: decrement active connections and clear the stop handle.
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
             if let Ok(mut guard) = state.watcher_stop.lock() {
                 *guard = None;
@@ -282,7 +276,7 @@ impl NestWeaverDaemon for DaemonService {
             ok: true,
             message: format!(
                 "Watcher started for {} (vault: {})",
-                vault_path_display, vault_name
+                req.vault_path, vault_name
             ),
         }))
     }
