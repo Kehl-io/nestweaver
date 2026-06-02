@@ -941,15 +941,16 @@ fn extract_types_from_tree(
             }
         }
 
-        if let (Some(name), Some(type_name)) = (var_name, var_type) {
-            if !name.is_empty() && !type_name.is_empty() {
-                bindings.push(AstTypeBinding {
-                    var_name: name,
-                    type_name,
-                    line: var_line,
-                    kind,
-                });
-            }
+        if let (Some(name), Some(type_name)) = (var_name, var_type)
+            && !name.is_empty()
+            && !type_name.is_empty()
+        {
+            bindings.push(AstTypeBinding {
+                var_name: name,
+                type_name,
+                line: var_line,
+                kind,
+            });
         }
     }
 
