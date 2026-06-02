@@ -97,6 +97,9 @@ pub struct BrainWatcher {
     /// Compiled `.brainignore` glob patterns. Loaded once at construction
     /// from the vault root's `.brainignore` file (or built-in defaults).
     ignore_set: GlobSet,
+    /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
+    /// `run_inner` uses this instead of opening its own from `tantivy_path`.
+    external_tantivy: Option<TantivyIndex>,
 }
 
 impl BrainWatcher {
@@ -123,6 +126,7 @@ impl BrainWatcher {
             tantivy_path: None,
             manifests_path: None,
             ignore_set,
+            external_tantivy: None,
         }
     }
 
@@ -140,6 +144,14 @@ impl BrainWatcher {
     /// update the sidecar at this path.
     pub fn with_manifests_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifests_path = Some(path.into());
+        self
+    }
+
+    /// Use a pre-opened TantivyIndex instead of opening one from
+    /// `tantivy_path`. Used when the daemon spawns the watcher and
+    /// already holds the Tantivy writer.
+    pub fn with_external_tantivy(mut self, tantivy: TantivyIndex) -> Self {
+        self.external_tantivy = Some(tantivy);
         self
     }
 
@@ -189,25 +201,28 @@ impl BrainWatcher {
 
     /// Shared implementation used by both `run` and `run_with_store`.
     fn run_inner(
-        self,
+        mut self,
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
-        // Open the Tantivy index sidecar if configured. Best-effort: a
-        // broken index logs a warning but doesn't block graph updates.
-        let tantivy: Option<TantivyIndex> = match &self.tantivy_path {
-            Some(p) => match TantivyIndex::open_or_create(p) {
-                Ok(idx) => Some(idx),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %p.display(),
-                        error = %e,
-                        "BrainWatcher: Tantivy index unavailable; BM25 search will fall behind"
-                    );
-                    None
-                }
-            },
-            None => None,
+        // Use external Tantivy if provided (daemon mode), otherwise open from path.
+        let tantivy: Option<TantivyIndex> = if let Some(ext) = self.external_tantivy.take() {
+            Some(ext)
+        } else {
+            match &self.tantivy_path {
+                Some(p) => match TantivyIndex::open_or_create(p) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "BrainWatcher: Tantivy index unavailable; BM25 search will fall behind"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
         };
 
         // Make sure the Vault node exists — first-time runs (no prior
