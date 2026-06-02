@@ -589,8 +589,8 @@ pub struct ConsolidationProposal {
     pub evidence: Vec<String>,
 }
 
-/// Result of [`memory_consolidate`]. `applied` is always false in the safe
-/// dry-run default; `--apply` is a stub that records a warning.
+/// Result of [`memory_consolidate`]. `applied` is false in the safe
+/// dry-run default; set `--apply` to move files and return `applied: true`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationManifest {
     pub dry_run: bool,
@@ -607,7 +607,9 @@ const LOG_PROMOTION_MIN_AGE_DAYS: f64 = 14.0;
 
 /// Propose tier promotions over the vault. DRY-RUN by default — no files are
 /// ever mutated. `apply` is honoured only as an explicit, provenance-recording
-/// stub: when true it emits a warning and still does not mutate.
+/// When `apply` is true, proposed promotions are carried out: each source file
+/// is moved to its target directory under the vault root, and summaries are
+/// appended to `warnings`.
 ///
 /// Rules:
 /// - A daily-log note (path under `_logs/`) wikilinked from ≥3 distinct idea
@@ -621,15 +623,6 @@ pub fn memory_consolidate(
 ) -> Result<ConsolidationManifest> {
     let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     let mut warnings = Vec::new();
-    if apply {
-        // SAFE default: never silently mutate. --apply is an explicit stub
-        // that records its provenance (this warning) and mutates nothing.
-        warnings.push(
-            "--apply is not yet implemented; no files were modified. Re-run without --apply to \
-             review the dry-run manifest."
-                .to_string(),
-        );
-    }
     if notes.is_empty() {
         return Ok(ConsolidationManifest {
             dry_run: !apply,
@@ -749,12 +742,191 @@ pub fn memory_consolidate(
             .then(a.promote_to.cmp(&b.promote_to))
     });
 
+    if apply && !proposals.is_empty() {
+        match apply_proposals(store, &proposals) {
+            Ok((success, summaries)) => {
+                warnings.extend(summaries);
+                return Ok(ConsolidationManifest {
+                    dry_run: false,
+                    applied: success,
+                    proposals,
+                    warnings,
+                });
+            }
+            Err(e) => {
+                warnings.push(format!("apply failed: {e}"));
+                return Ok(ConsolidationManifest {
+                    dry_run: false,
+                    applied: false,
+                    proposals,
+                    warnings,
+                });
+            }
+        }
+    }
+
     Ok(ConsolidationManifest {
         dry_run: !apply,
         applied: false,
         proposals,
         warnings,
     })
+}
+
+/// Execute the file moves described by `proposals`, returning
+/// `(all_succeeded, summaries)`.
+fn apply_proposals(
+    store: &GraphStore,
+    proposals: &[ConsolidationProposal],
+) -> Result<(bool, Vec<String>)> {
+    let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Build a map from vault UID → root_path for resolving absolute paths.
+    let vault_roots: HashMap<&str, &str> = vaults
+        .iter()
+        .map(|v| (v.uid.as_str(), v.root_path.as_str()))
+        .collect();
+
+    // Build a map from note UID → Note so we can look up vault_uid for each
+    // proposal's source.
+    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
+    let note_by_uid: HashMap<&str, &nestweaver_schema::Note> =
+        notes.iter().map(|n| (n.uid.as_str(), n)).collect();
+
+    let mut summaries = Vec::new();
+    let mut all_ok = true;
+
+    for p in proposals {
+        // Resolve the vault root for this note.
+        let note = match note_by_uid.get(p.source_uid.as_str()) {
+            Some(n) => *n,
+            None => {
+                summaries.push(format!(
+                    "SKIP: note uid '{}' not found in store",
+                    p.source_uid
+                ));
+                all_ok = false;
+                continue;
+            }
+        };
+        let vault_root = match vault_roots.get(note.vault_uid.as_str()) {
+            Some(r) => std::path::Path::new(*r),
+            None => {
+                summaries.push(format!(
+                    "SKIP: vault uid '{}' not found for note '{}'",
+                    note.vault_uid, p.source_path
+                ));
+                all_ok = false;
+                continue;
+            }
+        };
+
+        let src = vault_root.join(&p.source_path);
+        if !src.exists() {
+            summaries.push(format!("SKIP: source does not exist: {}", src.display()));
+            all_ok = false;
+            continue;
+        }
+
+        // Determine the destination path.
+        let file_name = match src.file_name() {
+            Some(f) => f,
+            None => {
+                summaries.push(format!(
+                    "SKIP: cannot extract filename from '{}'",
+                    src.display()
+                ));
+                all_ok = false;
+                continue;
+            }
+        };
+
+        let dest_dir = if p.promote_to == "_ideas" {
+            vault_root.join("_ideas")
+        } else if p.promote_to.starts_with("project-file (") {
+            // Extract the project dir from "project-file (<dir>)".
+            let inner = p
+                .promote_to
+                .strip_prefix("project-file (")
+                .and_then(|s| s.strip_suffix(')'));
+            match inner {
+                Some(proj_dir) => vault_root.join(proj_dir),
+                None => {
+                    summaries.push(format!(
+                        "SKIP: cannot parse project dir from promote_to '{}'",
+                        p.promote_to
+                    ));
+                    all_ok = false;
+                    continue;
+                }
+            }
+        } else {
+            summaries.push(format!(
+                "SKIP: unknown promote_to target '{}'",
+                p.promote_to
+            ));
+            all_ok = false;
+            continue;
+        };
+
+        let dest = dest_dir.join(file_name);
+
+        if dest.exists() {
+            summaries.push(format!(
+                "SKIP: destination already exists: {}",
+                dest.display()
+            ));
+            all_ok = false;
+            continue;
+        }
+
+        // Ensure destination directory exists.
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            summaries.push(format!(
+                "SKIP: cannot create dir '{}': {e}",
+                dest_dir.display()
+            ));
+            all_ok = false;
+            continue;
+        }
+
+        // Move the file: try rename first, fall back to copy + delete for
+        // cross-filesystem moves.
+        let moved = match std::fs::rename(&src, &dest) {
+            Ok(()) => true,
+            Err(_rename_err) => match std::fs::copy(&src, &dest) {
+                Ok(_) => {
+                    if let Err(e) = std::fs::remove_file(&src) {
+                        summaries.push(format!(
+                            "WARN: copied to '{}' but failed to remove source '{}': {e}",
+                            dest.display(),
+                            src.display(),
+                        ));
+                    }
+                    true
+                }
+                Err(e) => {
+                    summaries.push(format!(
+                        "SKIP: failed to move '{}' → '{}': {e}",
+                        src.display(),
+                        dest.display(),
+                    ));
+                    all_ok = false;
+                    false
+                }
+            },
+        };
+
+        if moved {
+            summaries.push(format!(
+                "MOVED: {} → {}",
+                src.display(),
+                dest.display(),
+            ));
+        }
+    }
+
+    Ok((all_ok, summaries))
 }
 
 /// True when `path_lc` (lowercased, forward-slash) is inside a directory named
@@ -1067,14 +1239,55 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_apply_warns_and_never_mutates() {
+    fn consolidate_apply_on_empty_is_noop() {
         let store = GraphStore::in_memory().unwrap();
         let manifest = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
-        assert!(!manifest.applied, "--apply must not mutate (stub)");
+        assert!(!manifest.applied);
+        assert!(manifest.proposals.is_empty());
+    }
+
+    #[test]
+    fn consolidate_apply_moves_log_to_ideas() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let manifest = memory_consolidate(&store, true, 4_000_000_000.0).unwrap();
+
+        assert!(!manifest.dry_run);
         assert!(
-            !manifest.warnings.is_empty(),
-            "--apply must emit an explicit warning"
+            !manifest.proposals.is_empty(),
+            "should have at least one proposal"
         );
+
+        if manifest.applied {
+            // The log file should have been moved to _ideas/
+            let moved = root.join("_ideas/2025-01-01.md");
+            assert!(
+                moved.exists(),
+                "file should exist in _ideas/ after apply"
+            );
+            assert!(
+                !root.join("_logs/2025-01-01.md").exists(),
+                "original should be gone"
+            );
+        }
     }
 
     #[test]

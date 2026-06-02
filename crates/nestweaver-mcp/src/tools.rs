@@ -789,13 +789,13 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
 fn tool_schema_brain_memory_consolidate() -> Value {
     json!({
         "name": "brain_memory_consolidate",
-        "description": "Use to propose promotions of vault notes UP the memory tiers (daily logs → ideas → project files). DRY-RUN BY DEFAULT — it never mutates files. Proposes: (1) a daily log (under _logs/) wikilinked from >=3 distinct idea notes and older than 14 days → _ideas candidate; (2) an idea (under _ideas/) referenced from BOTH a project's sync.md and status.md → project-file candidate. Set `apply:true` to opt into write-mode; today that is an explicit no-op stub that records a warning and still mutates nothing. Output: `{dry_run, applied, proposals:[{source_uid, source_title, source_path, promote_to, rationale, evidence:[...]}], warnings:[...]}`.",
+        "description": "Use to propose promotions of vault notes UP the memory tiers (daily logs → ideas → project files). DRY-RUN BY DEFAULT — it never mutates files. Proposes: (1) a daily log (under _logs/) wikilinked from >=3 distinct idea notes and older than 14 days → _ideas candidate; (2) an idea (under _ideas/) referenced from BOTH a project's sync.md and status.md → project-file candidate. Set `apply:true` to carry out the moves (creates destination dirs, moves files). Output: `{dry_run, applied, proposals:[{source_uid, source_title, source_path, promote_to, rationale, evidence:[...]}], warnings:[...]}`.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "apply": {
                     "type": "boolean",
-                    "description": "Opt into write-mode (currently a no-op stub that warns; default false = safe dry-run).",
+                    "description": "Opt into write-mode: move files to their promoted destinations (default false = safe dry-run).",
                     "default": false
                 }
             }
