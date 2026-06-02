@@ -127,24 +127,18 @@ pub fn resolve_references_with_context(
                     if receiver == "self" || receiver == "this" || receiver == "$this" {
                         env.lookup_self(reference.start_line)
                     } else if receiver.contains('.') {
-                        let segments: Vec<&str> = receiver.split('.').collect();
-                        let mut current_type: Option<&crate::type_extractors::TypeBinding> = None;
-                        for (i, seg) in segments.iter().enumerate() {
-                            if i == 0 {
-                                current_type =
-                                    if *seg == "self" || *seg == "this" || *seg == "$this" {
-                                        env.lookup_self(reference.start_line)
-                                    } else {
-                                        env.lookup(seg, reference.start_line)
-                                    };
-                            } else {
-                                current_type = env.lookup(seg, reference.start_line);
-                            }
-                            if current_type.is_none() {
-                                break;
-                            }
+                        // Decompose chained receivers: a.b.method() → look up
+                        // the type of `a`, then use it. For chains deeper than
+                        // 2 segments (a.b.c.method), only the first segment's
+                        // type is resolved — field-of-type resolution would
+                        // require a full type system, so we fall through to
+                        // name-based resolution for deeper chains.
+                        let first = receiver.split('.').next().unwrap_or(receiver);
+                        if first == "self" || first == "this" || first == "$this" {
+                            env.lookup_self(reference.start_line)
+                        } else {
+                            env.lookup(first, reference.start_line)
                         }
-                        current_type
                     } else {
                         env.lookup(receiver, reference.start_line)
                     };

@@ -919,7 +919,13 @@ fn extract_types_from_tree(
                     kind = AstBindingKind::Constructor;
                 }
                 "ctor.type" => {
-                    var_type = Some(text.to_string());
+                    // For scoped paths (foo::bar::Baz), take the last segment.
+                    let base = text.rsplit("::").next().unwrap_or(text);
+                    // Only accept PascalCase types — filters out module-scoped
+                    // function calls like io::stdin() or env::var().
+                    if base.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        var_type = Some(base.to_string());
+                    }
                 }
                 "return.name" => {
                     var_name = Some(text.to_string());
