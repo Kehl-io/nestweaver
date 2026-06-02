@@ -274,13 +274,18 @@ fn cli_snapshot_push_succeeds() {
     std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
     std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
 
-    // Compute checksum: SHA-256 of graph.lbug + manifest.json + stamp.json (in that order)
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(graph_bytes);
-    hasher.update(manifest_bytes);
-    hasher.update(stamp_bytes);
-    let checksum = hex::encode(hasher.finalize());
-    std::fs::write(snap_dir.join("checksum.sha256"), &checksum).unwrap();
+    // Compute per-file checksums (sha256sum format)
+    let checksums = [
+        ("graph.lbug", graph_bytes.as_slice()),
+        ("manifest.json", manifest_bytes.as_slice()),
+        ("stamp.json", stamp_bytes.as_slice()),
+    ]
+    .iter()
+    .map(|(name, data)| format!("{}  {name}", hex::encode(sha2::Sha256::digest(data))))
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    std::fs::write(snap_dir.join("checksum.sha256"), &checksums).unwrap();
 
     nestweaver_cmd()
         .args([
