@@ -541,4 +541,32 @@ mod tests {
             "unexpected error: {msg}"
         );
     }
+
+    #[test]
+    fn verify_legacy_single_hash_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_fake_db(dir.path());
+
+        let stamp = make_stamp(
+            "0.1.0",
+            "0.1.0",
+            "schema-hash-abc",
+            "text-embedding-3-small",
+        );
+        let manifest = make_manifest();
+        build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
+
+        // Replace the per-file checksum with a legacy single-hash checksum
+        // (SHA-256 of graph.lbug + manifest.json + stamp.json concatenated).
+        let mut hasher = Sha256::new();
+        for name in CORE_FILES {
+            hasher.update(std::fs::read(snap_dir.join(name)).unwrap());
+        }
+        let legacy_checksum = hex::encode(hasher.finalize());
+        std::fs::write(snap_dir.join(CHECKSUM_FILE), &legacy_checksum).unwrap();
+
+        let loaded = verify_snapshot(&snap_dir).unwrap();
+        assert_eq!(loaded.instance_id, "test-instance");
+    }
 }

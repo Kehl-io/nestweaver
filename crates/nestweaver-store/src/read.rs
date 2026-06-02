@@ -825,6 +825,23 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Returns the dimension of stored embeddings, or 0 if none exist.
+    pub fn embedding_dimension(&self) -> Result<u32, StoreError> {
+        let conn = self.conn()?;
+        let result = conn
+            .query(
+                "MATCH (s:Symbol) WHERE s.embedding IS NOT NULL \
+                 RETURN list_len(s.embedding) LIMIT 1",
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        for row in result {
+            if let Ok(dim) = extract_i64(&row, 0) {
+                return Ok(u32::try_from(dim).unwrap_or(0));
+            }
+        }
+        Ok(0)
+    }
+
     /// All symbols with full details including the embedding field.
     /// Used by vector KNN search to load embeddings for cosine similarity.
     pub fn list_all_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {

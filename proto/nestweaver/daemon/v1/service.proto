@@ -38,6 +38,26 @@ message IndexVaultRequest {
 
 message RefreshBrainRequest {}
 
+// ─── Watching ───────────────────────────────────────────────────────
+
+message WatchVaultRequest {
+  string vault_path = 1;
+  string vault_name = 2;
+  string instance_id = 3;
+  repeated string extra_ignore_patterns = 4;
+}
+
+message WatchVaultResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StopWatchRequest {}
+
+message StopWatchResponse {
+  bool ok = 1;
+}
+
 enum Phase {
   DISCOVERING = 0;
   PARSING = 1;
@@ -176,6 +196,10 @@ service NestWeaverDaemon {
   rpc IndexRepo(IndexRepoRequest) returns (stream IndexProgress);
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
+
+  // Watching
+  rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);
+  rpc StopWatch(StopWatchRequest) returns (StopWatchResponse);
 
   // Read RPCs — typed hot-path
   rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
