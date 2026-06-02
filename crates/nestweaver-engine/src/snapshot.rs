@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// The oldest engine version that can read the current snapshot format.
+///
+/// Bump this ONLY when the snapshot layout changes in a backwards-incompatible
+/// way (new required files, changed checksum format, etc.).  Routine engine
+/// releases that don't touch the snapshot wire format should leave this alone.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "0.11.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
     pub instance_id: String,
@@ -51,49 +58,125 @@ const SIDECAR_PAGERANK: &str = "pagerank.json";
 const SIDECAR_MANIFESTS: &str = "manifests.json";
 const SIDECAR_TANTIVY_DIR: &str = "tantivy";
 
-/// Compute a SHA-256 checksum that covers graph.lbug + manifest.json + stamp.json
-/// (in that stable order).
-fn compute_checksum(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
-    let mut hasher = Sha256::new();
-    for name in [GRAPH_FILE, MANIFEST_FILE, STAMP_FILE] {
+/// Core files that MUST be present and checksummed in every snapshot.
+const CORE_FILES: &[&str] = &[GRAPH_FILE, MANIFEST_FILE, STAMP_FILE];
+
+/// Sidecar files that are checksummed when present.
+const SIDECAR_FILES: &[&str] = &[SIDECAR_PAGERANK, SIDECAR_MANIFESTS];
+
+/// Compute per-file SHA-256 checksums for all core files and any present
+/// sidecars.  Returns a sha256sum-style string: one `<hash>  <filename>\n`
+/// line per file, sorted by filename for determinism.
+fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
+    let mut lines: Vec<String> = Vec::new();
+    for &name in CORE_FILES {
         let bytes = std::fs::read(snapshot_dir.join(name))
             .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-        hasher.update(&bytes);
+        let hash = hex::encode(Sha256::digest(&bytes));
+        lines.push(format!("{hash}  {name}"));
     }
-    Ok(hex::encode(hasher.finalize()))
+    for &name in SIDECAR_FILES {
+        let path = snapshot_dir.join(name);
+        if path.exists() {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read sidecar {name} for checksum: {e}"))?;
+            let hash = hex::encode(Sha256::digest(&bytes));
+            lines.push(format!("{hash}  {name}"));
+        }
+    }
+    // Hash tantivy directory contents if present (hash each file, sorted)
+    let tantivy_dir = snapshot_dir.join(SIDECAR_TANTIVY_DIR);
+    if tantivy_dir.is_dir() {
+        let mut tantivy_files = collect_files_recursive(&tantivy_dir, SIDECAR_TANTIVY_DIR)?;
+        tantivy_files.sort();
+        for (rel_path, abs_path) in tantivy_files {
+            let bytes = std::fs::read(&abs_path)
+                .map_err(|e| anyhow::anyhow!("failed to read {rel_path} for checksum: {e}"))?;
+            let hash = hex::encode(Sha256::digest(&bytes));
+            lines.push(format!("{hash}  {rel_path}"));
+        }
+    }
+    lines.sort();
+    Ok(lines.join("\n") + "\n")
 }
 
-/// Recursively copy a directory tree from `src` to `dst`.
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| anyhow::anyhow!("create_dir_all {}: {e}", dst.display()))?;
-    for entry in
-        std::fs::read_dir(src).map_err(|e| anyhow::anyhow!("read_dir {}: {e}", src.display()))?
-    {
-        let entry = entry.map_err(|e| anyhow::anyhow!("read_dir entry: {e}"))?;
-        let ty = entry
-            .file_type()
-            .map_err(|e| anyhow::anyhow!("file_type: {e}"))?;
+/// Recursively collect (relative_path, absolute_path) for all files under `dir`.
+fn collect_files_recursive(
+    dir: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, PathBuf)>, anyhow::Error> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let name = entry.file_name();
+        let rel = format!("{prefix}/{}", name.to_string_lossy());
         if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))
-                .map_err(|e| anyhow::anyhow!("copy {}: {e}", entry.path().display()))?;
+            out.extend(collect_files_recursive(&entry.path(), &rel)?);
+        } else if ty.is_file() {
+            out.push((rel, entry.path()));
+        }
+    }
+    Ok(out)
+}
+
+/// Verify checksums from a checksum file.  Supports both the new per-file
+/// format (multiple `<hash>  <filename>` lines) and the legacy single-hash
+/// format for backwards compatibility.
+fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
+    let stored = std::fs::read_to_string(snapshot_dir.join(CHECKSUM_FILE))
+        .map_err(|e| anyhow::anyhow!("failed to read checksum.sha256: {e}"))?;
+    let stored = stored.trim();
+
+    if stored.contains("  ") {
+        // New per-file format
+        for line in stored.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (expected_hash, filename) = line
+                .split_once("  ")
+                .ok_or_else(|| anyhow::anyhow!("malformed checksum line: {line}"))?;
+            let file_path = snapshot_dir.join(filename);
+            if !file_path.exists() {
+                anyhow::bail!("checksum references missing file: {filename}");
+            }
+            let bytes = std::fs::read(&file_path)
+                .map_err(|e| anyhow::anyhow!("failed to read {filename}: {e}"))?;
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if actual != expected_hash {
+                anyhow::bail!(
+                    "integrity check failed for {filename}: \
+                     expected {expected_hash}, got {actual}"
+                );
+            }
+        }
+    } else {
+        // Legacy single-hash format: concatenated hash of core files
+        let mut hasher = Sha256::new();
+        for name in CORE_FILES {
+            let bytes = std::fs::read(snapshot_dir.join(name))
+                .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
+            hasher.update(&bytes);
+        }
+        let computed = hex::encode(hasher.finalize());
+        if computed != stored {
+            anyhow::bail!(
+                "snapshot integrity check failed: stored checksum does not match computed checksum"
+            );
         }
     }
     Ok(())
 }
 
+use nestweaver_storage::copy_dir_all;
+
 /// Build a snapshot in `output_dir`.
 ///
-/// Steps:
-/// 1. Create the output directory.
-/// 2. Copy `db_path` (graph.lbug) into the directory.
-/// 3. Write manifest.json.
-/// 4. Write stamp.json.
-/// 5. Compute SHA-256 checksum of all three files combined and write checksum.sha256.
-/// 6. Copy sidecars if present: `<db>.pagerank.json`, `<db>.manifests.json`,
-///    `<db>.tantivy/` directory.
+/// 1. Copy core files (graph, manifest, stamp).
+/// 2. Copy sidecars (pagerank, manifests, tantivy) if present.
+/// 3. Compute per-file SHA-256 checksums over everything that was copied.
 pub fn build_snapshot(
     output_dir: &Path,
     stamp: &Stamp,
@@ -104,6 +187,7 @@ pub fn build_snapshot(
         anyhow::anyhow!("failed to create output_dir {}: {e}", output_dir.display())
     })?;
 
+    // ── Core files ──────────────────────────────────────────────────────────
     std::fs::copy(db_path, output_dir.join(GRAPH_FILE))
         .map_err(|e| anyhow::anyhow!("failed to copy graph file: {e}"))?;
 
@@ -113,16 +197,7 @@ pub fn build_snapshot(
     let stamp_json = serde_json::to_string_pretty(stamp)?;
     std::fs::write(output_dir.join(STAMP_FILE), &stamp_json)?;
 
-    let checksum = compute_checksum(output_dir)?;
-    std::fs::write(output_dir.join(CHECKSUM_FILE), &checksum)?;
-
-    // ── Sidecars ────────────────────────────────────────────────────────────
-    // All sidecars append a suffix to the database path (preserving the
-    // `.lbug` extension), e.g. `brain.lbug.pagerank.json`.
-    //
-    // These are best-effort: log a debug message if absent, warn on copy error.
-
-    // pagerank sidecar
+    // ── Sidecars (best-effort) ──────────────────────────────────────────────
     let pagerank_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_PAGERANK}"));
     if pagerank_src.exists() {
         if let Err(e) = std::fs::copy(&pagerank_src, output_dir.join(SIDECAR_PAGERANK)) {
@@ -138,7 +213,6 @@ pub fn build_snapshot(
         );
     }
 
-    // manifests sidecar
     let manifests_src = crate::sidecar_path(db_path, &format!(".{SIDECAR_MANIFESTS}"));
     if manifests_src.exists() {
         if let Err(e) = std::fs::copy(&manifests_src, output_dir.join(SIDECAR_MANIFESTS)) {
@@ -154,7 +228,6 @@ pub fn build_snapshot(
         );
     }
 
-    // Tantivy index directory
     let tantivy_src = crate::sidecar_path(db_path, ".tantivy");
     if tantivy_src.exists() && tantivy_src.is_dir() {
         if let Err(e) = copy_dir_all(&tantivy_src, &output_dir.join(SIDECAR_TANTIVY_DIR)) {
@@ -170,28 +243,19 @@ pub fn build_snapshot(
         );
     }
 
+    // ── Checksums (after all files are in place) ────────────────────────────
+    let checksums = compute_checksums(output_dir)?;
+    std::fs::write(output_dir.join(CHECKSUM_FILE), &checksums)?;
+
     Ok(())
 }
 
 /// Verify a snapshot directory's integrity.
 ///
-/// Steps:
-/// 1. Read checksum.sha256.
-/// 2. Recompute checksum from graph.lbug + manifest.json + stamp.json.
-/// 3. Compare — bail on mismatch.
-/// 4. Parse and return the stamp.
+/// Supports both the new per-file checksum format and the legacy single-hash
+/// format for backwards compatibility.
 pub fn verify_snapshot(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error> {
-    let stored_checksum = std::fs::read_to_string(snapshot_dir.join(CHECKSUM_FILE))
-        .map_err(|e| anyhow::anyhow!("failed to read checksum.sha256: {e}"))?;
-    let stored_checksum = stored_checksum.trim();
-
-    let computed = compute_checksum(snapshot_dir)?;
-
-    if computed != stored_checksum {
-        anyhow::bail!(
-            "snapshot integrity check failed: stored checksum does not match computed checksum"
-        );
-    }
+    verify_checksums(snapshot_dir)?;
 
     let stamp_json = std::fs::read_to_string(snapshot_dir.join(STAMP_FILE))
         .map_err(|e| anyhow::anyhow!("failed to read stamp.json: {e}"))?;
