@@ -895,10 +895,61 @@ fn index_into_store(
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
 
-    let edges_count = insertable_edges.len();
+    let mut edges_count = insertable_edges.len();
     store
         .batch_insert_edges(&insertable_edges)
         .context("batch_insert_edges (resolved)")?;
+
+    // ── Structural MEMBER_OF edges ────────────────────────────────────────
+    // Build a lookup: (file_path, type_name) → type_symbol_uid for all
+    // container symbols (Class / Interface / Enum / Trait).  Then for every
+    // raw symbol that carries a parent_name, emit a MEMBER_OF edge from the
+    // member to its parent container.
+    {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let container_kinds = [
+            nestweaver_schema::SymbolKind::Class,
+            nestweaver_schema::SymbolKind::Interface,
+            nestweaver_schema::SymbolKind::Enum,
+            nestweaver_schema::SymbolKind::Trait,
+        ];
+
+        // (file_path, type_name) → uid
+        let mut container_map: HashMap<(String, String), String> = HashMap::new();
+        for sym in &all_symbols {
+            if container_kinds.contains(&sym.kind) {
+                container_map.insert((sym.file_path.clone(), sym.name.clone()), sym.uid.clone());
+            }
+        }
+
+        let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
+        for (rel_path, raw_symbols, _) in &parsed_files_for_resolver {
+            for raw_sym in raw_symbols {
+                if let Some(parent_name) = &raw_sym.parent_name {
+                    let key = (rel_path.clone(), parent_name.clone());
+                    if let Some(parent_uid) = container_map.get(&key) {
+                        let child_uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                        member_of_edges.push(ResolvedEdge {
+                            source_uid: child_uid,
+                            target_uid: parent_uid.clone(),
+                            edge_type: EdgeType::MemberOf,
+                            confidence: 1.0,
+                            link_type: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !member_of_edges.is_empty() {
+            edges_count += member_of_edges.len();
+            store
+                .batch_insert_edges(&member_of_edges)
+                .context("batch_insert_edges (member_of)")?;
+            tracing::debug!(count = member_of_edges.len(), "emitted MEMBER_OF edges");
+        }
+    }
 
     resolve_pb.finish_and_clear();
 
@@ -2104,5 +2155,49 @@ function hello(name) { return "Hello " + name; }
         );
         // files_count tracks only files that were actually processed (parsed).
         assert_eq!(result2.files_count, 0, "no files should be re-indexed");
+    }
+
+    #[test]
+    fn index_emits_member_of_edges_for_rust_struct_methods() {
+        // Task 4: MEMBER_OF edges must be emitted from methods to their parent
+        // struct (which the parser classifies as SymbolKind::Class via the impl
+        // block).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            r#"
+pub struct Counter {
+    value: u32,
+}
+
+impl Counter {
+    pub fn new() -> Self {
+        Counter { value: 0 }
+    }
+
+    pub fn increment(&mut self) {
+        self.value += 1;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let all_edges = store.load_typed_edges().unwrap();
+        let member_of: Vec<_> = all_edges
+            .iter()
+            .filter(|(_, _, edge_type, _)| edge_type == "MEMBER_OF")
+            .collect();
+
+        assert!(
+            member_of.len() >= 2,
+            "expected at least 2 MEMBER_OF edges (new + increment), got {}: {member_of:?}",
+            member_of.len()
+        );
     }
 }
