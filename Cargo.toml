@@ -104,6 +104,8 @@ serde_json = { workspace = true }
 criterion = { version = "0.8", default-features = false }
 nestweaver-daemon = { workspace = true }
 libc = "0.2"
+sha2 = { workspace = true }
+hex = "0.4"
 
 [[bench]]
 name = "brain_benchmarks"
