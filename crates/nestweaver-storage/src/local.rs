@@ -1,4 +1,5 @@
 use crate::backend::{SnapshotMeta, StorageBackend};
+use crate::copy_dir_all;
 use std::path::{Path, PathBuf};
 
 pub struct LocalBackend {
@@ -18,12 +19,14 @@ impl StorageBackend for LocalBackend {
         let version_dir = self.root.join(format!("v{}", meta.version));
         std::fs::create_dir_all(&version_dir)?;
 
-        // Copy all files from src into the versioned directory
+        // Copy all files and directories from src into the versioned directory
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
-            if file_type.is_file() {
-                let dest = version_dir.join(entry.file_name());
+            let dest = version_dir.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_all(&entry.path(), &dest)?;
+            } else if file_type.is_file() {
                 std::fs::copy(entry.path(), dest)?;
             }
         }
@@ -46,7 +49,7 @@ impl StorageBackend for LocalBackend {
         let meta_bytes = std::fs::read(&meta_path)?;
         let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)?;
 
-        // Copy all files except meta.json to dest
+        // Copy all files and directories except meta.json to dest
         std::fs::create_dir_all(dest)?;
         for entry in std::fs::read_dir(&latest)? {
             let entry = entry?;
@@ -54,8 +57,10 @@ impl StorageBackend for LocalBackend {
                 continue;
             }
             let file_type = entry.file_type()?;
-            if file_type.is_file() {
-                let target = dest.join(entry.file_name());
+            let target = dest.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_all(&entry.path(), &target)?;
+            } else if file_type.is_file() {
                 std::fs::copy(entry.path(), target)?;
             }
         }
@@ -201,5 +206,50 @@ mod tests {
         // Confirm the actual file content is from v2
         let content = std::fs::read(dest.path().join("graph.lbug")).unwrap();
         assert_eq!(content, b"v2");
+    }
+
+    #[test]
+    fn push_and_pull_preserves_subdirectories() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // Create a nested directory structure similar to what tantivy produces
+        let seg_dir = src_dir
+            .path()
+            .join("tantivy")
+            .join("segments")
+            .join("seg_0");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("postings.idx"), b"postings data").unwrap();
+        std::fs::write(seg_dir.join("fieldnorm.idx"), b"fieldnorm data").unwrap();
+        std::fs::write(src_dir.path().join("graph.lbug"), b"top-level file").unwrap();
+
+        let backend = LocalBackend::new(store_dir.path());
+        let meta = SnapshotMeta {
+            version: "0.1.0".into(),
+            instance_id: "subdir-test".into(),
+        };
+
+        backend.push_snapshot(src_dir.path(), &meta).unwrap();
+        let pulled = backend.pull_snapshot(dest_dir.path()).unwrap();
+        assert_eq!(pulled.instance_id, "subdir-test");
+
+        // Top-level file must survive
+        assert!(dest_dir.path().join("graph.lbug").exists());
+
+        // Full nested directory tree must survive
+        let dest_seg = dest_dir
+            .path()
+            .join("tantivy")
+            .join("segments")
+            .join("seg_0");
+        assert!(dest_seg.exists(), "seg_0 directory should exist after pull");
+        assert!(dest_seg.join("postings.idx").exists());
+        assert!(dest_seg.join("fieldnorm.idx").exists());
+
+        // Verify file contents are intact
+        let postings = std::fs::read(dest_seg.join("postings.idx")).unwrap();
+        assert_eq!(postings, b"postings data");
     }
 }
