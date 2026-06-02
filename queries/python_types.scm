@@ -16,3 +16,9 @@
 (typed_parameter
   (identifier) @param.name
   type: (type (_) @param.type))
+
+; Constructor call: x = Foo(...)
+(assignment
+  left: (identifier) @ctor.name
+  right: (call
+    function: (identifier) @ctor.type))

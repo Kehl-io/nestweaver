@@ -613,11 +613,11 @@ enum Commands {
         #[command(subcommand)]
         command: InstanceCommands,
     },
-    /// Brain: unified knowledge graph over markdown vaults (walking skeleton)
+    /// Brain: unified knowledge graph over markdown vaults
     ///
-    /// First step toward the Project Brain — indexes a markdown vault into the
-    /// graph alongside any code repositories already indexed. Headings, sections,
-    /// wikilinks, and PPR-based retrieval arrive in later phases.
+    /// Indexes a markdown vault into the graph alongside code repositories.
+    /// Supports headings, sections, wikilinks, tags, PPR-based context
+    /// retrieval, topic clustering, memory tiers, and live file watching.
     Brain {
         #[command(subcommand)]
         command: Box<BrainCommands>,
@@ -6121,14 +6121,87 @@ fn run_brain(
                 ));
             }
 
+            // Respect watch config when --config is provided.
+            let watch_cfg = load_instance_config_opt(config.as_deref())
+                .map(|c| c.watch)
+                .unwrap_or_default();
+            if !watch_cfg.enabled {
+                out.status(
+                    "Watching disabled in instance config ([watch] enabled = false). Exiting.",
+                );
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let extra_patterns = parse_ignore_flag(&ignore);
+
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let req = nestweaver_proto::WatchVaultRequest {
+                    vault_path: path.display().to_string(),
+                    vault_name: vault_name.clone(),
+                    instance_id: instance_id.clone(),
+                    extra_ignore_patterns: extra_patterns.clone(),
+                };
+                let resp = rt.block_on(async {
+                    client
+                        .inner_mut()
+                        .watch_vault(req)
+                        .await
+                        .map(|r| r.into_inner())
+                })?;
+                if !resp.ok {
+                    eprintln!("Error: {}", resp.message);
+                    return Ok((EXIT_ERROR, None));
+                }
+                out.status(&format!(
+                    "Watching {} via daemon (Ctrl-C to stop)",
+                    path.display()
+                ));
+
+                // Block until Ctrl-C or daemon death, then send StopWatch.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = ctrlc_handler(move || {
+                    let _ = tx.send(());
+                });
+
+                // Periodic health check so we notice daemon death.
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let health = rt.block_on(async {
+                                client
+                                    .inner_mut()
+                                    .health_check(nestweaver_proto::HealthCheckRequest {})
+                                    .await
+                            });
+                            if health.is_err() {
+                                eprintln!("Daemon is no longer running.");
+                                return Ok((EXIT_ERROR, None));
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                let stop_req = nestweaver_proto::StopWatchRequest {};
+                if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
+                {
+                    eprintln!("Warning: failed to stop watcher: {e}");
+                }
+                out.status("Watcher stopped.");
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = db_path.with_extension("manifests.json");
             let wiki_instance_id = instance_id.clone();
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
-                .with_extra_ignore_patterns(&extra_patterns);
+                .with_extra_ignore_patterns(&extra_patterns)
+                .with_debounce_ms(watch_cfg.debounce_ms);
             let stop = watcher.shutdown_handle();
 
             // Write a PID lock file so MCP servers and other readers know a
@@ -7685,7 +7758,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 schema_hash_extensions: ext_hash,
                 schema_hash_effective: effective_hash,
                 embedding_model_id,
-                embedding_dimension: 0,
+                embedding_dimension: store.embedding_dimension().unwrap_or(0),
                 built_at,
                 repos: repo_stamps,
             };

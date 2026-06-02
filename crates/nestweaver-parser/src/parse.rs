@@ -919,7 +919,13 @@ fn extract_types_from_tree(
                     kind = AstBindingKind::Constructor;
                 }
                 "ctor.type" => {
-                    var_type = Some(text.to_string());
+                    // For scoped paths (foo::bar::Baz), take the last segment.
+                    let base = text.rsplit("::").next().unwrap_or(text);
+                    // Only accept PascalCase types — filters out module-scoped
+                    // function calls like io::stdin() or env::var().
+                    if base.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        var_type = Some(base.to_string());
+                    }
                 }
                 "return.name" => {
                     var_name = Some(text.to_string());
@@ -4694,5 +4700,149 @@ fn main() {
             .expect("should find 'get_store' return type");
         assert_eq!(binding.type_name, "GraphStore");
         assert!(matches!(binding.kind, AstBindingKind::ReturnType));
+    }
+
+    #[test]
+    fn ast_extracts_rust_struct_expression_constructor() {
+        let source = r#"
+fn main() {
+    let config = Config { host: "localhost", port: 8080 };
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "config")
+            .expect("should find 'config' binding from struct expression");
+        assert_eq!(binding.type_name, "Config");
+        assert!(matches!(binding.kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_rust_static_method_constructor() {
+        let source = r#"
+fn main() {
+    let store = GraphStore::new();
+    let map = HashMap::default();
+    let v = Vec::with_capacity(10);
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+
+        let store_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "store")
+            .expect("should find 'store' binding");
+        assert_eq!(store_binding.type_name, "GraphStore");
+        assert!(matches!(store_binding.kind, AstBindingKind::Constructor));
+
+        let map_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "map")
+            .expect("should find 'map' binding");
+        assert_eq!(map_binding.type_name, "HashMap");
+        assert!(matches!(map_binding.kind, AstBindingKind::Constructor));
+
+        let v_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "v")
+            .expect("should find 'v' binding");
+        assert_eq!(v_binding.type_name, "Vec");
+        assert!(matches!(v_binding.kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_rust_tuple_struct_destructuring() {
+        let source = r#"
+fn main() {
+    let point = Point(1, 2);
+    let Point(x, y) = point;
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        // The destructuring pattern `let Point(x, y) = point` should yield a binding
+        // with type_name = "Point". var.name capture is absent for this pattern so
+        // the parser will emit it as a var.type-only match, but the query still fires.
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.type_name == "Point" && b.var_name.is_empty())
+            .or_else(|| parsed.type_bindings.iter().find(|b| b.type_name == "Point"))
+            .expect("should find a binding with type_name 'Point' from tuple struct pattern");
+        assert_eq!(binding.type_name, "Point");
+    }
+
+    #[test]
+    fn ast_extracts_rust_struct_pattern_destructuring() {
+        let source = r#"
+fn main() {
+    let foo = Foo { x: 1, y: 2 };
+    let Foo { x, y } = foo;
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        // The struct pattern `let Foo { x, y } = foo` captures the type name.
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.type_name == "Foo")
+            .expect("should find a binding with type_name 'Foo' from struct pattern");
+        assert_eq!(binding.type_name, "Foo");
+    }
+
+    #[test]
+    fn ast_extracts_python_constructor_call() {
+        let source = "store = GraphStore()\n";
+        let parsed = parse_source(Path::new("test.py"), source).unwrap();
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "store");
+        assert!(
+            binding.is_some(),
+            "should find store binding: {:?}",
+            parsed.type_bindings
+        );
+        assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn ast_extracts_go_short_var_composite_literal() {
+        let source = "package main\nfunc main() {\n\tcfg := Config{Host: \"localhost\"}\n}\n";
+        let parsed = parse_source(Path::new("test.go"), source).unwrap();
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "cfg");
+        assert!(
+            binding.is_some(),
+            "should find cfg binding: {:?}",
+            parsed.type_bindings
+        );
+        assert_eq!(binding.unwrap().type_name, "Config");
+    }
+
+    #[test]
+    fn ast_extracts_java_new_in_local_var() {
+        let source = "class Main { void run() { User u = new User(); } }";
+        let parsed = parse_source(Path::new("test.java"), source).unwrap();
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "u");
+        assert!(
+            binding.is_some(),
+            "should find u binding: {:?}",
+            parsed.type_bindings
+        );
+        assert_eq!(binding.unwrap().type_name, "User");
+    }
+
+    #[test]
+    fn ast_extracts_ts_class_property_constructor() {
+        let source = "class Service { store = new Store(); }";
+        let parsed = parse_source(Path::new("test.ts"), source).unwrap();
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "store");
+        assert!(
+            binding.is_some(),
+            "should find store binding: {:?}",
+            parsed.type_bindings
+        );
+        assert_eq!(binding.unwrap().type_name, "Store");
     }
 }

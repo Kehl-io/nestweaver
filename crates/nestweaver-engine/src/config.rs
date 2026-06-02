@@ -166,6 +166,9 @@ pub struct InstanceConfig {
     /// Feature F16 — response cache tuning (`[cache]`).
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Vault file-watching configuration (`[watch]`).
+    #[serde(default)]
+    pub watch: WatchConfig,
 }
 
 /// `[cache]` — tuning for the F16 response cache (Feature F16).
@@ -191,6 +194,31 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_size_mb: default_cache_max_size_mb(),
+        }
+    }
+}
+
+/// `[watch]` — vault file-watching configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_debounce_ms() -> u64 {
+    200
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 200,
         }
     }
 }

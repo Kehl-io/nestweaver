@@ -1,5 +1,5 @@
 name: nestweaver
-description: Code knowledge graph with 17 MCP tools for structural codebase understanding, cross-domain code-notes bridging, and AI agent context generation
+description: Code knowledge graph with 38 MCP tools for structural codebase understanding, cross-domain code-notes bridging, and AI agent context generation
 author: Kehl-io
 repository: https://github.com/Kehl-io/nestweaver
 install:

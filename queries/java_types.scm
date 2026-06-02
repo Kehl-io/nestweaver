@@ -24,6 +24,18 @@
   type: (_) @param.type
   name: (identifier) @param.name)
 
-; Constructor new expression: new Foo(...)
+; Variable with new: Foo x = new Foo(...)
+(local_variable_declaration
+  declarator: (variable_declarator
+    name: (identifier) @ctor.name
+    value: (object_creation_expression
+      type: (type_identifier) @ctor.type)))
+
+; Enhanced for loop: for (Type item : collection)
+(enhanced_for_statement
+  type: (type_identifier) @var.type
+  name: (identifier) @var.name)
+
+; Constructor new expression (standalone): new Foo(...)
 (object_creation_expression
   type: (type_identifier) @ctor.type)
