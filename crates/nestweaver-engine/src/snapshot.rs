@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// The oldest engine version that can read the current snapshot format.
+///
+/// Bump this ONLY when the snapshot layout changes in a backwards-incompatible
+/// way (new required files, changed checksum format, etc.).  Routine engine
+/// releases that don't touch the snapshot wire format should leave this alone.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "0.11.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
     pub instance_id: String,
