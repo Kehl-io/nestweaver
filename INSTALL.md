@@ -74,3 +74,11 @@ nestweaver mcp --db ./nestweaver.lbug
 ```
 
 The daemon owns the database exclusively, enabling concurrent access from multiple AI tools and CLI commands. Daemon logs are at `~/.local/state/nestweaver/<instance>/daemon.log`.
+
+## Optional: Git history analysis
+
+```bash
+nestweaver index --repo . --with-git-activity
+```
+
+This enables co-change mining (finds files that always change together) and git recency scoring for ranking. Results are stored as sidecars alongside the database.

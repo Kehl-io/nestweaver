@@ -445,7 +445,7 @@ fn extract_go_constructor(line: &str) -> Option<(String, String)> {
 
 // ── Tier 2: Self/This ────────────────────────────────────────────────────
 
-fn extract_self_bindings(
+pub fn extract_self_bindings(
     language: Language,
     symbols: &[RawSymbol],
     bindings: &mut HashMap<(String, u32), TypeBinding>,
