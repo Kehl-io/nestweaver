@@ -22,7 +22,7 @@ use crate::lifecycle;
 
 /// Shared state held by the daemon process.
 pub struct DaemonState {
-    pub store: GraphStore,
+    pub store: Arc<GraphStore>,
     pub tantivy: Option<TantivyIndex>,
     pub db_path: PathBuf,
     pub instance_id: String,
@@ -30,6 +30,7 @@ pub struct DaemonState {
     pub active_connections: AtomicU32,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -969,7 +970,7 @@ pub async fn run_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let state = Arc::new(DaemonState {
-        store,
+        store: Arc::new(store),
         tantivy,
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
@@ -977,6 +978,7 @@ pub async fn run_server(
         active_connections: AtomicU32::new(0),
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
+        watcher_stop: std::sync::Mutex::new(None),
     });
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
