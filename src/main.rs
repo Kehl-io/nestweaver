@@ -1901,6 +1901,14 @@ enum SnapshotCommands {
     Push {
         #[arg(long, help = "Instance ID to push snapshot for")]
         instance: Option<String>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Path to the snapshot directory to push")]
+        snapshot_dir: Option<PathBuf>,
+        #[arg(long, help = "Storage backend name (local, s3, gitlab)")]
+        backend: Option<String>,
+        #[arg(long, help = "Storage backend path")]
+        backend_path: Option<String>,
     },
 }
 
@@ -7729,9 +7737,71 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 }
             }
         }
-        SnapshotCommands::Push { .. } => {
-            eprintln!("Not yet implemented");
-            process::exit(EXIT_ERROR);
+        SnapshotCommands::Push {
+            instance,
+            config,
+            snapshot_dir,
+            backend,
+            backend_path,
+        } => {
+            // Resolve snapshot directory and backend from args/config/instance registry.
+            let (snap_dir, backend_name, b_path) = if let Some(inst_id) = instance {
+                // Load from registry → instance config
+                let registry =
+                    nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+                let entry = registry
+                    .get(&inst_id)
+                    .ok_or_else(|| anyhow::anyhow!("instance '{}' not registered", inst_id))?;
+                let cfg =
+                    nestweaver_engine::InstanceConfig::from_file(Path::new(&entry.config_path))?;
+                let dir = snapshot_dir.unwrap_or_else(|| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("nestweaver")
+                        .join(&inst_id)
+                        .join("snapshot")
+                });
+                (dir, cfg.snapshot_storage.backend, cfg.snapshot_storage.path)
+            } else if let Some(ref cfg_path) = config {
+                // Load from explicit config file
+                let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
+                let dir = snapshot_dir.unwrap_or_else(|| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("nestweaver")
+                        .join(&cfg.instance_id)
+                        .join("snapshot")
+                });
+                (dir, cfg.snapshot_storage.backend, cfg.snapshot_storage.path)
+            } else if let (Some(b), Some(dir)) = (backend, snapshot_dir) {
+                // Direct flags: --backend + --snapshot-dir
+                (dir, b, backend_path)
+            } else {
+                anyhow::bail!(
+                    "provide --instance, --config, or both --backend and --snapshot-dir"
+                );
+            };
+
+            // Verify integrity first
+            let stamp = nestweaver_engine::verify_snapshot(&snap_dir).map_err(|e| {
+                anyhow::anyhow!("snapshot integrity check failed: {e}")
+            })?;
+
+            // Build meta from stamp
+            let meta = nestweaver_storage::SnapshotMeta {
+                version: stamp.engine_version.clone(),
+                instance_id: stamp.instance_id.clone(),
+            };
+
+            // Create backend and push
+            let storage = nestweaver_storage::create_backend(&backend_name, b_path.as_deref())?;
+            storage.push_snapshot(&snap_dir, &meta)?;
+
+            println!(
+                "Snapshot pushed: instance='{}' version='{}'",
+                meta.instance_id, meta.version
+            );
+            Ok(EXIT_SUCCESS)
         }
     }
 }
