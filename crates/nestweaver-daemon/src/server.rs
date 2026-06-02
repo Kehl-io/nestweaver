@@ -161,12 +161,156 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
         tracing::info!("shutdown requested via gRPC");
+
+        // Stop the file watcher if one is running.
+        if let Ok(mut guard) = self.state.watcher_stop.lock() {
+            if let Some(handle) = guard.take() {
+                tracing::info!("stopping active watcher before shutdown");
+                handle.stop();
+            }
+        }
+
         let tx = self.state.shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = tx.send(true);
         });
         Ok(Response::new(ShutdownResponse { ok: true }))
+    }
+
+    // ── Watching ─────────────────────────────────────────────────────
+
+    async fn watch_vault(
+        &self,
+        request: Request<WatchVaultRequest>,
+    ) -> Result<Response<WatchVaultResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        // Check if a watcher is already running.
+        {
+            let guard = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            if guard.is_some() {
+                return Ok(Response::new(WatchVaultResponse {
+                    ok: false,
+                    message: "A watcher is already running. Stop it first with StopWatch."
+                        .to_string(),
+                }));
+            }
+        }
+
+        let req = request.into_inner();
+        let vault_path = PathBuf::from(&req.vault_path);
+        let vault_name = req.vault_name.clone();
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+        let extra_patterns = req.extra_ignore_patterns.clone();
+
+        // Validate vault path.
+        if !vault_path.exists() || !vault_path.is_dir() {
+            return Ok(Response::new(WatchVaultResponse {
+                ok: false,
+                message: format!(
+                    "vault path is not a directory: {}",
+                    vault_path.display()
+                ),
+            }));
+        }
+
+        let db_path = self.state.db_path.clone();
+        let vault_path_display = vault_path.display().to_string();
+
+        // Build the watcher with Tantivy support.
+        let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
+        let tantivy_idx = TantivyIndex::open_or_create(&tantivy_path).ok();
+        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+
+        let mut watcher = nestweaver_engine::BrainWatcher::new(
+            &db_path,
+            &vault_path,
+            &instance_id,
+            &vault_name,
+        )
+        .with_manifests_path(&manifests_path)
+        .with_extra_ignore_patterns(&extra_patterns);
+
+        if let Some(idx) = tantivy_idx {
+            watcher = watcher.with_external_tantivy(idx);
+        } else {
+            watcher = watcher.with_tantivy_index(&tantivy_path);
+        }
+
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Store the shutdown handle so StopWatch and shutdown can use it.
+        {
+            let mut guard = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            *guard = Some(shutdown_handle);
+        }
+
+        // Increment active connections to prevent idle timeout.
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.state.clone();
+        let store = self.state.store.clone();
+
+        tokio::task::spawn_blocking(move || {
+            tracing::info!(
+                vault = %vault_path.display(),
+                "watcher thread started"
+            );
+
+            if let Err(e) = watcher.run_with_store(store, None) {
+                tracing::error!(error = %e, "watcher exited with error");
+            } else {
+                tracing::info!("watcher exited cleanly");
+            }
+
+            // Cleanup: decrement active connections and clear the stop handle.
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut guard) = state.watcher_stop.lock() {
+                *guard = None;
+            }
+        });
+
+        Ok(Response::new(WatchVaultResponse {
+            ok: true,
+            message: format!(
+                "Watcher started for {} (vault: {})",
+                vault_path_display, vault_name
+            ),
+        }))
+    }
+
+    async fn stop_watch(
+        &self,
+        _request: Request<StopWatchRequest>,
+    ) -> Result<Response<StopWatchResponse>, Status> {
+        let mut guard = self
+            .state
+            .watcher_stop
+            .lock()
+            .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+
+        if let Some(handle) = guard.take() {
+            tracing::info!("stop_watch: stopping active watcher");
+            handle.stop();
+            Ok(Response::new(StopWatchResponse { ok: true }))
+        } else {
+            Ok(Response::new(StopWatchResponse { ok: false }))
+        }
     }
 
     // ── Indexing ─────────────────────────────────────────────────────
