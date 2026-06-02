@@ -851,8 +851,15 @@ pub async fn run_server(
     db_path: &Path,
     idle_timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
-    let db_path = std::fs::canonicalize(db_path)
-        .with_context(|| format!("canonicalize db path: {}", db_path.display()))?;
+    // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
+    // The DB will be created by GraphStore::open_or_create below.
+    let db_path = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
+        // Ensure parent directory exists so the DB can be created
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        db_path.to_path_buf()
+    });
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
