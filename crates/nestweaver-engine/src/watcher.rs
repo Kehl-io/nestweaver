@@ -94,6 +94,8 @@ pub struct BrainWatcher {
     /// When set, manifest file changes (Cargo.toml, package.json, …) trigger
     /// a re-parse and sidecar update.
     manifests_path: Option<PathBuf>,
+    /// Debounce interval in milliseconds for filesystem events.
+    debounce_ms: u64,
     /// Compiled `.brainignore` glob patterns. Loaded once at construction
     /// from the vault root's `.brainignore` file (or built-in defaults).
     ignore_set: GlobSet,
@@ -125,6 +127,7 @@ impl BrainWatcher {
             stop_flag: Arc::new(AtomicBool::new(false)),
             tantivy_path: None,
             manifests_path: None,
+            debounce_ms: 200,
             ignore_set,
             external_tantivy: None,
         }
@@ -152,6 +155,12 @@ impl BrainWatcher {
     /// already holds the Tantivy writer.
     pub fn with_external_tantivy(mut self, tantivy: TantivyIndex) -> Self {
         self.external_tantivy = Some(tantivy);
+        self
+    }
+
+    /// Set the debounce interval for filesystem events.
+    pub fn with_debounce_ms(mut self, ms: u64) -> Self {
+        self.debounce_ms = ms;
         self
     }
 
@@ -239,7 +248,7 @@ impl BrainWatcher {
         // Channel from the debouncer into our loop.
         let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
         let mut debouncer = new_debouncer(
-            Duration::from_millis(200),
+            Duration::from_millis(self.debounce_ms),
             move |res: Result<Vec<DebouncedEvent>, notify::Error>| {
                 let _ = tx.send(res);
             },

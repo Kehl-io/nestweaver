@@ -6121,10 +6121,11 @@ fn run_brain(
                 ));
             }
 
-            // Respect watch.enabled config when --config is provided.
-            if let Some(cfg) = load_instance_config_opt(config.as_deref())
-                && !cfg.watch.enabled
-            {
+            // Respect watch config when --config is provided.
+            let watch_cfg = load_instance_config_opt(config.as_deref())
+                .map(|c| c.watch)
+                .unwrap_or_default();
+            if !watch_cfg.enabled {
                 out.status(
                     "Watching disabled in instance config ([watch] enabled = false). Exiting.",
                 );
@@ -6199,7 +6200,8 @@ fn run_brain(
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
-                .with_extra_ignore_patterns(&extra_patterns);
+                .with_extra_ignore_patterns(&extra_patterns)
+                .with_debounce_ms(watch_cfg.debounce_ms);
             let stop = watcher.shutdown_handle();
 
             // Write a PID lock file so MCP servers and other readers know a

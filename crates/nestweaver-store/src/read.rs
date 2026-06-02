@@ -836,7 +836,7 @@ impl GraphStore {
             .map_err(|e| StoreError::Query(e.to_string()))?;
         for row in result {
             if let Ok(dim) = extract_i64(&row, 0) {
-                return Ok(dim as u32);
+                return Ok(u32::try_from(dim).unwrap_or(0));
             }
         }
         Ok(0)
