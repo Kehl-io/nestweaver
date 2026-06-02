@@ -205,6 +205,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
         path: path_str,
         symbols,
         references,
+        type_bindings: Vec::new(),
     }
 }
 
