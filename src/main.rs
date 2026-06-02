@@ -7562,6 +7562,12 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 .join(&id);
             std::fs::create_dir_all(&dest)?;
             let meta = backend.pull_snapshot(&dest)?;
+            nestweaver_engine::verify_snapshot(&dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "pulled snapshot failed integrity check: {e}; \
+                     the snapshot in storage may be corrupted"
+                )
+            })?;
             println!("Pulled snapshot v{} for '{}'", meta.version, id);
             Ok(EXIT_SUCCESS)
         }
