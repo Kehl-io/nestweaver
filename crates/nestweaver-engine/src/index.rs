@@ -929,7 +929,8 @@ fn index_into_store(
                 if let Some(parent_name) = &raw_sym.parent_name {
                     let key = (rel_path.clone(), parent_name.clone());
                     if let Some(parent_uid) = container_map.get(&key) {
-                        let child_uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                        let child_uid =
+                            symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
                         member_of_edges.push(ResolvedEdge {
                             source_uid: child_uid,
                             target_uid: parent_uid.clone(),

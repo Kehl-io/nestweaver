@@ -163,11 +163,11 @@ impl NestWeaverDaemon for DaemonService {
         tracing::info!("shutdown requested via gRPC");
 
         // Stop the file watcher if one is running.
-        if let Ok(mut guard) = self.state.watcher_stop.lock() {
-            if let Some(handle) = guard.take() {
-                tracing::info!("stopping active watcher before shutdown");
-                handle.stop();
-            }
+        if let Ok(mut guard) = self.state.watcher_stop.lock()
+            && let Some(handle) = guard.take()
+        {
+            tracing::info!("stopping active watcher before shutdown");
+            handle.stop();
         }
 
         let tx = self.state.shutdown_tx.clone();
@@ -216,10 +216,7 @@ impl NestWeaverDaemon for DaemonService {
         if !vault_path.exists() || !vault_path.is_dir() {
             return Ok(Response::new(WatchVaultResponse {
                 ok: false,
-                message: format!(
-                    "vault path is not a directory: {}",
-                    vault_path.display()
-                ),
+                message: format!("vault path is not a directory: {}", vault_path.display()),
             }));
         }
 
@@ -231,14 +228,10 @@ impl NestWeaverDaemon for DaemonService {
         let tantivy_idx = TantivyIndex::open_or_create(&tantivy_path).ok();
         let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
 
-        let mut watcher = nestweaver_engine::BrainWatcher::new(
-            &db_path,
-            &vault_path,
-            &instance_id,
-            &vault_name,
-        )
-        .with_manifests_path(&manifests_path)
-        .with_extra_ignore_patterns(&extra_patterns);
+        let mut watcher =
+            nestweaver_engine::BrainWatcher::new(&db_path, &vault_path, &instance_id, &vault_name)
+                .with_manifests_path(&manifests_path)
+                .with_extra_ignore_patterns(&extra_patterns);
 
         if let Some(idx) = tantivy_idx {
             watcher = watcher.with_external_tantivy(idx);
@@ -1037,33 +1030,13 @@ pub async fn run_server(
     let store = match GraphStore::open_or_create(&db_path) {
         Ok(s) => s,
         Err(e) => {
-            // Check if a watcher is holding the lock (writes PID to <db>.lock).
-            let lock_path = {
-                let mut s = db_path.as_os_str().to_owned();
-                s.push(".lock");
-                std::path::PathBuf::from(s)
-            };
-            let mut hint = String::new();
-            if let Ok(pid_str) = std::fs::read_to_string(&lock_path)
-                && let Ok(pid) = pid_str.trim().parse::<i32>()
-                && unsafe { libc::kill(pid, 0) } == 0
-            {
-                hint = format!(
-                    "\n\nA brain watcher (PID {pid}) is holding the database lock.\n\
-                     Stop it with: nestweaver brain watch-stop --db {}\n\
-                     Or use --no-daemon to bypass the daemon.",
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to open database with write access at {}; \
+                     another process may hold the write lock",
                     db_path.display()
-                );
-            }
-            if hint.is_empty() {
-                hint = format!(
-                    "\n\nAnother process may hold the write lock on {}.\n\
-                     Check for running nestweaver processes and stop them, or use --no-daemon.",
-                    db_path.display()
-                );
-            }
-            return Err(e)
-                .with_context(|| format!("failed to open database with write access{hint}"));
+                )
+            });
         }
     };
 

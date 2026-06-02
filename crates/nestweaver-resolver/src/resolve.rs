@@ -123,32 +123,31 @@ pub fn resolve_references_with_context(
                 && let Some(envs) = _type_envs
                 && let Some(env) = envs.get(file_path.as_str())
             {
-                let receiver_type = if receiver == "self"
-                    || receiver == "this"
-                    || receiver == "$this"
-                {
-                    env.lookup_self(reference.start_line)
-                } else if receiver.contains('.') {
-                    let segments: Vec<&str> = receiver.split('.').collect();
-                    let mut current_type: Option<&crate::type_extractors::TypeBinding> = None;
-                    for (i, seg) in segments.iter().enumerate() {
-                        if i == 0 {
-                            current_type = if *seg == "self" || *seg == "this" || *seg == "$this" {
-                                env.lookup_self(reference.start_line)
+                let receiver_type =
+                    if receiver == "self" || receiver == "this" || receiver == "$this" {
+                        env.lookup_self(reference.start_line)
+                    } else if receiver.contains('.') {
+                        let segments: Vec<&str> = receiver.split('.').collect();
+                        let mut current_type: Option<&crate::type_extractors::TypeBinding> = None;
+                        for (i, seg) in segments.iter().enumerate() {
+                            if i == 0 {
+                                current_type =
+                                    if *seg == "self" || *seg == "this" || *seg == "$this" {
+                                        env.lookup_self(reference.start_line)
+                                    } else {
+                                        env.lookup(seg, reference.start_line)
+                                    };
                             } else {
-                                env.lookup(seg, reference.start_line)
-                            };
-                        } else {
-                            current_type = env.lookup(seg, reference.start_line);
+                                current_type = env.lookup(seg, reference.start_line);
+                            }
+                            if current_type.is_none() {
+                                break;
+                            }
                         }
-                        if current_type.is_none() {
-                            break;
-                        }
-                    }
-                    current_type
-                } else {
-                    env.lookup(receiver, reference.start_line)
-                };
+                        current_type
+                    } else {
+                        env.lookup(receiver, reference.start_line)
+                    };
 
                 if let Some(binding) = receiver_type {
                     let method_name = &reference.name;
@@ -1378,7 +1377,11 @@ mod tests {
         };
 
         let files = vec![
-            ("src/store.rs".to_string(), vec![store_class, store_query], vec![]),
+            (
+                "src/store.rs".to_string(),
+                vec![store_class, store_query],
+                vec![],
+            ),
             (
                 "src/service.rs".to_string(),
                 vec![service_class, handle_method],

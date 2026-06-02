@@ -4765,12 +4765,7 @@ fn main() {
             .type_bindings
             .iter()
             .find(|b| b.type_name == "Point" && b.var_name.is_empty())
-            .or_else(|| {
-                parsed
-                    .type_bindings
-                    .iter()
-                    .find(|b| b.type_name == "Point")
-            })
+            .or_else(|| parsed.type_bindings.iter().find(|b| b.type_name == "Point"))
             .expect("should find a binding with type_name 'Point' from tuple struct pattern");
         assert_eq!(binding.type_name, "Point");
     }
@@ -4808,8 +4803,7 @@ fn main() {
 
     #[test]
     fn ast_extracts_go_short_var_composite_literal() {
-        let source =
-            "package main\nfunc main() {\n\tcfg := Config{Host: \"localhost\"}\n}\n";
+        let source = "package main\nfunc main() {\n\tcfg := Config{Host: \"localhost\"}\n}\n";
         let parsed = parse_source(Path::new("test.go"), source).unwrap();
         let binding = parsed.type_bindings.iter().find(|b| b.var_name == "cfg");
         assert!(
@@ -4837,10 +4831,7 @@ fn main() {
     fn ast_extracts_ts_class_property_constructor() {
         let source = "class Service { store = new Store(); }";
         let parsed = parse_source(Path::new("test.ts"), source).unwrap();
-        let binding = parsed
-            .type_bindings
-            .iter()
-            .find(|b| b.var_name == "store");
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "store");
         assert!(
             binding.is_some(),
             "should find store binding: {:?}",
