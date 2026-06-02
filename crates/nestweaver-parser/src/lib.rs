@@ -29,7 +29,7 @@ pub use markdown::{
     parse_markdown,
 };
 pub use parse::{
-    ParseError, ParseResult, ParsedFile, RawReference, RawSymbol, ReferenceKind, SkippedFile,
-    parse_batch, parse_source,
+    AstBindingKind, AstTypeBinding, ParseError, ParseResult, ParsedFile, RawReference, RawSymbol,
+    ReferenceKind, SkippedFile, parse_batch, parse_source,
 };
 pub use registry::{LanguageParser, ParserRegistry};
