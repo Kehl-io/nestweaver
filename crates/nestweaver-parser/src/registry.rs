@@ -78,6 +78,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 symbols: Vec::new(),
                 references: Vec::new(),
+                type_bindings: Vec::new(),
             })
         }
     }

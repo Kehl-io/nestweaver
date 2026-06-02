@@ -83,11 +83,29 @@ pub struct RawReference {
     pub receiver: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AstBindingKind {
+    Annotation,  // let x: Foo
+    Constructor, // let x = Foo::new()
+    ReturnType,  // fn foo() -> Foo
+    Parameter,   // fn foo(x: Foo)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AstTypeBinding {
+    pub var_name: String,
+    pub type_name: String,
+    pub line: u32,
+    pub kind: AstBindingKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedFile {
     pub path: String,
     pub symbols: Vec<RawSymbol>,
     pub references: Vec<RawReference>,
+    #[serde(default)]
+    pub type_bindings: Vec<AstTypeBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -797,11 +815,145 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // Type extraction: walk the same tree with type-specific queries
+    let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
+
     Ok(ParsedFile {
         path: path.to_string_lossy().into_owned(),
         symbols,
         references,
+        type_bindings,
     })
+}
+
+// ── type extraction helpers ────────────────────────────────────────────────
+
+/// Return the type query source for a language, or None if unsupported.
+fn type_query_source(lang: Language) -> Option<&'static str> {
+    match lang {
+        Language::Rust => Some(include_str!("../../../queries/rust_types.scm")),
+        Language::TypeScript | Language::JavaScript => {
+            Some(include_str!("../../../queries/typescript_types.scm"))
+        }
+        Language::Java => Some(include_str!("../../../queries/java_types.scm")),
+        Language::Python => Some(include_str!("../../../queries/python_types.scm")),
+        Language::Go => Some(include_str!("../../../queries/go_types.scm")),
+        _ => None,
+    }
+}
+
+/// Extract the base type name from a full type string.
+/// Strips references (&, &mut), lifetimes, generics brackets, pointers (*), etc.
+/// "HashMap<String, Vec<Foo>>" -> "HashMap"
+/// "&mut Vec<Foo>" -> "Vec"
+/// "*const Foo" -> "Foo"
+fn extract_base_type(full_type: &str) -> String {
+    let s = full_type
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches('*')
+        .trim_start_matches("const ")
+        .trim();
+    // Strip lifetime: 'a str -> str
+    let s = if s.starts_with('\'') {
+        s.find(char::is_whitespace)
+            .map(|i| s[i..].trim())
+            .unwrap_or(s)
+    } else {
+        s
+    };
+    // Strip generics: HashMap<K,V> -> HashMap
+    let base = s.find('<').map(|i| &s[..i]).unwrap_or(s);
+    base.trim().to_string()
+}
+
+fn extract_types_from_tree(
+    tree: &tree_sitter::Tree,
+    ts_lang: &tree_sitter::Language,
+    source: &[u8],
+    lang: Language,
+) -> Vec<AstTypeBinding> {
+    let query_src = match type_query_source(lang) {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+
+    let query = match tree_sitter::Query::new(ts_lang, query_src) {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+
+    let capture_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut bindings = Vec::new();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut var_name: Option<String> = None;
+        let mut var_type: Option<String> = None;
+        let mut var_line: u32 = 0;
+        let mut kind = AstBindingKind::Annotation;
+
+        for capture in m.captures {
+            let name = &capture_names[capture.index as usize];
+            let text = capture.node.utf8_text(source).unwrap_or("").trim();
+            let line = capture.node.start_position().row as u32 + 1;
+
+            match name.as_str() {
+                "var.name" => {
+                    var_name = Some(text.to_string());
+                    var_line = line;
+                    kind = AstBindingKind::Annotation;
+                }
+                "var.type" => {
+                    var_type = Some(extract_base_type(text));
+                }
+                "ctor.name" => {
+                    var_name = Some(text.to_string());
+                    var_line = line;
+                    kind = AstBindingKind::Constructor;
+                }
+                "ctor.type" => {
+                    var_type = Some(text.to_string());
+                }
+                "return.name" => {
+                    var_name = Some(text.to_string());
+                    var_line = line;
+                    kind = AstBindingKind::ReturnType;
+                }
+                "return.type" => {
+                    var_type = Some(extract_base_type(text));
+                }
+                "param.name" => {
+                    var_name = Some(text.to_string());
+                    var_line = line;
+                    kind = AstBindingKind::Parameter;
+                }
+                "param.type" => {
+                    var_type = Some(extract_base_type(text));
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(name), Some(type_name)) = (var_name, var_type) {
+            if !name.is_empty() && !type_name.is_empty() {
+                bindings.push(AstTypeBinding {
+                    var_name: name,
+                    type_name,
+                    line: var_line,
+                    kind,
+                });
+            }
+        }
+    }
+
+    bindings
 }
 
 /// Find the value of a `@name` capture within the same query match.
@@ -4498,5 +4650,48 @@ trait Drawable {
             Some("Drawable".to_string()),
             "method inside trait Drawable should have parent_name = Drawable"
         );
+    }
+
+    #[test]
+    fn ast_extracts_rust_let_annotation() {
+        let source = r#"
+fn main() {
+    let store: GraphStore = GraphStore::new();
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "store")
+            .expect("should find 'store' binding");
+        assert_eq!(binding.type_name, "GraphStore");
+        assert!(matches!(binding.kind, AstBindingKind::Annotation));
+    }
+
+    #[test]
+    fn ast_extracts_typescript_new_constructor() {
+        let source = "const user = new User();";
+        let parsed = parse_source(Path::new("test.ts"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user")
+            .expect("should find 'user' binding");
+        assert_eq!(binding.type_name, "User");
+        assert!(matches!(binding.kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_function_return_type() {
+        let source = "fn get_store() -> GraphStore { todo!() }";
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "get_store")
+            .expect("should find 'get_store' return type");
+        assert_eq!(binding.type_name, "GraphStore");
+        assert!(matches!(binding.kind, AstBindingKind::ReturnType));
     }
 }
