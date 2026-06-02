@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -166,12 +165,87 @@ fn cli_snapshot_verify_nonexistent() {
 }
 
 #[test]
-fn cli_snapshot_build_exits_error() {
+fn cli_snapshot_build_and_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    let snapshot_dir = dir.path().join("snapshot-out");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Create a minimal git repo so index produces a valid database
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .expect("git init failed");
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // Index
     nestweaver_cmd()
-        .args(["snapshot", "build"])
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
         .assert()
-        .failure()
-        .stderr(contains("not yet implemented").or(contains("instance-aware")));
+        .success();
+
+    // Build snapshot
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "build",
+            "--db",
+            &db_path.display().to_string(),
+            "--output",
+            &snapshot_dir.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot built successfully"));
+
+    // Verify expected files exist
+    assert!(snapshot_dir.join("graph.lbug").exists());
+    assert!(snapshot_dir.join("stamp.json").exists());
+    assert!(snapshot_dir.join("manifest.json").exists());
+    assert!(snapshot_dir.join("checksum.sha256").exists());
+
+    // Verify integrity via CLI
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "verify",
+            &snapshot_dir.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot verified OK"));
 }
 
 #[test]
