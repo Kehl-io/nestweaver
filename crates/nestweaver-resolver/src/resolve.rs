@@ -123,12 +123,32 @@ pub fn resolve_references_with_context(
                 && let Some(envs) = _type_envs
                 && let Some(env) = envs.get(file_path.as_str())
             {
-                let receiver_type =
-                    if receiver == "self" || receiver == "this" || receiver == "$this" {
-                        env.lookup_self(reference.start_line)
-                    } else {
-                        env.lookup(receiver, reference.start_line)
-                    };
+                let receiver_type = if receiver == "self"
+                    || receiver == "this"
+                    || receiver == "$this"
+                {
+                    env.lookup_self(reference.start_line)
+                } else if receiver.contains('.') {
+                    let segments: Vec<&str> = receiver.split('.').collect();
+                    let mut current_type: Option<&crate::type_extractors::TypeBinding> = None;
+                    for (i, seg) in segments.iter().enumerate() {
+                        if i == 0 {
+                            current_type = if *seg == "self" || *seg == "this" || *seg == "$this" {
+                                env.lookup_self(reference.start_line)
+                            } else {
+                                env.lookup(seg, reference.start_line)
+                            };
+                        } else {
+                            current_type = env.lookup(seg, reference.start_line);
+                        }
+                        if current_type.is_none() {
+                            break;
+                        }
+                    }
+                    current_type
+                } else {
+                    env.lookup(receiver, reference.start_line)
+                };
 
                 if let Some(binding) = receiver_type {
                     let method_name = &reference.name;
@@ -1307,6 +1327,112 @@ mod tests {
         assert!(
             !call_edges.is_empty(),
             "should still produce edges via name-based fallback"
+        );
+    }
+
+    #[test]
+    fn type_aware_chained_dot_receiver_resolves_self_store_query() {
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        use crate::types::TypeEnvironment;
+
+        // Store class with method `query`
+        let store_class = RawSymbol {
+            name: "Store".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 20,
+            signature: "class Store".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+        let mut store_query = make_symbol("query", 5);
+        store_query.parent_name = Some("Store".to_string());
+
+        // MyService class with method `handle` that calls `self.store.query()`
+        let service_class = RawSymbol {
+            name: "MyService".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 30,
+            signature: "class MyService".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+        };
+        let mut handle_method = make_symbol("handle", 10);
+        handle_method.parent_name = Some("MyService".to_string());
+
+        let chained_call = RawReference {
+            name: "query".to_string(),
+            kind: ReferenceKind::Call,
+            start_line: 12,
+            context: String::new(),
+            receiver: Some("self.store".to_string()),
+        };
+
+        let files = vec![
+            ("src/store.rs".to_string(), vec![store_class, store_query], vec![]),
+            (
+                "src/service.rs".to_string(),
+                vec![service_class, handle_method],
+                vec![chained_call],
+            ),
+        ];
+
+        // Type env for service.rs:
+        //   self → MyService at line 5 (enclosing class)
+        //   store → Store at line 2 (field binding)
+        let mut type_envs = std::collections::HashMap::new();
+        let env = TypeEnvironment::from_bindings(vec![
+            (
+                "self".to_string(),
+                5,
+                TypeBinding {
+                    type_name: "MyService".to_string(),
+                    line: 5,
+                    confidence: 1.0,
+                    source: BindingSource::SelfThis,
+                },
+            ),
+            (
+                "store".to_string(),
+                2,
+                TypeBinding {
+                    type_name: "Store".to_string(),
+                    line: 2,
+                    confidence: 0.9,
+                    source: BindingSource::Annotation,
+                },
+            ),
+        ]);
+        type_envs.insert("src/service.rs".to_string(), env);
+
+        let edges = resolve_references_with_context(
+            &files,
+            Language::TypeScript,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&type_envs),
+        );
+
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(call_edges.len(), 1, "should have exactly one call edge");
+
+        let edge = &call_edges[0];
+        let expected_target = symbol_uid("repo:test:abc", "src/store.rs", "query", 5);
+        assert_eq!(
+            edge.target_uid, expected_target,
+            "self.store.query() should resolve to Store::query in store.rs"
         );
     }
 }
