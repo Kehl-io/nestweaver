@@ -4442,6 +4442,45 @@ class UserService {
     }
 
     #[test]
+    fn type_queries_compile_for_all_languages() {
+        let languages: Vec<(&str, tree_sitter::Language, &str)> = vec![
+            (
+                "rust",
+                tree_sitter_rust::LANGUAGE.into(),
+                include_str!("../../../queries/rust_types.scm"),
+            ),
+            (
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                include_str!("../../../queries/typescript_types.scm"),
+            ),
+            (
+                "java",
+                tree_sitter_java::LANGUAGE.into(),
+                include_str!("../../../queries/java_types.scm"),
+            ),
+            (
+                "python",
+                tree_sitter_python::LANGUAGE.into(),
+                include_str!("../../../queries/python_types.scm"),
+            ),
+            (
+                "go",
+                tree_sitter_go::LANGUAGE.into(),
+                include_str!("../../../queries/go_types.scm"),
+            ),
+        ];
+        for (name, lang, query_src) in languages {
+            match tree_sitter::Query::new(&lang, query_src) {
+                Ok(q) => {
+                    assert!(q.capture_names().len() > 0, "{name}: no captures");
+                }
+                Err(e) => panic!("{name} type query failed to compile: {e}"),
+            }
+        }
+    }
+
+    #[test]
     fn extracts_parent_name_for_rust_trait_method() {
         let source = r#"
 trait Drawable {
