@@ -743,9 +743,16 @@ pub fn memory_consolidate(
     });
 
     if apply && !proposals.is_empty() {
-        match apply_proposals(store, &proposals) {
+        match apply_proposals(store, &proposals, &notes) {
             Ok((success, summaries)) => {
                 warnings.extend(summaries);
+                if success {
+                    warnings.push(
+                        "Re-index the vault to update the graph: \
+                         nestweaver brain refresh <vault-path>"
+                            .to_string(),
+                    );
+                }
                 return Ok(ConsolidationManifest {
                     dry_run: false,
                     applied: success,
@@ -778,18 +785,15 @@ pub fn memory_consolidate(
 fn apply_proposals(
     store: &GraphStore,
     proposals: &[ConsolidationProposal],
+    notes: &[nestweaver_schema::Note],
 ) -> Result<(bool, Vec<String>)> {
     let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Build a map from vault UID → root_path for resolving absolute paths.
     let vault_roots: HashMap<&str, &str> = vaults
         .iter()
         .map(|v| (v.uid.as_str(), v.root_path.as_str()))
         .collect();
 
-    // Build a map from note UID → Note so we can look up vault_uid for each
-    // proposal's source.
-    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     let note_by_uid: HashMap<&str, &nestweaver_schema::Note> =
         notes.iter().map(|n| (n.uid.as_str(), n)).collect();
 
@@ -918,11 +922,7 @@ fn apply_proposals(
         };
 
         if moved {
-            summaries.push(format!(
-                "MOVED: {} → {}",
-                src.display(),
-                dest.display(),
-            ));
+            summaries.push(format!("MOVED: {} → {}", src.display(), dest.display(),));
         }
     }
 
@@ -1276,18 +1276,26 @@ mod tests {
             "should have at least one proposal"
         );
 
-        if manifest.applied {
-            // The log file should have been moved to _ideas/
-            let moved = root.join("_ideas/2025-01-01.md");
-            assert!(
-                moved.exists(),
-                "file should exist in _ideas/ after apply"
-            );
-            assert!(
-                !root.join("_logs/2025-01-01.md").exists(),
-                "original should be gone"
-            );
-        }
+        assert!(
+            manifest.applied,
+            "apply should have succeeded; warnings: {:?}",
+            manifest.warnings
+        );
+
+        let moved = root.join("_ideas/2025-01-01.md");
+        assert!(moved.exists(), "file should exist in _ideas/ after apply");
+        assert!(
+            !root.join("_logs/2025-01-01.md").exists(),
+            "original should be gone"
+        );
+
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|w| w.contains("re-index") || w.contains("Re-index")),
+            "should warn user to re-index after apply"
+        );
     }
 
     #[test]

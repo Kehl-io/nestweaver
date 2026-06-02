@@ -1770,11 +1770,11 @@ enum MemoryCommands {
         config: Option<PathBuf>,
     },
     /// Propose tier promotions (daily logs → ideas → project files).
-    /// DRY-RUN by default; `--apply` is an explicit no-op stub for now.
+    /// DRY-RUN by default; set `--apply` to move files to their promoted destinations.
     Consolidate {
         #[arg(
             long,
-            help = "Opt into write-mode (currently a no-op stub that warns; default is dry-run)"
+            help = "Move files to their promoted destinations (default is dry-run)"
         )]
         apply: bool,
         #[arg(long, help = "Output as JSON")]
@@ -7583,8 +7583,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
             output,
         } => {
             // Resolve DB path: --db > --config > env/default
-            let db_path =
-                resolve_db_with_config(db, config.as_deref())?;
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             if !db_path.exists() {
                 anyhow::bail!(
@@ -7630,8 +7629,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 }
                 None => "none".to_string(),
             };
-            let effective_hash =
-                nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
+            let effective_hash = nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
 
             // Embedding info
             let embedding_model_id = cfg
@@ -7668,10 +7666,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
             };
 
             // Repos
-            let repos = nestweaver_engine::list_repos(
-                &store,
-                Some(&instance_id),
-            )?;
+            let repos = nestweaver_engine::list_repos(&store, Some(&instance_id))?;
 
             let repo_stamps: Vec<nestweaver_engine::RepoStamp> = repos
                 .iter()
@@ -7707,16 +7702,10 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
             };
 
             // Determine output directory
-            let output_dir = output.unwrap_or_else(|| {
-                PathBuf::from(format!("snapshot-{instance_id}"))
-            });
+            let output_dir =
+                output.unwrap_or_else(|| PathBuf::from(format!("snapshot-{instance_id}")));
 
-            nestweaver_engine::build_snapshot(
-                &output_dir,
-                &stamp,
-                &manifest,
-                &db_path,
-            )?;
+            nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
 
             println!("Snapshot built successfully in {}", output_dir.display());
             println!("  Instance: {}", stamp.instance_id);
@@ -7767,7 +7756,9 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                         .join(&inst_id)
                         .join("snapshot")
                 });
-                (dir, cfg.snapshot_storage.backend, cfg.snapshot_storage.path)
+                let be_name = backend.unwrap_or(cfg.snapshot_storage.backend);
+                let be_path = backend_path.or(cfg.snapshot_storage.path);
+                (dir, be_name, be_path)
             } else if let Some(ref cfg_path) = config {
                 // Load from explicit config file
                 let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
@@ -7778,20 +7769,19 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                         .join(&cfg.instance_id)
                         .join("snapshot")
                 });
-                (dir, cfg.snapshot_storage.backend, cfg.snapshot_storage.path)
+                let be_name = backend.unwrap_or(cfg.snapshot_storage.backend);
+                let be_path = backend_path.or(cfg.snapshot_storage.path);
+                (dir, be_name, be_path)
             } else if let (Some(b), Some(dir)) = (backend, snapshot_dir) {
                 // Direct flags: --backend + --snapshot-dir
                 (dir, b, backend_path)
             } else {
-                anyhow::bail!(
-                    "provide --instance, --config, or both --backend and --snapshot-dir"
-                );
+                anyhow::bail!("provide --instance, --config, or both --backend and --snapshot-dir");
             };
 
             // Verify integrity first
-            let stamp = nestweaver_engine::verify_snapshot(&snap_dir).map_err(|e| {
-                anyhow::anyhow!("snapshot integrity check failed: {e}")
-            })?;
+            let stamp = nestweaver_engine::verify_snapshot(&snap_dir)
+                .map_err(|e| anyhow::anyhow!("snapshot integrity check failed: {e}"))?;
 
             // Build meta from stamp
             let meta = nestweaver_storage::SnapshotMeta {

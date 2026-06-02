@@ -238,11 +238,7 @@ fn cli_snapshot_build_and_verify() {
 
     // Verify integrity via CLI
     nestweaver_cmd()
-        .args([
-            "snapshot",
-            "verify",
-            &snapshot_dir.display().to_string(),
-        ])
+        .args(["snapshot", "verify", &snapshot_dir.display().to_string()])
         .assert()
         .success()
         .stdout(contains("Snapshot verified OK"));
