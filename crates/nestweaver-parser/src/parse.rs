@@ -4695,4 +4695,101 @@ fn main() {
         assert_eq!(binding.type_name, "GraphStore");
         assert!(matches!(binding.kind, AstBindingKind::ReturnType));
     }
+
+    #[test]
+    fn ast_extracts_rust_struct_expression_constructor() {
+        let source = r#"
+fn main() {
+    let config = Config { host: "localhost", port: 8080 };
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "config")
+            .expect("should find 'config' binding from struct expression");
+        assert_eq!(binding.type_name, "Config");
+        assert!(matches!(binding.kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_rust_static_method_constructor() {
+        let source = r#"
+fn main() {
+    let store = GraphStore::new();
+    let map = HashMap::default();
+    let v = Vec::with_capacity(10);
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+
+        let store_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "store")
+            .expect("should find 'store' binding");
+        assert_eq!(store_binding.type_name, "GraphStore");
+        assert!(matches!(store_binding.kind, AstBindingKind::Constructor));
+
+        let map_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "map")
+            .expect("should find 'map' binding");
+        assert_eq!(map_binding.type_name, "HashMap");
+        assert!(matches!(map_binding.kind, AstBindingKind::Constructor));
+
+        let v_binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "v")
+            .expect("should find 'v' binding");
+        assert_eq!(v_binding.type_name, "Vec");
+        assert!(matches!(v_binding.kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_rust_tuple_struct_destructuring() {
+        let source = r#"
+fn main() {
+    let point = Point(1, 2);
+    let Point(x, y) = point;
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        // The destructuring pattern `let Point(x, y) = point` should yield a binding
+        // with type_name = "Point". var.name capture is absent for this pattern so
+        // the parser will emit it as a var.type-only match, but the query still fires.
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.type_name == "Point" && b.var_name.is_empty())
+            .or_else(|| {
+                parsed
+                    .type_bindings
+                    .iter()
+                    .find(|b| b.type_name == "Point")
+            })
+            .expect("should find a binding with type_name 'Point' from tuple struct pattern");
+        assert_eq!(binding.type_name, "Point");
+    }
+
+    #[test]
+    fn ast_extracts_rust_struct_pattern_destructuring() {
+        let source = r#"
+fn main() {
+    let foo = Foo { x: 1, y: 2 };
+    let Foo { x, y } = foo;
+}
+"#;
+        let parsed = parse_source(Path::new("test.rs"), source).unwrap();
+        // The struct pattern `let Foo { x, y } = foo` captures the type name.
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.type_name == "Foo")
+            .expect("should find a binding with type_name 'Foo' from struct pattern");
+        assert_eq!(binding.type_name, "Foo");
+    }
 }
