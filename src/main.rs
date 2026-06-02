@@ -7756,7 +7756,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 schema_hash_extensions: ext_hash,
                 schema_hash_effective: effective_hash,
                 embedding_model_id,
-                embedding_dimension: 0,
+                embedding_dimension: store.embedding_dimension().unwrap_or(0),
                 built_at,
                 repos: repo_stamps,
             };
