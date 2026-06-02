@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -166,21 +165,148 @@ fn cli_snapshot_verify_nonexistent() {
 }
 
 #[test]
-fn cli_snapshot_build_exits_error() {
+fn cli_snapshot_build_and_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    let snapshot_dir = dir.path().join("snapshot-out");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Create a minimal git repo so index produces a valid database
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .expect("git init failed");
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // Index
     nestweaver_cmd()
-        .args(["snapshot", "build"])
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
         .assert()
-        .failure()
-        .stderr(contains("not yet implemented").or(contains("instance-aware")));
+        .success();
+
+    // Build snapshot
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "build",
+            "--db",
+            &db_path.display().to_string(),
+            "--output",
+            &snapshot_dir.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot built successfully"));
+
+    // Verify expected files exist
+    assert!(snapshot_dir.join("graph.lbug").exists());
+    assert!(snapshot_dir.join("stamp.json").exists());
+    assert!(snapshot_dir.join("manifest.json").exists());
+    assert!(snapshot_dir.join("checksum.sha256").exists());
+
+    // Verify integrity via CLI
+    nestweaver_cmd()
+        .args(["snapshot", "verify", &snapshot_dir.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot verified OK"));
 }
 
 #[test]
-fn cli_snapshot_push_exits_error() {
+fn cli_snapshot_push_succeeds() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let snap_dir = dir.path().join("snapshot");
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::create_dir_all(&storage_dir).unwrap();
+
+    // Minimal valid snapshot files
+    let graph_bytes = b"fake-graph-data";
+    let manifest_bytes = b"{\"repos\":[]}";
+    let stamp_bytes = br#"{
+        "instance_id": "push-test",
+        "engine_version": "0.1.0",
+        "min_compatible_engine": "0.1.0",
+        "schema_hash_core": "c",
+        "schema_hash_extensions": "e",
+        "schema_hash_effective": "eff",
+        "embedding_model_id": "model",
+        "embedding_dimension": 0,
+        "built_at": "2026-06-01T00:00:00Z",
+        "repos": []
+    }"#;
+
+    std::fs::write(snap_dir.join("graph.lbug"), graph_bytes).unwrap();
+    std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
+    std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
+
+    // Compute per-file checksums (sha256sum format)
+    let checksums = [
+        ("graph.lbug", graph_bytes.as_slice()),
+        ("manifest.json", manifest_bytes.as_slice()),
+        ("stamp.json", stamp_bytes.as_slice()),
+    ]
+    .iter()
+    .map(|(name, data)| format!("{}  {name}", hex::encode(sha2::Sha256::digest(data))))
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    std::fs::write(snap_dir.join("checksum.sha256"), &checksums).unwrap();
+
     nestweaver_cmd()
-        .args(["snapshot", "push"])
+        .args([
+            "snapshot",
+            "push",
+            "--snapshot-dir",
+            &snap_dir.display().to_string(),
+            "--backend",
+            "local",
+            "--backend-path",
+            &storage_dir.display().to_string(),
+        ])
         .assert()
-        .failure()
-        .stderr(contains("Not yet implemented"));
+        .success()
+        .stdout(contains("Snapshot pushed"));
+
+    // A versioned directory v0.1.0 should exist in the storage dir
+    assert!(
+        storage_dir.join("v0.1.0").exists(),
+        "expected versioned snapshot directory v0.1.0 in storage"
+    );
 }
 
 #[test]

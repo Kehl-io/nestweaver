@@ -1770,11 +1770,11 @@ enum MemoryCommands {
         config: Option<PathBuf>,
     },
     /// Propose tier promotions (daily logs → ideas → project files).
-    /// DRY-RUN by default; `--apply` is an explicit no-op stub for now.
+    /// DRY-RUN by default; set `--apply` to move files to their promoted destinations.
     Consolidate {
         #[arg(
             long,
-            help = "Opt into write-mode (currently a no-op stub that warns; default is dry-run)"
+            help = "Move files to their promoted destinations (default is dry-run)"
         )]
         apply: bool,
         #[arg(long, help = "Output as JSON")]
@@ -1885,6 +1885,12 @@ enum SnapshotCommands {
         /// Path to the database file
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Path to the instance config (instance.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output directory for the snapshot
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Verify snapshot integrity (checksum, schema, version)
     Verify {
@@ -1895,6 +1901,14 @@ enum SnapshotCommands {
     Push {
         #[arg(long, help = "Instance ID to push snapshot for")]
         instance: Option<String>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Path to the snapshot directory to push")]
+        snapshot_dir: Option<PathBuf>,
+        #[arg(long, help = "Storage backend name (local, s3, gitlab)")]
+        backend: Option<String>,
+        #[arg(long, help = "Storage backend path")]
+        backend_path: Option<String>,
     },
 }
 
@@ -7548,6 +7562,12 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 .join(&id);
             std::fs::create_dir_all(&dest)?;
             let meta = backend.pull_snapshot(&dest)?;
+            nestweaver_engine::verify_snapshot(&dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "pulled snapshot failed integrity check: {e}; \
+                     the snapshot in storage may be corrupted"
+                )
+            })?;
             println!("Pulled snapshot v{} for '{}'", meta.version, id);
             Ok(EXIT_SUCCESS)
         }
@@ -7556,12 +7576,143 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
 
 fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
     match command {
-        SnapshotCommands::Build { instance: _, db: _ } => {
-            eprintln!(
-                "Use 'nestweaver index' to build a database, then package it with snapshot build"
-            );
-            eprintln!("Full instance-aware build not yet implemented.");
-            process::exit(EXIT_ERROR);
+        SnapshotCommands::Build {
+            instance,
+            db,
+            config,
+            output,
+        } => {
+            // Resolve DB path: --db > --config > env/default
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            if !db_path.exists() {
+                anyhow::bail!(
+                    "database not found at {}; run 'nestweaver index' first",
+                    db_path.display()
+                );
+            }
+
+            // Open the store to query repos
+            let store = GraphStore::open_read_only(&db_path)
+                .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+
+            // Load instance config if provided
+            let cfg = load_instance_config_opt(config.as_deref());
+
+            // Resolve instance ID
+            let instance_id = instance
+                .or_else(|| cfg.as_ref().map(|c| c.instance_id.clone()))
+                .unwrap_or_else(|| "standalone".to_string());
+
+            // Schema hashes
+            let core_hash = nestweaver_schema::core_schema_hash();
+            let ext_hash = match cfg.as_ref().and_then(|c| c.schema_extensions.as_ref()) {
+                Some(ext) => {
+                    // Build a deterministic string from the extensions
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(ref props) = ext.extra_node_properties {
+                        let mut labels: Vec<&String> = props.keys().collect();
+                        labels.sort();
+                        for label in labels {
+                            let inner = &props[label];
+                            let mut keys: Vec<&String> = inner.keys().collect();
+                            keys.sort();
+                            for key in keys {
+                                parts.push(format!("{label}.{key}={}", inner[key]));
+                            }
+                        }
+                    }
+                    let joined = parts.join("\n");
+                    use sha2::Digest;
+                    let hash = sha2::Sha256::digest(joined.as_bytes());
+                    hex::encode(hash)
+                }
+                None => "none".to_string(),
+            };
+            let effective_hash = nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
+
+            // Embedding info
+            let embedding_model_id = cfg
+                .as_ref()
+                .map(|c| c.inference.embedding_model.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            // Timestamp (RFC3339 UTC)
+            let built_at = {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs();
+                // Format as RFC3339 UTC
+                let days = secs / 86400;
+                let time_secs = secs % 86400;
+                let hours = time_secs / 3600;
+                let minutes = (time_secs % 3600) / 60;
+                let seconds = time_secs % 60;
+
+                // Convert days since epoch to y/m/d
+                // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+                let z = days as i64 + 719468;
+                let era = if z >= 0 { z } else { z - 146096 } / 146097;
+                let doe = (z - era * 146097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = if m <= 2 { y + 1 } else { y };
+                format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+            };
+
+            // Repos
+            let repos = nestweaver_engine::list_repos(&store, Some(&instance_id))?;
+
+            let repo_stamps: Vec<nestweaver_engine::RepoStamp> = repos
+                .iter()
+                .map(|r| nestweaver_engine::RepoStamp {
+                    url: r.url.clone(),
+                    indexed_sha: r.indexed_sha.clone(),
+                    commits_behind_head: r.staleness_commits_behind,
+                })
+                .collect();
+
+            let stamp = nestweaver_engine::Stamp {
+                instance_id: instance_id.clone(),
+                engine_version: env!("CARGO_PKG_VERSION").to_string(),
+                min_compatible_engine: nestweaver_engine::MIN_SNAPSHOT_READER_VERSION.to_string(),
+                schema_hash_core: core_hash,
+                schema_hash_extensions: ext_hash,
+                schema_hash_effective: effective_hash,
+                embedding_model_id,
+                embedding_dimension: 0,
+                built_at,
+                repos: repo_stamps,
+            };
+
+            let manifest = nestweaver_engine::Manifest {
+                repos: repos
+                    .iter()
+                    .map(|r| nestweaver_engine::ManifestRepo {
+                        url: r.url.clone(),
+                        indexed_sha: r.indexed_sha.clone(),
+                        files_skipped: Vec::new(),
+                    })
+                    .collect(),
+            };
+
+            // Determine output directory
+            let output_dir =
+                output.unwrap_or_else(|| PathBuf::from(format!("snapshot-{instance_id}")));
+
+            nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
+
+            println!("Snapshot built successfully in {}", output_dir.display());
+            println!("  Instance: {}", stamp.instance_id);
+            println!("  Engine: {}", stamp.engine_version);
+            println!("  Schema: {}", stamp.schema_hash_effective);
+            println!("  Repos: {}", stamp.repos.len());
+            Ok(EXIT_SUCCESS)
         }
         SnapshotCommands::Verify { path } => {
             match nestweaver_engine::verify_snapshot(Path::new(&path)) {
@@ -7581,9 +7732,72 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 }
             }
         }
-        SnapshotCommands::Push { .. } => {
-            eprintln!("Not yet implemented");
-            process::exit(EXIT_ERROR);
+        SnapshotCommands::Push {
+            instance,
+            config,
+            snapshot_dir,
+            backend,
+            backend_path,
+        } => {
+            // Resolve snapshot directory and backend from args/config/instance registry.
+            let (snap_dir, backend_name, b_path) = if let Some(inst_id) = instance {
+                // Load from registry → instance config
+                let registry =
+                    nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
+                let entry = registry
+                    .get(&inst_id)
+                    .ok_or_else(|| anyhow::anyhow!("instance '{}' not registered", inst_id))?;
+                let cfg =
+                    nestweaver_engine::InstanceConfig::from_file(Path::new(&entry.config_path))?;
+                let dir = snapshot_dir.unwrap_or_else(|| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("nestweaver")
+                        .join(&inst_id)
+                        .join("snapshot")
+                });
+                let be_name = backend.unwrap_or(cfg.snapshot_storage.backend);
+                let be_path = backend_path.or(cfg.snapshot_storage.path);
+                (dir, be_name, be_path)
+            } else if let Some(ref cfg_path) = config {
+                // Load from explicit config file
+                let cfg = nestweaver_engine::InstanceConfig::from_file(cfg_path)?;
+                let dir = snapshot_dir.unwrap_or_else(|| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("nestweaver")
+                        .join(&cfg.instance_id)
+                        .join("snapshot")
+                });
+                let be_name = backend.unwrap_or(cfg.snapshot_storage.backend);
+                let be_path = backend_path.or(cfg.snapshot_storage.path);
+                (dir, be_name, be_path)
+            } else if let (Some(b), Some(dir)) = (backend, snapshot_dir) {
+                // Direct flags: --backend + --snapshot-dir
+                (dir, b, backend_path)
+            } else {
+                anyhow::bail!("provide --instance, --config, or both --backend and --snapshot-dir");
+            };
+
+            // Verify integrity first
+            let stamp = nestweaver_engine::verify_snapshot(&snap_dir)
+                .map_err(|e| anyhow::anyhow!("snapshot integrity check failed: {e}"))?;
+
+            // Build meta from stamp
+            let meta = nestweaver_storage::SnapshotMeta {
+                version: stamp.engine_version.clone(),
+                instance_id: stamp.instance_id.clone(),
+            };
+
+            // Create backend and push
+            let storage = nestweaver_storage::create_backend(&backend_name, b_path.as_deref())?;
+            storage.push_snapshot(&snap_dir, &meta)?;
+
+            println!(
+                "Snapshot pushed: instance='{}' version='{}'",
+                meta.instance_id, meta.version
+            );
+            Ok(EXIT_SUCCESS)
         }
     }
 }
