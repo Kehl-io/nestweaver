@@ -613,11 +613,11 @@ enum Commands {
         #[command(subcommand)]
         command: InstanceCommands,
     },
-    /// Brain: unified knowledge graph over markdown vaults (walking skeleton)
+    /// Brain: unified knowledge graph over markdown vaults
     ///
-    /// First step toward the Project Brain — indexes a markdown vault into the
-    /// graph alongside any code repositories already indexed. Headings, sections,
-    /// wikilinks, and PPR-based retrieval arrive in later phases.
+    /// Indexes a markdown vault into the graph alongside code repositories.
+    /// Supports headings, sections, wikilinks, tags, PPR-based context
+    /// retrieval, topic clustering, memory tiers, and live file watching.
     Brain {
         #[command(subcommand)]
         command: Box<BrainCommands>,
