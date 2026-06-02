@@ -6122,6 +6122,48 @@ fn run_brain(
             }
 
             let extra_patterns = parse_ignore_flag(&ignore);
+
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let req = nestweaver_proto::WatchVaultRequest {
+                    vault_path: path.display().to_string(),
+                    vault_name: vault_name.clone(),
+                    instance_id: instance_id.clone(),
+                    extra_ignore_patterns: extra_patterns.clone(),
+                };
+                let resp = rt.block_on(async {
+                    client
+                        .inner_mut()
+                        .watch_vault(req)
+                        .await
+                        .map(|r| r.into_inner())
+                })?;
+                if !resp.ok {
+                    eprintln!("Error: {}", resp.message);
+                    return Ok((EXIT_ERROR, None));
+                }
+                out.status(&format!(
+                    "Watching {} via daemon (Ctrl-C to stop)",
+                    path.display()
+                ));
+
+                // Block until Ctrl-C, then send StopWatch to the daemon.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = ctrlc_handler(move || {
+                    let _ = tx.send(());
+                });
+                let _ = rx.recv();
+
+                let stop_req = nestweaver_proto::StopWatchRequest {};
+                let _ = rt.block_on(async {
+                    client.inner_mut().stop_watch(stop_req).await
+                });
+                out.status("Watcher stopped.");
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = db_path.with_extension("manifests.json");
             let wiki_instance_id = instance_id.clone();
