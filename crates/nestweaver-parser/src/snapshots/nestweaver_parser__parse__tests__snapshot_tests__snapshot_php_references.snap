@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3961
+assertion_line: 4241
 expression: "parsed_references(\"simple.php\", &source)"
 ---
 - name: "App\\Contracts\\Greeter"
@@ -22,7 +22,7 @@ expression: "parsed_references(\"simple.php\", &source)"
   kind: Call
   start_line: 27
   context: "$this->log(\"Greeting $name\");"
-  receiver: ~
+  receiver: $this
 - name: ucfirst
   kind: Call
   start_line: 33
@@ -32,4 +32,4 @@ expression: "parsed_references(\"simple.php\", &source)"
   kind: Call
   start_line: 47
   context: return $greeter->greet($input);
-  receiver: ~
+  receiver: $greeter

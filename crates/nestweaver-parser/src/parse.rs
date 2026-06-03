@@ -790,22 +790,63 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 }
 
                 // Extract receiver for method calls: in `obj.method()`,
-                // the captured `@reference.call` node is the call_expression.
-                // Its `function` child may be a field_expression (Rust) or
-                // member_expression (JS/TS/Java) containing the receiver as
-                // `value` (Rust) or `object` (JS/TS/Java/Go/etc.).
+                // the captured node may be a call_expression, method_invocation,
+                // or similar. The receiver is nested differently per language:
+                //
+                //   Rust/C++:  call_expression > function: field_expression > value
+                //   JS/TS:     call_expression > function: member_expression > object
+                //   Python:    call > function: attribute > object
+                //   Go:        call_expression > function: selector_expression > operand
+                //   C#:        invocation_expression > function: member_access_expression > expression
+                //   Java:      method_invocation > object (direct field, no nesting)
+                //   Kotlin:    call_expression > navigation_expression > navigation_suffix
+                //   Ruby:      call > receiver (direct field)
+                //   PHP:       member_call_expression > object
                 let receiver = if kind == ReferenceKind::Call {
-                    node.child_by_field_name("function")
-                        .filter(|f| {
-                            let k = f.kind();
-                            k.contains("field") || k.contains("member")
-                        })
+                    // Strategy 1: function child contains a member/field/selector/attribute node
+                    let from_function_child = node
+                        .child_by_field_name("function")
                         .and_then(|f| {
-                            f.child_by_field_name("object")
-                                .or_else(|| f.child_by_field_name("value"))
+                            let k = f.kind();
+                            if k.contains("field")
+                                || k.contains("member")
+                                || k.contains("selector")
+                                || k.contains("attribute")
+                                || k.contains("navigation")
+                            {
+                                f.child_by_field_name("object")
+                                    .or_else(|| f.child_by_field_name("value"))
+                                    .or_else(|| f.child_by_field_name("operand"))
+                                    .or_else(|| f.child_by_field_name("expression"))
+                            } else {
+                                None
+                            }
                         })
                         .and_then(|obj| obj.utf8_text(source_bytes).ok())
-                        .map(|s| s.to_string())
+                        .map(|s| s.to_string());
+
+                    // Strategy 2: direct object field (Java method_invocation)
+                    let from_direct_object = if from_function_child.is_none() {
+                        node.child_by_field_name("object")
+                            .and_then(|obj| obj.utf8_text(source_bytes).ok())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    };
+
+                    // Strategy 3: direct receiver field (Ruby call)
+                    let from_receiver_field =
+                        if from_function_child.is_none() && from_direct_object.is_none() {
+                            node.child_by_field_name("receiver")
+                                .and_then(|r| r.utf8_text(source_bytes).ok())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        };
+
+                    from_function_child
+                        .or(from_direct_object)
+                        .or(from_receiver_field)
                 } else {
                     None
                 };
