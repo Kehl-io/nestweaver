@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4343
+assertion_line: 4381
 expression: "parsed_references(\"simple.groovy\", &source)"
 ---
 - name: groovy.transform.CompileStatic
@@ -82,7 +82,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
   kind: Call
   start_line: 27
   context: return name.capitalize()
-  receiver: ~
+  receiver: name
 - name: SimpleGreeter
   kind: Extends
   start_line: 31
@@ -92,7 +92,7 @@ expression: "parsed_references(\"simple.groovy\", &source)"
   kind: Call
   start_line: 43
   context: "(greeter.greet(\"world\"))"
-  receiver: ~
+  receiver: greeter
 - name: println
   kind: Call
   start_line: 43

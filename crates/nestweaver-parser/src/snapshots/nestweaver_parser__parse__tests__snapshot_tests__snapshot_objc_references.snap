@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4336
+assertion_line: 4367
 expression: "parsed_references(\"simple.m\", &source)"
 ---
 - name: Foundation/Foundation.h
@@ -22,37 +22,37 @@ expression: "parsed_references(\"simple.m\", &source)"
   kind: Call
   start_line: 16
   context: "self = [super init]"
-  receiver: ~
+  receiver: super
 - name: formatName
   kind: Call
   start_line: 24
   context: "*formatted = [self formatName:name]"
-  receiver: ~
+  receiver: self
 - name: stringWithFormat
   kind: Call
   start_line: 25
   context: "return [NSString stringWithFormat:@\"%@ %@!\", self.prefix, formatted];"
-  receiver: ~
+  receiver: NSString
 - name: capitalizedString
   kind: Call
   start_line: 29
   context: "return [name capitalizedString];"
-  receiver: ~
+  receiver: name
 - name: alloc
   kind: Call
   start_line: 36
   context: "[[SimpleGreeter alloc] initWithPrefix:@\"Hello\"]"
-  receiver: ~
+  receiver: SimpleGreeter
 - name: initWithPrefix
   kind: Call
   start_line: 36
   context: "*greeter = [[SimpleGreeter alloc] initWithPrefix:@\"Hello\"]"
-  receiver: ~
+  receiver: "[SimpleGreeter alloc]"
 - name: greet
   kind: Call
   start_line: 37
   context: "*result = [greeter greet:@\"world\"]"
-  receiver: ~
+  receiver: greeter
 - name: NSLog
   kind: Call
   start_line: 38
