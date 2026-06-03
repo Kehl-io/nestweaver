@@ -1269,6 +1269,12 @@ enum DaemonAction {
         /// Idle timeout in seconds
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
+        /// Optional path to `nestweaver-instance.toml`. When supplied, the
+        /// daemon loads `[ranking]`, `[response]`, and other instance settings
+        /// once at startup so RPCs (e.g. `brain_search`) apply them with
+        /// parity to the direct-disk CLI path.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Stop the running daemon
     Stop,
@@ -1278,6 +1284,11 @@ enum DaemonAction {
     Restart {
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
+        /// Optional path to `nestweaver-instance.toml`, forwarded to the
+        /// `daemon start` invocation so restarts preserve F6 `[ranking]`
+        /// priors and other instance settings.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -4927,7 +4938,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let log_file = nestweaver_daemon::log_path(&instance_id);
 
             match action {
-                DaemonAction::Start { idle_timeout } => {
+                DaemonAction::Start {
+                    idle_timeout,
+                    config,
+                } => {
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
@@ -5021,8 +5035,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             };
                             let rt = tokio::runtime::Runtime::new()
                                 .expect("failed to create tokio runtime");
+                            let config_path = config.clone();
                             rt.block_on(async {
-                                if let Err(e) = nestweaver_daemon::run_server(&db_path, idle).await
+                                if let Err(e) = nestweaver_daemon::run_server(
+                                    &db_path,
+                                    idle,
+                                    config_path.as_deref(),
+                                )
+                                .await
                                 {
                                     eprintln!("Daemon error: {e:#}");
                                     std::process::exit(1);
@@ -5087,7 +5107,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
 
-                DaemonAction::Restart { idle_timeout } => {
+                DaemonAction::Restart {
+                    idle_timeout,
+                    config,
+                } => {
                     // Stop if running.
                     if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
                         && let Ok(pid) = pid_str.trim().parse::<i32>()
@@ -5113,15 +5136,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // Re-exec ourselves to start the daemon fresh.
                     let exe =
                         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let mut start_args: Vec<String> = vec![
+                        "daemon".to_string(),
+                        "--db".to_string(),
+                        db_path.display().to_string(),
+                        "start".to_string(),
+                        "--idle-timeout".to_string(),
+                        idle_timeout.to_string(),
+                    ];
+                    if let Some(cfg) = config.as_deref() {
+                        start_args.push("--config".to_string());
+                        start_args.push(cfg.display().to_string());
+                    }
                     let status = std::process::Command::new(&exe)
-                        .args([
-                            "daemon",
-                            "--db",
-                            &db_path.display().to_string(),
-                            "start",
-                            "--idle-timeout",
-                            &idle_timeout.to_string(),
-                        ])
+                        .args(&start_args)
                         .status()
                         .with_context(|| "failed to restart daemon")?;
                     if !status.success() {

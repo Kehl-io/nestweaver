@@ -1829,6 +1829,68 @@ fn tool_brain_search(
         }
     }
 
+    // Feature F6: per-path `[ranking]` priors from the daemon-installed
+    // InstanceConfig (set via `set_current_instance_config`). Mirrors the
+    // direct-disk CLI handler: project each row into a `BrainNode`, apply
+    // multiplicative priors keyed by file-path glob, then fold the adjusted
+    // relevance back into the row's `score`. No config → no-op (byte-identical
+    // output to the pre-F6 path).
+    if let Some(cfg) = current_instance_config()
+        && !cfg.ranking.is_empty()
+    {
+        let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
+        for v in &note_results {
+            let uid = v.get("uid").and_then(|u| u.as_str()).unwrap_or("");
+            if uid.is_empty() {
+                continue;
+            }
+            let kind = v
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let score = v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            // For note rows the JSON carries no `location`; resolve the note's
+            // file_path so the ranking-glob can match. Symbol rows already
+            // carry `"location": "<path>:<line>"`.
+            let location = v
+                .get("location")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    store
+                        .lookup_note(uid)
+                        .map(|note| note.file_path)
+                        .unwrap_or_default()
+                });
+            probe.push(nestweaver_engine::BrainNode {
+                uid: uid.to_string(),
+                kind,
+                title: String::new(),
+                location,
+                relevance: score,
+                inline_body: None,
+            });
+        }
+        nestweaver_engine::apply_ranking_priors(&mut probe, &cfg.ranking);
+        let adjusted: std::collections::HashMap<String, f64> =
+            probe.into_iter().map(|n| (n.uid, n.relevance)).collect();
+        for item in note_results.iter_mut() {
+            if let Some(uid) = item.get("uid").and_then(|u| u.as_str()).map(String::from)
+                && let Some(&adj) = adjusted.get(&uid)
+            {
+                item["score"] = json!(adj);
+            }
+        }
+        // Re-sort after priors mutate scores so the truncate below keeps the
+        // best-ranked rows.
+        note_results.sort_by(|a, b| {
+            let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     note_results.truncate(limit);
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by
@@ -4226,6 +4288,8 @@ fn walk_has_markdown(root: &Path) -> bool {
 thread_local! {
     static CURRENT_DB_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static CURRENT_INSTANCE_CONFIG: std::cell::RefCell<Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>> =
+        const { std::cell::RefCell::new(None) };
     static ALLOW_ADD_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static LITE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
@@ -4240,6 +4304,20 @@ thread_local! {
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
     CURRENT_DB_PATH.with(|c| *c.borrow_mut() = Some(path));
+}
+
+/// Install the parsed `InstanceConfig` for the current dispatch context.
+/// Callers (daemon, MCP server) set this once per dispatch so tools like
+/// `brain_search` can apply Feature F6 `[ranking]` priors without re-parsing
+/// the file. Pass `None` to clear.
+pub fn set_current_instance_config(cfg: Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>) {
+    CURRENT_INSTANCE_CONFIG.with(|c| *c.borrow_mut() = cfg);
+}
+
+/// Retrieve the parsed `InstanceConfig` installed for this dispatch, if any.
+pub(crate) fn current_instance_config() -> Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>
+{
+    CURRENT_INSTANCE_CONFIG.with(|c| c.borrow().clone())
 }
 
 /// Set the F16 response-cache size cap in MiB (from `[cache] max_size_mb`).
