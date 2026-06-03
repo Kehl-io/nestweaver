@@ -165,6 +165,7 @@ mod tests {
             edge_type: EdgeType::Calls,
             confidence: 0.9,
             link_type: None,
+            evidence: Vec::new(),
         };
         store.insert_edge(&edge).unwrap();
 
@@ -194,6 +195,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.8,
                 link_type: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         store
@@ -203,6 +205,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.7,
                 link_type: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -286,6 +289,7 @@ mod tests {
             edge_type: EdgeType::CrossRepoLink,
             confidence: 0.6,
             link_type: Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+            evidence: Vec::new(),
         };
         store.insert_edge(&edge).unwrap();
     }
@@ -956,6 +960,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: Vec::new(),
             },
             ResolvedEdge {
                 source_uid: "be-sym-1".to_string(),
@@ -963,6 +968,7 @@ mod tests {
                 edge_type: EdgeType::Imports,
                 confidence: 0.8,
                 link_type: None,
+                evidence: Vec::new(),
             },
         ];
         store.batch_insert_edges(&edges).unwrap();
@@ -1018,6 +1024,7 @@ mod tests {
                 edge_type: EdgeType::ImplementsContract,
                 confidence: 1.0,
                 link_type: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
