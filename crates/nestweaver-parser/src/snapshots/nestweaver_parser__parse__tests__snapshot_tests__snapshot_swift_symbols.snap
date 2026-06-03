@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4317
 expression: "parsed_symbols(\"simple.swift\", &source)"
 ---
 - name: Greeter
@@ -13,6 +12,20 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
+  parent_name: ~
+- name: greet
+  kind: Method
+  start_line: 4
+  end_line: 4
+  signature: "func greet(name: String) -> String"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info:
+    declared_type: ~
+    parameter_types: []
+    return_type: String
   parent_name: ~
 - name: SimpleGreeter
   kind: Class

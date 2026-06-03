@@ -22,6 +22,10 @@
 (call
   method: (identifier) @name) @reference.call
 
+; Instance variable assignment: @name = value
+(assignment
+  left: (instance_variable) @name) @definition.property
+
 ; Superclass (inheritance)
 (class
   superclass: (superclass
