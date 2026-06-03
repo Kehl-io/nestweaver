@@ -259,10 +259,14 @@ fn extract_assignments(source: &str) -> Vec<Assignment> {
                     .unwrap_or(lhs);
                 // For dotted RHS (`config.store`), look up just the last segment.
                 let rhs_key = rhs.rsplit('.').next().unwrap_or(rhs);
-                assignments.push((
-                    (lhs_key.to_string(), line_num),
-                    (rhs_key.to_string(), line_num),
-                ));
+                // Skip self-referential assignments (e.g., `store = config.store`
+                // produces lhs=store, rhs=store after last-segment extraction).
+                if lhs_key != rhs_key {
+                    assignments.push((
+                        (lhs_key.to_string(), line_num),
+                        (rhs_key.to_string(), line_num),
+                    ));
+                }
             }
             // Also handle function-call RHS: `let x = foo()` or `let x = obj.method()`
             if !lhs.is_empty()
