@@ -154,13 +154,9 @@ fn resolve_specifier(
         Language::Zig => lang::zig::resolve_import(from_file, specifier, known_files),
         Language::ObjectiveC => lang::objc::resolve_import(from_file, specifier, known_files),
         Language::Lua => lang::lua::resolve_import(from_file, specifier, known_files),
-        Language::PowerShell => {
-            lang::powershell::resolve_import(from_file, specifier, known_files)
-        }
+        Language::PowerShell => lang::powershell::resolve_import(from_file, specifier, known_files),
         Language::Julia => lang::julia::resolve_import(from_file, specifier, known_files),
-        Language::Cobol | Language::Bash | Language::Elixir | Language::Sql | Language::Hcl => {
-            None
-        }
+        Language::Cobol | Language::Bash | Language::Elixir | Language::Sql | Language::Hcl => None,
         Language::Vue | Language::Svelte | Language::Astro => {
             lang::javascript::resolve_import(from_file, specifier, known_files, workspace_ctx)
         }

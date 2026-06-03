@@ -56,10 +56,7 @@ mod tests {
     fn resolves_framework_import() {
         let known = set(&["include/Foundation/NSObject.h"]);
         let result = resolve_import("src/main.m", "Foundation/NSObject.h", &known);
-        assert_eq!(
-            result,
-            Some("include/Foundation/NSObject.h".to_string())
-        );
+        assert_eq!(result, Some("include/Foundation/NSObject.h".to_string()));
     }
 
     #[test]
