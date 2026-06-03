@@ -144,21 +144,23 @@ fn resolve_specifier(
         Language::Ruby => lang::ruby::resolve_import(from_file, specifier, known_files),
         Language::Dart => lang::dart::resolve_import(from_file, specifier, known_files),
         Language::Swift => lang::swift::resolve_import(from_file, specifier, known_files),
-        Language::Cobol
-        | Language::Lua
-        | Language::Bash
-        | Language::Scala
-        | Language::Elixir
-        | Language::Zig
-        | Language::ObjectiveC
-        | Language::Groovy
-        | Language::PowerShell
-        | Language::Julia
-        | Language::Sql
-        | Language::Hcl
-        | Language::Fortran
-        | Language::Pascal
-        | Language::SystemVerilog => None,
+        Language::Scala => lang::scala::resolve_import(from_file, specifier, known_files),
+        Language::Groovy => lang::groovy::resolve_import(from_file, specifier, known_files),
+        Language::Fortran => lang::fortran::resolve_import(from_file, specifier, known_files),
+        Language::Pascal => lang::pascal::resolve_import(from_file, specifier, known_files),
+        Language::SystemVerilog => {
+            lang::systemverilog::resolve_import(from_file, specifier, known_files)
+        }
+        Language::Zig => lang::zig::resolve_import(from_file, specifier, known_files),
+        Language::ObjectiveC => lang::objc::resolve_import(from_file, specifier, known_files),
+        Language::Lua => lang::lua::resolve_import(from_file, specifier, known_files),
+        Language::PowerShell => {
+            lang::powershell::resolve_import(from_file, specifier, known_files)
+        }
+        Language::Julia => lang::julia::resolve_import(from_file, specifier, known_files),
+        Language::Cobol | Language::Bash | Language::Elixir | Language::Sql | Language::Hcl => {
+            None
+        }
         Language::Vue | Language::Svelte | Language::Astro => {
             lang::javascript::resolve_import(from_file, specifier, known_files, workspace_ctx)
         }
