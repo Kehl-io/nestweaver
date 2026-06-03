@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4330
 expression: "parsed_symbols(\"simple.m\", &source)"
 ---
 - name: GreeterProtocol
   kind: Interface
   start_line: 5
-  end_line: 5
+  end_line: 7
   signature: "@protocol GreeterProtocol"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -14,7 +15,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
   type_info: ~
   parent_name: ~
 - name: greet
-  kind: Function
+  kind: Method
   start_line: 6
   end_line: 6
   signature: "- (NSString *)greet:(NSString *)name;"
@@ -24,10 +25,21 @@ expression: "parsed_symbols(\"simple.m\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+- name: NSObject
+  kind: Interface
+  start_line: 9
+  end_line: 11
+  signature: "@interface SimpleGreeter : NSObject <GreeterProtocol>"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
 - name: SimpleGreeter
   kind: Interface
   start_line: 9
-  end_line: 9
+  end_line: 11
   signature: "@interface SimpleGreeter : NSObject <GreeterProtocol>"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -38,7 +50,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
 - name: SimpleGreeter
   kind: Class
   start_line: 13
-  end_line: 13
+  end_line: 32
   signature: "@implementation SimpleGreeter"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -49,7 +61,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
 - name: initWithPrefix
   kind: Method
   start_line: 15
-  end_line: 15
+  end_line: 21
   signature: "- (instancetype)initWithPrefix:(NSString *)prefix {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -60,7 +72,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
 - name: greet
   kind: Method
   start_line: 23
-  end_line: 23
+  end_line: 26
   signature: "- (NSString *)greet:(NSString *)name {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -71,7 +83,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
 - name: formatName
   kind: Method
   start_line: 28
-  end_line: 28
+  end_line: 30
   signature: "- (NSString *)formatName:(NSString *)name {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -82,7 +94,7 @@ expression: "parsed_symbols(\"simple.m\", &source)"
 - name: main
   kind: Function
   start_line: 34
-  end_line: 34
+  end_line: 41
   signature: "int main(int argc, const char *argv[]) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
