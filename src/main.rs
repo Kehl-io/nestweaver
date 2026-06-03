@@ -6225,7 +6225,24 @@ fn run_brain(
                 let stop_req = nestweaver_proto::StopWatchRequest {};
                 if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
                 {
-                    eprintln!("Warning: failed to stop watcher: {e}");
+                    // The watcher thread lives inside the daemon, so when the
+                    // daemon process is gone the watcher has already stopped
+                    // with it - nothing for us to clean up, nothing to warn
+                    // about. Two error shapes indicate "daemon gone":
+                    //   - `Unavailable`: connect failed (socket file removed,
+                    //     or "Connection refused" on a stale socket).
+                    //   - `Unknown` with a tonic transport error: the
+                    //     connection was open when the RPC started but was
+                    //     abruptly closed mid-call (e.g. daemon SIGKILLed).
+                    // Without this filter, `KeepAlive=true` on the watch
+                    // plist turns every daemon restart into a perpetual
+                    // "failed to stop watcher" loop in the watch error log.
+                    let daemon_gone = matches!(e.code(), tonic::Code::Unavailable)
+                        || (matches!(e.code(), tonic::Code::Unknown)
+                            && e.message().contains("transport error"));
+                    if !daemon_gone {
+                        eprintln!("Warning: failed to stop watcher: {e}");
+                    }
                 }
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
