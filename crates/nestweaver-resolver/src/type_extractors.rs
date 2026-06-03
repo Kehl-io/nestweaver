@@ -451,7 +451,7 @@ pub fn extract_self_bindings(
     bindings: &mut HashMap<(String, u32), TypeBinding>,
 ) {
     let self_keyword = match language {
-        Language::Rust | Language::Python | Language::Swift | Language::Lua | Language::ObjectiveC => "self",
+        Language::Rust | Language::Python | Language::Swift | Language::Lua | Language::ObjectiveC | Language::Pascal => "self",
         Language::TypeScript
         | Language::JavaScript
         | Language::Java
@@ -459,7 +459,8 @@ pub fn extract_self_bindings(
         | Language::Kotlin
         | Language::Dart
         | Language::Cpp
-        | Language::Scala => "this",
+        | Language::Scala
+        | Language::SystemVerilog => "this",
         Language::Php => "$this",
         Language::Ruby => "self",
         _ => return,

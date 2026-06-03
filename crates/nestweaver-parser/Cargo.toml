@@ -44,6 +44,9 @@ tree-sitter-julia = "0.23"
 tree-sitter-hcl = "1.1"
 tree-sitter-sql = "0.0.2"
 tree-sitter-sequel = "0.3"
+tree-sitter-fortran = "0.6"
+tree-sitter-pascal = "0.10"
+tree-sitter-systemverilog = "0.3"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
