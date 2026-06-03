@@ -12,13 +12,19 @@ pub fn resolve_import(
     // The specifier is the package name (parser strips ::symbol or ::*)
     let extensions = ["sv", "svh"];
 
+    let mut best: Option<&str> = None;
     for ext in &extensions {
         let candidate = format!("{specifier}.{ext}");
         for &file in known_files {
             if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
@@ -51,5 +57,12 @@ mod tests {
         let known = set(&["rtl/other.sv"]);
         let result = resolve_import("rtl/top.sv", "missing", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn multiple_matches_picks_shortest() {
+        let known = set(&["vendor/rtl/my_pkg.sv", "rtl/my_pkg.sv"]);
+        let result = resolve_import("rtl/top.sv", "my_pkg", &known);
+        assert_eq!(result, Some("rtl/my_pkg.sv".to_string()));
     }
 }

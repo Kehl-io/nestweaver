@@ -12,12 +12,18 @@ pub fn resolve_import(
 
     let candidates = [format!("{path}.lua"), format!("{path}/init.lua")];
 
+    let mut best: Option<&str> = None;
     for candidate in &candidates {
         for &file in known_files {
             if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None

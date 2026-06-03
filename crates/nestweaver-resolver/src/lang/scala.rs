@@ -16,10 +16,16 @@ pub fn resolve_import(
 
     let candidate = format!("{}.scala", specifier.replace('.', "/"));
 
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if file == candidate || file.ends_with(&format!("/{candidate}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
@@ -55,5 +61,12 @@ mod tests {
         let known = set(&["com/example/Bar.scala"]);
         let result = resolve_import("Main.scala", "com.example.Missing", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn multiple_matches_picks_shortest() {
+        let known = set(&["vendor/src/main/scala/com/example/Foo.scala", "src/main/scala/com/example/Foo.scala"]);
+        let result = resolve_import("Main.scala", "com.example.Foo", &known);
+        assert_eq!(result, Some("src/main/scala/com/example/Foo.scala".to_string()));
     }
 }
