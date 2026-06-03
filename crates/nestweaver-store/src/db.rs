@@ -399,49 +399,68 @@ impl GraphStore {
         conn.query("CREATE REL TABLE IF NOT EXISTS SERVICE_HAS_SYMBOL(FROM Service TO Symbol)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
 
-        conn.query("CREATE REL TABLE IF NOT EXISTS CALLS(FROM Symbol TO Symbol, confidence FLOAT)")
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-
-        conn.query("CREATE REL TABLE IF NOT EXISTS USES(FROM Symbol TO Symbol, confidence FLOAT)")
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS ACCESSES(FROM Symbol TO Symbol, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS CALLS(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE CALLS ADD evidence STRING DEFAULT ''");
 
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM Symbol TO Symbol, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS USES(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE USES ADD evidence STRING DEFAULT ''");
 
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS EXTENDS_SYM(FROM Symbol TO Symbol, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS ACCESSES(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE ACCESSES ADD evidence STRING DEFAULT ''");
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS IMPORTS(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE IMPORTS ADD evidence STRING DEFAULT ''");
+
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS EXTENDS_SYM(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE EXTENDS_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS_SYM(\
-                FROM Symbol TO Symbol, confidence FLOAT)",
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE IMPLEMENTS_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS INCLUDES_SYM(\
-                FROM Symbol TO Symbol, confidence FLOAT)",
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE INCLUDES_SYM ADD evidence STRING DEFAULT ''");
 
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS MEMBER_OF(FROM Symbol TO Symbol, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS MEMBER_OF(\
+                FROM Symbol TO Symbol, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE MEMBER_OF ADD evidence STRING DEFAULT ''");
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS CROSS_REPO_LINK(\
-                FROM Symbol TO Symbol, confidence FLOAT, link_type STRING)",
+                FROM Symbol TO Symbol, confidence FLOAT, link_type STRING, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE CROSS_REPO_LINK ADD evidence STRING DEFAULT ''");
 
         // ── Brain extension: markdown nodes (walking skeleton) ──────────────
         //
@@ -565,19 +584,29 @@ impl GraphStore {
         // SUPERSEDES→prov:wasRevisionOf, DEPENDS_ON→prov:wasInformedBy,
         // CAUSED_BY→prov:wasDerivedFrom, RELATES_TO→skos:related.
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS SUPERSEDES(FROM Note TO Note, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS SUPERSEDES(\
+                FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE SUPERSEDES ADD evidence STRING DEFAULT ''");
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(FROM Note TO Note, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(\
+                FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
-        conn.query("CREATE REL TABLE IF NOT EXISTS CAUSED_BY(FROM Note TO Note, confidence FLOAT)")
-            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE DEPENDS_ON ADD evidence STRING DEFAULT ''");
         conn.query(
-            "CREATE REL TABLE IF NOT EXISTS RELATES_TO(FROM Note TO Note, confidence FLOAT)",
+            "CREATE REL TABLE IF NOT EXISTS CAUSED_BY(\
+                FROM Note TO Note, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE CAUSED_BY ADD evidence STRING DEFAULT ''");
+        conn.query(
+            "CREATE REL TABLE IF NOT EXISTS RELATES_TO(\
+                FROM Note TO Note, confidence FLOAT, evidence STRING)",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE RELATES_TO ADD evidence STRING DEFAULT ''");
 
         conn.query("CREATE REL TABLE IF NOT EXISTS NOTE_TAGGED_WITH(FROM Note TO Tag)")
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -651,9 +680,10 @@ impl GraphStore {
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS_CONTRACT(\
-                FROM Symbol TO Contract, confidence FLOAT)",
+                FROM Symbol TO Contract, confidence FLOAT, evidence STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+        let _ = conn.query("ALTER TABLE IMPLEMENTS_CONTRACT ADD evidence STRING DEFAULT ''");
 
         // ── Trigram posting table (F3/F4) ───────────────────────────────────
         // Maps a lowercased 3-gram to a node UID whose indexed text contains
