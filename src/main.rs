@@ -6766,13 +6766,17 @@ fn run_brain(
                         "location": format!("{}:{}", sym.file_path, sym.start_line),
                     }));
                 }
-                // Sort by score descending and truncate.
+                // Sort by score descending. `limit` is interpreted per-kind
+                // (each of notes/symbols is already capped upstream); a
+                // cross-kind truncate here would evict every symbol whenever
+                // ≥ `limit` notes match because symbols carry a fixed 0.5
+                // score while BM25 notes score 15+. Mirrors the daemon-side
+                // `tool_brain_search` semantics.
                 results.sort_by(|a, b| {
                     let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                results.truncate(limit);
                 let mut payload = serde_json::json!({
                     "query": query,
                     "engine": engine,
