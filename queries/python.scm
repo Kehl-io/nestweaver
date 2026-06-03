@@ -18,6 +18,24 @@
     (assignment
       left: (identifier) @name))) @definition.variable
 
+; Class-level attribute assignments (NAME = value inside class body)
+(class_definition
+  body: (block
+    (expression_statement
+      (assignment
+        left: (identifier) @name)))) @definition.property
+
+; Instance attributes set via self.x = ... inside methods
+(class_definition
+  body: (block
+    (function_definition
+      body: (block
+        (expression_statement
+          (assignment
+            left: (attribute
+              object: (identifier) @_self
+              attribute: (identifier) @name))))))) @definition.property
+
 ; Call expressions
 (call
   function: (identifier) @name) @reference.call
