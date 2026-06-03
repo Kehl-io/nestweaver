@@ -36,6 +36,13 @@
 (enum_case
   name: (name) @name) @definition.const
 
+; Instance property: $this->prop = value
+(assignment_expression
+  left: (member_access_expression
+    object: (variable_name) @_this
+    name: (name) @name)
+  (#eq? @_this "$this")) @definition.property
+
 ; Function call expressions
 (function_call_expression
   function: (name) @name) @reference.call

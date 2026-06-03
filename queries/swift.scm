@@ -40,11 +40,16 @@
     (navigation_suffix
       (simple_identifier) @name))) @reference.call
 
-; Methods (functions inside class/struct/protocol body)
+; Methods (functions inside class/struct body)
 (class_declaration
   body: (class_body
     (function_declaration
       name: (simple_identifier) @name) @definition.method))
+
+; Protocol method declarations
+(protocol_body
+  (protocol_function_declaration
+    name: (simple_identifier) @name) @definition.method)
 
 ; Inheritance / protocol conformance
 (inheritance_specifier

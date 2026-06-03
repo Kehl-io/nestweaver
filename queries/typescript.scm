@@ -99,6 +99,12 @@
 (implements_clause
   (type_identifier) @name) @reference.implements
 
+; Instance property: this.prop = value
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @name)) @definition.property
+
 ; ── Type references (USES edges) ────────────────────────────────────
 ; Parameter type annotation
 (required_parameter

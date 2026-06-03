@@ -57,6 +57,17 @@ expression: "parsed_symbols(\"simple.js\", &source)"
   visibility: Private
   type_info: ~
   parent_name: Animal
+- name: name
+  kind: Property
+  start_line: 13
+  end_line: 13
+  signature: this.name = name
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Private
+  type_info: ~
+  parent_name: Animal
 - name: speak
   kind: Method
   start_line: 16
