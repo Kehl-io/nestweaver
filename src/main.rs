@@ -6572,6 +6572,55 @@ fn run_brain(
             prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            // Route through the daemon's typed `Search` RPC when running. The
+            // daemon owns the writer-mode Tantivy index and shares dispatch
+            // with the MCP server (`tool_brain_search`), so daemon-routed
+            // searches eliminate the "Database is locked" reader fallback
+            // and stay in sync with live re-indexing. Falls through to the
+            // direct-disk implementation below when `--no-daemon` is set,
+            // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path));
+                if let Ok(mut client) = connect {
+                    let req = nestweaver_proto::BrainSearchRequest {
+                        query: raw_query.clone(),
+                        limit: limit as i32,
+                        response_format: String::new(),
+                        include_bodies: false,
+                        prf,
+                        rerank: false,
+                        root: String::new(),
+                    };
+                    let rpc = rt.block_on(async {
+                        client.inner_mut().search(req).await.map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            render_brain_search_response(&resp, json)?;
+                            let stats = format!(
+                                "{} results in {} (via daemon)",
+                                resp.results.len(),
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
+                        }
+                        Err(status) => {
+                            // Surface a single eprintln, then fall through to
+                            // the direct-disk path so the user still gets a
+                            // result.
+                            eprintln!(
+                                "warning: daemon search RPC failed ({}); falling back to direct DB read",
+                                status.message()
+                            );
+                        }
+                    }
+                }
+                // Connect failed → silently fall through (daemon may not be
+                // running for this DB; the direct-disk path is the legacy
+                // behavior and remains correct).
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -7469,6 +7518,91 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
             }
         }
     }
+}
+
+/// Render a daemon-routed `BrainSearchResponse` in the same shape as the
+/// direct-disk `brain search` handler. The daemon merges note + symbol
+/// results into a single `results` array, distinguished by `kind`
+/// (`"note"` vs `"Symbol/<Kind>"`); text mode splits them back out so the
+/// per-row format matches the legacy output.
+fn render_brain_search_response(
+    resp: &nestweaver_proto::BrainSearchResponse,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
+        for item in &resp.results {
+            let mut v = serde_json::json!({
+                "uid": item.uid,
+                "kind": item.kind,
+                "title": item.title,
+                "score": item.score,
+            });
+            if !item.location.is_empty() {
+                v["location"] = serde_json::json!(item.location);
+            }
+            if !item.matched_headings.is_empty() {
+                v["matched_headings"] = serde_json::json!(item.matched_headings);
+            }
+            if !item.inline_body.is_empty() {
+                v["inline_body"] = serde_json::json!(item.inline_body);
+            }
+            results.push(v);
+        }
+        let mut payload = serde_json::json!({
+            "query": resp.query,
+            "engine": resp.engine,
+            "results": results,
+            "total_matches": resp.total_matches,
+        });
+        if !resp.expansion_terms.is_empty() {
+            payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if resp.results.is_empty() {
+        println!("No results for '{}'.", resp.query);
+        return Ok(());
+    }
+
+    let header = if resp.engine == "bm25" {
+        "Brain search (BM25)"
+    } else {
+        "Brain search (substring fallback)"
+    };
+    println!("{}: {} result(s)", header, resp.results.len());
+    if !resp.expansion_terms.is_empty() {
+        println!("  PRF expansion terms: {}", resp.expansion_terms.join(", "));
+    }
+    println!();
+    for item in &resp.results {
+        if item.kind == "note" {
+            if item.matched_headings.is_empty() {
+                println!("  [{:.2}] {}", item.score, item.title);
+            } else {
+                println!(
+                    "  [{:.2}] {} (matched: {})",
+                    item.score,
+                    item.title,
+                    item.matched_headings.join(", "),
+                );
+            }
+        } else {
+            // Symbol/<Kind> row: split "kind" prefix off, render with location.
+            let kind_short = item.kind.strip_prefix("Symbol/").unwrap_or(&item.kind);
+            if item.location.is_empty() {
+                println!("  [{:.2}] {} [{}]", item.score, item.title, kind_short);
+            } else {
+                println!(
+                    "  [{:.2}] {} [{}] @ {}",
+                    item.score, item.title, kind_short, item.location,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
