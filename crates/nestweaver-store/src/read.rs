@@ -1129,8 +1129,9 @@ impl GraphStore {
         ];
         let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
-            let q =
-                format!("MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence");
+            let q = format!(
+                "MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence"
+            );
             let result = match conn.query(&q) {
                 Ok(r) => r,
                 Err(e) => {

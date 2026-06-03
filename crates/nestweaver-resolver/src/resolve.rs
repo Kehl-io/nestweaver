@@ -964,13 +964,11 @@ mod tests {
 
     #[test]
     fn resolved_edge_contains_evidence() {
-        let files = vec![
-            (
-                "src/main.js".to_string(),
-                vec![make_symbol("main", 1), make_symbol("greet", 10)],
-                vec![make_ref("greet", ReferenceKind::Call, 5)],
-            ),
-        ];
+        let files = vec![(
+            "src/main.js".to_string(),
+            vec![make_symbol("main", 1), make_symbol("greet", 10)],
+            vec![make_ref("greet", ReferenceKind::Call, 5)],
+        )];
 
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
         let call = edges
