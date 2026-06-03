@@ -22,10 +22,10 @@ pub fn resolve_import(
         // Also try as-is
         let mut best: Option<&str> = None;
         for &file in known_files {
-            if file == specifier || file.ends_with(&format!("/{specifier}")) {
-                if best.is_none() || file.len() < best.unwrap().len() {
-                    best = Some(file);
-                }
+            if (file == specifier || file.ends_with(&format!("/{specifier}")))
+                && (best.is_none() || file.len() < best.unwrap().len())
+            {
+                best = Some(file);
             }
         }
         if let Some(f) = best {
@@ -41,10 +41,10 @@ pub fn resolve_import(
     let mut best: Option<&str> = None;
     for candidate in &candidates {
         for &file in known_files {
-            if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-                if best.is_none() || file.len() < best.unwrap().len() {
-                    best = Some(file);
-                }
+            if (file == candidate.as_str() || file.ends_with(&format!("/{candidate}")))
+                && (best.is_none() || file.len() < best.unwrap().len())
+            {
+                best = Some(file);
             }
         }
     }

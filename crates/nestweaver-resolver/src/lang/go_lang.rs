@@ -26,10 +26,10 @@ pub fn resolve_import(
             Some(idx) => &file[..idx],
             None => continue,
         };
-        if dir == specifier || dir.ends_with(&format!("/{specifier}")) {
-            if best.is_none() || file.len() < best.unwrap().len() {
-                best = Some(file);
-            }
+        if (dir == specifier || dir.ends_with(&format!("/{specifier}")))
+            && (best.is_none() || file.len() < best.unwrap().len())
+        {
+            best = Some(file);
         }
     }
     if let Some(f) = best {

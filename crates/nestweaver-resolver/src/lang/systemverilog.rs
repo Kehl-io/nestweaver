@@ -16,10 +16,10 @@ pub fn resolve_import(
     for ext in &extensions {
         let candidate = format!("{specifier}.{ext}");
         for &file in known_files {
-            if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-                if best.is_none() || file.len() < best.unwrap().len() {
-                    best = Some(file);
-                }
+            if (file == candidate.as_str() || file.ends_with(&format!("/{candidate}")))
+                && (best.is_none() || file.len() < best.unwrap().len())
+            {
+                best = Some(file);
             }
         }
     }

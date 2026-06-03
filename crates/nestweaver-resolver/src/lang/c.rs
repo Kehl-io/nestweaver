@@ -27,10 +27,8 @@ pub fn resolve_import(
     let suffix = format!("/{specifier}");
     let mut best: Option<&str> = None;
     for &file in known_files {
-        if file.ends_with(&suffix) {
-            if best.is_none() || file.len() < best.unwrap().len() {
-                best = Some(file);
-            }
+        if file.ends_with(&suffix) && (best.is_none() || file.len() < best.unwrap().len()) {
+            best = Some(file);
         }
     }
     if let Some(f) = best {
