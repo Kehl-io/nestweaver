@@ -855,6 +855,12 @@ fn type_query_source(lang: Language) -> Option<&'static str> {
         Language::Ruby => Some(include_str!("../../../queries/ruby_types.scm")),
         Language::C => Some(include_str!("../../../queries/c_types.scm")),
         Language::Elixir => Some(include_str!("../../../queries/elixir_types.scm")),
+        Language::Groovy => Some(include_str!("../../../queries/groovy_types.scm")),
+        Language::ObjectiveC => Some(include_str!("../../../queries/objc_types.scm")),
+        Language::PowerShell => Some(include_str!("../../../queries/powershell_types.scm")),
+        Language::Pascal => Some(include_str!("../../../queries/pascal_types.scm")),
+        Language::SystemVerilog => Some(include_str!("../../../queries/systemverilog_types.scm")),
+        // Lua: dynamically typed, no type annotations in grammar (see lua_types.scm)
         _ => None,
     }
 }
@@ -5002,5 +5008,110 @@ fn main() {
         assert!(!bindings.is_empty(), "expected user binding from struct: {:?}", parsed.type_bindings);
         assert_eq!(bindings[0].type_name, "User");
         assert_eq!(bindings[0].kind, AstBindingKind::Constructor);
+    }
+
+    #[test]
+    fn ast_extracts_groovy_typed_local() {
+        let source = "class Main { void run() { String name = 'hello' } }";
+        let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "name" && b.type_name == "String"),
+            "expected name binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_groovy_method_return_type() {
+        let source = "class Main { Integer compute() { return 42 } }";
+        let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "compute" && b.type_name == "Integer"
+                && matches!(b.kind, AstBindingKind::ReturnType)),
+            "expected compute return type: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_groovy_constructor() {
+        let source = "class Main { void run() { Foo x = new Foo() } }";
+        let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "x" && b.type_name == "Foo"
+                && matches!(b.kind, AstBindingKind::Constructor)),
+            "expected x ctor binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_objc_typed_variable() {
+        let source = "int main() { NSString* name = @\"hello\"; return 0; }";
+        let parsed = parse_source(Path::new("test.m"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "name" && b.type_name == "NSString"),
+            "expected name binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_objc_function_return_type() {
+        let source = "NSInteger getValue() { return 42; }";
+        let parsed = parse_source(Path::new("test.m"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "getValue" && b.type_name == "NSInteger"
+                && matches!(b.kind, AstBindingKind::ReturnType)),
+            "expected getValue return type: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_powershell_class_property() {
+        let source = "class Person {\n  [string]$Name\n  [int]$Age\n}";
+        let parsed = parse_source(Path::new("test.ps1"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name.contains("Name")),
+            "expected Name binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_pascal_typed_var() {
+        let source = "program Main;\nvar\n  count: Integer;\nbegin\nend.";
+        let parsed = parse_source(Path::new("test.pas"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "count"),
+            "expected count binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_pascal_function_return_type() {
+        let source = "function GetValue(): Integer;\nbegin\n  Result := 42;\nend;";
+        let parsed = parse_source(Path::new("test.pas"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "GetValue"
+                && matches!(b.kind, AstBindingKind::ReturnType)),
+            "expected GetValue return type: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_systemverilog_typed_var() {
+        let source = "module test;\n  int count;\nendmodule";
+        let parsed = parse_source(Path::new("test.sv"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "count"),
+            "expected count binding: {:?}", parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_lua_no_types() {
+        // Lua is dynamically typed — no type bindings expected
+        let source = "local x = 42\nfunction foo(a, b) return a + b end";
+        let parsed = parse_source(Path::new("test.lua"), source).unwrap();
+        assert!(
+            parsed.type_bindings.is_empty(),
+            "Lua should have no type bindings: {:?}", parsed.type_bindings
+        );
     }
 }
