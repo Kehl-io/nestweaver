@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4317
 expression: "parsed_symbols(\"simple.swift\", &source)"
 ---
 - name: Greeter
@@ -73,7 +74,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   entry_point_kind: ~
   visibility: Inferred
   type_info: ~
-  parent_name: ~
+  parent_name: AppConfig
 - name: Priority
   kind: Class
   start_line: 21
