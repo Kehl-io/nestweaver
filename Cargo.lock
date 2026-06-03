@@ -3134,6 +3134,7 @@ dependencies = [
  "tree-sitter-cpp",
  "tree-sitter-dart",
  "tree-sitter-elixir",
+ "tree-sitter-fortran",
  "tree-sitter-go",
  "tree-sitter-groovy",
  "tree-sitter-hcl",
@@ -3143,6 +3144,7 @@ dependencies = [
  "tree-sitter-kotlin",
  "tree-sitter-lua",
  "tree-sitter-objc",
+ "tree-sitter-pascal",
  "tree-sitter-php",
  "tree-sitter-powershell",
  "tree-sitter-python",
@@ -3152,6 +3154,7 @@ dependencies = [
  "tree-sitter-sequel",
  "tree-sitter-sql",
  "tree-sitter-swift",
+ "tree-sitter-systemverilog",
  "tree-sitter-typescript",
  "tree-sitter-zig",
 ]
@@ -5624,6 +5627,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-fortran"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea5fea41363a9b59666001dc26c4b356d4e164da27c6ce31145e00aba6bf9b16"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5719,6 +5732,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-pascal"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb51e9a57493fd237e4517566749f7f7453349261a72a427e5f11d3b34b72a8"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-php"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5803,6 +5826,16 @@ name = "tree-sitter-swift"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3b98fb6bc8e6a6a10023f401aa6a1858115e849dfaf7de57dd8b8ea0f257bd9"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-systemverilog"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48b2c568cff66b5c773aa1b5b1ce1a71cb763c2a79bbd94bb2cac9db57f39741"
 dependencies = [
  "cc",
  "tree-sitter-language",

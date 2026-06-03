@@ -34,6 +34,9 @@ const POWERSHELL_QUERY: &str = include_str!("../../../queries/powershell.scm");
 const JULIA_QUERY: &str = include_str!("../../../queries/julia.scm");
 const SQL_QUERY: &str = include_str!("../../../queries/sql.scm");
 const HCL_QUERY: &str = include_str!("../../../queries/hcl.scm");
+const FORTRAN_QUERY: &str = include_str!("../../../queries/fortran.scm");
+const PASCAL_QUERY: &str = include_str!("../../../queries/pascal.scm");
+const SYSTEMVERILOG_QUERY: &str = include_str!("../../../queries/systemverilog.scm");
 
 // ── error ──────────────────────────────────────────────────────────────────
 
@@ -280,12 +283,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         Language::PowerShell | Language::Julia | Language::Sql | Language::Hcl => {
             Visibility::Inferred
         }
-        // Ruby, Cobol, SystemVerilog, and other regex-parsed languages: inferred
-        Language::Ruby
-        | Language::Cobol
-        | Language::Fortran
-        | Language::Pascal
-        | Language::SystemVerilog => Visibility::Inferred,
+        // Ruby and COBOL (regex-parsed): inferred visibility
+        Language::Ruby | Language::Cobol => Visibility::Inferred,
+        // Fortran, Pascal, SystemVerilog: inferred visibility (tree-sitter)
+        Language::Fortran | Language::Pascal | Language::SystemVerilog => Visibility::Inferred,
     }
 }
 
@@ -324,13 +325,10 @@ fn build_ts_language(lang: Language, path: &Path) -> tree_sitter::Language {
         Language::Julia => tree_sitter_julia::LANGUAGE.into(),
         Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
         Language::Hcl => tree_sitter_hcl::LANGUAGE.into(),
-        Language::Cobol
-        | Language::Fortran
-        | Language::Pascal
-        | Language::Vue
-        | Language::Svelte
-        | Language::Astro
-        | Language::SystemVerilog => {
+        Language::Fortran => tree_sitter_fortran::LANGUAGE.into(),
+        Language::Pascal => tree_sitter_pascal::LANGUAGE.into(),
+        Language::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     }
@@ -375,13 +373,10 @@ fn query_source(lang: Language, path: &Path) -> std::borrow::Cow<'static, str> {
         Language::Julia => JULIA_QUERY,
         Language::Sql => SQL_QUERY,
         Language::Hcl => HCL_QUERY,
-        Language::Cobol
-        | Language::Fortran
-        | Language::Pascal
-        | Language::Vue
-        | Language::Svelte
-        | Language::Astro
-        | Language::SystemVerilog => {
+        Language::Fortran => FORTRAN_QUERY,
+        Language::Pascal => PASCAL_QUERY,
+        Language::SystemVerilog => SYSTEMVERILOG_QUERY,
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -596,14 +591,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // All regex-dispatched languages are handled in this single match block.
     match lang {
         Language::Cobol => return Ok(crate::cobol::parse_cobol(path, source)),
-        Language::Fortran => return Ok(crate::fortran::parse_fortran(path, source)),
-        Language::Pascal => return Ok(crate::pascal::parse_pascal(path, source)),
         Language::Vue => return Ok(crate::vue::parse_vue(path, source)),
         Language::Svelte => return Ok(crate::svelte::parse_svelte(path, source)),
         Language::Astro => return Ok(crate::astro::parse_astro(path, source)),
-        Language::SystemVerilog => {
-            return Ok(crate::systemverilog::parse_systemverilog(path, source));
-        }
         _ => {}
     }
 
@@ -650,13 +640,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Julia => "julia",
         Language::Sql => "sql",
         Language::Hcl => "hcl",
-        Language::Cobol
-        | Language::Fortran
-        | Language::Pascal
-        | Language::Vue
-        | Language::Svelte
-        | Language::Astro
-        | Language::SystemVerilog => {
+        Language::Fortran => "fortran",
+        Language::Pascal => "pascal",
+        Language::SystemVerilog => "systemverilog",
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
