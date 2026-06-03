@@ -17,10 +17,10 @@ pub fn resolve_import(
         let candidate = format!("{base}.{ext}");
         for &file in known_files {
             let file_lower = file.to_lowercase();
-            if file_lower == candidate || file_lower.ends_with(&format!("/{candidate}")) {
-                if best.is_none() || file.len() < best.unwrap().len() {
-                    best = Some(file);
-                }
+            if (file_lower == candidate || file_lower.ends_with(&format!("/{candidate}")))
+                && (best.is_none() || file.len() < best.unwrap().len())
+            {
+                best = Some(file);
             }
         }
     }

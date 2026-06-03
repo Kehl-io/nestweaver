@@ -24,10 +24,10 @@ pub fn resolve_import(
     // Match against known files (may include path prefix like src/main/java/...)
     let mut best: Option<&str> = None;
     for &file in known_files {
-        if file == candidate || file.ends_with(&format!("/{candidate}")) {
-            if best.is_none() || file.len() < best.unwrap().len() {
-                best = Some(file);
-            }
+        if (file == candidate || file.ends_with(&format!("/{candidate}")))
+            && (best.is_none() || file.len() < best.unwrap().len())
+        {
+            best = Some(file);
         }
     }
     if let Some(f) = best {
