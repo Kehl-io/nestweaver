@@ -161,6 +161,7 @@ pub fn resolve_references_with_context(
                             edge_type,
                             confidence,
                             link_type: None,
+                            evidence: Vec::new(),
                         });
                         continue 'ref_loop;
                     }
@@ -199,6 +200,7 @@ pub fn resolve_references_with_context(
                                                 edge_type,
                                                 confidence: conf,
                                                 link_type: None,
+                                                evidence: Vec::new(),
                                             });
                                             continue 'ref_loop;
                                         }
@@ -242,6 +244,7 @@ pub fn resolve_references_with_context(
                     edge_type,
                     confidence,
                     link_type: None,
+                    evidence: Vec::new(),
                 });
                 continue;
             }
@@ -262,6 +265,7 @@ pub fn resolve_references_with_context(
                         edge_type,
                         confidence,
                         link_type: None,
+                        evidence: Vec::new(),
                     });
                     found = true;
                     break 'import_search;
@@ -289,6 +293,7 @@ pub fn resolve_references_with_context(
                             edge_type,
                             confidence,
                             link_type: None,
+                            evidence: Vec::new(),
                         });
                         found = true;
                         break 'reexport_search;
@@ -321,6 +326,7 @@ pub fn resolve_references_with_context(
                         edge_type,
                         confidence,
                         link_type: None,
+                        evidence: Vec::new(),
                     });
                     found = true;
                 }
@@ -337,6 +343,7 @@ pub fn resolve_references_with_context(
                 edge_type,
                 confidence: 0.0,
                 link_type: None,
+                evidence: Vec::new(),
             });
         }
     }
@@ -381,6 +388,7 @@ pub fn resolve_references_with_context(
                 edge_type: EdgeType::Imports,
                 confidence,
                 link_type: None,
+                evidence: Vec::new(),
             });
         }
     }
@@ -455,6 +463,7 @@ pub fn resolve_references_with_context(
                     edge_type: EdgeType::Imports,
                     confidence,
                     link_type: None,
+                    evidence: Vec::new(),
                 });
             }
         }
