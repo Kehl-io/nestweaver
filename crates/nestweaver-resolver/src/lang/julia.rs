@@ -30,10 +30,7 @@ pub fn resolve_import(
     }
 
     // Package import: using/import PackageName
-    let candidates = [
-        format!("{specifier}.jl"),
-        format!("src/{specifier}.jl"),
-    ];
+    let candidates = [format!("{specifier}.jl"), format!("src/{specifier}.jl")];
 
     for candidate in &candidates {
         for &file in known_files {
@@ -58,10 +55,7 @@ mod tests {
     fn resolves_package_import() {
         let known = set(&["packages/MyPkg/src/MyPkg.jl"]);
         let result = resolve_import("src/main.jl", "MyPkg", &known);
-        assert_eq!(
-            result,
-            Some("packages/MyPkg/src/MyPkg.jl".to_string())
-        );
+        assert_eq!(result, Some("packages/MyPkg/src/MyPkg.jl".to_string()));
     }
 
     #[test]
