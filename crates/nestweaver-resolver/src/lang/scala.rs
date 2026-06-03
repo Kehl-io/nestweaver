@@ -65,8 +65,14 @@ mod tests {
 
     #[test]
     fn multiple_matches_picks_shortest() {
-        let known = set(&["vendor/src/main/scala/com/example/Foo.scala", "src/main/scala/com/example/Foo.scala"]);
+        let known = set(&[
+            "vendor/src/main/scala/com/example/Foo.scala",
+            "src/main/scala/com/example/Foo.scala",
+        ]);
         let result = resolve_import("Main.scala", "com.example.Foo", &known);
-        assert_eq!(result, Some("src/main/scala/com/example/Foo.scala".to_string()));
+        assert_eq!(
+            result,
+            Some("src/main/scala/com/example/Foo.scala".to_string())
+        );
     }
 }

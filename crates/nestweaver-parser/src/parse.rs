@@ -279,7 +279,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Private
             }
         }
-        // Ruby: public/private/protected are method-level section keywords
+        // Ruby: handles inline modifier form (`private def foo`).
+        // Section-form (`private` on its own line affecting subsequent methods)
+        // requires tracking state across definitions, which tree-sitter queries
+        // don't support — those methods stay Public (over-approximate, safe).
         Language::Ruby => {
             let sig = first_line(node_text);
             if sig.starts_with("private") || sig.contains("private ") {

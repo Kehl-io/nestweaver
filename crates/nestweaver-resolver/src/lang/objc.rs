@@ -31,7 +31,9 @@ pub fn resolve_import(
         return Some(f.to_string());
     }
 
-    // For framework imports like "Framework/Header.h", try just the basename
+    // For framework imports like "Framework/Header.h", try just the basename.
+    // This may match a different framework's header with the same name — the
+    // shortest-path heuristic prefers the most specific (shallowest) match.
     if let Some((_, basename)) = specifier.rsplit_once('/') {
         let mut best: Option<&str> = None;
         for &file in known_files {
