@@ -3,6 +3,7 @@ use std::collections::HashSet;
 /// Resolve a Fortran `use module_name` to a file path.
 ///
 /// Searches for `module_name.f90`, `.f95`, `.f03`, `.F90` (case-insensitive).
+/// When multiple files match, returns the shortest path (most specific match).
 pub fn resolve_import(
     _from_file: &str,
     specifier: &str,
@@ -11,17 +12,20 @@ pub fn resolve_import(
     let base = specifier.to_lowercase();
     let extensions = ["f90", "f95", "f03"];
 
+    let mut best: Option<&str> = None;
     for ext in &extensions {
         let candidate = format!("{base}.{ext}");
         for &file in known_files {
             let file_lower = file.to_lowercase();
             if file_lower == candidate || file_lower.ends_with(&format!("/{candidate}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
         }
     }
 
-    None
+    best.map(|f| f.to_string())
 }
 
 #[cfg(test)]
@@ -58,5 +62,12 @@ mod tests {
         let known = set(&["src/other.f90"]);
         let result = resolve_import("src/main.f90", "missing", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn multiple_matches_picks_shortest() {
+        let known = set(&["vendor/lib/utils.f90", "src/utils.f90"]);
+        let result = resolve_import("src/main.f90", "utils", &known);
+        assert_eq!(result, Some("src/utils.f90".to_string()));
     }
 }
