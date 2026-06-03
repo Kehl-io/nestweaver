@@ -279,14 +279,68 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Private
             }
         }
-        // PowerShell, Julia, SQL: inferred visibility
-        Language::PowerShell | Language::Julia | Language::Sql => Visibility::Inferred,
-        // Ruby, COBOL: inferred visibility
-        Language::Ruby | Language::Cobol => Visibility::Inferred,
-        // HCL: inferred visibility (tree-sitter)
-        Language::Hcl => Visibility::Inferred,
-        // Fortran, Pascal, SystemVerilog: inferred visibility (tree-sitter)
-        Language::Fortran | Language::Pascal | Language::SystemVerilog => Visibility::Inferred,
+        // Ruby: public/private/protected are method-level section keywords
+        Language::Ruby => {
+            let sig = first_line(node_text);
+            if sig.starts_with("private") || sig.contains("private ") {
+                Visibility::Private
+            } else if sig.starts_with("protected") || sig.contains("protected ") {
+                Visibility::Protected
+            } else {
+                Visibility::Public
+            }
+        }
+        // PowerShell: class members can have [public]/[private] attributes
+        Language::PowerShell => {
+            let sig = first_line(node_text);
+            if sig.contains("[hidden]") || sig.contains("hidden ") {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            }
+        }
+        // Fortran: PUBLIC/PRIVATE keywords on module members
+        Language::Fortran => {
+            let sig = first_line(node_text).to_lowercase();
+            if sig.contains("private") {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            }
+        }
+        // Pascal: private/public/protected/published sections in class declarations
+        Language::Pascal => {
+            let sig = first_line(node_text);
+            if sig.contains("private") {
+                Visibility::Private
+            } else if sig.contains("protected") {
+                Visibility::Protected
+            } else {
+                Visibility::Public
+            }
+        }
+        // SystemVerilog: local/protected keywords on class members
+        Language::SystemVerilog => {
+            let sig = first_line(node_text);
+            if sig.contains("local ") || sig.starts_with("local ") {
+                Visibility::Private
+            } else if sig.contains("protected ") {
+                Visibility::Protected
+            } else {
+                Visibility::Public
+            }
+        }
+        // Julia: exported symbols are public, rest are module-private
+        Language::Julia => {
+            let sig = first_line(node_text);
+            if sig.starts_with("export ") {
+                Visibility::Public
+            } else {
+                Visibility::Inferred
+            }
+        }
+        // SQL, HCL, COBOL: no visibility concept
+        Language::Sql | Language::Hcl | Language::Cobol => Visibility::Inferred,
     }
 }
 
