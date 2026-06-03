@@ -457,7 +457,9 @@ pub fn extract_self_bindings(
         | Language::Java
         | Language::CSharp
         | Language::Kotlin
-        | Language::Dart => "this",
+        | Language::Dart
+        | Language::Cpp
+        | Language::Scala => "this",
         Language::Php => "$this",
         Language::Ruby => "self",
         _ => return,
