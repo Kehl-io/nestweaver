@@ -8,7 +8,7 @@
 ; Function return type: func foo() -> Type
 (function_declaration
   name: (simple_identifier) @return.name
-  name: (user_type (type_identifier) @return.type))
+  return_type: (user_type (type_identifier) @return.type))
 
 ; Parameter: func foo(x: Type)
 (parameter

@@ -3050,7 +3050,15 @@ mod tests {
         );
         let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
         // Each block's first string_lit becomes a symbol
-        for expected in &["region", "instance_type", "aws_instance", "aws_security_group", "vpc", "instance_ip", "vpc_id"] {
+        for expected in &[
+            "region",
+            "instance_type",
+            "aws_instance",
+            "aws_security_group",
+            "vpc",
+            "instance_ip",
+            "vpc_id",
+        ] {
             assert!(
                 names.contains(expected),
                 "should find '{expected}'; got: {names:?}"
@@ -4883,10 +4891,7 @@ fn main() {
         let source = "class Foo { string GetName() { return \"\"; } }";
         let parsed = parse_source(Path::new("test.cs"), source).unwrap();
         assert!(
-            parsed
-                .type_bindings
-                .iter()
-                .any(|b| b.var_name == "GetName"),
+            parsed.type_bindings.iter().any(|b| b.var_name == "GetName"),
             "expected return type binding: {:?}",
             parsed.type_bindings
         );
@@ -5000,12 +5005,19 @@ fn main() {
 
     #[test]
     fn ast_extracts_elixir_struct_construction() {
-        let source = "defmodule Main do\n  def run do\n    user = %User{name: \"test\"}\n  end\nend\n";
+        let source =
+            "defmodule Main do\n  def run do\n    user = %User{name: \"test\"}\n  end\nend\n";
         let parsed = parse_source(Path::new("test.ex"), source).unwrap();
-        let bindings: Vec<_> = parsed.type_bindings.iter()
+        let bindings: Vec<_> = parsed
+            .type_bindings
+            .iter()
             .filter(|b| b.var_name == "user")
             .collect();
-        assert!(!bindings.is_empty(), "expected user binding from struct: {:?}", parsed.type_bindings);
+        assert!(
+            !bindings.is_empty(),
+            "expected user binding from struct: {:?}",
+            parsed.type_bindings
+        );
         assert_eq!(bindings[0].type_name, "User");
         assert_eq!(bindings[0].kind, AstBindingKind::Constructor);
     }
@@ -5015,8 +5027,12 @@ fn main() {
         let source = "class Main { void run() { String name = 'hello' } }";
         let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "name" && b.type_name == "String"),
-            "expected name binding: {:?}", parsed.type_bindings
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "name" && b.type_name == "String"),
+            "expected name binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5025,9 +5041,11 @@ fn main() {
         let source = "class Main { Integer compute() { return 42 } }";
         let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "compute" && b.type_name == "Integer"
+            parsed.type_bindings.iter().any(|b| b.var_name == "compute"
+                && b.type_name == "Integer"
                 && matches!(b.kind, AstBindingKind::ReturnType)),
-            "expected compute return type: {:?}", parsed.type_bindings
+            "expected compute return type: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5036,9 +5054,11 @@ fn main() {
         let source = "class Main { void run() { Foo x = new Foo() } }";
         let parsed = parse_source(Path::new("test.groovy"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "x" && b.type_name == "Foo"
+            parsed.type_bindings.iter().any(|b| b.var_name == "x"
+                && b.type_name == "Foo"
                 && matches!(b.kind, AstBindingKind::Constructor)),
-            "expected x ctor binding: {:?}", parsed.type_bindings
+            "expected x ctor binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5047,8 +5067,12 @@ fn main() {
         let source = "int main() { NSString* name = @\"hello\"; return 0; }";
         let parsed = parse_source(Path::new("test.m"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "name" && b.type_name == "NSString"),
-            "expected name binding: {:?}", parsed.type_bindings
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "name" && b.type_name == "NSString"),
+            "expected name binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5057,9 +5081,11 @@ fn main() {
         let source = "NSInteger getValue() { return 42; }";
         let parsed = parse_source(Path::new("test.m"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "getValue" && b.type_name == "NSInteger"
+            parsed.type_bindings.iter().any(|b| b.var_name == "getValue"
+                && b.type_name == "NSInteger"
                 && matches!(b.kind, AstBindingKind::ReturnType)),
-            "expected getValue return type: {:?}", parsed.type_bindings
+            "expected getValue return type: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5068,8 +5094,12 @@ fn main() {
         let source = "class Person {\n  [string]$Name\n  [int]$Age\n}";
         let parsed = parse_source(Path::new("test.ps1"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name.contains("Name")),
-            "expected Name binding: {:?}", parsed.type_bindings
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name.contains("Name")),
+            "expected Name binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5079,7 +5109,8 @@ fn main() {
         let parsed = parse_source(Path::new("test.pas"), source).unwrap();
         assert!(
             parsed.type_bindings.iter().any(|b| b.var_name == "count"),
-            "expected count binding: {:?}", parsed.type_bindings
+            "expected count binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5088,9 +5119,12 @@ fn main() {
         let source = "function GetValue(): Integer;\nbegin\n  Result := 42;\nend;";
         let parsed = parse_source(Path::new("test.pas"), source).unwrap();
         assert!(
-            parsed.type_bindings.iter().any(|b| b.var_name == "GetValue"
-                && matches!(b.kind, AstBindingKind::ReturnType)),
-            "expected GetValue return type: {:?}", parsed.type_bindings
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "GetValue" && matches!(b.kind, AstBindingKind::ReturnType)),
+            "expected GetValue return type: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5100,7 +5134,8 @@ fn main() {
         let parsed = parse_source(Path::new("test.sv"), source).unwrap();
         assert!(
             parsed.type_bindings.iter().any(|b| b.var_name == "count"),
-            "expected count binding: {:?}", parsed.type_bindings
+            "expected count binding: {:?}",
+            parsed.type_bindings
         );
     }
 
@@ -5111,7 +5146,8 @@ fn main() {
         let parsed = parse_source(Path::new("test.lua"), source).unwrap();
         assert!(
             parsed.type_bindings.is_empty(),
-            "Lua should have no type bindings: {:?}", parsed.type_bindings
+            "Lua should have no type bindings: {:?}",
+            parsed.type_bindings
         );
     }
 }
