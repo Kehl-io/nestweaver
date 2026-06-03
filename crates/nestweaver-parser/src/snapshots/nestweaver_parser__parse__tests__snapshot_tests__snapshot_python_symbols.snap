@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4158
 expression: "parsed_symbols(\"simple.py\", &source)"
 ---
 - name: standalone_function
@@ -59,6 +60,17 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   parent_name: ~
 - name: Animal
   kind: Class
+  start_line: 18
+  end_line: 23
+  signature: "class Animal:"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Inferred
+  type_info: ~
+  parent_name: ~
+- name: name
+  kind: Property
   start_line: 18
   end_line: 23
   signature: "class Animal:"
