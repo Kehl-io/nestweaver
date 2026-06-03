@@ -36,7 +36,7 @@ pub fn export_in_memory_graph(store: &GraphStore) -> anyhow::Result<InMemoryGrap
     }
 
     // ── 2. Edges ──────────────────────────────────────────────────────────────
-    // load_typed_edges returns (src_uid, tgt_uid, edge_type_str, confidence).
+    // load_typed_edges returns (src_uid, tgt_uid, edge_type_str, confidence, evidence).
     // Edge type strings match the DB table names:
     //   CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM, USES, ACCESSES,
     //   MEMBER_OF, INCLUDES_SYM
@@ -45,7 +45,7 @@ pub fn export_in_memory_graph(store: &GraphStore) -> anyhow::Result<InMemoryGrap
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut edges: Vec<(u32, u32, f32, EdgeKind)> = Vec::with_capacity(typed_edges.len());
 
-    for (src_uid, tgt_uid, edge_type, confidence) in &typed_edges {
+    for (src_uid, tgt_uid, edge_type, confidence, _evidence) in &typed_edges {
         let (Some(&si), Some(&ti)) = (uid_to_idx.get(src_uid), uid_to_idx.get(tgt_uid)) else {
             continue;
         };
