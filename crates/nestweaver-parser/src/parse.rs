@@ -838,6 +838,14 @@ fn type_query_source(lang: Language) -> Option<&'static str> {
         Language::Java => Some(include_str!("../../../queries/java_types.scm")),
         Language::Python => Some(include_str!("../../../queries/python_types.scm")),
         Language::Go => Some(include_str!("../../../queries/go_types.scm")),
+        Language::Cpp => Some(include_str!("../../../queries/cpp_types.scm")),
+        Language::CSharp => Some(include_str!("../../../queries/csharp_types.scm")),
+        Language::Kotlin => Some(include_str!("../../../queries/kotlin_types.scm")),
+        Language::Php => Some(include_str!("../../../queries/php_types.scm")),
+        Language::Dart => Some(include_str!("../../../queries/dart_types.scm")),
+        Language::Swift => Some(include_str!("../../../queries/swift_types.scm")),
+        Language::Scala => Some(include_str!("../../../queries/scala_types.scm")),
+        Language::Ruby => Some(include_str!("../../../queries/ruby_types.scm")),
         _ => None,
     }
 }
@@ -4844,5 +4852,108 @@ fn main() {
             parsed.type_bindings
         );
         assert_eq!(binding.unwrap().type_name, "Store");
+    }
+
+    #[test]
+    fn ast_extracts_cpp_typed_variable() {
+        let source = "void foo() { int count = 0; }";
+        let parsed = parse_source(Path::new("test.cpp"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "count" && b.type_name == "int"),
+            "expected int binding for count: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_csharp_method_return() {
+        let source = "class Foo { string GetName() { return \"\"; } }";
+        let parsed = parse_source(Path::new("test.cs"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "GetName"),
+            "expected return type binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_kotlin_typed_val() {
+        let source = "fun main() { val name: String = \"hello\" }";
+        let parsed = parse_source(Path::new("test.kt"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "name" && b.type_name == "String"),
+            "expected String binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_php_return_type() {
+        let source = "<?php\nfunction greet(): string { return 'hi'; }\n";
+        let parsed = parse_source(Path::new("test.php"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "greet" && b.type_name == "string"),
+            "expected string return: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_dart_typed_var() {
+        let source = "void main() { String name = 'hello'; }";
+        let parsed = parse_source(Path::new("test.dart"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "name"),
+            "expected name binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_scala_typed_val() {
+        let source = "object Main { val count: Int = 0 }";
+        let parsed = parse_source(Path::new("test.scala"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "count"),
+            "expected count binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_ruby_constructor() {
+        let source = "user = User.new";
+        let parsed = parse_source(Path::new("test.rb"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|b| b.var_name == "user" && b.type_name == "User"),
+            "expected User binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_swift_typed_let() {
+        let source = "func foo() { let name: String = \"hello\" }";
+        let parsed = parse_source(Path::new("test.swift"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "name"),
+            "expected name binding: {:?}",
+            parsed.type_bindings
+        );
     }
 }
