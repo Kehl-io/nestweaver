@@ -34,6 +34,12 @@
 (call_expression
   (simple_identifier) @name) @reference.call
 
+; Method call on receiver: obj.method(...)
+(call_expression
+  (navigation_expression
+    (navigation_suffix
+      (simple_identifier) @name))) @reference.call
+
 ; Methods (functions inside class/struct/protocol body)
 (class_declaration
   body: (class_body

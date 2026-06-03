@@ -846,6 +846,7 @@ fn type_query_source(lang: Language) -> Option<&'static str> {
         Language::Swift => Some(include_str!("../../../queries/swift_types.scm")),
         Language::Scala => Some(include_str!("../../../queries/scala_types.scm")),
         Language::Ruby => Some(include_str!("../../../queries/ruby_types.scm")),
+        Language::C => Some(include_str!("../../../queries/c_types.scm")),
         _ => None,
     }
 }
@@ -4954,6 +4955,37 @@ fn main() {
             parsed.type_bindings.iter().any(|b| b.var_name == "name"),
             "expected name binding: {:?}",
             parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn ast_extracts_c_typed_variable() {
+        let source = "void foo() { int count = 0; }";
+        let parsed = parse_source(Path::new("test.c"), source).unwrap();
+        assert!(
+            parsed.type_bindings.iter().any(|b| b.var_name == "count"),
+            "expected count binding: {:?}",
+            parsed.type_bindings
+        );
+    }
+
+    #[test]
+    fn swift_extracts_member_call() {
+        let source = "class Foo {\n  func bar() {\n    store.query()\n  }\n}";
+        let parsed = parse_source(Path::new("test.swift"), source).unwrap();
+        let calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "query")
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "expected query call reference: {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| (&r.name, &r.kind))
+                .collect::<Vec<_>>()
         );
     }
 }
