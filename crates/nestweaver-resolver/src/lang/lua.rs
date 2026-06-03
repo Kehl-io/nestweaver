@@ -10,10 +10,7 @@ pub fn resolve_import(
 ) -> Option<String> {
     let path = specifier.replace('.', "/");
 
-    let candidates = [
-        format!("{path}.lua"),
-        format!("{path}/init.lua"),
-    ];
+    let candidates = [format!("{path}.lua"), format!("{path}/init.lua")];
 
     for candidate in &candidates {
         for &file in known_files {
