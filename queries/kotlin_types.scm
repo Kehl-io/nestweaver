@@ -18,3 +18,13 @@
   (simple_identifier) @param.name
   (user_type
     (type_identifier) @param.type))
+
+; Constructor: val x = MyClass(...)
+; property_declaration positional children: variable_declaration then call_expression
+; variable_declaration first child is simple_identifier (the var name)
+; call_expression first child is simple_identifier (the class name)
+(property_declaration
+  (variable_declaration
+    (simple_identifier) @ctor.name)
+  (call_expression
+    (simple_identifier) @ctor.type))

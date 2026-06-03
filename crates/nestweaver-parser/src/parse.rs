@@ -5245,4 +5245,100 @@ fn main() {
             parsed.type_bindings
         );
     }
+
+    // ── Constructor pattern tests ───────────────────────────────────────────
+
+    #[test]
+    fn ast_extracts_kotlin_constructor() {
+        let source = "fun main() { val user = User() }";
+        let parsed = parse_source(Path::new("test.kt"), source).unwrap();
+        let binding = parsed.type_bindings.iter().find(|b| b.var_name == "user");
+        assert!(
+            binding.is_some(),
+            "expected user binding: {:?}",
+            parsed.type_bindings
+        );
+        assert_eq!(binding.unwrap().type_name, "User");
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_dart_constructor() {
+        let source = "void main() { var user = User(); }";
+        let parsed = parse_source(Path::new("test.dart"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user" && b.type_name == "User");
+        assert!(
+            binding.is_some(),
+            "expected User binding: {:?}",
+            parsed.type_bindings
+        );
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_swift_constructor() {
+        let source = "func foo() { let user = User() }";
+        let parsed = parse_source(Path::new("test.swift"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user" && b.type_name == "User");
+        assert!(
+            binding.is_some(),
+            "expected User binding: {:?}",
+            parsed.type_bindings
+        );
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_scala_new_constructor() {
+        let source = "object Main { val user = new User() }";
+        let parsed = parse_source(Path::new("test.scala"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user" && b.type_name == "User");
+        assert!(
+            binding.is_some(),
+            "expected User binding from new expression: {:?}",
+            parsed.type_bindings
+        );
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_scala_apply_constructor() {
+        let source = "object Main { val user = User(\"alice\") }";
+        let parsed = parse_source(Path::new("test.scala"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user" && b.type_name == "User");
+        assert!(
+            binding.is_some(),
+            "expected User binding from apply-style: {:?}",
+            parsed.type_bindings
+        );
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
+
+    #[test]
+    fn ast_extracts_csharp_new_constructor() {
+        let source = "class Foo { void Run() { var user = new User(); } }";
+        let parsed = parse_source(Path::new("test.cs"), source).unwrap();
+        let binding = parsed
+            .type_bindings
+            .iter()
+            .find(|b| b.var_name == "user" && b.type_name == "User");
+        assert!(
+            binding.is_some(),
+            "expected User binding: {:?}",
+            parsed.type_bindings
+        );
+        assert!(matches!(binding.unwrap().kind, AstBindingKind::Constructor));
+    }
 }

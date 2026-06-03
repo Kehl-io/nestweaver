@@ -15,3 +15,11 @@
 (formal_parameter
   (type (type_identifier) @param.type)
   name: (identifier) @param.name)
+
+; Constructor: var x = MyClass(...) or final x = MyClass(...)
+; initialized_variable_definition.value can be call_expression;
+; call_expression.function is identifier (the class name)
+(initialized_variable_definition
+  name: (identifier) @ctor.name
+  value: (call_expression
+    function: (identifier) @ctor.type))
