@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-resolver/src/resolve.rs
-assertion_line: 449
 expression: "sorted_edges(files, Language::JavaScript)"
 ---
 - source_uid: "sym:repo:test:snapshot:a19725de73a8:d0dd4cf0ac87:20"
@@ -8,3 +7,6 @@ expression: "sorted_edges(files, Language::JavaScript)"
   edge_type: Extends
   confidence: 0.95
   link_type: ~
+  evidence:
+    - kind: same_file
+      weight: 0.95
