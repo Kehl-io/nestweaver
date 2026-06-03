@@ -16,10 +16,16 @@ pub fn resolve_import(
 
     let candidate = format!("{}.groovy", specifier.replace('.', "/"));
 
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if file == candidate || file.ends_with(&format!("/{candidate}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
@@ -48,5 +54,12 @@ mod tests {
         let known = set(&["com/example/Foo.groovy"]);
         let result = resolve_import("Main.groovy", "com.example.*", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn multiple_matches_picks_shortest() {
+        let known = set(&["vendor/com/example/Foo.groovy", "com/example/Foo.groovy"]);
+        let result = resolve_import("Main.groovy", "com.example.Foo", &known);
+        assert_eq!(result, Some("com/example/Foo.groovy".to_string()));
     }
 }

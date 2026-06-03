@@ -20,10 +20,16 @@ pub fn resolve_import(
         }
 
         // Also try as-is
+        let mut best: Option<&str> = None;
         for &file in known_files {
             if file == specifier || file.ends_with(&format!("/{specifier}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
+        }
+        if let Some(f) = best {
+            return Some(f.to_string());
         }
 
         return None;
@@ -32,12 +38,18 @@ pub fn resolve_import(
     // Package import: using/import PackageName
     let candidates = [format!("{specifier}.jl"), format!("src/{specifier}.jl")];
 
+    let mut best: Option<&str> = None;
     for candidate in &candidates {
         for &file in known_files {
             if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
