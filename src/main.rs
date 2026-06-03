@@ -4928,24 +4928,58 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             match action {
                 DaemonAction::Start { idle_timeout } => {
-                    // Check if already running.
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                            let alive = unsafe { libc::kill(pid, 0) } == 0;
-                            if alive {
-                                eprintln!("Daemon already running (PID {pid}).");
-                                return Ok((EXIT_SUCCESS, None));
-                            }
-                        }
-                        // Stale pidfile — remove it.
-                        let _ = std::fs::remove_file(&pidfile);
-                    }
-
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
+
+                    // Atomically detect another running or starting daemon via
+                    // a non-blocking exclusive flock on the pidfile. daemonize2
+                    // holds LOCK_EX on the pidfile for the daemon's entire
+                    // lifetime (see autostart.rs for the matching consumer),
+                    // so a successful flock here proves no daemon owns it.
+                    //
+                    // This replaces a previous `kill(pid, 0)` check that had a
+                    // TOCTOU window: two concurrent `daemon start` invocations
+                    // (e.g. from `launchctl kickstart -k` or rapid respawn)
+                    // could both pass the kill check and race for the DB write
+                    // lock, with the loser dying with "Could not set lock on
+                    // file ... another process may hold the write lock".
+                    use std::os::unix::io::AsRawFd;
+                    let pid_lock = std::fs::OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&pidfile)
+                        .with_context(|| format!("open pidfile: {}", pidfile.display()))?;
+                    let pid_lock_fd = pid_lock.as_raw_fd();
+                    let lock_ret =
+                        unsafe { libc::flock(pid_lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+                    if lock_ret != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+                            let pid_trimmed = pid_text.trim();
+                            if pid_trimmed.is_empty() {
+                                eprintln!("Daemon already running (starting up).");
+                            } else {
+                                eprintln!("Daemon already running (PID {pid_trimmed}).");
+                            }
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        anyhow::bail!("flock on pidfile failed: {err}");
+                    }
+
+                    // We hold the lock — no other daemon is running or
+                    // starting. Any PID in the file is stale; daemonize2 will
+                    // overwrite it after the double-fork.
+                    // Release the flock immediately before daemonize2's
+                    // start() so it can acquire its own lock on the same
+                    // pidfile; the race window between release and reacquire
+                    // is microseconds, far smaller than the prior TOCTOU
+                    // window of the kill(pid, 0) check.
 
                     let stdout_file = std::fs::OpenOptions::new()
                         .create(true)
@@ -4973,6 +5007,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .stdout(stdout_file)
                         .stderr(stderr_file)
                         .working_directory(".");
+
+                    unsafe { libc::flock(pid_lock_fd, libc::LOCK_UN) };
+                    drop(pid_lock);
 
                     match unsafe { daemonize.start() } {
                         Ok(()) => {
