@@ -45,6 +45,7 @@ pub fn find_cross_repo_links(repos: &[RepoSymbols]) -> Vec<ResolvedEdge> {
                         edge_type: EdgeType::CrossRepoLink,
                         confidence,
                         link_type: Some(CrossRepoLinkType::SharedImport),
+                        evidence: Vec::new(),
                     });
                 }
             }
@@ -86,6 +87,7 @@ pub fn find_cross_repo_links(repos: &[RepoSymbols]) -> Vec<ResolvedEdge> {
                     edge_type: EdgeType::CrossRepoLink,
                     confidence,
                     link_type: Some(CrossRepoLinkType::ContractMatch),
+                    evidence: Vec::new(),
                 });
             }
         }
