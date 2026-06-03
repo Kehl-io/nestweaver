@@ -32,6 +32,14 @@
   type: (predefined_type) @param.type
   name: (identifier) @param.name)
 
-; new expression
+; new expression (standalone, no variable binding — kept for other code paths)
 (object_creation_expression
   type: (identifier) @ctor.type)
+
+; Variable with new: var x = new Foo() or Type x = new Foo()
+; variable_declarator has name: identifier and an expression child (object_creation_expression)
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @ctor.name
+    (object_creation_expression
+      type: (identifier) @ctor.type)))
