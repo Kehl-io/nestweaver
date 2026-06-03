@@ -2971,7 +2971,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3055,7 +3055,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "nestweaver-engine",
@@ -3113,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "comrak",
  "hex",
@@ -3135,10 +3135,12 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-elixir",
  "tree-sitter-go",
+ "tree-sitter-groovy",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-kotlin",
  "tree-sitter-lua",
+ "tree-sitter-objc",
  "tree-sitter-php",
  "tree-sitter-python",
  "tree-sitter-ruby",
@@ -3146,11 +3148,12 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+ "tree-sitter-zig",
 ]
 
 [[package]]
 name = "nestweaver-proto"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "prost 0.13.5",
  "tonic",
@@ -3159,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "glob",
  "insta",
@@ -3175,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "hex",
  "serde",
@@ -3186,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3201,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3221,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
@@ -5616,6 +5619,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-groovy"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a20016017f0865ba902ca50354f92429de5de8df994e64ab7fae087a13c40ed"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-java"
 version = "0.23.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5655,6 +5668,16 @@ name = "tree-sitter-lua"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8daaf5f4235188a58603c39760d5fa5d4b920d36a299c934adddae757f32a10c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-objc"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ca8bb556423fc176f0535e79d525f783a6684d3c9da81bf9d905303c129e1d2"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -5725,6 +5748,16 @@ name = "tree-sitter-typescript"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-zig"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab11fc124851b0db4dd5e55983bbd9631192e93238389dcd44521715e5d53e28"
 dependencies = [
  "cc",
  "tree-sitter-language",
