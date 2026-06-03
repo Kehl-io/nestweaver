@@ -23,7 +23,7 @@ use crate::lifecycle;
 /// Shared state held by the daemon process.
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
-    pub tantivy: Option<TantivyIndex>,
+    pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_id: String,
     pub start_time: Instant,
@@ -71,7 +71,7 @@ impl DaemonService {
 
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store,
-                state.tantivy.as_ref(),
+                state.tantivy.as_deref(),
                 &tool_name,
                 args,
             )
@@ -111,8 +111,13 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
 
-            nestweaver_mcp::tools::dispatch(&state.store, state.tantivy.as_ref(), &tool_name, args)
-                .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
+            nestweaver_mcp::tools::dispatch(
+                &state.store,
+                state.tantivy.as_deref(),
+                &tool_name,
+                args,
+            )
+            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
@@ -214,15 +219,14 @@ impl NestWeaverDaemon for DaemonService {
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns);
 
-        if self.state.tantivy.as_ref().is_some_and(|t| t.has_writer()) {
-            // Open a reader-only handle for the watcher — the daemon's
-            // writer handle owns the lock, so open_or_create would fail.
-            // The watcher uses this for search queries; writes go through
-            // the daemon's writer via the shared store.
-            match TantivyIndex::open_reader_only(&tantivy_path) {
-                Ok(idx) => watcher = watcher.with_external_tantivy(idx),
-                Err(_) => watcher = watcher.with_tantivy_index(&tantivy_path),
-            }
+        // Share the daemon's writer-mode Tantivy handle with the watcher
+        // so live edits update BM25 in place. Opening a separate handle
+        // (reader-only or read-write) would either silently no-op writes
+        // or collide on the writer lock.
+        if let Some(ref tantivy) = self.state.tantivy
+            && tantivy.has_writer()
+        {
+            watcher = watcher.with_external_tantivy(Arc::clone(tantivy));
         } else {
             watcher = watcher.with_tantivy_index(&tantivy_path);
         }
@@ -1056,7 +1060,7 @@ pub async fn run_server(
                 path = %tantivy_path.display(),
                 "Tantivy index open (read-write)"
             );
-            Some(idx)
+            Some(Arc::new(idx))
         }
         Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
             Ok(idx) => {
@@ -1065,7 +1069,7 @@ pub async fn run_server(
                     path = %tantivy_path.display(),
                     "Tantivy index open (reader-only fallback)"
                 );
-                Some(idx)
+                Some(Arc::new(idx))
             }
             Err(e) => {
                 tracing::warn!(
