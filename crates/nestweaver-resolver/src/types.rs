@@ -560,9 +560,15 @@ mod tests {
 
     #[test]
     fn extract_assignments_handles_dotted_rhs() {
-        let source = "let store = config.store;\n";
+        let source = "let db = config.database;\n";
         let assignments = extract_assignments(source);
-        assert!(!assignments.is_empty(), "should extract dotted assignment");
+        assert!(
+            assignments
+                .iter()
+                .any(|((lhs, _), (rhs, _))| lhs == "db" && rhs == "database"),
+            "should extract dotted assignment: {:?}",
+            assignments
+        );
     }
 
     #[test]
