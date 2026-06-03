@@ -20,6 +20,9 @@ pub struct SymbolBasic {
 /// Edge data for clustering: (source_uid, target_uid, confidence).
 pub type CodeEdge = (String, String, f64);
 
+/// Edge data with type and evidence: (source_uid, target_uid, edge_type, confidence, evidence_json).
+pub type TypedEdge = (String, String, String, f64, String);
+
 /// Combined symbols and edges for clustering algorithms.
 pub type CodeGraph = (Vec<SymbolBasic>, Vec<CodeEdge>);
 
@@ -1111,7 +1114,7 @@ impl GraphStore {
     ///
     /// Each tuple is `(source_uid, target_uid, edge_type, confidence, evidence)`.
     /// Used by graph-export functions that need the relationship type.
-    pub fn load_typed_edges(&self) -> Result<Vec<(String, String, String, f64, String)>, StoreError> {
+    pub fn load_typed_edges(&self) -> Result<Vec<TypedEdge>, StoreError> {
         let conn = self.conn()?;
 
         let edge_types = [
