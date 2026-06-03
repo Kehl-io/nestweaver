@@ -39,6 +39,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 comrak = { version = "0.52", default-features = false }
 serde_yaml = "0.9"
+tree-sitter-powershell = "0.26"
+tree-sitter-julia = "0.23"
+tree-sitter-hcl = "1.1"
+tree-sitter-sql = "0.0.2"
+tree-sitter-sequel = "0.3"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }
