@@ -2194,7 +2194,7 @@ impl Counter {
         let all_edges = store.load_typed_edges().unwrap();
         let member_of: Vec<_> = all_edges
             .iter()
-            .filter(|(_, _, edge_type, _)| edge_type == "MEMBER_OF")
+            .filter(|(_, _, edge_type, _, _)| edge_type == "MEMBER_OF")
             .collect();
 
         assert!(

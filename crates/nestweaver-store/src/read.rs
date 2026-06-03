@@ -1107,11 +1107,11 @@ impl GraphStore {
         Ok((symbols, edges))
     }
 
-    /// Returns all code-level edges with their type label and confidence.
+    /// Returns all code-level edges with their type label, confidence, and evidence.
     ///
-    /// Each tuple is `(source_uid, target_uid, edge_type, confidence)`.
+    /// Each tuple is `(source_uid, target_uid, edge_type, confidence, evidence)`.
     /// Used by graph-export functions that need the relationship type.
-    pub fn load_typed_edges(&self) -> Result<Vec<(String, String, String, f64)>, StoreError> {
+    pub fn load_typed_edges(&self) -> Result<Vec<(String, String, String, f64, String)>, StoreError> {
         let conn = self.conn()?;
 
         let edge_types = [
@@ -1124,10 +1124,10 @@ impl GraphStore {
             "MEMBER_OF",
             "INCLUDES_SYM",
         ];
-        let mut edges: Vec<(String, String, String, f64)> = Vec::new();
+        let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
             let q =
-                format!("MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence");
+                format!("MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence");
             let result = match conn.query(&q) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1141,7 +1141,8 @@ impl GraphStore {
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 let confidence = extract_f64(&row, 2)?;
-                edges.push((src, dst, et.to_string(), confidence));
+                let evidence = extract_string(&row, 3).unwrap_or_default();
+                edges.push((src, dst, et.to_string(), confidence, evidence));
             }
         }
 
