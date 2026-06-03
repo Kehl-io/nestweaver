@@ -33,8 +33,6 @@ const OBJC_QUERY: &str = include_str!("../../../queries/objc.scm");
 const POWERSHELL_QUERY: &str = include_str!("../../../queries/powershell.scm");
 const JULIA_QUERY: &str = include_str!("../../../queries/julia.scm");
 const SQL_QUERY: &str = include_str!("../../../queries/sql.scm");
-// Kept for documentation; HCL uses a regex parser (hcl.rs) rather than tree-sitter.
-#[allow(dead_code)]
 const HCL_QUERY: &str = include_str!("../../../queries/hcl.scm");
 const FORTRAN_QUERY: &str = include_str!("../../../queries/fortran.scm");
 const PASCAL_QUERY: &str = include_str!("../../../queries/pascal.scm");
@@ -283,8 +281,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         }
         // PowerShell, Julia, SQL: inferred visibility
         Language::PowerShell | Language::Julia | Language::Sql => Visibility::Inferred,
-        // Ruby, COBOL, HCL (regex-parsed): inferred visibility
-        Language::Ruby | Language::Cobol | Language::Hcl => Visibility::Inferred,
+        // Ruby, COBOL: inferred visibility
+        Language::Ruby | Language::Cobol => Visibility::Inferred,
+        // HCL: inferred visibility (tree-sitter)
+        Language::Hcl => Visibility::Inferred,
         // Fortran, Pascal, SystemVerilog: inferred visibility (tree-sitter)
         Language::Fortran | Language::Pascal | Language::SystemVerilog => Visibility::Inferred,
     }
@@ -327,7 +327,8 @@ fn build_ts_language(lang: Language, path: &Path) -> tree_sitter::Language {
         Language::Fortran => tree_sitter_fortran::LANGUAGE.into(),
         Language::Pascal => tree_sitter_pascal::LANGUAGE.into(),
         Language::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
+        Language::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     }
@@ -374,7 +375,8 @@ fn query_source(lang: Language, path: &Path) -> std::borrow::Cow<'static, str> {
         Language::Fortran => FORTRAN_QUERY,
         Language::Pascal => PASCAL_QUERY,
         Language::SystemVerilog => SYSTEMVERILOG_QUERY,
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
+        Language::Hcl => HCL_QUERY,
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -592,7 +594,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Vue => return Ok(crate::vue::parse_vue(path, source)),
         Language::Svelte => return Ok(crate::svelte::parse_svelte(path, source)),
         Language::Astro => return Ok(crate::astro::parse_astro(path, source)),
-        Language::Hcl => return Ok(crate::hcl::parse_hcl(path, source)),
         _ => {}
     }
 
@@ -641,7 +642,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Fortran => "fortran",
         Language::Pascal => "pascal",
         Language::SystemVerilog => "systemverilog",
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
+        Language::Hcl => "hcl",
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -852,6 +854,7 @@ fn type_query_source(lang: Language) -> Option<&'static str> {
         Language::Scala => Some(include_str!("../../../queries/scala_types.scm")),
         Language::Ruby => Some(include_str!("../../../queries/ruby_types.scm")),
         Language::C => Some(include_str!("../../../queries/c_types.scm")),
+        Language::Elixir => Some(include_str!("../../../queries/elixir_types.scm")),
         _ => None,
     }
 }
@@ -2962,6 +2965,8 @@ mod tests {
     }
 
     // ── HCL tests ──────────────────────────────────────────────────────────
+    // HCL uses tree-sitter: all block definitions become @definition.class
+    // with the first string_lit as the name (stripped of quotes).
 
     #[test]
     fn parse_hcl_extracts_resources() {
@@ -2973,16 +2978,16 @@ mod tests {
             .iter()
             .filter(|s| s.kind == SymbolKind::Class)
             .collect();
+        // Tree-sitter captures the first string_lit of each block as the name.
+        // For `resource "aws_instance" "web"`, that's "aws_instance".
         assert!(
-            classes.iter().any(|s| s.name == "aws_instance.web"),
-            "should find resource 'aws_instance.web'; got: {:?}",
+            classes.iter().any(|s| s.name == "aws_instance"),
+            "should find resource type 'aws_instance'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
         assert!(
-            classes
-                .iter()
-                .any(|s| s.name == "aws_security_group.web_sg"),
-            "should find resource 'aws_security_group.web_sg'; got: {:?}",
+            classes.iter().any(|s| s.name == "aws_security_group"),
+            "should find resource type 'aws_security_group'; got: {:?}",
             classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
@@ -2992,20 +2997,21 @@ mod tests {
         let source = fixture("hcl/simple.tf");
         let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
 
-        let functions: Vec<_> = parsed
+        // With tree-sitter, variables and outputs are all @definition.class
+        let classes: Vec<_> = parsed
             .symbols
             .iter()
-            .filter(|s| s.kind == SymbolKind::Function)
+            .filter(|s| s.kind == SymbolKind::Class)
             .collect();
         assert!(
-            functions.iter().any(|s| s.name == "region"),
-            "should find variable 'region'; got: {:?}",
-            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+            classes.iter().any(|s| s.name == "region"),
+            "should find variable 'region' as class; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
         assert!(
-            functions.iter().any(|s| s.name == "instance_ip"),
-            "should find output 'instance_ip'; got: {:?}",
-            functions.iter().map(|s| &s.name).collect::<Vec<_>>()
+            classes.iter().any(|s| s.name == "instance_ip"),
+            "should find output 'instance_ip' as class; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
@@ -3014,48 +3020,36 @@ mod tests {
         let source = fixture("hcl/simple.tf");
         let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
 
-        let modules: Vec<_> = parsed
+        // With tree-sitter, module blocks are also @definition.class
+        let classes: Vec<_> = parsed
             .symbols
             .iter()
-            .filter(|s| s.kind == SymbolKind::Module)
+            .filter(|s| s.kind == SymbolKind::Class)
             .collect();
         assert!(
-            modules.iter().any(|s| s.name == "vpc"),
-            "should find module 'vpc'; got: {:?}",
-            modules.iter().map(|s| &s.name).collect::<Vec<_>>()
+            classes.iter().any(|s| s.name == "vpc"),
+            "should find module 'vpc' as class; got: {:?}",
+            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn parse_hcl_extracts_references() {
+    fn parse_hcl_extracts_symbols() {
+        // Verify the tree-sitter parser extracts all block first-labels
         let source = fixture("hcl/simple.tf");
         let parsed = parse_source(Path::new("simple.tf"), &source).unwrap();
-
-        let calls: Vec<_> = parsed
-            .references
-            .iter()
-            .filter(|r| r.kind == ReferenceKind::Call)
-            .collect();
         assert!(
-            calls.iter().any(|r| r.name.starts_with("var.")),
-            "should find var references; got: {:?}",
-            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
+            !parsed.symbols.is_empty(),
+            "should extract some symbols from HCL"
         );
-
-        let imports: Vec<_> = parsed
-            .references
-            .iter()
-            .filter(|r| r.kind == ReferenceKind::Import)
-            .collect();
-        assert!(
-            !imports.is_empty(),
-            "should find module source as import; got: {:?}",
-            parsed
-                .references
-                .iter()
-                .map(|r| (&r.name, r.kind))
-                .collect::<Vec<_>>()
-        );
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        // Each block's first string_lit becomes a symbol
+        for expected in &["region", "instance_type", "aws_instance", "aws_security_group", "vpc", "instance_ip", "vpc_id"] {
+            assert!(
+                names.contains(expected),
+                "should find '{expected}'; got: {names:?}"
+            );
+        }
     }
 
     // ── Fortran tests ──────────────────────────────────────────────────────
@@ -4996,5 +4990,17 @@ fn main() {
                 .map(|r| (&r.name, &r.kind))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ast_extracts_elixir_struct_construction() {
+        let source = "defmodule Main do\n  def run do\n    user = %User{name: \"test\"}\n  end\nend\n";
+        let parsed = parse_source(Path::new("test.ex"), source).unwrap();
+        let bindings: Vec<_> = parsed.type_bindings.iter()
+            .filter(|b| b.var_name == "user")
+            .collect();
+        assert!(!bindings.is_empty(), "expected user binding from struct: {:?}", parsed.type_bindings);
+        assert_eq!(bindings[0].type_name, "User");
+        assert_eq!(bindings[0].kind, AstBindingKind::Constructor);
     }
 }

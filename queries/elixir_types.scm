@@ -1,4 +1,13 @@
 ; ── Elixir type extraction ───────────────────────────────────────────
-; Elixir is dynamically typed. @spec annotations exist but are not
-; represented as distinct AST nodes in tree-sitter-elixir.
-; This file exists for completeness.
+
+; Struct construction: user = %User{name: "test"}
+; In the AST this is:
+;   binary_operator (=)
+;     left: identifier ("user")
+;     right: map
+;       struct > alias ("User")
+(binary_operator
+  left: (identifier) @ctor.name
+  right: (map
+    (struct
+      (alias) @ctor.type)))
