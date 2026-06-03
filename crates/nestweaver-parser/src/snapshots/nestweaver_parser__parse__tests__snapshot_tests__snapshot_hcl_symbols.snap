@@ -1,115 +1,92 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4399
 expression: "parsed_symbols(\"simple.tf\", &source)"
 ---
-- name: variable
-  kind: Class
+- name: region
+  kind: Function
   start_line: 1
-  end_line: 5
+  end_line: 1
   signature: "variable \"region\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: variable
-  kind: Class
+- name: instance_type
+  kind: Function
   start_line: 7
-  end_line: 11
+  end_line: 7
   signature: "variable \"instance_type\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: data
+- name: aws_ami.ubuntu
   kind: Class
   start_line: 13
-  end_line: 21
+  end_line: 13
   signature: "data \"aws_ami\" \"ubuntu\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: filter
-  kind: Class
-  start_line: 17
-  end_line: 20
-  signature: "filter {"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Inferred
-  type_info: ~
-  parent_name: ~
-- name: resource
+- name: aws_instance.web
   kind: Class
   start_line: 23
-  end_line: 30
+  end_line: 23
   signature: "resource \"aws_instance\" \"web\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: resource
+- name: aws_security_group.web_sg
   kind: Class
   start_line: 32
-  end_line: 42
+  end_line: 32
   signature: "resource \"aws_security_group\" \"web_sg\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: ingress
-  kind: Class
-  start_line: 36
-  end_line: 41
-  signature: "ingress {"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Inferred
-  type_info: ~
-  parent_name: ~
-- name: module
-  kind: Class
+- name: vpc
+  kind: Module
   start_line: 44
-  end_line: 50
+  end_line: 44
   signature: "module \"vpc\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: output
-  kind: Class
+- name: instance_ip
+  kind: Function
   start_line: 52
-  end_line: 55
+  end_line: 52
   signature: "output \"instance_ip\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
-- name: output
-  kind: Class
+- name: vpc_id
+  kind: Function
   start_line: 57
-  end_line: 60
+  end_line: 57
   signature: "output \"vpc_id\" {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
