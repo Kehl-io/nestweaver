@@ -826,6 +826,7 @@ mod tests {
             edge_type: EdgeType::Calls,
             confidence: 1.0,
             link_type: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -1435,6 +1436,7 @@ mod tests {
                 edge_type: EdgeType::Imports,
                 confidence: 1.0,
                 link_type: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
