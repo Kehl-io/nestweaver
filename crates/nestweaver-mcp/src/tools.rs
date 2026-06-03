@@ -1882,8 +1882,8 @@ fn tool_brain_search(
                 item["score"] = json!(adj);
             }
         }
-        // Re-sort after priors mutate scores so the truncate below keeps the
-        // best-ranked rows.
+        // Re-sort after priors mutate scores so the highest-ranked rows
+        // surface first within the merged list.
         note_results.sort_by(|a, b| {
             let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1891,7 +1891,13 @@ fn tool_brain_search(
         });
     }
 
-    note_results.truncate(limit);
+    // Bug C / symbol-parity fix: `limit` is interpreted per-kind. Notes
+    // (capped at `limit` in `group_search_hits_by_note` / substring `.take`)
+    // and symbols (capped at `limit` in `search_symbols`) are each bounded
+    // upstream, so we deliberately skip a cross-kind truncate here. A merged
+    // cap would evict every symbol whenever ≥ `limit` notes match because
+    // symbols carry a fixed 0.5 score while BM25 notes score 15+. Callers
+    // that need a hard total cap should pass a smaller `limit`.
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by
     // default. Concise mode carries no UID/score, so inline bodies are skipped
