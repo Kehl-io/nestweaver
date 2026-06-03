@@ -103,6 +103,8 @@ message BrainSearchResponse {
   string engine = 2;
   int32 total_matches = 3;
   repeated SearchResultItem results = 4;
+  // F7 PRF-mined expansion terms (empty unless prf=true on the request).
+  repeated string expansion_terms = 5;
 }
 message SearchResultItem {
   string uid = 1;
