@@ -79,6 +79,12 @@
 (jsx_self_closing_element
   name: (identifier) @name) @reference.call
 
+; Instance property: this.prop = value
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @name)) @definition.property
+
 ; ── Field access (ACCESSES edges) ───────────────────────────────────
 ; Property read: obj.field
 (member_expression

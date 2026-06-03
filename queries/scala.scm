@@ -14,6 +14,10 @@
 (function_definition
   name: (identifier) @name) @definition.function
 
+; Abstract function declarations (e.g. in traits)
+(function_declaration
+  name: (identifier) @name) @definition.function
+
 ; Value definitions (val)
 (val_definition
   pattern: (identifier) @name) @definition.const
