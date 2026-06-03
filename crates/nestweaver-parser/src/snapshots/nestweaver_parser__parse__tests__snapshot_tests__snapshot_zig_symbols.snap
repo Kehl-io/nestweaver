@@ -1,33 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4316
 expression: "parsed_symbols(\"simple.zig\", &source)"
 ---
-- name: std
-  kind: Constant
-  start_line: 1
-  end_line: 1
-  signature: "const std = @import(\"std\");"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Private
-  type_info: ~
-  parent_name: ~
-- name: math
-  kind: Constant
-  start_line: 2
-  end_line: 2
-  signature: "const math = @import(\"math.zig\");"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Private
-  type_info: ~
-  parent_name: ~
 - name: SensorKind
-  kind: Class
+  kind: Enum
   start_line: 4
-  end_line: 4
+  end_line: 8
   signature: "pub const SensorKind = enum {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -38,7 +17,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
 - name: SensorConfig
   kind: Class
   start_line: 10
-  end_line: 10
+  end_line: 14
   signature: "pub const SensorConfig = struct {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -49,7 +28,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
 - name: InternalState
   kind: Class
   start_line: 16
-  end_line: 16
+  end_line: 19
   signature: "const InternalState = union {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -60,7 +39,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
 - name: initialize
   kind: Function
   start_line: 21
-  end_line: 21
+  end_line: 24
   signature: "pub fn initialize(config: SensorConfig) void {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -71,7 +50,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
 - name: calibrate
   kind: Function
   start_line: 26
-  end_line: 26
+  end_line: 28
   signature: "fn calibrate(config: SensorConfig) void {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -82,22 +61,11 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
 - name: main
   kind: Function
   start_line: 30
-  end_line: 30
+  end_line: 37
   signature: "pub fn main() !void {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
   entry_point_kind: Main
   visibility: Public
-  type_info: ~
-  parent_name: ~
-- name: config
-  kind: Constant
-  start_line: 31
-  end_line: 31
-  signature: "const config = SensorConfig{"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Private
   type_info: ~
   parent_name: ~

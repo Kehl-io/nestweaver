@@ -1,9 +1,9 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3891
+assertion_line: 4140
 expression: "parsed_references(\"simple.cpp\", &source)"
 ---
-- name: "<iostream>"
+- name: iostream
   kind: Import
   start_line: 1
   context: "#include <iostream>"
