@@ -937,6 +937,7 @@ fn index_into_store(
                             edge_type: EdgeType::MemberOf,
                             confidence: 1.0,
                             link_type: None,
+                            evidence: Vec::new(),
                         });
                     }
                 }
@@ -1083,6 +1084,7 @@ fn derive_contracts(
                     edge_type: EdgeType::ImplementsContract,
                     confidence: m.confidence,
                     link_type: None,
+                    evidence: Vec::new(),
                 });
             }
         }

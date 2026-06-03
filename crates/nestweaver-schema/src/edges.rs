@@ -110,10 +110,59 @@ pub enum CrossRepoLinkType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeEvidence {
+    pub kind: String,
+    pub weight: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedEdge {
     pub source_uid: String,
     pub target_uid: String,
     pub edge_type: EdgeType,
     pub confidence: f32,
     pub link_type: Option<CrossRepoLinkType>,
+    #[serde(default)]
+    pub evidence: Vec<EdgeEvidence>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_evidence_serializes_to_json() {
+        let evidence = vec![
+            EdgeEvidence {
+                kind: "same_file".to_string(),
+                weight: 0.95,
+                note: None,
+            },
+            EdgeEvidence {
+                kind: "type_aware".to_string(),
+                weight: 0.10,
+                note: Some("receiver self -> GraphStore".to_string()),
+            },
+        ];
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("same_file"));
+        let roundtrip: Vec<EdgeEvidence> = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.len(), 2);
+        assert!((roundtrip[0].weight - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolved_edge_evidence_defaults_empty() {
+        let edge = ResolvedEdge {
+            source_uid: "a".to_string(),
+            target_uid: "b".to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 0.95,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+        assert!(edge.evidence.is_empty());
+    }
 }
