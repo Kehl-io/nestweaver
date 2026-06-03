@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3975
+assertion_line: 4255
 expression: "parsed_references(\"simple.rb\", &source)"
 ---
 - name: require
@@ -17,7 +17,7 @@ expression: "parsed_references(\"simple.rb\", &source)"
   kind: Call
   start_line: 13
   context: name.capitalize
-  receiver: ~
+  receiver: name
 - name: Greeter
   kind: Extends
   start_line: 17
@@ -32,9 +32,9 @@ expression: "parsed_references(\"simple.rb\", &source)"
   kind: Call
   start_line: 25
   context: "greeter = Greetings::FormalGreeter.new"
-  receiver: ~
+  receiver: "Greetings::FormalGreeter"
 - name: greet
   kind: Call
   start_line: 26
   context: "greeter = Greetings::FormalGreeter.new"
-  receiver: ~
+  receiver: greeter
