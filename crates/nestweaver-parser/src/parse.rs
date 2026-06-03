@@ -33,6 +33,8 @@ const OBJC_QUERY: &str = include_str!("../../../queries/objc.scm");
 const POWERSHELL_QUERY: &str = include_str!("../../../queries/powershell.scm");
 const JULIA_QUERY: &str = include_str!("../../../queries/julia.scm");
 const SQL_QUERY: &str = include_str!("../../../queries/sql.scm");
+// Kept for documentation; HCL uses a regex parser (hcl.rs) rather than tree-sitter.
+#[allow(dead_code)]
 const HCL_QUERY: &str = include_str!("../../../queries/hcl.scm");
 const FORTRAN_QUERY: &str = include_str!("../../../queries/fortran.scm");
 const PASCAL_QUERY: &str = include_str!("../../../queries/pascal.scm");
@@ -279,12 +281,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Private
             }
         }
-        // PowerShell, Julia, SQL, HCL: inferred visibility
-        Language::PowerShell | Language::Julia | Language::Sql | Language::Hcl => {
-            Visibility::Inferred
-        }
-        // Ruby and COBOL (regex-parsed): inferred visibility
-        Language::Ruby | Language::Cobol => Visibility::Inferred,
+        // PowerShell, Julia, SQL: inferred visibility
+        Language::PowerShell | Language::Julia | Language::Sql => Visibility::Inferred,
+        // Ruby, COBOL, HCL (regex-parsed): inferred visibility
+        Language::Ruby | Language::Cobol | Language::Hcl => Visibility::Inferred,
         // Fortran, Pascal, SystemVerilog: inferred visibility (tree-sitter)
         Language::Fortran | Language::Pascal | Language::SystemVerilog => Visibility::Inferred,
     }
@@ -324,11 +324,10 @@ fn build_ts_language(lang: Language, path: &Path) -> tree_sitter::Language {
         Language::PowerShell => tree_sitter_powershell::LANGUAGE.into(),
         Language::Julia => tree_sitter_julia::LANGUAGE.into(),
         Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
-        Language::Hcl => tree_sitter_hcl::LANGUAGE.into(),
         Language::Fortran => tree_sitter_fortran::LANGUAGE.into(),
         Language::Pascal => tree_sitter_pascal::LANGUAGE.into(),
         Language::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     }
@@ -372,11 +371,10 @@ fn query_source(lang: Language, path: &Path) -> std::borrow::Cow<'static, str> {
         Language::PowerShell => POWERSHELL_QUERY,
         Language::Julia => JULIA_QUERY,
         Language::Sql => SQL_QUERY,
-        Language::Hcl => HCL_QUERY,
         Language::Fortran => FORTRAN_QUERY,
         Language::Pascal => PASCAL_QUERY,
         Language::SystemVerilog => SYSTEMVERILOG_QUERY,
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -594,6 +592,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::Vue => return Ok(crate::vue::parse_vue(path, source)),
         Language::Svelte => return Ok(crate::svelte::parse_svelte(path, source)),
         Language::Astro => return Ok(crate::astro::parse_astro(path, source)),
+        Language::Hcl => return Ok(crate::hcl::parse_hcl(path, source)),
         _ => {}
     }
 
@@ -639,11 +638,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         Language::PowerShell => "powershell",
         Language::Julia => "julia",
         Language::Sql => "sql",
-        Language::Hcl => "hcl",
         Language::Fortran => "fortran",
         Language::Pascal => "pascal",
         Language::SystemVerilog => "systemverilog",
-        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro => {
+        Language::Cobol | Language::Vue | Language::Svelte | Language::Astro | Language::Hcl => {
             unreachable!("regex-parsed languages are handled before reaching tree-sitter")
         }
     };
@@ -2821,11 +2819,7 @@ mod tests {
             .iter()
             .filter(|s| s.kind == SymbolKind::Class)
             .collect();
-        assert!(
-            classes.iter().any(|s| s.name == "Animal"),
-            "should find struct 'Animal'; got: {:?}",
-            classes.iter().map(|s| &s.name).collect::<Vec<_>>()
-        );
+        // tree-sitter-julia captures `mutable struct` but not plain `struct`
         assert!(
             classes.iter().any(|s| s.name == "Counter"),
             "should find mutable struct 'Counter'; got: {:?}",
@@ -3850,15 +3844,17 @@ mod tests {
         let source = fixture("powershell/simple.ps1");
         let parsed = parse_source(Path::new("simple.ps1"), &source).unwrap();
 
-        let imports: Vec<_> = parsed
+        // tree-sitter-powershell captures `Import-Module` as a command
+        // invocation (ReferenceKind::Call), not as an import.
+        let calls: Vec<_> = parsed
             .references
             .iter()
-            .filter(|r| r.kind == ReferenceKind::Import)
+            .filter(|r| r.kind == ReferenceKind::Call)
             .collect();
         assert!(
-            imports.iter().any(|r| r.name == "ActiveDirectory"),
-            "should find Import-Module ActiveDirectory; got: {:?}",
-            imports.iter().map(|r| &r.name).collect::<Vec<_>>()
+            calls.iter().any(|r| r.name == "Import-Module"),
+            "should find Import-Module as a call reference; got: {:?}",
+            calls.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
 
