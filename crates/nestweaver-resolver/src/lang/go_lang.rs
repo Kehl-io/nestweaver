@@ -15,6 +15,7 @@ pub fn resolve_import(
     let specifier = specifier.trim_matches('"');
 
     // Look for .go files whose path contains the package directory
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if !file.ends_with(".go") {
             continue;
@@ -26,8 +27,13 @@ pub fn resolve_import(
             None => continue,
         };
         if dir == specifier || dir.ends_with(&format!("/{specifier}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
@@ -49,13 +55,24 @@ mod tests {
             "cmd/main.go",
         ]);
         let result = resolve_import("cmd/main.go", "internal/service", &known);
-        // Should return the first matching .go file in the package directory
+        // Should return the shortest matching .go file in the package directory
         assert!(result.is_some());
         let path = result.unwrap();
+        // Both candidates are the same length, so either is valid — but result must be deterministic
         assert!(
             path == "internal/service/server.go" || path == "internal/service/client.go",
             "unexpected: {path}"
         );
+    }
+
+    #[test]
+    fn go_multiple_packages_picks_shortest() {
+        let known = set(&[
+            "vendor/internal/service/server.go",
+            "internal/service/client.go",
+        ]);
+        let result = resolve_import("cmd/main.go", "internal/service", &known);
+        assert_eq!(result, Some("internal/service/client.go".to_string()));
     }
 
     #[test]

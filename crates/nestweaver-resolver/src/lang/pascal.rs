@@ -11,14 +11,20 @@ pub fn resolve_import(
     let base = specifier.to_lowercase();
     let extensions = ["pas", "pp"];
 
+    let mut best: Option<&str> = None;
     for ext in &extensions {
         let candidate = format!("{base}.{ext}");
         for &file in known_files {
             let file_lower = file.to_lowercase();
             if file_lower == candidate || file_lower.ends_with(&format!("/{candidate}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None
@@ -51,5 +57,12 @@ mod tests {
         let known = set(&["src/Other.pas"]);
         let result = resolve_import("src/main.pas", "missing", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn multiple_matches_picks_shortest() {
+        let known = set(&["vendor/lib/MyUnit.pas", "src/MyUnit.pas"]);
+        let result = resolve_import("src/main.pas", "myunit", &known);
+        assert_eq!(result, Some("src/MyUnit.pas".to_string()));
     }
 }

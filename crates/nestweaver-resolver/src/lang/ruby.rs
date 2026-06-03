@@ -33,10 +33,16 @@ pub fn resolve_import(
 
     // require: search lib/ directory
     let candidate = format!("lib/{specifier}.rb");
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if file == candidate.as_str() || file.ends_with(&format!("/{candidate}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     None

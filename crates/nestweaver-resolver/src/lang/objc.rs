@@ -19,18 +19,30 @@ pub fn resolve_import(
     }
 
     // Try the specifier as-is or as a suffix
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if file == specifier || file.ends_with(&format!("/{specifier}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     // For framework imports like "Framework/Header.h", try just the basename
     if let Some((_, basename)) = specifier.rsplit_once('/') {
+        let mut best: Option<&str> = None;
         for &file in known_files {
             if file == basename || file.ends_with(&format!("/{basename}")) {
-                return Some(file.to_string());
+                if best.is_none() || file.len() < best.unwrap().len() {
+                    best = Some(file);
+                }
             }
+        }
+        if let Some(f) = best {
+            return Some(f.to_string());
         }
     }
 

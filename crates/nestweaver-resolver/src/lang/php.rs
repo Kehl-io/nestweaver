@@ -13,10 +13,16 @@ pub fn resolve_import(
     // PSR-4 style: App\Models\User -> App/Models/User.php
     let candidate = format!("{}.php", specifier.replace('\\', "/"));
 
+    let mut best: Option<&str> = None;
     for &file in known_files {
         if file == candidate || file.ends_with(&format!("/{candidate}")) {
-            return Some(file.to_string());
+            if best.is_none() || file.len() < best.unwrap().len() {
+                best = Some(file);
+            }
         }
+    }
+    if let Some(f) = best {
+        return Some(f.to_string());
     }
 
     // Try relative include/require paths
