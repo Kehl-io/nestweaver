@@ -1150,6 +1150,16 @@ impl GraphStore {
             }
         }
 
+        // FILE_HAS_SYMBOL (DEFINES) edges: File → Symbol
+        let q = "MATCH (f:File)-[r:FILE_HAS_SYMBOL]->(s:Symbol) RETURN f.uid, s.uid";
+        if let Ok(result) = conn.query(q) {
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                edges.push((src, dst, "DEFINES".to_string(), 1.0, String::new()));
+            }
+        }
+
         Ok(edges)
     }
 
