@@ -789,12 +789,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
                 let visibility = infer_visibility(&name, &node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
-                let parent_name =
-                    if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
-                        find_parent_name(&node, source_bytes)
-                    } else {
-                        None
-                    };
+                let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
+                    find_parent_name(&node, source_bytes)
+                } else {
+                    None
+                };
                 symbols.push(RawSymbol {
                     name,
                     kind,
