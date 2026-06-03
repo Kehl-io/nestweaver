@@ -460,8 +460,9 @@ pub fn extract_self_bindings(
         | Language::Dart
         | Language::Cpp
         | Language::Scala
+        | Language::Groovy
         | Language::SystemVerilog => "this",
-        Language::Php => "$this",
+        Language::Php | Language::PowerShell => "$this",
         Language::Ruby => "self",
         _ => return,
     };
