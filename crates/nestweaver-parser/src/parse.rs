@@ -322,7 +322,7 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         // SystemVerilog: local/protected keywords on class members
         Language::SystemVerilog => {
             let sig = first_line(node_text);
-            if sig.contains("local ") || sig.starts_with("local ") {
+            if sig.contains("local ") {
                 Visibility::Private
             } else if sig.contains("protected ") {
                 Visibility::Protected
@@ -330,17 +330,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
                 Visibility::Public
             }
         }
-        // Julia: exported symbols are public, rest are module-private
-        Language::Julia => {
-            let sig = first_line(node_text);
-            if sig.starts_with("export ") {
-                Visibility::Public
-            } else {
-                Visibility::Inferred
-            }
-        }
+        // Julia: `export` is a module-level statement, not part of function signatures.
+        // Visibility is inferred since we can't detect it from the definition node text.
         // SQL, HCL, COBOL: no visibility concept
-        Language::Sql | Language::Hcl | Language::Cobol => Visibility::Inferred,
+        Language::Julia | Language::Sql | Language::Hcl | Language::Cobol => Visibility::Inferred,
     }
 }
 
