@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4512
 expression: "parsed_symbols(\"simple.pas\", &source)"
 ---
 - name: Greeter
@@ -10,7 +11,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: FormatName
@@ -21,7 +22,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: PrintGreeting
@@ -32,7 +33,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: TAnimal
@@ -43,7 +44,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: TDog
@@ -54,7 +55,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: Create
@@ -65,7 +66,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: Speak
@@ -76,7 +77,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: Create
@@ -87,7 +88,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: PrintGreeting
@@ -98,7 +99,7 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: FormatName
@@ -109,6 +110,6 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~

@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4498
 expression: "parsed_symbols(\"simple.f90\", &source)"
 ---
 - name: math_utils
@@ -10,7 +11,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: Vector3D
@@ -21,7 +22,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: add_vectors
@@ -32,7 +33,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: normalize
@@ -43,7 +44,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: main
@@ -54,6 +55,6 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true
   entry_point_kind: Main
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
