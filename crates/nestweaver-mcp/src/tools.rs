@@ -1502,7 +1502,7 @@ fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Use when you need to find specific notes, headings, sections, tags, or code symbols by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, plus substring search across code symbol names, returning ranked hits (best match first) with a kind discriminator so you can tell note/symbol hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include scores and location details.",
+        "description": "Use when you need to find specific notes, headings, sections, tags, or code symbols by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, plus substring search across code symbol names, returning ranked hits (best match first) with a kind discriminator so you can tell note/symbol hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include scores and location details.\n\nNote: results include both notes AND code symbols in a single call. The `limit` parameter is applied per-kind (up to `limit` notes + up to `limit` symbols), so you never need separate queries to surface both.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1804,6 +1804,7 @@ fn tool_brain_search(
                         .to_string(),
                     relevance: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
                     inline_body: None,
+                    body_complete: true,
                 })
             })
             .collect();
@@ -1829,7 +1830,76 @@ fn tool_brain_search(
         }
     }
 
-    note_results.truncate(limit);
+    // Feature F6: per-path `[ranking]` priors from the daemon-installed
+    // InstanceConfig (set via `set_current_instance_config`). Mirrors the
+    // direct-disk CLI handler: project each row into a `BrainNode`, apply
+    // multiplicative priors keyed by file-path glob, then fold the adjusted
+    // relevance back into the row's `score`. No config → no-op (byte-identical
+    // output to the pre-F6 path).
+    if let Some(cfg) = current_instance_config()
+        && !cfg.ranking.is_empty()
+    {
+        let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
+        for v in &note_results {
+            let uid = v.get("uid").and_then(|u| u.as_str()).unwrap_or("");
+            if uid.is_empty() {
+                continue;
+            }
+            let kind = v
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let score = v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            // For note rows the JSON carries no `location`; resolve the note's
+            // file_path so the ranking-glob can match. Symbol rows already
+            // carry `"location": "<path>:<line>"`.
+            let location = v
+                .get("location")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    store
+                        .lookup_note(uid)
+                        .map(|note| note.file_path)
+                        .unwrap_or_default()
+                });
+            probe.push(nestweaver_engine::BrainNode {
+                uid: uid.to_string(),
+                kind,
+                title: String::new(),
+                location,
+                relevance: score,
+                inline_body: None,
+                body_complete: true,
+            });
+        }
+        nestweaver_engine::apply_ranking_priors(&mut probe, &cfg.ranking);
+        let adjusted: std::collections::HashMap<String, f64> =
+            probe.into_iter().map(|n| (n.uid, n.relevance)).collect();
+        for item in note_results.iter_mut() {
+            if let Some(uid) = item.get("uid").and_then(|u| u.as_str()).map(String::from)
+                && let Some(&adj) = adjusted.get(&uid)
+            {
+                item["score"] = json!(adj);
+            }
+        }
+        // Re-sort after priors mutate scores so the highest-ranked rows
+        // surface first within the merged list.
+        note_results.sort_by(|a, b| {
+            let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    // Bug C / symbol-parity fix: `limit` is interpreted per-kind. Notes
+    // (capped at `limit` in `group_search_hits_by_note` / substring `.take`)
+    // and symbols (capped at `limit` in `search_symbols`) are each bounded
+    // upstream, so we deliberately skip a cross-kind truncate here. A merged
+    // cap would evict every symbol whenever ≥ `limit` notes match because
+    // symbols carry a fixed 0.5 score while BM25 notes score 15+. Callers
+    // that need a hard total cap should pass a smaller `limit`.
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by
     // default. Concise mode carries no UID/score, so inline bodies are skipped
@@ -1864,6 +1934,7 @@ fn tool_brain_search(
                     location: String::new(),
                     relevance: score,
                     inline_body: None,
+                    body_complete: true,
                 })
             })
             .collect();
@@ -4226,6 +4297,8 @@ fn walk_has_markdown(root: &Path) -> bool {
 thread_local! {
     static CURRENT_DB_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static CURRENT_INSTANCE_CONFIG: std::cell::RefCell<Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>> =
+        const { std::cell::RefCell::new(None) };
     static ALLOW_ADD_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static LITE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
@@ -4240,6 +4313,20 @@ thread_local! {
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
     CURRENT_DB_PATH.with(|c| *c.borrow_mut() = Some(path));
+}
+
+/// Install the parsed `InstanceConfig` for the current dispatch context.
+/// Callers (daemon, MCP server) set this once per dispatch so tools like
+/// `brain_search` can apply Feature F6 `[ranking]` priors without re-parsing
+/// the file. Pass `None` to clear.
+pub fn set_current_instance_config(cfg: Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>) {
+    CURRENT_INSTANCE_CONFIG.with(|c| *c.borrow_mut() = cfg);
+}
+
+/// Retrieve the parsed `InstanceConfig` installed for this dispatch, if any.
+pub(crate) fn current_instance_config() -> Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>
+{
+    CURRENT_INSTANCE_CONFIG.with(|c| c.borrow().clone())
 }
 
 /// Set the F16 response-cache size cap in MiB (from `[cache] max_size_mb`).
@@ -4630,7 +4717,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Use to orient yourself on an unfamiliar topic, feature, or subsystem in ONE call instead of a chain of searches. Runs hybrid PPR + BM25 retrieval (with pseudo-relevance feedback) for your query, groups the results into architectural domains (code directories + notes), inlines a few high-confidence source bodies, and returns a token-budgeted map plus a `bundle_id`. Drill into specific entries afterwards with `investigate_expand` (by asset_id) or fill in all remaining bodies with `investigate_hydrate`.\n\nScope: \"project:<slug>\" restricts seeds to a project's members, \"repo:<name>\" restricts results to a repo, \"vault\"/\"all\"/omitted = no restriction. Returns `{bundle_id, domains:[{label, entry_point, members}], entries:[{asset_id, uid, kind, title, location, summary, inline_body?, relevance}], more_available}`. `more_available` counts entries dropped by the token budget — raise `token_budget` to see them.",
+        "description": "Use to orient yourself on an unfamiliar topic, feature, or subsystem in ONE call instead of a chain of searches. Runs hybrid PPR + BM25 retrieval (with pseudo-relevance feedback) for your query, groups the results into architectural domains (code directories + notes), inlines a few high-confidence source bodies, and returns a token-budgeted map plus a `bundle_id`. Drill into specific entries afterwards with `investigate_expand` (by asset_id) or fill in all remaining bodies with `investigate_hydrate`.\n\nScope: \"project:<slug>\" restricts seeds to a project's members, \"repo:<name>\" restricts results to a repo, \"vault\"/\"all\"/omitted = no restriction. Returns `{bundle_id, domains:[{label, entry_point, members}], entries:[{asset_id, uid, kind, title, location, summary, inline_body?, body_complete?, relevance}], more_available}`. `more_available` counts entries dropped by the token budget — raise `token_budget` to see them. `body_complete` is present (false) only when `inline_body` was truncated at the per-body cap; absent means the body is complete. When false, call `read_symbols(uid)` or `investigate_expand` to get the full source.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4678,7 +4765,7 @@ fn tool_investigate(
 fn tool_schema_investigate_expand() -> Value {
     json!({
         "name": "investigate_expand",
-        "description": "Use after `investigate` to drill into specific map entries. Given a `bundle_id` and one or more targets (each an `asset_id` from the map, or a raw node uid), returns each entry's full source body plus its immediate neighbors (callers/callees for symbols, wikilink sources for notes) and marks the entries expanded. Returns `{bundle_id, expanded:[entry], neighbors:[{of, uid, kind, title, relation}], unresolved:[target]}`. Bundles expire 24h after creation.",
+        "description": "Use after `investigate` to drill into specific map entries. Given a `bundle_id` and one or more targets (each an `asset_id` from the map, or a raw node uid), returns each entry's full source body plus its immediate neighbors (callers/callees for symbols, wikilink sources for notes) and marks the entries expanded. Returns `{bundle_id, expanded:[entry], neighbors:[{of, uid, kind, title, relation}], unresolved:[target]}`. Expanded entries always have `body_complete: true` (full untruncated body). Bundles expire 24h after creation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4717,7 +4804,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
 fn tool_schema_investigate_hydrate() -> Value {
     json!({
         "name": "investigate_hydrate",
-        "description": "Use after `investigate` to fill in source bodies/summaries for every map entry that doesn't yet have one — the bulk version of `investigate_expand`, budget-bounded. Given a `bundle_id`, reads bodies for all un-hydrated entries up to the token budget. Returns `{bundle_id, hydrated, entries}`. Bundles expire 24h after creation.",
+        "description": "Use after `investigate` to fill in source bodies/summaries for every map entry that doesn't yet have one — the bulk version of `investigate_expand`, budget-bounded. Given a `bundle_id`, reads bodies for all un-hydrated entries up to the token budget. Returns `{bundle_id, hydrated, entries}` where each entry carries `body_complete: bool` — `true` when the full source is inlined, `false` when the per-body cap truncated it (call `read_symbols(uid)` for the rest). Bundles expire 24h after creation.",
         "inputSchema": {
             "type": "object",
             "properties": {

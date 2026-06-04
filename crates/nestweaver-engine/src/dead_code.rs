@@ -488,6 +488,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -497,6 +498,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -529,6 +531,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -561,6 +564,7 @@ mod tests {
                 edge_type: EdgeType::Imports,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -570,6 +574,7 @@ mod tests {
                 edge_type: EdgeType::Extends,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -596,6 +601,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -638,6 +644,7 @@ mod tests {
                 edge_type: EdgeType::Imports,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -649,6 +656,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -690,6 +698,7 @@ mod tests {
                 edge_type: EdgeType::Imports,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -699,6 +708,7 @@ mod tests {
                 edge_type: EdgeType::MemberOf,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -758,6 +768,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.2,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -786,6 +797,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.4,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -819,6 +831,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -846,6 +859,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.5,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -884,6 +898,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.4,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -895,6 +910,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -904,6 +920,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.8,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -1049,6 +1066,7 @@ mod tests {
                 edge_type: EdgeType::MemberOf,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -1058,6 +1076,7 @@ mod tests {
                 edge_type: EdgeType::MemberOf,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -1102,6 +1121,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
         store
@@ -1111,6 +1131,7 @@ mod tests {
                 edge_type: EdgeType::MemberOf,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 

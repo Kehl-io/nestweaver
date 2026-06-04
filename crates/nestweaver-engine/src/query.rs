@@ -365,6 +365,7 @@ mod promote_tests {
             location: format!("Projects/x/{uid}.md"),
             relevance: 0.9,
             inline_body: None,
+            body_complete: true,
         }
     }
 
@@ -376,6 +377,7 @@ mod promote_tests {
             location: format!("src/{uid}.rs"),
             relevance: 0.5,
             inline_body: None,
+            body_complete: true,
         }
     }
 
@@ -687,6 +689,34 @@ pub struct BrainNode {
     /// default so existing callers see unchanged output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_body: Option<String>,
+    /// Bug H — fidelity signal for `inline_body`. `true` when the inlined
+    /// body contains the full source, `false` when the per-body cap forced
+    /// truncation. Skipped from JSON when `true` so existing consumers see
+    /// unchanged output and only learn about the field when it flags a
+    /// truncated body. (BrainNode is Serialize-only — no Deserialize default
+    /// needed; constructors set this explicitly.)
+    #[serde(skip_serializing_if = "is_true")]
+    pub body_complete: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// Char-truncate `body` to `max_chars`, preferring the last newline within the
+/// truncated range so we never split a statement mid-line. Returns the (possibly
+/// shortened) body plus a `body_complete` flag — `true` when no truncation was
+/// needed. Safe on UTF-8: the char-iter cap respects codepoint boundaries.
+pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String, bool) {
+    if body.chars().count() <= max_chars {
+        return (body, true);
+    }
+    let mut truncated: String = body.chars().take(max_chars).collect();
+    if let Some(last_nl) = truncated.rfind('\n') {
+        truncated.truncate(last_nl);
+    }
+    (truncated, false)
 }
 
 #[derive(Debug, Serialize)]
@@ -1147,6 +1177,7 @@ fn render_brain_node(
                 location: format!("{}:{}", s.file_path, s.start_line),
                 relevance: score,
                 inline_body: None,
+                body_complete: true,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -1160,6 +1191,7 @@ fn render_brain_node(
                 location: n.file_path,
                 relevance: score,
                 inline_body: None,
+                body_complete: true,
             })),
             Err(nestweaver_store::StoreError::NotFound) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(e)),
@@ -1183,6 +1215,7 @@ fn render_brain_node(
             location,
             relevance: score,
             inline_body: None,
+            body_complete: true,
         }))
     } else if uid.starts_with("sec:") {
         // Look up the Section node and derive a readable title from the
@@ -1230,6 +1263,7 @@ fn render_brain_node(
             location,
             relevance: score,
             inline_body: None,
+            body_complete: true,
         }))
     } else if uid.starts_with("tag:") {
         Ok(Some(BrainNode {
@@ -1239,6 +1273,7 @@ fn render_brain_node(
             location: String::new(),
             relevance: score,
             inline_body: None,
+            body_complete: true,
         }))
     } else {
         Ok(None)
@@ -1392,17 +1427,17 @@ pub fn populate_inline_bodies(
         if normalized < threshold {
             continue;
         }
-        let Some(mut body) = fetch_node_body(store, &node.uid, root) else {
+        let Some(body) = fetch_node_body(store, &node.uid, root) else {
             continue;
         };
         if body.is_empty() {
             continue;
         }
-        // Truncate to the per-body cap (chars/4 estimate). Respect char
-        // boundaries so we never split a UTF-8 codepoint.
-        if body.chars().count() > max_body_chars {
-            body = body.chars().take(max_body_chars).collect();
-        }
+        // Truncate to the per-body cap (chars/4 estimate). Bug H: prefer the
+        // last newline within the cap so we never split a statement mid-line;
+        // the returned flag is propagated into BrainNode.body_complete so
+        // downstream consumers know whether the body is full or partial.
+        let (body, complete) = truncate_body_to_chars(body, max_body_chars);
         // Token-budget gate: charge inline bodies ahead of metadata. The first
         // qualifying node is always allowed (mirrors read_symbols), so a single
         // oversized body never starves the whole result.
@@ -1414,6 +1449,7 @@ pub fn populate_inline_bodies(
             used_tokens += cost;
         }
         node.inline_body = Some(body);
+        node.body_complete = complete;
     }
 }
 
@@ -1712,6 +1748,7 @@ mod ranking_prior_tests {
             location: location.to_string(),
             relevance,
             inline_body: None,
+            body_complete: true,
         }
     }
 
@@ -1849,6 +1886,7 @@ mod inline_body_tests {
             location: String::new(),
             relevance,
             inline_body: None,
+            body_complete: true,
         }
     }
 
