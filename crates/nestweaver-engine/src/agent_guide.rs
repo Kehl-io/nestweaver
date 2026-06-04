@@ -484,6 +484,29 @@ pub fn generate_skill_with_tools(
     out.push_str("3. `backlinks` to discover what links to a specific note.\n");
     out.push_str("4. Use `since` or `recency_weight` parameters on `brain_context` to prioritize recent notes.\n\n");
 
+    // ── Token efficiency ────────────────────────────────────────────────
+    out.push_str("## Token efficiency\n\n");
+
+    out.push_str("### Choosing the right retrieval tool\n\n");
+    out.push_str("- **`brain_search`** for locating named symbols or notes by keyword — direct BM25/substring lookup, cheaper than a full PPR walk. Returns both notes and code symbols in one call (per-kind cap, not cross-kind), so you never need separate queries.\n");
+    out.push_str("- **`brain_context`** for structural exploration — when you need to understand what's *connected* to something, not just find it by name.\n");
+    out.push_str("- **`get_summary`** for token-efficient overviews of files or clusters — much cheaper than reading entire source files.\n\n");
+
+    out.push_str("### Progressive disclosure with investigate\n\n");
+    out.push_str("Use the investigate chain to go from broad orientation to precise source without reading every file upfront:\n\n");
+    out.push_str(
+        "1. `investigate(\"topic\")` — returns a map with summaries and a few inline bodies\n",
+    );
+    out.push_str("2. `investigate_hydrate(bundle_id)` — fills remaining bodies (may truncate long sources)\n");
+    out.push_str("3. For entries where `body_complete` is `false`: call `read_symbols(uid)` to get the full untruncated source\n\n");
+    out.push_str("The `body_complete` field tells you whether an inlined body is the full source (`true` or absent) or was truncated at the per-body cap (`false`). Only call `read_symbols` when the truncated tail matters for your task — skip it otherwise to save tokens.\n\n");
+    out.push_str("`investigate_expand` always returns the full untruncated body (`body_complete: true`), so no follow-up read is needed after expanding.\n\n");
+
+    out.push_str("### Other tips\n\n");
+    out.push_str("- The `summary` field on investigate entries is the first non-empty line of the body (capped at 200 chars), not an LLM-generated summary. Use it for quick scanning, not for understanding content.\n");
+    out.push_str("- Use `response_format: \"concise\"` on `brain_context` and `brain_search` when you only need titles and kinds (good for scanning many results).\n");
+    out.push_str("- Filter with `kinds`, `repos`, `path_prefix`, or `tags` to narrow results before they consume your token budget.\n\n");
+
     // ── Query patterns ───────────────────────────────────────────────────
     out.push_str("## Graph query patterns\n\n");
 
