@@ -1,15 +1,15 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4115
+assertion_line: 4363
 expression: "parsed_references(\"simple.ps1\", &source)"
 ---
-- name: ActiveDirectory
-  kind: Import
+- name: Import-Module
+  kind: Call
   start_line: 1
   context: Import-Module ActiveDirectory
   receiver: ~
-- name: helpers.ps1
-  kind: Includes
+- name: ".\\helpers.ps1"
+  kind: Call
   start_line: 2
   context: ". .\\helpers.ps1"
   receiver: ~
@@ -26,12 +26,12 @@ expression: "parsed_references(\"simple.ps1\", &source)"
 - name: Get-WmiObject
   kind: Call
   start_line: 39
-  context: $data = Get-WmiObject -Class Win32_Sensor
+  context: Get-WmiObject -Class Win32_Sensor
   receiver: ~
 - name: Where-Object
   kind: Call
   start_line: 40
-  context: "return $data | Where-Object { $_.Name -eq $SensorName }"
+  context: "$data | Where-Object { $_.Name -eq $SensorName }"
   receiver: ~
 - name: Initialize-Sensor
   kind: Call
@@ -41,10 +41,15 @@ expression: "parsed_references(\"simple.ps1\", &source)"
 - name: Get-SensorData
   kind: Call
   start_line: 52
-  context: "$data = Get-SensorData -SensorName \"temp-1\""
+  context: "Get-SensorData -SensorName \"temp-1\""
   receiver: ~
 - name: Write-Output
   kind: Call
   start_line: 53
   context: Write-Output $data
+  receiver: ~
+- name: Main
+  kind: Call
+  start_line: 56
+  context: Main
   receiver: ~

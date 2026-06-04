@@ -239,14 +239,54 @@ fn extract_assignments(source: &str) -> Vec<Assignment> {
                 .trim_start_matches("var ")
                 .trim();
             let rhs = trimmed[eq_pos + 1..].trim().trim_end_matches(';');
-            // Only simple identifier-to-identifier assignments
+            // Accept dotted identifiers (field access like `a.b`, `self.store`)
+            // but reject range operators (`..`) and type annotations (`:` in LHS).
             if !lhs.is_empty()
                 && !rhs.is_empty()
-                && rhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && rhs
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && lhs
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && !lhs.contains(':')
+                && !rhs.contains("..")
+            {
+                // Strip `self.` / `this.` prefix from LHS so we bind the field name.
+                let lhs_key = lhs
+                    .strip_prefix("self.")
+                    .or_else(|| lhs.strip_prefix("this."))
+                    .unwrap_or(lhs);
+                // For dotted RHS (`config.store`), look up just the last segment.
+                let rhs_key = rhs.rsplit('.').next().unwrap_or(rhs);
+                // Skip self-referential assignments (e.g., `store = config.store`
+                // produces lhs=store, rhs=store after last-segment extraction).
+                if lhs_key != rhs_key {
+                    assignments.push((
+                        (lhs_key.to_string(), line_num),
+                        (rhs_key.to_string(), line_num),
+                    ));
+                }
+            }
+            // Also handle function-call RHS: `let x = foo()` or `let x = obj.method()`
+            if !lhs.is_empty()
                 && lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
                 && !lhs.contains(':')
             {
-                assignments.push(((lhs.to_string(), line_num), (rhs.to_string(), line_num)));
+                let rhs_trimmed = rhs.trim_end_matches(';').trim();
+                if let Some(paren_pos) = rhs_trimmed.find('(') {
+                    let callee = rhs_trimmed[..paren_pos].trim();
+                    // Extract last segment for dotted calls: `obj.method(` → `method`
+                    let callee_name = callee.rsplit('.').next().unwrap_or(callee);
+                    if !callee_name.is_empty()
+                        && callee_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        assignments.push((
+                            (lhs.to_string(), line_num),
+                            (callee_name.to_string(), line_num),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -516,5 +556,80 @@ mod tests {
         let binding = env.lookup("store", 1);
         assert!(binding.is_some());
         assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn extract_assignments_handles_dotted_rhs() {
+        let source = "let db = config.database;\n";
+        let assignments = extract_assignments(source);
+        assert!(
+            assignments
+                .iter()
+                .any(|((lhs, _), (rhs, _))| lhs == "db" && rhs == "database"),
+            "should extract dotted assignment: {:?}",
+            assignments
+        );
+    }
+
+    #[test]
+    fn extract_assignments_handles_function_call() {
+        let source = "let result = compute();\n";
+        let assignments = extract_assignments(source);
+        assert!(
+            assignments
+                .iter()
+                .any(|((lhs, _), (rhs, _))| lhs == "result" && rhs == "compute"),
+            "should extract function call assignment: {:?}",
+            assignments
+        );
+    }
+
+    #[test]
+    fn extract_assignments_handles_method_call() {
+        let source = "let conn = db.connect();\n";
+        let assignments = extract_assignments(source);
+        assert!(
+            assignments
+                .iter()
+                .any(|((lhs, _), (rhs, _))| lhs == "conn" && rhs == "connect"),
+            "should extract method call assignment: {:?}",
+            assignments
+        );
+    }
+
+    #[test]
+    fn propagation_chains_through_assignments() {
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        let mut bindings = HashMap::new();
+        // Seed: config has type Config
+        bindings.insert(
+            ("config".to_string(), 1u32),
+            TypeBinding {
+                type_name: "Config".to_string(),
+                line: 1,
+                confidence: 0.95,
+                source: BindingSource::Constructor,
+            },
+        );
+        // Assignments: store = config, alias = store
+        let assignments = vec![
+            (("store".to_string(), 5u32), ("config".to_string(), 5u32)),
+            (("alias".to_string(), 8u32), ("store".to_string(), 8u32)),
+        ];
+        propagate_assignments(&mut bindings, &assignments, 10);
+
+        let store_type = bindings.get(&("store".to_string(), 5));
+        assert!(
+            store_type.is_some(),
+            "store should have type after propagation"
+        );
+        assert_eq!(store_type.unwrap().type_name, "Config");
+
+        let alias_type = bindings.get(&("alias".to_string(), 8));
+        assert!(
+            alias_type.is_some(),
+            "alias should have type after chain propagation"
+        );
+        assert_eq!(alias_type.unwrap().type_name, "Config");
     }
 }

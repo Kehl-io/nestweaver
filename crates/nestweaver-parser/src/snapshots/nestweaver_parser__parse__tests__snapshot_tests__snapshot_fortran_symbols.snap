@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4498
 expression: "parsed_symbols(\"simple.f90\", &source)"
 ---
 - name: math_utils
   kind: Module
   start_line: 1
-  end_line: 1
+  end_line: 30
   signature: module math_utils
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -16,7 +17,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
 - name: Vector3D
   kind: Class
   start_line: 4
-  end_line: 4
+  end_line: 7
   signature: "type :: Vector3D"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -27,7 +28,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
 - name: add_vectors
   kind: Function
   start_line: 10
-  end_line: 10
+  end_line: 17
   signature: "function add_vectors(a, b) result(c)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -38,7 +39,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
 - name: normalize
   kind: Function
   start_line: 18
-  end_line: 18
+  end_line: 28
   signature: subroutine normalize(v)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -49,7 +50,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
 - name: main
   kind: Module
   start_line: 31
-  end_line: 31
+  end_line: 45
   signature: program main
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

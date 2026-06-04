@@ -40,6 +40,20 @@
     name: (type_identifier) @name
     type: (function_type))) @definition.type
 
+(type_declaration
+  (type_spec
+    name: (type_identifier) @name
+    type: (array_type))) @definition.type
+
+(type_declaration
+  (type_spec
+    name: (type_identifier) @name
+    type: (channel_type))) @definition.type
+
+; Interface method declarations
+(method_elem
+  name: (field_identifier) @name) @definition.method
+
 ; Const declarations
 (const_declaration
   (const_spec

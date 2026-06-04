@@ -1,11 +1,12 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4337
 expression: "parsed_symbols(\"simple.groovy\", &source)"
 ---
 - name: Greeter
   kind: Interface
   start_line: 4
-  end_line: 4
+  end_line: 6
   signature: "interface Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -16,40 +17,18 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: greet
   kind: Method
   start_line: 5
-  end_line: 5
+  end_line: 6
   signature: String greet(String name)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
-- name: Loggable
-  kind: Trait
-  start_line: 8
-  end_line: 8
-  signature: "trait Loggable {"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-- name: log
-  kind: Method
-  start_line: 9
-  end_line: 9
-  signature: "void log(String message) {"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
+  parent_name: Greeter
 - name: SimpleGreeter
   kind: Class
   start_line: 14
-  end_line: 14
+  end_line: 29
   signature: "class SimpleGreeter implements Greeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -57,32 +36,43 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+- name: SimpleGreeter
+  kind: Method
+  start_line: 15
+  end_line: 19
+  signature: String prefix
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: SimpleGreeter
 - name: greet
   kind: Method
   start_line: 21
-  end_line: 21
+  end_line: 24
   signature: "String greet(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: SimpleGreeter
 - name: formatName
   kind: Method
   start_line: 26
-  end_line: 26
+  end_line: 28
   signature: "private String formatName(String name) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Private
   type_info: ~
-  parent_name: ~
+  parent_name: SimpleGreeter
 - name: FormalGreeter
   kind: Class
   start_line: 31
-  end_line: 31
+  end_line: 35
   signature: "class FormalGreeter extends SimpleGreeter {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -90,11 +80,55 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+- name: FormalGreeter
+  kind: Method
+  start_line: 32
+  end_line: 34
+  signature: "FormalGreeter() {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: FormalGreeter
 - name: Priority
   kind: Enum
   start_line: 37
-  end_line: 37
+  end_line: 39
   signature: "enum Priority {"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+- name: HIGH
+  kind: Constant
+  start_line: 38
+  end_line: 38
+  signature: HIGH
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+- name: LOW
+  kind: Constant
+  start_line: 38
+  end_line: 38
+  signature: LOW
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+- name: MEDIUM
+  kind: Constant
+  start_line: 38
+  end_line: 38
+  signature: MEDIUM
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -104,7 +138,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
 - name: main
   kind: Function
   start_line: 41
-  end_line: 41
+  end_line: 44
   signature: "def main(String[] args) {"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: true

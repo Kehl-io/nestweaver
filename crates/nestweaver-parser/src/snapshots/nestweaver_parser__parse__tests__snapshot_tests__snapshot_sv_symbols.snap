@@ -1,11 +1,23 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4568
 expression: "parsed_symbols(\"simple.sv\", &source)"
 ---
+- name: compute_checksum
+  kind: Function
+  start_line: 1
+  end_line: 78
+  signature: "`include \"common_defs.svh\""
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
 - name: top_module
   kind: Module
   start_line: 6
-  end_line: 6
+  end_line: 30
   signature: "module top_module #("
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -16,7 +28,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
 - name: axi_if
   kind: Interface
   start_line: 32
-  end_line: 32
+  end_line: 43
   signature: "interface axi_if #("
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -27,7 +39,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
 - name: packet
   kind: Class
   start_line: 45
-  end_line: 45
+  end_line: 60
   signature: class packet extends base_packet;
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
@@ -35,54 +47,43 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
-- name: new
+- name: "function new(string name = \"packet\");\n    super.new(name);\n  endfunction"
   kind: Method
   start_line: 49
-  end_line: 49
+  end_line: 51
   signature: "function new(string name = \"packet\");"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: packet
 - name: build
   kind: Method
   start_line: 53
-  end_line: 53
+  end_line: 55
   signature: function void build();
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
+  parent_name: packet
 - name: send
   kind: Method
   start_line: 57
-  end_line: 57
+  end_line: 59
   signature: task send(input int port);
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
   visibility: Public
   type_info: ~
-  parent_name: ~
-- name: compute_checksum
-  kind: Function
-  start_line: 62
-  end_line: 62
-  signature: "function automatic int compute_checksum(input bit [7:0] data[], input int len);"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
+  parent_name: packet
 - name: sub_module
   kind: Module
   start_line: 70
-  end_line: 70
+  end_line: 77
   signature: "module sub_module #("
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false

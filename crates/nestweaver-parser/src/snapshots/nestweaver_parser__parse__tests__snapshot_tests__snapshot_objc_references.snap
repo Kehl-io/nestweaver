@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4087
+assertion_line: 4367
 expression: "parsed_references(\"simple.m\", &source)"
 ---
 - name: Foundation/Foundation.h
@@ -11,40 +11,50 @@ expression: "parsed_references(\"simple.m\", &source)"
 - name: Greeter.h
   kind: Import
   start_line: 2
-  context: "#import \"Greeter.h\""
+  context: "#import <Foundation/Foundation.h>"
   receiver: ~
 - name: utils.h
-  kind: Includes
+  kind: Import
   start_line: 3
-  context: "#include \"utils.h\""
+  context: "#import <Foundation/Foundation.h>"
   receiver: ~
 - name: init
   kind: Call
   start_line: 16
-  context: "self = [super init];"
-  receiver: ~
+  context: "self = [super init]"
+  receiver: super
 - name: formatName
   kind: Call
   start_line: 24
-  context: "NSString *formatted = [self formatName:name];"
-  receiver: ~
+  context: "*formatted = [self formatName:name]"
+  receiver: self
 - name: stringWithFormat
   kind: Call
   start_line: 25
   context: "return [NSString stringWithFormat:@\"%@ %@!\", self.prefix, formatted];"
-  receiver: ~
+  receiver: NSString
 - name: capitalizedString
   kind: Call
   start_line: 29
   context: "return [name capitalizedString];"
-  receiver: ~
+  receiver: name
 - name: alloc
   kind: Call
   start_line: 36
-  context: "SimpleGreeter *greeter = [[SimpleGreeter alloc] initWithPrefix:@\"Hello\"];"
-  receiver: ~
+  context: "[[SimpleGreeter alloc] initWithPrefix:@\"Hello\"]"
+  receiver: SimpleGreeter
+- name: initWithPrefix
+  kind: Call
+  start_line: 36
+  context: "*greeter = [[SimpleGreeter alloc] initWithPrefix:@\"Hello\"]"
+  receiver: "[SimpleGreeter alloc]"
 - name: greet
   kind: Call
   start_line: 37
-  context: "NSString *result = [greeter greet:@\"world\"];"
+  context: "*result = [greeter greet:@\"world\"]"
+  receiver: greeter
+- name: NSLog
+  kind: Call
+  start_line: 38
+  context: "NSLog(@\"%@\", result);"
   receiver: ~

@@ -1,7 +1,7 @@
 use nestweaver_parser::{RawReference, RawSymbol, ReferenceKind};
 use nestweaver_schema::{
-    EdgeType, Language, MatchType, ResolvedEdge, SymbolKind, Visibility, confidence_score,
-    symbol_uid,
+    EdgeEvidence, EdgeType, Language, MatchType, ResolvedEdge, SymbolKind, Visibility,
+    confidence_score, symbol_uid,
 };
 
 use crate::imports::build_import_graph;
@@ -161,6 +161,11 @@ pub fn resolve_references_with_context(
                             edge_type,
                             confidence,
                             link_type: None,
+                            evidence: vec![EdgeEvidence {
+                                kind: "type_aware".to_string(),
+                                weight: confidence,
+                                note: Some(format!("{} -> {}", receiver, type_name)),
+                            }],
                         });
                         continue 'ref_loop;
                     }
@@ -199,6 +204,15 @@ pub fn resolve_references_with_context(
                                                 edge_type,
                                                 confidence: conf,
                                                 link_type: None,
+                                                evidence: vec![EdgeEvidence {
+                                                    kind: "type_aware_mro".to_string(),
+                                                    weight: conf,
+                                                    note: Some(format!(
+                                                        "MRO depth {} via {}",
+                                                        depth + 1,
+                                                        parent
+                                                    )),
+                                                }],
                                             });
                                             continue 'ref_loop;
                                         }
@@ -242,6 +256,11 @@ pub fn resolve_references_with_context(
                     edge_type,
                     confidence,
                     link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: "same_file".to_string(),
+                        weight: confidence,
+                        note: None,
+                    }],
                 });
                 continue;
             }
@@ -262,6 +281,11 @@ pub fn resolve_references_with_context(
                         edge_type,
                         confidence,
                         link_type: None,
+                        evidence: vec![EdgeEvidence {
+                            kind: "import_resolved".to_string(),
+                            weight: confidence,
+                            note: None,
+                        }],
                     });
                     found = true;
                     break 'import_search;
@@ -289,6 +313,11 @@ pub fn resolve_references_with_context(
                             edge_type,
                             confidence,
                             link_type: None,
+                            evidence: vec![EdgeEvidence {
+                                kind: "reexport_resolved".to_string(),
+                                weight: confidence,
+                                note: None,
+                            }],
                         });
                         found = true;
                         break 'reexport_search;
@@ -321,6 +350,11 @@ pub fn resolve_references_with_context(
                         edge_type,
                         confidence,
                         link_type: None,
+                        evidence: vec![EdgeEvidence {
+                            kind: "same_package".to_string(),
+                            weight: confidence,
+                            note: None,
+                        }],
                     });
                     found = true;
                 }
@@ -337,6 +371,11 @@ pub fn resolve_references_with_context(
                 edge_type,
                 confidence: 0.0,
                 link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "unresolved".to_string(),
+                    weight: 0.0,
+                    note: None,
+                }],
             });
         }
     }
@@ -381,6 +420,11 @@ pub fn resolve_references_with_context(
                 edge_type: EdgeType::Imports,
                 confidence,
                 link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "structural".to_string(),
+                    weight: confidence,
+                    note: None,
+                }],
             });
         }
     }
@@ -455,6 +499,11 @@ pub fn resolve_references_with_context(
                     edge_type: EdgeType::Imports,
                     confidence,
                     link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: "structural".to_string(),
+                        weight: confidence,
+                        note: None,
+                    }],
                 });
             }
         }
@@ -911,6 +960,28 @@ mod tests {
             2,
             "should have IMPORTS edges to both target files; got: {import_edges:?}"
         );
+    }
+
+    #[test]
+    fn resolved_edge_contains_evidence() {
+        let files = vec![(
+            "src/main.js".to_string(),
+            vec![make_symbol("main", 1), make_symbol("greet", 10)],
+            vec![make_ref("greet", ReferenceKind::Call, 5)],
+        )];
+
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:"))
+            .expect("should have a resolved CALLS edge");
+
+        assert!(
+            !call.evidence.is_empty(),
+            "resolved edge should have evidence entries"
+        );
+        assert_eq!(call.evidence[0].kind, "same_file");
+        assert!(call.evidence[0].weight > 0.0);
     }
 
     mod snapshot_tests {

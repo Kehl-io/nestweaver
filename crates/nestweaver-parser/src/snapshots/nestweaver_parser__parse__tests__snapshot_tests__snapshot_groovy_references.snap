@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4101
+assertion_line: 4381
 expression: "parsed_references(\"simple.groovy\", &source)"
 ---
 - name: groovy.transform.CompileStatic
@@ -11,7 +11,22 @@ expression: "parsed_references(\"simple.groovy\", &source)"
 - name: java.util.logging.Logger
   kind: Import
   start_line: 2
-  context: import java.util.logging.Logger
+  context: import groovy.transform.CompileStatic
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 5
+  context: "{"
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 5
+  context: (String name)
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 9
+  context: (String message)
   receiver: ~
 - name: println
   kind: Call
@@ -23,46 +38,61 @@ expression: "parsed_references(\"simple.groovy\", &source)"
   start_line: 14
   context: "class SimpleGreeter implements Greeter {"
   receiver: ~
-- name: SimpleGreeter
-  kind: Call
+- name: String
+  kind: TypeRef
+  start_line: 15
+  context: "{"
+  receiver: ~
+- name: String
+  kind: TypeRef
   start_line: 17
-  context: "SimpleGreeter(String prefix) {"
+  context: (String prefix)
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 21
+  context: "{"
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 21
+  context: (String name)
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 22
+  context: "{"
   receiver: ~
 - name: formatName
   kind: Call
   start_line: 22
-  context: String formatted = formatName(name)
+  context: formatted = formatName(name)
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 26
+  context: "{"
+  receiver: ~
+- name: String
+  kind: TypeRef
+  start_line: 26
+  context: (String name)
   receiver: ~
 - name: capitalize
   kind: Call
   start_line: 27
   context: return name.capitalize()
-  receiver: ~
+  receiver: name
 - name: SimpleGreeter
   kind: Extends
   start_line: 31
   context: "class FormalGreeter extends SimpleGreeter {"
   receiver: ~
-- name: FormalGreeter
-  kind: Call
-  start_line: 32
-  context: "FormalGreeter() {"
-  receiver: ~
-- name: super
-  kind: Call
-  start_line: 33
-  context: "super(\"Dear\")"
-  receiver: ~
-- name: SimpleGreeter
-  kind: Call
-  start_line: 42
-  context: "def greeter = new SimpleGreeter(\"Hello\")"
-  receiver: ~
 - name: greet
   kind: Call
   start_line: 43
-  context: "println(greeter.greet(\"world\"))"
-  receiver: ~
+  context: "(greeter.greet(\"world\"))"
+  receiver: greeter
 - name: println
   kind: Call
   start_line: 43

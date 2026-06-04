@@ -176,7 +176,7 @@ fn detect_dead_code_inner(
     // Additionally, track class -> [member_uid] for dedup in step 6.
     let mut adjacency: HashMap<String, Vec<(String, f32)>> = HashMap::new();
     let mut class_members: HashMap<String, Vec<String>> = HashMap::new();
-    for (src, dst, edge_type, confidence) in &typed_edges {
+    for (src, dst, edge_type, confidence, _evidence) in &typed_edges {
         let conf = *confidence as f32;
         adjacency
             .entry(src.clone())

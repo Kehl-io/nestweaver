@@ -1643,6 +1643,7 @@ fn derive_typed_edges(notes: &[NoteContext], lookup: &WikilinkLookup<'_>) -> Vec
             edge_type: et,
             confidence: 1.0,
             link_type: None,
+            evidence: Vec::new(),
         });
     };
 

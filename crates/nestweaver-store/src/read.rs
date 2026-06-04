@@ -20,6 +20,9 @@ pub struct SymbolBasic {
 /// Edge data for clustering: (source_uid, target_uid, confidence).
 pub type CodeEdge = (String, String, f64);
 
+/// Edge data with type and evidence: (source_uid, target_uid, edge_type, confidence, evidence_json).
+pub type TypedEdge = (String, String, String, f64, String);
+
 /// Combined symbols and edges for clustering algorithms.
 pub type CodeGraph = (Vec<SymbolBasic>, Vec<CodeEdge>);
 
@@ -1107,11 +1110,11 @@ impl GraphStore {
         Ok((symbols, edges))
     }
 
-    /// Returns all code-level edges with their type label and confidence.
+    /// Returns all code-level edges with their type label, confidence, and evidence.
     ///
-    /// Each tuple is `(source_uid, target_uid, edge_type, confidence)`.
+    /// Each tuple is `(source_uid, target_uid, edge_type, confidence, evidence)`.
     /// Used by graph-export functions that need the relationship type.
-    pub fn load_typed_edges(&self) -> Result<Vec<(String, String, String, f64)>, StoreError> {
+    pub fn load_typed_edges(&self) -> Result<Vec<TypedEdge>, StoreError> {
         let conn = self.conn()?;
 
         let edge_types = [
@@ -1124,10 +1127,11 @@ impl GraphStore {
             "MEMBER_OF",
             "INCLUDES_SYM",
         ];
-        let mut edges: Vec<(String, String, String, f64)> = Vec::new();
+        let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
-            let q =
-                format!("MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence");
+            let q = format!(
+                "MATCH (a:Symbol)-[r:{et}]->(b:Symbol) RETURN a.uid, b.uid, r.confidence, r.evidence"
+            );
             let result = match conn.query(&q) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1141,7 +1145,18 @@ impl GraphStore {
                 let src = extract_string(&row, 0)?;
                 let dst = extract_string(&row, 1)?;
                 let confidence = extract_f64(&row, 2)?;
-                edges.push((src, dst, et.to_string(), confidence));
+                let evidence = extract_string(&row, 3).unwrap_or_default();
+                edges.push((src, dst, et.to_string(), confidence, evidence));
+            }
+        }
+
+        // FILE_HAS_SYMBOL (DEFINES) edges: File → Symbol
+        let q = "MATCH (f:File)-[r:FILE_HAS_SYMBOL]->(s:Symbol) RETURN f.uid, s.uid";
+        if let Ok(result) = conn.query(q) {
+            for row in result {
+                let src = extract_string(&row, 0)?;
+                let dst = extract_string(&row, 1)?;
+                edges.push((src, dst, "DEFINES".to_string(), 1.0, String::new()));
             }
         }
 

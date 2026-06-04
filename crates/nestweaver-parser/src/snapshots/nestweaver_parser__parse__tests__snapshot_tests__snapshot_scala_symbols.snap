@@ -13,6 +13,17 @@ expression: "parsed_symbols(\"Simple.scala\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+- name: greet
+  kind: Function
+  start_line: 4
+  end_line: 4
+  signature: "def greet(name: String): String"
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
 - name: SimpleGreeter
   kind: Class
   start_line: 7
