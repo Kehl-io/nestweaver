@@ -6713,6 +6713,7 @@ fn run_brain(
                             location,
                             relevance: n.best_score as f64,
                             inline_body: None,
+                            body_complete: true,
                         });
                     }
                     for sym in &code_results {
@@ -6723,6 +6724,7 @@ fn run_brain(
                             location: format!("{}:{}", sym.file_path, sym.start_line),
                             relevance: 0.5,
                             inline_body: None,
+                            body_complete: true,
                         });
                     }
                     nestweaver_engine::apply_ranking_priors(&mut probe, ranking);

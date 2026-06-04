@@ -544,6 +544,7 @@ mod tests {
             location: format!("src/{uid}.rs:1"),
             relevance,
             inline_body: None,
+            body_complete: true,
         }
     }
 

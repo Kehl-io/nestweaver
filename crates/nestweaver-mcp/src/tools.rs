@@ -1804,6 +1804,7 @@ fn tool_brain_search(
                         .to_string(),
                     relevance: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
                     inline_body: None,
+                    body_complete: true,
                 })
             })
             .collect();
@@ -1870,6 +1871,7 @@ fn tool_brain_search(
                 location,
                 relevance: score,
                 inline_body: None,
+                body_complete: true,
             });
         }
         nestweaver_engine::apply_ranking_priors(&mut probe, &cfg.ranking);
@@ -1932,6 +1934,7 @@ fn tool_brain_search(
                     location: String::new(),
                     relevance: score,
                     inline_body: None,
+                    body_complete: true,
                 })
             })
             .collect();
