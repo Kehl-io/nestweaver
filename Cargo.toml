@@ -86,7 +86,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "6"
-signal-hook = "0.3"
+signal-hook = "0.4"
 nestweaver-daemon = { workspace = true }
 nestweaver-client = { workspace = true }
 nestweaver-proto = { workspace = true }
