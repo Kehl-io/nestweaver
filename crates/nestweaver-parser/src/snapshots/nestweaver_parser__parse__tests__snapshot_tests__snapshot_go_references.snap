@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3863
+assertion_line: 4143
 expression: "parsed_references(\"simple.go\", &source)"
 ---
 - name: fmt
@@ -52,7 +52,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: fmt
 - name: Sprintf
   kind: ReadAccess
   start_line: 18
@@ -82,7 +82,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
-  receiver: ~
+  receiver: fmt
 - name: Sprintf
   kind: ReadAccess
   start_line: 22
@@ -102,7 +102,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 26
   context: strings.TrimSpace(prefix)
-  receiver: ~
+  receiver: strings
 - name: TrimSpace
   kind: ReadAccess
   start_line: 26
@@ -117,7 +117,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 31
   context: "greeter.Greet(\"world\")"
-  receiver: ~
+  receiver: greeter
 - name: Greet
   kind: ReadAccess
   start_line: 31
@@ -127,7 +127,7 @@ expression: "parsed_references(\"simple.go\", &source)"
   kind: Call
   start_line: 32
   context: fmt.Println(result)
-  receiver: ~
+  receiver: fmt
 - name: Println
   kind: ReadAccess
   start_line: 32

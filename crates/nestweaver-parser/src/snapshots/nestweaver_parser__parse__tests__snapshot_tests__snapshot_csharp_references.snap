@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3905
+assertion_line: 4185
 expression: "parsed_references(\"Simple.cs\", &source)"
 ---
 - name: System
@@ -22,14 +22,14 @@ expression: "parsed_references(\"Simple.cs\", &source)"
   kind: Call
   start_line: 27
   context: Console.WriteLine(message);
-  receiver: ~
+  receiver: Console
 - name: Greet
   kind: Call
   start_line: 36
   context: "result = greeter.Greet(\"World\")"
-  receiver: ~
+  receiver: greeter
 - name: WriteLine
   kind: Call
   start_line: 37
   context: Console.WriteLine(result);
-  receiver: ~
+  receiver: Console

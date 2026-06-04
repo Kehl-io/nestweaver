@@ -35,7 +35,6 @@ nestweaver-storage = { path = "crates/nestweaver-storage" }
 nestweaver-engine = { path = "crates/nestweaver-engine" }
 nestweaver-mcp = { path = "crates/nestweaver-mcp" }
 nestweaver-web = { path = "crates/nestweaver-web" }
-nestweaver-wasm = { path = "crates/nestweaver-wasm" }
 nestweaver-proto = { path = "crates/nestweaver-proto" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }

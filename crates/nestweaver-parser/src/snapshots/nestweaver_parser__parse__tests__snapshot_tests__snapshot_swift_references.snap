@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3989
+assertion_line: 4210
 expression: "parsed_references(\"simple.swift\", &source)"
 ---
 - name: Foundation
@@ -22,6 +22,11 @@ expression: "parsed_references(\"simple.swift\", &source)"
   kind: Call
   start_line: 29
   context: let config = AppConfig()
+  receiver: ~
+- name: greet
+  kind: Call
+  start_line: 30
+  context: "let result = greeter.greet(name: config.defaultName)"
   receiver: ~
 - name: print
   kind: Call

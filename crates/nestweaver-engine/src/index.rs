@@ -937,6 +937,7 @@ fn index_into_store(
                             edge_type: EdgeType::MemberOf,
                             confidence: 1.0,
                             link_type: None,
+                            evidence: Vec::new(),
                         });
                     }
                 }
@@ -1083,6 +1084,7 @@ fn derive_contracts(
                     edge_type: EdgeType::ImplementsContract,
                     confidence: m.confidence,
                     link_type: None,
+                    evidence: Vec::new(),
                 });
             }
         }
@@ -2192,7 +2194,7 @@ impl Counter {
         let all_edges = store.load_typed_edges().unwrap();
         let member_of: Vec<_> = all_edges
             .iter()
-            .filter(|(_, _, edge_type, _)| edge_type == "MEMBER_OF")
+            .filter(|(_, _, edge_type, _, _)| edge_type == "MEMBER_OF")
             .collect();
 
         assert!(
