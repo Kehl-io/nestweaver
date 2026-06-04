@@ -43,7 +43,7 @@ jobs:
           cargo build -p nestweaver-store 2>/dev/null || true
           sleep 2
           cargo build
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Tests
