@@ -64,10 +64,28 @@ pub struct BundleEntry {
     /// inlined in the initial map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_body: Option<String>,
+    /// Bug H — fidelity signal for `inline_body`. `true` when the inlined
+    /// body contains the full source, `false` when the per-body cap forced
+    /// truncation. Default `true`; skipped from JSON when `true` so existing
+    /// consumers see unchanged output and only learn about the field when it
+    /// flags a truncated body. Reliable on entries produced by
+    /// `investigate_expand` and `investigate_hydrate`; best-effort on the
+    /// initial `investigate` map (propagated from BrainNode.body_complete).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub body_complete: bool,
     /// Whether the entry has been expanded (full body + neighbors fetched).
     #[serde(default)]
     pub expanded: bool,
     pub relevance: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// A persisted investigation bundle.
@@ -286,6 +304,7 @@ pub fn investigate(
             location: node.location.clone(),
             summary,
             inline_body: node.inline_body.clone(),
+            body_complete: node.body_complete,
             expanded: false,
             relevance: node.relevance,
         };
@@ -363,13 +382,16 @@ pub fn investigate_expand(
         let asset_id = bundle.entries[idx].asset_id.clone();
 
         if let Some(body) = fetch_full_body(store, &uid, root) {
-            bundle.entries[idx].inline_body = Some(body.clone());
+            // Bug H: `investigate_expand` stores the full body without
+            // truncation, so the entry is unconditionally body-complete.
             if bundle.entries[idx].summary.is_none() {
                 let s = summarize(&body);
                 if !s.is_empty() {
                     bundle.entries[idx].summary = Some(s);
                 }
             }
+            bundle.entries[idx].inline_body = Some(body);
+            bundle.entries[idx].body_complete = true;
         }
         bundle.entries[idx].expanded = true;
         neighbors.extend(fetch_neighbors(store, &uid, &asset_id));
@@ -410,16 +432,18 @@ pub fn investigate_hydrate(
         if entry.inline_body.is_some() {
             continue;
         }
-        let Some(mut body) = fetch_full_body(store, &entry.uid, root) else {
+        let Some(body) = fetch_full_body(store, &entry.uid, root) else {
             continue;
         };
         if body.is_empty() {
             continue;
         }
         let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
-        if body.chars().count() > max_chars {
-            body = body.chars().take(max_chars).collect();
-        }
+        // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
+        // `complete` flag is propagated to BundleEntry.body_complete so
+        // consumers can decide whether to fall back to `read_symbols` for the
+        // full source.
+        let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
         let cost = body.len().div_ceil(4);
         if hydrated > 0 && used_tokens + cost > budget {
             break;
@@ -432,6 +456,7 @@ pub fn investigate_hydrate(
             }
         }
         entry.inline_body = Some(body);
+        entry.body_complete = complete;
         hydrated += 1;
     }
 
@@ -844,6 +869,72 @@ mod tests {
         );
         if missing_before > 0 {
             assert!(hydrated.hydrated >= 1, "should hydrate at least one body");
+        }
+    }
+
+    #[test]
+    fn truncate_body_to_chars_prefers_last_newline() {
+        // Body under the cap is returned unchanged with body_complete = true.
+        let (out, complete) = crate::query::truncate_body_to_chars("short body".to_string(), 100);
+        assert_eq!(out, "short body");
+        assert!(complete);
+
+        // Multi-line body over the cap: truncation walks back to the last
+        // newline so we never split a statement mid-line. body_complete is
+        // false so consumers know to fall back to read_symbols for the rest.
+        let body = "line 1\nline 2\nline 3 is long and will get cut".to_string();
+        let (out, complete) = crate::query::truncate_body_to_chars(body, 20);
+        assert!(!complete);
+        assert!(
+            out.ends_with("line 2"),
+            "truncated body should end at the last newline within the cap, got: {out:?}"
+        );
+        assert!(!out.contains("will get cut"));
+
+        // No newline within the cap → falls back to char-truncate.
+        let (out, complete) =
+            crate::query::truncate_body_to_chars("aaaaaaaaaaaaaaaaaaaaaaaa".to_string(), 10);
+        assert!(!complete);
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn investigate_hydrate_marks_truncated_body_incomplete() {
+        // Build a synthetic bundle with one entry whose body exceeds the
+        // INLINE_MAX_BODY_TOKENS * 4 cap, then verify hydrate populates the
+        // body and sets body_complete = false.
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            Some(50),
+        )
+        .unwrap();
+
+        let hydrated =
+            investigate_hydrate(&store, &db_path, &src, &result.bundle_id, Some(4000)).unwrap();
+        // Every hydrated entry must have an inline_body and a body_complete
+        // value that reflects whether truncation actually happened (i.e. the
+        // flag is `false` iff char count == the cap).
+        let cap = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
+        for e in hydrated.entries.iter().filter(|e| e.inline_body.is_some()) {
+            let len = e.inline_body.as_deref().map(|b| b.chars().count()).unwrap();
+            assert!(
+                len <= cap,
+                "hydrated body must respect the per-body cap (cap={cap}, got={len})"
+            );
+            if e.body_complete {
+                assert!(
+                    len < cap,
+                    "body_complete=true means the body fit under the cap"
+                );
+            }
         }
     }
 
