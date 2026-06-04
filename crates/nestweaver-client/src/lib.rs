@@ -27,8 +27,8 @@ impl DaemonClient {
     /// After connecting, performs a version check. If the running daemon's
     /// version doesn't match this binary's version, it stops the old daemon
     /// and restarts with the current binary.
-    pub async fn connect(db_path: &Path) -> Result<Self> {
-        let sock_path = autostart::ensure_daemon(db_path)?;
+    pub async fn connect(db_path: &Path, config_path: Option<&Path>) -> Result<Self> {
+        let sock_path = autostart::ensure_daemon(db_path, config_path)?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
 
         // Version check.
@@ -51,7 +51,7 @@ impl DaemonClient {
             Self::stop_old_daemon(db_path)?;
 
             // Re-start and reconnect.
-            let sock_path = autostart::ensure_daemon(db_path)?;
+            let sock_path = autostart::ensure_daemon(db_path, config_path)?;
             client = Self::connect_to_socket(&sock_path).await?;
 
             info!("reconnected after daemon restart");
