@@ -771,6 +771,8 @@ For token-efficient overviews, use `get_summary` at file or cluster level instea
 When working on a named project, use `project_context`.\n\n\
 After making changes, use `detect_changes` to assess risk.\n\n\
 To find cleanup opportunities, use `dead_code` to detect unreachable symbols.\n\n\
+For deep-dive exploration, use `investigate` → `investigate_hydrate` → `read_symbols` (only where `body_complete` is false). This progressive disclosure pattern avoids reading every file upfront.\n\n\
+Prefer `brain_search` over `brain_context` when locating symbols or notes by name — it returns both notes and code symbols in one call.\n\n\
 If using many MCP servers, pass `--tools` to the NestWeaver server to allowlist only the tools you need.\n".to_string()
 }
 
