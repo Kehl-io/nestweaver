@@ -4749,7 +4749,7 @@ class UserService {
         for (name, lang, query_src) in languages {
             match tree_sitter::Query::new(&lang, query_src) {
                 Ok(q) => {
-                    assert!(q.capture_names().len() > 0, "{name}: no captures");
+                    assert!(!q.capture_names().is_empty(), "{name}: no captures");
                 }
                 Err(e) => panic!("{name} type query failed to compile: {e}"),
             }

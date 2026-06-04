@@ -299,6 +299,7 @@ mod tests {
             edge_type: EdgeType::Calls,
             confidence: 0.9,
             link_type: None,
+            evidence: vec![],
         }
     }
 
