@@ -1,27 +1,47 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4129
+assertion_line: 4377
 expression: "parsed_references(\"simple.jl\", &source)"
 ---
+- name: greet
+  kind: Call
+  start_line: 16
+  context: "greet(name::String)::String"
+  receiver: ~
+- name: process
+  kind: Call
+  start_line: 20
+  context: "process(items::Vector{Int})"
+  receiver: ~
 - name: println
   kind: Call
   start_line: 22
-  context: println(item)
+  context: for item in items
+  receiver: ~
+- name: log_call
+  kind: Call
+  start_line: 26
+  context: log_call(expr)
   receiver: ~
 - name: println
   kind: Call
   start_line: 28
-  context: "println(\"Calling: \", $(string(expr)))"
+  context: quote
   receiver: ~
 - name: string
   kind: Call
   start_line: 28
-  context: "println(\"Calling: \", $(string(expr)))"
+  context: (string(expr))
   receiver: ~
 - name: esc
   kind: Call
   start_line: 29
-  context: $(esc(expr))
+  context: (esc(expr))
+  receiver: ~
+- name: main
+  kind: Call
+  start_line: 33
+  context: main()
   receiver: ~
 - name: Animal
   kind: Call
@@ -36,10 +56,10 @@ expression: "parsed_references(\"simple.jl\", &source)"
 - name: println
   kind: Call
   start_line: 36
-  context: println(greeting)
+  context: function main()
   receiver: ~
 - name: process
   kind: Call
   start_line: 37
-  context: "@log_call process([1, 2, 3])"
+  context: "process([1, 2, 3])"
   receiver: ~

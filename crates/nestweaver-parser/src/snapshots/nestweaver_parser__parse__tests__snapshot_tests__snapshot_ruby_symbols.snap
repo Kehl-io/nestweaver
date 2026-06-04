@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 4302
 expression: "parsed_symbols(\"simple.rb\", &source)"
 ---
 - name: Greetings
@@ -10,7 +11,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: Greeter
@@ -21,7 +22,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: greet
@@ -32,7 +33,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: format_name
@@ -43,7 +44,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: FormalGreeter
@@ -54,7 +55,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: greet
@@ -65,7 +66,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~
 - name: standalone_function
@@ -76,6 +77,6 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Inferred
+  visibility: Public
   type_info: ~
   parent_name: ~

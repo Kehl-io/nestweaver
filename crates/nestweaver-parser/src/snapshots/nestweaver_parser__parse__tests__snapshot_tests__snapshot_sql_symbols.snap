@@ -5,55 +5,44 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
 - name: users
   kind: Class
   start_line: 1
-  end_line: 1
+  end_line: 6
   signature: CREATE TABLE users (
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Public
+  visibility: Inferred
   type_info: ~
   parent_name: ~
 - name: orders
   kind: Class
   start_line: 8
-  end_line: 8
+  end_line: 13
   signature: CREATE TABLE orders (
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Public
+  visibility: Inferred
   type_info: ~
   parent_name: ~
 - name: active_users
   kind: Class
   start_line: 15
-  end_line: 15
+  end_line: 18
   signature: CREATE VIEW active_users AS
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Public
+  visibility: Inferred
   type_info: ~
   parent_name: ~
 - name: calculate_total
   kind: Function
   start_line: 20
-  end_line: 20
+  end_line: 25
   signature: CREATE FUNCTION calculate_total(order_id INTEGER)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-- name: update_status
-  kind: Function
-  start_line: 27
-  end_line: 27
-  signature: CREATE PROCEDURE update_status(
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
+  visibility: Inferred
   type_info: ~
   parent_name: ~

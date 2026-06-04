@@ -107,15 +107,27 @@ pub fn export_cypher(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Resu
     let typed_edges = store
         .load_typed_edges()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for (src, dst, edge_type, confidence) in &typed_edges {
-        writeln!(
-            writer,
-            "MATCH (a {{uid: {}}}), (b {{uid: {}}}) CREATE (a)-[:{} {{confidence: {:.4}}}]->(b);",
-            cypher_escape(src),
-            cypher_escape(dst),
-            cypher_edge_label(edge_type),
-            confidence,
-        )?;
+    for (src, dst, edge_type, confidence, evidence) in &typed_edges {
+        if evidence.is_empty() {
+            writeln!(
+                writer,
+                "MATCH (a {{uid: {}}}), (b {{uid: {}}}) CREATE (a)-[:{} {{confidence: {:.4}}}]->(b);",
+                cypher_escape(src),
+                cypher_escape(dst),
+                cypher_edge_label(edge_type),
+                confidence,
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "MATCH (a {{uid: {}}}), (b {{uid: {}}}) CREATE (a)-[:{} {{confidence: {:.4}, evidence: {}}}]->(b);",
+                cypher_escape(src),
+                cypher_escape(dst),
+                cypher_edge_label(edge_type),
+                confidence,
+                cypher_escape(evidence),
+            )?;
+        }
     }
 
     Ok(())
@@ -243,7 +255,7 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
     let typed_edges = store
         .load_typed_edges()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for (idx, (src, dst, edge_type, confidence)) in typed_edges.iter().enumerate() {
+    for (idx, (src, dst, edge_type, confidence, _evidence)) in typed_edges.iter().enumerate() {
         writeln!(
             writer,
             r#"    <edge id="e{}" source="{}" target="{}">
@@ -351,7 +363,7 @@ pub fn export_mermaid(
     let typed_edges = store
         .load_typed_edges()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for (src, dst, _edge_type, _confidence) in &typed_edges {
+    for (src, dst, _edge_type, _confidence, _evidence) in &typed_edges {
         if included.contains(src.as_str()) && included.contains(dst.as_str()) {
             writeln!(writer, "  {} --> {}", mermaid_id(src), mermaid_id(dst))?;
         }
