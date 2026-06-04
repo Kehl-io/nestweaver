@@ -438,6 +438,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .expect("insert edge");
 
@@ -504,6 +505,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.9,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -515,6 +517,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.8,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -573,6 +576,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.3,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
@@ -584,6 +588,7 @@ mod tests {
                 edge_type: EdgeType::Calls,
                 confidence: 0.2,
                 link_type: None,
+                evidence: vec![],
             })
             .unwrap();
 
