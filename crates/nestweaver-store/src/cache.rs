@@ -46,8 +46,8 @@ pub const TTL_SECS: f64 = 24.0 * 60.0 * 60.0;
 /// Default LRU size cap when no `[cache] max_size_mb` is configured.
 pub const DEFAULT_MAX_SIZE_MB: u64 = 256;
 
-/// ZSTD compression level. Level 3 is the default speed/ratio trade-off.
-const ZSTD_LEVEL: i32 = 3;
+/// Flate2 compression level (6 = default speed/ratio trade-off).
+const FLATE_LEVEL: u32 = 6;
 
 /// One cached tool response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +56,7 @@ pub struct CacheEntry {
     pub key_hash: u64,
     /// The tool that produced this response (for diagnostics + per-tool stats).
     pub tool: String,
-    /// ZSTD-compressed response bytes (the serialized JSON result).
+    /// Deflate-compressed response bytes (the serialized JSON result).
     pub response: Vec<u8>,
     /// Unix epoch seconds when the entry was written.
     pub created_at: f64,
@@ -160,11 +160,17 @@ impl ResponseCache {
             return None;
         }
         entry.last_access = now;
-        zstd::decode_all(entry.response.as_slice()).ok()
+        {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+            let mut decoder = DeflateDecoder::new(entry.response.as_slice());
+            let mut buf = Vec::new();
+            decoder.read_to_end(&mut buf).ok().map(|_| buf)
+        }
     }
 
     /// Insert (or replace) a response for `key`. `response` is the raw
-    /// (uncompressed) JSON bytes; it is ZSTD-compressed at level 3 before
+    /// (uncompressed) JSON bytes; it is deflate-compressed before
     /// storage. After insertion the cache is trimmed to its size cap via LRU.
     pub fn insert(
         &mut self,
@@ -174,11 +180,21 @@ impl ResponseCache {
         generation: u64,
         scope_digest: u64,
     ) {
-        let compressed = match zstd::encode_all(response, ZSTD_LEVEL) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("response cache: zstd compress failed: {e}");
+        let compressed = {
+            use flate2::Compression;
+            use flate2::write::DeflateEncoder;
+            use std::io::Write;
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(FLATE_LEVEL));
+            if encoder.write_all(response).is_err() {
+                tracing::warn!("response cache: deflate compress failed");
                 return;
+            }
+            match encoder.finish() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("response cache: deflate finish failed: {e}");
+                    return;
+                }
             }
         };
         let now = now_secs();
