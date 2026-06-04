@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 /// Acquires an exclusive flock on the pidfile, checks whether a live daemon
 /// already exists, and spawns one if not. Uses exponential-backoff polling
 /// to wait for the socket to appear.
-pub fn ensure_daemon(db_path: &Path) -> Result<PathBuf> {
+pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let rt_dir = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
     let sock = nestweaver_daemon::lifecycle::socket_path(&instance_id);
@@ -74,7 +74,7 @@ pub fn ensure_daemon(db_path: &Path) -> Result<PathBuf> {
     drop(file);
 
     // Spawn the daemon as a detached child.
-    spawn_daemon(db_path)?;
+    spawn_daemon(db_path, config_path)?;
 
     // Poll for socket to appear.
     wait_for_socket(&sock)?;
@@ -103,17 +103,18 @@ pub fn is_process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Spawn `nestweaver daemon --db <path> start` as a detached child.
-fn spawn_daemon(db_path: &Path) -> Result<()> {
+/// Spawn `nestweaver daemon --db <path> start [--config <path>]` as a detached child.
+fn spawn_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
-    std::process::Command::new(&exe)
-        .args(["daemon", "--db"])
-        .arg(db_path)
-        .arg("start")
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

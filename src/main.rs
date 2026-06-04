@@ -3804,7 +3804,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
                 let daemon_client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(&db_path))
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
                     .context("connect to daemon")?;
                 let grpc_client = daemon_client.into_inner();
                 nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
@@ -4687,7 +4687,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Restart daemon if we stopped it
             if daemon_was_running && !cli.no_daemon {
                 eprintln!("Restarting daemon...");
-                let _ = nestweaver_client::autostart::ensure_daemon(&db_path);
+                let _ =
+                    nestweaver_client::autostart::ensure_daemon(&db_path, Some(config.as_path()));
             }
 
             Ok((EXIT_SUCCESS, None))
@@ -4739,7 +4740,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
 
                 let req = nestweaver_proto::IndexRepoRequest {
                     repo_path: repo_path.display().to_string(),
@@ -5865,7 +5869,8 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6201,7 +6206,10 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
                 let req = nestweaver_proto::WatchVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6399,7 +6407,8 @@ fn run_brain(
             if use_daemon && since.is_none() {
                 // Route full refresh through daemon's IndexVault RPC
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6581,7 +6590,10 @@ fn run_brain(
             // direct-disk implementation below when `--no-daemon` is set,
             // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path));
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ));
                 if let Ok(mut client) = connect {
                     let req = nestweaver_proto::BrainSearchRequest {
                         query: raw_query.clone(),
