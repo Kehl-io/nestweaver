@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
-lbug = "0.16.1"
+lbug = "0.17.1"
 tantivy = "0.26"
 regex = "1.12"
 regex-syntax = "0.8"
