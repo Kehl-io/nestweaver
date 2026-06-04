@@ -101,7 +101,7 @@ pub struct BrainWatcher {
     ignore_set: GlobSet,
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
-    external_tantivy: Option<TantivyIndex>,
+    external_tantivy: Option<Arc<TantivyIndex>>,
 }
 
 impl BrainWatcher {
@@ -153,7 +153,7 @@ impl BrainWatcher {
     /// Use a pre-opened TantivyIndex instead of opening one from
     /// `tantivy_path`. Used when the daemon spawns the watcher and
     /// already holds the Tantivy writer.
-    pub fn with_external_tantivy(mut self, tantivy: TantivyIndex) -> Self {
+    pub fn with_external_tantivy(mut self, tantivy: Arc<TantivyIndex>) -> Self {
         self.external_tantivy = Some(tantivy);
         self
     }
@@ -215,12 +215,12 @@ impl BrainWatcher {
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
         // Use external Tantivy if provided (daemon mode), otherwise open from path.
-        let tantivy: Option<TantivyIndex> = if let Some(ext) = self.external_tantivy.take() {
+        let tantivy: Option<Arc<TantivyIndex>> = if let Some(ext) = self.external_tantivy.take() {
             Some(ext)
         } else {
             match &self.tantivy_path {
                 Some(p) => match TantivyIndex::open_or_create(p) {
-                    Ok(idx) => Some(idx),
+                    Ok(idx) => Some(Arc::new(idx)),
                     Err(e) => {
                         tracing::warn!(
                             path = %p.display(),
@@ -335,7 +335,7 @@ impl BrainWatcher {
             for event in batch {
                 match self.handle_event(
                     &store,
-                    tantivy.as_ref(),
+                    tantivy.as_deref(),
                     &v_uid,
                     event,
                     symbol_index.as_ref(),

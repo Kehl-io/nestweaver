@@ -23,7 +23,7 @@ use crate::lifecycle;
 /// Shared state held by the daemon process.
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
-    pub tantivy: Option<TantivyIndex>,
+    pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_id: String,
     pub start_time: Instant,
@@ -31,6 +31,10 @@ pub struct DaemonState {
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
+    /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
+    /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
+    /// `brain_search`) via the `set_current_instance_config` thread-local.
+    pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -68,10 +72,11 @@ impl DaemonService {
 
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
+            nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store,
-                state.tantivy.as_ref(),
+                state.tantivy.as_deref(),
                 &tool_name,
                 args,
             )
@@ -110,9 +115,15 @@ impl DaemonService {
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
+            nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
-            nestweaver_mcp::tools::dispatch(&state.store, state.tantivy.as_ref(), &tool_name, args)
-                .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
+            nestweaver_mcp::tools::dispatch(
+                &state.store,
+                state.tantivy.as_deref(),
+                &tool_name,
+                args,
+            )
+            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
@@ -214,15 +225,14 @@ impl NestWeaverDaemon for DaemonService {
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns);
 
-        if self.state.tantivy.as_ref().is_some_and(|t| t.has_writer()) {
-            // Open a reader-only handle for the watcher — the daemon's
-            // writer handle owns the lock, so open_or_create would fail.
-            // The watcher uses this for search queries; writes go through
-            // the daemon's writer via the shared store.
-            match TantivyIndex::open_reader_only(&tantivy_path) {
-                Ok(idx) => watcher = watcher.with_external_tantivy(idx),
-                Err(_) => watcher = watcher.with_tantivy_index(&tantivy_path),
-            }
+        // Share the daemon's writer-mode Tantivy handle with the watcher
+        // so live edits update BM25 in place. Opening a separate handle
+        // (reader-only or read-write) would either silently no-op writes
+        // or collide on the writer lock.
+        if let Some(ref tantivy) = self.state.tantivy
+            && tantivy.has_writer()
+        {
+            watcher = watcher.with_external_tantivy(Arc::clone(tantivy));
         } else {
             watcher = watcher.with_tantivy_index(&tantivy_path);
         }
@@ -580,11 +590,22 @@ impl NestWeaverDaemon for DaemonService {
             })
             .unwrap_or_default();
 
+        let expansion_terms = value
+            .get("expansion_terms")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Response::new(BrainSearchResponse {
             query: query_echo,
             engine,
             total_matches,
             results,
+            expansion_terms,
         }))
     }
 
@@ -982,6 +1003,7 @@ impl NestWeaverDaemon for DaemonService {
 pub async fn run_server(
     db_path: &Path,
     idle_timeout: Option<Duration>,
+    config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
     // The DB will be created by GraphStore::open_or_create below.
@@ -1056,7 +1078,7 @@ pub async fn run_server(
                 path = %tantivy_path.display(),
                 "Tantivy index open (read-write)"
             );
-            Some(idx)
+            Some(Arc::new(idx))
         }
         Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
             Ok(idx) => {
@@ -1065,7 +1087,7 @@ pub async fn run_server(
                     path = %tantivy_path.display(),
                     "Tantivy index open (reader-only fallback)"
                 );
-                Some(idx)
+                Some(Arc::new(idx))
             }
             Err(e) => {
                 tracing::warn!(
@@ -1080,6 +1102,29 @@ pub async fn run_server(
     let idle_notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Load the InstanceConfig once at start if `--config` was supplied so
+    // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
+    // it without re-parsing the file per RPC. A missing/unreadable file is
+    // logged but non-fatal — the daemon still serves with built-in defaults.
+    let instance_cfg =
+        config_path.and_then(|p| match nestweaver_engine::InstanceConfig::from_file(p) {
+            Ok(c) => {
+                tracing::info!(
+                    config = %p.display(),
+                    "loaded instance config (ranking, response, features)"
+                );
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    config = %p.display(),
+                    error = %e,
+                    "failed to load instance config — ranking/response settings will use defaults"
+                );
+                None
+            }
+        });
+
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
         tantivy,
@@ -1090,6 +1135,7 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
+        instance_cfg,
     });
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))

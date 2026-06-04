@@ -1269,6 +1269,12 @@ enum DaemonAction {
         /// Idle timeout in seconds
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
+        /// Optional path to `nestweaver-instance.toml`. When supplied, the
+        /// daemon loads `[ranking]`, `[response]`, and other instance settings
+        /// once at startup so RPCs (e.g. `brain_search`) apply them with
+        /// parity to the direct-disk CLI path.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Stop the running daemon
     Stop,
@@ -1278,6 +1284,11 @@ enum DaemonAction {
     Restart {
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
+        /// Optional path to `nestweaver-instance.toml`, forwarded to the
+        /// `daemon start` invocation so restarts preserve F6 `[ranking]`
+        /// priors and other instance settings.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -3793,7 +3804,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
                 let daemon_client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(&db_path))
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
                     .context("connect to daemon")?;
                 let grpc_client = daemon_client.into_inner();
                 nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
@@ -4676,7 +4687,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Restart daemon if we stopped it
             if daemon_was_running && !cli.no_daemon {
                 eprintln!("Restarting daemon...");
-                let _ = nestweaver_client::autostart::ensure_daemon(&db_path);
+                let _ =
+                    nestweaver_client::autostart::ensure_daemon(&db_path, Some(config.as_path()));
             }
 
             Ok((EXIT_SUCCESS, None))
@@ -4728,7 +4740,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
 
                 let req = nestweaver_proto::IndexRepoRequest {
                     repo_path: repo_path.display().to_string(),
@@ -4927,25 +4942,62 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let log_file = nestweaver_daemon::log_path(&instance_id);
 
             match action {
-                DaemonAction::Start { idle_timeout } => {
-                    // Check if already running.
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                            let alive = unsafe { libc::kill(pid, 0) } == 0;
-                            if alive {
-                                eprintln!("Daemon already running (PID {pid}).");
-                                return Ok((EXIT_SUCCESS, None));
-                            }
-                        }
-                        // Stale pidfile — remove it.
-                        let _ = std::fs::remove_file(&pidfile);
-                    }
-
+                DaemonAction::Start {
+                    idle_timeout,
+                    config,
+                } => {
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
+
+                    // Atomically detect another running or starting daemon via
+                    // a non-blocking exclusive flock on the pidfile. daemonize2
+                    // holds LOCK_EX on the pidfile for the daemon's entire
+                    // lifetime (see autostart.rs for the matching consumer),
+                    // so a successful flock here proves no daemon owns it.
+                    //
+                    // This replaces a previous `kill(pid, 0)` check that had a
+                    // TOCTOU window: two concurrent `daemon start` invocations
+                    // (e.g. from `launchctl kickstart -k` or rapid respawn)
+                    // could both pass the kill check and race for the DB write
+                    // lock, with the loser dying with "Could not set lock on
+                    // file ... another process may hold the write lock".
+                    use std::os::unix::io::AsRawFd;
+                    let pid_lock = std::fs::OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&pidfile)
+                        .with_context(|| format!("open pidfile: {}", pidfile.display()))?;
+                    let pid_lock_fd = pid_lock.as_raw_fd();
+                    let lock_ret =
+                        unsafe { libc::flock(pid_lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+                    if lock_ret != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+                            let pid_trimmed = pid_text.trim();
+                            if pid_trimmed.is_empty() {
+                                eprintln!("Daemon already running (starting up).");
+                            } else {
+                                eprintln!("Daemon already running (PID {pid_trimmed}).");
+                            }
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        anyhow::bail!("flock on pidfile failed: {err}");
+                    }
+
+                    // We hold the lock — no other daemon is running or
+                    // starting. Any PID in the file is stale; daemonize2 will
+                    // overwrite it after the double-fork.
+                    // Release the flock immediately before daemonize2's
+                    // start() so it can acquire its own lock on the same
+                    // pidfile; the race window between release and reacquire
+                    // is microseconds, far smaller than the prior TOCTOU
+                    // window of the kill(pid, 0) check.
 
                     let stdout_file = std::fs::OpenOptions::new()
                         .create(true)
@@ -4974,6 +5026,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .stderr(stderr_file)
                         .working_directory(".");
 
+                    unsafe { libc::flock(pid_lock_fd, libc::LOCK_UN) };
+                    drop(pid_lock);
+
                     match unsafe { daemonize.start() } {
                         Ok(()) => {
                             // We are now the daemon process.
@@ -4984,8 +5039,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             };
                             let rt = tokio::runtime::Runtime::new()
                                 .expect("failed to create tokio runtime");
+                            let config_path = config.clone();
                             rt.block_on(async {
-                                if let Err(e) = nestweaver_daemon::run_server(&db_path, idle).await
+                                if let Err(e) = nestweaver_daemon::run_server(
+                                    &db_path,
+                                    idle,
+                                    config_path.as_deref(),
+                                )
+                                .await
                                 {
                                     eprintln!("Daemon error: {e:#}");
                                     std::process::exit(1);
@@ -5050,7 +5111,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
 
-                DaemonAction::Restart { idle_timeout } => {
+                DaemonAction::Restart {
+                    idle_timeout,
+                    config,
+                } => {
                     // Stop if running.
                     if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
                         && let Ok(pid) = pid_str.trim().parse::<i32>()
@@ -5076,15 +5140,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // Re-exec ourselves to start the daemon fresh.
                     let exe =
                         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let mut start_args: Vec<String> = vec![
+                        "daemon".to_string(),
+                        "--db".to_string(),
+                        db_path.display().to_string(),
+                        "start".to_string(),
+                        "--idle-timeout".to_string(),
+                        idle_timeout.to_string(),
+                    ];
+                    if let Some(cfg) = config.as_deref() {
+                        start_args.push("--config".to_string());
+                        start_args.push(cfg.display().to_string());
+                    }
                     let status = std::process::Command::new(&exe)
-                        .args([
-                            "daemon",
-                            "--db",
-                            &db_path.display().to_string(),
-                            "start",
-                            "--idle-timeout",
-                            &idle_timeout.to_string(),
-                        ])
+                        .args(&start_args)
                         .status()
                         .with_context(|| "failed to restart daemon")?;
                     if !status.success() {
@@ -5800,7 +5869,8 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6136,7 +6206,10 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
                 let req = nestweaver_proto::WatchVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6188,7 +6261,24 @@ fn run_brain(
                 let stop_req = nestweaver_proto::StopWatchRequest {};
                 if let Err(e) = rt.block_on(async { client.inner_mut().stop_watch(stop_req).await })
                 {
-                    eprintln!("Warning: failed to stop watcher: {e}");
+                    // The watcher thread lives inside the daemon, so when the
+                    // daemon process is gone the watcher has already stopped
+                    // with it - nothing for us to clean up, nothing to warn
+                    // about. Two error shapes indicate "daemon gone":
+                    //   - `Unavailable`: connect failed (socket file removed,
+                    //     or "Connection refused" on a stale socket).
+                    //   - `Unknown` with a tonic transport error: the
+                    //     connection was open when the RPC started but was
+                    //     abruptly closed mid-call (e.g. daemon SIGKILLed).
+                    // Without this filter, `KeepAlive=true` on the watch
+                    // plist turns every daemon restart into a perpetual
+                    // "failed to stop watcher" loop in the watch error log.
+                    let daemon_gone = matches!(e.code(), tonic::Code::Unavailable)
+                        || (matches!(e.code(), tonic::Code::Unknown)
+                            && e.message().contains("transport error"));
+                    if !daemon_gone {
+                        eprintln!("Warning: failed to stop watcher: {e}");
+                    }
                 }
                 out.status("Watcher stopped.");
                 return Ok((EXIT_SUCCESS, None));
@@ -6317,7 +6407,8 @@ fn run_brain(
             if use_daemon && since.is_none() {
                 // Route full refresh through daemon's IndexVault RPC
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path))?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
@@ -6490,6 +6581,58 @@ fn run_brain(
             prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            // Route through the daemon's typed `Search` RPC when running. The
+            // daemon owns the writer-mode Tantivy index and shares dispatch
+            // with the MCP server (`tool_brain_search`), so daemon-routed
+            // searches eliminate the "Database is locked" reader fallback
+            // and stay in sync with live re-indexing. Falls through to the
+            // direct-disk implementation below when `--no-daemon` is set,
+            // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ));
+                if let Ok(mut client) = connect {
+                    let req = nestweaver_proto::BrainSearchRequest {
+                        query: raw_query.clone(),
+                        limit: limit as i32,
+                        response_format: String::new(),
+                        include_bodies: false,
+                        prf,
+                        rerank: false,
+                        root: String::new(),
+                    };
+                    let rpc = rt.block_on(async {
+                        client.inner_mut().search(req).await.map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            render_brain_search_response(&resp, json)?;
+                            let stats = format!(
+                                "{} results in {} (via daemon)",
+                                resp.results.len(),
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
+                        }
+                        Err(status) => {
+                            // Surface a single eprintln, then fall through to
+                            // the direct-disk path so the user still gets a
+                            // result.
+                            eprintln!(
+                                "warning: daemon search RPC failed ({}); falling back to direct DB read",
+                                status.message()
+                            );
+                        }
+                    }
+                }
+                // Connect failed → silently fall through (daemon may not be
+                // running for this DB; the direct-disk path is the legacy
+                // behavior and remains correct).
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -6582,6 +6725,7 @@ fn run_brain(
                             location,
                             relevance: n.best_score as f64,
                             inline_body: None,
+                            body_complete: true,
                         });
                     }
                     for sym in &code_results {
@@ -6592,6 +6736,7 @@ fn run_brain(
                             location: format!("{}:{}", sym.file_path, sym.start_line),
                             relevance: 0.5,
                             inline_body: None,
+                            body_complete: true,
                         });
                     }
                     nestweaver_engine::apply_ranking_priors(&mut probe, ranking);
@@ -6635,13 +6780,17 @@ fn run_brain(
                         "location": format!("{}:{}", sym.file_path, sym.start_line),
                     }));
                 }
-                // Sort by score descending and truncate.
+                // Sort by score descending. `limit` is interpreted per-kind
+                // (each of notes/symbols is already capped upstream); a
+                // cross-kind truncate here would evict every symbol whenever
+                // ≥ `limit` notes match because symbols carry a fixed 0.5
+                // score while BM25 notes score 15+. Mirrors the daemon-side
+                // `tool_brain_search` semantics.
                 results.sort_by(|a, b| {
                     let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                results.truncate(limit);
                 let mut payload = serde_json::json!({
                     "query": query,
                     "engine": engine,
@@ -7387,6 +7536,91 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
             }
         }
     }
+}
+
+/// Render a daemon-routed `BrainSearchResponse` in the same shape as the
+/// direct-disk `brain search` handler. The daemon merges note + symbol
+/// results into a single `results` array, distinguished by `kind`
+/// (`"note"` vs `"Symbol/<Kind>"`); text mode splits them back out so the
+/// per-row format matches the legacy output.
+fn render_brain_search_response(
+    resp: &nestweaver_proto::BrainSearchResponse,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
+        for item in &resp.results {
+            let mut v = serde_json::json!({
+                "uid": item.uid,
+                "kind": item.kind,
+                "title": item.title,
+                "score": item.score,
+            });
+            if !item.location.is_empty() {
+                v["location"] = serde_json::json!(item.location);
+            }
+            if !item.matched_headings.is_empty() {
+                v["matched_headings"] = serde_json::json!(item.matched_headings);
+            }
+            if !item.inline_body.is_empty() {
+                v["inline_body"] = serde_json::json!(item.inline_body);
+            }
+            results.push(v);
+        }
+        let mut payload = serde_json::json!({
+            "query": resp.query,
+            "engine": resp.engine,
+            "results": results,
+            "total_matches": resp.total_matches,
+        });
+        if !resp.expansion_terms.is_empty() {
+            payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if resp.results.is_empty() {
+        println!("No results for '{}'.", resp.query);
+        return Ok(());
+    }
+
+    let header = if resp.engine == "bm25" {
+        "Brain search (BM25)"
+    } else {
+        "Brain search (substring fallback)"
+    };
+    println!("{}: {} result(s)", header, resp.results.len());
+    if !resp.expansion_terms.is_empty() {
+        println!("  PRF expansion terms: {}", resp.expansion_terms.join(", "));
+    }
+    println!();
+    for item in &resp.results {
+        if item.kind == "note" {
+            if item.matched_headings.is_empty() {
+                println!("  [{:.2}] {}", item.score, item.title);
+            } else {
+                println!(
+                    "  [{:.2}] {} (matched: {})",
+                    item.score,
+                    item.title,
+                    item.matched_headings.join(", "),
+                );
+            }
+        } else {
+            // Symbol/<Kind> row: split "kind" prefix off, render with location.
+            let kind_short = item.kind.strip_prefix("Symbol/").unwrap_or(&item.kind);
+            if item.location.is_empty() {
+                println!("  [{:.2}] {} [{}]", item.score, item.title, kind_short);
+            } else {
+                println!(
+                    "  [{:.2}] {} [{}] @ {}",
+                    item.score, item.title, kind_short, item.location,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
