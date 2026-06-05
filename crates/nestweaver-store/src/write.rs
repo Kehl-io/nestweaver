@@ -2046,12 +2046,27 @@ impl GraphStore {
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
 
+        // Collect target-instance vault root paths so we can detect
+        // collisions after rewriting.
+        let target_roots: std::collections::HashSet<String> = self
+            .list_vaults(None)?
+            .into_iter()
+            .filter(|v| v.instance_id == to)
+            .map(|v| v.root_path)
+            .collect();
+
         for v in self.list_vaults(None)? {
             if v.instance_id == from {
-                self.upsert_vault(&Vault {
-                    instance_id: to.to_string(),
-                    ..v
-                })?;
+                if target_roots.contains(&v.root_path) {
+                    // Target already has a vault for this root — delete
+                    // the source duplicate instead of rewriting it.
+                    self.delete_vault_cascade(&v.uid)?;
+                } else {
+                    self.upsert_vault(&Vault {
+                        instance_id: to.to_string(),
+                        ..v
+                    })?;
+                }
                 vault_count += 1;
             }
         }
