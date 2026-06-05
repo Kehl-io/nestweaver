@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.19.0](https://github.com/Kehl-io/nestweaver/compare/v0.18.0...v0.19.0) (2026-06-05)
+
+
+### Features
+
+* **cli:** instance_id from config, instance merge, and duplicate vault warning ([160d40e](https://github.com/Kehl-io/nestweaver/commit/160d40e65a9149ffaddf28dd4ecc960dda59f142))
+
+
+### Bug Fixes
+
+* **ci:** eliminate zstd link errors and skip daemon tests on Linux ([c017d0f](https://github.com/Kehl-io/nestweaver/commit/c017d0f8b0dcfe13b47ce63de679ab7157958c67))
+* **cli:** add stale-check subcommand, body_complete indicator, and snapshot output default ([ffce373](https://github.com/Kehl-io/nestweaver/commit/ffce3734b99f6db230339f4331acc9d4fdcf247c))
+* **store:** deduplicate vaults during instance merge ([16bf188](https://github.com/Kehl-io/nestweaver/commit/16bf18803f463c9cb05b7f24bc283979bf35d01e))
+* **store:** make insert_vault idempotent and remove obsolete binary ([494caae](https://github.com/Kehl-io/nestweaver/commit/494caaef0bbf2fcb6534e36c52d1f8d345b082b2))
+* **store:** use DETACH DELETE pattern in merge_instance_ids ([dbd8bff](https://github.com/Kehl-io/nestweaver/commit/dbd8bff178acd5890e9b343d933b1af85a8413b4))
+* **store:** use upsert_vault with DETACH DELETE pattern ([b9bd9c0](https://github.com/Kehl-io/nestweaver/commit/b9bd9c01afbfd225d096864ace99291f4b0f8f4e))
+* vault idempotency, stale-check CLI, instance merge, and CI linker fix ([959d6ac](https://github.com/Kehl-io/nestweaver/commit/959d6aca05531b3aa0fa94e53b32e4dff28d72d6))
+
 ## [0.18.0](https://github.com/Kehl-io/nestweaver/compare/v0.17.0...v0.18.0) (2026-06-04)
 
 
