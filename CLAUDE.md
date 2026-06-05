@@ -45,6 +45,7 @@ nestweaver export --format msgpack       # graph snapshot for WASM engine
 
 # Markdown brain (`.brainignore` for glob exclusion patterns; `--ignore` flag for ad-hoc)
 nestweaver brain add ~/Documents/Obsidian/MyVault
+nestweaver brain add ~/vault --config ./instance.toml  # uses config's instance_id and db_path
 nestweaver brain search "architecture"   # searches code symbols AND vault notes
 nestweaver brain context "MyProject"     # unified code + notes context
 nestweaver brain status                  # vault counts, per-vault staleness
@@ -63,6 +64,7 @@ nestweaver suggest-links --db ./all.lbug
 nestweaver list-links --config ./nestweaver-instance.toml --db ./main.lbug
 nestweaver list-features --config ./nestweaver-instance.toml
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
+nestweaver instance merge --from default --to my-instance  # fix misconfigured instance_ids
 
 # Recency-aware retrieval
 nestweaver brain context "status" --since 2026-05-20T00:00:00Z       # only recent notes

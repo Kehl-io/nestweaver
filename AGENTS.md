@@ -34,3 +34,8 @@ This project uses NestWeaver for codebase intelligence. Run `nestweaver setup` t
 - Prefer `brain_search` over `brain_context` when locating symbols or notes by name
 - Use the investigate chain: `investigate` → `investigate_hydrate` → `read_symbols` (only where `body_complete` is false)
 - Use `response_format: "concise"` on `brain_context` and `brain_search` for quick scans
+
+## Troubleshooting
+
+- If `brain status` warns about duplicate vault entries sharing a root path, run `nestweaver instance merge --from <old-id> --to <correct-id>` to fix misconfigured instance IDs
+- Always pass `--config` to `brain add` and `brain watch` when using an instance config — this ensures the correct `instance_id` is used
