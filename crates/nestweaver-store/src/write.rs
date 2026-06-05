@@ -2031,4 +2031,58 @@ impl GraphStore {
         }
         Ok(())
     }
+
+    /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
+    /// match `from` to `to`. Returns `(vaults, repos, projects)` counts.
+    pub fn merge_instance_ids(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(usize, usize, usize), StoreError> {
+        let conn = self.conn()?;
+        let mut vault_count = 0usize;
+        let mut repo_count = 0usize;
+        let mut project_count = 0usize;
+
+        for v in self.list_vaults(None)? {
+            if v.instance_id == from {
+                exec_params(
+                    &conn,
+                    "MATCH (v:Vault {uid: $uid}) SET v.instance_id = $to",
+                    vec![
+                        ("uid", lbug::Value::String(v.uid.clone())),
+                        ("to", lbug::Value::String(to.to_string())),
+                    ],
+                )?;
+                vault_count += 1;
+            }
+        }
+        for r in self.list_repos(None)? {
+            if r.instance_id == from {
+                exec_params(
+                    &conn,
+                    "MATCH (r:Repo {uid: $uid}) SET r.instance_id = $to",
+                    vec![
+                        ("uid", lbug::Value::String(r.uid.clone())),
+                        ("to", lbug::Value::String(to.to_string())),
+                    ],
+                )?;
+                repo_count += 1;
+            }
+        }
+        for p in self.list_projects()? {
+            if p.instance_id == from {
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid}) SET p.instance_id = $to",
+                    vec![
+                        ("uid", lbug::Value::String(p.uid.clone())),
+                        ("to", lbug::Value::String(to.to_string())),
+                    ],
+                )?;
+                project_count += 1;
+            }
+        }
+        Ok((vault_count, repo_count, project_count))
+    }
 }
