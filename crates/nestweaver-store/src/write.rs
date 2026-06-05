@@ -807,7 +807,7 @@ impl GraphStore {
         let conn = self.conn()?;
         exec_params(
             &conn,
-            "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+            "MERGE (v:Vault {uid: $uid}) SET v.name = $name, v.root_path = $rp, v.instance_id = $iid",
             vec![
                 ("uid", lbug::Value::String(vault.uid.clone())),
                 ("name", lbug::Value::String(vault.name.clone())),
