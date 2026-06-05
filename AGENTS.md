@@ -19,6 +19,7 @@ This project uses NestWeaver for codebase intelligence. Run `nestweaver setup` t
 | `investigate` | One-call orientation on a topic — returns a token-budgeted map with a bundle_id |
 | `investigate_hydrate` | Fill in source bodies for investigate entries (check `body_complete` for truncation) |
 | `read_symbols` | Read a symbol's source span — cheaper than reading entire files |
+| `stale_check` | Compare each repo's indexed SHA against git HEAD — verify the index is current |
 
 ## When to Use
 
