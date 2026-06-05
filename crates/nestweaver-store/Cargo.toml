@@ -10,7 +10,7 @@ repository.workspace = true
 nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
 lbug = "0.16.1"
-tantivy = "0.26"
+tantivy = { version = "0.26", default-features = false, features = ["mmap", "stopwords", "lz4-compression", "stemmer"] }
 regex = "1.12"
 regex-syntax = "0.8"
 thiserror = { workspace = true }

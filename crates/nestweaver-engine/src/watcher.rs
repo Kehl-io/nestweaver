@@ -677,17 +677,14 @@ fn ensure_vault(
     instance_id: &str,
     name: &str,
 ) -> Result<(), anyhow::Error> {
-    if store.lookup_vault(v_uid).is_ok() {
-        return Ok(());
-    }
     store
-        .insert_vault(&Vault {
+        .upsert_vault(&Vault {
             uid: v_uid.to_string(),
             name: name.to_string(),
             root_path: root.to_string_lossy().into_owned(),
             instance_id: instance_id.to_string(),
         })
-        .context("insert_vault")?;
+        .context("upsert_vault")?;
     Ok(())
 }
 
