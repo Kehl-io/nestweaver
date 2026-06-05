@@ -6244,8 +6244,8 @@ fn run_brain(
                 for r in &results {
                     let url = r["url"].as_str().unwrap_or("?");
                     let stale = r["is_stale"].as_bool().unwrap_or(false);
-                    let indexed = &r["indexed_sha"].as_str().unwrap_or("?")
-                        [..8.min(r["indexed_sha"].as_str().unwrap_or("").len())];
+                    let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
+                    let indexed = &indexed_full[..8.min(indexed_full.len())];
                     let head = r["current_head"]
                         .as_str()
                         .map(|h| &h[..8.min(h.len())])
