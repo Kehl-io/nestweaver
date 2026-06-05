@@ -817,6 +817,16 @@ impl GraphStore {
         )
     }
 
+    pub fn upsert_vault(&self, vault: &Vault) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let _ = exec_params(
+            &conn,
+            "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
+            vec![("uid", lbug::Value::String(vault.uid.clone()))],
+        );
+        self.insert_vault(vault)
+    }
+
     pub fn insert_note(&self, note: &Note) -> Result<(), StoreError> {
         let conn = self.conn()?;
         exec_params(
@@ -2020,5 +2030,70 @@ impl GraphStore {
             }
         }
         Ok(())
+    }
+
+    /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
+    /// match `from` to `to`. Returns `(vaults, repos, projects)` counts.
+    ///
+    /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
+    /// since SET is not supported for property updates.
+    pub fn merge_instance_ids(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(usize, usize, usize), StoreError> {
+        let mut vault_count = 0usize;
+        let mut repo_count = 0usize;
+        let mut project_count = 0usize;
+
+        // Collect target-instance vault root paths so we can detect
+        // collisions after rewriting.
+        let target_roots: std::collections::HashSet<String> = self
+            .list_vaults(None)?
+            .into_iter()
+            .filter(|v| v.instance_id == to)
+            .map(|v| v.root_path)
+            .collect();
+
+        for v in self.list_vaults(None)? {
+            if v.instance_id == from {
+                if target_roots.contains(&v.root_path) {
+                    // Target already has a vault for this root — delete
+                    // the source duplicate instead of rewriting it.
+                    self.delete_vault_cascade(&v.uid)?;
+                } else {
+                    self.upsert_vault(&Vault {
+                        instance_id: to.to_string(),
+                        ..v
+                    })?;
+                }
+                vault_count += 1;
+            }
+        }
+        for r in self.list_repos(None)? {
+            if r.instance_id == from {
+                let conn = self.conn()?;
+                exec_params(
+                    &conn,
+                    "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
+                    vec![("uid", lbug::Value::String(r.uid.clone()))],
+                )?;
+                self.insert_repo(&Repo {
+                    instance_id: to.to_string(),
+                    ..r
+                })?;
+                repo_count += 1;
+            }
+        }
+        for p in self.list_projects()? {
+            if p.instance_id == from {
+                self.upsert_project(&Project {
+                    instance_id: to.to_string(),
+                    ..p
+                })?;
+                project_count += 1;
+            }
+        }
+        Ok((vault_count, repo_count, project_count))
     }
 }

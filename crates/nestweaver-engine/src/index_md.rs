@@ -210,16 +210,14 @@ pub fn index_markdown_directory_since_with_ignore(
     let v_uid = vault_uid(instance_id, &root_str);
     let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
 
-    // Ensure the vault node exists; create it if this is the first run.
-    if store.lookup_vault(&v_uid).is_err() {
-        let vault = Vault {
+    store
+        .upsert_vault(&Vault {
             uid: v_uid.clone(),
             name: vault_name.to_string(),
             root_path: root_str.clone(),
             instance_id: instance_id.to_string(),
-        };
-        store.insert_vault(&vault).context("insert_vault")?;
-    }
+        })
+        .context("upsert_vault")?;
 
     // Track visited directory inodes to detect symlink loops.
     #[cfg(unix)]
