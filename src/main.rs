@@ -1441,6 +1441,17 @@ enum BrainCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
+    /// Check if the indexed graph is stale by comparing each repo's
+    /// indexed SHA against git HEAD.
+    StaleCheck {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Watch a vault directory for changes and keep the brain in sync.
     /// Runs in the foreground; Ctrl-C stops it cleanly. On each .md save
     /// the changed file is re-parsed and its nodes are replaced via
@@ -1899,7 +1910,7 @@ enum SnapshotCommands {
         /// Path to the instance config (instance.toml)
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Output directory for the snapshot
+        /// Output directory for the snapshot [default: next to the database]
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -4551,7 +4562,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 e.asset_id, e.title, e.kind, e.location
                             );
                             if let Some(s) = &e.summary {
-                                println!("      {s}");
+                                let truncated = if e.inline_body.is_some() && !e.body_complete {
+                                    " [truncated]"
+                                } else {
+                                    ""
+                                };
+                                println!("      {s}{truncated}");
                             }
                         }
                     }
@@ -4628,11 +4644,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
+                let truncated_count = result
+                    .entries
+                    .iter()
+                    .filter(|e| e.inline_body.is_some() && !e.body_complete)
+                    .count();
                 println!(
-                    "Hydrated {} entr{} in bundle {}",
+                    "Hydrated {} entr{} in bundle {}{}",
                     result.hydrated,
                     if result.hydrated == 1 { "y" } else { "ies" },
-                    result.bundle_id
+                    result.bundle_id,
+                    if truncated_count > 0 {
+                        format!(" ({truncated_count} truncated — use read_symbols for full source)")
+                    } else {
+                        String::new()
+                    }
                 );
             }
             Ok((EXIT_SUCCESS, None))
@@ -6153,6 +6179,79 @@ fn run_brain(
                             "  interaction_tracking: disabled (run with --track-interactions to enable)"
                         );
                     }
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        BrainCommands::StaleCheck { json, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let repos = store.list_repos(None).unwrap_or_default();
+
+            let mut any_stale = false;
+            let mut results: Vec<serde_json::Value> = Vec::new();
+
+            for repo in &repos {
+                let current_head = if let Some(path) = repo.url.strip_prefix("file://") {
+                    std::process::Command::new("git")
+                        .args(["-C", path, "rev-parse", "HEAD"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                };
+
+                let is_stale = match &current_head {
+                    Some(head) => head != &repo.indexed_sha,
+                    None => repo.staleness_commits_behind > 0,
+                };
+                if is_stale {
+                    any_stale = true;
+                }
+
+                results.push(serde_json::json!({
+                    "url": repo.url,
+                    "indexed_sha": repo.indexed_sha,
+                    "current_head": current_head,
+                    "is_stale": is_stale,
+                }));
+            }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "repo_count": repos.len(),
+                        "any_stale": any_stale,
+                        "repos": results,
+                    }))?
+                );
+            } else if repos.is_empty() {
+                println!("No repos indexed.");
+            } else {
+                println!(
+                    "Stale check: {} repo(s), {}",
+                    repos.len(),
+                    if any_stale {
+                        "INDEX IS STALE"
+                    } else {
+                        "up to date"
+                    }
+                );
+                for r in &results {
+                    let url = r["url"].as_str().unwrap_or("?");
+                    let stale = r["is_stale"].as_bool().unwrap_or(false);
+                    let indexed = &r["indexed_sha"].as_str().unwrap_or("?")
+                        [..8.min(r["indexed_sha"].as_str().unwrap_or("").len())];
+                    let head = r["current_head"]
+                        .as_str()
+                        .map(|h| &h[..8.min(h.len())])
+                        .unwrap_or("unknown");
+                    let marker = if stale { "STALE" } else { "ok" };
+                    println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -8008,9 +8107,12 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                     .collect(),
             };
 
-            // Determine output directory
-            let output_dir =
-                output.unwrap_or_else(|| PathBuf::from(format!("snapshot-{instance_id}")));
+            let output_dir = output.unwrap_or_else(|| {
+                db_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(format!("snapshot-{instance_id}"))
+            });
 
             nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
 
