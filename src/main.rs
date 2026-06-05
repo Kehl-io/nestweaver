@@ -1409,13 +1409,18 @@ enum BrainCommands {
         path: PathBuf,
         #[arg(long, help = "Friendly name for the vault (default: directory name)")]
         name: Option<String>,
-        #[arg(long, help = "Instance ID for multi-instance setups")]
+        #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — uses its instance_id and db_path"
+        )]
+        config: Option<PathBuf>,
         #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
         ignore: Option<String>,
     },
@@ -1851,6 +1856,22 @@ enum InstanceCommands {
     Pull {
         /// Instance ID to pull
         id: String,
+    },
+    /// Merge one instance into another by rewriting vault, project, and
+    /// repo rows. Use this to recover from misconfigured deployments
+    /// where brain add was run with the wrong --instance.
+    Merge {
+        /// Source instance ID to merge from
+        #[arg(long)]
+        from: String,
+        /// Target instance ID to merge into
+        #[arg(long)]
+        to: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -5857,10 +5878,15 @@ fn run_brain(
             name,
             instance,
             db,
+            config,
             ignore,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
-            let instance_id = instance.as_deref().unwrap_or("default");
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let instance_cfg = load_instance_config_opt(config.as_deref());
+            let instance_id_owned = instance
+                .or_else(|| instance_cfg.map(|c| c.instance_id))
+                .unwrap_or_else(|| "default".to_string());
+            let instance_id = instance_id_owned.as_str();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
@@ -6181,6 +6207,35 @@ fn run_brain(
                     }
                 }
             }
+
+            // Warn when multiple vault UIDs map to the same canonical root
+            // path — usually caused by brain add with mismatched --instance
+            // or missing --config. This produces phantom 0-note vault rows.
+            let mut root_to_vaults: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for v in &vaults {
+                root_to_vaults
+                    .entry(v.root_path.as_str())
+                    .or_default()
+                    .push(v.name.as_str());
+            }
+            for (root, names) in &root_to_vaults {
+                if names.len() > 1 {
+                    eprintln!(
+                        "Warning: {} vault entries share root path {}:",
+                        names.len(),
+                        root
+                    );
+                    eprintln!("  {}", names.join(", "));
+                    eprintln!(
+                        "  This usually means brain add was run with different --instance values."
+                    );
+                    eprintln!(
+                        "  Fix with: nestweaver instance merge --from <old-id> --to <correct-id>"
+                    );
+                }
+            }
+
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -6281,7 +6336,14 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            // Instance ID priority: --instance flag > config's instance_id > "default"
+            let instance_cfg = load_instance_config_opt(config.as_deref());
+            let instance_id = instance.unwrap_or_else(|| {
+                instance_cfg
+                    .as_ref()
+                    .map(|c| c.instance_id.clone())
+                    .unwrap_or_else(|| "default".to_string())
+            });
 
             if let Some(hours) = refresh_wiki_hours {
                 out.status(&format!(
@@ -6291,9 +6353,7 @@ fn run_brain(
             }
 
             // Respect watch config when --config is provided.
-            let watch_cfg = load_instance_config_opt(config.as_deref())
-                .map(|c| c.watch)
-                .unwrap_or_default();
+            let watch_cfg = instance_cfg.map(|c| c.watch).unwrap_or_default();
             if !watch_cfg.enabled {
                 out.status(
                     "Watching disabled in instance config ([watch] enabled = false). Exiting.",
@@ -7975,6 +8035,23 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 )
             })?;
             println!("Pulled snapshot v{} for '{}'", meta.version, id);
+            Ok(EXIT_SUCCESS)
+        }
+        InstanceCommands::Merge { from, to, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let store = open_store(Some(&db_path))?;
+            let (vault_count, repo_count, project_count) = store
+                .merge_instance_ids(&from, &to)
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if vault_count + repo_count + project_count == 0 {
+                println!("No rows found with instance_id '{from}'.");
+            } else {
+                println!(
+                    "Merged '{from}' -> '{to}': {vault_count} vault(s), \
+                     {repo_count} repo(s), {project_count} project(s)"
+                );
+            }
             Ok(EXIT_SUCCESS)
         }
     }
