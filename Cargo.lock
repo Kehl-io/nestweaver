@@ -3181,6 +3181,7 @@ dependencies = [
  "nestweaver-parser",
  "nestweaver-schema",
  "proptest",
+ "rayon",
  "serde_json",
  "serde_yaml",
  "tempfile",
