@@ -1031,4 +1031,48 @@ mod tests {
         let implemented = store.list_implemented_contract_uids().unwrap();
         assert_eq!(implemented, vec!["contract:http:POST:/v1/approvals"]);
     }
+
+    #[test]
+    fn test_transactional_note_insert() {
+        use nestweaver_schema::{Note, NoteKind};
+        let store = test_store();
+
+        let notes = vec![
+            Note {
+                uid: "note:txn:1".to_string(),
+                vault_uid: "vlt:txn".to_string(),
+                file_path: "txn/a.md".to_string(),
+                title: "Txn Note A".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: "aaa".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+            Note {
+                uid: "note:txn:2".to_string(),
+                vault_uid: "vlt:txn".to_string(),
+                file_path: "txn/b.md".to_string(),
+                title: "Txn Note B".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 20,
+                content_hash: "bbb".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+        ];
+
+        let conn = store.begin_transaction().unwrap();
+        GraphStore::batch_insert_notes_on(&conn, &notes).unwrap();
+        store.commit_transaction(&conn).unwrap();
+
+        let count = store.count_notes().unwrap();
+        assert_eq!(count, 2);
+        let listed = store.list_notes(Some("vlt:txn")).unwrap();
+        assert_eq!(listed.len(), 2);
+    }
 }

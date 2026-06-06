@@ -619,6 +619,17 @@ impl GraphStore {
     }
 
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        Self::batch_insert_edges_on(&conn, edges)?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
+    /// Insert resolved edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[ResolvedEdge],
+    ) -> Result<(), StoreError> {
         // Group edges by their SQL query string so we prepare each statement only once.
         use std::collections::HashMap;
 
@@ -787,7 +798,6 @@ impl GraphStore {
             }
         }
 
-        let conn = self.begin_transaction()?;
         for (query, param_sets) in &groups {
             let mut stmt = conn
                 .prepare(query)
@@ -797,7 +807,6 @@ impl GraphStore {
                     .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
             }
         }
-        self.commit_transaction(&conn)?;
         Ok(())
     }
 
@@ -864,6 +873,14 @@ impl GraphStore {
 
     pub fn batch_insert_notes(&self, notes: &[Note]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_notes_on(&conn, notes)
+    }
+
+    /// Insert notes using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_notes_on(
+        conn: &lbug::Connection<'_>,
+        notes: &[Note],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
@@ -924,6 +941,14 @@ impl GraphStore {
 
     pub fn batch_insert_vault_note_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_vault_note_edges_on(&conn, edges)
+    }
+
+    /// Insert vault-note edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_vault_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (v:Vault {uid: $vid}), (n:Note {uid: $nid}) \
@@ -966,6 +991,14 @@ impl GraphStore {
 
     pub fn batch_insert_headings(&self, headings: &[Heading]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_headings_on(&conn, headings)
+    }
+
+    /// Insert headings using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_headings_on(
+        conn: &lbug::Connection<'_>,
+        headings: &[Heading],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Heading {uid: $uid, note_uid: $nid, level: $lvl, text: $text, \
@@ -1020,6 +1053,14 @@ impl GraphStore {
 
     pub fn batch_insert_sections(&self, sections: &[Section]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_sections_on(&conn, sections)
+    }
+
+    /// Insert sections using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_sections_on(
+        conn: &lbug::Connection<'_>,
+        sections: &[Section],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
@@ -1055,6 +1096,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_heading_edges_on(&conn, edges)
+    }
+
+    /// Insert note-heading edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_heading_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (h:Heading {uid: $hid}) \
@@ -1079,6 +1128,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_section_edges_on(&conn, edges)
+    }
+
+    /// Insert note-section edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_section_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (s:Section {uid: $sid}) \
@@ -1103,6 +1160,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_heading_section_edges_on(&conn, edges)
+    }
+
+    /// Insert heading-section edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_heading_section_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (h:Heading {uid: $hid}), (s:Section {uid: $sid}) \
@@ -1127,6 +1192,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_heading_parent_edges_on(&conn, edges)
+    }
+
+    /// Insert heading-parent edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_heading_parent_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (child:Heading {uid: $cid}), (parent:Heading {uid: $pid}) \
@@ -1163,6 +1236,14 @@ impl GraphStore {
 
     pub fn batch_insert_tags(&self, tags: &[Tag]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_tags_on(&conn, tags)
+    }
+
+    /// Insert tags using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_tags_on(
+        conn: &lbug::Connection<'_>,
+        tags: &[Tag],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare("CREATE (:Tag {uid: $uid, vault_uid: $vid, name: $name})")
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
@@ -1288,6 +1369,14 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_wikilink_to_note_edges_on(&conn, edges)
+    }
+
+    /// Insert wikilink-to-note edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_wikilink_to_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (n:Note {uid: $nid}) \
@@ -1314,6 +1403,14 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_wikilink_to_heading_edges_on(&conn, edges)
+    }
+
+    /// Insert wikilink-to-heading edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_wikilink_to_heading_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (h:Heading {uid: $hid}) \
@@ -1337,6 +1434,14 @@ impl GraphStore {
 
     pub fn batch_insert_note_tag_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_tag_edges_on(&conn, edges)
+    }
+
+    /// Insert note-tag edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_tag_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (t:Tag {uid: $tid}) \
@@ -1358,6 +1463,14 @@ impl GraphStore {
 
     pub fn batch_insert_section_tag_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_section_tag_edges_on(&conn, edges)
+    }
+
+    /// Insert section-tag edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_section_tag_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (t:Tag {uid: $tid}) \
