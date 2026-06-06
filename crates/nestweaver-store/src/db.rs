@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
@@ -75,7 +75,7 @@ pub struct GraphStore {
     /// `graph_generation`; stale entries are discarded on any reindex.
     /// Avoids full-table scans on every seed-resolution call for brain_context,
     /// flow_trace, blast_radius, etc.
-    pub(crate) symbol_name_cache: Mutex<Option<crate::traverse::SymbolNameCached>>,
+    pub(crate) symbol_name_cache: Mutex<Option<Arc<crate::traverse::SymbolNameCached>>>,
 }
 
 impl GraphStore {

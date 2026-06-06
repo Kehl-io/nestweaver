@@ -237,14 +237,16 @@ impl GraphStore {
         let cur_gen = self.graph_generation();
 
         // --- Step 1: check the cache (hold the lock only briefly) -----------
-        let cached_symbols: Option<Vec<(String, nestweaver_schema::Symbol)>> = {
+        // On a hit we clone the Arc (cheap ref-count bump) rather than the
+        // entire symbol Vec, so the lock is released before any filtering work.
+        let cached_symbols: Option<std::sync::Arc<SymbolNameCached>> = {
             let guard = self
                 .symbol_name_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref c) = *guard {
                 if c.generation == cur_gen {
-                    Some(c.symbols.clone())
+                    Some(std::sync::Arc::clone(c))
                 } else {
                     None
                 }
@@ -254,8 +256,8 @@ impl GraphStore {
         };
 
         // --- Step 2: on cache miss, query the DB then populate the cache ----
-        let symbols = if let Some(s) = cached_symbols {
-            s
+        let entry: std::sync::Arc<SymbolNameCached> = if let Some(arc) = cached_symbols {
+            arc
         } else {
             // LadybugDB's CONTAINS is case-sensitive and has no toLower().
             // Load all symbols and filter in Rust for case-insensitive matching.
@@ -275,30 +277,31 @@ impl GraphStore {
 
             // Store the populated cache (re-check generation under the lock in
             // case another thread raced us, preferring the newer fill).
-            {
-                let mut guard = self
-                    .symbol_name_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let current_gen = self.graph_generation();
-                let should_update = match &*guard {
-                    None => true,
-                    Some(c) => c.generation != current_gen,
-                };
-                if should_update {
-                    *guard = Some(crate::traverse::SymbolNameCached {
-                        generation: current_gen,
-                        symbols: all.clone(),
-                    });
-                }
+            let mut guard = self
+                .symbol_name_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let current_gen = self.graph_generation();
+            let should_update = match &*guard {
+                None => true,
+                Some(c) => c.generation != current_gen,
+            };
+            if should_update {
+                let arc = std::sync::Arc::new(SymbolNameCached {
+                    generation: current_gen,
+                    symbols: all,
+                });
+                *guard = Some(std::sync::Arc::clone(&arc));
+                arc
+            } else {
+                // Another thread raced us and filled the cache; use its entry.
+                std::sync::Arc::clone(guard.as_ref().unwrap())
             }
-
-            all
         };
 
         // --- Step 3: filter the in-memory list ------------------------------
         let mut matches = Vec::new();
-        for (lower, sym) in &symbols {
+        for (lower, sym) in &entry.symbols {
             if lower.contains(&needle) {
                 matches.push(sym.clone());
                 if matches.len() >= limit {
