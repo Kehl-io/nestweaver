@@ -1072,59 +1072,10 @@ fn index_into_store(
         "vault indexing complete"
     );
 
-    // 3. Batch insert nodes first (edge inserts depend on both endpoints existing).
-    store
-        .batch_insert_notes(&all_notes)
-        .context("batch_insert_notes")?;
-    store
-        .batch_insert_headings(&all_headings)
-        .context("batch_insert_headings")?;
-    store
-        .batch_insert_sections(&all_sections)
-        .context("batch_insert_sections")?;
-
-    // 4. Batch insert all containment edges.
-    let edge_refs: Vec<(&str, &str)> = edge_pairs
-        .iter()
-        .map(|(v, n)| (v.as_str(), n.as_str()))
-        .collect();
-    store
-        .batch_insert_vault_note_edges(&edge_refs)
-        .context("batch_insert_vault_note_edges")?;
-
-    let note_heading_refs: Vec<(&str, &str)> = note_heading_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_note_heading_edges(&note_heading_refs)
-        .context("batch_insert_note_heading_edges")?;
-
-    let note_section_refs: Vec<(&str, &str)> = note_section_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_note_section_edges(&note_section_refs)
-        .context("batch_insert_note_section_edges")?;
-
-    let heading_section_refs: Vec<(&str, &str)> = heading_section_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_heading_section_edges(&heading_section_refs)
-        .context("batch_insert_heading_section_edges")?;
-
-    let heading_parent_refs: Vec<(&str, &str)> = heading_parent_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_heading_parent_edges(&heading_parent_refs)
-        .context("batch_insert_heading_parent_edges")?;
-
     // ── Pass 2: cross-reference resolution (tags + wikilinks) ───────────────
+    // All data is computed from in-memory `note_contexts` (WikilinkLookup does
+    // not query the store), so we can pre-compute everything before touching
+    // the DB and then flush it all in one transaction via `bulk_vault_write`.
     let resolve_pb = ProgressBar::new_spinner();
     resolve_pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -1169,6 +1120,9 @@ fn index_into_store(
     }
     let tags_count = all_tags.len();
 
+    // Insert tag nodes outside the main transaction so that duplicate tags
+    // from earlier index runs are silently skipped rather than aborting the
+    // whole batch.
     for tag in &all_tags {
         if let Err(e) = store.insert_tag(tag) {
             if e.is_duplicate() {
@@ -1178,20 +1132,6 @@ fn index_into_store(
             }
         }
     }
-    let note_tag_refs: Vec<(&str, &str)> = note_tag_edges
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    store
-        .batch_insert_note_tag_edges(&note_tag_refs)
-        .context("batch_insert_note_tag_edges")?;
-    let section_tag_refs: Vec<(&str, &str)> = section_tag_edges
-        .iter()
-        .map(|(s, t)| (s.as_str(), t.as_str()))
-        .collect();
-    store
-        .batch_insert_section_tag_edges(&section_tag_refs)
-        .context("batch_insert_section_tag_edges")?;
 
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
@@ -1269,21 +1209,63 @@ fn index_into_store(
 
     let wikilinks_resolved = wikilink_to_note.len() + wikilink_to_heading.len();
 
-    let wl_note_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_note
-        .iter()
-        .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
-        .collect();
-    store
-        .batch_insert_wikilink_to_note_edges(&wl_note_refs)
-        .context("batch_insert_wikilink_to_note_edges")?;
+    // 3 & 4. Flush all nodes and edges for this vault in one transaction.
+    {
+        let vault_note_refs: Vec<(&str, &str)> = edge_pairs
+            .iter()
+            .map(|(v, n)| (v.as_str(), n.as_str()))
+            .collect();
+        let note_heading_refs: Vec<(&str, &str)> = note_heading_edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let note_section_refs: Vec<(&str, &str)> = note_section_edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let heading_section_refs: Vec<(&str, &str)> = heading_section_edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let heading_parent_refs: Vec<(&str, &str)> = heading_parent_edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let note_tag_refs: Vec<(&str, &str)> = note_tag_edges
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+        let section_tag_refs: Vec<(&str, &str)> = section_tag_edges
+            .iter()
+            .map(|(s, t)| (s.as_str(), t.as_str()))
+            .collect();
+        let wl_note_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_note
+            .iter()
+            .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
+            .collect();
+        let wl_head_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_heading
+            .iter()
+            .map(|(s, h, c, d)| (s.as_str(), h.as_str(), *c, d.as_str()))
+            .collect();
 
-    let wl_head_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_heading
-        .iter()
-        .map(|(s, h, c, d)| (s.as_str(), h.as_str(), *c, d.as_str()))
-        .collect();
-    store
-        .batch_insert_wikilink_to_heading_edges(&wl_head_refs)
-        .context("batch_insert_wikilink_to_heading_edges")?;
+        store
+            .bulk_vault_write(
+                &all_notes,
+                &all_headings,
+                &all_sections,
+                &vault_note_refs,
+                &note_heading_refs,
+                &note_section_refs,
+                &heading_section_refs,
+                &heading_parent_refs,
+                &[],
+                &note_tag_refs,
+                &section_tag_refs,
+                &wl_note_refs,
+                &wl_head_refs,
+            )
+            .context("bulk_vault_write")?;
+    }
 
     // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
     for (uid, snu, sp, st, wt) in &unresolved_records {
