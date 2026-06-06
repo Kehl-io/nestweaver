@@ -71,6 +71,11 @@ pub struct GraphStore {
     /// Avoids rebuilding the adjacency list from DB on every PPR call when the
     /// graph has not changed between index refreshes.
     pub(crate) ppr_graph_cache: Mutex<Option<PprGraphCached>>,
+    /// Cached full symbol table for `search_symbols_by_name`. Keyed on
+    /// `graph_generation`; stale entries are discarded on any reindex.
+    /// Avoids full-table scans on every seed-resolution call for brain_context,
+    /// flow_trace, blast_radius, etc.
+    pub(crate) symbol_name_cache: Mutex<Option<crate::traverse::SymbolNameCached>>,
 }
 
 impl GraphStore {
@@ -87,6 +92,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -108,6 +114,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -129,6 +136,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
@@ -174,6 +182,7 @@ impl GraphStore {
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
             ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
