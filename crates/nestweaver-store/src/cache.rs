@@ -327,9 +327,14 @@ fn normalize_args(value: &serde_json::Value) -> serde_json::Value {
 /// - Any error returns `Err` so the caller can fall back to an empty cache.
 fn decode_cache_bytes(bytes: &[u8]) -> Result<CacheDoc, Box<dyn std::error::Error>> {
     if bytes.starts_with(CACHE_MAGIC) {
-        let _version = *bytes
+        let version = *bytes
             .get(CACHE_MAGIC.len())
             .ok_or("truncated binary cache header")?;
+        if version != CACHE_VERSION {
+            return Err(
+                format!("unsupported cache version {version} (expected {CACHE_VERSION})").into(),
+            );
+        }
         let payload = &bytes[CACHE_MAGIC.len() + 1..];
         let decompressed = zstd::decode_all(payload)?;
         let doc = rmp_serde::from_slice::<CacheDoc>(&decompressed)?;

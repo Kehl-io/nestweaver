@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
@@ -235,7 +234,7 @@ impl GraphStore {
         limit: usize,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
-        let cur_gen = self.graph_generation.load(Ordering::Relaxed);
+        let cur_gen = self.graph_generation();
 
         // --- Step 1: check the cache (hold the lock only briefly) -----------
         let cached_symbols: Option<Vec<(String, nestweaver_schema::Symbol)>> = {
@@ -281,7 +280,7 @@ impl GraphStore {
                     .symbol_name_cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let current_gen = self.graph_generation.load(Ordering::Relaxed);
+                let current_gen = self.graph_generation();
                 let should_update = match &*guard {
                     None => true,
                     Some(c) => c.generation != current_gen,
