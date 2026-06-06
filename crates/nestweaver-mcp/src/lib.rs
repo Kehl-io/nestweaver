@@ -115,6 +115,9 @@ pub fn run_stdio_server(
                     tracing::warn!("failed to flush interaction tracker: {e}");
                 }
             }
+            // Flush any in-process response cache entries that haven't been
+            // written to disk yet (periodic flush threshold may not have been hit).
+            crate::tools::flush_response_cache();
             tracing::info!("client closed stdin; shutting down");
             return Ok(());
         }
