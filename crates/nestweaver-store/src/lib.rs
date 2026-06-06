@@ -1231,4 +1231,221 @@ mod tests {
         let map = store.batch_lookup_symbols(&[]).unwrap();
         assert!(map.is_empty());
     }
+
+    #[test]
+    fn test_delete_vault_cascade_bulk_removes_all_node_types() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
+        let store = test_store();
+
+        let vault = Vault {
+            uid: "vlt:cas".to_string(),
+            name: "cascade-vault".to_string(),
+            root_path: "/tmp/cas".to_string(),
+            instance_id: "default".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+
+        let make_note = |uid: &str, n: u32| Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:cas".to_string(),
+            file_path: format!("n{n}.md"),
+            title: format!("Note {n}"),
+            note_kind: NoteKind::General,
+            word_count: n,
+            content_hash: format!("h{n}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+
+        let notes = vec![
+            make_note("note:cas:1", 1),
+            make_note("note:cas:2", 2),
+            make_note("note:cas:3", 3),
+        ];
+        store.batch_insert_notes(&notes).unwrap();
+        store
+            .batch_insert_vault_note_edges(&[
+                ("vlt:cas", "note:cas:1"),
+                ("vlt:cas", "note:cas:2"),
+                ("vlt:cas", "note:cas:3"),
+            ])
+            .unwrap();
+
+        let headings = vec![
+            Heading {
+                uid: "hdg:cas:1".to_string(),
+                note_uid: "note:cas:1".to_string(),
+                level: 1,
+                text: "H1".to_string(),
+                slug: "h1".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "hh1".to_string(),
+            },
+            Heading {
+                uid: "hdg:cas:2".to_string(),
+                note_uid: "note:cas:2".to_string(),
+                level: 1,
+                text: "H2".to_string(),
+                slug: "h2".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "hh2".to_string(),
+            },
+        ];
+        store.batch_insert_headings(&headings).unwrap();
+
+        let sections = vec![
+            Section {
+                uid: "sec:cas:1".to_string(),
+                note_uid: "note:cas:1".to_string(),
+                heading_uid: Some("hdg:cas:1".to_string()),
+                start_line: 2,
+                end_line: 5,
+                text_hash: "th1".to_string(),
+                text_content: "body 1".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            },
+            Section {
+                uid: "sec:cas:2".to_string(),
+                note_uid: "note:cas:2".to_string(),
+                heading_uid: Some("hdg:cas:2".to_string()),
+                start_line: 2,
+                end_line: 5,
+                text_hash: "th2".to_string(),
+                text_content: "body 2".to_string(),
+                word_count: 3,
+                pagerank_score: None,
+            },
+        ];
+        store.batch_insert_sections(&sections).unwrap();
+
+        store
+            .batch_insert_note_heading_edges(&[
+                ("note:cas:1", "hdg:cas:1"),
+                ("note:cas:2", "hdg:cas:2"),
+            ])
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[
+                ("note:cas:1", "sec:cas:1"),
+                ("note:cas:2", "sec:cas:2"),
+            ])
+            .unwrap();
+        store
+            .batch_insert_heading_section_edges(&[
+                ("hdg:cas:1", "sec:cas:1"),
+                ("hdg:cas:2", "sec:cas:2"),
+            ])
+            .unwrap();
+
+        let tags = vec![
+            Tag {
+                uid: "tag:cas:alpha".to_string(),
+                vault_uid: "vlt:cas".to_string(),
+                name: "alpha".to_string(),
+            },
+            Tag {
+                uid: "tag:cas:beta".to_string(),
+                vault_uid: "vlt:cas".to_string(),
+                name: "beta".to_string(),
+            },
+        ];
+        store.batch_insert_tags(&tags).unwrap();
+        store
+            .batch_insert_note_tag_edges(&[
+                ("note:cas:1", "tag:cas:alpha"),
+                ("note:cas:3", "tag:cas:beta"),
+            ])
+            .unwrap();
+
+        // Confirm pre-delete counts.
+        assert!(store.count_notes().unwrap() > 0);
+        assert!(store.count_headings().unwrap() > 0);
+        assert!(store.count_sections().unwrap() > 0);
+        assert!(store.count_tags().unwrap() > 0);
+
+        let deleted = store.delete_vault_cascade("vlt:cas").unwrap();
+
+        assert_eq!(deleted, 3);
+        assert_eq!(store.count_notes().unwrap(), 0);
+        assert_eq!(store.count_headings().unwrap(), 0);
+        assert_eq!(store.count_sections().unwrap(), 0);
+        assert_eq!(store.count_tags().unwrap(), 0);
+        // Vault node itself should be gone — list_vaults returns nothing.
+        assert_eq!(store.list_vaults(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_bulk_delete_repo_files_and_symbols_removes_all() {
+        use nestweaver_schema::file_uid;
+        let store = test_store();
+
+        let repo = make_repo("repo-bulk-del");
+        store.insert_repo(&repo).unwrap();
+
+        let files: Vec<File> = (1..=3u32)
+            .map(|i| File {
+                uid: file_uid("repo-bulk-del", &format!("src/f{i}.rs")),
+                path: format!("src/f{i}.rs"),
+                repo_uid: "repo-bulk-del".to_string(),
+                content_hash: format!("fhash{i}"),
+            })
+            .collect();
+        store.batch_insert_files(&files).unwrap();
+
+        let repo_file_edges: Vec<(&str, &str)> = files
+            .iter()
+            .map(|f| ("repo-bulk-del", f.uid.as_str()))
+            .collect();
+        store
+            .batch_insert_repo_file_edges(&repo_file_edges)
+            .unwrap();
+
+        let symbols: Vec<Symbol> = (1..=5u32)
+            .map(|i| {
+                make_symbol(
+                    &format!("sym:bulk-del:{i}"),
+                    &format!("fn_{i}"),
+                    "repo-bulk-del",
+                    &format!("src/f{}.rs", ((i - 1) % 3) + 1),
+                )
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+
+        let file_sym_edges: Vec<(&str, &str)> = symbols
+            .iter()
+            .map(|s| {
+                let file_path = s.file_path.as_str();
+                let fuid = files
+                    .iter()
+                    .find(|f| f.path == file_path)
+                    .map(|f| f.uid.as_str())
+                    .unwrap_or("");
+                (fuid, s.uid.as_str())
+            })
+            .collect();
+        store
+            .batch_insert_file_symbol_edges(&file_sym_edges)
+            .unwrap();
+
+        assert!(store.count_symbols().unwrap() > 0);
+
+        let (file_count, sym_count) = store
+            .bulk_delete_repo_files_and_symbols("repo-bulk-del")
+            .unwrap();
+
+        assert_eq!(file_count, 3);
+        assert_eq!(sym_count, 5);
+        assert_eq!(store.count_symbols().unwrap(), 0);
+
+        // No files remain for this repo (list_repos still returns the repo node,
+        // but files are gone — verify by checking a lookup would find no symbols).
+        let all_syms = store.lookup_symbols_by_name("fn_1").unwrap();
+        assert!(all_syms.is_empty());
+    }
 }
