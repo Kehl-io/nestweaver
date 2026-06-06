@@ -721,11 +721,17 @@ fn index_into_store(
     //     and some files changed), clean up old File nodes and their symbols
     //     for files we are about to re-insert.
     if existing_repo.is_some() {
-        for file in &all_files {
-            // Remove old symbols belonging to this file.
-            let _ = store.delete_symbols_in_file(&r_uid, &file.path);
-            // Remove old File node.
-            let _ = store.delete_file_node(&file.uid);
+        if files_unchanged == 0 {
+            // Force re-index: all files are being replaced. Bulk delete is O(1) queries.
+            let _ = store.bulk_delete_repo_files_and_symbols(&r_uid);
+        } else {
+            // Incremental: only delete the specific files we're about to re-insert.
+            for file in &all_files {
+                // Remove old symbols belonging to this file.
+                let _ = store.delete_symbols_in_file(&r_uid, &file.path);
+                // Remove old File node.
+                let _ = store.delete_file_node(&file.uid);
+            }
         }
         // BUG FIX: clear repo-scoped derived nodes (Service, Contract) before
         // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID is
