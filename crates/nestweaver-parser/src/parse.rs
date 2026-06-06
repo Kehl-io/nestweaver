@@ -3,7 +3,9 @@ use crate::language::detect_language;
 use nestweaver_schema::{EntryPointKind, Language, SymbolKind, TypeInfo, Visibility};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
@@ -48,6 +50,52 @@ pub enum ParseError {
     QueryError(#[from] tree_sitter::QueryError),
     #[error("tree-sitter failed to parse")]
     ParseFailed,
+}
+
+// ── query cache ────────────────────────────────────────────────────────────
+
+/// Cache key for a compiled tree-sitter `Query`.
+///
+/// Two files of the same language produce the same query source *unless* one
+/// is a JSX/TSX file (where we append extra JSX patterns).  The
+/// `is_type_query` flag distinguishes the symbol-extraction query from the
+/// type-binding query for the same language.
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct QueryCacheKey {
+    lang: Language,
+    is_jsx: bool,
+    is_type_query: bool,
+}
+
+/// Global cache of compiled [`Query`] objects, keyed by language + variant.
+///
+/// `Query` is `Send + Sync` but not `Clone`, so we wrap in `Arc` to allow
+/// multiple callers to share the same compiled query without copying it.
+static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryCacheKey, Arc<Query>>>> = OnceLock::new();
+
+/// Return a cached (or freshly compiled) `Query` wrapped in an `Arc`.
+///
+/// The first call for a given `(lang, is_jsx, is_type_query)` triple compiles
+/// the S-expression source string and stores the result; subsequent calls
+/// return the cached `Arc` without recompiling.
+///
+/// `query_src` must be the same string for a given `key` on every call —
+/// the cache stores only the compiled form, not the source.
+fn get_or_compile_query(
+    ts_lang: &tree_sitter::Language,
+    key: QueryCacheKey,
+    query_src: &str,
+) -> Result<Arc<Query>, ParseError> {
+    let cache = QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(q) = map.get(&key) {
+        return Ok(Arc::clone(q));
+    }
+
+    let arc = Arc::new(Query::new(ts_lang, query_src)?);
+    map.insert(key, Arc::clone(&arc));
+    Ok(arc)
 }
 
 // ── output types ───────────────────────────────────────────────────────────
@@ -657,7 +705,19 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let tree = parser.parse(source, None).ok_or(ParseError::ParseFailed)?;
 
     let query_src = query_source(lang, path);
-    let query = Query::new(&ts_lang, &query_src)?;
+    let is_jsx = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "tsx" || e == "jsx");
+    let query = get_or_compile_query(
+        &ts_lang,
+        QueryCacheKey {
+            lang,
+            is_jsx,
+            is_type_query: false,
+        },
+        &query_src,
+    )?;
     let capture_names: Vec<String> = query
         .capture_names()
         .iter()
@@ -993,7 +1053,15 @@ fn extract_types_from_tree(
         None => return Vec::new(),
     };
 
-    let query = match tree_sitter::Query::new(ts_lang, query_src) {
+    let query = match get_or_compile_query(
+        ts_lang,
+        QueryCacheKey {
+            lang,
+            is_jsx: false,
+            is_type_query: true,
+        },
+        query_src,
+    ) {
         Ok(q) => q,
         Err(_) => return Vec::new(),
     };
@@ -1146,6 +1214,48 @@ mod tests {
         let path = root.join(rel);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read fixture {rel}: {e}"))
+    }
+
+    // ── query cache tests ───────────────────────────────────────────────────
+
+    /// Parsing two distinct files with the same language should both succeed,
+    /// exercising the cache path on the second call.
+    #[test]
+    fn query_cache_second_parse_succeeds() {
+        let source_a = "fn foo() {}";
+        let source_b = "fn bar(x: i32) -> i32 { x }";
+
+        let result_a = parse_source(Path::new("a.rs"), source_a).unwrap();
+        let result_b = parse_source(Path::new("b.rs"), source_b).unwrap();
+
+        assert!(
+            result_a.symbols.iter().any(|s| s.name == "foo"),
+            "expected foo in first parse"
+        );
+        assert!(
+            result_b.symbols.iter().any(|s| s.name == "bar"),
+            "expected bar in second parse (cache path)"
+        );
+    }
+
+    /// TSX and TS files use different query sources; both should parse correctly
+    /// even though they share the same `Language::TypeScript`.
+    #[test]
+    fn query_cache_tsx_vs_ts_both_succeed() {
+        let ts_source = "function greet(): string { return 'hi'; }";
+        let tsx_source = "function App() { return <div />; }";
+
+        let ts_result = parse_source(Path::new("comp.ts"), ts_source).unwrap();
+        let tsx_result = parse_source(Path::new("comp.tsx"), tsx_source).unwrap();
+
+        assert!(
+            ts_result.symbols.iter().any(|s| s.name == "greet"),
+            "expected greet in .ts parse"
+        );
+        assert!(
+            tsx_result.symbols.iter().any(|s| s.name == "App"),
+            "expected App in .tsx parse"
+        );
     }
 
     // ── JS tests ────────────────────────────────────────────────────────────
