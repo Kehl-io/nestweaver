@@ -273,6 +273,92 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Batch variant of [`Self::update_note`]: processes every entry in
+    /// `notes` — deleting old docs and adding fresh ones — then issues a
+    /// **single** commit and reader reload at the end.
+    ///
+    /// Use this when updating many notes at once (e.g. an initial corpus
+    /// build, a vault-wide re-parse). N individual `update_note` calls would
+    /// issue N Tantivy commits (each triggering an fsync + segment merge);
+    /// this method replaces that with 1 commit regardless of batch size.
+    ///
+    /// Each tuple in `notes` has the same shape as the parameters of
+    /// `update_note`:
+    /// `(note_uid, title, vault_uid, body_chunks, headings, sections, tags)`
+    ///
+    /// `headings` entries are `(uid, heading_text)`.
+    /// `sections` entries are `(uid, body_text, heading_title)`.
+    #[allow(clippy::type_complexity)]
+    pub fn update_notes_batch(
+        &self,
+        notes: &[(
+            String,
+            String,
+            String,
+            Vec<String>,
+            Vec<(String, String)>,
+            Vec<(String, String, String)>,
+            Vec<String>,
+        )],
+    ) -> Result<(), TantivyError> {
+        let writer_mutex = self
+            .writer
+            .as_ref()
+            .ok_or(TantivyError::WriterUnavailable)?;
+        let mut writer = writer_mutex
+            .lock()
+            .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
+
+        for (note_uid, title, vault_uid, body_chunks, headings, sections, tags) in notes {
+            // Remove all existing docs for this note.
+            writer.delete_term(Term::from_field_text(self.fields.note_uid, note_uid));
+
+            // 1. The note itself.
+            let combined_body = body_chunks.join("\n\n");
+            writer.add_document(doc!(
+                self.fields.uid => note_uid.clone(),
+                self.fields.kind => "note".to_string(),
+                self.fields.title => title.clone(),
+                self.fields.body => combined_body,
+                self.fields.vault_uid => vault_uid.clone(),
+                self.fields.note_uid => note_uid.clone(),
+            ))?;
+
+            // 2. Per-heading docs.
+            for (h_uid, h_text) in headings {
+                writer.add_document(doc!(
+                    self.fields.uid => h_uid.clone(),
+                    self.fields.kind => "heading".to_string(),
+                    self.fields.title => h_text.clone(),
+                    self.fields.body => h_text.clone(),
+                    self.fields.vault_uid => vault_uid.clone(),
+                    self.fields.note_uid => note_uid.clone(),
+                ))?;
+            }
+
+            // 3. Per-section docs — heading text in title, body text in body.
+            for (s_uid, s_body, s_heading_title) in sections {
+                writer.add_document(doc!(
+                    self.fields.uid => s_uid.clone(),
+                    self.fields.kind => "section".to_string(),
+                    self.fields.title => s_heading_title.clone(),
+                    self.fields.body => s_body.clone(),
+                    self.fields.vault_uid => vault_uid.clone(),
+                    self.fields.note_uid => note_uid.clone(),
+                ))?;
+            }
+
+            // Tags are indexed globally in reindex_from_store, not per note.
+            let _ = tags;
+        }
+
+        // Single commit for the entire batch.
+        writer.commit()?;
+        drop(writer);
+        self.reader.reload()?;
+        Ok(())
+    }
+
     /// Drop every Tantivy doc belonging to `note_uid`. Called by the
     /// watcher on file delete.
     pub fn remove_note(&self, note_uid: &str) -> Result<(), TantivyError> {
@@ -553,13 +639,47 @@ impl TantivyIndex {
         writer: &mut tantivy::IndexWriter,
         store: &GraphStore,
     ) -> Result<usize, TantivyError> {
+        use std::collections::HashMap;
+
         let mut count = 0usize;
 
         let notes = store
             .list_notes(None)
             .map_err(|e| TantivyError::Tantivy(e.to_string()))?;
+
+        // Bulk-load all headings and sections in 2 queries instead of 2N.
+        let all_headings = store
+            .list_all_headings()
+            .map_err(|e| TantivyError::Tantivy(e.to_string()))?;
+        let all_sections = store
+            .list_all_sections()
+            .map_err(|e| TantivyError::Tantivy(e.to_string()))?;
+
+        // Group by note_uid for O(1) lookup inside the per-note loop.
+        let mut headings_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+        for h in &all_headings {
+            headings_by_note
+                .entry(h.note_uid.as_str())
+                .or_default()
+                .push(h);
+        }
+        let mut sections_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+        for s in &all_sections {
+            sections_by_note
+                .entry(s.note_uid.as_str())
+                .or_default()
+                .push(s);
+        }
+
         for note in &notes {
-            let sections = store.sections_in_note(&note.uid).unwrap_or_default();
+            let headings = headings_by_note
+                .get(note.uid.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let sections = sections_by_note
+                .get(note.uid.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
             // Try to read the note body from disk for full-text indexing.
             let body_from_disk: Option<String> =
@@ -579,8 +699,7 @@ impl TantivyIndex {
             ))?;
             count += 1;
 
-            let headings = store.headings_in_note(&note.uid).unwrap_or_default();
-            for h in &headings {
+            for h in headings {
                 writer.add_document(doc!(
                     self.fields.uid => h.uid.clone(),
                     self.fields.kind => "heading".to_string(),
@@ -603,7 +722,7 @@ impl TantivyIndex {
                 .as_deref()
                 .map(|b| b.lines().collect())
                 .unwrap_or_default();
-            for s in &sections {
+            for s in sections {
                 let section_text = if !s.text_content.is_empty() {
                     s.text_content.clone()
                 } else {
@@ -1181,6 +1300,104 @@ mod tests {
         assert_eq!(q.split_whitespace().count(), 5, "query: {q}");
         assert!(q.starts_with("alpha beta"));
         assert!(q.contains("^0.3"));
+    }
+
+    #[test]
+    fn update_notes_batch_indexes_all_notes_with_single_commit() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+
+        // Build a batch of three notes — each with a distinctive term.
+        let notes = vec![
+            (
+                "note:b1".to_string(),
+                "Batch Alpha".to_string(),
+                "vlt:t".to_string(),
+                vec!["alpha unique term here".to_string()],
+                vec![],
+                vec![],
+                vec![],
+            ),
+            (
+                "note:b2".to_string(),
+                "Batch Beta".to_string(),
+                "vlt:t".to_string(),
+                vec!["beta distinctive phrase".to_string()],
+                vec![("head:b2:1".to_string(), "Beta Heading".to_string())],
+                vec![(
+                    "sec:b2:1".to_string(),
+                    "beta section body".to_string(),
+                    "Beta Heading".to_string(),
+                )],
+                vec![],
+            ),
+            (
+                "note:b3".to_string(),
+                "Batch Gamma".to_string(),
+                "vlt:t".to_string(),
+                vec!["gamma exclusive content".to_string()],
+                vec![],
+                vec![],
+                vec![],
+            ),
+        ];
+
+        idx.update_notes_batch(&notes).unwrap();
+
+        // All three notes must be searchable after the single commit.
+        assert!(
+            !idx.search("alpha", 5).unwrap().is_empty(),
+            "note:b1 should be findable"
+        );
+        assert!(
+            !idx.search("beta", 5).unwrap().is_empty(),
+            "note:b2 should be findable"
+        );
+        assert!(
+            !idx.search("gamma", 5).unwrap().is_empty(),
+            "note:b3 should be findable"
+        );
+
+        // Re-batching replaces old docs — the old body term that does NOT
+        // appear in the new title or body must vanish from the index.
+        let updated = vec![(
+            "note:b1".to_string(),
+            "Batch Alpha Renamed".to_string(),
+            "vlt:t".to_string(),
+            vec!["completely different body".to_string()],
+            vec![],
+            vec![],
+            vec![],
+        )];
+        idx.update_notes_batch(&updated).unwrap();
+        // "peculiar" only appeared in the old body ("alpha unique term here"
+        // doesn't contain it, but "term" does — use a truly absent word).
+        // Search for "term" which was in the old body but not the new one.
+        assert!(
+            idx.search("term", 5)
+                .unwrap()
+                .iter()
+                .all(|h| h.uid != "note:b1"),
+            "stale body term should no longer hit note:b1 after re-batch"
+        );
+        assert!(
+            !idx.search("different", 5).unwrap().is_empty(),
+            "new content should be searchable after re-batch"
+        );
+    }
+
+    #[test]
+    fn update_notes_batch_reader_only_returns_writer_unavailable() {
+        let dir = tempdir().unwrap();
+        let _w = TantivyIndex::open_or_create(dir.path()).unwrap();
+        drop(_w);
+
+        let reader = TantivyIndex::open_reader_only(dir.path()).unwrap();
+        let err = reader.update_notes_batch(&[]).unwrap_err();
+        assert!(
+            matches!(err, TantivyError::WriterUnavailable),
+            "expected WriterUnavailable, got: {err}"
+        );
     }
 
     #[test]
