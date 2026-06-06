@@ -55,6 +55,18 @@ pub fn resolve_references_with_context(
 ) -> Vec<ResolvedEdge> {
     let graph = build_import_graph(files, language, workspace_ctx);
 
+    // Pre-sort symbols per file so find_enclosing_symbol's binary search invariant holds.
+    // Tree-sitter guarantees sorted output in production, but callers (e.g. property tests)
+    // may pass unsorted symbols, so we sort defensively here once per call.
+    let sorted_symbols_per_file: Vec<Vec<&RawSymbol>> = files
+        .iter()
+        .map(|(_, symbols, _)| {
+            let mut v: Vec<&RawSymbol> = symbols.iter().collect();
+            v.sort_by_key(|s| s.start_line);
+            v
+        })
+        .collect();
+
     // Build a lookup: symbol_name → Vec<(file_path, RawSymbol)>
     let mut symbol_map: std::collections::HashMap<String, Vec<(&str, &RawSymbol)>> =
         std::collections::HashMap::new();
@@ -72,10 +84,10 @@ pub fn resolve_references_with_context(
     let extends_map: std::collections::HashMap<String, Vec<String>> = {
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for (_, symbols, references) in files {
+        for ((_, _, references), sorted_syms) in files.iter().zip(sorted_symbols_per_file.iter()) {
             for reference in references {
                 if reference.kind == ReferenceKind::Extends
-                    && let Some(sym) = find_enclosing_symbol(symbols, reference.start_line)
+                    && let Some(sym) = find_enclosing_symbol(sorted_syms, reference.start_line)
                     && matches!(
                         sym.kind,
                         SymbolKind::Class
@@ -95,7 +107,9 @@ pub fn resolve_references_with_context(
 
     let mut edges: Vec<ResolvedEdge> = Vec::new();
 
-    for (file_path, symbols, references) in files {
+    for ((file_path, _symbols, references), sorted_syms) in
+        files.iter().zip(sorted_symbols_per_file.iter())
+    {
         'ref_loop: for reference in references {
             let edge_type = match reference.kind {
                 ReferenceKind::Call => EdgeType::Calls,
@@ -108,7 +122,7 @@ pub fn resolve_references_with_context(
             };
 
             // Find the enclosing symbol: symbol in same file with largest start_line <= reference.start_line
-            let source_sym = find_enclosing_symbol(symbols, reference.start_line);
+            let source_sym = find_enclosing_symbol(sorted_syms, reference.start_line);
             let source_uid = match source_sym {
                 Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
                 None => {
@@ -399,6 +413,13 @@ pub fn resolve_references_with_context(
         .map(|(path, syms, _)| (path.as_str(), syms))
         .collect();
 
+    // Build a file → sorted symbols lookup for find_enclosing_symbol in Pass 3b.
+    let file_sorted_symbols: std::collections::HashMap<&str, &Vec<&RawSymbol>> = files
+        .iter()
+        .zip(sorted_symbols_per_file.iter())
+        .map(|((path, _, _), sorted)| (path.as_str(), sorted))
+        .collect();
+
     // Build a file → references lookup for import reference line matching.
     let file_refs: std::collections::HashMap<&str, &Vec<RawReference>> = files
         .iter()
@@ -441,6 +462,11 @@ pub fn resolve_references_with_context(
             _ => continue,
         };
 
+        let source_sorted_syms: &[&RawSymbol] = match file_sorted_symbols.get(file_path.as_str()) {
+            Some(syms) if !syms.is_empty() => syms.as_slice(),
+            _ => continue,
+        };
+
         let empty_refs = Vec::new();
         let source_refs = file_refs
             .get(file_path.as_str())
@@ -461,7 +487,7 @@ pub fn resolve_references_with_context(
 
             // Use enclosing symbol at import line, or fall back to first symbol in file.
             let source_sym = import_line
-                .and_then(|line| find_enclosing_symbol(source_symbols, line))
+                .and_then(|line| find_enclosing_symbol(source_sorted_syms, line))
                 .or_else(|| source_symbols.first());
 
             let source_uid = match source_sym {
@@ -519,11 +545,25 @@ pub fn resolve_references_with_context(
 }
 
 /// Find the enclosing symbol: the symbol with the largest start_line that is <= reference line.
-fn find_enclosing_symbol(symbols: &[RawSymbol], ref_line: u32) -> Option<&RawSymbol> {
-    symbols
-        .iter()
-        .filter(|s| s.start_line <= ref_line)
-        .max_by_key(|s| s.start_line)
+///
+/// Requires `symbols` to be sorted by `start_line` ascending (tree-sitter LR-parser guarantee).
+/// Uses binary search (O(log n)) instead of a linear scan (O(n)).
+fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Option<&'a RawSymbol> {
+    debug_assert!(
+        symbols
+            .windows(2)
+            .all(|w| w[0].start_line <= w[1].start_line),
+        "find_enclosing_symbol requires symbols sorted by start_line"
+    );
+    if symbols.is_empty() {
+        return None;
+    }
+    let idx = symbols.partition_point(|s| s.start_line <= ref_line);
+    if idx == 0 {
+        None
+    } else {
+        Some(symbols[idx - 1])
+    }
 }
 
 #[cfg(test)]
@@ -982,6 +1022,81 @@ mod tests {
         );
         assert_eq!(call.evidence[0].kind, "same_file");
         assert!(call.evidence[0].weight > 0.0);
+    }
+
+    #[test]
+    fn find_enclosing_symbol_binary_search_correctness() {
+        // Helper that runs both the old linear scan and the new binary search,
+        // asserting they agree, then returns the start_line of the result.
+        fn linear_scan(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
+            symbols
+                .iter()
+                .filter(|s| s.start_line <= ref_line)
+                .max_by_key(|s| s.start_line)
+                .map(|s| s.start_line)
+        }
+
+        fn check(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
+            // find_enclosing_symbol requires &[&RawSymbol]; build a sorted refs slice.
+            let sorted: Vec<&RawSymbol> = {
+                let mut v: Vec<&RawSymbol> = symbols.iter().collect();
+                v.sort_by_key(|s| s.start_line);
+                v
+            };
+            let binary = find_enclosing_symbol(&sorted, ref_line).map(|s| s.start_line);
+            let linear = linear_scan(symbols, ref_line);
+            assert_eq!(
+                binary, linear,
+                "binary search and linear scan disagree for ref_line={ref_line}"
+            );
+            binary
+        }
+
+        // Empty slice → None
+        assert!(check(&[], 5).is_none());
+
+        let symbols = vec![
+            make_symbol("a", 10),
+            make_symbol("b", 20),
+            make_symbol("c", 30),
+        ];
+
+        // ref_line before all symbols → None
+        assert!(check(&symbols, 5).is_none());
+
+        // ref_line exactly on first symbol → first symbol
+        assert_eq!(check(&symbols, 10), Some(10));
+
+        // ref_line between first and second → first symbol
+        assert_eq!(check(&symbols, 15), Some(10));
+
+        // ref_line exactly on second symbol → second symbol
+        assert_eq!(check(&symbols, 20), Some(20));
+
+        // ref_line between second and third → second symbol
+        assert_eq!(check(&symbols, 25), Some(20));
+
+        // ref_line exactly on last symbol → last symbol
+        assert_eq!(check(&symbols, 30), Some(30));
+
+        // ref_line after all symbols → last symbol
+        assert_eq!(check(&symbols, 999), Some(30));
+
+        // Single symbol — before it → None
+        let single = vec![make_symbol("only", 5)];
+        assert!(check(&single, 1).is_none());
+
+        // Single symbol — exactly on it → that symbol
+        assert_eq!(check(&single, 5), Some(5));
+
+        // Single symbol — after it → that symbol
+        assert_eq!(check(&single, 50), Some(5));
+
+        // Two symbols with same start_line — either is correct; just verify no panic
+        // and that it agrees with linear scan.
+        let dupes = vec![make_symbol("x", 10), make_symbol("y", 10)];
+        let result = check(&dupes, 10);
+        assert!(result.is_some());
     }
 
     mod snapshot_tests {
