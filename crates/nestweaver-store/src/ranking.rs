@@ -342,9 +342,11 @@ impl GraphScope {
 /// detect scope changes without storing or comparing the full query strings.
 fn scope_hash(scope: &GraphScope) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.node_queries.len().hash(&mut hasher);
     for q in &scope.node_queries {
         q.hash(&mut hasher);
     }
+    scope.edge_queries.len().hash(&mut hasher);
     for eq in &scope.edge_queries {
         eq.query.hash(&mut hasher);
     }
