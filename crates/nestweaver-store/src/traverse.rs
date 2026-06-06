@@ -1,7 +1,21 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+
+/// Cached result of a full symbol table scan, keyed on `graph_generation`.
+///
+/// Stored in `GraphStore::symbol_name_cache` to avoid repeated full-table
+/// scans in `search_symbols_by_name`. Valid as long as `generation` matches
+/// the current `graph_generation`; stale once any reindex bumps that counter.
+pub(crate) struct SymbolNameCached {
+    /// The `graph_generation` value at cache-fill time.
+    pub generation: u64,
+    /// All symbols together with their pre-lowercased names for O(n) contains
+    /// matching without re-allocating on every call.
+    pub symbols: Vec<(String, nestweaver_schema::Symbol)>,
+}
 
 /// Minimum impact score for a node to be included in traversal results.
 /// Edges below this threshold are pruned during BFS.
@@ -211,30 +225,181 @@ impl GraphStore {
 
     /// Search symbols whose name contains `query` (case-insensitive substring match).
     /// Returns up to `limit` results.
+    ///
+    /// The full symbol table is loaded once per `graph_generation` and cached in
+    /// `symbol_name_cache`. Subsequent calls within the same generation skip the
+    /// DB round-trip entirely and filter the in-memory list.
     pub fn search_symbols_by_name(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
-        let conn = self.conn()?;
-        // LadybugDB's CONTAINS is case-sensitive and has no toLower().
-        // Load all symbols and filter in Rust for case-insensitive matching.
-        let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS,);
-        let result = conn
-            .query(&q)
-            .map_err(|e| StoreError::Query(format!("query: {e}")))?;
-        let mut matches = Vec::new();
-        for row in result {
-            if let Ok(sym) = crate::read::row_to_symbol(&row)
-                && sym.name.to_lowercase().contains(&needle)
+        let cur_gen = self.graph_generation.load(Ordering::Relaxed);
+
+        // --- Step 1: check the cache (hold the lock only briefly) -----------
+        let cached_symbols: Option<Vec<(String, nestweaver_schema::Symbol)>> = {
+            let guard = self
+                .symbol_name_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref c) = *guard {
+                if c.generation == cur_gen {
+                    Some(c.symbols.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // --- Step 2: on cache miss, query the DB then populate the cache ----
+        let symbols = if let Some(s) = cached_symbols {
+            s
+        } else {
+            // LadybugDB's CONTAINS is case-sensitive and has no toLower().
+            // Load all symbols and filter in Rust for case-insensitive matching.
+            let conn = self.conn()?;
+            let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS);
+            let result = conn
+                .query(&q)
+                .map_err(|e| StoreError::Query(format!("query: {e}")))?;
+
+            let mut all: Vec<(String, nestweaver_schema::Symbol)> = Vec::new();
+            for row in result {
+                if let Ok(sym) = crate::read::row_to_symbol(&row) {
+                    let lower = sym.name.to_lowercase();
+                    all.push((lower, sym));
+                }
+            }
+
+            // Store the populated cache (re-check generation under the lock in
+            // case another thread raced us, preferring the newer fill).
             {
-                matches.push(sym);
+                let mut guard = self
+                    .symbol_name_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let current_gen = self.graph_generation.load(Ordering::Relaxed);
+                let should_update = match &*guard {
+                    None => true,
+                    Some(c) => c.generation != current_gen,
+                };
+                if should_update {
+                    *guard = Some(crate::traverse::SymbolNameCached {
+                        generation: current_gen,
+                        symbols: all.clone(),
+                    });
+                }
+            }
+
+            all
+        };
+
+        // --- Step 3: filter the in-memory list ------------------------------
+        let mut matches = Vec::new();
+        for (lower, sym) in &symbols {
+            if lower.contains(&needle) {
+                matches.push(sym.clone());
                 if matches.len() >= limit {
                     break;
                 }
             }
         }
         Ok(matches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+    use crate::db::GraphStore;
+
+    fn make_symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+        }
+    }
+
+    /// Verify that `search_symbols_by_name` returns consistent results across
+    /// two calls and that the second call is served from the cache.
+    #[test]
+    fn symbol_name_cache_returns_same_results_on_second_call() {
+        let store = GraphStore::in_memory().unwrap();
+
+        store.insert_symbol(&make_symbol("s1", "FooBar")).unwrap();
+        store.insert_symbol(&make_symbol("s2", "FooQux")).unwrap();
+        store.insert_symbol(&make_symbol("s3", "BazBaz")).unwrap();
+
+        // First call — cache miss, queries DB.
+        let first = store.search_symbols_by_name("foo", 10).unwrap();
+        assert_eq!(first.len(), 2, "expected FooBar and FooQux");
+
+        // Second call — should hit the cache. Results must be identical.
+        let second = store.search_symbols_by_name("foo", 10).unwrap();
+        assert_eq!(second.len(), 2, "cached call must return the same count");
+
+        // The UIDs returned by both calls must be the same set.
+        let mut uids_first: Vec<&str> = first.iter().map(|s| s.uid.as_str()).collect();
+        let mut uids_second: Vec<&str> = second.iter().map(|s| s.uid.as_str()).collect();
+        uids_first.sort_unstable();
+        uids_second.sort_unstable();
+        assert_eq!(uids_first, uids_second);
+
+        // Verify the cache is populated.
+        {
+            let guard = store.symbol_name_cache.lock().unwrap();
+            assert!(guard.is_some(), "cache must be populated after first call");
+            assert_eq!(
+                guard.as_ref().unwrap().symbols.len(),
+                3,
+                "cache must hold all inserted symbols"
+            );
+        }
+    }
+
+    /// After bumping `graph_generation`, the next call must re-query the DB
+    /// (cache miss) and reflect the new symbol table.
+    #[test]
+    fn symbol_name_cache_invalidated_on_generation_bump() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("s1", "Alpha")).unwrap();
+
+        let first = store.search_symbols_by_name("alpha", 10).unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Simulate a reindex bump.
+        store.bump_graph_generation();
+
+        // Insert a second symbol that would have been picked up by "alpha" —
+        // it won't match, but we add a new "AlphaBeta" that should appear.
+        store
+            .insert_symbol(&make_symbol("s2", "AlphaBeta"))
+            .unwrap();
+
+        let second = store.search_symbols_by_name("alpha", 10).unwrap();
+        assert_eq!(
+            second.len(),
+            2,
+            "after generation bump the cache should be refreshed and include the new symbol"
+        );
     }
 }
