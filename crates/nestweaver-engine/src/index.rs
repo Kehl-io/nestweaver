@@ -1486,22 +1486,20 @@ fn process_added_or_modified_file(
 
 /// Delete all File nodes (and their symbols) that belong to a repo,
 /// then delete the Repo node itself.  Used before a forced full re-index.
+///
+/// Uses two bulk DETACH DELETE queries (one for Symbol, one for File)
+/// instead of the previous per-file loop that issued O(2N) queries.
 fn delete_repo_all_data(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
 ) -> Result<(), anyhow::Error> {
-    let files = store
-        .list_files_by_repo(r_uid)
-        .with_context(|| "list_files_by_repo")?;
+    let (file_count, sym_count) = store
+        .bulk_delete_repo_files_and_symbols(r_uid)
+        .with_context(|| "bulk_delete_repo_files_and_symbols")?;
 
-    for (f_uid, f_path) in &files {
-        store
-            .delete_symbols_in_file(r_uid, f_path)
-            .with_context(|| format!("delete_symbols_in_file {}", f_path))?;
-        store
-            .delete_file_node(f_uid)
-            .with_context(|| format!("delete_file_node {}", f_uid))?;
-    }
+    tracing::debug!(
+        "delete_repo_all_data: removed {sym_count} symbols and {file_count} files for repo {r_uid}"
+    );
 
     // Clear repo-scoped derived nodes (Service, Contract) so a forced full
     // re-index does not collide on their deterministic primary keys.
