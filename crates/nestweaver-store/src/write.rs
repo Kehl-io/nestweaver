@@ -2102,15 +2102,17 @@ impl GraphStore {
         &self,
         repo_uid: &str,
     ) -> Result<(usize, usize), StoreError> {
-        let safe_rid = repo_uid.replace('\'', "\\'");
+        let rid = lbug::Value::String(repo_uid.to_string());
+
+        let conn = self.begin_transaction()?;
 
         // Count before deleting so the caller can log what was removed.
         let sym_count: usize = {
-            let conn = self.conn()?;
+            let mut stmt = conn
+                .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid RETURN count(s)")
+                .map_err(|e| StoreError::Query(format!("prepare count symbols: {e}")))?;
             let rows = conn
-                .query(&format!(
-                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_rid}' RETURN count(s)"
-                ))
+                .execute(&mut stmt, vec![("rid", rid.clone())])
                 .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
@@ -2122,11 +2124,11 @@ impl GraphStore {
             .unwrap_or(0)
         };
         let file_count: usize = {
-            let conn = self.conn()?;
+            let mut stmt = conn
+                .prepare("MATCH (f:File) WHERE f.repo_uid = $rid RETURN count(f)")
+                .map_err(|e| StoreError::Query(format!("prepare count files: {e}")))?;
             let rows = conn
-                .query(&format!(
-                    "MATCH (f:File) WHERE f.repo_uid = '{safe_rid}' RETURN count(f)"
-                ))
+                .execute(&mut stmt, vec![("rid", rid.clone())])
                 .map_err(|e| StoreError::Query(format!("count files: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
@@ -2138,24 +2140,19 @@ impl GraphStore {
             .unwrap_or(0)
         };
 
-        // Single bulk DETACH DELETE for all symbols in the repo.
-        {
-            let conn = self.conn()?;
-            conn.query(&format!(
-                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_rid}' DETACH DELETE s"
-            ))
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid DETACH DELETE s")
+            .map_err(|e| StoreError::Query(format!("prepare delete symbols: {e}")))?;
+        conn.execute(&mut stmt, vec![("rid", rid.clone())])
             .map_err(|e| StoreError::Query(format!("bulk delete symbols: {e}")))?;
-        }
 
-        // Single bulk DETACH DELETE for all files in the repo.
-        {
-            let conn = self.conn()?;
-            conn.query(&format!(
-                "MATCH (f:File) WHERE f.repo_uid = '{safe_rid}' DETACH DELETE f"
-            ))
+        let mut stmt = conn
+            .prepare("MATCH (f:File) WHERE f.repo_uid = $rid DETACH DELETE f")
+            .map_err(|e| StoreError::Query(format!("prepare delete files: {e}")))?;
+        conn.execute(&mut stmt, vec![("rid", rid)])
             .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
-        }
 
+        self.commit_transaction(&conn)?;
         Ok((file_count, sym_count))
     }
 

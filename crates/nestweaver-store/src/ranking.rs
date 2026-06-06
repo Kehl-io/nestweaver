@@ -652,9 +652,7 @@ impl GraphStore {
         // --- PPR graph cache check -------------------------------------------
         // Read the current generation before locking the cache so we never hold
         // the mutex across the (potentially expensive) DB queries.
-        let current_gen = self
-            .graph_generation
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let current_gen = self.graph_generation();
         let s_hash = scope_hash(scope);
 
         // Step 1: check cache (lock, compare key, unlock).
