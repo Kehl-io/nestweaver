@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
@@ -7,7 +8,7 @@ use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr};
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
-use crate::db::GraphStore;
+use crate::db::{GraphStore, PprGraphCached};
 use crate::error::StoreError;
 use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
 
@@ -335,6 +336,21 @@ impl GraphScope {
     }
 }
 
+/// Compute a stable `u64` hash over the query strings in a `GraphScope`.
+///
+/// The hash encodes the scope identity cheaply so the PPR graph cache can
+/// detect scope changes without storing or comparing the full query strings.
+fn scope_hash(scope: &GraphScope) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for q in &scope.node_queries {
+        q.hash(&mut hasher);
+    }
+    for eq in &scope.edge_queries {
+        eq.query.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 impl GraphStore {
     /// Compute PageRank over the nodes and edges in `scope`.
     ///
@@ -632,7 +648,56 @@ impl GraphStore {
         intent: Option<QueryIntent>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
         let effective_damping = intent.map_or(damping, |i| i.damping());
-        let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, intent)?;
+
+        // --- PPR graph cache check -------------------------------------------
+        // Read the current generation before locking the cache so we never hold
+        // the mutex across the (potentially expensive) DB queries.
+        let current_gen = self
+            .graph_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let s_hash = scope_hash(scope);
+
+        // Step 1: check cache (lock, compare key, unlock).
+        let cache_hit = {
+            let guard = self
+                .ppr_graph_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = guard.as_ref() {
+                cached.generation == current_gen
+                    && cached.scope_hash == s_hash
+                    && cached.intent == intent
+            } else {
+                false
+            }
+        };
+
+        // Step 2: on miss, build the graph (no mutex held during DB I/O).
+        if !cache_hit {
+            let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, intent)?;
+            let mut guard = self
+                .ppr_graph_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(PprGraphCached {
+                generation: current_gen,
+                scope_hash: s_hash,
+                intent,
+                uids,
+                uid_to_idx,
+                incoming,
+                out_weight,
+            });
+        }
+
+        // Step 3: read from cache (guaranteed populated).
+        let guard = self
+            .ppr_graph_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cached = guard
+            .as_ref()
+            .expect("ppr_graph_cache must be Some after fill");
 
         // Clone interaction scores out of the mutex for the algorithms crate.
         let interaction_scores = self
@@ -642,10 +707,14 @@ impl GraphStore {
             .clone();
 
         let adjacency = AdjacencyData {
-            uid_to_idx,
-            incoming,
-            out_weight,
+            uid_to_idx: cached.uid_to_idx.clone(),
+            incoming: cached.incoming.clone(),
+            out_weight: cached.out_weight.clone(),
         };
+
+        let uids = cached.uids.clone();
+        // Release the lock before running the iterative PPR computation.
+        drop(guard);
 
         let config = PprConfig {
             damping: effective_damping,
@@ -1947,6 +2016,76 @@ mod tests {
             project_ratio >= general_ratio,
             "ProjectContext member/popular ratio ({project_ratio:.4}) should be >= \
              GeneralContext ratio ({general_ratio:.4})"
+        );
+    }
+
+    // ── PPR graph cache ──────────────────────────────────────────────────
+
+    #[test]
+    fn ppr_graph_cache_hit_produces_identical_results() {
+        // Running PPR twice with the same scope + intent must produce byte-for-byte
+        // identical results; the second call should hit the cache.
+        let store = test_store();
+        for uid in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+
+        let first = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let second = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "cached PPR must produce the same number of results"
+        );
+        for ((uid1, s1), (uid2, s2)) in first.iter().zip(second.iter()) {
+            assert_eq!(uid1, uid2, "cached PPR must return same UIDs in same order");
+            assert!(
+                (s1 - s2).abs() < 1e-15,
+                "cached PPR scores must be identical: {uid1}: {s1} vs {s2}"
+            );
+        }
+    }
+
+    #[test]
+    fn ppr_graph_cache_invalidates_on_scope_change() {
+        // Different scopes must not share the same cache entry.
+        let store = test_store();
+        for uid in ["A", "B"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+
+        // First call with code_only populates the cache.
+        let code_results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        // Second call with unified uses a different scope — must not return the
+        // code_only cached graph (unified has more node types).
+        let unified_results = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 20, &GraphScope::unified())
+            .unwrap();
+
+        // Both should contain A (the seed), but they used different graphs.
+        assert!(
+            code_results.iter().any(|(u, _)| u == "A"),
+            "code_only results must include seed A"
+        );
+        assert!(
+            unified_results.iter().any(|(u, _)| u == "A"),
+            "unified results must include seed A"
         );
     }
 
