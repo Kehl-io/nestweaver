@@ -618,6 +618,57 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Wrap all markdown vault inserts in a single transaction.
+    ///
+    /// Accepts the full set of data produced by `index_into_store` (notes,
+    /// headings, sections, structural edges, tags, and cross-reference edges)
+    /// and writes everything atomically, avoiding per-statement WAL flushes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_write(
+        &self,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Insert node tables first so edge MATCH clauses find their endpoints.
+        Self::batch_insert_notes_on(&conn, notes)?;
+        Self::batch_insert_headings_on(&conn, headings)?;
+        Self::batch_insert_sections_on(&conn, sections)?;
+
+        // Structural containment edges.
+        Self::batch_insert_vault_note_edges_on(&conn, vault_note_edges)?;
+        Self::batch_insert_note_heading_edges_on(&conn, note_heading_edges)?;
+        Self::batch_insert_note_section_edges_on(&conn, note_section_edges)?;
+        Self::batch_insert_heading_section_edges_on(&conn, heading_section_edges)?;
+        Self::batch_insert_heading_parent_edges_on(&conn, heading_parent_edges)?;
+
+        // Tags (nodes + edges). Tags may already exist from a previous index
+        // run; the caller is responsible for deduplicating `tags` by uid before
+        // passing them in.
+        Self::batch_insert_tags_on(&conn, tags)?;
+        Self::batch_insert_note_tag_edges_on(&conn, note_tag_edges)?;
+        Self::batch_insert_section_tag_edges_on(&conn, section_tag_edges)?;
+
+        // Cross-reference wikilink edges.
+        Self::batch_insert_wikilink_to_note_edges_on(&conn, wikilink_to_note_edges)?;
+        Self::batch_insert_wikilink_to_heading_edges_on(&conn, wikilink_to_heading_edges)?;
+
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         Self::batch_insert_edges_on(&conn, edges)?;

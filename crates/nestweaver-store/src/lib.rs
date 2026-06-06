@@ -1075,4 +1075,114 @@ mod tests {
         let listed = store.list_notes(Some("vlt:txn")).unwrap();
         assert_eq!(listed.len(), 2);
     }
+
+    #[test]
+    fn bulk_vault_write_inserts_notes_headings_sections_and_edges() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
+        let store = test_store();
+
+        // Insert the vault first so VAULT_HAS_NOTE edge MATCH finds it.
+        let vault = Vault {
+            uid: "vlt:bvw".to_string(),
+            name: "bvw-vault".to_string(),
+            root_path: "/tmp/bvw".to_string(),
+            instance_id: "default".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+
+        let notes = vec![
+            Note {
+                uid: "note:bvw:n1".to_string(),
+                vault_uid: "vlt:bvw".to_string(),
+                file_path: "n1.md".to_string(),
+                title: "Note One".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: "h1".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+            Note {
+                uid: "note:bvw:n2".to_string(),
+                vault_uid: "vlt:bvw".to_string(),
+                file_path: "n2.md".to_string(),
+                title: "Note Two".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 20,
+                content_hash: "h2".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+        ];
+
+        let headings = vec![Heading {
+            uid: "hdg:bvw:h1".to_string(),
+            note_uid: "note:bvw:n1".to_string(),
+            level: 2,
+            text: "Intro".to_string(),
+            slug: "intro".to_string(),
+            start_line: 1,
+            end_line: 5,
+            content_hash: "hh1".to_string(),
+        }];
+
+        let sections = vec![Section {
+            uid: "sec:bvw:s1".to_string(),
+            note_uid: "note:bvw:n1".to_string(),
+            heading_uid: Some("hdg:bvw:h1".to_string()),
+            start_line: 1,
+            end_line: 5,
+            text_hash: "sh1".to_string(),
+            text_content: "Section body text.".to_string(),
+            word_count: 3,
+            pagerank_score: None,
+        }];
+
+        let tags = vec![Tag {
+            uid: "tag:bvw:rust".to_string(),
+            vault_uid: "vlt:bvw".to_string(),
+            name: "rust".to_string(),
+        }];
+
+        let vault_note_edges: Vec<(&str, &str)> =
+            vec![("vlt:bvw", "note:bvw:n1"), ("vlt:bvw", "note:bvw:n2")];
+        let note_heading_edges: Vec<(&str, &str)> = vec![("note:bvw:n1", "hdg:bvw:h1")];
+        let note_section_edges: Vec<(&str, &str)> = vec![("note:bvw:n1", "sec:bvw:s1")];
+        let heading_section_edges: Vec<(&str, &str)> = vec![("hdg:bvw:h1", "sec:bvw:s1")];
+        let note_tag_edges: Vec<(&str, &str)> = vec![("note:bvw:n1", "tag:bvw:rust")];
+        let wikilink_to_note_edges: Vec<(&str, &str, f32, &str)> =
+            vec![("sec:bvw:s1", "note:bvw:n2", 1.0, "Note Two")];
+
+        store
+            .bulk_vault_write(
+                &notes,
+                &headings,
+                &sections,
+                &vault_note_edges,
+                &note_heading_edges,
+                &note_section_edges,
+                &heading_section_edges,
+                &[],
+                &tags,
+                &note_tag_edges,
+                &[],
+                &wikilink_to_note_edges,
+                &[],
+            )
+            .unwrap();
+
+        // Verify nodes were inserted.
+        let count = store.count_notes().unwrap();
+        assert_eq!(count, 2);
+
+        let listed = store.list_notes(Some("vlt:bvw")).unwrap();
+        assert_eq!(listed.len(), 2);
+        let titles: Vec<_> = listed.iter().map(|n| n.title.as_str()).collect();
+        assert!(titles.contains(&"Note One"));
+        assert!(titles.contains(&"Note Two"));
+    }
 }
