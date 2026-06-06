@@ -15,6 +15,11 @@ use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+/// Per-file entry accumulated during Phase 2 and consumed in Phase 3.
+/// The 4th field carries the retained source string (up to 2 MB) so Phase 3
+/// can build type environments without re-reading files from disk.
+type ParsedFileEntry = (String, Vec<RawSymbol>, Vec<RawReference>, Option<String>);
+
 /// F2.2: data captured per Spring/NestJS controller file so handler →
 /// contract edges can be derived after the bulk symbol insert.
 struct HandlerFileData {
@@ -510,12 +515,19 @@ fn index_into_store(
             match parse_source(path, &source) {
                 Ok(parsed) => {
                     parse_pb.inc(1);
-                    // Retain source only for TS/JS, where NestJS class/method
-                    // decorators live above the declaration and are not in the
-                    // parsed signatures. Other languages don't need it.
+                    // Retain source for all languages up to 2 MB so Phase 3
+                    // (type env build) can skip redundant disk re-reads.
+                    // TS/JS must clone because `source` is still needed below
+                    // for NestJS controller detection; other languages move it.
+                    const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
                     let retained_source =
-                        matches!(*lang, Language::TypeScript | Language::JavaScript)
-                            .then(|| source.clone());
+                        if matches!(*lang, Language::TypeScript | Language::JavaScript) {
+                            Some(source.clone())
+                        } else if source.len() <= SOURCE_RETENTION_CAP {
+                            Some(source)
+                        } else {
+                            None
+                        };
                     ParseOutcome::Parsed {
                         rel_path: display_name,
                         lang: *lang,
@@ -545,8 +557,7 @@ fn index_into_store(
     let mut all_symbols: Vec<Symbol> = Vec::new();
     let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
     let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
-    let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
-        Vec::new();
+    let mut parsed_files_for_resolver: Vec<ParsedFileEntry> = Vec::new();
     let mut ast_bindings_by_file: HashMap<String, Vec<AstTypeBinding>> = HashMap::new();
     let mut detected_languages: Vec<Language> = Vec::new();
     // F2.2: per framework file, the controller class signature + the (uid,
@@ -701,7 +712,7 @@ fn index_into_store(
                 if !raw_type_bindings.is_empty() {
                     ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
                 }
-                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references));
+                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, source));
             }
         }
     }
@@ -820,22 +831,27 @@ fn index_into_store(
         nestweaver_resolver::types::TypeEnvironment,
     > = {
         let mut envs = std::collections::HashMap::new();
-        for (file_path, symbols, _references) in &parsed_files_for_resolver {
+        for (file_path, symbols, _references, source_opt) in &parsed_files_for_resolver {
             let full_path = repo_path.join(file_path);
-            if let Ok(source) = std::fs::read_to_string(&full_path) {
-                let empty_bindings = Vec::new();
-                let file_ast_bindings = ast_bindings_by_file
-                    .get(file_path)
-                    .unwrap_or(&empty_bindings);
-                let env = nestweaver_resolver::types::TypeEnvironment::build(
-                    &source,
-                    language,
-                    symbols,
-                    file_ast_bindings,
-                );
-                if env.binding_count() > 0 {
-                    envs.insert(file_path.clone(), env);
-                }
+            let source_str = match source_opt {
+                Some(s) => s.clone(),
+                None => match std::fs::read_to_string(&full_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+            };
+            let empty_bindings = Vec::new();
+            let file_ast_bindings = ast_bindings_by_file
+                .get(file_path)
+                .unwrap_or(&empty_bindings);
+            let env = nestweaver_resolver::types::TypeEnvironment::build(
+                &source_str,
+                language,
+                symbols,
+                file_ast_bindings,
+            );
+            if env.binding_count() > 0 {
+                envs.insert(file_path.clone(), env);
             }
         }
         tracing::info!(
@@ -853,7 +869,7 @@ fn index_into_store(
             &nestweaver_parser::RawSymbol,
         > = parsed_files_for_resolver
             .iter()
-            .flat_map(|(_, syms, _)| syms.iter())
+            .flat_map(|(_, syms, _, _)| syms.iter())
             .filter(|s| {
                 s.type_info
                     .as_ref()
@@ -865,14 +881,19 @@ fn index_into_store(
 
         if !all_symbols_with_returns.is_empty() {
             let mut seeded = 0usize;
-            for (file_path, _symbols, _refs) in &parsed_files_for_resolver {
+            for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
                 if let Some(env) = type_envs.get_mut(file_path) {
                     let full_path = repo_path.join(file_path);
-                    if let Ok(source) = std::fs::read_to_string(&full_path) {
-                        let before = env.binding_count();
-                        env.seed_return_types(&source, &all_symbols_with_returns);
-                        seeded += env.binding_count() - before;
-                    }
+                    let source_str = match source_opt {
+                        Some(s) => s.clone(),
+                        None => match std::fs::read_to_string(&full_path) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        },
+                    };
+                    let before = env.binding_count();
+                    env.seed_return_types(&source_str, &all_symbols_with_returns);
+                    seeded += env.binding_count() - before;
                 }
             }
             if seeded > 0 {
@@ -881,8 +902,13 @@ fn index_into_store(
         }
     }
 
+    // Build a 3-tuple view for the resolver (it does not need source strings).
+    let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = parsed_files_for_resolver
+        .iter()
+        .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
+        .collect();
     let resolved_edges = resolve_references_with_context(
-        &parsed_files_for_resolver,
+        &resolver_view,
         language,
         &r_uid,
         &workspace_ctx,
@@ -924,7 +950,7 @@ fn index_into_store(
         }
 
         let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-        for (rel_path, raw_symbols, _) in &parsed_files_for_resolver {
+        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
             for raw_sym in raw_symbols {
                 if let Some(parent_name) = &raw_sym.parent_name {
                     let key = (rel_path.clone(), parent_name.clone());
