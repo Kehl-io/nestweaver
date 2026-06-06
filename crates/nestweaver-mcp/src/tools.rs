@@ -448,23 +448,31 @@ fn maybe_cached(
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     let result = dispatch_uncached(store, tantivy, name, args)?;
-    if let Ok(bytes) = serde_json::to_vec(&result) {
-        // Insert into the in-process cache, then decide whether to flush.
-        let should_flush = RESPONSE_CACHE.with(|map| {
-            let mut map = map.borrow_mut();
-            let cache = map
-                .entry(db_path.clone())
-                .or_insert_with(|| nestweaver_store::cache::ResponseCache::open(&db_path, max_mb));
-            cache.insert(key, name, &bytes, generation, scope_digest);
-            let count = FLUSH_COUNTER.with(|c| {
-                let next = c.get() + 1;
-                c.set(next);
-                next
+    match serde_json::to_vec(&result) {
+        Ok(bytes) => {
+            // Insert into the in-process cache, then decide whether to flush.
+            let should_flush = RESPONSE_CACHE.with(|map| {
+                let mut map = map.borrow_mut();
+                let cache = map.entry(db_path.clone()).or_insert_with(|| {
+                    nestweaver_store::cache::ResponseCache::open(&db_path, max_mb)
+                });
+                cache.insert(key, name, &bytes, generation, scope_digest);
+                let count = FLUSH_COUNTER.with(|c| {
+                    let next = c.get() + 1;
+                    c.set(next);
+                    next
+                });
+                count >= CACHE_FLUSH_INTERVAL
             });
-            count >= CACHE_FLUSH_INTERVAL
-        });
-        if should_flush {
-            flush_response_cache();
+            if should_flush {
+                flush_response_cache();
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                tool = name,
+                "cache: serialization failed, skipping insert: {e}"
+            );
         }
     }
     Ok(result)
