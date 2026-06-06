@@ -1185,4 +1185,50 @@ mod tests {
         assert!(titles.contains(&"Note One"));
         assert!(titles.contains(&"Note Two"));
     }
+
+    #[test]
+    fn batch_lookup_symbols_returns_all_found() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("sym:batch-1", "alpha", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("sym:batch-2", "beta", "repo-1", "b.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("sym:batch-3", "gamma", "repo-1", "c.rs"))
+            .unwrap();
+
+        let map = store
+            .batch_lookup_symbols(&["sym:batch-1", "sym:batch-2", "sym:batch-3"])
+            .unwrap();
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["sym:batch-1"].name, "alpha");
+        assert_eq!(map["sym:batch-2"].name, "beta");
+        assert_eq!(map["sym:batch-3"].name, "gamma");
+    }
+
+    #[test]
+    fn batch_lookup_symbols_missing_uids_absent_from_map() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("sym:present", "present_fn", "repo-1", "a.rs"))
+            .unwrap();
+
+        let map = store
+            .batch_lookup_symbols(&["sym:present", "sym:ghost"])
+            .unwrap();
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("sym:present"));
+        assert!(!map.contains_key("sym:ghost"));
+    }
+
+    #[test]
+    fn batch_lookup_symbols_empty_input_returns_empty_map() {
+        let store = test_store();
+        let map = store.batch_lookup_symbols(&[]).unwrap();
+        assert!(map.is_empty());
+    }
 }
