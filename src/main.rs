@@ -2158,6 +2158,37 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     Ok(store)
 }
 
+/// Stops the daemon if it is currently running on `db_path`.
+/// Returns `true` if a daemon was found and sent SIGTERM, `false` otherwise.
+fn stop_daemon_if_running(db_path: &Path) -> bool {
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+    let was_running = pidfile.exists()
+        && nestweaver_client::autostart::read_pid(&pidfile)
+            .is_some_and(nestweaver_client::autostart::is_process_alive);
+    if was_running {
+        eprintln!("Stopping daemon to acquire write lock (will restart after)...");
+        if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile) {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !nestweaver_client::autostart::is_process_alive(pid) {
+                    break;
+                }
+            }
+        }
+    }
+    was_running
+}
+
+/// Restarts the daemon, logging a warning if it fails.
+fn restart_daemon(db_path: &Path, config: Option<&Path>) {
+    eprintln!("Restarting daemon...");
+    if let Err(e) = nestweaver_client::autostart::ensure_daemon(db_path, config) {
+        eprintln!("Warning: failed to restart daemon: {e}");
+    }
+}
+
 /// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
 /// `.pagerank.json` sidecar convention.
 fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
@@ -4694,23 +4725,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Materialize requires direct write access — stop the daemon
             // temporarily if it's running on this DB.
-            let daemon_instance = nestweaver_daemon::instance_id_from_db_path(&db_path);
-            let daemon_pid_path = nestweaver_daemon::pidfile_path(&daemon_instance);
-            let daemon_was_running = daemon_pid_path.exists()
-                && nestweaver_client::autostart::read_pid(&daemon_pid_path)
-                    .is_some_and(nestweaver_client::autostart::is_process_alive);
-            if daemon_was_running && !cli.no_daemon {
-                eprintln!("Stopping daemon for materialize-projects (will restart after)...");
-                if let Some(pid) = nestweaver_client::autostart::read_pid(&daemon_pid_path) {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
-                    for _ in 0..50 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if !nestweaver_client::autostart::is_process_alive(pid) {
-                            break;
-                        }
-                    }
-                }
-            }
+            let daemon_was_running = !cli.no_daemon && stop_daemon_if_running(&db_path);
 
             let store = open_store(Some(&db_path))?;
 
@@ -4732,10 +4747,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             );
 
             // Restart daemon if we stopped it
-            if daemon_was_running && !cli.no_daemon {
-                eprintln!("Restarting daemon...");
-                let _ =
-                    nestweaver_client::autostart::ensure_daemon(&db_path, Some(config.as_path()));
+            if daemon_was_running {
+                restart_daemon(&db_path, Some(config.as_path()));
             }
 
             Ok((EXIT_SUCCESS, None))
@@ -4826,24 +4839,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repo_url = format!("file://{}", repo_path.display());
 
             // If a daemon holds the write lock, stop it so we can index directly.
-            let daemon_instance_id =
-                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
-            let daemon_pid_path = nestweaver_daemon::lifecycle::pidfile_path(&daemon_instance_id);
-            let daemon_was_running = daemon_pid_path.exists()
-                && nestweaver_client::autostart::read_pid(&daemon_pid_path)
-                    .is_some_and(nestweaver_client::autostart::is_process_alive);
-            if daemon_was_running {
-                eprintln!("Stopping daemon to acquire write lock (will restart after)...");
-                if let Some(pid) = nestweaver_client::autostart::read_pid(&daemon_pid_path) {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
-                    for _ in 0..50 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if !nestweaver_client::autostart::is_process_alive(pid) {
-                            break;
-                        }
-                    }
-                }
-            }
+            let daemon_was_running = stop_daemon_if_running(&db_path);
 
             out.status(&format!("Indexing {}", repo_path.display()));
 
@@ -4988,11 +4984,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Restart daemon if we stopped it for direct-mode indexing
             if daemon_was_running {
-                eprintln!("Restarting daemon...");
-                let _ = nestweaver_client::autostart::ensure_daemon(
-                    &db_path,
-                    config.as_deref().map(std::path::Path::new),
-                );
+                restart_daemon(&db_path, config.as_deref().map(std::path::Path::new));
             }
 
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -5979,25 +5971,7 @@ fn run_brain(
             }
 
             // If a daemon holds the write lock, stop it so we can index directly.
-            let daemon_instance_id_brain =
-                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
-            let daemon_pid_path_brain =
-                nestweaver_daemon::lifecycle::pidfile_path(&daemon_instance_id_brain);
-            let daemon_was_running_brain = daemon_pid_path_brain.exists()
-                && nestweaver_client::autostart::read_pid(&daemon_pid_path_brain)
-                    .is_some_and(nestweaver_client::autostart::is_process_alive);
-            if daemon_was_running_brain {
-                eprintln!("Stopping daemon to acquire write lock (will restart after)...");
-                if let Some(pid) = nestweaver_client::autostart::read_pid(&daemon_pid_path_brain) {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
-                    for _ in 0..50 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if !nestweaver_client::autostart::is_process_alive(pid) {
-                            break;
-                        }
-                    }
-                }
-            }
+            let daemon_was_running_brain = stop_daemon_if_running(&db_path);
 
             let result = index_markdown_directory_with_ignore(
                 &path,
@@ -6078,8 +6052,7 @@ fn run_brain(
 
             // Restart daemon if we stopped it for direct-mode indexing
             if daemon_was_running_brain {
-                eprintln!("Restarting daemon...");
-                let _ = nestweaver_client::autostart::ensure_daemon(&db_path, None);
+                restart_daemon(&db_path, None);
             }
 
             let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
