@@ -832,41 +832,44 @@ fn index_into_store(
     };
 
     // Build type environments per file for type-aware resolution.
-    let mut type_envs: std::collections::HashMap<
-        String,
-        nestweaver_resolver::types::TypeEnvironment,
-    > = {
-        let mut envs = std::collections::HashMap::new();
-        for (file_path, symbols, _references, source_opt) in &parsed_files_for_resolver {
-            let full_path = repo_path.join(file_path);
-            let source_str = match source_opt {
-                Some(s) => s.clone(),
-                None => match std::fs::read_to_string(&full_path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-            };
-            let empty_bindings = Vec::new();
-            let file_ast_bindings = ast_bindings_by_file
-                .get(file_path)
-                .unwrap_or(&empty_bindings);
-            let env = nestweaver_resolver::types::TypeEnvironment::build(
-                &source_str,
-                language,
-                symbols,
-                file_ast_bindings,
-            );
-            if env.binding_count() > 0 {
-                envs.insert(file_path.clone(), env);
-            }
-        }
-        tracing::info!(
-            files_with_bindings = envs.len(),
-            total_bindings = envs.values().map(|e| e.binding_count()).sum::<usize>(),
-            "type environments built"
-        );
-        envs
-    };
+    // Each file's type env is independent, so we build them in parallel.
+    let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
+        parsed_files_for_resolver
+            .par_iter()
+            .filter_map(|(file_path, symbols, _references, source_opt)| {
+                let source_owned;
+                let source: &str = if let Some(s) = source_opt.as_deref() {
+                    s
+                } else {
+                    let full_path = repo_path.join(file_path);
+                    source_owned = std::fs::read_to_string(&full_path).ok()?;
+                    &source_owned
+                };
+
+                let empty_bindings = Vec::new();
+                let file_ast_bindings = ast_bindings_by_file
+                    .get(file_path.as_str())
+                    .unwrap_or(&empty_bindings);
+
+                let env = nestweaver_resolver::types::TypeEnvironment::build(
+                    source,
+                    language,
+                    symbols,
+                    file_ast_bindings,
+                );
+
+                if env.binding_count() > 0 {
+                    Some((file_path.clone(), env))
+                } else {
+                    None
+                }
+            })
+            .collect();
+    tracing::info!(
+        files_with_bindings = type_envs.len(),
+        total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
+        "type environments built"
+    );
 
     // Cross-file return type propagation: seed bindings from known function return types
     {
