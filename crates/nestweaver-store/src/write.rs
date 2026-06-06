@@ -1691,23 +1691,95 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Cascade-delete a Vault and every Note belonging to it. Calls
-    /// `delete_note_cascade` for each note (which removes its headings +
-    /// sections + cross-reference edges) then drops the Vault node.
-    /// Returns the number of notes removed.
+    /// Cascade-delete a Vault and every Note belonging to it using bulk
+    /// DETACH DELETE queries scoped by `vault_uid` — avoids the O(N) per-note
+    /// query loop that was issuing 4 queries × N notes.
+    ///
+    /// Order of operations (within a single transaction):
+    ///   1. Count notes (before deleting, so we can return the count).
+    ///   2. Delete Sections via edge traversal (NOTE_HAS_SECTION).
+    ///   3. Delete Headings via edge traversal (NOTE_HAS_HEADING).
+    ///   4. Delete UnresolvedWikilinks via cross-node join on source_note_uid.
+    ///   5. Delete all Note nodes (vault_uid property; DETACH removes
+    ///      VAULT_HAS_NOTE, NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and
+    ///      all incoming WIKILINK_TO_NOTE / WIKILINK_TO_HEADING edges).
+    ///   6. Delete Tag nodes belonging to this vault.
+    ///   7. Delete the Vault node itself.
+    ///
+    /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
-        // Find every note belonging to this vault first.
-        let notes = self.list_notes(Some(vault_uid))?;
-        let count = notes.len();
-        for n in &notes {
-            self.delete_note_cascade(&n.uid)?;
-        }
-        let conn = self.conn()?;
+        // Count notes before deletion so we can return the count.
+        let count = {
+            let conn = self.conn()?;
+            let safe_vid = vault_uid.replace('\'', "\\'");
+            let rows = conn
+                .query(&format!(
+                    "MATCH (n:Note) WHERE n.vault_uid = '{safe_vid}' RETURN count(n)"
+                ))
+                .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+
+        let conn = self.begin_transaction()?;
+
+        // 1. Delete all Sections under notes in this vault.
         exec_params(
             &conn,
-            "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
-            vec![("uid", lbug::Value::String(vault_uid.to_string()))],
+            "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
+
+        // 2. Delete all Headings under notes in this vault.
+        exec_params(
+            &conn,
+            "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 3. Delete UnresolvedWikilinks whose source note belongs to this vault.
+        //    Uses a cross-node join: LadybugDB supports `MATCH (a), (b) WHERE a.prop = b.prop`.
+        //    Best-effort: silently skip if the table does not exist on older DBs.
+        {
+            let safe_vid = vault_uid.replace('\'', "\\'");
+            if let Err(e) = conn.query(&format!(
+                "MATCH (n:Note), (u:UnresolvedWikilink) \
+                 WHERE n.vault_uid = '{safe_vid}' AND u.source_note_uid = n.uid \
+                 DELETE u"
+            )) {
+                tracing::trace!("delete_vault_cascade: UnresolvedWikilink delete skipped: {e}");
+            }
+        }
+
+        // 4. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
+        //    PROJECT_INCLUDES_NOTE, and any incoming/outgoing wikilink edges).
+        exec_params(
+            &conn,
+            "MATCH (n:Note {vault_uid: $vid}) DETACH DELETE n",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 5. Delete Tag nodes belonging to this vault.
+        exec_params(
+            &conn,
+            "MATCH (t:Tag {vault_uid: $vid}) DETACH DELETE t",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 6. Delete the Vault node itself.
+        exec_params(
+            &conn,
+            "MATCH (v:Vault {uid: $vid}) DETACH DELETE v",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        self.commit_transaction(&conn)?;
         Ok(count)
     }
 
@@ -2018,6 +2090,73 @@ impl GraphStore {
         self.insert_symbol_with_conn(&conn, &sym)?;
 
         Ok(())
+    }
+
+    /// Bulk-delete all Symbol and File nodes belonging to `repo_uid` using two
+    /// DETACH DELETE queries instead of one per file. Called by `delete_repo_all_data`
+    /// before a forced full re-index. `DETACH DELETE` removes all incident edges
+    /// (FILE_HAS_SYMBOL, REPO_HAS_FILE, CALLS, IMPORTS, etc.) automatically.
+    ///
+    /// Returns `(file_count, symbol_count)` for logging.
+    pub fn bulk_delete_repo_files_and_symbols(
+        &self,
+        repo_uid: &str,
+    ) -> Result<(usize, usize), StoreError> {
+        let safe_rid = repo_uid.replace('\'', "\\'");
+
+        // Count before deleting so the caller can log what was removed.
+        let sym_count: usize = {
+            let conn = self.conn()?;
+            let rows = conn
+                .query(&format!(
+                    "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_rid}' RETURN count(s)"
+                ))
+                .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+        let file_count: usize = {
+            let conn = self.conn()?;
+            let rows = conn
+                .query(&format!(
+                    "MATCH (f:File) WHERE f.repo_uid = '{safe_rid}' RETURN count(f)"
+                ))
+                .map_err(|e| StoreError::Query(format!("count files: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+
+        // Single bulk DETACH DELETE for all symbols in the repo.
+        {
+            let conn = self.conn()?;
+            conn.query(&format!(
+                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_rid}' DETACH DELETE s"
+            ))
+            .map_err(|e| StoreError::Query(format!("bulk delete symbols: {e}")))?;
+        }
+
+        // Single bulk DETACH DELETE for all files in the repo.
+        {
+            let conn = self.conn()?;
+            conn.query(&format!(
+                "MATCH (f:File) WHERE f.repo_uid = '{safe_rid}' DETACH DELETE f"
+            ))
+            .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
+        }
+
+        Ok((file_count, sym_count))
     }
 
     /// Delete a Repo node (and its REPO_HAS_FILE edges) by UID.
