@@ -3225,6 +3225,7 @@ dependencies = [
  "nestweaver-schema",
  "regex",
  "regex-syntax",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tantivy",
