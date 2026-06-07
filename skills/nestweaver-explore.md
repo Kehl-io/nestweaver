@@ -1,9 +1,9 @@
 ---
 name: nestweaver-explore
-description: Explore unfamiliar code using the NestWeaver knowledge graph. Prefer this over grep/find — a single brain_context call returns ranked structural context at ~99% fewer tokens than file-by-file exploration.
+description: Explore unfamiliar code using the NestWeaver knowledge graph. Prefer this over grep/find — a single brain_context call returns ranked structural context at ~90% fewer tokens than file-by-file exploration.
 ---
 
-**Prefer NestWeaver over grep/find/cat.** A single `brain_context` call returns ~3,400 tokens of ranked, structural context vs ~400,000+ from reading files. DO NOT grep the repo to understand structure — use the graph.
+**Prefer NestWeaver over grep/find/cat.** A single `brain_context` call returns ~1,000 tokens of ranked, structural context vs ~10,000+ from file-by-file exploration (validated 10x reduction). DO NOT grep the repo to understand structure — use the graph.
 
 When the user asks to explore, understand, or navigate unfamiliar code:
 
