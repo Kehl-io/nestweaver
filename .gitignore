@@ -67,3 +67,5 @@ crates/nestweaver-web/frontend/playwright-report/
 crates/nestweaver-web/frontend/e2e/fixtures/*.lbug*
 graphify-out/
 nestweaver.filemeta.json
+.mcp.json
+.github/copilot-mcp.json

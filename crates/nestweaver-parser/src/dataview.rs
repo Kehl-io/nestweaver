@@ -18,7 +18,7 @@ static RE_FROM_QUOTED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bFROM\s+"([^"]+)""#).unwrap());
 
 static RE_FROM_TAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bFROM\s+(#[\w/]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bFROM\s+(#[\w/.\-]+)").unwrap());
 
 static RE_WHERE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bWHERE\s+(.+?)(?:\n|$)").unwrap());

@@ -196,7 +196,7 @@ impl NoteKind {
             "design" | "design-doc" | "designdoc" => NoteKind::Design,
             "meeting" | "meeting-note" | "meetingnote" => NoteKind::Meeting,
             "journal" | "daily" | "daily-note" => NoteKind::Journal,
-            "agent-config" | "agentconfig" | "agent" | "config" => NoteKind::AgentConfig,
+            "agent-config" | "agentconfig" => NoteKind::AgentConfig,
             _ => NoteKind::General,
         }
     }
