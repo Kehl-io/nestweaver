@@ -510,6 +510,23 @@ fn title_from_path(rel_path: &str) -> String {
 /// Looks at directory and filename hints.
 fn kind_from_path(rel_path: &str) -> NoteKind {
     let lower = rel_path.to_ascii_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+
+    // Agent config files — detect before general heuristics.
+    if matches!(
+        filename,
+        "claude.md"
+            | "agents.md"
+            | "gemini.md"
+            | ".cursorrules"
+            | "copilot-instructions.md"
+            | ".windsurfrules"
+            | ".clinerules"
+    ) || lower.contains(".github/copilot-instructions")
+    {
+        return NoteKind::AgentConfig;
+    }
+
     if lower.contains("prd") {
         NoteKind::Prd
     } else if lower.contains("design") || lower.contains("rfc") {
@@ -1376,6 +1393,32 @@ top 2 body
         let src = "# n\n\nJust prose, no block refs.\n";
         let note = parse_markdown("x.md", src).unwrap();
         assert!(note.block_refs.is_empty());
+    }
+
+    // ── AgentConfig kind detection ───────────────────────────────────────────
+
+    #[test]
+    fn detects_claude_md_as_agent_config() {
+        let parsed = parse_markdown("CLAUDE.md", "# Instructions\n\nDo this.\n").unwrap();
+        assert_eq!(parsed.note_kind, NoteKind::AgentConfig);
+    }
+
+    #[test]
+    fn detects_agents_md_as_agent_config() {
+        let parsed = parse_markdown("AGENTS.md", "# Agents\n").unwrap();
+        assert_eq!(parsed.note_kind, NoteKind::AgentConfig);
+    }
+
+    #[test]
+    fn detects_copilot_instructions() {
+        let parsed = parse_markdown(".github/copilot-instructions.md", "# Rules\n").unwrap();
+        assert_eq!(parsed.note_kind, NoteKind::AgentConfig);
+    }
+
+    #[test]
+    fn regular_md_not_agent_config() {
+        let parsed = parse_markdown("notes/architecture.md", "# Architecture\n").unwrap();
+        assert_ne!(parsed.note_kind, NoteKind::AgentConfig);
     }
 
     // ── Obsidian comment stripping ───────────────────────────────────────────

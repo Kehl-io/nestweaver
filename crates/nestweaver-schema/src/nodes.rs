@@ -171,6 +171,7 @@ pub enum NoteKind {
     Design,
     Meeting,
     Journal,
+    AgentConfig,
 }
 
 impl fmt::Display for NoteKind {
@@ -181,6 +182,7 @@ impl fmt::Display for NoteKind {
             NoteKind::Design => write!(f, "Design"),
             NoteKind::Meeting => write!(f, "Meeting"),
             NoteKind::Journal => write!(f, "Journal"),
+            NoteKind::AgentConfig => write!(f, "AgentConfig"),
         }
     }
 }
@@ -194,6 +196,7 @@ impl NoteKind {
             "design" | "design-doc" | "designdoc" => NoteKind::Design,
             "meeting" | "meeting-note" | "meetingnote" => NoteKind::Meeting,
             "journal" | "daily" | "daily-note" => NoteKind::Journal,
+            "agent-config" | "agentconfig" | "agent" | "config" => NoteKind::AgentConfig,
             _ => NoteKind::General,
         }
     }
