@@ -191,7 +191,7 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     // 7. Extract headings and sections from the body; annotate callout types.
     let headings = extract_headings(body);
     let mut sections = extract_sections(body, &headings);
-    for (i, sec) in sections.iter_mut().enumerate() {
+    for sec in sections.iter_mut() {
         sec.callout_type = extract_callout_type(&sec.text);
         let (total, checked) = count_checkboxes(&sec.text);
         sec.checkbox_total = total;
@@ -201,7 +201,6 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
         {
             sec.is_adr_section = is_adr_heading(&heading.text);
         }
-        let _ = i;
     }
 
     // 8. Extract wikilinks per section + tags (inline + frontmatter).
@@ -633,7 +632,7 @@ fn extract_wikilinks(sections: &[RawSection]) -> Vec<RawWikilink> {
                 let (vault_prefix, resolved_target) = {
                     let slash_pos = target.find('/').unwrap_or(usize::MAX);
                     if let Some(colon_pos) = target.find(':') {
-                        if colon_pos < slash_pos && colon_pos > 0 {
+                        if colon_pos < slash_pos && colon_pos > 1 {
                             (
                                 Some(target[..colon_pos].to_string()),
                                 target[colon_pos + 1..].to_string(),
