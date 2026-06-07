@@ -216,7 +216,7 @@ cargo build --release
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
-| `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md) |
+| `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
 | `embed` | Generate vector embeddings for indexed symbols |
 | `pull` | Pull a snapshot from a remote storage backend |
