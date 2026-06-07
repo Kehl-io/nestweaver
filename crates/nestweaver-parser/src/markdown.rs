@@ -196,12 +196,12 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
         let (total, checked) = count_checkboxes(&sec.text);
         sec.checkbox_total = total;
         sec.checkbox_checked = checked;
-        if let Some(h_idx) = sec.heading_idx {
-            if let Some(heading) = headings.get(h_idx) {
-                sec.is_adr_section = is_adr_heading(&heading.text);
-            }
+        if let Some(h_idx) = sec.heading_idx
+            && let Some(heading) = headings.get(h_idx)
+        {
+            sec.is_adr_section = is_adr_heading(&heading.text);
         }
-        let _ = i; // suppress unused warning
+        let _ = i;
     }
 
     // 8. Extract wikilinks per section + tags (inline + frontmatter).
