@@ -719,6 +719,59 @@ fn render_legacy_tool_tables(out: &mut String) {
     );
 }
 
+/// Generate CLAUDE.md content from the indexed graph.
+///
+/// Returns a markdown string suitable for writing to `CLAUDE.md` at the
+/// workspace root so Claude Code picks it up automatically at session start.
+pub fn generate_claude_md(
+    store: &GraphStore,
+    config: Option<&InstanceConfig>,
+) -> Result<String, anyhow::Error> {
+    generate_claude_md_with_rules(store, config, None)
+}
+
+/// Like [`generate_claude_md`] but allows overriding the built-in hard rules.
+pub fn generate_claude_md_with_rules(
+    store: &GraphStore,
+    config: Option<&InstanceConfig>,
+    rules: Option<&[OwnedRule]>,
+) -> Result<String, anyhow::Error> {
+    let _ = config; // reserved for future use (feature bundles, declared links)
+
+    let mut out = String::new();
+
+    out.push_str("# Project Instructions\n\n");
+
+    // ── Hard rules (front-of-context, highest attention) ──────────────────
+    out.push_str(&render_rules(rules));
+
+    // ── Architecture section: top hub nodes by centrality ─────────────────
+    out.push_str("## Architecture\n\n");
+    match crate::hubs::find_hub_nodes(store, 10) {
+        Ok(hubs) if !hubs.is_empty() => {
+            out.push_str("Key modules (by centrality):\n\n");
+            for hub in &hubs {
+                out.push_str(&format!("- `{}` — {}\n", hub.file_path, hub.name));
+            }
+            out.push('\n');
+        }
+        _ => {
+            out.push_str("No symbols indexed yet.\n\n");
+        }
+    }
+
+    // ── Code Intelligence section ─────────────────────────────────────────
+    out.push_str("## Code Intelligence\n\n");
+    out.push_str("This project is indexed by NestWeaver. Use these MCP tools:\n\n");
+    out.push_str("- `brain_context` — PPR-ranked structural context from symbol seeds\n");
+    out.push_str("- `brain_impact` — blast radius before modifying code\n");
+    out.push_str("- `brain_search` — full-text search across code and notes\n");
+    out.push_str("- `project_context` — project-scoped notes and symbols\n");
+    out.push_str("- `detect_changes` — assess risk after changes\n");
+
+    Ok(out)
+}
+
 /// Generate a Cursor rule file with MDC frontmatter.
 ///
 /// Returns content suitable for writing to `.cursor/rules/nestweaver.mdc`.
@@ -962,5 +1015,19 @@ mod tests {
         // Legacy tables include Extensions section
         assert!(skill.contains("### Extensions"));
         assert!(skill.contains("set_extension"));
+    }
+
+    #[test]
+    fn generate_claude_md_produces_valid_output() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let output = generate_claude_md(&store, None).unwrap();
+        assert!(output.contains("# Project Instructions"));
+        assert!(output.contains("## Architecture"));
+        assert!(output.contains("## Code Intelligence"));
+        assert!(output.contains("brain_context"));
+        assert!(output.contains("brain_impact"));
+        assert!(output.contains("brain_search"));
+        assert!(output.contains("project_context"));
+        assert!(output.contains("detect_changes"));
     }
 }
