@@ -15,6 +15,11 @@ use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+/// Per-file entry accumulated during Phase 2 and consumed in Phase 3.
+/// The 4th field carries the retained source string (up to 2 MB) so Phase 3
+/// can build type environments without re-reading files from disk.
+type ParsedFileEntry = (String, Vec<RawSymbol>, Vec<RawReference>, Option<String>);
+
 /// F2.2: data captured per Spring/NestJS controller file so handler →
 /// contract edges can be derived after the bulk symbol insert.
 struct HandlerFileData {
@@ -510,12 +515,19 @@ fn index_into_store(
             match parse_source(path, &source) {
                 Ok(parsed) => {
                     parse_pb.inc(1);
-                    // Retain source only for TS/JS, where NestJS class/method
-                    // decorators live above the declaration and are not in the
-                    // parsed signatures. Other languages don't need it.
+                    // Retain source for all languages up to 2 MB so Phase 3
+                    // (type env build) can skip redundant disk re-reads.
+                    // TS/JS must clone because `source` is still needed below
+                    // for NestJS controller detection; other languages move it.
+                    const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
                     let retained_source =
-                        matches!(*lang, Language::TypeScript | Language::JavaScript)
-                            .then(|| source.clone());
+                        if matches!(*lang, Language::TypeScript | Language::JavaScript) {
+                            Some(source.clone())
+                        } else if source.len() <= SOURCE_RETENTION_CAP {
+                            Some(source)
+                        } else {
+                            None
+                        };
                     ParseOutcome::Parsed {
                         rel_path: display_name,
                         lang: *lang,
@@ -545,8 +557,7 @@ fn index_into_store(
     let mut all_symbols: Vec<Symbol> = Vec::new();
     let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
     let mut file_symbol_edge_pairs: Vec<(String, String)> = Vec::new();
-    let mut parsed_files_for_resolver: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
-        Vec::new();
+    let mut parsed_files_for_resolver: Vec<ParsedFileEntry> = Vec::new();
     let mut ast_bindings_by_file: HashMap<String, Vec<AstTypeBinding>> = HashMap::new();
     let mut detected_languages: Vec<Language> = Vec::new();
     // F2.2: per framework file, the controller class signature + the (uid,
@@ -701,7 +712,7 @@ fn index_into_store(
                 if !raw_type_bindings.is_empty() {
                     ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
                 }
-                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references));
+                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, source));
             }
         }
     }
@@ -710,11 +721,17 @@ fn index_into_store(
     //     and some files changed), clean up old File nodes and their symbols
     //     for files we are about to re-insert.
     if existing_repo.is_some() {
-        for file in &all_files {
-            // Remove old symbols belonging to this file.
-            let _ = store.delete_symbols_in_file(&r_uid, &file.path);
-            // Remove old File node.
-            let _ = store.delete_file_node(&file.uid);
+        if files_unchanged == 0 {
+            // Force re-index: all files are being replaced. Bulk delete is O(1) queries.
+            let _ = store.bulk_delete_repo_files_and_symbols(&r_uid);
+        } else {
+            // Incremental: only delete the specific files we're about to re-insert.
+            for file in &all_files {
+                // Remove old symbols belonging to this file.
+                let _ = store.delete_symbols_in_file(&r_uid, &file.path);
+                // Remove old File node.
+                let _ = store.delete_file_node(&file.uid);
+            }
         }
         // BUG FIX: clear repo-scoped derived nodes (Service, Contract) before
         // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID is
@@ -815,36 +832,44 @@ fn index_into_store(
     };
 
     // Build type environments per file for type-aware resolution.
-    let mut type_envs: std::collections::HashMap<
-        String,
-        nestweaver_resolver::types::TypeEnvironment,
-    > = {
-        let mut envs = std::collections::HashMap::new();
-        for (file_path, symbols, _references) in &parsed_files_for_resolver {
-            let full_path = repo_path.join(file_path);
-            if let Ok(source) = std::fs::read_to_string(&full_path) {
+    // Each file's type env is independent, so we build them in parallel.
+    let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
+        parsed_files_for_resolver
+            .par_iter()
+            .filter_map(|(file_path, symbols, _references, source_opt)| {
+                let source_owned;
+                let source: &str = if let Some(s) = source_opt.as_deref() {
+                    s
+                } else {
+                    let full_path = repo_path.join(file_path);
+                    source_owned = std::fs::read_to_string(&full_path).ok()?;
+                    &source_owned
+                };
+
                 let empty_bindings = Vec::new();
                 let file_ast_bindings = ast_bindings_by_file
-                    .get(file_path)
+                    .get(file_path.as_str())
                     .unwrap_or(&empty_bindings);
+
                 let env = nestweaver_resolver::types::TypeEnvironment::build(
-                    &source,
+                    source,
                     language,
                     symbols,
                     file_ast_bindings,
                 );
+
                 if env.binding_count() > 0 {
-                    envs.insert(file_path.clone(), env);
+                    Some((file_path.clone(), env))
+                } else {
+                    None
                 }
-            }
-        }
-        tracing::info!(
-            files_with_bindings = envs.len(),
-            total_bindings = envs.values().map(|e| e.binding_count()).sum::<usize>(),
-            "type environments built"
-        );
-        envs
-    };
+            })
+            .collect();
+    tracing::info!(
+        files_with_bindings = type_envs.len(),
+        total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
+        "type environments built"
+    );
 
     // Cross-file return type propagation: seed bindings from known function return types
     {
@@ -853,7 +878,7 @@ fn index_into_store(
             &nestweaver_parser::RawSymbol,
         > = parsed_files_for_resolver
             .iter()
-            .flat_map(|(_, syms, _)| syms.iter())
+            .flat_map(|(_, syms, _, _)| syms.iter())
             .filter(|s| {
                 s.type_info
                     .as_ref()
@@ -865,14 +890,19 @@ fn index_into_store(
 
         if !all_symbols_with_returns.is_empty() {
             let mut seeded = 0usize;
-            for (file_path, _symbols, _refs) in &parsed_files_for_resolver {
+            for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
                 if let Some(env) = type_envs.get_mut(file_path) {
                     let full_path = repo_path.join(file_path);
-                    if let Ok(source) = std::fs::read_to_string(&full_path) {
-                        let before = env.binding_count();
-                        env.seed_return_types(&source, &all_symbols_with_returns);
-                        seeded += env.binding_count() - before;
-                    }
+                    let source_str = match source_opt {
+                        Some(s) => s.clone(),
+                        None => match std::fs::read_to_string(&full_path) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        },
+                    };
+                    let before = env.binding_count();
+                    env.seed_return_types(&source_str, &all_symbols_with_returns);
+                    seeded += env.binding_count() - before;
                 }
             }
             if seeded > 0 {
@@ -881,8 +911,13 @@ fn index_into_store(
         }
     }
 
+    // Build a 3-tuple view for the resolver (it does not need source strings).
+    let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = parsed_files_for_resolver
+        .iter()
+        .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
+        .collect();
     let resolved_edges = resolve_references_with_context(
-        &parsed_files_for_resolver,
+        &resolver_view,
         language,
         &r_uid,
         &workspace_ctx,
@@ -924,7 +959,7 @@ fn index_into_store(
         }
 
         let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-        for (rel_path, raw_symbols, _) in &parsed_files_for_resolver {
+        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
             for raw_sym in raw_symbols {
                 if let Some(parent_name) = &raw_sym.parent_name {
                     let key = (rel_path.clone(), parent_name.clone());
@@ -1486,22 +1521,20 @@ fn process_added_or_modified_file(
 
 /// Delete all File nodes (and their symbols) that belong to a repo,
 /// then delete the Repo node itself.  Used before a forced full re-index.
+///
+/// Uses two bulk DETACH DELETE queries (one for Symbol, one for File)
+/// instead of the previous per-file loop that issued O(2N) queries.
 fn delete_repo_all_data(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
 ) -> Result<(), anyhow::Error> {
-    let files = store
-        .list_files_by_repo(r_uid)
-        .with_context(|| "list_files_by_repo")?;
+    let (file_count, sym_count) = store
+        .bulk_delete_repo_files_and_symbols(r_uid)
+        .with_context(|| "bulk_delete_repo_files_and_symbols")?;
 
-    for (f_uid, f_path) in &files {
-        store
-            .delete_symbols_in_file(r_uid, f_path)
-            .with_context(|| format!("delete_symbols_in_file {}", f_path))?;
-        store
-            .delete_file_node(f_uid)
-            .with_context(|| format!("delete_file_node {}", f_uid))?;
-    }
+    tracing::debug!(
+        "delete_repo_all_data: removed {sym_count} symbols and {file_count} files for repo {r_uid}"
+    );
 
     // Clear repo-scoped derived nodes (Service, Contract) so a forced full
     // re-index does not collide on their deterministic primary keys.
