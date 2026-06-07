@@ -55,6 +55,7 @@ tokio-stream = "0.1"
 open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
+rayon = "1"
 
 [package]
 name = "nestweaver"

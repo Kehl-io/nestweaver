@@ -411,6 +411,9 @@ fn whole_db_scope_digest(db_path: &Path) -> u64 {
 ///
 /// If the db path is unknown (e.g. in tests with no server-set path), caching
 /// is skipped and the tool runs directly.
+/// Number of cache misses between periodic disk flushes.
+const CACHE_FLUSH_INTERVAL: u32 = 50;
+
 fn maybe_cached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -422,14 +425,22 @@ fn maybe_cached(
     };
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
-    let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, max_mb);
     let key = nestweaver_store::cache::ResponseCache::key(name, &args);
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 
-    if let Some(bytes) = cache.get(key, generation, scope_digest) {
+    // Lazily initialise the in-process cache for this db path, then check for a hit.
+    let hit_bytes = RESPONSE_CACHE.with(|map| {
+        let mut map = map.borrow_mut();
+        let cache = map
+            .entry(db_path.clone())
+            .or_insert_with(|| nestweaver_store::cache::ResponseCache::open(&db_path, max_mb));
+        cache.get(key, generation, scope_digest)
+    });
+
+    if let Some(bytes) = hit_bytes {
         CACHE_HITS.with(|c| c.set(c.get() + 1));
-        cache.save(); // persist updated LRU last_access
+        // No save() on hit — LRU timestamp update is not worth a disk round-trip.
         let value: Value =
             serde_json::from_slice(&bytes).with_context(|| "decode cached response")?;
         return Ok(value);
@@ -437,11 +448,46 @@ fn maybe_cached(
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     let result = dispatch_uncached(store, tantivy, name, args)?;
-    if let Ok(bytes) = serde_json::to_vec(&result) {
-        cache.insert(key, name, &bytes, generation, scope_digest);
-        cache.save();
+    match serde_json::to_vec(&result) {
+        Ok(bytes) => {
+            // Insert into the in-process cache, then decide whether to flush.
+            let should_flush = RESPONSE_CACHE.with(|map| {
+                let mut map = map.borrow_mut();
+                let cache = map.entry(db_path.clone()).or_insert_with(|| {
+                    nestweaver_store::cache::ResponseCache::open(&db_path, max_mb)
+                });
+                cache.insert(key, name, &bytes, generation, scope_digest);
+                let count = FLUSH_COUNTER.with(|c| {
+                    let next = c.get() + 1;
+                    c.set(next);
+                    next
+                });
+                count >= CACHE_FLUSH_INTERVAL
+            });
+            if should_flush {
+                flush_response_cache();
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                tool = name,
+                "cache: serialization failed, skipping insert: {e}"
+            );
+        }
     }
     Ok(result)
+}
+
+/// Flush all in-process response caches to disk and reset the flush counter.
+/// Called periodically (every `CACHE_FLUSH_INTERVAL` misses) and can be
+/// called explicitly on clean shutdown.
+pub fn flush_response_cache() {
+    RESPONSE_CACHE.with(|map| {
+        for cache in map.borrow().values() {
+            cache.flush();
+        }
+    });
+    FLUSH_COUNTER.with(|c| c.set(0));
 }
 
 /// Session cache stats `(size_bytes, entries, hit_rate)` for `brain_status`.
@@ -450,7 +496,17 @@ fn maybe_cached(
 /// this hit-rate is unproven and should be measured in real usage.
 fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
-    let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+    // Prefer the in-process cache for accurate stats; fall back to disk read
+    // if the in-process cache hasn't been seeded for this path yet.
+    let (size_bytes, len) = RESPONSE_CACHE.with(|map| {
+        let map = map.borrow();
+        if let Some(cache) = map.get(db_path) {
+            (cache.size_bytes(), cache.len())
+        } else {
+            let cache = nestweaver_store::cache::ResponseCache::open(db_path, max_mb);
+            (cache.size_bytes(), cache.len())
+        }
+    });
     let hits = CACHE_HITS.with(|c| c.get());
     let misses = CACHE_MISSES.with(|c| c.get());
     let total = hits + misses;
@@ -459,7 +515,7 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
     } else {
         None
     };
-    (cache.size_bytes(), cache.len(), hit_rate)
+    (size_bytes, len, hit_rate)
 }
 
 /// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
@@ -4309,6 +4365,12 @@ thread_local! {
         const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
     static CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // In-process cache map: db_path → ResponseCache (avoids per-call disk I/O).
+    static RESPONSE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<std::path::PathBuf, nestweaver_store::cache::ResponseCache>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    // Counts cache misses since last flush; flush to disk every N misses.
+    static FLUSH_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 pub fn set_current_db_path(path: std::path::PathBuf) {
@@ -5057,6 +5119,8 @@ mod cache_dispatch_tests {
     fn reset_session() {
         CACHE_HITS.with(|c| c.set(0));
         CACHE_MISSES.with(|c| c.set(0));
+        RESPONSE_CACHE.with(|m| m.borrow_mut().clear());
+        FLUSH_COUNTER.with(|c| c.set(0));
     }
 
     #[test]
@@ -5077,6 +5141,8 @@ mod cache_dispatch_tests {
             first, second,
             "2nd call must return byte-identical response"
         );
+        // Flush the in-process cache to disk so we can verify disk state.
+        flush_response_cache();
         // The cache file exists and holds an entry.
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,

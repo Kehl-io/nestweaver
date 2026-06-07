@@ -129,6 +129,7 @@ Sidecar files written alongside the database:
 - `<db>.aliases.json` — taxonomy alias mappings from vault files
 - `<db>.interactions.json` — agent interaction memory (query patterns, access frequency, follow-up signals)
 - `<db>.perspectives.json` — saved web UI perspectives (web crate only)
+- `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read)
 
 ## Architecture
 

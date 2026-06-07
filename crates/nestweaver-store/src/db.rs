@@ -1,9 +1,35 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::error::StoreError;
+use crate::ranking::QueryIntent;
+
+/// Cached PPR adjacency graph keyed on `(graph_generation, scope_hash, intent)`.
+///
+/// Stores the output of `load_ppr_graph` so repeated PPR calls within the same
+/// graph generation reuse the pre-built adjacency structures instead of firing
+/// multiple DB queries on every invocation.
+pub(crate) struct PprGraphCached {
+    /// The `graph_generation` value at cache-fill time. Compared on every
+    /// lookup; a mismatch means the graph changed and the cache is stale.
+    pub generation: u64,
+    /// `DefaultHasher` hash of the concatenated node_query + edge_query strings
+    /// from the `GraphScope`. Encodes the scope identity cheaply.
+    pub scope_hash: u64,
+    /// The `QueryIntent` (or `None`) that was in effect when the graph was built.
+    /// Edge weights are intent-dependent, so different intents need separate entries.
+    pub intent: Option<QueryIntent>,
+    /// Ordered list of all node UIDs in scope.
+    pub uids: Vec<String>,
+    /// Maps uid → index in `uids`.
+    pub uid_to_idx: HashMap<String, usize>,
+    /// For each node v, the list of `(u, weight)` incoming edges.
+    pub incoming: Vec<Vec<(usize, f64)>>,
+    /// Sum of all outgoing edge weights per node (pre-normalisation denominator).
+    pub out_weight: Vec<f64>,
+}
 
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
@@ -40,6 +66,16 @@ pub struct GraphStore {
     /// sidecar so `graph_generation` can be loaded on open and persisted on
     /// mutation without callers having to thread the path through.
     pub(crate) db_path: Option<PathBuf>,
+    /// Cached PPR adjacency graph. Holds the last-built `(uids, uid_to_idx,
+    /// incoming, out_weight)` keyed on `(graph_generation, scope_hash, intent)`.
+    /// Avoids rebuilding the adjacency list from DB on every PPR call when the
+    /// graph has not changed between index refreshes.
+    pub(crate) ppr_graph_cache: Mutex<Option<PprGraphCached>>,
+    /// Cached full symbol table for `search_symbols_by_name`. Keyed on
+    /// `graph_generation`; stale entries are discarded on any reindex.
+    /// Avoids full-table scans on every seed-resolution call for brain_context,
+    /// flow_trace, blast_radius, etc.
+    pub(crate) symbol_name_cache: Mutex<Option<Arc<crate::traverse::SymbolNameCached>>>,
 }
 
 impl GraphStore {
@@ -55,6 +91,8 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -75,6 +113,8 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -95,6 +135,8 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
@@ -139,6 +181,8 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
+            ppr_graph_cache: Mutex::new(None),
+            symbol_name_cache: Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
