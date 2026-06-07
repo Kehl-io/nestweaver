@@ -1,7 +1,9 @@
 ---
 name: nestweaver-debug
-description: Debug errors using NestWeaver's code+notes graph.
+description: Debug errors using NestWeaver's code+notes graph. Prefer graph queries over grep — brain_context shows the full call chain and related code in one ranked result.
 ---
+
+**Use NestWeaver to trace errors through the graph.** `brain_context` + `flow_trace` show the call chain and related code without reading files. `brain_search` finds error patterns across both code AND vault notes in one call.
 
 When debugging an error or unexpected behavior:
 
