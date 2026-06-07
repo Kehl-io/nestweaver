@@ -16,12 +16,12 @@ use nestweaver_engine::{
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_cursor_rule_with_rules, generate_guide_with_rules, generate_repo_map,
-    generate_summaries, get_last_indexed_at, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, materialize_projects,
-    record_last_indexed_at, render_text, save_clusters, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
+    generate_repo_map, generate_summaries, get_last_indexed_at,
+    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
+    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
+    lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
+    save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -730,7 +730,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "markdown",
-            help = "Output format: markdown (default), skill, cursor-rule, agents-md"
+            help = "Output format: markdown (default), skill, cursor-rule, agents-md, claude-md"
         )]
         format: String,
         #[arg(
@@ -2835,6 +2835,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 )?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
                 "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
+                "claude-md" => generate_claude_md_with_rules(&store, cfg_ref, rules_ref)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
             match output {
