@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nestweaver": {
+      "args": [
+        "mcp",
+        "--db",
+        "/tmp/nw-regression.lbug"
+      ],
+      "command": "nestweaver"
+    }
+  }
+}
