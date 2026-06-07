@@ -116,6 +116,10 @@ pub struct RawWikilink {
     pub transclude: bool,
     pub section_idx: usize,
     pub line: u32,
+    /// Cross-vault prefix from `[[vault:target]]` syntax.
+    /// `None` for same-vault links, `Some("vault-name")` for cross-vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_prefix: Option<String>,
 }
 
 /// A tag — either an inline `#tag` in section body, or pulled from frontmatter
@@ -624,13 +628,31 @@ fn extract_wikilinks(sections: &[RawSection]) -> Vec<RawWikilink> {
                     col = end + 2;
                     continue;
                 }
+                // Detect cross-vault prefix: [[vault:target]]
+                // Only split on `:` if it appears before any `/` (path separator).
+                let (vault_prefix, resolved_target) = {
+                    let slash_pos = target.find('/').unwrap_or(usize::MAX);
+                    if let Some(colon_pos) = target.find(':') {
+                        if colon_pos < slash_pos && colon_pos > 0 {
+                            (
+                                Some(target[..colon_pos].to_string()),
+                                target[colon_pos + 1..].to_string(),
+                            )
+                        } else {
+                            (None, target)
+                        }
+                    } else {
+                        (None, target)
+                    }
+                };
                 out.push(RawWikilink {
-                    target,
+                    target: resolved_target,
                     heading_anchor: anchor,
                     display,
                     transclude,
                     section_idx: sec_idx,
                     line: sec.start_line + line_offset as u32,
+                    vault_prefix,
                 });
                 col = end + 2;
                 // Advance the slice for the next iteration of the outer loop.
@@ -898,6 +920,7 @@ fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
                 transclude: false,
                 section_idx,
                 line,
+                vault_prefix: None,
             });
         }
     }
@@ -1524,6 +1547,42 @@ top 2 body
         let note_without = parse_markdown("x.md", without_comment).unwrap();
         // Different source → different hash.
         assert_ne!(note_with.content_hash, note_without.content_hash);
+    }
+
+    #[test]
+    fn parses_vault_prefix_wikilink() {
+        let md = "# Note\n\nSee [[work:architecture]] for details.\n";
+        let parsed = parse_markdown("test.md", md).unwrap();
+        let wl = parsed
+            .wikilinks
+            .iter()
+            .find(|w| w.vault_prefix.is_some())
+            .expect("should find cross-vault wikilink");
+        assert_eq!(wl.vault_prefix.as_deref(), Some("work"));
+        assert_eq!(wl.target, "architecture");
+    }
+
+    #[test]
+    fn regular_wikilink_has_no_vault_prefix() {
+        let md = "# Note\n\n[[architecture]] is here.\n";
+        let parsed = parse_markdown("test.md", md).unwrap();
+        assert!(
+            parsed.wikilinks.iter().all(|w| w.vault_prefix.is_none()),
+            "regular wikilinks should have no vault prefix"
+        );
+    }
+
+    #[test]
+    fn path_wikilink_colon_not_treated_as_vault() {
+        // [[C:/path/to/file]] — colon after single char is a drive letter, not vault
+        let md = "# Note\n\n[[folder/file:with:colons]] ref.\n";
+        let parsed = parse_markdown("test.md", md).unwrap();
+        // The colon is after `/`, so no vault prefix
+        let wl = &parsed.wikilinks[0];
+        assert!(
+            wl.vault_prefix.is_none(),
+            "colon after slash should not be vault prefix"
+        );
     }
 
     #[test]
