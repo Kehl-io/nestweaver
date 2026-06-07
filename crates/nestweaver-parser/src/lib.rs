@@ -3,6 +3,7 @@
 pub mod astro;
 pub mod canvas;
 pub mod cobol;
+pub mod dataview;
 pub mod entry_points;
 pub mod frameworks;
 pub mod language;
@@ -13,6 +14,7 @@ pub mod svelte;
 pub mod vue;
 
 pub use canvas::{parse_canvas, CanvasEdge, CanvasFile, CanvasNode};
+pub use dataview::{parse_dataview_query, DataviewQuery};
 pub use entry_points::{detect_entry_point, is_test_file};
 pub use frameworks::detect_frameworks;
 pub use language::{detect_language, is_markdown};
