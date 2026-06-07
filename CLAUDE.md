@@ -82,6 +82,7 @@ nestweaver setup claude-code --allow-writes                            # enable 
 nestweaver generate-guide --format skill                              # Claude Code skill (SKILL.md)
 nestweaver generate-guide --format cursor-rule                        # Cursor .mdc rule
 nestweaver generate-guide --format agents-md                          # Codex AGENTS.md
+nestweaver generate-guide --format claude-md                          # Claude Code CLAUDE.md
 
 # Shell completions
 nestweaver completions bash              # also: zsh, fish, powershell
