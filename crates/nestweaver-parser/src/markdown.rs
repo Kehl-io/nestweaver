@@ -81,6 +81,10 @@ pub struct RawHeading {
 ///
 /// `callout_type` is set when the section body contains an Obsidian callout
 /// (`> [!type]`), e.g. `Some("note")` or `Some("warning")`.
+///
+/// `checkbox_total` / `checkbox_checked` count `- [ ]` / `- [x]` items in the
+/// section body. `is_adr_section` is `true` when the owning heading matches a
+/// standard ADR keyword (Context, Decision, Consequences, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawSection {
     pub heading_idx: Option<usize>,
@@ -89,6 +93,13 @@ pub struct RawSection {
     pub text: String,
     /// Obsidian callout type extracted from `> [!type]` syntax, lowercased.
     pub callout_type: Option<String>,
+    /// Total number of checkbox items (`- [ ]` and `- [x]`) in this section.
+    pub checkbox_total: u32,
+    /// Number of checked checkbox items (`- [x]` / `- [X]`) in this section.
+    pub checkbox_checked: u32,
+    /// `true` when the section's heading text matches a standard ADR keyword
+    /// (e.g. "Context", "Decision", "Consequences", "Status", …).
+    pub is_adr_section: bool,
 }
 
 /// A wikilink extracted from a section body — `[[Target]]`, `[[Target|display]]`,
@@ -176,8 +187,17 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     // 7. Extract headings and sections from the body; annotate callout types.
     let headings = extract_headings(body);
     let mut sections = extract_sections(body, &headings);
-    for sec in &mut sections {
+    for (i, sec) in sections.iter_mut().enumerate() {
         sec.callout_type = extract_callout_type(&sec.text);
+        let (total, checked) = count_checkboxes(&sec.text);
+        sec.checkbox_total = total;
+        sec.checkbox_checked = checked;
+        if let Some(h_idx) = sec.heading_idx {
+            if let Some(heading) = headings.get(h_idx) {
+                sec.is_adr_section = is_adr_heading(&heading.text);
+            }
+        }
+        let _ = i; // suppress unused warning
     }
 
     // 8. Extract wikilinks per section + tags (inline + frontmatter).
@@ -302,6 +322,9 @@ fn extract_sections(body: &str, headings: &[RawHeading]) -> Vec<RawSection> {
                 end_line: preamble_end,
                 text,
                 callout_type: None,
+                checkbox_total: 0,
+                checkbox_checked: 0,
+                is_adr_section: false,
             });
         }
     }
@@ -321,6 +344,9 @@ fn extract_sections(body: &str, headings: &[RawHeading]) -> Vec<RawSection> {
                 end_line: body_start,
                 text: String::new(),
                 callout_type: None,
+                checkbox_total: 0,
+                checkbox_checked: 0,
+                is_adr_section: false,
             });
             continue;
         }
@@ -335,6 +361,9 @@ fn extract_sections(body: &str, headings: &[RawHeading]) -> Vec<RawSection> {
             end_line: body_end.max(body_start),
             text,
             callout_type: None,
+            checkbox_total: 0,
+            checkbox_checked: 0,
+            is_adr_section: false,
         });
     }
 
@@ -892,6 +921,46 @@ fn extract_callout_type(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Count checkbox items in section text.
+///
+/// Matches `- [ ]` (unchecked) and `- [x]`/`- [X]` (checked), also with `*` bullets.
+fn count_checkboxes(text: &str) -> (u32, u32) {
+    let mut total = 0u32;
+    let mut checked = 0u32;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ") {
+            total += 1;
+        } else if trimmed.starts_with("- [x] ")
+            || trimmed.starts_with("- [X] ")
+            || trimmed.starts_with("* [x] ")
+            || trimmed.starts_with("* [X] ")
+        {
+            total += 1;
+            checked += 1;
+        }
+    }
+    (total, checked)
+}
+
+/// Check if a heading text matches a standard ADR (Architecture Decision Record)
+/// section keyword.
+fn is_adr_heading(heading_text: &str) -> bool {
+    let lower = heading_text.to_ascii_lowercase();
+    matches!(
+        lower.trim(),
+        "context"
+            | "decision"
+            | "consequences"
+            | "status"
+            | "options"
+            | "rationale"
+            | "alternatives"
+            | "options considered"
+            | "decision outcome"
+    )
 }
 
 /// Scan for Obsidian block references (`^block-id`) at the end of lines.
@@ -1455,5 +1524,39 @@ top 2 body
         let note_without = parse_markdown("x.md", without_comment).unwrap();
         // Different source → different hash.
         assert_ne!(note_with.content_hash, note_without.content_hash);
+    }
+
+    #[test]
+    fn extracts_checkbox_counts() {
+        let md = "# Tasks\n\n- [ ] Do thing\n- [x] Done thing\n- [ ] Another\n";
+        let parsed = parse_markdown("test.md", md).unwrap();
+        let task_sec = parsed
+            .sections
+            .iter()
+            .find(|s| s.checkbox_total > 0)
+            .expect("should find section with checkboxes");
+        assert_eq!(task_sec.checkbox_total, 3);
+        assert_eq!(task_sec.checkbox_checked, 1);
+    }
+
+    #[test]
+    fn detects_adr_sections() {
+        let md = "# ADR: Use Postgres\n\n## Context\n\nWe need a db.\n\n## Decision\n\nUse Postgres.\n\n## Consequences\n\nMigrations.\n";
+        let parsed = parse_markdown("adr-001.md", md).unwrap();
+        let adr_count = parsed.sections.iter().filter(|s| s.is_adr_section).count();
+        assert!(
+            adr_count >= 3,
+            "expected >= 3 ADR sections, got {adr_count}"
+        );
+    }
+
+    #[test]
+    fn non_adr_sections_not_flagged() {
+        let md = "# Overview\n\nText.\n\n## Features\n\nList.\n";
+        let parsed = parse_markdown("readme.md", md).unwrap();
+        assert!(
+            !parsed.sections.iter().any(|s| s.is_adr_section),
+            "regular sections should not be ADR"
+        );
     }
 }
