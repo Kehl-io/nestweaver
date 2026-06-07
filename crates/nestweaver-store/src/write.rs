@@ -618,7 +618,69 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Wrap all markdown vault inserts in a single transaction.
+    ///
+    /// Accepts the full set of data produced by `index_into_store` (notes,
+    /// headings, sections, structural edges, tags, and cross-reference edges)
+    /// and writes everything atomically, avoiding per-statement WAL flushes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_write(
+        &self,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Insert node tables first so edge MATCH clauses find their endpoints.
+        Self::batch_insert_notes_on(&conn, notes)?;
+        Self::batch_insert_headings_on(&conn, headings)?;
+        Self::batch_insert_sections_on(&conn, sections)?;
+
+        // Structural containment edges.
+        Self::batch_insert_vault_note_edges_on(&conn, vault_note_edges)?;
+        Self::batch_insert_note_heading_edges_on(&conn, note_heading_edges)?;
+        Self::batch_insert_note_section_edges_on(&conn, note_section_edges)?;
+        Self::batch_insert_heading_section_edges_on(&conn, heading_section_edges)?;
+        Self::batch_insert_heading_parent_edges_on(&conn, heading_parent_edges)?;
+
+        // Tags (nodes + edges). Tags may already exist from a previous index
+        // run; the caller is responsible for deduplicating `tags` by uid before
+        // passing them in.
+        Self::batch_insert_tags_on(&conn, tags)?;
+        Self::batch_insert_note_tag_edges_on(&conn, note_tag_edges)?;
+        Self::batch_insert_section_tag_edges_on(&conn, section_tag_edges)?;
+
+        // Cross-reference wikilink edges.
+        Self::batch_insert_wikilink_to_note_edges_on(&conn, wikilink_to_note_edges)?;
+        Self::batch_insert_wikilink_to_heading_edges_on(&conn, wikilink_to_heading_edges)?;
+
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        Self::batch_insert_edges_on(&conn, edges)?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
+    /// Insert resolved edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[ResolvedEdge],
+    ) -> Result<(), StoreError> {
         // Group edges by their SQL query string so we prepare each statement only once.
         use std::collections::HashMap;
 
@@ -787,7 +849,6 @@ impl GraphStore {
             }
         }
 
-        let conn = self.begin_transaction()?;
         for (query, param_sets) in &groups {
             let mut stmt = conn
                 .prepare(query)
@@ -797,7 +858,6 @@ impl GraphStore {
                     .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
             }
         }
-        self.commit_transaction(&conn)?;
         Ok(())
     }
 
@@ -864,6 +924,14 @@ impl GraphStore {
 
     pub fn batch_insert_notes(&self, notes: &[Note]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_notes_on(&conn, notes)
+    }
+
+    /// Insert notes using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_notes_on(
+        conn: &lbug::Connection<'_>,
+        notes: &[Note],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
@@ -924,6 +992,14 @@ impl GraphStore {
 
     pub fn batch_insert_vault_note_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_vault_note_edges_on(&conn, edges)
+    }
+
+    /// Insert vault-note edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_vault_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (v:Vault {uid: $vid}), (n:Note {uid: $nid}) \
@@ -966,6 +1042,14 @@ impl GraphStore {
 
     pub fn batch_insert_headings(&self, headings: &[Heading]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_headings_on(&conn, headings)
+    }
+
+    /// Insert headings using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_headings_on(
+        conn: &lbug::Connection<'_>,
+        headings: &[Heading],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Heading {uid: $uid, note_uid: $nid, level: $lvl, text: $text, \
@@ -1020,6 +1104,14 @@ impl GraphStore {
 
     pub fn batch_insert_sections(&self, sections: &[Section]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_sections_on(&conn, sections)
+    }
+
+    /// Insert sections using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_sections_on(
+        conn: &lbug::Connection<'_>,
+        sections: &[Section],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
@@ -1055,6 +1147,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_heading_edges_on(&conn, edges)
+    }
+
+    /// Insert note-heading edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_heading_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (h:Heading {uid: $hid}) \
@@ -1079,6 +1179,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_section_edges_on(&conn, edges)
+    }
+
+    /// Insert note-section edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_section_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (s:Section {uid: $sid}) \
@@ -1103,6 +1211,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_heading_section_edges_on(&conn, edges)
+    }
+
+    /// Insert heading-section edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_heading_section_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (h:Heading {uid: $hid}), (s:Section {uid: $sid}) \
@@ -1127,6 +1243,14 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_heading_parent_edges_on(&conn, edges)
+    }
+
+    /// Insert heading-parent edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_heading_parent_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (child:Heading {uid: $cid}), (parent:Heading {uid: $pid}) \
@@ -1163,6 +1287,14 @@ impl GraphStore {
 
     pub fn batch_insert_tags(&self, tags: &[Tag]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_tags_on(&conn, tags)
+    }
+
+    /// Insert tags using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_tags_on(
+        conn: &lbug::Connection<'_>,
+        tags: &[Tag],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare("CREATE (:Tag {uid: $uid, vault_uid: $vid, name: $name})")
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
@@ -1288,6 +1420,14 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_wikilink_to_note_edges_on(&conn, edges)
+    }
+
+    /// Insert wikilink-to-note edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_wikilink_to_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (n:Note {uid: $nid}) \
@@ -1314,6 +1454,14 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_wikilink_to_heading_edges_on(&conn, edges)
+    }
+
+    /// Insert wikilink-to-heading edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_wikilink_to_heading_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (h:Heading {uid: $hid}) \
@@ -1337,6 +1485,14 @@ impl GraphStore {
 
     pub fn batch_insert_note_tag_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_tag_edges_on(&conn, edges)
+    }
+
+    /// Insert note-tag edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_note_tag_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (t:Tag {uid: $tid}) \
@@ -1358,6 +1514,14 @@ impl GraphStore {
 
     pub fn batch_insert_section_tag_edges(&self, edges: &[(&str, &str)]) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_section_tag_edges_on(&conn, edges)
+    }
+
+    /// Insert section-tag edges using an externally-provided connection (for transaction batching).
+    pub fn batch_insert_section_tag_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (t:Tag {uid: $tid}) \
@@ -1527,23 +1691,95 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Cascade-delete a Vault and every Note belonging to it. Calls
-    /// `delete_note_cascade` for each note (which removes its headings +
-    /// sections + cross-reference edges) then drops the Vault node.
-    /// Returns the number of notes removed.
+    /// Cascade-delete a Vault and every Note belonging to it using bulk
+    /// DETACH DELETE queries scoped by `vault_uid` — avoids the O(N) per-note
+    /// query loop that was issuing 4 queries × N notes.
+    ///
+    /// Order of operations (within a single transaction):
+    ///   1. Count notes (before deleting, so we can return the count).
+    ///   2. Delete Sections via edge traversal (NOTE_HAS_SECTION).
+    ///   3. Delete Headings via edge traversal (NOTE_HAS_HEADING).
+    ///   4. Delete UnresolvedWikilinks via cross-node join on source_note_uid.
+    ///   5. Delete all Note nodes (vault_uid property; DETACH removes
+    ///      VAULT_HAS_NOTE, NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and
+    ///      all incoming WIKILINK_TO_NOTE / WIKILINK_TO_HEADING edges).
+    ///   6. Delete Tag nodes belonging to this vault.
+    ///   7. Delete the Vault node itself.
+    ///
+    /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
-        // Find every note belonging to this vault first.
-        let notes = self.list_notes(Some(vault_uid))?;
-        let count = notes.len();
-        for n in &notes {
-            self.delete_note_cascade(&n.uid)?;
-        }
-        let conn = self.conn()?;
+        // Count notes before deletion so we can return the count.
+        let count = {
+            let conn = self.conn()?;
+            let safe_vid = vault_uid.replace('\'', "\\'");
+            let rows = conn
+                .query(&format!(
+                    "MATCH (n:Note) WHERE n.vault_uid = '{safe_vid}' RETURN count(n)"
+                ))
+                .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+
+        let conn = self.begin_transaction()?;
+
+        // 1. Delete all Sections under notes in this vault.
         exec_params(
             &conn,
-            "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
-            vec![("uid", lbug::Value::String(vault_uid.to_string()))],
+            "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
+
+        // 2. Delete all Headings under notes in this vault.
+        exec_params(
+            &conn,
+            "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 3. Delete UnresolvedWikilinks whose source note belongs to this vault.
+        //    Uses a cross-node join: LadybugDB supports `MATCH (a), (b) WHERE a.prop = b.prop`.
+        //    Best-effort: silently skip if the table does not exist on older DBs.
+        {
+            let safe_vid = vault_uid.replace('\'', "\\'");
+            if let Err(e) = conn.query(&format!(
+                "MATCH (n:Note), (u:UnresolvedWikilink) \
+                 WHERE n.vault_uid = '{safe_vid}' AND u.source_note_uid = n.uid \
+                 DELETE u"
+            )) {
+                tracing::trace!("delete_vault_cascade: UnresolvedWikilink delete skipped: {e}");
+            }
+        }
+
+        // 4. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
+        //    PROJECT_INCLUDES_NOTE, and any incoming/outgoing wikilink edges).
+        exec_params(
+            &conn,
+            "MATCH (n:Note {vault_uid: $vid}) DETACH DELETE n",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 5. Delete Tag nodes belonging to this vault.
+        exec_params(
+            &conn,
+            "MATCH (t:Tag {vault_uid: $vid}) DETACH DELETE t",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 6. Delete the Vault node itself.
+        exec_params(
+            &conn,
+            "MATCH (v:Vault {uid: $vid}) DETACH DELETE v",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        self.commit_transaction(&conn)?;
         Ok(count)
     }
 
@@ -1854,6 +2090,70 @@ impl GraphStore {
         self.insert_symbol_with_conn(&conn, &sym)?;
 
         Ok(())
+    }
+
+    /// Bulk-delete all Symbol and File nodes belonging to `repo_uid` using two
+    /// DETACH DELETE queries instead of one per file. Called by `delete_repo_all_data`
+    /// before a forced full re-index. `DETACH DELETE` removes all incident edges
+    /// (FILE_HAS_SYMBOL, REPO_HAS_FILE, CALLS, IMPORTS, etc.) automatically.
+    ///
+    /// Returns `(file_count, symbol_count)` for logging.
+    pub fn bulk_delete_repo_files_and_symbols(
+        &self,
+        repo_uid: &str,
+    ) -> Result<(usize, usize), StoreError> {
+        let rid = lbug::Value::String(repo_uid.to_string());
+
+        let conn = self.begin_transaction()?;
+
+        // Count before deleting so the caller can log what was removed.
+        let sym_count: usize = {
+            let mut stmt = conn
+                .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid RETURN count(s)")
+                .map_err(|e| StoreError::Query(format!("prepare count symbols: {e}")))?;
+            let rows = conn
+                .execute(&mut stmt, vec![("rid", rid.clone())])
+                .map_err(|e| StoreError::Query(format!("count symbols: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+        let file_count: usize = {
+            let mut stmt = conn
+                .prepare("MATCH (f:File) WHERE f.repo_uid = $rid RETURN count(f)")
+                .map_err(|e| StoreError::Query(format!("prepare count files: {e}")))?;
+            let rows = conn
+                .execute(&mut stmt, vec![("rid", rid.clone())])
+                .map_err(|e| StoreError::Query(format!("count files: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol) WHERE s.repo_uid = $rid DETACH DELETE s")
+            .map_err(|e| StoreError::Query(format!("prepare delete symbols: {e}")))?;
+        conn.execute(&mut stmt, vec![("rid", rid.clone())])
+            .map_err(|e| StoreError::Query(format!("bulk delete symbols: {e}")))?;
+
+        let mut stmt = conn
+            .prepare("MATCH (f:File) WHERE f.repo_uid = $rid DETACH DELETE f")
+            .map_err(|e| StoreError::Query(format!("prepare delete files: {e}")))?;
+        conn.execute(&mut stmt, vec![("rid", rid)])
+            .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
+
+        self.commit_transaction(&conn)?;
+        Ok((file_count, sym_count))
     }
 
     /// Delete a Repo node (and its REPO_HAS_FILE edges) by UID.

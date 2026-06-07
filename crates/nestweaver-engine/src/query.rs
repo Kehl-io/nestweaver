@@ -304,11 +304,16 @@ pub fn build_context_with_intent(
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
 
+    // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
+    let ppr_uids: Vec<&str> = ppr_results.iter().map(|(u, _)| u.as_str()).collect();
+    let sym_map = store
+        .batch_lookup_symbols(&ppr_uids)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     for (uid, score) in &ppr_results {
-        // Look up full symbol details.
-        let sym = match store.lookup_symbol(uid) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sym = match sym_map.get(uid.as_str()) {
+            Some(s) => s,
+            None => continue,
         };
 
         let node = ContextNode {
@@ -625,10 +630,16 @@ pub fn build_feature_context(
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
 
+    // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
+    let ppr_uids: Vec<&str> = ppr_scores.iter().map(|(u, _)| u.as_str()).collect();
+    let sym_map = store
+        .batch_lookup_symbols(&ppr_uids)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     for (uid, score) in &ppr_scores {
-        let sym = match store.lookup_symbol(uid) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sym = match sym_map.get(uid.as_str()) {
+            Some(s) => s,
+            None => continue,
         };
         let node = ContextNode {
             uid: sym.uid.clone(),

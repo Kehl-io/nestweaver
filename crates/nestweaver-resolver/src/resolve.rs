@@ -3,8 +3,9 @@ use nestweaver_schema::{
     EdgeEvidence, EdgeType, Language, MatchType, ResolvedEdge, SymbolKind, Visibility,
     confidence_score, symbol_uid,
 };
+use rayon::prelude::*;
 
-use crate::imports::build_import_graph;
+use crate::imports::{ImportGraph, build_import_graph};
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
 
@@ -55,6 +56,18 @@ pub fn resolve_references_with_context(
 ) -> Vec<ResolvedEdge> {
     let graph = build_import_graph(files, language, workspace_ctx);
 
+    // Pre-sort symbols per file so find_enclosing_symbol's binary search invariant holds.
+    // Tree-sitter guarantees sorted output in production, but callers (e.g. property tests)
+    // may pass unsorted symbols, so we sort defensively here once per call.
+    let sorted_symbols_per_file: Vec<Vec<&RawSymbol>> = files
+        .iter()
+        .map(|(_, symbols, _)| {
+            let mut v: Vec<&RawSymbol> = symbols.iter().collect();
+            v.sort_by_key(|s| s.start_line);
+            v
+        })
+        .collect();
+
     // Build a lookup: symbol_name → Vec<(file_path, RawSymbol)>
     let mut symbol_map: std::collections::HashMap<String, Vec<(&str, &RawSymbol)>> =
         std::collections::HashMap::new();
@@ -72,10 +85,10 @@ pub fn resolve_references_with_context(
     let extends_map: std::collections::HashMap<String, Vec<String>> = {
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for (_, symbols, references) in files {
+        for ((_, _, references), sorted_syms) in files.iter().zip(sorted_symbols_per_file.iter()) {
             for reference in references {
                 if reference.kind == ReferenceKind::Extends
-                    && let Some(sym) = find_enclosing_symbol(symbols, reference.start_line)
+                    && let Some(sym) = find_enclosing_symbol(sorted_syms, reference.start_line)
                     && matches!(
                         sym.kind,
                         SymbolKind::Class
@@ -93,292 +106,32 @@ pub fn resolve_references_with_context(
         map
     };
 
-    let mut edges: Vec<ResolvedEdge> = Vec::new();
-
-    for (file_path, symbols, references) in files {
-        'ref_loop: for reference in references {
-            let edge_type = match reference.kind {
-                ReferenceKind::Call => EdgeType::Calls,
-                ReferenceKind::Extends => EdgeType::Extends,
-                ReferenceKind::Implements => EdgeType::Implements,
-                ReferenceKind::Includes => EdgeType::Includes,
-                ReferenceKind::TypeRef => EdgeType::Uses,
-                ReferenceKind::ReadAccess | ReferenceKind::WriteAccess => EdgeType::Accesses,
-                ReferenceKind::Import | ReferenceKind::Uses => continue,
-            };
-
-            // Find the enclosing symbol: symbol in same file with largest start_line <= reference.start_line
-            let source_sym = find_enclosing_symbol(symbols, reference.start_line);
-            let source_uid = match source_sym {
-                Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
-                None => {
-                    // No enclosing symbol — skip this reference
-                    continue;
-                }
-            };
-
-            // ── Type-aware resolution for member calls with known receiver type ──
-            if edge_type == EdgeType::Calls
-                && let Some(ref receiver) = reference.receiver
-                && let Some(envs) = _type_envs
-                && let Some(env) = envs.get(file_path.as_str())
-            {
-                let receiver_type =
-                    if receiver == "self" || receiver == "this" || receiver == "$this" {
-                        env.lookup_self(reference.start_line)
-                    } else if receiver.contains('.') {
-                        // Decompose chained receivers: a.b.method() → look up
-                        // the type of `a`, then use it. For chains deeper than
-                        // 2 segments (a.b.c.method), only the first segment's
-                        // type is resolved — field-of-type resolution would
-                        // require a full type system, so we fall through to
-                        // name-based resolution for deeper chains.
-                        let first = receiver.split('.').next().unwrap_or(receiver);
-                        if first == "self" || first == "this" || first == "$this" {
-                            env.lookup_self(reference.start_line)
-                        } else {
-                            env.lookup(first, reference.start_line)
-                        }
-                    } else {
-                        env.lookup(receiver, reference.start_line)
-                    };
-
-                if let Some(binding) = receiver_type {
-                    let method_name = &reference.name;
-                    let type_name = &binding.type_name;
-
-                    if let Some(candidates) = symbol_map.get(method_name.as_str())
-                        && let Some((candidate_file, sym)) = candidates
-                            .iter()
-                            .find(|(_, s)| s.parent_name.as_deref() == Some(type_name.as_str()))
-                    {
-                        let target_uid =
-                            symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
-                        let confidence = binding.confidence.min(0.95);
-                        edges.push(ResolvedEdge {
-                            source_uid: source_uid.clone(),
-                            target_uid,
-                            edge_type,
-                            confidence,
-                            link_type: None,
-                            evidence: vec![EdgeEvidence {
-                                kind: "type_aware".to_string(),
-                                weight: confidence,
-                                note: Some(format!("{} -> {}", receiver, type_name)),
-                            }],
-                        });
-                        continue 'ref_loop;
-                    }
-                    // MRO walk: check parent types via inheritance chain
-                    {
-                        let mut current_types = vec![type_name.clone()];
-                        let mut visited = std::collections::HashSet::new();
-                        visited.insert(type_name.clone());
-                        let mut depth = 0u32;
-
-                        while depth < 5 && !current_types.is_empty() {
-                            let mut next_types = Vec::new();
-                            for t in &current_types {
-                                if let Some(parents) = extends_map.get(t.as_str()) {
-                                    for parent in parents {
-                                        if visited.contains(parent) {
-                                            continue; // cycle guard
-                                        }
-                                        visited.insert(parent.clone());
-
-                                        if let Some(candidates) =
-                                            symbol_map.get(method_name.as_str())
-                                            && let Some((cf, sym)) =
-                                                candidates.iter().find(|(_, s)| {
-                                                    s.parent_name.as_deref()
-                                                        == Some(parent.as_str())
-                                                })
-                                        {
-                                            let target_uid =
-                                                symbol_uid(repo_uid, cf, &sym.name, sym.start_line);
-                                            let conf = binding.confidence
-                                                * 0.95_f32.powi((depth + 1) as i32);
-                                            edges.push(ResolvedEdge {
-                                                source_uid: source_uid.clone(),
-                                                target_uid,
-                                                edge_type,
-                                                confidence: conf,
-                                                link_type: None,
-                                                evidence: vec![EdgeEvidence {
-                                                    kind: "type_aware_mro".to_string(),
-                                                    weight: conf,
-                                                    note: Some(format!(
-                                                        "MRO depth {} via {}",
-                                                        depth + 1,
-                                                        parent
-                                                    )),
-                                                }],
-                                            });
-                                            continue 'ref_loop;
-                                        }
-                                        next_types.push(parent.clone());
-                                    }
-                                }
-                            }
-                            current_types = next_types;
-                            depth += 1;
-                        }
-                    }
-                    // Type was known but method not found on that type or ancestors.
-                    // Fall through to name-based resolution.
+    // ── Pass 2: Resolve non-import references in parallel per file ─────
+    let ref_edges: Vec<ResolvedEdge> = files
+        .par_iter()
+        .zip(sorted_symbols_per_file.par_iter())
+        .flat_map(|((file_path, _symbols, references), sorted_syms)| {
+            let mut local_edges = Vec::new();
+            for reference in references {
+                if let Some(edge) = resolve_single_reference(
+                    file_path,
+                    reference,
+                    sorted_syms,
+                    &symbol_map,
+                    &extends_map,
+                    &graph,
+                    language,
+                    repo_uid,
+                    _type_envs,
+                ) {
+                    local_edges.push(edge);
                 }
             }
+            local_edges
+        })
+        .collect();
 
-            let name = &reference.name;
-
-            // Check if the reference name is a local alias introduced by an aliased import.
-            // If so, resolve using the original exported name instead.
-            let effective_name = {
-                let bindings = graph.bindings_of(file_path);
-                if let Some(binding) = bindings.iter().find(|b| b.local_name == *name) {
-                    binding.original_name.clone()
-                } else {
-                    name.clone()
-                }
-            };
-
-            let candidates = symbol_map.get(effective_name.as_str());
-
-            // Priority 1: Same file
-            if let Some(syms) = &candidates
-                && let Some((_, sym)) = syms.iter().find(|(f, _)| *f == file_path.as_str())
-            {
-                let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
-                let confidence = confidence_score(MatchType::SameFileExact, language);
-                edges.push(ResolvedEdge {
-                    source_uid,
-                    target_uid,
-                    edge_type,
-                    confidence,
-                    link_type: None,
-                    evidence: vec![EdgeEvidence {
-                        kind: "same_file".to_string(),
-                        weight: confidence,
-                        note: None,
-                    }],
-                });
-                continue;
-            }
-
-            // Priority 2: Direct imports — find files directly imported by this file
-            let mut imports = graph.imports_of(file_path);
-            imports.sort_by(|(_, a), (_, b)| a.cmp(b));
-            let mut found = false;
-            'import_search: for (_, imported_file) in &imports {
-                if let Some(syms) = &candidates
-                    && let Some((_, sym)) = syms.iter().find(|(f, _)| f == imported_file)
-                {
-                    let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
-                    let confidence = confidence_score(MatchType::ImportResolved, language);
-                    edges.push(ResolvedEdge {
-                        source_uid: source_uid.clone(),
-                        target_uid,
-                        edge_type,
-                        confidence,
-                        link_type: None,
-                        evidence: vec![EdgeEvidence {
-                            kind: "import_resolved".to_string(),
-                            weight: confidence,
-                            note: None,
-                        }],
-                    });
-                    found = true;
-                    break 'import_search;
-                }
-            }
-            if found {
-                continue;
-            }
-
-            // Priority 3: Re-exports — files imported by our imports that export the name
-            let mut found = false;
-            'reexport_search: for (_, imported_file) in &imports {
-                let mut transitive_imports = graph.imports_of(imported_file);
-                transitive_imports.sort_by(|(_, a), (_, b)| a.cmp(b));
-                for (_, transitive_file) in &transitive_imports {
-                    if let Some(syms) = &candidates
-                        && let Some((_, sym)) = syms.iter().find(|(f, _)| f == transitive_file)
-                    {
-                        let target_uid =
-                            symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
-                        let confidence = confidence_score(MatchType::ReExportResolved, language);
-                        edges.push(ResolvedEdge {
-                            source_uid: source_uid.clone(),
-                            target_uid,
-                            edge_type,
-                            confidence,
-                            link_type: None,
-                            evidence: vec![EdgeEvidence {
-                                kind: "reexport_resolved".to_string(),
-                                weight: confidence,
-                                note: None,
-                            }],
-                        });
-                        found = true;
-                        break 'reexport_search;
-                    }
-                }
-            }
-            if found {
-                continue;
-            }
-
-            // Priority 4: Same package/directory — files in the same directory
-            let same_dir = parent_dir(file_path);
-            let mut found = false;
-            if let Some(syms) = &candidates {
-                let mut same_pkg: Vec<_> = syms
-                    .iter()
-                    .filter(|(candidate_file, _)| {
-                        *candidate_file != file_path.as_str()
-                            && parent_dir(candidate_file) == same_dir
-                    })
-                    .collect();
-                same_pkg.sort_by_key(|(path, _)| *path);
-                if let Some((candidate_file, sym)) = same_pkg.into_iter().next() {
-                    let target_uid =
-                        symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
-                    let confidence = confidence_score(MatchType::SamePackageFallback, language);
-                    edges.push(ResolvedEdge {
-                        source_uid: source_uid.clone(),
-                        target_uid,
-                        edge_type,
-                        confidence,
-                        link_type: None,
-                        evidence: vec![EdgeEvidence {
-                            kind: "same_package".to_string(),
-                            weight: confidence,
-                            note: None,
-                        }],
-                    });
-                    found = true;
-                }
-            }
-            if found {
-                continue;
-            }
-
-            // No match → unresolved
-            let target_uid = format!("unresolved:{name}");
-            edges.push(ResolvedEdge {
-                source_uid,
-                target_uid,
-                edge_type,
-                confidence: 0.0,
-                link_type: None,
-                evidence: vec![EdgeEvidence {
-                    kind: "unresolved".to_string(),
-                    weight: 0.0,
-                    note: None,
-                }],
-            });
-        }
-    }
+    let mut edges: Vec<ResolvedEdge> = ref_edges;
 
     // ── Pass 3: Create IMPORTS edges from the import graph ──────────────
     //
@@ -397,6 +150,13 @@ pub fn resolve_references_with_context(
     let file_symbols: std::collections::HashMap<&str, &Vec<RawSymbol>> = files
         .iter()
         .map(|(path, syms, _)| (path.as_str(), syms))
+        .collect();
+
+    // Build a file → sorted symbols lookup for find_enclosing_symbol in Pass 3b.
+    let file_sorted_symbols: std::collections::HashMap<&str, &Vec<&RawSymbol>> = files
+        .iter()
+        .zip(sorted_symbols_per_file.iter())
+        .map(|((path, _, _), sorted)| (path.as_str(), sorted))
         .collect();
 
     // Build a file → references lookup for import reference line matching.
@@ -441,6 +201,11 @@ pub fn resolve_references_with_context(
             _ => continue,
         };
 
+        let source_sorted_syms: &[&RawSymbol] = match file_sorted_symbols.get(file_path.as_str()) {
+            Some(syms) if !syms.is_empty() => syms.as_slice(),
+            _ => continue,
+        };
+
         let empty_refs = Vec::new();
         let source_refs = file_refs
             .get(file_path.as_str())
@@ -461,7 +226,7 @@ pub fn resolve_references_with_context(
 
             // Use enclosing symbol at import line, or fall back to first symbol in file.
             let source_sym = import_line
-                .and_then(|line| find_enclosing_symbol(source_symbols, line))
+                .and_then(|line| find_enclosing_symbol(source_sorted_syms, line))
                 .or_else(|| source_symbols.first());
 
             let source_uid = match source_sym {
@@ -518,12 +283,284 @@ pub fn resolve_references_with_context(
     edges
 }
 
+/// Resolve a single non-import reference to a `ResolvedEdge`, or return `None`
+/// if the reference should be skipped (e.g. Import/Uses kind, no enclosing symbol).
+///
+/// This is extracted from the main loop body so it can be called from parallel
+/// iterators without needing labeled `continue` across closure boundaries.
+#[allow(clippy::too_many_arguments)]
+fn resolve_single_reference(
+    file_path: &str,
+    reference: &RawReference,
+    sorted_syms: &[&RawSymbol],
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    extends_map: &std::collections::HashMap<String, Vec<String>>,
+    graph: &ImportGraph,
+    language: Language,
+    repo_uid: &str,
+    type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
+) -> Option<ResolvedEdge> {
+    let edge_type = match reference.kind {
+        ReferenceKind::Call => EdgeType::Calls,
+        ReferenceKind::Extends => EdgeType::Extends,
+        ReferenceKind::Implements => EdgeType::Implements,
+        ReferenceKind::Includes => EdgeType::Includes,
+        ReferenceKind::TypeRef => EdgeType::Uses,
+        ReferenceKind::ReadAccess | ReferenceKind::WriteAccess => EdgeType::Accesses,
+        ReferenceKind::Import | ReferenceKind::Uses => return None,
+    };
+
+    let source_sym = find_enclosing_symbol(sorted_syms, reference.start_line)?;
+    let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
+
+    // ── Type-aware resolution for member calls with known receiver type ──
+    if edge_type == EdgeType::Calls
+        && let Some(ref receiver) = reference.receiver
+        && let Some(envs) = type_envs
+        && let Some(env) = envs.get(file_path)
+    {
+        let receiver_type = if receiver == "self" || receiver == "this" || receiver == "$this" {
+            env.lookup_self(reference.start_line)
+        } else if receiver.contains('.') {
+            let first = receiver.split('.').next().unwrap_or(receiver);
+            if first == "self" || first == "this" || first == "$this" {
+                env.lookup_self(reference.start_line)
+            } else {
+                env.lookup(first, reference.start_line)
+            }
+        } else {
+            env.lookup(receiver, reference.start_line)
+        };
+
+        if let Some(binding) = receiver_type {
+            let method_name = &reference.name;
+            let type_name = &binding.type_name;
+
+            // Direct match on the receiver type
+            if let Some(candidates) = symbol_map.get(method_name.as_str())
+                && let Some((candidate_file, sym)) = candidates
+                    .iter()
+                    .find(|(_, s)| s.parent_name.as_deref() == Some(type_name.as_str()))
+            {
+                let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
+                let confidence = binding.confidence.min(0.95);
+                return Some(ResolvedEdge {
+                    source_uid,
+                    target_uid,
+                    edge_type,
+                    confidence,
+                    link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: "type_aware".to_string(),
+                        weight: confidence,
+                        note: Some(format!("{} -> {}", receiver, type_name)),
+                    }],
+                });
+            }
+
+            // MRO walk: check parent types via inheritance chain
+            {
+                let mut current_types = vec![type_name.clone()];
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(type_name.clone());
+                let mut depth = 0u32;
+
+                while depth < 5 && !current_types.is_empty() {
+                    let mut next_types = Vec::new();
+                    for t in &current_types {
+                        if let Some(parents) = extends_map.get(t.as_str()) {
+                            for parent in parents {
+                                if visited.contains(parent) {
+                                    continue; // cycle guard
+                                }
+                                visited.insert(parent.clone());
+
+                                if let Some(candidates) = symbol_map.get(method_name.as_str())
+                                    && let Some((cf, sym)) = candidates.iter().find(|(_, s)| {
+                                        s.parent_name.as_deref() == Some(parent.as_str())
+                                    })
+                                {
+                                    let target_uid =
+                                        symbol_uid(repo_uid, cf, &sym.name, sym.start_line);
+                                    let conf =
+                                        binding.confidence * 0.95_f32.powi((depth + 1) as i32);
+                                    return Some(ResolvedEdge {
+                                        source_uid,
+                                        target_uid,
+                                        edge_type,
+                                        confidence: conf,
+                                        link_type: None,
+                                        evidence: vec![EdgeEvidence {
+                                            kind: "type_aware_mro".to_string(),
+                                            weight: conf,
+                                            note: Some(format!(
+                                                "MRO depth {} via {}",
+                                                depth + 1,
+                                                parent
+                                            )),
+                                        }],
+                                    });
+                                }
+                                next_types.push(parent.clone());
+                            }
+                        }
+                    }
+                    current_types = next_types;
+                    depth += 1;
+                }
+            }
+            // Type was known but method not found on that type or ancestors.
+            // Fall through to name-based resolution.
+        }
+    }
+
+    let name = &reference.name;
+
+    // Check if the reference name is a local alias introduced by an aliased import.
+    let effective_name = {
+        let bindings = graph.bindings_of(file_path);
+        if let Some(binding) = bindings.iter().find(|b| b.local_name == *name) {
+            binding.original_name.clone()
+        } else {
+            name.clone()
+        }
+    };
+
+    let candidates = symbol_map.get(effective_name.as_str());
+
+    // Priority 1: Same file
+    if let Some(syms) = &candidates
+        && let Some((_, sym)) = syms.iter().find(|(f, _)| *f == file_path)
+    {
+        let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
+        let confidence = confidence_score(MatchType::SameFileExact, language);
+        return Some(ResolvedEdge {
+            source_uid,
+            target_uid,
+            edge_type,
+            confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "same_file".to_string(),
+                weight: confidence,
+                note: None,
+            }],
+        });
+    }
+
+    // Priority 2: Direct imports
+    let mut imports = graph.imports_of(file_path);
+    imports.sort_by(|(_, a), (_, b)| a.cmp(b));
+    for (_, imported_file) in &imports {
+        if let Some(syms) = &candidates
+            && let Some((_, sym)) = syms.iter().find(|(f, _)| f == imported_file)
+        {
+            let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
+            let confidence = confidence_score(MatchType::ImportResolved, language);
+            return Some(ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type,
+                confidence,
+                link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "import_resolved".to_string(),
+                    weight: confidence,
+                    note: None,
+                }],
+            });
+        }
+    }
+
+    // Priority 3: Re-exports
+    for (_, imported_file) in &imports {
+        let mut transitive_imports = graph.imports_of(imported_file);
+        transitive_imports.sort_by(|(_, a), (_, b)| a.cmp(b));
+        for (_, transitive_file) in &transitive_imports {
+            if let Some(syms) = &candidates
+                && let Some((_, sym)) = syms.iter().find(|(f, _)| f == transitive_file)
+            {
+                let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
+                let confidence = confidence_score(MatchType::ReExportResolved, language);
+                return Some(ResolvedEdge {
+                    source_uid,
+                    target_uid,
+                    edge_type,
+                    confidence,
+                    link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: "reexport_resolved".to_string(),
+                        weight: confidence,
+                        note: None,
+                    }],
+                });
+            }
+        }
+    }
+
+    // Priority 4: Same package/directory
+    let same_dir = parent_dir(file_path);
+    if let Some(syms) = &candidates {
+        let mut same_pkg: Vec<_> = syms
+            .iter()
+            .filter(|(candidate_file, _)| {
+                *candidate_file != file_path && parent_dir(candidate_file) == same_dir
+            })
+            .collect();
+        same_pkg.sort_by_key(|(path, _)| *path);
+        if let Some((candidate_file, sym)) = same_pkg.into_iter().next() {
+            let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
+            let confidence = confidence_score(MatchType::SamePackageFallback, language);
+            return Some(ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type,
+                confidence,
+                link_type: None,
+                evidence: vec![EdgeEvidence {
+                    kind: "same_package".to_string(),
+                    weight: confidence,
+                    note: None,
+                }],
+            });
+        }
+    }
+
+    // No match → unresolved
+    Some(ResolvedEdge {
+        source_uid,
+        target_uid: format!("unresolved:{name}"),
+        edge_type,
+        confidence: 0.0,
+        link_type: None,
+        evidence: vec![EdgeEvidence {
+            kind: "unresolved".to_string(),
+            weight: 0.0,
+            note: None,
+        }],
+    })
+}
+
 /// Find the enclosing symbol: the symbol with the largest start_line that is <= reference line.
-fn find_enclosing_symbol(symbols: &[RawSymbol], ref_line: u32) -> Option<&RawSymbol> {
-    symbols
-        .iter()
-        .filter(|s| s.start_line <= ref_line)
-        .max_by_key(|s| s.start_line)
+///
+/// Requires `symbols` to be sorted by `start_line` ascending (tree-sitter LR-parser guarantee).
+/// Uses binary search (O(log n)) instead of a linear scan (O(n)).
+fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Option<&'a RawSymbol> {
+    debug_assert!(
+        symbols
+            .windows(2)
+            .all(|w| w[0].start_line <= w[1].start_line),
+        "find_enclosing_symbol requires symbols sorted by start_line"
+    );
+    if symbols.is_empty() {
+        return None;
+    }
+    let idx = symbols.partition_point(|s| s.start_line <= ref_line);
+    if idx == 0 {
+        None
+    } else {
+        Some(symbols[idx - 1])
+    }
 }
 
 #[cfg(test)]
@@ -984,6 +1021,81 @@ mod tests {
         assert!(call.evidence[0].weight > 0.0);
     }
 
+    #[test]
+    fn find_enclosing_symbol_binary_search_correctness() {
+        // Helper that runs both the old linear scan and the new binary search,
+        // asserting they agree, then returns the start_line of the result.
+        fn linear_scan(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
+            symbols
+                .iter()
+                .filter(|s| s.start_line <= ref_line)
+                .max_by_key(|s| s.start_line)
+                .map(|s| s.start_line)
+        }
+
+        fn check(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
+            // find_enclosing_symbol requires &[&RawSymbol]; build a sorted refs slice.
+            let sorted: Vec<&RawSymbol> = {
+                let mut v: Vec<&RawSymbol> = symbols.iter().collect();
+                v.sort_by_key(|s| s.start_line);
+                v
+            };
+            let binary = find_enclosing_symbol(&sorted, ref_line).map(|s| s.start_line);
+            let linear = linear_scan(symbols, ref_line);
+            assert_eq!(
+                binary, linear,
+                "binary search and linear scan disagree for ref_line={ref_line}"
+            );
+            binary
+        }
+
+        // Empty slice → None
+        assert!(check(&[], 5).is_none());
+
+        let symbols = vec![
+            make_symbol("a", 10),
+            make_symbol("b", 20),
+            make_symbol("c", 30),
+        ];
+
+        // ref_line before all symbols → None
+        assert!(check(&symbols, 5).is_none());
+
+        // ref_line exactly on first symbol → first symbol
+        assert_eq!(check(&symbols, 10), Some(10));
+
+        // ref_line between first and second → first symbol
+        assert_eq!(check(&symbols, 15), Some(10));
+
+        // ref_line exactly on second symbol → second symbol
+        assert_eq!(check(&symbols, 20), Some(20));
+
+        // ref_line between second and third → second symbol
+        assert_eq!(check(&symbols, 25), Some(20));
+
+        // ref_line exactly on last symbol → last symbol
+        assert_eq!(check(&symbols, 30), Some(30));
+
+        // ref_line after all symbols → last symbol
+        assert_eq!(check(&symbols, 999), Some(30));
+
+        // Single symbol — before it → None
+        let single = vec![make_symbol("only", 5)];
+        assert!(check(&single, 1).is_none());
+
+        // Single symbol — exactly on it → that symbol
+        assert_eq!(check(&single, 5), Some(5));
+
+        // Single symbol — after it → that symbol
+        assert_eq!(check(&single, 50), Some(5));
+
+        // Two symbols with same start_line — either is correct; just verify no panic
+        // and that it agrees with linear scan.
+        let dupes = vec![make_symbol("x", 10), make_symbol("y", 10)];
+        let result = check(&dupes, 10);
+        assert!(result.is_some());
+    }
+
     mod snapshot_tests {
         use super::*;
         use insta::assert_yaml_snapshot;
@@ -1392,6 +1504,150 @@ mod tests {
             !call_edges.is_empty(),
             "should still produce edges via name-based fallback"
         );
+    }
+
+    #[test]
+    fn parallel_resolution_produces_identical_edges() {
+        // Build a multi-file fixture with cross-file calls, imports, extends,
+        // same-file references, and type references. Run resolution twice and
+        // assert the sorted edge vectors are identical (determinism check).
+        fn make_class(name: &str, line: u32) -> RawSymbol {
+            RawSymbol {
+                name: name.to_string(),
+                kind: SymbolKind::Class,
+                start_line: line,
+                end_line: line + 20,
+                signature: format!("class {name}"),
+                content_hash: String::new(),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                parent_name: None,
+            }
+        }
+
+        fn make_method(name: &str, line: u32, parent: &str) -> RawSymbol {
+            RawSymbol {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                start_line: line,
+                end_line: line,
+                signature: format!("function {name}()"),
+                content_hash: String::new(),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                parent_name: Some(parent.to_string()),
+            }
+        }
+
+        let files = vec![
+            // File 1: base module with two functions
+            (
+                "src/base.ts".to_string(),
+                vec![
+                    make_class("Base", 1),
+                    make_method("save", 5, "Base"),
+                    make_symbol("validate", 15),
+                ],
+                vec![],
+            ),
+            // File 2: child extending base
+            (
+                "src/child.ts".to_string(),
+                vec![make_class("Child", 1), make_symbol("process", 10)],
+                vec![
+                    make_ref("Base", ReferenceKind::Extends, 1),
+                    make_ref("./base", ReferenceKind::Import, 1),
+                    make_ref("validate", ReferenceKind::Call, 12),
+                ],
+            ),
+            // File 3: utils with helpers
+            (
+                "src/utils.ts".to_string(),
+                vec![
+                    make_symbol("format", 1),
+                    make_symbol("parse", 10),
+                    make_symbol("transform", 20),
+                ],
+                vec![make_ref("format", ReferenceKind::Call, 15)],
+            ),
+            // File 4: service importing child and utils
+            (
+                "src/service.ts".to_string(),
+                vec![
+                    make_symbol("init", 1),
+                    make_symbol("run", 10),
+                    make_symbol("cleanup", 20),
+                ],
+                vec![
+                    make_ref("./child", ReferenceKind::Import, 1),
+                    make_ref("./utils", ReferenceKind::Import, 2),
+                    make_ref("process", ReferenceKind::Call, 12),
+                    make_ref("format", ReferenceKind::Call, 14),
+                    make_ref("transform", ReferenceKind::Call, 22),
+                ],
+            ),
+            // File 5: tests importing service
+            (
+                "src/test.ts".to_string(),
+                vec![make_symbol("testInit", 1), make_symbol("testRun", 10)],
+                vec![
+                    make_ref("./service", ReferenceKind::Import, 1),
+                    make_ref("init", ReferenceKind::Call, 5),
+                    make_ref("run", ReferenceKind::Call, 12),
+                    make_ref("unknownFn", ReferenceKind::Call, 15),
+                ],
+            ),
+            // File 6: another consumer in same directory
+            (
+                "src/consumer.ts".to_string(),
+                vec![make_symbol("consume", 1)],
+                vec![
+                    make_ref("parse", ReferenceKind::Call, 3),
+                    make_ref("Base", ReferenceKind::TypeRef, 5),
+                ],
+            ),
+        ];
+
+        let sort_key = |e: &ResolvedEdge| {
+            (
+                e.source_uid.clone(),
+                e.target_uid.clone(),
+                format!("{:?}", e.edge_type),
+            )
+        };
+
+        let mut edges1 = resolve_references(&files, Language::TypeScript, "repo:test:determinism");
+        edges1.sort_by_key(|e| sort_key(e));
+
+        let mut edges2 = resolve_references(&files, Language::TypeScript, "repo:test:determinism");
+        edges2.sort_by_key(|e| sort_key(e));
+
+        assert_eq!(
+            edges1.len(),
+            edges2.len(),
+            "edge counts must match across runs"
+        );
+        for (i, (e1, e2)) in edges1.iter().zip(edges2.iter()).enumerate() {
+            assert_eq!(
+                e1.source_uid, e2.source_uid,
+                "source_uid mismatch at edge {i}"
+            );
+            assert_eq!(
+                e1.target_uid, e2.target_uid,
+                "target_uid mismatch at edge {i}"
+            );
+            assert_eq!(e1.edge_type, e2.edge_type, "edge_type mismatch at edge {i}");
+            assert!(
+                (e1.confidence - e2.confidence).abs() < f32::EPSILON,
+                "confidence mismatch at edge {i}: {} vs {}",
+                e1.confidence,
+                e2.confidence,
+            );
+        }
     }
 
     #[test]

@@ -346,6 +346,39 @@ impl GraphStore {
         }
     }
 
+    /// Fetch multiple symbols in a single query, keyed by UID.
+    ///
+    /// Builds one `WHERE s.uid IN [...]` query instead of N individual lookups.
+    /// UIDs not found in the graph are simply absent from the returned map.
+    /// Returns an empty map when `uids` is empty.
+    pub fn batch_lookup_symbols(
+        &self,
+        uids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
+        if uids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn()?;
+        let in_list: String = uids
+            .iter()
+            .map(|u| format!("'{}'", u.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.uid IN [{}] RETURN {}",
+            in_list, SYMBOL_COLUMNS
+        );
+        let result = conn
+            .query(&q)
+            .map_err(|e| StoreError::Query(format!("batch_lookup_symbols: {e}")))?;
+        let mut map = std::collections::HashMap::new();
+        for row in result {
+            let sym = row_to_symbol(&row)?;
+            map.insert(sym.uid.clone(), sym);
+        }
+        Ok(map)
+    }
+
     pub fn lookup_symbols_by_name(&self, name: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
         let q = format!(

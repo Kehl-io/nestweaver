@@ -38,6 +38,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rmp_serde;
 use serde::{Deserialize, Serialize};
 
 /// Entries older than this never hit (seconds). 24h.
@@ -48,6 +49,12 @@ pub const DEFAULT_MAX_SIZE_MB: u64 = 256;
 
 /// ZSTD compression level. Level 3 is the default speed/ratio trade-off.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Magic bytes that identify the binary cache format (MessagePack + ZSTD).
+const CACHE_MAGIC: &[u8; 4] = b"NWRC";
+
+/// Binary format version byte.
+const CACHE_VERSION: u8 = 1;
 
 /// One cached tool response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,11 +112,15 @@ impl ResponseCache {
 
     /// Open (or create empty) the cache for `db_path` with a size cap in MiB.
     /// A corrupt or absent sidecar yields an empty cache (never an error path).
+    ///
+    /// Format detection:
+    /// - Starts with `NWRC` + version byte → binary (MessagePack + ZSTD).
+    /// - Otherwise → JSON legacy fallback.
     pub fn open(db_path: &Path, max_size_mb: u64) -> Self {
         let path = Self::sidecar_path(db_path);
         let entries = std::fs::read(&path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<CacheDoc>(&bytes).ok())
+            .and_then(|bytes| decode_cache_bytes(&bytes).ok())
             .map(|doc| {
                 doc.entries
                     .into_iter()
@@ -225,19 +236,45 @@ impl ResponseCache {
         }
     }
 
-    /// Persist the cache to its sidecar. Best-effort; logs on failure.
+    /// Persist the cache to its sidecar using binary format (MessagePack + ZSTD).
+    /// Uses atomic write: serializes to a `.tmp` file then renames to the final
+    /// path to prevent corruption on crash. Best-effort; logs on failure.
+    pub fn flush(&self) {
+        match self.encode_binary() {
+            Ok(bytes) => {
+                let tmp = self.path.with_extension("cache.tmp");
+                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                    tracing::warn!("response cache: failed to write tmp sidecar: {e}");
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                    tracing::warn!("response cache: failed to rename sidecar: {e}");
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Err(e) => tracing::warn!("response cache: binary encode failed: {e}"),
+        }
+    }
+
+    /// Persist the cache to its sidecar. Calls [`flush`](Self::flush) internally,
+    /// so existing callers get the new binary format automatically.
     pub fn save(&self) {
+        self.flush();
+    }
+
+    /// Encode the cache as binary: MessagePack → ZSTD → magic header.
+    fn encode_binary(&self) -> Result<Vec<u8>, std::io::Error> {
         let doc = CacheDoc {
             entries: self.entries.values().cloned().collect(),
         };
-        match serde_json::to_vec(&doc) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(&self.path, bytes) {
-                    tracing::warn!("response cache: failed to write sidecar: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("response cache: serialize failed: {e}"),
-        }
+        let msgpack = rmp_serde::to_vec(&doc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let compressed = zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL)?;
+        let mut out = Vec::with_capacity(CACHE_MAGIC.len() + 1 + compressed.len());
+        out.extend_from_slice(CACHE_MAGIC);
+        out.push(CACHE_VERSION);
+        out.extend_from_slice(&compressed);
+        Ok(out)
     }
 
     /// Number of entries currently held.
@@ -280,6 +317,31 @@ fn normalize_args(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(normalize_args).collect())
         }
         other => other.clone(),
+    }
+}
+
+/// Decode raw sidecar bytes into a [`CacheDoc`], detecting format automatically.
+///
+/// - Starts with `NWRC` + version byte → decompress ZSTD, deserialize MessagePack.
+/// - Otherwise → try JSON (legacy fallback).
+/// - Any error returns `Err` so the caller can fall back to an empty cache.
+fn decode_cache_bytes(bytes: &[u8]) -> Result<CacheDoc, Box<dyn std::error::Error>> {
+    if bytes.starts_with(CACHE_MAGIC) {
+        let version = *bytes
+            .get(CACHE_MAGIC.len())
+            .ok_or("truncated binary cache header")?;
+        if version != CACHE_VERSION {
+            return Err(
+                format!("unsupported cache version {version} (expected {CACHE_VERSION})").into(),
+            );
+        }
+        let payload = &bytes[CACHE_MAGIC.len() + 1..];
+        let decompressed = zstd::decode_all(payload)?;
+        let doc = rmp_serde::from_slice::<CacheDoc>(&decompressed)?;
+        Ok(doc)
+    } else {
+        let doc = serde_json::from_slice::<CacheDoc>(bytes)?;
+        Ok(doc)
     }
 }
 
@@ -403,6 +465,79 @@ mod tests {
         // handful survive (the most recently inserted). The invariant we care
         // about is that it does not grow without bound.
         assert!(cache.len() <= 1);
+    }
+
+    #[test]
+    fn flush_binary_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let key = ResponseCache::key("clusters", &json!({}));
+        {
+            let mut cache = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+            cache.insert(key, "clusters", b"binary round trip", 7, 42);
+            cache.flush();
+        }
+        // Verify the sidecar starts with magic bytes.
+        let raw = std::fs::read(ResponseCache::sidecar_path(&db_path)).unwrap();
+        assert!(
+            raw.starts_with(b"NWRC"),
+            "sidecar should start with NWRC magic"
+        );
+
+        let mut reopened = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+        assert_eq!(
+            reopened.get(key, 7, 42).as_deref(),
+            Some(&b"binary round trip"[..])
+        );
+    }
+
+    #[test]
+    fn json_migration_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let key = ResponseCache::key("clusters", &json!({}));
+
+        // Write a JSON sidecar directly (legacy format).
+        {
+            let mut cache = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+            cache.insert(key, "clusters", b"legacy json payload", 3, 9);
+            // Bypass flush; serialize as plain JSON.
+            let doc = CacheDoc {
+                entries: cache.entries.values().cloned().collect(),
+            };
+            let json_bytes = serde_json::to_vec(&doc).unwrap();
+            std::fs::write(ResponseCache::sidecar_path(&db_path), json_bytes).unwrap();
+        }
+
+        // open() should fall back to JSON and serve the entry.
+        let mut reopened = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+        assert_eq!(
+            reopened.get(key, 3, 9).as_deref(),
+            Some(&b"legacy json payload"[..])
+        );
+    }
+
+    #[test]
+    fn save_uses_binary_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let key = ResponseCache::key("hub_nodes", &json!({"n": 5}));
+        {
+            let mut cache = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+            cache.insert(key, "hub_nodes", b"save delegates to flush", 1, 1);
+            cache.save();
+        }
+        let raw = std::fs::read(ResponseCache::sidecar_path(&db_path)).unwrap();
+        assert!(
+            raw.starts_with(b"NWRC"),
+            "save() should write binary format"
+        );
+
+        let mut reopened = ResponseCache::open(&db_path, DEFAULT_MAX_SIZE_MB);
+        assert_eq!(
+            reopened.get(key, 1, 1).as_deref(),
+            Some(&b"save delegates to flush"[..])
+        );
     }
 
     #[test]
