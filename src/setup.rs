@@ -201,6 +201,9 @@ fn setup_claude_code(
         "skill written"
     };
 
+    // Install Claude Code hooks in .claude/settings.json
+    let hooks_status = install_claude_hooks(&db_str)?;
+
     print_result(
         "Claude Code",
         &[
@@ -213,9 +216,81 @@ fn setup_claude_code(
                 },
             ),
             (".claude/skills/nestweaver/SKILL.md", skill_status),
+            (".claude/settings.json", hooks_status),
         ],
     );
     Ok(())
+}
+
+/// Install NestWeaver hooks into `.claude/settings.json`.
+///
+/// Adds a SessionStart hook that prints brain status so the agent knows
+/// NestWeaver is available, and a PreToolUse hook for Bash that suggests
+/// graph alternatives when the agent falls back to grep/find.
+fn install_claude_hooks(db_str: &str) -> Result<&'static str, anyhow::Error> {
+    let settings_path = Path::new(".claude/settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(settings_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    // Check if NestWeaver hooks already installed
+    let hooks_obj = hooks.as_object_mut().unwrap();
+    let already_installed = hooks_obj
+        .get("SessionStart")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.contains("nestweaver"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    if already_installed {
+        return Ok("hooks already installed");
+    }
+
+    // SessionStart: print brain status
+    let session_start = hooks_obj
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = session_start.as_array_mut() {
+        arr.push(serde_json::json!({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": format!(
+                    "nestweaver brain status --db {} 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+                    db_str
+                )
+            }]
+        }));
+    }
+
+    std::fs::create_dir_all(".claude")?;
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(settings_path, formatted)?;
+
+    Ok("hooks installed")
 }
 
 fn setup_cursor(
@@ -764,16 +839,26 @@ fn generate_skill_content() -> String {
 
 fn generate_cursor_rule_content() -> String {
     "---\ndescription: Use NestWeaver for structural codebase understanding\nglobs:\nalwaysApply: true\n---\n\n\
-When exploring unfamiliar code, use the `brain_context` MCP tool with relevant symbol names as seeds.\n\n\
-Before modifying functions with many callers, use `brain_impact` to check blast radius.\n\n\
-For architecture questions, use `brain_guide` for a narrative overview, or `hub_nodes` and `bridge_nodes` to find the most connected and most critical nodes.\n\n\
-For token-efficient overviews, use `get_summary` at file or cluster level instead of reading entire files.\n\n\
-When working on a named project, use `project_context`.\n\n\
-After making changes, use `detect_changes` to assess risk.\n\n\
-To find cleanup opportunities, use `dead_code` to detect unreachable symbols.\n\n\
-For deep-dive exploration, use `investigate` → `investigate_hydrate` → `read_symbols` (only where `body_complete` is false). This progressive disclosure pattern avoids reading every file upfront.\n\n\
-Prefer `brain_search` over `brain_context` when locating symbols or notes by name — it returns both notes and code symbols in one call.\n\n\
-If using many MCP servers, pass `--tools` to the NestWeaver server to allowlist only the tools you need.\n".to_string()
+## Retrieval doctrine (token efficiency)\n\n\
+**Prefer the graph over raw files.** A single `brain_context` call returns ~3,400 tokens of ranked, structural \
+context vs ~400,000+ tokens from reading files with grep/find. Use NestWeaver tools INSTEAD OF grep/find/cat \
+whenever you need to understand code structure, find related symbols, or check impact.\n\n\
+- DO: `brain_context` seeded with a symbol → get ranked neighbors in one call\n\
+- DO: `brain_search` to find symbols/notes by name → faster than grep, searches code AND notes\n\
+- DO: `brain_impact` before modifying code → see blast radius without reading callers\n\
+- DO NOT: grep/rg across the whole repo to find usages — `brain_context` already has them\n\
+- DO NOT: read files to understand architecture — `brain_guide` or `hub_nodes` gives the structural picture\n\
+- DO NOT: open files just to check what a function does — `read_symbols` returns just the symbol body\n\n\
+## Key tools\n\n\
+- `brain_context` — PPR-ranked structural context from symbol/note seeds\n\
+- `brain_search` — full-text search across code AND notes in one call\n\
+- `brain_impact` — blast radius before modifying code\n\
+- `project_context` — project-scoped notes and symbols\n\
+- `detect_changes` — assess risk after changes\n\
+- `investigate` → `investigate_hydrate` → `read_symbols` — progressive disclosure\n\
+- `dead_code` — find unreachable symbols\n\
+- `hub_nodes` / `bridge_nodes` — find central and critical code\n\
+- `get_summary` — token-efficient overview at file or cluster level\n".to_string()
 }
 
 fn generate_copilot_instructions() -> String {

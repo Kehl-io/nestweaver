@@ -1,7 +1,9 @@
 ---
 name: nestweaver-review
-description: Review code changes with full codebase context from NestWeaver.
+description: Review code changes with full codebase context from NestWeaver. Use blast_radius instead of manually tracing callers — it shows the full impact chain with confidence scores.
 ---
+
+**Use NestWeaver to understand what a change affects.** `blast_radius` gives confidence-weighted impact across the full dependency chain. `affected_tests` identifies test coverage. DO NOT manually grep for callers.
 
 When reviewing a PR or set of changes:
 
