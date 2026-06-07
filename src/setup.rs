@@ -269,7 +269,7 @@ fn install_claude_hooks(db_str: &str) -> Result<&'static str, anyhow::Error> {
         return Ok("hooks already installed");
     }
 
-    // SessionStart: print brain status
+    // SessionStart: print brain status so the agent knows the graph is available
     let session_start = hooks_obj
         .entry("SessionStart")
         .or_insert_with(|| serde_json::json!([]));
@@ -281,6 +281,26 @@ fn install_claude_hooks(db_str: &str) -> Result<&'static str, anyhow::Error> {
                 "command": format!(
                     "nestweaver brain status --db {} 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
                     db_str
+                )
+            }]
+        }));
+    }
+
+    // PreToolUse on Bash: when the agent runs grep/rg/find, suggest graph alternatives.
+    // Non-blocking — returns additionalContext, never blocks the tool call.
+    let pre_tool_use = hooks_obj
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = pre_tool_use.as_array_mut() {
+        arr.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{
+                "type": "command",
+                "command": format!(
+                    "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.command // empty'); \
+                     if echo \"$CMD\" | grep -qE '(grep|rg|find|fd|ack|ag)\\s'; then \
+                       echo '{{\"additionalContext\": \"NestWeaver is indexed — prefer `brain_search` (searches code + notes) or `brain_context` (ranked structural context) over grep/find. Token savings: ~90% fewer tokens than file-by-file exploration.\"}}'; \
+                     fi",
                 )
             }]
         }));
@@ -840,8 +860,8 @@ fn generate_skill_content() -> String {
 fn generate_cursor_rule_content() -> String {
     "---\ndescription: Use NestWeaver for structural codebase understanding\nglobs:\nalwaysApply: true\n---\n\n\
 ## Retrieval doctrine (token efficiency)\n\n\
-**Prefer the graph over raw files.** A single `brain_context` call returns ~3,400 tokens of ranked, structural \
-context vs ~400,000+ tokens from reading files with grep/find. Use NestWeaver tools INSTEAD OF grep/find/cat \
+**Prefer the graph over raw files.** A single `brain_context` call returns ~1,000 tokens of ranked, structural \
+context vs ~10,000+ tokens from file-by-file exploration (validated 10x reduction, 2x fewer tool calls). Use NestWeaver tools INSTEAD OF grep/find/cat \
 whenever you need to understand code structure, find related symbols, or check impact.\n\n\
 - DO: `brain_context` seeded with a symbol → get ranked neighbors in one call\n\
 - DO: `brain_search` to find symbols/notes by name → faster than grep, searches code AND notes\n\
