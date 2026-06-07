@@ -77,10 +77,7 @@ mod tests {
         let dql = "LIST\nFROM \"Workspaces/Freeplay\"\nSORT file.mtime DESC";
         let query = parse_dataview_query(dql).unwrap();
         assert_eq!(query.query_type, "LIST");
-        assert_eq!(
-            query.from_source.as_deref(),
-            Some("Workspaces/Freeplay")
-        );
+        assert_eq!(query.from_source.as_deref(), Some("Workspaces/Freeplay"));
     }
 
     #[test]

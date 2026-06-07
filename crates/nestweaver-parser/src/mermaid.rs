@@ -29,7 +29,10 @@ pub struct MermaidDiagram {
 }
 
 static RE_DIAGRAM_TYPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie)\b").unwrap()
+    Regex::new(
+        r"(?i)^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie)\b",
+    )
+    .unwrap()
 });
 
 // Matches: A[Label] --> B[Label]  or  A --> B  or  A -- text --> B
@@ -42,9 +45,8 @@ static RE_EDGE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // Matches standalone node declarations: A[Label] or A(Label) or A{Label}
-static RE_NODE_DECL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(\w+)\[([^\]]*)\]\s*$").unwrap()
-});
+static RE_NODE_DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\w+)\[([^\]]*)\]\s*$").unwrap());
 
 pub fn parse_mermaid(source: &str) -> Option<MermaidDiagram> {
     let first_line = source.lines().next()?.trim();
@@ -66,13 +68,27 @@ pub fn parse_mermaid(source: &str) -> Option<MermaidDiagram> {
 
         // Try edge pattern first
         if let Some(caps) = RE_EDGE.captures(trimmed) {
-            let from_id = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let from_label = caps.get(2).or(caps.get(3)).or(caps.get(4))
+            let from_id = caps
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let from_label = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
                 .map(|m| m.as_str().to_string());
-            let edge_label = caps.get(5).map(|m| m.as_str().trim().to_string())
+            let edge_label = caps
+                .get(5)
+                .map(|m| m.as_str().trim().to_string())
                 .filter(|s| !s.is_empty());
-            let to_id = caps.get(6).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let to_label = caps.get(7).or(caps.get(8)).or(caps.get(9))
+            let to_id = caps
+                .get(6)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let to_label = caps
+                .get(7)
+                .or(caps.get(8))
+                .or(caps.get(9))
                 .map(|m| m.as_str().to_string());
 
             if !from_id.is_empty() && !to_id.is_empty() {
@@ -99,7 +115,10 @@ pub fn parse_mermaid(source: &str) -> Option<MermaidDiagram> {
 
         // Try standalone node declaration
         if let Some(caps) = RE_NODE_DECL.captures(trimmed) {
-            let id = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let id = caps
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             let label = caps.get(2).map(|m| m.as_str().to_string());
             if !id.is_empty() && seen_ids.insert(id.clone()) {
                 nodes.push(MermaidNode { id, label });
@@ -143,10 +162,7 @@ mod tests {
         let src = "flowchart TD\n    A -- sends request --> B\n";
         let diagram = parse_mermaid(src).unwrap();
         assert_eq!(diagram.edges.len(), 1);
-        assert_eq!(
-            diagram.edges[0].label.as_deref(),
-            Some("sends request")
-        );
+        assert_eq!(diagram.edges[0].label.as_deref(), Some("sends request"));
     }
 
     #[test]

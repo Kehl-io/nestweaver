@@ -84,10 +84,7 @@ mod tests {
             Some("notes/architecture.md")
         );
         assert_eq!(canvas.nodes[1].node_type, "text");
-        assert_eq!(
-            canvas.nodes[1].text.as_deref(),
-            Some("Design decisions")
-        );
+        assert_eq!(canvas.nodes[1].text.as_deref(), Some("Design decisions"));
     }
 
     #[test]
