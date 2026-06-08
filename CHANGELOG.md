@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.20.0](https://github.com/Kehl-io/nestweaver/compare/v0.19.0...v0.20.0) (2026-06-08)
+
+
+### Features
+
+* **brain:** support cross-vault wikilinks with vault:note prefix ([5e28d75](https://github.com/Kehl-io/nestweaver/commit/5e28d758dcf820ea6b5c772ac6daf3e22e7c0946))
+* **guide:** add CLAUDE.md generation format ([3dde889](https://github.com/Kehl-io/nestweaver/commit/3dde889b154a5c0570f157c941373e4304f4e697))
+* markdown knowledge graph enhancements — CLAUDE.md gen, AgentConfig, canvas/dataview/mermaid parsers ([857cbbb](https://github.com/Kehl-io/nestweaver/commit/857cbbb1fa4147b019331a73d22b5d391fdc2d1f))
+* **parser:** add Dataview DQL query parser ([5408a9f](https://github.com/Kehl-io/nestweaver/commit/5408a9ff28cfdfbdf0326162256e2f7075c5b126))
+* **parser:** add Mermaid flowchart/graph diagram parser ([4aef510](https://github.com/Kehl-io/nestweaver/commit/4aef51056c4a2ef5a44765bf77fc53b25d544274))
+* **parser:** add Obsidian canvas file parser ([e2918c9](https://github.com/Kehl-io/nestweaver/commit/e2918c91b86e068c2c6afe6f00b528172884eae7))
+* **parser:** extract checkboxes and ADR sections from markdown ([2ff7e0b](https://github.com/Kehl-io/nestweaver/commit/2ff7e0bbb6375f71544ef587684934008dac53af))
+* **schema:** add NoteKind::AgentConfig for agentic instruction files ([06e2780](https://github.com/Kehl-io/nestweaver/commit/06e27805cf1690e2170bcf446f1db07acc75291e))
+* **setup:** add PreToolUse hook to intercept grep/find, fix token savings claims to validated 10x ([e3bd6dc](https://github.com/Kehl-io/nestweaver/commit/e3bd6dc1a45ebdf4fabb52e1f7a0d5057950b05d))
+* **setup:** install Claude Code hooks, add token-savings messaging to skills and cursor rules ([fdd4867](https://github.com/Kehl-io/nestweaver/commit/fdd48673e2f89142de989f9b555ebf1e0e294619))
+
+
+### Bug Fixes
+
+* address code review findings — AgentConfig round-trip, drive letter guard, leaked configs, dead code, dataview tag regex ([dc27560](https://github.com/Kehl-io/nestweaver/commit/dc275608f007157c2e261d2d1680afd6a6c5f2bb))
+* **cli:** stop daemon before direct-mode index to prevent lock contention ([3f65f63](https://github.com/Kehl-io/nestweaver/commit/3f65f63e811e089e1cd5c0a6d075e4983bd1734d))
+* collapse nested if-let per clippy ([6760593](https://github.com/Kehl-io/nestweaver/commit/67605938fc57150ff81168e1d7ddb9d137861f11))
+* **mcp:** log cache serialization failures instead of silently skipping ([acf771f](https://github.com/Kehl-io/nestweaver/commit/acf771f1712e0806399e535ec3d7cef040b437ad))
+* rustfmt formatting for new parser modules ([19b4177](https://github.com/Kehl-io/nestweaver/commit/19b4177dd85bedde21c548bf2f2a6c26ee0eb1ba))
+* **store:** address review findings — transaction safety, ordering, cache version ([9fb2ce4](https://github.com/Kehl-io/nestweaver/commit/9fb2ce4f30baebbd60ff7962dd0766b726801d55))
+* **store:** hash vec lengths in scope_hash to prevent prefix collisions ([242390b](https://github.com/Kehl-io/nestweaver/commit/242390bd42b1cb3ae6fa628fe1029efcdb2cd60f))
+
+
+### Performance Improvements
+
+* comprehensive performance audit — 35x index, 10000x cache, parallel resolution ([efbff3b](https://github.com/Kehl-io/nestweaver/commit/efbff3b938f9bb21ee8feddbdeef080493b19a65))
+* **engine:** parallelize type environment construction with rayon ([b92a7c4](https://github.com/Kehl-io/nestweaver/commit/b92a7c48dbb693439ea3c1f5f9e3f8a364375f1e))
+* **engine:** retain parsed source to avoid redundant disk re-reads ([0028f87](https://github.com/Kehl-io/nestweaver/commit/0028f87fc8d8f5281b567e707aa105231aee56aa))
+* **engine:** use bulk delete for force re-index cleanup ([42be7a5](https://github.com/Kehl-io/nestweaver/commit/42be7a53d803b43a3c529a0a6d686f3ed553d060))
+* **mcp:** hold response cache in-process with periodic flush ([bebc4d3](https://github.com/Kehl-io/nestweaver/commit/bebc4d3aad6af6c2ff2e663bd63ffa2bda104878))
+* **parser:** cache compiled tree-sitter Query objects globally ([31dc3f5](https://github.com/Kehl-io/nestweaver/commit/31dc3f5082eb1d562bcb3f0fa1cb46245a9ff611))
+* **resolver:** parallelize per-file reference resolution with rayon ([d67f3b4](https://github.com/Kehl-io/nestweaver/commit/d67f3b4e3f8437a9c630cc6b39e5582078919b74))
+* **resolver:** use binary search for find_enclosing_symbol (O(n) → O(log n)) ([2423699](https://github.com/Kehl-io/nestweaver/commit/2423699a8c27f7914a7ecf8896600584db0d2278))
+* **store:** add _on variants for markdown batch inserts ([d77e747](https://github.com/Kehl-io/nestweaver/commit/d77e747ba91dcf215a1309ad0d91c0f5b8eceaa1))
+* **store:** batch symbol lookups to eliminate N+1 after PPR ([4220cad](https://github.com/Kehl-io/nestweaver/commit/4220cad448e2b75f1b22cb040d77ea1ff6a47198))
+* **store:** batch Tantivy commits and use bulk section/heading loaders ([43468ed](https://github.com/Kehl-io/nestweaver/commit/43468ed0453127c2f9d6b68c712af451735edefc))
+* **store:** cache PPR adjacency graph keyed on (generation, scope, intent) ([ffd3fba](https://github.com/Kehl-io/nestweaver/commit/ffd3fba5f631c61b66cea8d0203ecc38a929b694))
+* **store:** cache symbol name index keyed on graph generation ([c577725](https://github.com/Kehl-io/nestweaver/commit/c5777259d56cc401150c101ff7598310c6dea6ee))
+* **store:** replace per-row cascade deletes with bulk DETACH DELETE ([e6df168](https://github.com/Kehl-io/nestweaver/commit/e6df1687ff69f8ff18503560fb8a4367f74acc87))
+* **store:** switch response cache to binary format (MessagePack + ZSTD) ([7fed80d](https://github.com/Kehl-io/nestweaver/commit/7fed80d507d175516d1bc46be578f666b6b96c17))
+* **store:** wrap vault indexing in single transaction via bulk_vault_write ([9123576](https://github.com/Kehl-io/nestweaver/commit/9123576431dcefaf16834cb6326d5210915b5178))
+
 ## [0.19.0](https://github.com/Kehl-io/nestweaver/compare/v0.18.0...v0.19.0) (2026-06-05)
 
 
