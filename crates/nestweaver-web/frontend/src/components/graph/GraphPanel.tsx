@@ -188,6 +188,7 @@ function GraphModeHooks() {
   const { hops, setHops } = useLocalMode();
 
   const graphMode = useStore((s) => s.graphMode);
+  const viewMode = useStore((s) => s.viewMode);
   const semanticLayoutRequested = useStore((s) => s.semanticLayoutRequested);
   const clearSemanticLayoutRequest = useStore(
     (s) => s.clearSemanticLayoutRequest,
@@ -203,7 +204,7 @@ function GraphModeHooks() {
 
   return (
     <>
-      {graphMode === "overview" && (
+      {graphMode === "overview" && viewMode === "graph" && (
         <>
           <OverviewCommandShelf {...overviewState} />
           <OverviewContextSurface
