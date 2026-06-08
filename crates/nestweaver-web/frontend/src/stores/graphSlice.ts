@@ -55,7 +55,7 @@ export const createGraphSlice: StateCreator<
   selectedNodeId: null,
   selectedNodeKind: null,
   hoveredNodeId: null,
-  graphMode: "context",
+  graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
   scopeRepoUid: null,
