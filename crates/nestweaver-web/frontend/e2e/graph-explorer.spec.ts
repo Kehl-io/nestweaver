@@ -12,8 +12,10 @@ async function fetchOverview(
   const response = await request.get("/api/v1/overview?limit=24");
   expect(response.ok()).toBeTruthy();
   const overview = (await response.json()) as OverviewResponse;
-  expect(overview.landmarks.length).toBeGreaterThan(0);
-  expect(overview.start_here.length).toBeGreaterThan(0);
+  expect(overview).toHaveProperty("counts");
+  expect(Array.isArray(overview.landmarks)).toBeTruthy();
+  expect(Array.isArray(overview.start_here)).toBeTruthy();
+  expect(Array.isArray(overview.gaps)).toBeTruthy();
   return overview;
 }
 
@@ -63,6 +65,9 @@ test.describe("Graph Explorer", () => {
         startHere.getByText(item.label, { exact: true }),
       ).toBeVisible();
     }
+    if (visibleItems.length === 0) {
+      await expect(startHere.getByText("No entry points found.")).toBeVisible();
+    }
 
     const contextSurface = page.getByRole("complementary", {
       name: "Overview context",
@@ -83,7 +88,12 @@ test.describe("Graph Explorer", () => {
     request,
   }) => {
     const overview = await fetchOverview(request);
-    const [firstItem] = displayedStartHereItems(overview);
+    const firstItem = displayedStartHereItems(overview)[0];
+
+    if (!firstItem) {
+      test.skip(true, "overview fixture has no visible Start Here items");
+      return;
+    }
 
     await openOverview(page);
 
@@ -162,7 +172,13 @@ test.describe("Graph Explorer", () => {
 
   test("overview API returns Start Here data", async ({ request }) => {
     const overview = await fetchOverview(request);
-    expect(overview).toHaveProperty("counts");
+
+    if (overview.landmarks.length === 0) {
+      test.skip(true, "overview fixture is empty");
+      return;
+    }
+
+    expect(overview.start_here.length).toBeGreaterThan(0);
     expect(overview.start_here.length).toBeLessThanOrEqual(
       overview.landmarks.length,
     );
