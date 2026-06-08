@@ -2,6 +2,7 @@ import { useStore } from "../../stores";
 import type { GraphMode } from "../../api/types";
 
 const modes: { key: GraphMode; label: string }[] = [
+  { key: "overview", label: "Overview" },
   { key: "context", label: "Context" },
   { key: "impact", label: "Impact" },
   { key: "repos", label: "Repos" },
