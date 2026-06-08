@@ -147,7 +147,6 @@ fn repo_label(repo: &nestweaver_schema::Repo) -> String {
         .trim_end_matches('/')
         .rsplit('/')
         .find(|segment| !segment.is_empty())
-        .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
         .filter(|segment| !segment.is_empty())
         .unwrap_or(&repo.uid)
         .to_string()
