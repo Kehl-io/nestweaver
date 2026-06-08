@@ -11,6 +11,7 @@ import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { LlmQueryBar } from "../llm/LlmQueryBar";
 import { TimelineSlider } from "../timeline/TimelineSlider";
+import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
 import { useReposMode } from "./modes/useReposMode";
@@ -171,6 +172,7 @@ function useGraphKeyboardNav(
  * Hooks read and write graph state via zustand.
  */
 function GraphModeHooks() {
+  useOverviewMode();
   useContextMode();
   useImpactMode();
   useReposMode();
