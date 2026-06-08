@@ -4,9 +4,10 @@ import { GraphCanvas } from "./GraphCanvas";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { NodeFilterBar } from "./NodeFilterBar";
 import { ModeTabs } from "./ModeTabs";
-import { GraphToolbar } from "./GraphToolbar";
+import { ControlDock } from "./ControlDock";
+import { ActiveFilterSummary } from "./ActiveFilterSummary";
+import { GraphLegend } from "./GraphLegend";
 import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { LlmQueryBar } from "../llm/LlmQueryBar";
@@ -276,7 +277,8 @@ export function GraphPanel() {
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
-        <GraphToolbar />
+        <ControlDock />
+        <GraphLegend />
         {minimapVisible && (
           <div className="absolute top-2 right-12 z-10">
             <GraphMinimap />
@@ -300,7 +302,7 @@ export function GraphPanel() {
         </div>
       </div>
       <TimelineSlider />
-      <NodeFilterBar />
+      <ActiveFilterSummary />
       <ModeTabs />
       <LlmQueryBar />
     </div>
