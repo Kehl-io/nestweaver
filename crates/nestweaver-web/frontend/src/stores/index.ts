@@ -46,7 +46,6 @@ export const useStore = create<StoreState>()(
           forceParams: state.forceParams,
           activeStyleRules: state.activeStyleRules,
           theme: state.theme,
-          graphMode: state.graphMode,
           explorerTab: state.explorerTab,
           communityOverlay: state.communityOverlay,
           tagsVisible: state.tagsVisible,
