@@ -39,7 +39,7 @@ export function GraphLegend() {
           {visuals.colorEncoding}
         </span>
         <span className="rounded border border-[var(--color-border)] px-1.5 py-0.5">
-          Rings: relevance, seeds, bridges
+          Glow: relevance, seeds, bridges
         </span>
       </div>
 
@@ -52,7 +52,7 @@ export function GraphLegend() {
             {visibleKinds.map(([kind]) => (
               <div key={kind} className="flex items-center gap-1.5">
                 <span
-                  className="h-2.5 w-2.5 rounded-full border border-white/70 shadow-[0_0_0_1px_rgba(15,23,42,0.25)]"
+                  className="h-2.5 w-2.5 rounded-full shadow-[0_0_0_1px_rgba(255,255,255,0.45),0_0_10px_rgba(59,130,246,0.18)]"
                   style={{ backgroundColor: kindColor(kind, isDark) }}
                 />
                 <span className="truncate text-[11px] text-[var(--color-text-muted)]">
