@@ -33,6 +33,8 @@ Obsidian's graph feels useful partly because it is fluid: nodes settle naturally
 
 The goal is not a new visual identity. Keep the current NestWeaver colors. Improve composition, motion, density, affordances, labeling, and control clarity.
 
+The layout itself is also in scope. NestWeaver should not be limited to the common graph-app pattern of left browser, center graph, right inspector, and bottom filters. That layout is a useful baseline, but it is not the product vision. The design should explore a layout that feels specific to NestWeaver's job: turning code, notes, and graph intelligence into an explorable map of what matters.
+
 ## Research Principles
 
 The design follows a few durable visualization and product patterns.
@@ -62,13 +64,31 @@ The first version should optimize for these jobs:
 - "Where are documentation, test, or knowledge gaps?"
 - "How do I narrow this graph without learning a mode taxonomy?"
 
-## Proposed First-Open Layout
+## Layout Direction
 
-The default screen should keep the current three-region structure, but change what each region does.
+Do not treat the current three-pane structure as fixed. The first implementation can reuse existing panels where practical, but the spec should push toward a fresh layout that feels less like a generic graph library demo and more like an intelligence workspace.
+
+The layout should prioritize:
+
+- a large, fluid graph canvas as the primary surface,
+- contextual controls that appear where they are needed,
+- guidance that does not permanently consume too much space,
+- detail panels that can dock, float, collapse, or become bottom sheets depending on task and viewport,
+- smooth movement between overview, local exploration, impact, and detail reading.
+
+Recommended exploration paths:
+
+- **Map With Command Shelf:** a full-bleed graph canvas with a compact floating command shelf for Start Here, search, filters, and perspectives.
+- **Constellation Workbench:** a graph-centered layout where selected nodes open small contextual satellites for actions, detail previews, related notes, and impact.
+- **Narrated Map:** a graph canvas paired with a lightweight insight strip that explains the current scene and recommends the next few moves.
+
+These directions are not mutually exclusive. The implementation can combine them, but it should avoid defaulting to permanent sidebars unless they clearly serve the current task.
+
+## Proposed First-Open Experience
 
 ### Left Rail: Start Here
 
-Replace or augment the passive explorer-first panel with an action-oriented rail.
+Replace or augment the passive explorer-first panel with action-oriented guidance. This guidance can be a left rail, floating command shelf, collapsible drawer, bottom sheet, or other layout treatment that preserves the graph as the primary canvas.
 
 Primary sections:
 
@@ -92,24 +112,26 @@ Initial graph contents should be intentionally small and ranked:
 - current project scope if an instance config is active,
 - recent-change nodes when available.
 
-The center graph should answer, "What are the major landmarks?" It should not attempt to render the entire graph by default.
+The primary graph surface should answer, "What are the major landmarks?" It should not attempt to render the entire graph by default.
 
-### Right Panel: Why This Matters
+### Context Surface: Why This Matters
 
-When nothing is selected, the detail panel should summarize the current overview:
+When nothing is selected, the context surface should summarize the current overview:
 
 - indexed counts,
 - most important clusters,
 - detected gaps,
 - recommended first actions.
 
-When a node is selected, the panel should explain:
+When a node is selected, the context surface should explain:
 
 - what the node is,
 - why it appears in the overview,
 - where it lives,
 - what connects to it,
 - what to do next.
+
+The context surface can be a docked panel, floating panel, inline popover, bottom tray, or split reading mode. The user should feel like details are attached to the current map state, not like they have entered a separate app.
 
 ## Interaction Model
 
@@ -262,6 +284,9 @@ The response should include a reason string or reason codes for each recommended
 - Primary landmarks have readable labels without flooding the canvas.
 - The UI has a clear focal point and obvious next action in the first viewport.
 - Panels, controls, and graph overlays feel like one product surface rather than separate debug tools.
+- The implementation explores at least one layout that is not a permanent left-sidebar, center-graph, right-inspector frame.
+- Guidance and details can collapse, float, or move so the graph remains the primary spatial surface.
+- The layout feels specific to NestWeaver's code-plus-knowledge map rather than interchangeable with a generic graph visualization library.
 
 ### Accessibility
 
@@ -284,6 +309,7 @@ The response should include a reason string or reason codes for each recommended
 - Load a bounded overview graph by default.
 - Replace empty detail state with overview summary and recommended actions.
 - Add Start Here rail with top hubs, repos/vaults, and gaps using existing APIs where possible.
+- Prototype one nonstandard layout treatment for Start Here and context details, such as a floating command shelf, contextual node satellites, or collapsible insight strip.
 
 ### Phase 2: Contextual Actions
 
@@ -296,6 +322,7 @@ The response should include a reason string or reason codes for each recommended
 - Replace the vertical cryptic toolbar with grouped controls.
 - Add readable legends and active filter summaries.
 - Preserve shortcuts and compact expert access.
+- Re-evaluate whether persistent side panels are still needed after grouped controls and contextual actions are in place.
 
 ### Phase 4: Dense Graph Alternatives
 
