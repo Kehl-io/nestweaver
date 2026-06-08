@@ -117,7 +117,7 @@ export function GraphMatrixView() {
         {selectedCell && (
           <div className="max-w-[520px] rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-2">
             <p className="truncate text-[11px] text-[var(--color-text)]">
-              {selectedCell.source.name} -> {selectedCell.target.name}
+              {selectedCell.source.name} {"->"} {selectedCell.target.name}
             </p>
             <p className="text-[10px] text-[var(--color-text-muted)]">
               {selectedCell.edge.type}

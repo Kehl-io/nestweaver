@@ -19,42 +19,6 @@ function findOverviewItem(
   );
 }
 
-const SYMBOL_KINDS = new Set([
-  "symbol",
-  "Function",
-  "Class",
-  "Method",
-  "Interface",
-  "Trait",
-  "Enum",
-  "Module",
-  "Extension",
-  "Constant",
-  "Property",
-  "TypeAlias",
-  "Variable",
-]);
-
-function isSymbolLandmark(item: OverviewLandmark | null): boolean {
-  return item != null && SYMBOL_KINDS.has(item.kind);
-}
-
-function canExploreLandmark(item: OverviewLandmark | null): boolean {
-  if (item == null) return false;
-  return isSymbolLandmark(item) || item.kind === "note";
-}
-
-function firstSupportedTarget(
-  overview: OverviewResponse | null,
-  predicate: (item: OverviewLandmark | null) => boolean,
-): OverviewLandmark | null {
-  return (
-    overview?.start_here.find(predicate) ??
-    overview?.landmarks.find(predicate) ??
-    null
-  );
-}
-
 function isEmptyOverview(overview: OverviewResponse | null): boolean {
   return (
     overview != null &&
@@ -80,12 +44,6 @@ export function OverviewContextSurface({
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
-  const setSeeds = useStore((s) => s.setSeeds);
-  const selectNode = useStore((s) => s.selectNode);
-  const setGraphMode = useStore((s) => s.setGraphMode);
-  const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
-  const viewMode = useStore((s) => s.viewMode);
-  const toggleViewMode = useStore((s) => s.toggleViewMode);
 
   const emptyOverview = isEmptyOverview(overview);
   const overviewItem = findOverviewItem(overview, selectedNodeId);
@@ -109,32 +67,6 @@ export function OverviewContextSurface({
         }
       : null;
   const selected = overviewItem ?? graphSelected;
-  const selectedOverviewItem = findOverviewItem(overview, selectedNodeId);
-  const hasOverviewSelection =
-    selectedNodeId != null && selectedOverviewItem != null;
-  const exploreFallback = firstSupportedTarget(overview, canExploreLandmark);
-  const impactFallback = firstSupportedTarget(overview, isSymbolLandmark);
-  const exploreActionTarget =
-    hasOverviewSelection
-      ? canExploreLandmark(selectedOverviewItem) ? selectedOverviewItem : null
-      : exploreFallback;
-  const impactActionTarget =
-    hasOverviewSelection
-      ? isSymbolLandmark(selectedOverviewItem) ? selectedOverviewItem : null
-      : impactFallback;
-
-  const exploreTarget = () => {
-    if (!exploreActionTarget) return;
-    selectNode(exploreActionTarget.uid, exploreActionTarget.kind);
-    setSeeds([exploreActionTarget.uid]);
-    setGraphMode("local");
-  };
-
-  const impactTarget = () => {
-    if (!impactActionTarget) return;
-    selectNode(impactActionTarget.uid, impactActionTarget.kind);
-    setGraphMode("impact");
-  };
 
   return (
     <aside
@@ -179,41 +111,6 @@ export function OverviewContextSurface({
               {compactLocation(selected.location)}
             </p>
           )}
-
-          <div className="mt-3 grid grid-cols-2 gap-1.5">
-            <button
-              type="button"
-              onClick={exploreTarget}
-              disabled={!exploreActionTarget}
-              title={!exploreActionTarget ? "Explore is available for symbols and notes" : undefined}
-              className="rounded bg-blue-600 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-            >
-              Explore neighborhood
-            </button>
-            <button
-              type="button"
-              onClick={impactTarget}
-              disabled={!impactActionTarget}
-              title={!impactActionTarget ? "Impact is available for symbols" : undefined}
-              className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-            >
-              Impact
-            </button>
-            <button
-              type="button"
-              onClick={requestSemanticLayout}
-              className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-            >
-              Settle layout
-            </button>
-            <button
-              type="button"
-              onClick={toggleViewMode}
-              className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-            >
-              {viewMode === "list" ? "Graph view" : "List view"}
-            </button>
-          </div>
         </div>
       ) : (
         <div className="p-3">
@@ -296,34 +193,6 @@ export function OverviewContextSurface({
                   </p>
                 </div>
               )}
-
-              <div className="mt-3 grid grid-cols-3 gap-1.5">
-                <button
-                  type="button"
-                  onClick={exploreTarget}
-                  disabled={!exploreActionTarget}
-                  title={!exploreActionTarget ? "Explore is available for symbols and notes" : undefined}
-                  className="rounded bg-blue-600 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-                >
-                  Explore
-                </button>
-                <button
-                  type="button"
-                  onClick={impactTarget}
-                  disabled={!impactActionTarget}
-                  title={!impactActionTarget ? "Impact is available for symbols" : undefined}
-                  className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-                >
-                  Impact
-                </button>
-                <button
-                  type="button"
-                  onClick={requestSemanticLayout}
-                  className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-                >
-                  Settle
-                </button>
-              </div>
             </>
           ) : (
             <p className="mt-2 text-xs text-[var(--color-text-muted)]">
