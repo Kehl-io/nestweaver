@@ -236,6 +236,36 @@ async fn overview_returns_ranked_landmarks() {
 }
 
 #[tokio::test]
+async fn overview_keeps_symbol_when_repos_exceed_limit() {
+    let store = setup_test_store();
+    for index in 0..8 {
+        let repo = Repo {
+            uid: format!("repo:extra:{index}"),
+            url: format!("https://example.com/extra-{index}.git"),
+            indexed_sha: format!("extra-{index}"),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: None,
+        };
+        store.insert_repo(&repo).unwrap();
+    }
+
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/test.lbug"));
+    let app = create_router(state);
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=6").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let landmarks = json["landmarks"]
+        .as_array()
+        .expect("landmarks should be an array");
+    assert_eq!(landmarks.len(), 6);
+    assert!(
+        landmarks.iter().any(|item| item["uid"] == "sym:test:greet"),
+        "overview should retain a representative symbol when repos exceed limit"
+    );
+}
+
+#[tokio::test]
 async fn brain_status_returns_counts() {
     let app = make_app();
     let (status, json) = get_json(&app, "/api/v1/brain/status").await;
