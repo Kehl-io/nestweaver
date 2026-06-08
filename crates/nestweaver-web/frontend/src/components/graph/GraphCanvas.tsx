@@ -233,12 +233,15 @@ export function GraphCanvas() {
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
   const bgColor = isDark ? "#06080f" : "#f8fafc";
+  const pixelRatio =
+    typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
   return (
     <Canvas
       camera={{ position: [0, 0, 500], fov: 50, near: 0.1, far: 10000 }}
+      dpr={[1, pixelRatio]}
       style={{ width: "100%", height: "100%" }}
-      gl={{ antialias: true, alpha: false }}
+      gl={{ antialias: true, alpha: false, powerPreference: "high-performance" }}
     >
       <color attach="background" args={[bgColor]} />
       <ambientLight intensity={1} />
@@ -267,10 +270,10 @@ export function GraphCanvas() {
       {!reducedMotion && (
         <EffectComposer>
           <Bloom
-            luminanceThreshold={0.7}
-            luminanceSmoothing={0.3}
-            intensity={0.65}
-            radius={0.5}
+            luminanceThreshold={0.82}
+            luminanceSmoothing={0.24}
+            intensity={0.38}
+            radius={0.28}
           />
         </EffectComposer>
       )}

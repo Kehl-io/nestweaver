@@ -51,27 +51,31 @@ void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
 
-    // SDF circle — crisp edge
-    float circle = 1.0 - smoothstep(0.82, 0.88, dist);
+    // SDF circle with a firm fill and a narrow rim.
+    float body = 1.0 - smoothstep(0.78, 0.82, dist);
+    float rim = smoothstep(0.72, 0.78, dist) * (1.0 - smoothstep(0.86, 0.9, dist));
 
     // Radial gradient: bright center → saturated rim (keeps color visible)
-    float t = clamp(dist / 0.82, 0.0, 1.0);
-    vec3 fillColor = v_color * mix(1.3, 0.85, t);
+    float t = clamp(dist / 0.78, 0.0, 1.0);
+    vec3 fillColor = v_color * mix(1.2, 0.88, t);
 
     // Highlight: selected/hovered nodes burn brighter
-    fillColor *= (1.0 + v_highlight * 1.0);
+    fillColor *= (1.0 + v_highlight * 0.75);
 
-    // Outer glow: wide, soft, vivid — the "fierce" halo
-    float glowDist = max(0.0, dist - 0.7);
-    float glow = exp(-4.5 * glowDist) * 0.35;
+    // Crisp rim gives the node a readable silhouette at small sizes.
+    vec3 rimColor = mix(v_color * 0.72, vec3(1.0), 0.18 + v_highlight * 0.18);
 
-    // Inner core bloom: adds depth, not overwhelming
-    float core = exp(-4.0 * dist) * 0.1;
+    // Keep a small halo for depth, but avoid the previous broad fuzzy edge.
+    float haloDist = max(0.0, dist - 0.88);
+    float halo = exp(-7.0 * haloDist) * (0.1 + v_highlight * 0.12);
 
-    vec3 color = fillColor * circle + v_color * (glow + core);
-    float alpha = max(circle, max(glow, core));
+    // Inner core adds dimensionality without washing out the edge.
+    float core = exp(-4.6 * dist) * 0.08;
 
-    if (alpha < 0.005) discard;
+    vec3 color = fillColor * body + rimColor * rim * 0.58 + v_color * (halo + core);
+    float alpha = max(body, max(rim * 0.82, max(halo, core)));
+
+    if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
 }
 `;
