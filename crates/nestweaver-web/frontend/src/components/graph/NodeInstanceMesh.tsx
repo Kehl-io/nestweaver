@@ -85,25 +85,30 @@ void main() {
     float angle = atan(uv.y, uv.x);
     float arcPos = fract((angle + 3.14159265) / 6.2831853 + v_phase * 0.08);
 
-    // Semantic beacon layers: matte body, etched rim, importance arc, and state rings.
-    float body = 1.0 - smoothstep(0.64, 0.69, dist);
-    float bevel = ring(dist, 0.54, 0.67, 0.035);
-    float outerRim = ring(dist, 0.71, 0.84, 0.018);
-    float fineEdge = ring(dist, 0.86, 0.9, 0.01);
+    // Plasma bead layers: soft silhouette, internal contour, and data-bearing orbit.
+    float body = 1.0 - smoothstep(0.68, 0.78, dist);
+    float innerContour = ring(dist, 0.45, 0.58, 0.035);
+    float chromaEdge = ring(dist, 0.7, 0.84, 0.045);
+    float outerFeather = exp(-13.0 * max(0.0, dist - 0.72));
 
     float arcAmount = mix(0.24, 0.98, clamp(v_importance, 0.0, 1.0));
     float arcMask = 1.0 - smoothstep(arcAmount - 0.025, arcAmount + 0.025, arcPos);
-    float importanceArc = outerRim * arcMask;
+    float importanceArc = ring(dist, 0.56, 0.66, 0.018) * arcMask;
 
     float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
-    float focusRing = ring(dist, 0.91, 0.985, 0.014) * v_highlight * (0.78 + pulse * 0.22);
-    float seedRing = ring(dist, 0.91, 0.985, 0.012) * v_seed;
-    float bridgeRing = ring(dist, 0.47, 0.52, 0.012) * v_bridge;
+    float focusAura = exp(-9.5 * max(0.0, dist - 0.72)) *
+        v_highlight *
+        (0.2 + pulse * 0.18);
+    float seedAura = exp(-10.0 * max(0.0, dist - 0.76)) * v_seed * 0.18;
+    float bridgeCrescent =
+        ring(dist, 0.37, 0.45, 0.014) *
+        smoothstep(0.42, 0.72, fract(arcPos + 0.16)) *
+        v_bridge;
     float sparkSource = clamp(v_highlight + v_seed * 0.7, 0.0, 1.0);
     float sparkPos = fract(arcPos - u_time * 0.28);
     float sparkDistance = min(sparkPos, 1.0 - sparkPos);
     float focusSpark = exp(-260.0 * sparkDistance * sparkDistance) *
-        ring(dist, 0.91, 0.985, 0.01) *
+        ring(dist, 0.72, 0.86, 0.018) *
         sparkSource *
         (0.62 + pulse * 0.38);
 
@@ -115,25 +120,24 @@ void main() {
     coreColor = mix(coreColor, coreColor * 0.72, lowerShade * 0.28);
     coreColor *= 1.0 + v_highlight * 0.34 + v_seed * 0.16;
 
-    vec3 darkInk = v_color * 0.42;
-    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.34);
+    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.38);
     vec3 focusInk = mix(v_color * 1.1, vec3(1.0), 0.62);
 
     vec3 color =
         coreColor * body +
-        lightInk * bevel * 0.22 +
-        darkInk * outerRim * 0.55 +
+        lightInk * innerContour * 0.2 +
+        lightInk * chromaEdge * 0.16 +
         lightInk * importanceArc * (0.56 + v_importance * 0.34) +
-        focusInk * focusRing +
-        focusInk * seedRing * 0.86 +
+        focusInk * focusAura +
+        focusInk * seedAura +
         vec3(1.0) * focusSpark * 0.9 +
-        lightInk * bridgeRing * 0.62 +
+        lightInk * bridgeCrescent * 0.7 +
         vec3(1.0) * glint * body * 0.2 +
-        lightInk * fineEdge * 0.38;
+        v_color * outerFeather * 0.045;
 
-    float halo = exp(-16.0 * max(0.0, dist - 0.93)) * (v_highlight * 0.09 + v_seed * 0.045);
+    float halo = exp(-9.0 * max(0.0, dist - 0.84)) * (v_highlight * 0.06 + v_seed * 0.035);
     color += v_color * halo;
-    float alpha = max(body, max(outerRim * 0.8, max(fineEdge, max(focusRing, max(seedRing, max(bridgeRing, max(focusSpark, halo)))))));
+    float alpha = max(body, max(chromaEdge * 0.32, max(importanceArc * 0.45, max(focusAura, max(seedAura, max(bridgeCrescent, max(focusSpark, halo)))))));
 
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);

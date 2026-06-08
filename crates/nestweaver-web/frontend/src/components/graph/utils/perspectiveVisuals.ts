@@ -11,19 +11,19 @@ export function perspectiveVisuals(mode: GraphMode): PerspectiveVisuals {
     case "overview":
       return {
         summary: "Overview landmarks are bounded and ranked for first-read orientation.",
-        sizeEncoding: "Size/ring: overview importance",
+        sizeEncoding: "Size/glow: overview importance",
         colorEncoding: "Color: node kind",
       };
     case "context":
       return {
         summary: "Context mode emphasizes seeds and ranked related nodes.",
-        sizeEncoding: "Size/ring: relevance and degree",
+        sizeEncoding: "Size/glow: relevance and degree",
         colorEncoding: "Color: node kind",
       };
     case "local":
       return {
         summary: "Local mode keeps the selected item central while nearby nodes expand by depth.",
-        sizeEncoding: "Size/ring: local degree and relevance",
+        sizeEncoding: "Size/glow: local degree and relevance",
         colorEncoding: "Color: node kind",
       };
     case "impact":
@@ -35,19 +35,19 @@ export function perspectiveVisuals(mode: GraphMode): PerspectiveVisuals {
     case "repos":
       return {
         summary: "Architecture mode highlights repositories, services, hubs, and bridges.",
-        sizeEncoding: "Size/ring: connectivity",
+        sizeEncoding: "Size/glow: connectivity",
         colorEncoding: "Color: repository or service grouping",
       };
     case "features":
       return {
         summary: "Feature mode groups related implementation areas.",
-        sizeEncoding: "Size/ring: cluster relevance",
+        sizeEncoding: "Size/glow: cluster relevance",
         colorEncoding: "Color: feature grouping",
       };
     default:
       return {
         summary: "The active perspective controls graph emphasis.",
-        sizeEncoding: "Size/ring: relevance",
+        sizeEncoding: "Size/glow: relevance",
         colorEncoding: "Color: node kind",
       };
   }
