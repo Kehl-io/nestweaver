@@ -26,6 +26,7 @@ export interface GraphSlice {
   cameraZoom: number;
   setCameraZoom: (zoom: number) => void;
   selectNode: (id: string | null, kind?: string | null) => void;
+  exploreNode: (id: string, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
   setSeeds: (seeds: string[]) => void;
@@ -99,6 +100,14 @@ export const createGraphSlice: StateCreator<
     set((s) => {
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
+    }),
+
+  exploreNode: (id, kind) =>
+    set((s) => {
+      s.selectedNodeId = id;
+      s.selectedNodeKind = kind ?? null;
+      s.seeds = [id];
+      s.graphMode = "context";
     }),
 
   hoverNode: (id) =>

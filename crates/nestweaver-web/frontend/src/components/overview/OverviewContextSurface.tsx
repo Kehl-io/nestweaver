@@ -3,6 +3,7 @@ import { useStore } from "../../stores";
 
 interface OverviewContextSurfaceProps {
   overview: OverviewResponse | null;
+  reload: () => void;
 }
 
 function findOverviewItem(
@@ -53,6 +54,19 @@ function firstSupportedTarget(
   );
 }
 
+function isEmptyOverview(overview: OverviewResponse | null): boolean {
+  return (
+    overview != null &&
+    overview.counts.repo_count === 0 &&
+    overview.counts.service_count === 0 &&
+    overview.counts.vault_count === 0 &&
+    overview.counts.symbol_count === 0 &&
+    overview.counts.note_count === 0 &&
+    overview.start_here.length === 0 &&
+    overview.landmarks.length === 0
+  );
+}
+
 function compactLocation(location: string): string {
   const parts = location.split("/");
   return parts.length > 3 ? parts.slice(-3).join("/") : location;
@@ -60,6 +74,7 @@ function compactLocation(location: string): string {
 
 export function OverviewContextSurface({
   overview,
+  reload,
 }: OverviewContextSurfaceProps) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
@@ -71,6 +86,7 @@ export function OverviewContextSurface({
   const viewMode = useStore((s) => s.viewMode);
   const toggleViewMode = useStore((s) => s.toggleViewMode);
 
+  const emptyOverview = isEmptyOverview(overview);
   const overviewItem = findOverviewItem(overview, selectedNodeId);
   const graphSelected =
     selectedNodeId && graphInstance?.hasNode(selectedNodeId)
@@ -207,7 +223,29 @@ export function OverviewContextSurface({
             )}
           </div>
 
-          {overview ? (
+          {emptyOverview ? (
+            <div className="mt-3 space-y-3 text-xs text-[var(--color-text-muted)]">
+              <p className="text-[var(--color-text)]">
+                No indexed content is available yet.
+              </p>
+              <ol className="space-y-1.5 pl-4">
+                <li>Index the current repo.</li>
+                <li>Add a notes vault when you have one.</li>
+                <li>Retry the overview after indexing finishes.</li>
+              </ol>
+              <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-2 font-mono text-[11px]">
+                <p>nestweaver index --repo .</p>
+                <p>nestweaver brain add ~/vault --name personal</p>
+              </div>
+              <button
+                type="button"
+                onClick={reload}
+                className="rounded border border-[var(--color-border)] px-2 py-1 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+              >
+                Retry overview
+              </button>
+            </div>
+          ) : overview ? (
             <>
               <div className="mt-3 grid grid-cols-3 divide-x divide-[var(--color-border)] border-y border-[var(--color-border)] py-2 text-center">
                 <div className="px-2">

@@ -11,8 +11,7 @@ interface SymbolDetailProps {
 }
 
 export function SymbolDetail({ uid }: SymbolDetailProps) {
-  const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
 
   const [detail, setDetail] = useState<SymbolDetailType | null>(null);
   const [loading, setLoading] = useState(true);
@@ -65,8 +64,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
   const refCount = callers.length + callees.length;
 
   const handleRefClick = (refUid: string, kind: string) => {
-    selectNode(refUid, kind);
-    setSeeds([refUid]);
+    exploreNode(refUid, kind);
   };
 
   return (

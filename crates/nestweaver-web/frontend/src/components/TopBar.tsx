@@ -46,8 +46,7 @@ export function TopBar() {
   const setSearchLoading = useStore((s) => s.setSearchLoading);
   const setSearchResults = useStore((s) => s.setSearchResults);
   const clearSearch = useStore((s) => s.clearSearch);
-  const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
   const setScopeFilter = useStore((s) => s.setScopeFilter);
 
   const debouncedSearch = useDebouncedCallback(async (q: string) => {
@@ -77,8 +76,7 @@ export function TopBar() {
   }
 
   function handleSelect(uid: string, kind: string) {
-    selectNode(uid, kind);
-    setSeeds([uid]);
+    exploreNode(uid, kind);
     clearSearch();
     inputRef.current?.blur();
   }

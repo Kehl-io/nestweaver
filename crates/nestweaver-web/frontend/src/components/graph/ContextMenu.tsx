@@ -10,7 +10,7 @@ interface Props {
 }
 
 export function ContextMenu({ x, y, nodeId, onClose }: Props) {
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const selectNode = useStore((s) => s.selectNode);
   const setFlowTrace = useStore((s) => s.setFlowTrace);
@@ -22,7 +22,7 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
 
   const actions = [
     { label: "Re-seed context from here", hint: "Enter", key: null,
-      action: () => { setSeeds([nodeId]); onClose(); } },
+      action: () => { exploreNode(nodeId); onClose(); } },
     { label: "Impact analysis...", hint: "I", key: "i",
       action: () => { selectNode(nodeId, null); setGraphMode("impact"); onClose(); } },
     { label: "Trace flow...", hint: "F", key: "f",
