@@ -7,6 +7,7 @@ import type {
   ImpactNode,
   Note,
   NoteDetail,
+  OverviewResponse,
   Perspective,
   Repo,
   ScopeFilter,
@@ -85,6 +86,10 @@ export const api = {
       token_budget: tokenBudget,
       scope,
     });
+  },
+
+  overview(limit = 24) {
+    return get<OverviewResponse>(`/api/v1/overview?limit=${limit}`);
   },
 
   impact(uid: string, depth = 3, confidence = 0.5) {
