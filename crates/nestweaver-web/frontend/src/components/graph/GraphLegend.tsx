@@ -39,7 +39,7 @@ export function GraphLegend() {
           {visuals.colorEncoding}
         </span>
         <span className="rounded border border-[var(--color-border)] px-1.5 py-0.5">
-          Glow: relevance, seeds, bridges
+          Light: relevance and focus
         </span>
       </div>
 

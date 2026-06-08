@@ -74,70 +74,43 @@ varying float v_phase;
 
 uniform float u_time;
 
-float ring(float dist, float inner, float outer, float softness) {
-    return smoothstep(inner - softness, inner + softness, dist) *
-        (1.0 - smoothstep(outer - softness, outer + softness, dist));
-}
-
 void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
-    float angle = atan(uv.y, uv.x);
-    float arcPos = fract((angle + 3.14159265) / 6.2831853 + v_phase * 0.08);
 
-    // Plasma bead layers: soft silhouette, internal contour, and data-bearing orbit.
-    float body = 1.0 - smoothstep(0.68, 0.78, dist);
-    float innerContour = ring(dist, 0.45, 0.58, 0.035);
-    float chromaEdge = ring(dist, 0.7, 0.84, 0.045);
-    float outerFeather = exp(-13.0 * max(0.0, dist - 0.72));
-
-    float arcAmount = mix(0.24, 0.98, clamp(v_importance, 0.0, 1.0));
-    float arcMask = 1.0 - smoothstep(arcAmount - 0.025, arcAmount + 0.025, arcPos);
-    float importanceArc = ring(dist, 0.56, 0.66, 0.018) * arcMask;
-
+    // LED dot: simple Obsidian-like bead with no contour rings.
+    float body = 1.0 - smoothstep(0.6, 0.78, dist);
+    float hotCore = exp(-4.4 * dist * dist);
+    float softBody = exp(-1.8 * dist * dist) * body;
+    float outerGlow = exp(-6.8 * max(0.0, dist - 0.62));
     float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
-    float focusAura = exp(-9.5 * max(0.0, dist - 0.72)) *
+    float focusAura = exp(-8.2 * max(0.0, dist - 0.56)) *
         v_highlight *
-        (0.2 + pulse * 0.18);
-    float seedAura = exp(-10.0 * max(0.0, dist - 0.76)) * v_seed * 0.18;
-    float bridgeCrescent =
-        ring(dist, 0.37, 0.45, 0.014) *
-        smoothstep(0.42, 0.72, fract(arcPos + 0.16)) *
-        v_bridge;
-    float sparkSource = clamp(v_highlight + v_seed * 0.7, 0.0, 1.0);
-    float sparkPos = fract(arcPos - u_time * 0.28);
-    float sparkDistance = min(sparkPos, 1.0 - sparkPos);
-    float focusSpark = exp(-260.0 * sparkDistance * sparkDistance) *
-        ring(dist, 0.72, 0.86, 0.018) *
-        sparkSource *
-        (0.62 + pulse * 0.38);
-
-    // A small glint gives the node dimensionality while keeping the silhouette sharp.
-    float glint = exp(-72.0 * dot(uv - vec2(-0.17, 0.2), uv - vec2(-0.17, 0.2)));
+        (0.22 + pulse * 0.2);
+    float seedAura = exp(-8.6 * max(0.0, dist - 0.58)) * v_seed * 0.2;
+    float liveSpark = exp(-58.0 * dot(uv - vec2(-0.16, 0.18), uv - vec2(-0.16, 0.18))) *
+        (0.14 + v_importance * 0.18 + v_highlight * (0.24 + pulse * 0.16));
     float lowerShade = smoothstep(-0.18, -0.5, uv.y) * body;
 
-    vec3 coreColor = mix(v_color * 0.72, v_color * 1.18, 1.0 - smoothstep(0.0, 0.7, dist));
+    vec3 coreColor = mix(v_color * 0.74, v_color * 1.18, hotCore);
     coreColor = mix(coreColor, coreColor * 0.72, lowerShade * 0.28);
-    coreColor *= 1.0 + v_highlight * 0.34 + v_seed * 0.16;
+    coreColor *= 0.92 + v_importance * 0.24 + v_highlight * 0.42 + v_seed * 0.16;
 
-    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.38);
-    vec3 focusInk = mix(v_color * 1.1, vec3(1.0), 0.62);
+    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.16);
+    vec3 focusInk = v_color * 1.38;
 
     vec3 color =
         coreColor * body +
-        lightInk * innerContour * 0.2 +
-        lightInk * chromaEdge * 0.16 +
-        lightInk * importanceArc * (0.56 + v_importance * 0.34) +
+        lightInk * softBody * (0.08 + v_importance * 0.12) +
+        v_color * outerGlow * (0.03 + v_importance * 0.04) +
+        focusInk * hotCore * v_highlight * 0.46 +
         focusInk * focusAura +
         focusInk * seedAura +
-        vec3(1.0) * focusSpark * 0.9 +
-        lightInk * bridgeCrescent * 0.7 +
-        vec3(1.0) * glint * body * 0.2 +
-        v_color * outerFeather * 0.045;
+        lightInk * liveSpark * body;
 
-    float halo = exp(-9.0 * max(0.0, dist - 0.84)) * (v_highlight * 0.06 + v_seed * 0.035);
+    float halo = exp(-7.2 * max(0.0, dist - 0.78)) * (v_highlight * 0.08 + v_seed * 0.035);
     color += v_color * halo;
-    float alpha = max(body, max(chromaEdge * 0.32, max(importanceArc * 0.45, max(focusAura, max(seedAura, max(bridgeCrescent, max(focusSpark, halo)))))));
+    float alpha = max(body, max(focusAura, max(seedAura, halo)));
 
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
