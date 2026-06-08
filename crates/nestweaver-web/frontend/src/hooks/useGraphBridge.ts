@@ -10,6 +10,12 @@ export interface GraphBuffers {
   sizes: Float32Array;
   /** [p0, p1, ...] length = nodeCount (per-node phase offset for breathing animation) */
   phases: Float32Array;
+  /** [i0, i1, ...] length = nodeCount, normalized by relevance and degree */
+  importance: Float32Array;
+  /** [s0, s1, ...] length = nodeCount, 1 when the node is an active seed */
+  seedMarkers: Float32Array;
+  /** [b0, b1, ...] length = nodeCount, normalized bridge/hub strength */
+  bridgeStrengths: Float32Array;
   /** [sx0, sy0, sz0, tx0, ty0, tz0, ...] length = edgeCount * 6 */
   edgePositions: Float32Array;
   /** [sr0, sg0, sb0, tr0, tg0, tb0, ...] length = edgeCount * 6 */
@@ -25,6 +31,9 @@ export const EMPTY_BUFFERS: GraphBuffers = {
   colors: new Float32Array(0),
   sizes: new Float32Array(0),
   phases: new Float32Array(0),
+  importance: new Float32Array(0),
+  seedMarkers: new Float32Array(0),
+  bridgeStrengths: new Float32Array(0),
   edgePositions: new Float32Array(0),
   edgeColors: new Float32Array(0),
   uidToIndex: new Map(),
@@ -67,6 +76,14 @@ function hashToPhase(uid: string): number {
   return (h >>> 0) / 0xffffffff;
 }
 
+function numericMetric(attrs: Record<string, unknown>, names: string[]): number {
+  for (const name of names) {
+    const value = attrs[name];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
 /**
  * Hash a string to a hue value in [0, 360).
  */
@@ -105,6 +122,7 @@ export function useGraphBridge(): GraphBuffers {
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
   const activeStyleRules = useStore((s) => s.activeStyleRules);
+  const seeds = useStore((s) => s.seeds);
 
   return useMemo(() => {
     if (!graphInstance || graphInstance.order === 0) {
@@ -120,8 +138,24 @@ export function useGraphBridge(): GraphBuffers {
     const colors = new Float32Array(nodeCount * 3);
     const sizes = new Float32Array(nodeCount);
     const phases = new Float32Array(nodeCount);
+    const importance = new Float32Array(nodeCount);
+    const seedMarkers = new Float32Array(nodeCount);
+    const bridgeStrengths = new Float32Array(nodeCount);
     const uidToIndex = new Map<string, number>();
     const indexToUid: string[] = new Array(nodeCount);
+    const seedSet = new Set(seeds);
+
+    let maxRelevance = 0;
+    let maxDegree = 0;
+    graph.forEachNode((uid, attrs) => {
+      const relevance = numericMetric(attrs, [
+        "relevance",
+        "pagerank",
+        "pagerank_score",
+      ]);
+      maxRelevance = Math.max(maxRelevance, relevance);
+      maxDegree = Math.max(maxDegree, graph.degree(uid));
+    });
 
     let ni = 0;
     graph.forEachNode((uid, attrs) => {
@@ -165,6 +199,21 @@ export function useGraphBridge(): GraphBuffers {
       // Phase: deterministic per-node float derived from UID
       phases[ni] = hashToPhase(uid);
 
+      const relevance = numericMetric(attrs, [
+        "relevance",
+        "pagerank",
+        "pagerank_score",
+      ]);
+      const degree = graph.degree(uid);
+      const relevanceScore = maxRelevance > 0 ? relevance / maxRelevance : 0;
+      const degreeScore = maxDegree > 0 ? degree / maxDegree : 0;
+      importance[ni] = Math.min(1, Math.max(relevanceScore, degreeScore * 0.7));
+      seedMarkers[ni] = attrs.isSeed === true || seedSet.has(uid) ? 1 : 0;
+      bridgeStrengths[ni] =
+        degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
+          ? Math.min(1, degreeScore)
+          : 0;
+
       ni++;
     });
 
@@ -207,6 +256,9 @@ export function useGraphBridge(): GraphBuffers {
       colors,
       sizes,
       phases,
+      importance,
+      seedMarkers,
+      bridgeStrengths,
       edgePositions,
       edgeColors,
       uidToIndex,
@@ -215,5 +267,5 @@ export function useGraphBridge(): GraphBuffers {
       edgeCount,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphInstance, graphVersion, activeStyleRules]);
+  }, [graphInstance, graphVersion, activeStyleRules, seeds]);
 }
