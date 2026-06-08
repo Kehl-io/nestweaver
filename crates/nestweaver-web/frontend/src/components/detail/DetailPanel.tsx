@@ -9,7 +9,21 @@ import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
 
-const SYMBOL_KINDS = new Set(["Function", "Class", "Interface", "Method", "Module"]);
+const SYMBOL_KINDS = new Set([
+  "symbol",
+  "Function",
+  "Class",
+  "Method",
+  "Interface",
+  "Trait",
+  "Enum",
+  "Module",
+  "Extension",
+  "Constant",
+  "Property",
+  "TypeAlias",
+  "Variable",
+]);
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
