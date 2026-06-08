@@ -2,32 +2,56 @@ import {
   test,
   expect,
   type APIRequestContext,
+  type APIResponse,
   type Page,
 } from "@playwright/test";
 import type { OverviewLandmark, OverviewResponse } from "../src/api/types";
 
-async function fetchOverview(
-  request: APIRequestContext,
-): Promise<OverviewResponse> {
+async function waitForOk(
+  requestCall: () => Promise<APIResponse>,
+  label: string,
+): Promise<APIResponse> {
   let lastStatus = 0;
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    const response = await request.get("/api/v1/overview?limit=24");
+    const response = await requestCall();
     lastStatus = response.status();
 
     if (response.ok()) {
-      const overview = (await response.json()) as OverviewResponse;
-      expect(overview).toHaveProperty("counts");
-      expect(Array.isArray(overview.landmarks)).toBeTruthy();
-      expect(Array.isArray(overview.start_here)).toBeTruthy();
-      expect(Array.isArray(overview.gaps)).toBeTruthy();
-      return overview;
+      return response;
     }
 
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  throw new Error(`overview API did not become ready; last status ${lastStatus}`);
+  throw new Error(`${label} did not become ready; last status ${lastStatus}`);
+}
+
+async function getOk(
+  request: APIRequestContext,
+  path: string,
+): Promise<APIResponse> {
+  return waitForOk(() => request.get(path), path);
+}
+
+async function postOk(
+  request: APIRequestContext,
+  path: string,
+  data: unknown,
+): Promise<APIResponse> {
+  return waitForOk(() => request.post(path, { data }), path);
+}
+
+async function fetchOverview(
+  request: APIRequestContext,
+): Promise<OverviewResponse> {
+  const response = await getOk(request, "/api/v1/overview?limit=24");
+  const overview = (await response.json()) as OverviewResponse;
+  expect(overview).toHaveProperty("counts");
+  expect(Array.isArray(overview.landmarks)).toBeTruthy();
+  expect(Array.isArray(overview.start_here)).toBeTruthy();
+  expect(Array.isArray(overview.gaps)).toBeTruthy();
+  return overview;
 }
 
 function displayedStartHereItems(
@@ -179,8 +203,7 @@ test.describe("Graph Explorer", () => {
   });
 
   test("repo-map API returns data", async ({ request }) => {
-    const response = await request.get("/api/v1/repo-map?token_budget=2000");
-    expect(response.ok()).toBeTruthy();
+    const response = await getOk(request, "/api/v1/repo-map?token_budget=2000");
     const body = await response.text();
     expect(body.length).toBeGreaterThan(0);
   });
@@ -203,10 +226,10 @@ test.describe("Graph Explorer", () => {
   });
 
   test("context API returns ranked symbols", async ({ request }) => {
-    const response = await request.post("/api/v1/context", {
-      data: { seeds: ["greet"], limit: 50 },
+    const response = await postOk(request, "/api/v1/context", {
+      seeds: ["greet"],
+      limit: 50,
     });
-    expect(response.ok()).toBeTruthy();
     const body = await response.json();
     expect(body).toHaveProperty("seeds");
     expect(body).toHaveProperty("connected");
@@ -214,14 +237,13 @@ test.describe("Graph Explorer", () => {
   });
 
   test("impact analysis API works", async ({ request }) => {
-    const searchResponse = await request.get("/api/v1/search?q=greet");
+    const searchResponse = await getOk(request, "/api/v1/search?q=greet");
     const symbols = await searchResponse.json();
     if (symbols.length === 0) {
       test.skip();
       return;
     }
     const uid = symbols[0].uid;
-    const impactResponse = await request.get(`/api/v1/impact/${uid}?depth=2`);
-    expect(impactResponse.ok()).toBeTruthy();
+    await getOk(request, `/api/v1/impact/${uid}?depth=2`);
   });
 });
