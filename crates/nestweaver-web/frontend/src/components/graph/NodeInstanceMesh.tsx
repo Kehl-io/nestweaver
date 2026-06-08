@@ -16,27 +16,48 @@ attribute float aPhase;
 attribute float aSize;
 attribute vec3 aColor;
 attribute float aHighlight;
+attribute float aImportance;
+attribute float aSeed;
+attribute float aBridge;
 
 uniform float u_time;
 uniform float u_breatheAmp;
+uniform float u_motionAmp;
+uniform float u_intro;
 
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_importance;
+varying float v_seed;
+varying float v_bridge;
+varying float v_phase;
 
 void main() {
     v_uv = uv;
     v_color = aColor;
     v_highlight = aHighlight;
+    v_importance = aImportance;
+    v_seed = aSeed;
+    v_bridge = aBridge;
+    v_phase = aPhase;
 
-    // Breathing: per-instance scale oscillation (disabled when u_breatheAmp == 0)
+    // Nodes arrive with a springy, deterministic pop, then settle into a quiet breath.
+    float intro = clamp(u_intro, 0.0, 1.0);
+    float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.22 * u_motionAmp;
+    float introScale = mix(0.34, 1.0, intro) + rebound;
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
-    float scale = aSize * breathe;
+    float focusLift = 1.0 + aHighlight * 0.08 + aSeed * 0.035;
+    float beaconScale = 1.08 + aImportance * 0.06;
+    float scale = aSize * beaconScale * introScale * breathe * focusLift;
 
-    // Scale the quad in local space
     vec3 pos = position * scale;
 
-    // Apply instance matrix (position only — scale handled above)
+    // A tiny outward bounce on load makes the graph feel alive without moving nodes forever.
+    vec2 arrivalDir = normalize(vec2(cos(aPhase * 6.2831), sin(aPhase * 6.2831)));
+    float drift = sin((intro * 3.0 + aPhase) * 6.2831) * pow(1.0 - intro, 2.0);
+    pos.xy += arrivalDir * drift * aSize * 0.85 * u_motionAmp;
+
     vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
 }
@@ -46,34 +67,73 @@ const fragmentShader = /* glsl */ `
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_importance;
+varying float v_seed;
+varying float v_bridge;
+varying float v_phase;
+
+uniform float u_time;
+
+float ring(float dist, float inner, float outer, float softness) {
+    return smoothstep(inner - softness, inner + softness, dist) *
+        (1.0 - smoothstep(outer - softness, outer + softness, dist));
+}
 
 void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
+    float angle = atan(uv.y, uv.x);
+    float arcPos = fract((angle + 3.14159265) / 6.2831853 + v_phase * 0.08);
 
-    // SDF circle with a firm fill and a narrow rim.
-    float body = 1.0 - smoothstep(0.78, 0.82, dist);
-    float rim = smoothstep(0.72, 0.78, dist) * (1.0 - smoothstep(0.86, 0.9, dist));
+    // Semantic beacon layers: matte body, etched rim, importance arc, and state rings.
+    float body = 1.0 - smoothstep(0.64, 0.69, dist);
+    float bevel = ring(dist, 0.54, 0.67, 0.035);
+    float outerRim = ring(dist, 0.71, 0.84, 0.018);
+    float fineEdge = ring(dist, 0.86, 0.9, 0.01);
 
-    // Radial gradient: bright center → saturated rim (keeps color visible)
-    float t = clamp(dist / 0.78, 0.0, 1.0);
-    vec3 fillColor = v_color * mix(1.2, 0.88, t);
+    float arcAmount = mix(0.24, 0.98, clamp(v_importance, 0.0, 1.0));
+    float arcMask = 1.0 - smoothstep(arcAmount - 0.025, arcAmount + 0.025, arcPos);
+    float importanceArc = outerRim * arcMask;
 
-    // Highlight: selected/hovered nodes burn brighter
-    fillColor *= (1.0 + v_highlight * 0.75);
+    float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
+    float focusRing = ring(dist, 0.91, 0.985, 0.014) * v_highlight * (0.78 + pulse * 0.22);
+    float seedRing = ring(dist, 0.91, 0.985, 0.012) * v_seed;
+    float bridgeRing = ring(dist, 0.47, 0.52, 0.012) * v_bridge;
+    float sparkSource = clamp(v_highlight + v_seed * 0.7, 0.0, 1.0);
+    float sparkPos = fract(arcPos - u_time * 0.28);
+    float sparkDistance = min(sparkPos, 1.0 - sparkPos);
+    float focusSpark = exp(-260.0 * sparkDistance * sparkDistance) *
+        ring(dist, 0.91, 0.985, 0.01) *
+        sparkSource *
+        (0.62 + pulse * 0.38);
 
-    // Crisp rim gives the node a readable silhouette at small sizes.
-    vec3 rimColor = mix(v_color * 0.72, vec3(1.0), 0.18 + v_highlight * 0.18);
+    // A small glint gives the node dimensionality while keeping the silhouette sharp.
+    float glint = exp(-72.0 * dot(uv - vec2(-0.17, 0.2), uv - vec2(-0.17, 0.2)));
+    float lowerShade = smoothstep(-0.18, -0.5, uv.y) * body;
 
-    // Keep a small halo for depth, but avoid the previous broad fuzzy edge.
-    float haloDist = max(0.0, dist - 0.88);
-    float halo = exp(-7.0 * haloDist) * (0.1 + v_highlight * 0.12);
+    vec3 coreColor = mix(v_color * 0.72, v_color * 1.18, 1.0 - smoothstep(0.0, 0.7, dist));
+    coreColor = mix(coreColor, coreColor * 0.72, lowerShade * 0.28);
+    coreColor *= 1.0 + v_highlight * 0.34 + v_seed * 0.16;
 
-    // Inner core adds dimensionality without washing out the edge.
-    float core = exp(-4.6 * dist) * 0.08;
+    vec3 darkInk = v_color * 0.42;
+    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.34);
+    vec3 focusInk = mix(v_color * 1.1, vec3(1.0), 0.62);
 
-    vec3 color = fillColor * body + rimColor * rim * 0.58 + v_color * (halo + core);
-    float alpha = max(body, max(rim * 0.82, max(halo, core)));
+    vec3 color =
+        coreColor * body +
+        lightInk * bevel * 0.22 +
+        darkInk * outerRim * 0.55 +
+        lightInk * importanceArc * (0.56 + v_importance * 0.34) +
+        focusInk * focusRing +
+        focusInk * seedRing * 0.86 +
+        vec3(1.0) * focusSpark * 0.9 +
+        lightInk * bridgeRing * 0.62 +
+        vec3(1.0) * glint * body * 0.2 +
+        lightInk * fineEdge * 0.38;
+
+    float halo = exp(-16.0 * max(0.0, dist - 0.93)) * (v_highlight * 0.09 + v_seed * 0.045);
+    color += v_color * halo;
+    float alpha = max(body, max(outerRim * 0.8, max(fineEdge, max(focusRing, max(seedRing, max(bridgeRing, max(focusSpark, halo)))))));
 
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
@@ -100,7 +160,9 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
   const uniforms = useMemo(
     () => ({
       u_time: { value: 0 },
-      u_breatheAmp: { value: reducedMotion ? 0 : 0.02 },
+      u_breatheAmp: { value: reducedMotion ? 0 : 0.018 },
+      u_motionAmp: { value: reducedMotion ? 0 : 1 },
+      u_intro: { value: reducedMotion ? 1 : 0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -108,12 +170,26 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
   // Sync reducedMotion -> uniform
   useEffect(() => {
-    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.02;
+    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.018;
+    uniforms.u_motionAmp.value = reducedMotion ? 0 : 1;
+    if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
 
-  // Tick u_time every frame
+  const introStartRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    introStartRef.current = null;
+    uniforms.u_intro.value = reducedMotion ? 1 : 0;
+  }, [buffers, reducedMotion, uniforms]);
+
+  // Tick animation uniforms every frame.
   useFrame(({ clock }) => {
-    uniforms.u_time.value = clock.getElapsedTime();
+    const elapsed = clock.getElapsedTime();
+    uniforms.u_time.value = elapsed;
+    if (!reducedMotion && uniforms.u_intro.value < 1) {
+      if (introStartRef.current === null) introStartRef.current = elapsed;
+      uniforms.u_intro.value = Math.min(1, (elapsed - introStartRef.current) / 1.2);
+    }
   });
 
   // Update instance matrices when positions change.
@@ -143,7 +219,15 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     const mesh = meshRef.current;
     if (!mesh) return;
 
-    const { nodeCount, colors, sizes, phases } = buffers;
+    const {
+      nodeCount,
+      colors,
+      sizes,
+      phases,
+      importance,
+      seedMarkers,
+      bridgeStrengths,
+    } = buffers;
 
     // aColor
     mesh.geometry.setAttribute(
@@ -161,6 +245,21 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     mesh.geometry.setAttribute(
       "aPhase",
       new InstancedBufferAttribute(phases.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aImportance",
+      new InstancedBufferAttribute(importance.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aSeed",
+      new InstancedBufferAttribute(seedMarkers.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aBridge",
+      new InstancedBufferAttribute(bridgeStrengths.slice(), 1),
     );
 
     // aHighlight — initially all zero
