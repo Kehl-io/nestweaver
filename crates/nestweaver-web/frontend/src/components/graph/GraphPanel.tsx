@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
+import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
@@ -273,13 +274,19 @@ export function GraphPanel() {
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
         >
-          {viewMode === "list" ? <NodeListView /> : <GraphCanvas />}
+          {viewMode === "list" ? (
+            <NodeListView />
+          ) : viewMode === "matrix" ? (
+            <GraphMatrixView />
+          ) : (
+            <GraphCanvas />
+          )}
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
         <ControlDock />
         <GraphLegend />
-        {minimapVisible && (
+        {viewMode === "graph" && minimapVisible && (
           <div className="absolute top-2 right-12 z-10">
             <GraphMinimap />
           </div>

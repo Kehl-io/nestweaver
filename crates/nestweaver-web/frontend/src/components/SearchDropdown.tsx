@@ -155,11 +155,15 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               id={`search-option-${s.uid}`}
               role="option"
               aria-selected={activeDescendant === `search-option-${s.uid}`}
+              onClick={() => onSelect(s.uid, s.kind)}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
                 type="button"
-                onClick={() => onSelect(s.uid, s.kind)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSelect(s.uid, s.kind);
+                }}
                 className="flex min-w-0 flex-1 items-center gap-2 text-left"
               >
                 <KindBadge kind={s.kind} />
@@ -171,7 +175,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               <span className="ml-2 flex shrink-0 gap-1">
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     openDetail(s.uid, s.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
@@ -180,7 +185,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     onSelect(s.uid, s.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
@@ -189,7 +195,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     addResultToScene(s.uid, s.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
@@ -213,11 +220,15 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               id={`search-option-${n.uid}`}
               role="option"
               aria-selected={activeDescendant === `search-option-${n.uid}`}
+              onClick={() => onSelect(n.uid, n.kind)}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
                 type="button"
-                onClick={() => onSelect(n.uid, n.kind)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSelect(n.uid, n.kind);
+                }}
                 className="flex min-w-0 flex-1 items-center gap-2 text-left"
               >
                 <KindBadge kind={n.kind} />
@@ -229,7 +240,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               <span className="ml-2 flex shrink-0 gap-1">
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     openDetail(n.uid, n.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
@@ -238,7 +250,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     onSelect(n.uid, n.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
@@ -247,7 +260,8 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(event) => {
+                    event.stopPropagation();
                     addResultToScene(n.uid, n.kind);
                   }}
                   className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"

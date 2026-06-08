@@ -214,6 +214,117 @@ test.describe("Graph Explorer", () => {
     });
   });
 
+  test("selected overview node exposes contextual actions", async ({
+    page,
+    request,
+  }) => {
+    const overview = await fetchOverview(request);
+    const firstItem = displayedStartHereItems(overview)[0];
+
+    if (!firstItem) {
+      test.skip(true, "overview fixture has no visible Start Here items");
+      return;
+    }
+
+    await openOverview(page);
+
+    const startHere = page.getByRole("region", { name: "Start Here" });
+    await startHere
+      .getByRole("button", {
+        name: new RegExp(escapeRegExp(firstItem.label)),
+      })
+      .first()
+      .click();
+
+    const contextSurface = page.getByRole("complementary", {
+      name: "Overview context",
+    });
+    await expect(
+      contextSurface.getByRole("button", { name: "Explore" }).first(),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByRole("button", { name: "Ask" }).first(),
+    ).toBeVisible();
+  });
+
+  test("search result secondary Add action builds current scene", async ({
+    page,
+    request,
+  }) => {
+    const searchResponse = await getOk(request, "/api/v1/search?q=greet");
+    const symbols = await searchResponse.json();
+    const firstSymbol = symbols[0];
+
+    if (!firstSymbol) {
+      test.skip(true, "fixture has no searchable symbol");
+      return;
+    }
+
+    await openOverview(page);
+    await page.getByTestId("search-input").fill(firstSymbol.name);
+
+    const option = page
+      .getByRole("option", {
+        name: new RegExp(escapeRegExp(firstSymbol.name)),
+      })
+      .first();
+    await expect(option).toBeVisible();
+    await option.getByRole("button", { name: "Add" }).click();
+
+    await expect(
+      page.getByRole("button", { name: "Context", exact: true }),
+    ).toHaveClass(/border-blue-500/);
+  });
+
+  test("grouped controls switch to list and matrix views", async ({ page }) => {
+    await openOverview(page);
+
+    await page.getByRole("button", { name: "View" }).click();
+    await page.getByRole("button", { name: "List" }).click();
+    await expect(
+      page.getByRole("region", { name: "Ranked node table" }),
+    ).toBeVisible();
+
+    await page.getByRole("button", { name: "View" }).click();
+    await page.getByRole("button", { name: "Matrix" }).click();
+    await expect(
+      page.getByRole("region", { name: "Graph matrix view" }),
+    ).toBeVisible();
+
+    await page.getByRole("button", { name: "Filter" }).click();
+    await expect(page.getByLabel("Scope")).toBeVisible();
+  });
+
+  test("ranked table sorts and selects nodes", async ({ page }) => {
+    await openOverview(page);
+
+    await page.getByRole("button", { name: "View" }).click();
+    await page.getByRole("button", { name: "List" }).click();
+
+    const table = page.getByRole("region", { name: "Ranked node table" });
+    await expect(table).toBeVisible();
+    await table.getByRole("button", { name: "Name" }).click();
+    const firstRowButton = table.locator("tbody button").first();
+    await expect(firstRowButton).toBeVisible();
+    await firstRowButton.click();
+  });
+
+  test("matrix view renders bounded nodes and row selection", async ({
+    page,
+  }) => {
+    await openOverview(page);
+
+    await page.getByRole("button", { name: "View" }).click();
+    await page.getByRole("button", { name: "Matrix" }).click();
+
+    const matrix = page.getByRole("region", { name: "Graph matrix view" });
+    await expect(matrix).toBeVisible();
+    await expect(matrix.getByText(/Showing top \d+ of \d+/)).toBeVisible();
+    const firstRowButton = matrix.locator("tbody th button").first();
+    await expect(firstRowButton).toBeVisible();
+    await firstRowButton.click();
+  });
+
   test("empty overview shows setup steps with retry", async ({ page }) => {
     await page.route("**/api/v1/overview**", async (route) => {
       await route.fulfill({ json: emptyOverview() });
