@@ -286,7 +286,7 @@ export function GraphPanel() {
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
         <ControlDock />
-        <GraphLegend />
+        {viewMode === "graph" && <GraphLegend />}
         {viewMode === "graph" && minimapVisible && (
           <div className="absolute top-2 right-12 z-10">
             <GraphMinimap />
