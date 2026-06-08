@@ -1,9 +1,10 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 interface CollapsibleProps {
   title: string;
   count?: number;
   defaultOpen?: boolean;
+  active?: boolean;
   children: ReactNode;
 }
 
@@ -11,12 +12,23 @@ export function Collapsible({
   title,
   count,
   defaultOpen = true,
+  active = false,
   children,
 }: CollapsibleProps) {
   const [open, setOpen] = useState(defaultOpen);
 
+  useEffect(() => {
+    if (active) setOpen(true);
+  }, [active]);
+
   return (
-    <div>
+    <div
+      className={
+        active
+          ? "rounded border border-blue-500/40 bg-blue-500/5"
+          : undefined
+      }
+    >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}

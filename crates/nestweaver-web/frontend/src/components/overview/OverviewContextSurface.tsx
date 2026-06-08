@@ -1,5 +1,6 @@
 import type { OverviewLandmark, OverviewResponse } from "../../api/types";
 import { useStore } from "../../stores";
+import { NodeActionBar } from "../actions/NodeActionBar";
 
 interface OverviewContextSurfaceProps {
   overview: OverviewResponse | null;
@@ -161,6 +162,17 @@ export function OverviewContextSurface({
           <p className="mt-2 max-h-12 overflow-hidden text-xs leading-5 text-[var(--color-text-muted)]">
             {selected.reason ?? "Selected overview landmark"}
           </p>
+
+          <NodeActionBar
+            node={{
+              uid: selected.uid,
+              kind: selected.kind,
+              label: selected.label,
+            }}
+            ids={["open", "explore", "impact", "related", "path", "ask"]}
+            compact
+            className="mt-3"
+          />
 
           {selected.location && (
             <p className="mt-2 truncate border-t border-[var(--color-border)] pt-2 text-[11px] text-[var(--color-text-muted)]">
