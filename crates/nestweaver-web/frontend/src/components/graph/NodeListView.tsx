@@ -5,7 +5,7 @@ export function NodeListView() {
   const graphInstance = useStore((s) => s.graphInstance);
   const selectNode = useStore((s) => s.selectNode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
   const [filter, setFilter] = useState("");
 
   // Build sorted list from graphology
@@ -41,15 +41,15 @@ export function NodeListView() {
   }, [nodes, filter]);
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent, uid: string) => {
+    (e: React.KeyboardEvent, uid: string, kind: string) => {
       if (e.key === "Enter") {
         selectNode(uid);
       } else if (e.key === " ") {
         e.preventDefault();
-        setSeeds([uid]);
+        exploreNode(uid, kind);
       }
     },
-    [selectNode, setSeeds],
+    [selectNode, exploreNode],
   );
 
   return (
@@ -76,8 +76,8 @@ export function NodeListView() {
             aria-selected={selectedNodeId === node.uid}
             tabIndex={0}
             onClick={() => selectNode(node.uid)}
-            onDoubleClick={() => setSeeds([node.uid])}
-            onKeyDown={(e) => handleKeyDown(e, node.uid)}
+            onDoubleClick={() => exploreNode(node.uid, node.kind)}
+            onKeyDown={(e) => handleKeyDown(e, node.uid, node.kind)}
             className={`flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer border-b border-[var(--color-border)] hover:bg-[var(--color-surface-alt)] ${
               selectedNodeId === node.uid
                 ? "bg-blue-500/10 border-l-2 border-l-blue-500"

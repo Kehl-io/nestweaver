@@ -36,7 +36,7 @@ function useGraphKeyboardNav(
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
   const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
 
   // Keep a ref to a pagerank-sorted node list so the keydown handler is stable
   const sortedNodesRef = useRef<string[]>([]);
@@ -81,7 +81,11 @@ function useGraphKeyboardNav(
       if (e.key === "Enter") {
         if (currentId) {
           e.preventDefault();
-          setSeeds([currentId]);
+          const kind =
+            graph?.hasNode(currentId)
+              ? (graph.getNodeAttribute(currentId, "kind") as string | null)
+              : null;
+          exploreNode(currentId, kind);
         }
         return;
       }
@@ -166,7 +170,7 @@ function useGraphKeyboardNav(
 
     el.addEventListener("keydown", handleKeyDown);
     return () => el.removeEventListener("keydown", handleKeyDown);
-  }, [panelRef, selectNode, setSeeds]);
+  }, [panelRef, selectNode, exploreNode]);
 }
 
 /**
@@ -200,7 +204,10 @@ function GraphModeHooks() {
       {graphMode === "overview" && (
         <>
           <OverviewCommandShelf {...overviewState} />
-          <OverviewContextSurface overview={overviewState.overview} />
+          <OverviewContextSurface
+            overview={overviewState.overview}
+            reload={overviewState.reload}
+          />
         </>
       )}
       {graphMode === "local" && (
