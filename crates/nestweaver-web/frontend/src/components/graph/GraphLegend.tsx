@@ -1,14 +1,6 @@
 import { EDGE_COLORS, kindColor } from "./utils/graphColors";
+import { perspectiveVisuals } from "./utils/perspectiveVisuals";
 import { useStore } from "../../stores";
-
-const MODE_HINTS: Record<string, string> = {
-  overview: "Size shows overview importance; colors show item kind.",
-  context: "Seeds stay central; connected nodes are ranked by relevance.",
-  local: "Selected item is pinned; neighbors expand by local depth.",
-  impact: "Depth and confidence shape the blast-radius scene.",
-  repos: "Repositories, services, and hubs define the architecture view.",
-  features: "Feature clusters emphasize related implementation areas.",
-};
 
 export function GraphLegend() {
   const graphMode = useStore((s) => s.graphMode);
@@ -16,6 +8,7 @@ export function GraphLegend() {
   const nodeTypeFilter = useStore((s) => s.nodeTypeFilter);
   const edgeTypeFilter = useStore((s) => s.edgeTypeFilter);
   const isDark = document.documentElement.classList.contains("dark");
+  const visuals = perspectiveVisuals(graphMode);
 
   const visibleKinds = Object.entries(nodeTypeFilter)
     .filter(([, visible]) => visible !== false)
@@ -36,8 +29,16 @@ export function GraphLegend() {
         </span>
       </div>
       <p className="mt-1 text-[11px] leading-4 text-[var(--color-text-muted)]">
-        {MODE_HINTS[graphMode] ?? "Colors and size follow the active perspective."}
+        {visuals.summary}
       </p>
+      <div className="mt-2 flex flex-wrap gap-1.5 text-[10px] text-[var(--color-text-muted)]">
+        <span className="rounded border border-[var(--color-border)] px-1.5 py-0.5">
+          {visuals.sizeEncoding}
+        </span>
+        <span className="rounded border border-[var(--color-border)] px-1.5 py-0.5">
+          {visuals.colorEncoding}
+        </span>
+      </div>
 
       <div className="mt-3 grid grid-cols-2 gap-3">
         <div>
