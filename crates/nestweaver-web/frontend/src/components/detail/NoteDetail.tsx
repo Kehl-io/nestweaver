@@ -15,8 +15,7 @@ interface NoteDetailProps {
 }
 
 export function NoteDetail({ uid }: NoteDetailProps) {
-  const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
 
   const [detail, setDetail] = useState<NoteDetailType | null>(null);
   const [backlinks, setBacklinks] = useState<BacklinkRow[]>([]);
@@ -54,8 +53,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
   }, [uid]);
 
   const handleWikilink = (target: string) => {
-    selectNode(target, "note");
-    setSeeds([target]);
+    exploreNode(target, "note");
   };
 
   if (loading) {
@@ -155,8 +153,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
                 <button
                   type="button"
                   onClick={() => {
-                    selectNode(bl.source_note_uid, "note");
-                    setSeeds([bl.source_note_uid]);
+                    exploreNode(bl.source_note_uid, "note");
                   }}
                   className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-surface-alt)]"
                 >
@@ -185,8 +182,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
                 <button
                   type="button"
                   onClick={() => {
-                    selectNode(um.note_uid, "note");
-                    setSeeds([um.note_uid]);
+                    exploreNode(um.note_uid, "note");
                   }}
                   className="w-full rounded px-2 py-1 text-left text-xs hover:bg-[var(--color-surface-alt)]"
                 >

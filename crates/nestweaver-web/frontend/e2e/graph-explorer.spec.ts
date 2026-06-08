@@ -60,6 +60,22 @@ function displayedStartHereItems(
   return overview.start_here.slice(0, 7);
 }
 
+function emptyOverview(): OverviewResponse {
+  return {
+    counts: {
+      repo_count: 0,
+      service_count: 0,
+      vault_count: 0,
+      note_count: 0,
+      symbol_count: 0,
+      gap_count: 0,
+    },
+    landmarks: [],
+    start_here: [],
+    gaps: [],
+  };
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -161,6 +177,70 @@ test.describe("Graph Explorer", () => {
     ).toBeVisible();
     await expect(
       contextSurface.getByText("Overview", { exact: true }),
+    ).toBeVisible();
+  });
+
+  test("selecting a search result opens an explorable context scene", async ({
+    page,
+    request,
+  }) => {
+    const searchResponse = await getOk(request, "/api/v1/search?q=greet");
+    const symbols = await searchResponse.json();
+    const firstSymbol = symbols[0];
+
+    if (!firstSymbol) {
+      test.skip(true, "fixture has no searchable symbol");
+      return;
+    }
+
+    await openOverview(page);
+
+    await page.getByTestId("search-input").fill(firstSymbol.name);
+    const results = page.getByRole("listbox", { name: "Search results" });
+    await expect(results).toBeVisible();
+    await results
+      .getByRole("option", {
+        name: new RegExp(escapeRegExp(firstSymbol.name)),
+      })
+      .first()
+      .click();
+
+    await expect(
+      page.getByRole("button", { name: "Context", exact: true }),
+    ).toHaveClass(/border-blue-500/);
+    await postOk(request, "/api/v1/context", {
+      seeds: [firstSymbol.uid],
+      limit: 50,
+    });
+  });
+
+  test("empty overview shows setup steps with retry", async ({ page }) => {
+    await page.route("**/api/v1/overview**", async (route) => {
+      await route.fulfill({ json: emptyOverview() });
+    });
+
+    await openOverview(page);
+
+    const startHere = page.getByRole("region", { name: "Start Here" });
+    await expect(startHere.getByText("No indexed content")).toBeVisible();
+    await expect(
+      startHere.getByText("Index a project or add a vault"),
+    ).toBeVisible();
+    await expect(
+      startHere.getByText("nestweaver index --repo ."),
+    ).toBeVisible();
+    await expect(
+      startHere.getByRole("button", { name: "Retry overview" }),
+    ).toBeVisible();
+
+    const contextSurface = page.getByRole("complementary", {
+      name: "Overview context",
+    });
+    await expect(
+      contextSurface.getByText("No indexed content is available yet."),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByRole("button", { name: "Retry overview" }),
     ).toBeVisible();
   });
 

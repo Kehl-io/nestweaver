@@ -43,7 +43,7 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const { pick } = useGPUPicking(buffers);
   const selectNode = useStore((s) => s.selectNode);
   const hoverNode = useStore((s) => s.hoverNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
   const setGraphData = useStore((s) => s.setGraphData);
   const { camera, size } = useThree();
   const lastClickRef = useRef<{ time: number; nodeUid: string | null }>({
@@ -89,17 +89,17 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
       const prev = lastClickRef.current;
 
       if (result.nodeUid) {
+        const graphInstance = useStore.getState().graphInstance;
+        const kind = graphInstance?.hasNode(result.nodeUid)
+          ? (graphInstance.getNodeAttribute(result.nodeUid, "kind") as
+              | string
+              | null)
+          : null;
+
         // Double-click detection: same node within 400ms
         if (prev.nodeUid === result.nodeUid && now - prev.time < 400) {
-          setSeeds([result.nodeUid]);
+          exploreNode(result.nodeUid, kind);
         } else {
-          // Read kind from graphology attributes
-          const graphInstance = useStore.getState().graphInstance;
-          const kind = graphInstance?.hasNode(result.nodeUid)
-            ? (graphInstance.getNodeAttribute(result.nodeUid, "kind") as
-                | string
-                | null)
-            : null;
           selectNode(result.nodeUid, kind);
         }
       } else {
@@ -109,7 +109,7 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
 
       lastClickRef.current = { time: now, nodeUid: result.nodeUid };
     },
-    [pick, camera, size, selectNode, setSeeds],
+    [pick, camera, size, selectNode, exploreNode],
   );
 
   const handlePointerMove = useCallback(

@@ -56,6 +56,19 @@ function firstSupportedTarget(
   );
 }
 
+function isEmptyOverview(overview: OverviewResponse | null): boolean {
+  return (
+    overview != null &&
+    overview.counts.repo_count === 0 &&
+    overview.counts.service_count === 0 &&
+    overview.counts.vault_count === 0 &&
+    overview.counts.symbol_count === 0 &&
+    overview.counts.note_count === 0 &&
+    overview.start_here.length === 0 &&
+    overview.landmarks.length === 0
+  );
+}
+
 function compactLocation(location: string): string {
   const parts = location.split("/");
   return parts.length > 2 ? parts.slice(-2).join("/") : location;
@@ -73,6 +86,7 @@ export function OverviewCommandShelf({
   const setGraphMode = useStore((s) => s.setGraphMode);
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
 
+  const emptyOverview = isEmptyOverview(overview);
   const selectedLandmark = findSelectedLandmark(overview, selectedNodeId);
   const hasOverviewSelection = selectedNodeId != null && selectedLandmark != null;
   const exploreFallback = firstSupportedTarget(overview, canExploreLandmark);
@@ -111,7 +125,9 @@ export function OverviewCommandShelf({
           </h2>
           <p className="mt-0.5 truncate text-[11px] text-[var(--color-text-muted)]">
             {overview
-              ? `${overview.start_here.length} entry points`
+              ? emptyOverview
+                ? "No indexed content"
+                : `${overview.start_here.length} entry points`
               : loading
                 ? "Loading overview"
                 : "Overview unavailable"}
@@ -135,26 +151,28 @@ export function OverviewCommandShelf({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-1.5 border-b border-[var(--color-border)] px-3 py-2">
-        <button
-          type="button"
-          onClick={exploreTarget}
-          disabled={!exploreActionTarget}
-          title={!exploreActionTarget ? "Explore is available for symbols and notes" : undefined}
-          className="rounded bg-blue-600 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-        >
-          Explore
-        </button>
-        <button
-          type="button"
-          onClick={impactTarget}
-          disabled={!impactActionTarget}
-          title={!impactActionTarget ? "Impact is available for symbols" : undefined}
-          className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
-        >
-          Impact
-        </button>
-      </div>
+      {!emptyOverview && (
+        <div className="grid grid-cols-2 gap-1.5 border-b border-[var(--color-border)] px-3 py-2">
+          <button
+            type="button"
+            onClick={exploreTarget}
+            disabled={!exploreActionTarget}
+            title={!exploreActionTarget ? "Explore is available for symbols and notes" : undefined}
+            className="rounded bg-blue-600 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+          >
+            Explore
+          </button>
+          <button
+            type="button"
+            onClick={impactTarget}
+            disabled={!impactActionTarget}
+            title={!impactActionTarget ? "Impact is available for symbols" : undefined}
+            className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+          >
+            Impact
+          </button>
+        </div>
+      )}
 
       {loading && (
         <div className="px-3 py-3 text-xs text-[var(--color-text-muted)]">
@@ -175,7 +193,26 @@ export function OverviewCommandShelf({
         </div>
       )}
 
-      {!loading && !error && overview && (
+      {!loading && !error && emptyOverview && (
+        <div className="space-y-3 px-3 py-3 text-xs text-[var(--color-text-muted)]">
+          <p className="text-[var(--color-text)]">
+            Index a project or add a vault to build the overview map.
+          </p>
+          <div className="space-y-1.5 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-2 font-mono text-[11px]">
+            <p>nestweaver index --repo .</p>
+            <p>nestweaver brain add ~/vault --name personal</p>
+          </div>
+          <button
+            type="button"
+            onClick={reload}
+            className="rounded border border-[var(--color-border)] px-2 py-1 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+          >
+            Retry overview
+          </button>
+        </div>
+      )}
+
+      {!loading && !error && overview && !emptyOverview && (
         <div className="min-h-0 overflow-y-auto px-2 py-2">
           {overview.start_here.slice(0, 7).map((item) => (
             <button
