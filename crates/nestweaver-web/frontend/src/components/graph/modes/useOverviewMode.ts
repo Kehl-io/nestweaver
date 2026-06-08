@@ -17,12 +17,16 @@ export function useOverviewMode() {
     setError(null);
     try {
       const result = await api.overview(24);
+      if (useStore.getState().graphMode !== "overview") return;
       setOverview(result);
       setGraphData(buildGraphFromOverview(result));
     } catch (err) {
+      if (useStore.getState().graphMode !== "overview") return;
       setError(err instanceof Error ? err.message : "Failed to load overview");
     } finally {
-      setLoading(false);
+      if (useStore.getState().graphMode === "overview") {
+        setLoading(false);
+      }
     }
   }, [graphMode, setGraphData]);
 

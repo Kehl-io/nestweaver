@@ -32,7 +32,7 @@ export function useDeepLink() {
 
     const params = new URLSearchParams();
     if (seeds.length > 0) params.set("seeds", seeds.join(","));
-    if (graphMode !== "context") params.set("mode", graphMode);
+    if (graphMode !== "overview") params.set("mode", graphMode);
 
     const url = params.toString()
       ? `${window.location.pathname}?${params}`
