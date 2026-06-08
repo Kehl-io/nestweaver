@@ -1,7 +1,9 @@
 ---
 name: nestweaver-impact
-description: Check blast radius before modifying code using NestWeaver.
+description: Check blast radius before modifying code using NestWeaver. DO NOT grep for callers — brain_impact shows the full dependency chain with confidence scores in one call.
 ---
+
+**Use NestWeaver instead of grep to find callers/dependents.** `brain_impact` returns the full transitive blast radius with confidence-weighted impact scores — no need to manually grep for usages.
 
 Before modifying a function, class, or module:
 
