@@ -25,6 +25,14 @@ Open to a **Guided Overview Map**:
 4. The detail panel offers contextual next actions.
 5. Advanced controls are grouped by intent rather than shown as unexplained single-character buttons.
 
+## Why Look And Feel Is In Scope
+
+This work is not only about adding more information to the screen. The graph view is NestWeaver's primary spatial metaphor, so its visual feel directly affects whether users trust it, understand it, and want to explore it.
+
+Obsidian's graph feels useful partly because it is fluid: nodes settle naturally, zooming and panning feel direct, labels appear at the right moments, and controls feel like part of the graph rather than a separate expert console. NestWeaver should aim for that same sense of immediate manipulability while keeping its existing color palette and brand language.
+
+The goal is not a new visual identity. Keep the current NestWeaver colors. Improve composition, motion, density, affordances, labeling, and control clarity.
+
 ## Research Principles
 
 The design follows a few durable visualization and product patterns.
@@ -166,6 +174,40 @@ When the user searches:
 - Local graph expansion should animate or otherwise preserve orientation.
 - Dense graph states should offer list or matrix alternatives instead of forcing node-link reading.
 
+## Look And Feel Requirements
+
+Keep the current color system, including the dark graph background and node-kind colors, but improve the interface around it.
+
+### Graph Feel
+
+- Panning and zooming should feel smooth, direct, and responsive.
+- Force layout should settle gracefully instead of appearing jittery or arbitrary.
+- Node hover, selection, and expansion should use short transitions that preserve spatial orientation.
+- Local graph changes should avoid abrupt full-scene resets when the user is expanding from an existing node.
+- Reduced motion must remain available and should disable decorative motion without making the graph feel broken.
+
+### Visual Hierarchy
+
+- The graph should have one clear focal point on first open: the most important cluster, selected Start Here item, or ranked overview center.
+- Top landmarks should receive readable labels earlier than low-rank nodes.
+- Secondary nodes and unrelated edges should recede through opacity and weight rather than competing equally.
+- Empty space should be intentional: enough room to pan and inspect, but not so much that the graph feels lost.
+
+### Controls And Surfaces
+
+- Controls should feel integrated into the graph canvas instead of like debugging switches.
+- Replace single-character controls with recognizable icons, labels, grouped menus, or segmented controls.
+- Use tooltips for expert actions, but do not rely on tooltips to explain the primary workflow.
+- Cards and panels should stay compact and operational; avoid marketing-style hero composition.
+- Preserve the current restrained product-tool tone while increasing polish in spacing, typography scale, and hover/focus states.
+
+### Labeling And Microcopy
+
+- Labels should use plain language: `Explore neighborhood`, `Impact`, `Related notes`, not internal mode names where the user is choosing an action.
+- Empty states should recommend specific next actions based on available data.
+- Each Start Here item should explain why it is being shown.
+- Status text should communicate what the graph is doing: loading overview, settling layout, filtered to notes, showing local context, and so on.
+
 ## Data Requirements
 
 The overview needs an API or client-side query that returns ranked overview landmarks. It can be composed from existing data at first.
@@ -211,6 +253,15 @@ The response should include a reason string or reason codes for each recommended
 - Cryptic toolbar labels are replaced or grouped behind labeled controls.
 - Filters and legends are understandable without reading docs.
 - Expert shortcuts remain available.
+
+### Look And Feel
+
+- The graph keeps the existing NestWeaver color palette.
+- First-open graph motion is smooth and settles without distracting jitter.
+- Panning, zooming, hovering, selecting, and expanding nodes feel responsive.
+- Primary landmarks have readable labels without flooding the canvas.
+- The UI has a clear focal point and obvious next action in the first viewport.
+- Panels, controls, and graph overlays feel like one product surface rather than separate debug tools.
 
 ### Accessibility
 
