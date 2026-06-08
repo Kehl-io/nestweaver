@@ -28,6 +28,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
         .route("/api/v1/version", get(routes::version::version))
+        .route("/api/v1/overview", get(routes::overview::overview))
         .route("/api/v1/search", get(routes::symbols::search))
         .route("/api/v1/symbol/{uid}", get(routes::symbols::symbol_by_uid))
         .route(
