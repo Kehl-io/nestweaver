@@ -291,6 +291,7 @@ fn parse_note_kind(s: &str) -> NoteKind {
         "Design" => NoteKind::Design,
         "Meeting" => NoteKind::Meeting,
         "Journal" => NoteKind::Journal,
+        "AgentConfig" => NoteKind::AgentConfig,
         other => {
             tracing::warn!("unknown NoteKind '{}', falling back to General", other);
             NoteKind::General
