@@ -38,7 +38,14 @@ export const useStore = create<StoreState>()(
       })),
       {
         name: "nestweaver-ui",
-        version: 1,
+        version: 2,
+        migrate: (persistedState: any) => {
+          if (persistedState && typeof persistedState === "object") {
+            const { graphMode: _graphMode, ...rest } = persistedState;
+            return rest;
+          }
+          return persistedState;
+        },
         partialize: (state: any) => ({
           layoutMode: state.layoutMode,
           nodeTypeFilter: state.nodeTypeFilter,
