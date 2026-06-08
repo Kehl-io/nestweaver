@@ -5,6 +5,7 @@ import { kindToColor, nodeSize } from "./graphColors";
 function landmarkColor(item: OverviewLandmark): string {
   if (item.kind === "repo") return "#6B7280";
   if (item.kind === "service") return "#3B82F6";
+  if (item.kind === "symbol") return "#3B82F6";
   if (item.kind === "note") return "#78716C";
   return kindToColor(item.kind);
 }
@@ -30,6 +31,8 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       relevance: item.score,
       reason: item.reason,
       forceLabel: i < 8,
+      // Current label filtering preserves seed labels through zoom changes.
+      isSeed: i < 8,
       isOverview: true,
     });
   }
