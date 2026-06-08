@@ -10,6 +10,8 @@ import { GraphToolbar } from "./GraphToolbar";
 import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { LlmQueryBar } from "../llm/LlmQueryBar";
+import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
+import { OverviewContextSurface } from "../overview/OverviewContextSurface";
 import { TimelineSlider } from "../timeline/TimelineSlider";
 import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
@@ -172,7 +174,7 @@ function useGraphKeyboardNav(
  * Hooks read and write graph state via zustand.
  */
 function GraphModeHooks() {
-  useOverviewMode();
+  const overviewState = useOverviewMode();
   useContextMode();
   useImpactMode();
   useReposMode();
@@ -195,6 +197,12 @@ function GraphModeHooks() {
 
   return (
     <>
+      {graphMode === "overview" && (
+        <>
+          <OverviewCommandShelf {...overviewState} />
+          <OverviewContextSurface overview={overviewState.overview} />
+        </>
+      )}
       {graphMode === "local" && (
         <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded bg-[var(--color-surface-alt)] shadow text-xs text-[var(--color-text)]">
           <label htmlFor="local-hops-slider" className="whitespace-nowrap">
