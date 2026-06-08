@@ -78,7 +78,7 @@ export function NodeLabels({ buffers }: Props) {
   });
 
   // Font size scales inversely with zoom: bigger when close, smaller when far
-  const baseFontSize = cameraZoom < 300 ? 11 : cameraZoom < 600 ? 10 : 9;
+  const baseFontSize = cameraZoom < 300 ? 12 : cameraZoom < 600 ? 11 : 10;
 
   return (
     <>
@@ -98,20 +98,16 @@ export function NodeLabels({ buffers }: Props) {
             zIndexRange={[100, 0]}
           >
             <div
+              className={`graph-node-label ${
+                node.isSelected
+                  ? "graph-node-label-selected"
+                  : node.isHovered
+                    ? "graph-node-label-hovered"
+                    : ""
+              }`}
               style={{
                 fontSize: `${baseFontSize}px`,
-                fontFamily: "system-ui, sans-serif",
-                fontWeight: isHighlighted ? 600 : 400,
-                color: "var(--color-text, #e2e8f0)",
-                textShadow:
-                  "0 1px 3px rgba(0,0,0,0.8), 0 0px 6px rgba(0,0,0,0.5)",
-                padding: "1px 4px",
-                borderRadius: "3px",
-                background: node.isSelected
-                  ? "rgba(59, 130, 246, 0.25)"
-                  : node.isHovered
-                    ? "rgba(59, 130, 246, 0.12)"
-                    : "transparent",
+                fontWeight: isHighlighted ? 700 : 560,
               }}
             >
               {node.label}
