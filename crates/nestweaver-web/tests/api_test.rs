@@ -203,6 +203,33 @@ async fn services_returns_empty() {
 }
 
 #[tokio::test]
+async fn overview_returns_ranked_landmarks() {
+    let app = make_app();
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(json.get("counts").is_some(), "should include counts");
+    assert_eq!(json["counts"]["repo_count"], 1);
+    assert_eq!(json["counts"]["symbol_count"], 1);
+
+    let landmarks = json["landmarks"]
+        .as_array()
+        .expect("landmarks should be an array");
+    assert!(
+        landmarks.iter().any(|item| item["uid"] == "sym:test:greet"),
+        "overview should include top symbol"
+    );
+
+    let start_here = json["start_here"]
+        .as_array()
+        .expect("start_here should be an array");
+    assert!(
+        start_here.iter().any(|item| item["kind"] == "symbol"),
+        "start_here should include symbol guidance"
+    );
+}
+
+#[tokio::test]
 async fn brain_status_returns_counts() {
     let app = make_app();
     let (status, json) = get_json(&app, "/api/v1/brain/status").await;
