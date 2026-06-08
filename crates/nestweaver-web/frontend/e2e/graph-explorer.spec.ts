@@ -9,14 +9,25 @@ import type { OverviewLandmark, OverviewResponse } from "../src/api/types";
 async function fetchOverview(
   request: APIRequestContext,
 ): Promise<OverviewResponse> {
-  const response = await request.get("/api/v1/overview?limit=24");
-  expect(response.ok()).toBeTruthy();
-  const overview = (await response.json()) as OverviewResponse;
-  expect(overview).toHaveProperty("counts");
-  expect(Array.isArray(overview.landmarks)).toBeTruthy();
-  expect(Array.isArray(overview.start_here)).toBeTruthy();
-  expect(Array.isArray(overview.gaps)).toBeTruthy();
-  return overview;
+  let lastStatus = 0;
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await request.get("/api/v1/overview?limit=24");
+    lastStatus = response.status();
+
+    if (response.ok()) {
+      const overview = (await response.json()) as OverviewResponse;
+      expect(overview).toHaveProperty("counts");
+      expect(Array.isArray(overview.landmarks)).toBeTruthy();
+      expect(Array.isArray(overview.start_here)).toBeTruthy();
+      expect(Array.isArray(overview.gaps)).toBeTruthy();
+      return overview;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(`overview API did not become ready; last status ${lastStatus}`);
 }
 
 function displayedStartHereItems(
@@ -35,13 +46,17 @@ async function openOverview(page: Page) {
   const graphContainer = page.locator('[data-testid="graph-panel"]');
   await expect(graphContainer).toBeVisible({ timeout: 15_000 });
 
-  const overviewMode = page.getByRole("button", { name: "Overview" });
+  const overviewMode = page.getByRole("button", {
+    name: "Overview",
+    exact: true,
+  });
   await expect(overviewMode).toBeVisible();
   await expect(overviewMode).toHaveClass(/border-blue-500/);
 }
 
 test.describe("Graph Explorer", () => {
-  test("graph panel renders with nodes", async ({ page }) => {
+  test("graph panel renders with nodes", async ({ page, request }) => {
+    await fetchOverview(request);
     await openOverview(page);
   });
 
