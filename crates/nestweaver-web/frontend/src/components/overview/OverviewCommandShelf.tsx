@@ -8,8 +8,52 @@ interface OverviewCommandShelfProps {
   reload: () => void;
 }
 
-function firstTarget(overview: OverviewResponse | null): OverviewLandmark | null {
-  return overview?.start_here[0] ?? overview?.landmarks[0] ?? null;
+const SYMBOL_KINDS = new Set([
+  "symbol",
+  "Function",
+  "Class",
+  "Method",
+  "Interface",
+  "Trait",
+  "Enum",
+  "Module",
+  "Extension",
+  "Constant",
+  "Property",
+  "TypeAlias",
+  "Variable",
+]);
+
+function isSymbolLandmark(item: OverviewLandmark | null): boolean {
+  return item != null && SYMBOL_KINDS.has(item.kind);
+}
+
+function canExploreLandmark(item: OverviewLandmark | null): boolean {
+  if (item == null) return false;
+  return isSymbolLandmark(item) || item.kind === "note";
+}
+
+function findSelectedLandmark(
+  overview: OverviewResponse | null,
+  uid: string | null,
+): OverviewLandmark | null {
+  if (!overview || !uid) return null;
+  return (
+    overview.start_here.find((item) => item.uid === uid) ??
+    overview.landmarks.find((item) => item.uid === uid) ??
+    null
+  );
+}
+
+function firstSupportedTarget(
+  overview: OverviewResponse | null,
+  predicate: (item: OverviewLandmark | null) => boolean,
+): OverviewLandmark | null {
+  return (
+    overview?.start_here.find(predicate) ??
+    overview?.landmarks.find(predicate) ??
+    null
+  );
 }
 
 function compactLocation(location: string): string {
@@ -24,31 +68,34 @@ export function OverviewCommandShelf({
   reload,
 }: OverviewCommandShelfProps) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
-  const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const selectNode = useStore((s) => s.selectNode);
   const setSeeds = useStore((s) => s.setSeeds);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
 
-  const fallback = firstTarget(overview);
-  const actionTarget =
-    selectedNodeId != null
-      ? {
-          uid: selectedNodeId,
-          kind: selectedNodeKind ?? undefined,
-        }
-      : fallback;
+  const selectedLandmark = findSelectedLandmark(overview, selectedNodeId);
+  const hasOverviewSelection = selectedNodeId != null && selectedLandmark != null;
+  const exploreFallback = firstSupportedTarget(overview, canExploreLandmark);
+  const impactFallback = firstSupportedTarget(overview, isSymbolLandmark);
+  const exploreActionTarget =
+    hasOverviewSelection
+      ? canExploreLandmark(selectedLandmark) ? selectedLandmark : null
+      : exploreFallback;
+  const impactActionTarget =
+    hasOverviewSelection
+      ? isSymbolLandmark(selectedLandmark) ? selectedLandmark : null
+      : impactFallback;
 
   const exploreTarget = () => {
-    if (!actionTarget) return;
-    selectNode(actionTarget.uid, actionTarget.kind);
-    setSeeds([actionTarget.uid]);
+    if (!exploreActionTarget) return;
+    selectNode(exploreActionTarget.uid, exploreActionTarget.kind);
+    setSeeds([exploreActionTarget.uid]);
     setGraphMode("local");
   };
 
   const impactTarget = () => {
-    if (!actionTarget) return;
-    selectNode(actionTarget.uid, actionTarget.kind);
+    if (!impactActionTarget) return;
+    selectNode(impactActionTarget.uid, impactActionTarget.kind);
     setGraphMode("impact");
   };
 
@@ -92,7 +139,8 @@ export function OverviewCommandShelf({
         <button
           type="button"
           onClick={exploreTarget}
-          disabled={!actionTarget}
+          disabled={!exploreActionTarget}
+          title={!exploreActionTarget ? "Explore is available for symbols and notes" : undefined}
           className="rounded bg-blue-600 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
         >
           Explore
@@ -100,7 +148,8 @@ export function OverviewCommandShelf({
         <button
           type="button"
           onClick={impactTarget}
-          disabled={!actionTarget}
+          disabled={!impactActionTarget}
+          title={!impactActionTarget ? "Impact is available for symbols" : undefined}
           className="rounded border border-[var(--color-border)] px-2 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
         >
           Impact
