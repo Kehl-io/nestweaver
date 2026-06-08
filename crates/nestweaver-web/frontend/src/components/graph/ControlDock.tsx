@@ -158,7 +158,10 @@ export function ControlDock() {
   };
 
   return (
-    <div className="absolute right-2 top-2 z-20 flex flex-col gap-1.5">
+    <div
+      data-testid="control-dock"
+      className="absolute right-2 top-2 z-20 flex flex-col gap-1.5"
+    >
       <div className="relative">
         <DockButton
           id="view"
