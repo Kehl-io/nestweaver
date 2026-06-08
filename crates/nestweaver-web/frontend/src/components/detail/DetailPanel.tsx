@@ -7,6 +7,7 @@ import { LlmResultDetail } from "../llm/LlmResultDetail";
 import { NoteDetail } from "./NoteDetail";
 import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
+import { NodeActionBar } from "../actions/NodeActionBar";
 
 const SYMBOL_KINDS = new Set(["Function", "Class", "Interface", "Method", "Module"]);
 
@@ -46,24 +47,32 @@ export function DetailPanel() {
   const isNote = selectedNodeId.startsWith("note:") || (!isSymbol && selectedNodeKind !== "file");
 
   return (
-    <GlassPanel data-testid="detail-panel" className="h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
-      {llmResult && <LlmResultDetail />}
-      {diffActive && <DiffDetail />}
-      {gapActive && <GapDetail />}
-      {flowTraceActive && <FlowDetail />}
-      {pathfindingActive && pathResults.length > 0 && <PathDetail />}
-      {isSymbol ? (
-        <SymbolDetail uid={selectedNodeId} />
-      ) : isNote ? (
-        <NoteDetail uid={selectedNodeId} />
-      ) : (
-        <div className="p-4">
-          <h2 className="mb-2 text-sm font-semibold">Selected</h2>
-          <p className="break-all text-sm text-[var(--color-text-muted)]">
-            {selectedNodeId}
-          </p>
-        </div>
-      )}
+    <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]">
+      <div className="border-b border-[var(--color-border)] p-2">
+        <NodeActionBar
+          node={{ uid: selectedNodeId, kind: selectedNodeKind }}
+          compact
+        />
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {llmResult && <LlmResultDetail />}
+        {diffActive && <DiffDetail />}
+        {gapActive && <GapDetail />}
+        {flowTraceActive && <FlowDetail />}
+        {pathfindingActive && pathResults.length > 0 && <PathDetail />}
+        {isSymbol ? (
+          <SymbolDetail uid={selectedNodeId} />
+        ) : isNote ? (
+          <NoteDetail uid={selectedNodeId} />
+        ) : (
+          <div className="p-4">
+            <h2 className="mb-2 text-sm font-semibold">Selected</h2>
+            <p className="break-all text-sm text-[var(--color-text-muted)]">
+              {selectedNodeId}
+            </p>
+          </div>
+        )}
+      </div>
     </GlassPanel>
   );
 }

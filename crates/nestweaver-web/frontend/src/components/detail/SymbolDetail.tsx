@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import type { SymbolDetail as SymbolDetailType } from "../../api/types";
 import { useStore } from "../../stores";
+import { NodeActionBar } from "../actions/NodeActionBar";
 import { Collapsible } from "../shared/Collapsible";
 import { KindBadge } from "../shared/KindBadge";
 import { CodePreview } from "./CodePreview";
@@ -12,6 +13,7 @@ interface SymbolDetailProps {
 
 export function SymbolDetail({ uid }: SymbolDetailProps) {
   const exploreNode = useStore((s) => s.exploreNode);
+  const detailFocus = useStore((s) => s.detailFocus);
 
   const [detail, setDetail] = useState<SymbolDetailType | null>(null);
   const [loading, setLoading] = useState(true);
@@ -91,11 +93,22 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
             Refs: {refCount}
           </span>
         </div>
+        <NodeActionBar
+          node={{ uid: symbol.uid, kind: symbol.kind, label: symbol.name }}
+          ids={["open", "related", "ask"]}
+          compact
+          className="mt-3"
+        />
       </div>
 
       {/* Middle: Callers & Callees */}
       <div className="mb-4 space-y-1">
-        <Collapsible title="Callers" count={callers.length} defaultOpen={callers.length > 0}>
+        <Collapsible
+          title="Callers"
+          count={callers.length}
+          defaultOpen={callers.length > 0}
+          active={detailFocus === "related"}
+        >
           {callers.length === 0 ? (
             <div className="px-4 py-1 text-[10px] text-[var(--color-text-muted)]">
               No callers.
@@ -121,7 +134,12 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
           )}
         </Collapsible>
 
-        <Collapsible title="Callees" count={callees.length} defaultOpen={callees.length > 0}>
+        <Collapsible
+          title="Callees"
+          count={callees.length}
+          defaultOpen={callees.length > 0}
+          active={detailFocus === "related"}
+        >
           {callees.length === 0 ? (
             <div className="px-4 py-1 text-[10px] text-[var(--color-text-muted)]">
               No callees.
@@ -149,7 +167,13 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
       </div>
 
       {/* Bottom: Code Preview */}
-      <div>
+      <div
+        className={
+          detailFocus === "source"
+            ? "rounded border border-blue-500/40 bg-blue-500/5 p-2"
+            : undefined
+        }
+      >
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
           Source
         </h3>
