@@ -1,11 +1,156 @@
-import { test, expect } from "@playwright/test";
+import {
+  test,
+  expect,
+  type APIRequestContext,
+  type Page,
+} from "@playwright/test";
+import type { OverviewLandmark, OverviewResponse } from "../src/api/types";
+
+async function fetchOverview(
+  request: APIRequestContext,
+): Promise<OverviewResponse> {
+  const response = await request.get("/api/v1/overview?limit=24");
+  expect(response.ok()).toBeTruthy();
+  const overview = (await response.json()) as OverviewResponse;
+  expect(overview.landmarks.length).toBeGreaterThan(0);
+  expect(overview.start_here.length).toBeGreaterThan(0);
+  return overview;
+}
+
+function displayedStartHereItems(
+  overview: OverviewResponse,
+): OverviewLandmark[] {
+  return overview.start_here.slice(0, 7);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function openOverview(page: Page) {
+  await page.goto("/");
+
+  const graphContainer = page.locator('[data-testid="graph-panel"]');
+  await expect(graphContainer).toBeVisible({ timeout: 15_000 });
+
+  const overviewMode = page.getByRole("button", { name: "Overview" });
+  await expect(overviewMode).toBeVisible();
+  await expect(overviewMode).toHaveClass(/border-blue-500/);
+}
 
 test.describe("Graph Explorer", () => {
   test("graph panel renders with nodes", async ({ page }) => {
-    await page.goto("/");
-    await page.waitForTimeout(2_000);
-    const graphContainer = page.locator('[data-testid="graph-panel"]');
-    await expect(graphContainer).toBeVisible({ timeout: 15_000 });
+    await openOverview(page);
+  });
+
+  test("first open shows overview mode with Start Here and context", async ({
+    page,
+    request,
+  }) => {
+    const overview = await fetchOverview(request);
+    const visibleItems = displayedStartHereItems(overview);
+
+    await openOverview(page);
+
+    const startHere = page.getByRole("region", { name: "Start Here" });
+    await expect(startHere).toBeVisible({ timeout: 15_000 });
+    await expect(
+      startHere.getByText(`${overview.start_here.length} entry points`),
+    ).toBeVisible();
+
+    for (const item of visibleItems.slice(0, 3)) {
+      await expect(
+        startHere.getByText(item.label, { exact: true }),
+      ).toBeVisible();
+    }
+
+    const contextSurface = page.getByRole("complementary", {
+      name: "Overview context",
+    });
+    await expect(contextSurface).toBeVisible();
+    await expect(
+      contextSurface.getByRole("heading", { name: "Overview Map" }),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByText(`${overview.landmarks.length} landmarks`),
+    ).toBeVisible();
+    await expect(contextSurface.getByText("Repos")).toBeVisible();
+    await expect(contextSurface.getByText("Symbols")).toBeVisible();
+  });
+
+  test("clicking a Start Here item updates overview context", async ({
+    page,
+    request,
+  }) => {
+    const overview = await fetchOverview(request);
+    const [firstItem] = displayedStartHereItems(overview);
+
+    await openOverview(page);
+
+    const startHere = page.getByRole("region", { name: "Start Here" });
+    await expect(
+      startHere.getByText(firstItem.label, { exact: true }),
+    ).toBeVisible();
+    await startHere
+      .getByRole("button", {
+        name: new RegExp(escapeRegExp(firstItem.label)),
+      })
+      .first()
+      .click();
+
+    const contextSurface = page.getByRole("complementary", {
+      name: "Overview context",
+    });
+    await expect(
+      contextSurface.getByRole("heading", { name: firstItem.label }),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByText(firstItem.kind, { exact: true }),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByText(firstItem.reason, { exact: true }),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByText("Overview", { exact: true }),
+    ).toBeVisible();
+  });
+
+  test("repo and service Start Here items do not enable Impact", async ({
+    page,
+    request,
+  }) => {
+    const overview = await fetchOverview(request);
+    const unsupportedItem = displayedStartHereItems(overview).find(
+      (item) => item.kind === "repo" || item.kind === "service",
+    );
+
+    if (!unsupportedItem) {
+      test.skip(
+        true,
+        "fixture does not expose a repo or service in visible Start Here items",
+      );
+      return;
+    }
+
+    await openOverview(page);
+
+    const startHere = page.getByRole("region", { name: "Start Here" });
+    await startHere
+      .getByRole("button", {
+        name: new RegExp(escapeRegExp(unsupportedItem.label)),
+      })
+      .first()
+      .click();
+
+    const contextSurface = page.getByRole("complementary", {
+      name: "Overview context",
+    });
+    await expect(
+      contextSurface.getByRole("heading", { name: unsupportedItem.label }),
+    ).toBeVisible();
+    await expect(
+      contextSurface.getByRole("button", { name: "Impact" }),
+    ).toBeDisabled();
   });
 
   test("repo-map API returns data", async ({ request }) => {
@@ -13,6 +158,17 @@ test.describe("Graph Explorer", () => {
     expect(response.ok()).toBeTruthy();
     const body = await response.text();
     expect(body.length).toBeGreaterThan(0);
+  });
+
+  test("overview API returns Start Here data", async ({ request }) => {
+    const overview = await fetchOverview(request);
+    expect(overview).toHaveProperty("counts");
+    expect(overview.start_here.length).toBeLessThanOrEqual(
+      overview.landmarks.length,
+    );
+    expect(
+      overview.start_here.some((item) => item.kind === "symbol"),
+    ).toBeTruthy();
   });
 
   test("context API returns ranked symbols", async ({ request }) => {
