@@ -85,7 +85,7 @@ fn setup_test_store() -> GraphStore {
 
     let repo = Repo {
         uid: "repo:test".to_string(),
-        url: "https://example.com/test".to_string(),
+        url: "https://example.com/test.git".to_string(),
         indexed_sha: "abc123".to_string(),
         staleness_commits_behind: 0,
         instance_id: String::new(),
@@ -218,6 +218,12 @@ async fn overview_returns_ranked_landmarks() {
     assert!(
         landmarks.iter().any(|item| item["uid"] == "sym:test:greet"),
         "overview should include top symbol"
+    );
+    assert!(
+        landmarks
+            .iter()
+            .any(|item| item["uid"] == "repo:test" && item["label"] == "test.git"),
+        "overview should preserve literal repo URL segment"
     );
 
     let start_here = json["start_here"]
