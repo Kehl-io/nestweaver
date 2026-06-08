@@ -279,31 +279,36 @@ test.describe("Graph Explorer", () => {
   test("grouped controls switch to list and matrix views", async ({ page }) => {
     await openOverview(page);
 
-    await page.getByRole("button", { name: "View" }).click();
-    await page.getByRole("button", { name: "List" }).click();
+    const dock = page.getByTestId("control-dock");
+
+    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "List" }).click();
     await expect(
       page.getByRole("region", { name: "Ranked node table" }),
     ).toBeVisible();
 
-    await page.getByRole("button", { name: "View" }).click();
-    await page.getByRole("button", { name: "Matrix" }).click();
+    await dock.getByRole("button", { name: "Matrix" }).click();
     await expect(
       page.getByRole("region", { name: "Graph matrix view" }),
     ).toBeVisible();
 
-    await page.getByRole("button", { name: "Filter" }).click();
+    await dock.getByRole("button", { name: "Filter" }).click();
     await expect(page.getByLabel("Scope")).toBeVisible();
   });
 
   test("ranked table sorts and selects nodes", async ({ page }) => {
     await openOverview(page);
 
-    await page.getByRole("button", { name: "View" }).click();
-    await page.getByRole("button", { name: "List" }).click();
+    const dock = page.getByTestId("control-dock");
+    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "List" }).click();
 
     const table = page.getByRole("region", { name: "Ranked node table" });
     await expect(table).toBeVisible();
-    await table.getByRole("button", { name: "Name" }).click();
+    await table
+      .locator("thead")
+      .getByRole("button", { name: "Name", exact: true })
+      .click();
     const firstRowButton = table.locator("tbody button").first();
     await expect(firstRowButton).toBeVisible();
     await firstRowButton.click();
@@ -314,8 +319,9 @@ test.describe("Graph Explorer", () => {
   }) => {
     await openOverview(page);
 
-    await page.getByRole("button", { name: "View" }).click();
-    await page.getByRole("button", { name: "Matrix" }).click();
+    const dock = page.getByTestId("control-dock");
+    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "Matrix" }).click();
 
     const matrix = page.getByRole("region", { name: "Graph matrix view" });
     await expect(matrix).toBeVisible();
