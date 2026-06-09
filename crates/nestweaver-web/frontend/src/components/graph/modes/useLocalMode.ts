@@ -33,7 +33,7 @@ export function useLocalMode() {
       }
 
       setGraphData(graph);
-      start();
+      start(graph);
       // Stop after MAX_LAYOUT_MS as a safety ceiling
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
       stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);

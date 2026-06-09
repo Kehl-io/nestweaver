@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useStore } from "../stores";
+import { EDGE_COLORS } from "../components/graph/utils/graphColors";
 
 export interface GraphBuffers {
   /** [x0, y0, z0, x1, y1, z1, ...] length = nodeCount * 3 */
@@ -20,6 +21,8 @@ export interface GraphBuffers {
   edgePositions: Float32Array;
   /** [sr0, sg0, sb0, tr0, tg0, tb0, ...] length = edgeCount * 6 */
   edgeColors: Float32Array;
+  /** [sourceIndex0, targetIndex0, ...] length = edgeCount * 2 */
+  edgeNodeIndices: Int32Array;
   uidToIndex: Map<string, number>;
   indexToUid: string[];
   nodeCount: number;
@@ -36,6 +39,7 @@ export const EMPTY_BUFFERS: GraphBuffers = {
   bridgeStrengths: new Float32Array(0),
   edgePositions: new Float32Array(0),
   edgeColors: new Float32Array(0),
+  edgeNodeIndices: new Int32Array(0),
   uidToIndex: new Map(),
   indexToUid: [],
   nodeCount: 0,
@@ -63,6 +67,17 @@ function hexToRgb(hex: string): [number, number, number] {
   }
   return [0.5, 0.5, 0.5];
 }
+
+function edgeColorForType(type: unknown, isDark: boolean): [number, number, number] | null {
+  if (typeof type !== "string") return null;
+  if (type === "overview") {
+    return isDark ? hexToRgb("#64748b") : hexToRgb("#6b7280");
+  }
+  const color = EDGE_COLORS[type];
+  return color ? hexToRgb(color) : null;
+}
+
+const NODE_EDGE_RADIUS_FACTOR = 0;
 
 /**
  * Simple hash of a string into a float in [0, 1) for deterministic phase offsets.
@@ -123,6 +138,7 @@ export function useGraphBridge(): GraphBuffers {
   const graphVersion = useStore((s) => s.graphVersion);
   const activeStyleRules = useStore((s) => s.activeStyleRules);
   const seeds = useStore((s) => s.seeds);
+  const theme = useStore((s) => s.theme);
 
   return useMemo(() => {
     if (!graphInstance || graphInstance.order === 0) {
@@ -130,6 +146,11 @@ export function useGraphBridge(): GraphBuffers {
     }
 
     const graph = graphInstance;
+    const isDark =
+      theme === "dark" ||
+      (theme === "system" &&
+        typeof window !== "undefined" &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
     const nodeCount = graph.order;
     const edgeCount = graph.size;
 
@@ -222,6 +243,7 @@ export function useGraphBridge(): GraphBuffers {
     // and 6 floats for colors (source rgb + target rgb)
     const edgePositions = new Float32Array(edgeCount * 6);
     const edgeColors = new Float32Array(edgeCount * 6);
+    const edgeNodeIndices = new Int32Array(edgeCount * 2);
 
     let ei = 0;
     graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
@@ -229,23 +251,52 @@ export function useGraphBridge(): GraphBuffers {
       const ti = uidToIndex.get(targetUid);
 
       if (si !== undefined && ti !== undefined) {
+        edgeNodeIndices[ei * 2 + 0] = si;
+        edgeNodeIndices[ei * 2 + 1] = ti;
+
+        const sourceX = positions[si * 3 + 0];
+        const sourceY = positions[si * 3 + 1];
+        const targetX = positions[ti * 3 + 0];
+        const targetY = positions[ti * 3 + 1];
+        const dx = targetX - sourceX;
+        const dy = targetY - sourceY;
+        const length = Math.hypot(dx, dy);
+        const sourceRadius = sizes[si] * NODE_EDGE_RADIUS_FACTOR;
+        const targetRadius = sizes[ti] * NODE_EDGE_RADIUS_FACTOR;
+        const ux = length > 0 ? dx / length : 0;
+        const uy = length > 0 ? dy / length : 0;
+        const trimmedSourceX = sourceX + ux * sourceRadius;
+        const trimmedSourceY = sourceY + uy * sourceRadius;
+        const trimmedTargetX = targetX - ux * targetRadius;
+        const trimmedTargetY = targetY - uy * targetRadius;
+
         // Source position
-        edgePositions[ei * 6 + 0] = positions[si * 3 + 0];
-        edgePositions[ei * 6 + 1] = positions[si * 3 + 1];
+        edgePositions[ei * 6 + 0] = trimmedSourceX;
+        edgePositions[ei * 6 + 1] = trimmedSourceY;
         edgePositions[ei * 6 + 2] = positions[si * 3 + 2];
         // Target position
-        edgePositions[ei * 6 + 3] = positions[ti * 3 + 0];
-        edgePositions[ei * 6 + 4] = positions[ti * 3 + 1];
+        edgePositions[ei * 6 + 3] = trimmedTargetX;
+        edgePositions[ei * 6 + 4] = trimmedTargetY;
         edgePositions[ei * 6 + 5] = positions[ti * 3 + 2];
 
-        // Source endpoint color (from source node)
-        edgeColors[ei * 6 + 0] = colors[si * 3 + 0];
-        edgeColors[ei * 6 + 1] = colors[si * 3 + 1];
-        edgeColors[ei * 6 + 2] = colors[si * 3 + 2];
-        // Target endpoint color (from target node) — enables directional gradient
-        edgeColors[ei * 6 + 3] = colors[ti * 3 + 0];
-        edgeColors[ei * 6 + 4] = colors[ti * 3 + 1];
-        edgeColors[ei * 6 + 5] = colors[ti * 3 + 2];
+        const edgeColor = edgeColorForType(_attrs.type, isDark);
+        const sourceColor = edgeColor ?? [
+          colors[si * 3 + 0],
+          colors[si * 3 + 1],
+          colors[si * 3 + 2],
+        ];
+        const targetColor = edgeColor ?? [
+          colors[ti * 3 + 0],
+          colors[ti * 3 + 1],
+          colors[ti * 3 + 2],
+        ];
+
+        edgeColors[ei * 6 + 0] = sourceColor[0];
+        edgeColors[ei * 6 + 1] = sourceColor[1];
+        edgeColors[ei * 6 + 2] = sourceColor[2];
+        edgeColors[ei * 6 + 3] = targetColor[0];
+        edgeColors[ei * 6 + 4] = targetColor[1];
+        edgeColors[ei * 6 + 5] = targetColor[2];
       }
 
       ei++;
@@ -261,11 +312,12 @@ export function useGraphBridge(): GraphBuffers {
       bridgeStrengths,
       edgePositions,
       edgeColors,
+      edgeNodeIndices,
       uidToIndex,
       indexToUid,
       nodeCount,
       edgeCount,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphInstance, graphVersion, activeStyleRules, seeds]);
+  }, [graphInstance, graphVersion, activeStyleRules, seeds, theme]);
 }

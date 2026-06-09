@@ -42,21 +42,16 @@ void main() {
     v_bridge = aBridge;
     v_phase = aPhase;
 
-    // Nodes arrive with a springy, deterministic pop, then settle into a quiet breath.
+    // Nodes arrive with a quick scale-in while staying locked to their graph coordinates.
     float intro = clamp(u_intro, 0.0, 1.0);
-    float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.22 * u_motionAmp;
-    float introScale = mix(0.34, 1.0, intro) + rebound;
+    float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.08 * u_motionAmp;
+    float introScale = mix(0.62, 1.0, intro) + rebound;
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
-    float focusLift = 1.0 + aHighlight * 0.08 + aSeed * 0.035;
-    float beaconScale = 1.08 + aImportance * 0.06;
+    float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
+    float beaconScale = 0.62 + aImportance * 0.06;
     float scale = aSize * beaconScale * introScale * breathe * focusLift;
 
     vec3 pos = position * scale;
-
-    // A tiny outward bounce on load makes the graph feel alive without moving nodes forever.
-    vec2 arrivalDir = normalize(vec2(cos(aPhase * 6.2831), sin(aPhase * 6.2831)));
-    float drift = sin((intro * 3.0 + aPhase) * 6.2831) * pow(1.0 - intro, 2.0);
-    pos.xy += arrivalDir * drift * aSize * 0.85 * u_motionAmp;
 
     vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
@@ -78,39 +73,27 @@ void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
 
-    // LED dot: simple Obsidian-like bead with no contour rings.
-    float body = 1.0 - smoothstep(0.6, 0.78, dist);
-    float hotCore = exp(-4.4 * dist * dist);
-    float softBody = exp(-1.8 * dist * dist) * body;
-    float outerGlow = exp(-6.8 * max(0.0, dist - 0.62));
+    // Obsidian-like dot: clean filled center, soft antialiasing, glow only on focus.
+    float body = 1.0 - smoothstep(0.68, 0.78, dist);
+    float hotCore = exp(-7.5 * dist * dist);
     float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
-    float focusAura = exp(-8.2 * max(0.0, dist - 0.56)) *
+    float focusAura = exp(-8.2 * max(0.0, dist - 0.62)) *
         v_highlight *
-        (0.22 + pulse * 0.2);
-    float seedAura = exp(-8.6 * max(0.0, dist - 0.58)) * v_seed * 0.2;
-    float liveSpark = exp(-58.0 * dot(uv - vec2(-0.16, 0.18), uv - vec2(-0.16, 0.18))) *
-        (0.14 + v_importance * 0.18 + v_highlight * (0.24 + pulse * 0.16));
-    float lowerShade = smoothstep(-0.18, -0.5, uv.y) * body;
+        (0.11 + pulse * 0.08);
 
-    vec3 coreColor = mix(v_color * 0.74, v_color * 1.18, hotCore);
-    coreColor = mix(coreColor, coreColor * 0.72, lowerShade * 0.28);
-    coreColor *= 0.92 + v_importance * 0.24 + v_highlight * 0.42 + v_seed * 0.16;
+    vec3 coreColor = mix(v_color * 0.96, v_color * 1.04, hotCore * 0.28);
+    coreColor *= 0.98 + v_importance * 0.08 + v_highlight * 0.24 + v_seed * 0.08;
 
-    vec3 lightInk = mix(v_color * 1.1, vec3(1.0), 0.16);
-    vec3 focusInk = v_color * 1.38;
+    vec3 focusInk = v_color * 1.32;
 
     vec3 color =
         coreColor * body +
-        lightInk * softBody * (0.08 + v_importance * 0.12) +
-        v_color * outerGlow * (0.03 + v_importance * 0.04) +
-        focusInk * hotCore * v_highlight * 0.46 +
-        focusInk * focusAura +
-        focusInk * seedAura +
-        lightInk * liveSpark * body;
+        focusInk * hotCore * v_highlight * 0.20 +
+        focusInk * focusAura;
 
-    float halo = exp(-7.2 * max(0.0, dist - 0.78)) * (v_highlight * 0.08 + v_seed * 0.035);
+    float halo = exp(-8.6 * max(0.0, dist - 0.74)) * (v_highlight * 0.045 + v_seed * 0.018);
     color += v_color * halo;
-    float alpha = max(body, max(focusAura, max(seedAura, halo)));
+    float alpha = max(body, max(focusAura, halo));
 
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
@@ -132,12 +115,16 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const hoveredNodeId = useStore((s) => s.hoveredNodeId);
   const graphInstance = useStore((s) => s.graphInstance);
+  const graphKey = useMemo(
+    () => buffers.indexToUid.join("\u0000"),
+    [buffers.indexToUid],
+  );
 
   // Shared uniforms object — stable reference so we mutate in place
   const uniforms = useMemo(
     () => ({
       u_time: { value: 0 },
-      u_breatheAmp: { value: reducedMotion ? 0 : 0.018 },
+      u_breatheAmp: { value: 0 },
       u_motionAmp: { value: reducedMotion ? 0 : 1 },
       u_intro: { value: reducedMotion ? 1 : 0 },
     }),
@@ -147,7 +134,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
   // Sync reducedMotion -> uniform
   useEffect(() => {
-    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.018;
+    uniforms.u_breatheAmp.value = 0;
     uniforms.u_motionAmp.value = reducedMotion ? 0 : 1;
     if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
@@ -157,7 +144,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
   useEffect(() => {
     introStartRef.current = null;
     uniforms.u_intro.value = reducedMotion ? 1 : 0;
-  }, [buffers, reducedMotion, uniforms]);
+  }, [graphKey, reducedMotion, uniforms]);
 
   // Tick animation uniforms every frame.
   useFrame(({ clock }) => {
@@ -307,12 +294,13 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
     const { nodeCount, colors, sizes, uidToIndex } = buffers;
 
-    // Determine neighbor set of hovered node (for dim-non-neighbors logic)
+    // Determine neighbor set of the active node (for dim-non-neighbors logic)
     const neighborSet = new Set<number>();
-    if (hoveredNodeId && graphInstance) {
-      neighborSet.add(uidToIndex.get(hoveredNodeId) ?? -1);
+    const focusNodeId = hoveredNodeId ?? selectedNodeId;
+    if (focusNodeId && graphInstance) {
+      neighborSet.add(uidToIndex.get(focusNodeId) ?? -1);
       try {
-        graphInstance.neighbors(hoveredNodeId).forEach((n) => {
+        graphInstance.neighbors(focusNodeId).forEach((n) => {
           const idx = uidToIndex.get(n);
           if (idx !== undefined) neighborSet.add(idx);
         });
@@ -332,16 +320,16 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
     if (!colorAttr || !sizeAttr || !highlightAttr) return;
 
-    const dimming = hoveredNodeId !== null;
+    const dimming = focusNodeId !== null;
 
     for (let i = 0; i < nodeCount; i++) {
       const baseR = colors[i * 3];
       const baseG = colors[i * 3 + 1];
       const baseB = colors[i * 3 + 2];
 
-      // Dim factor: 0.15 for non-neighbors when hovering
+      // Dim factor: pull unrelated nodes back when exploring a neighborhood.
       const isNeighbor = !dimming || neighborSet.has(i);
-      const dimFactor = isNeighbor ? 1.0 : 0.15;
+      const dimFactor = isNeighbor ? 1.0 : 0.64;
 
       // Size modifiers
       let sizeMult = 1.0;
