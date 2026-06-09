@@ -170,7 +170,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
       <div
         className={
           detailFocus === "source"
-            ? "rounded border border-blue-500/40 bg-blue-500/5 p-2"
+            ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
             : undefined
         }
       >

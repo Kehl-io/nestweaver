@@ -11,6 +11,7 @@ import {
   Search,
 } from "lucide-react";
 import { api } from "../../api/client";
+import { isSymbolKind } from "../../api/kinds";
 import { useStore } from "../../stores";
 import type { DetailFocus } from "../../stores/graphSlice";
 
@@ -40,26 +41,6 @@ export interface NodeAction {
   run: () => void | Promise<void>;
 }
 
-const SYMBOL_KINDS = new Set([
-  "symbol",
-  "Function",
-  "Class",
-  "Method",
-  "Interface",
-  "Trait",
-  "Enum",
-  "Module",
-  "Extension",
-  "Constant",
-  "Property",
-  "TypeAlias",
-  "Variable",
-]);
-
-function isSymbolLike(kind?: string | null): boolean {
-  return kind != null && SYMBOL_KINDS.has(kind);
-}
-
 function isNoteLike(uid: string, kind?: string | null): boolean {
   return kind === "note" || kind === "Note" || uid.startsWith("note:");
 }
@@ -80,7 +61,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
 
   if (!node) return [];
 
-  const symbol = isSymbolLike(node.kind);
+  const symbol = isSymbolKind(node.kind);
   const note = isNoteLike(node.uid, node.kind);
   const label = nodeLabel(node);
 

@@ -66,10 +66,13 @@ export function ExportMenu({ onClose }: Props) {
       const y = numberAttribute(graph.getNodeAttribute(uid, "y"), 0);
       return { uid, x, y };
     });
-    const minX = Math.min(...positioned.map((node) => node.x));
-    const maxX = Math.max(...positioned.map((node) => node.x));
-    const minY = Math.min(...positioned.map((node) => node.y));
-    const maxY = Math.max(...positioned.map((node) => node.y));
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const node of positioned) {
+      if (node.x < minX) minX = node.x;
+      if (node.x > maxX) maxX = node.x;
+      if (node.y < minY) minY = node.y;
+      if (node.y > maxY) maxY = node.y;
+    }
     const spanX = Math.max(maxX - minX, 1);
     const spanY = Math.max(maxY - minY, 1);
     const scale = Math.min(

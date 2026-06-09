@@ -24,7 +24,7 @@
   --color-graph-label-hover: #111827;
   --color-graph-edge: rgba(107, 114, 128, 0.15);
   --color-graph-dim: #d0d0d0;
-  --color-graph-selection: #2563eb;
+  --color-graph-selection: #0862a7;
 }
 
 :root.dark {
@@ -38,7 +38,7 @@
   --color-graph-label-hover: #f1f5f9;
   --color-graph-edge: rgba(34, 211, 238, 0.12);
   --color-graph-dim: #1a1a2e;
-  --color-graph-selection: #22d3ee;
+  --color-graph-selection: #5ed0fe;
 }
 
 html, body, #root {

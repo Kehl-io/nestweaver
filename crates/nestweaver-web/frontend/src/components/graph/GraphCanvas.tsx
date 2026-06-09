@@ -360,42 +360,36 @@ function useGraphCanvasSize() {
 type ResizeCallback = (entries: ResizeObserverEntry[], observer: ResizeObserver) => void;
 
 class ImmediateResizeObserver implements ResizeObserver {
-  private target: Element | null = null;
+  private inner: ResizeObserver;
+  private callback: ResizeCallback;
   private frame = 0;
-  private timeout = 0;
-  private readonly callback: ResizeCallback;
 
   constructor(callback: ResizeCallback) {
     this.callback = callback;
+    this.inner = new window.ResizeObserver((entries, observer) => {
+      window.cancelAnimationFrame(this.frame);
+      this.frame = window.requestAnimationFrame(() => {
+        this.callback(entries, observer);
+      });
+    });
   }
 
-  observe = (target: Element) => {
-    this.target = target;
-    this.schedule();
-    window.addEventListener("resize", this.schedule);
+  observe = (target: Element, options?: ResizeObserverOptions) => {
+    this.inner.observe(target, options);
+    // Fire immediately so Canvas gets initial size
+    window.cancelAnimationFrame(this.frame);
+    this.frame = window.requestAnimationFrame(() => {
+      this.callback([], this);
+    });
   };
 
   unobserve = (target: Element) => {
-    if (this.target === target) this.target = null;
+    this.inner.unobserve(target);
   };
 
   disconnect = () => {
-    this.target = null;
     window.cancelAnimationFrame(this.frame);
-    window.clearTimeout(this.timeout);
-    window.removeEventListener("resize", this.schedule);
-  };
-
-  private schedule = () => {
-    window.cancelAnimationFrame(this.frame);
-    window.clearTimeout(this.timeout);
-    this.timeout = window.setTimeout(this.emit, 0);
-    this.frame = window.requestAnimationFrame(this.emit);
-  };
-
-  private emit = () => {
-    if (!this.target) return;
-    this.callback([], this);
+    this.inner.disconnect();
   };
 }
 
