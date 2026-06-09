@@ -1,6 +1,7 @@
 use nestweaver_schema::{
     Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
     Tag, Vault,
+    uid::{project_uid, repo_uid, vault_uid},
 };
 use serde_json;
 
@@ -2358,11 +2359,11 @@ impl GraphStore {
         for v in self.list_vaults(None)? {
             if v.instance_id == from {
                 if target_roots.contains(&v.root_path) {
-                    // Target already has a vault for this root — delete
-                    // the source duplicate instead of rewriting it.
                     self.delete_vault_cascade(&v.uid)?;
                 } else {
+                    self.delete_vault_cascade(&v.uid)?;
                     self.upsert_vault(&Vault {
+                        uid: vault_uid(to, &v.root_path),
                         instance_id: to.to_string(),
                         ..v
                     })?;
@@ -2379,6 +2380,7 @@ impl GraphStore {
                     vec![("uid", lbug::Value::String(r.uid.clone()))],
                 )?;
                 self.insert_repo(&Repo {
+                    uid: repo_uid(to, &r.url),
                     instance_id: to.to_string(),
                     ..r
                 })?;
@@ -2388,6 +2390,7 @@ impl GraphStore {
         for p in self.list_projects()? {
             if p.instance_id == from {
                 self.upsert_project(&Project {
+                    uid: project_uid(to, &p.name),
                     instance_id: to.to_string(),
                     ..p
                 })?;
