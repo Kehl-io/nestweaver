@@ -3,6 +3,18 @@ use std::collections::{HashMap, VecDeque};
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+fn is_test_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.contains("/playwright/")
+        || p.contains("/__tests__/")
+        || p.contains("/test/")
+        || p.contains("/tests/")
+        || p.contains("/e2e/")
+        || p.contains("/fixtures/")
+        || p.contains(".test.")
+        || p.contains(".spec.")
+}
+
 /// Cached result of a full symbol table scan, keyed on `graph_generation`.
 ///
 /// Stored in `GraphStore::symbol_name_cache` to avoid repeated full-table
@@ -299,17 +311,36 @@ impl GraphStore {
             }
         };
 
-        // --- Step 3: filter the in-memory list ------------------------------
-        let mut matches = Vec::new();
+        // --- Step 3: filter and rank the in-memory list ----------------------
+        // Collect all substring matches, rank by name quality and path, then
+        // take the top `limit`. This prevents test/playwright files from
+        // dominating when a PascalCase name also appears in production code.
+        let mut matches: Vec<(u8, &nestweaver_schema::Symbol)> = Vec::new();
         for (lower, sym) in &entry.symbols {
-            if lower.contains(&needle) {
-                matches.push(sym.clone());
-                if matches.len() >= limit {
-                    break;
-                }
+            if !lower.contains(&needle) {
+                continue;
             }
+            let name_rank = if *lower == needle {
+                0 // exact
+            } else if lower.starts_with(&needle) {
+                1 // prefix
+            } else {
+                2 // contains
+            };
+            let path_rank = if is_test_path(&sym.file_path) {
+                1u8
+            } else {
+                0u8
+            };
+            let rank = name_rank * 2 + path_rank;
+            matches.push((rank, sym));
         }
-        Ok(matches)
+        matches.sort_by_key(|(rank, _)| *rank);
+        Ok(matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, sym)| sym.clone())
+            .collect())
     }
 }
 
