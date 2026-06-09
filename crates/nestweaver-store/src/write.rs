@@ -2362,16 +2362,11 @@ impl GraphStore {
                     self.delete_vault_cascade(&v.uid)?;
                 } else {
                     let new_uid = vault_uid(to, &v.root_path);
-                    // Delete the old vault row and insert with corrected UID.
-                    // Notes still reference the old vault_uid; a subsequent
-                    // `brain add` reindexes the vault and fixes them.
-                    let conn = self.conn()?;
-                    let _ = exec_params(
-                        &conn,
-                        "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
-                        vec![("uid", lbug::Value::String(v.uid.clone()))],
-                    );
-                    drop(conn);
+                    // Cascade-delete the old vault (and its notes/sections/
+                    // headings) so no orphans survive, then insert the vault
+                    // row with the corrected UID. The next `brain add` will
+                    // re-populate the notes from disk.
+                    self.delete_vault_cascade(&v.uid)?;
                     self.insert_vault(&Vault {
                         uid: new_uid,
                         instance_id: to.to_string(),
