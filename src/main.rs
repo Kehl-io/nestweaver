@@ -6748,6 +6748,37 @@ fn run_brain(
 
         BrainCommands::ReindexSearch { db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                if let Ok(mut client) = connect {
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .reindex_search(nestweaver_proto::ReindexSearchRequest {})
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let sidecar = tantivy_sidecar_path_for(&db_path);
+                            println!(
+                                "Tantivy reindex complete: {} document(s) at {} (via daemon)",
+                                resp.document_count,
+                                sidecar.display()
+                            );
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        Err(status) => {
+                            eprintln!(
+                                "warning: daemon reindex RPC failed ({}); falling back to direct mode",
+                                status.message()
+                            );
+                        }
+                    }
+                }
+            }
+
             let sidecar = tantivy_sidecar_path_for(&db_path);
             let store = open_store(Some(&db_path))?;
             let idx = TantivyIndex::open_or_create(&sidecar)
