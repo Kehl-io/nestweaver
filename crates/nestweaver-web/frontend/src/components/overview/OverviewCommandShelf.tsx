@@ -1,3 +1,4 @@
+import { isSymbolKind } from "../../api/kinds";
 import type { OverviewLandmark, OverviewResponse } from "../../api/types";
 import { useStore } from "../../stores";
 
@@ -8,24 +9,8 @@ interface OverviewCommandShelfProps {
   reload: () => void;
 }
 
-const SYMBOL_KINDS = new Set([
-  "symbol",
-  "Function",
-  "Class",
-  "Method",
-  "Interface",
-  "Trait",
-  "Enum",
-  "Module",
-  "Extension",
-  "Constant",
-  "Property",
-  "TypeAlias",
-  "Variable",
-]);
-
 function isSymbolLandmark(item: OverviewLandmark | null): boolean {
-  return item != null && SYMBOL_KINDS.has(item.kind);
+  return item != null && isSymbolKind(item.kind);
 }
 
 function canExploreLandmark(item: OverviewLandmark | null): boolean {
@@ -82,7 +67,7 @@ export function OverviewCommandShelf({
 }: OverviewCommandShelfProps) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
 
@@ -102,9 +87,7 @@ export function OverviewCommandShelf({
 
   const exploreTarget = () => {
     if (!exploreActionTarget) return;
-    selectNode(exploreActionTarget.uid, exploreActionTarget.kind);
-    setSeeds([exploreActionTarget.uid]);
-    setGraphMode("local");
+    exploreNode(exploreActionTarget.uid, exploreActionTarget.kind);
   };
 
   const impactTarget = () => {

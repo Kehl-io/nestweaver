@@ -15,9 +15,8 @@ import {
   Sparkles,
   Tags,
 } from "lucide-react";
-import { api } from "../../api/client";
+import { api, loadGapItems } from "../../api/client";
 import type { ScopeFilter } from "../../api/types";
-import type { GapItem } from "../../stores/analysisSlice";
 import { useStore } from "../../stores";
 import { ExportMenu } from "../export/ExportMenu";
 import { ForceControls } from "./ForceControls";
@@ -92,24 +91,6 @@ function MenuButton({
       {children}
     </button>
   );
-}
-
-async function loadGapItems(): Promise<GapItem[]> {
-  const report = await api.gaps();
-  return [
-    ...report.undocumented.map((m) => ({
-      type: "undocumented" as const,
-      label: m.module,
-      detail: `${m.symbol_count} symbols with no documentation`,
-      nodeUids: [] as string[],
-    })),
-    ...report.untested.map((uid) => ({
-      type: "untested" as const,
-      label: uid.split(":").pop() || uid,
-      detail: "Entry point with no test coverage",
-      nodeUids: [uid],
-    })),
-  ];
 }
 
 export function ControlDock() {

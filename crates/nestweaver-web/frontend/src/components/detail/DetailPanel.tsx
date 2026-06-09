@@ -1,3 +1,4 @@
+import { isSymbolKind } from "../../api/kinds";
 import { useStore } from "../../stores";
 import { GlassPanel } from "../panels/GlassPanel";
 import { DiffDetail } from "./DiffDetail";
@@ -8,22 +9,6 @@ import { NoteDetail } from "./NoteDetail";
 import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
-
-const SYMBOL_KINDS = new Set([
-  "symbol",
-  "Function",
-  "Class",
-  "Method",
-  "Interface",
-  "Trait",
-  "Enum",
-  "Module",
-  "Extension",
-  "Constant",
-  "Property",
-  "TypeAlias",
-  "Variable",
-]);
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -75,7 +60,7 @@ export function DetailPanel() {
 
   const isSymbol =
     selectedNodeId.startsWith("sym:") ||
-    (selectedNodeKind != null && SYMBOL_KINDS.has(selectedNodeKind));
+    isSymbolKind(selectedNodeKind);
   const isNote =
     selectedNodeId.startsWith("note:") ||
     selectedNodeKind === "note" ||
