@@ -17,7 +17,7 @@ import { useStore } from "./stores";
 
 function ResizeHandle() {
   return (
-    <Separator className="w-1 bg-[var(--color-border)] hover:bg-blue-500 transition-colors cursor-col-resize" />
+    <Separator className="w-1 cursor-col-resize bg-[var(--color-border)] transition-colors hover:bg-[var(--color-graph-selection)]" />
   );
 }
 
@@ -29,6 +29,7 @@ function AppContent() {
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
 
   // Responsive breakpoint detection
   const [width, setWidth] = useState(window.innerWidth);
@@ -72,7 +73,7 @@ function AppContent() {
   );
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="flex h-full flex-col overflow-hidden">
       <TopBar />
       {isZen ? (
         // Zen mode: graph takes full area, detail floats
@@ -80,27 +81,28 @@ function AppContent() {
           <ErrorBoundary>
             {graphView}
           </ErrorBoundary>
-          {/* Floating detail panel */}
-          <div
-            style={{
-              position: "fixed",
-              bottom: "48px",
-              right: "16px",
-              width: "300px",
-              maxHeight: "60vh",
-              overflowY: "auto",
-              background: "var(--color-surface)",
-              opacity: 0.95,
-              borderRadius: "12px",
-              border: "1px solid var(--color-border)",
-              boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
-              zIndex: 50,
-            }}
-          >
-            <ErrorBoundary>
-              <DetailPanel />
-            </ErrorBoundary>
-          </div>
+          {selectedNodeId && (
+            <div
+              style={{
+                position: "fixed",
+                bottom: "24px",
+                right: "16px",
+                width: "320px",
+                maxHeight: "58vh",
+                overflowY: "auto",
+                background: "var(--color-surface)",
+                opacity: 0.96,
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                boxShadow: "0 10px 30px rgba(15,23,42,0.14)",
+                zIndex: 50,
+              }}
+            >
+              <ErrorBoundary>
+                <DetailPanel />
+              </ErrorBoundary>
+            </div>
+          )}
         </div>
       ) : (
         // Normal / responsive layout
@@ -112,7 +114,7 @@ function AppContent() {
             <>
               <Panel
                 id="explorer"
-                defaultSize="20%"
+                defaultSize="18%"
                 minSize="180px"
                 maxSize="35%"
                 collapsible
@@ -122,7 +124,7 @@ function AppContent() {
               <ResizeHandle />
             </>
           )}
-          <Panel id="graph" defaultSize={hideExplorer ? "75%" : "55%"} minSize="30%">
+          <Panel id="graph" defaultSize={hideExplorer ? "78%" : "62%"} minSize="36%">
             <ErrorBoundary>
               {graphView}
             </ErrorBoundary>
@@ -132,7 +134,7 @@ function AppContent() {
               <ResizeHandle />
               <Panel
                 id="detail"
-                defaultSize="25%"
+                defaultSize="20%"
                 minSize="180px"
                 maxSize="40%"
                 collapsible

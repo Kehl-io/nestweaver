@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useDebouncedCallback } from "use-debounce";
 import { api } from "../api/client";
@@ -27,7 +27,7 @@ function ThemeToggle() {
     <button
       onClick={() => setTheme(THEME_CYCLE[theme])}
       title={`Theme: ${theme} (click to cycle)`}
-      className="flex h-8 w-8 items-center justify-center rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] text-sm hover:bg-[var(--color-border)]"
+      className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] text-sm hover:bg-[var(--color-border)]"
     >
       {THEME_ICONS[theme]}
     </button>
@@ -90,6 +90,25 @@ export function TopBar() {
     { enableOnFormTags: false },
   );
 
+  useEffect(() => {
+    function handleGlobalSearchFocus(event: KeyboardEvent) {
+      if (event.key !== "/") return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      event.preventDefault();
+      inputRef.current?.focus();
+    }
+
+    window.addEventListener("keydown", handleGlobalSearchFocus);
+    return () => window.removeEventListener("keydown", handleGlobalSearchFocus);
+  }, []);
+
   useHotkeys(
     "escape",
     () => {
@@ -100,16 +119,21 @@ export function TopBar() {
   );
 
   return (
-    <header data-testid="top-bar" className="flex h-12 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-4">
+    <header data-testid="top-bar" className="sticky top-0 z-50 flex h-12 shrink-0 items-center gap-2 overflow-hidden border-b border-[var(--color-border)] bg-[var(--color-surface)] px-2 sm:gap-3 sm:px-4">
+      <img
+        src="/favicon.svg"
+        alt="NestWeaver"
+        className="h-8 w-8 shrink-0 sm:hidden"
+      />
       <img
         src={theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches)
           ? "/logo-horizontal-dark.svg"
           : "/logo-horizontal-light.svg"}
         alt="NestWeaver"
-        className="h-8"
+        className="hidden h-8 shrink-0 sm:block"
       />
 
-      <div className="relative flex-1 max-w-md">
+      <div className="relative min-w-0 flex-1 sm:max-w-md">
         <input
           data-testid="search-input"
           ref={inputRef}
@@ -119,8 +143,8 @@ export function TopBar() {
           onFocus={() => {
             if (searchQuery.trim()) setSearchOpen(true);
           }}
-          placeholder='Search symbols & notes  (press "/")'
-          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-1.5 text-sm outline-none focus:border-blue-500"
+          placeholder="Search"
+          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-sm outline-none focus:border-[var(--color-graph-selection)] sm:px-3"
         />
         {searchOpen && <SearchDropdown onSelect={handleSelect} />}
       </div>
@@ -128,7 +152,7 @@ export function TopBar() {
       <select
         value={scopeFilter}
         onChange={(e) => setScopeFilter(e.target.value as ScopeFilter)}
-        className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-xs outline-none"
+        className="w-[5.75rem] shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-xs outline-none"
       >
         <option value="all">All</option>
         <option value="code_only">Code only</option>
