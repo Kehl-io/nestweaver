@@ -16,6 +16,8 @@ export function NodeLabels({ buffers }: Props) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const hoveredNodeId = useStore((s) => s.hoveredNodeId);
   const cameraZoom = useStore((s) => s.cameraZoom);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const focusMap = layoutMode === "zen";
 
   // Compute median size for filtering at medium zoom
   const medianSize = useMemo(() => {
@@ -37,18 +39,35 @@ export function NodeLabels({ buffers }: Props) {
     y: number;
     size: number;
     isSeed: boolean;
+    forceLabel: boolean;
     isSelected: boolean;
     isHovered: boolean;
   }> = [];
+  let centerX = 0;
+  let centerY = 0;
+  for (let i = 0; i < buffers.nodeCount; i++) {
+    centerX += buffers.positions[i * 3];
+    centerY += buffers.positions[i * 3 + 1];
+  }
+  centerX /= buffers.nodeCount;
+  centerY /= buffers.nodeCount;
 
   graphInstance.forEachNode((uid, attrs) => {
     const idx = buffers.uidToIndex.get(uid);
     if (idx === undefined) return;
 
     const isSeed = attrs.isSeed === true;
+    const forceLabel = attrs.forceLabel === true || isSeed;
     const isSelected = uid === selectedNodeId;
     const isHovered = uid === hoveredNodeId;
     const size = buffers.sizes[idx] || 6;
+
+    const activeNodeId = hoveredNodeId ?? selectedNodeId;
+    const isRelatedToActive =
+      activeNodeId != null &&
+      graphInstance.hasNode(activeNodeId) &&
+      graphInstance.hasNode(uid) &&
+      (uid === activeNodeId || graphInstance.hasEdge(activeNodeId, uid) || graphInstance.hasEdge(uid, activeNodeId));
 
     // Zoom-aware visibility:
     // - Zoomed in (z < 300): show all labels
@@ -56,22 +75,43 @@ export function NodeLabels({ buffers }: Props) {
     // - Zoomed out (z > 600): show only seed labels
     // Selected/hovered are always visible regardless of zoom
     if (!isSelected && !isHovered) {
-      if (cameraZoom > 600 && !isSeed) return;
-      if (cameraZoom >= 300 && cameraZoom <= 600 && size <= medianSize && !isSeed) return;
+      if (focusMap && activeNodeId && !isRelatedToActive && !forceLabel) return;
+      if (focusMap && !activeNodeId && !forceLabel && size <= medianSize) return;
+      if (cameraZoom > 600 && !forceLabel) return;
+      if (cameraZoom >= 300 && cameraZoom <= 600 && size <= medianSize && !forceLabel) return;
     }
 
     const rawLabel = (attrs.label as string) || uid.split(":").pop() || uid;
     const label = truncateLabel(rawLabel);
     const x = buffers.positions[idx * 3];
     const y = buffers.positions[idx * 3 + 1];
+    const radialX = x - centerX;
+    const radialY = y - centerY;
+    const radialLength = Math.hypot(radialX, radialY);
+    const labelOffset = size * 0.95 + 8;
+    const horizontalSpoke =
+      radialLength > 1 && Math.abs(radialX) > Math.abs(radialY) * 1.25;
+    const verticalDirection =
+      Math.abs(radialY) > 1 ? Math.sign(radialY) : -1;
+    const labelX =
+      radialLength > 1 && !horizontalSpoke
+        ? x + (radialX / radialLength) * labelOffset
+        : x;
+    const labelY =
+      radialLength > 1
+        ? horizontalSpoke
+          ? y + verticalDirection * labelOffset
+          : y + (radialY / radialLength) * labelOffset
+        : y - size - 2;
 
     labelNodes.push({
       uid,
       label,
-      x,
-      y: y - size - 2,
+      x: labelX,
+      y: labelY,
       size,
       isSeed,
+      forceLabel,
       isSelected,
       isHovered,
     });
@@ -89,13 +129,12 @@ export function NodeLabels({ buffers }: Props) {
             key={node.uid}
             position={[node.x, node.y, 0]}
             center
-            occlude
             style={{
               pointerEvents: "none",
               userSelect: "none",
               whiteSpace: "nowrap",
             }}
-            zIndexRange={[100, 0]}
+            zIndexRange={[18, 0]}
           >
             <div
               className={`graph-node-label ${
@@ -104,7 +143,7 @@ export function NodeLabels({ buffers }: Props) {
                   : node.isHovered
                     ? "graph-node-label-hovered"
                     : ""
-              }`}
+              } ${focusMap ? "graph-node-label-focus" : ""}`}
               style={{
                 fontSize: `${baseFontSize}px`,
                 fontWeight: isHighlighted ? 700 : 560,

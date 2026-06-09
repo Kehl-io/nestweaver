@@ -5,6 +5,7 @@ import {
   type APIResponse,
   type Page,
 } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 import type { OverviewLandmark, OverviewResponse } from "../src/api/types";
 
 async function waitForOk(
@@ -57,7 +58,7 @@ async function fetchOverview(
 function displayedStartHereItems(
   overview: OverviewResponse,
 ): OverviewLandmark[] {
-  return overview.start_here.slice(0, 7);
+  return overview.start_here.slice(0, 2);
 }
 
 function emptyOverview(): OverviewResponse {
@@ -80,34 +81,56 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function openOverview(page: Page) {
+async function openOverview(
+  page: Page,
+  options: { panels?: boolean } = {},
+) {
   await page.goto("/");
 
   const graphContainer = page.locator('[data-testid="graph-panel"]');
   await expect(graphContainer).toBeVisible({ timeout: 15_000 });
+
+  const dock = page.getByTestId("control-dock");
+  await expect(dock).toBeVisible();
+
+  if (!options.panels) {
+    await expect(
+      page.getByRole("region", { name: "Start Here" }),
+    ).toHaveCount(0);
+    return;
+  }
+
+  await dock.getByRole("button", { name: "View" }).click();
+  await dock.getByRole("button", { name: "Focus Map" }).click();
 
   const overviewMode = page.getByRole("button", {
     name: "Overview",
     exact: true,
   });
   await expect(overviewMode).toBeVisible();
-  await expect(overviewMode).toHaveClass(/border-blue-500/);
+  await expect(overviewMode).toHaveClass(
+    /border-\[var\(--color-graph-selection\)\]/,
+  );
 }
 
 test.describe("Graph Explorer", () => {
-  test("graph panel renders with nodes", async ({ page, request }) => {
+  test("first open renders Focus Map by default", async ({ page, request }) => {
     await fetchOverview(request);
     await openOverview(page);
+    await expect(page.getByTestId("control-dock")).toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "Start Here" }),
+    ).toHaveCount(0);
   });
 
-  test("first open shows overview mode with Start Here and context", async ({
+  test("panel overview shows Start Here without an idle context card", async ({
     page,
     request,
   }) => {
     const overview = await fetchOverview(request);
     const visibleItems = displayedStartHereItems(overview);
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(startHere).toBeVisible({ timeout: 15_000 });
@@ -115,7 +138,7 @@ test.describe("Graph Explorer", () => {
       startHere.getByText(`${overview.start_here.length} entry points`),
     ).toBeVisible();
 
-    for (const item of visibleItems.slice(0, 3)) {
+    for (const item of visibleItems) {
       await expect(
         startHere.getByText(item.label, { exact: true }),
       ).toBeVisible();
@@ -124,18 +147,9 @@ test.describe("Graph Explorer", () => {
       await expect(startHere.getByText("No entry points found.")).toBeVisible();
     }
 
-    const contextSurface = page.getByRole("complementary", {
-      name: "Overview context",
-    });
-    await expect(contextSurface).toBeVisible();
     await expect(
-      contextSurface.getByRole("heading", { name: "Overview Map" }),
-    ).toBeVisible();
-    await expect(
-      contextSurface.getByText(`${overview.landmarks.length} landmarks`),
-    ).toBeVisible();
-    await expect(contextSurface.getByText("Repos")).toBeVisible();
-    await expect(contextSurface.getByText("Symbols")).toBeVisible();
+      page.getByRole("complementary", { name: "Overview context" }),
+    ).toHaveCount(0);
   });
 
   test("clicking a Start Here item updates overview context", async ({
@@ -150,7 +164,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(
@@ -193,7 +207,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     await page.getByTestId("search-input").fill(firstSymbol.name);
     const results = page.getByRole("listbox", { name: "Search results" });
@@ -207,7 +221,7 @@ test.describe("Graph Explorer", () => {
 
     await expect(
       page.getByRole("button", { name: "Context", exact: true }),
-    ).toHaveClass(/border-blue-500/);
+    ).toHaveClass(/border-\[var\(--color-graph-selection\)\]/);
     await postOk(request, "/api/v1/context", {
       seeds: [firstSymbol.uid],
       limit: 50,
@@ -226,7 +240,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await startHere
@@ -260,7 +274,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
     await page.getByTestId("search-input").fill(firstSymbol.name);
 
     const option = page
@@ -273,11 +287,11 @@ test.describe("Graph Explorer", () => {
 
     await expect(
       page.getByRole("button", { name: "Context", exact: true }),
-    ).toHaveClass(/border-blue-500/);
+    ).toHaveClass(/border-\[var\(--color-graph-selection\)\]/);
   });
 
   test("grouped controls switch to list and matrix views", async ({ page }) => {
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const dock = page.getByTestId("control-dock");
 
@@ -296,8 +310,43 @@ test.describe("Graph Explorer", () => {
     await expect(page.getByLabel("Scope")).toBeVisible();
   });
 
-  test("ranked table sorts and selects nodes", async ({ page }) => {
+  test("export menu downloads current graph as PNG, SVG, and HTML", async ({
+    page,
+  }, testInfo) => {
     await openOverview(page);
+    await expect(page.locator("canvas").first()).toBeVisible();
+    await expect(page.getByText("js", { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
+
+    async function downloadExport(label: RegExp, extension: string) {
+      const dock = page.getByTestId("control-dock");
+      await dock.getByRole("button", { name: "Export" }).click();
+      const downloadPromise = page.waitForEvent("download");
+      await dock.getByRole("button", { name: label }).click();
+      const download = await downloadPromise;
+      const outputPath = testInfo.outputPath(`nestweaver-graph.${extension}`);
+      await download.saveAs(outputPath);
+      return readFile(outputPath);
+    }
+
+    const png = await downloadExport(/PNG/, "png");
+    expect(png.length).toBeGreaterThan(1000);
+    expect(Array.from(png.subarray(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
+
+    const svg = (await downloadExport(/SVG/, "svg")).toString("utf8");
+    expect(svg).toContain("<svg");
+    expect((svg.match(/<circle\b/g) ?? []).length).toBeGreaterThan(0);
+    expect((svg.match(/<line\b/g) ?? []).length).toBeGreaterThan(0);
+
+    const html = (await downloadExport(/HTML/, "html")).toString("utf8");
+    expect(html).toContain("<!DOCTYPE html>");
+    expect(html).toMatch(/const nodes = \[\{/);
+    expect(html).toContain("const edges = [");
+  });
+
+  test("ranked table sorts and selects nodes", async ({ page }) => {
+    await openOverview(page, { panels: true });
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "View" }).click();
@@ -317,7 +366,7 @@ test.describe("Graph Explorer", () => {
   test("matrix view renders bounded nodes and row selection", async ({
     page,
   }) => {
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "View" }).click();
@@ -336,7 +385,7 @@ test.describe("Graph Explorer", () => {
       await route.fulfill({ json: emptyOverview() });
     });
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(startHere.getByText("No indexed content")).toBeVisible();
@@ -350,15 +399,9 @@ test.describe("Graph Explorer", () => {
       startHere.getByRole("button", { name: "Retry overview" }),
     ).toBeVisible();
 
-    const contextSurface = page.getByRole("complementary", {
-      name: "Overview context",
-    });
     await expect(
-      contextSurface.getByText("No indexed content is available yet."),
-    ).toBeVisible();
-    await expect(
-      contextSurface.getByRole("button", { name: "Retry overview" }),
-    ).toBeVisible();
+      page.getByRole("complementary", { name: "Overview context" }),
+    ).toHaveCount(0);
   });
 
   test("repo and service Start Here items do not enable Impact", async ({
@@ -378,7 +421,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page);
+    await openOverview(page, { panels: true });
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await startHere

@@ -106,7 +106,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               Open structural gap analysis
             </span>
           </span>
-          <span className="text-xs text-blue-600">Run</span>
+          <span className="text-xs text-[var(--color-graph-selection)]">Run</span>
         </button>
       )}
 
@@ -123,7 +123,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               Use the top symbol result
             </span>
           </span>
-          <span className="text-xs text-blue-600">Analyze</span>
+          <span className="text-xs text-[var(--color-graph-selection)]">Analyze</span>
         </button>
       )}
 
@@ -140,7 +140,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               {askText}
             </span>
           </span>
-          <span className="text-xs text-blue-600">Open</span>
+          <span className="text-xs text-[var(--color-graph-selection)]">Open</span>
         </button>
       )}
 

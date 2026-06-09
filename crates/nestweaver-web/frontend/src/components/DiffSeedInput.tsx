@@ -34,12 +34,12 @@ export function DiffSeedInput() {
           onChange={(e) => setSeedsB(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
           placeholder="Comma-separated seeds..."
-          className="flex-1 h-8 px-2 text-sm border border-[var(--color-border)] rounded bg-[var(--color-surface)] outline-none focus:ring-2 focus:ring-blue-500"
+          className="flex-1 h-8 px-2 text-sm border border-[var(--color-border)] rounded bg-[var(--color-surface)] outline-none focus:ring-2 focus:ring-[var(--color-graph-selection)]"
           autoFocus
         />
         <button
           onClick={handleSubmit}
-          className="h-8 px-3 text-xs bg-blue-500 text-white rounded hover:bg-blue-600"
+          className="h-8 px-3 text-xs bg-[var(--color-graph-selection)] text-white rounded opacity-90 hover:opacity-100"
         >
           Compare
         </button>

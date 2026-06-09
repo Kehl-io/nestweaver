@@ -44,7 +44,7 @@ function DockButton({ label, icon, active, onClick }: DockButtonProps) {
       aria-pressed={active}
       className={`flex h-9 w-9 items-center justify-center rounded border transition-colors ${
         active
-          ? "border-blue-300 bg-blue-100 text-blue-700"
+          ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
           : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)]"
       }`}
     >
@@ -85,7 +85,7 @@ function MenuButton({
       onClick={onClick}
       className={`inline-flex h-8 items-center gap-1.5 rounded border px-2 text-xs font-medium transition-colors ${
         active
-          ? "border-blue-300 bg-blue-100 text-blue-700"
+          ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
           : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)]"
       }`}
     >
@@ -160,7 +160,7 @@ export function ControlDock() {
   return (
     <div
       data-testid="control-dock"
-      className="absolute right-2 top-2 z-20 flex flex-col gap-1.5"
+      className="absolute right-2 top-2 z-50 flex flex-col gap-1.5"
     >
       <div className="relative">
         <DockButton
@@ -192,7 +192,7 @@ export function ControlDock() {
                 active={layoutMode === "zen"}
                 onClick={() => setLayoutMode(layoutMode === "zen" ? "panels" : "zen")}
               >
-                <Maximize className="h-3.5 w-3.5" /> Zen
+                <Maximize className="h-3.5 w-3.5" /> Focus Map
               </MenuButton>
             </div>
           </MenuPanel>

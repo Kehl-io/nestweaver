@@ -171,8 +171,8 @@ export function GraphMatrixView() {
                     onClick={() => selectNode(row.uid, row.kind)}
                     className={`flex w-full items-center gap-1.5 truncate ${
                       selectedNodeId === row.uid
-                        ? "text-blue-600"
-                        : "text-[var(--color-text)] hover:text-blue-600"
+                        ? "text-[var(--color-graph-selection)]"
+                        : "text-[var(--color-text)] hover:text-[var(--color-graph-selection)]"
                     }`}
                     title={row.name}
                   >

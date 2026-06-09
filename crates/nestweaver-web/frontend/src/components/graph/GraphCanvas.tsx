@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, useEffect } from "react";
+import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { EffectComposer, Bloom } from "@react-three/postprocessing";
@@ -218,13 +218,197 @@ function CameraFocusController({ buffers }: { buffers: GraphBuffers }) {
   return null;
 }
 
+function CameraFitController({
+  buffers,
+  canvasSize,
+}: {
+  buffers: GraphBuffers;
+  canvasSize: { width: number; height: number };
+}) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls);
+  const graphKey = useMemo(
+    () => buffers.indexToUid.join("\u0000"),
+    [buffers.indexToUid],
+  );
+  const fittedKeyRef = useRef("");
+
+  useEffect(() => {
+    if (buffers.nodeCount === 0 || !controls) return;
+    if (canvasSize.width <= 0 || canvasSize.height <= 0) return;
+    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}`;
+    if (fittedKeyRef.current === fitKey) return;
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+
+    for (let i = 0; i < buffers.nodeCount; i++) {
+      const x = buffers.positions[i * 3];
+      const y = buffers.positions[i * 3 + 1];
+      const radius = (buffers.sizes[i] || 6) * 1.6 + 28;
+      minX = Math.min(minX, x - radius);
+      maxX = Math.max(maxX, x + radius);
+      minY = Math.min(minY, y - radius);
+      maxY = Math.max(maxY, y + radius);
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const boundsWidth = Math.max(1, maxX - minX);
+    const boundsHeight = Math.max(1, maxY - minY);
+    const aspect = canvasSize.width / canvasSize.height;
+    const perspective = camera as typeof camera & { fov?: number };
+    const fov = ((perspective.fov ?? 50) * Math.PI) / 180;
+    const fitHeightZ = boundsHeight / (2 * Math.tan(fov / 2));
+    const fitWidthZ = boundsWidth / (2 * Math.tan(fov / 2) * aspect);
+    const z = Math.min(900, Math.max(300, Math.max(fitHeightZ, fitWidthZ) * 1.2));
+
+    camera.position.set(centerX, centerY, z);
+    (controls as any).target.set(centerX, centerY, 0);
+    (controls as any).update?.();
+    fittedKeyRef.current = fitKey;
+  }, [buffers, canvasSize.height, canvasSize.width, camera, controls, graphKey]);
+
+  return null;
+}
+
+function CanvasSizeBridge({ pixelRatio }: { pixelRatio: number }) {
+  const gl = useThree((s) => s.gl);
+  const setSize = useThree((s) => s.setSize);
+  const setDpr = useThree((s) => s.setDpr);
+
+  useEffect(() => {
+    const target = gl.domElement.parentElement;
+    if (!target) return;
+
+    let frame = 0;
+    const updateSize = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const rect = target.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        setDpr(pixelRatio);
+        setSize(rect.width, rect.height);
+        gl.setPixelRatio(pixelRatio);
+        gl.setSize(rect.width, rect.height, false);
+      });
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(target);
+    window.addEventListener("resize", updateSize);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", updateSize);
+    };
+  }, [gl, pixelRatio, setDpr, setSize]);
+
+  return null;
+}
+
+function useGraphCanvasSize() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    let frame = 0;
+    let timeout = 0;
+    const readSize = () => {
+      const rect = el.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (width <= 0 || height <= 0) return;
+      setSize((prev) =>
+        prev.width === width && prev.height === height
+          ? prev
+          : { width, height },
+      );
+    };
+
+    const update = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(readSize);
+    };
+
+    readSize();
+    timeout = window.setTimeout(readSize, 0);
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    window.addEventListener("resize", update);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
+  return { ref, size };
+}
+
+type ResizeCallback = (entries: ResizeObserverEntry[], observer: ResizeObserver) => void;
+
+class ImmediateResizeObserver implements ResizeObserver {
+  private target: Element | null = null;
+  private frame = 0;
+  private timeout = 0;
+  private readonly callback: ResizeCallback;
+
+  constructor(callback: ResizeCallback) {
+    this.callback = callback;
+  }
+
+  observe = (target: Element) => {
+    this.target = target;
+    this.schedule();
+    window.addEventListener("resize", this.schedule);
+  };
+
+  unobserve = (target: Element) => {
+    if (this.target === target) this.target = null;
+  };
+
+  disconnect = () => {
+    this.target = null;
+    window.cancelAnimationFrame(this.frame);
+    window.clearTimeout(this.timeout);
+    window.removeEventListener("resize", this.schedule);
+  };
+
+  private schedule = () => {
+    window.cancelAnimationFrame(this.frame);
+    window.clearTimeout(this.timeout);
+    this.timeout = window.setTimeout(this.emit, 0);
+    this.frame = window.requestAnimationFrame(this.emit);
+  };
+
+  private emit = () => {
+    if (!this.target) return;
+    this.callback([], this);
+  };
+}
+
 // ---- Main canvas ----
 
 export function GraphCanvas() {
   const buffers = useGraphBridge();
   const theme = useStore((s) => s.theme);
   const reducedEffectsToggle = useStore((s) => s.reducedEffects);
+  const layoutMode = useStore((s) => s.layoutMode);
   const reducedMotion = useReducedMotion() || reducedEffectsToggle;
+  const focusMap = layoutMode === "zen";
+  const { ref: shellRef, size: canvasSize } = useGraphCanvasSize();
 
   // Determine background color from theme
   const isDark =
@@ -237,46 +421,68 @@ export function GraphCanvas() {
     typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
   return (
-    <Canvas
-      camera={{ position: [0, 0, 500], fov: 50, near: 0.1, far: 10000 }}
-      dpr={[1, pixelRatio]}
-      style={{ width: "100%", height: "100%" }}
-      gl={{ antialias: true, alpha: false, powerPreference: "high-performance" }}
-    >
-      <color attach="background" args={[bgColor]} />
-      <ambientLight intensity={1} />
-      <CameraZoomBridge />
-      {buffers.nodeCount > 0 && (
-        <>
-          <CommunityOverlay />
-          <EdgeInstanceMesh buffers={buffers} />
-          {!reducedMotion && <EdgeParticles buffers={buffers} />}
-          <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
-          <NodeLabels buffers={buffers} />
-        </>
+    <div ref={shellRef} className="graph-canvas-shell relative h-full w-full overflow-hidden">
+      {canvasSize.width > 0 && canvasSize.height > 0 && (
+        <div
+          className="h-full w-full"
+          style={{ width: canvasSize.width, height: canvasSize.height }}
+        >
+          <Canvas
+            camera={{ position: [0, 0, 500], fov: 50, near: 0.1, far: 10000 }}
+            dpr={[1, pixelRatio]}
+            resize={{
+              offsetSize: true,
+              polyfill: ImmediateResizeObserver,
+              scroll: false,
+              debounce: { resize: 0, scroll: 50 },
+            }}
+            style={{ width: "100%", height: "100%" }}
+            gl={{
+              antialias: true,
+              alpha: false,
+              powerPreference: "high-performance",
+              preserveDrawingBuffer: true,
+            }}
+          >
+            <color attach="background" args={[bgColor]} />
+            <ambientLight intensity={1} />
+            <CanvasSizeBridge pixelRatio={pixelRatio} />
+            <CameraZoomBridge />
+            <CameraFitController buffers={buffers} canvasSize={canvasSize} />
+            {buffers.nodeCount > 0 && (
+              <>
+                <CommunityOverlay />
+                <EdgeInstanceMesh buffers={buffers} />
+                {!reducedMotion && !focusMap && <EdgeParticles buffers={buffers} />}
+                <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
+                <NodeLabels buffers={buffers} />
+              </>
+            )}
+            <GraphInteraction buffers={buffers} />
+            <CameraFocusController buffers={buffers} />
+            <OrbitControls
+              makeDefault
+              enableRotate={false}
+              enableDamping
+              dampingFactor={0.1}
+              minZoom={0.1}
+              maxZoom={100}
+              mouseButtons={{ LEFT: 0, MIDDLE: 2, RIGHT: 2 }}
+            />
+            {/* Bloom post-processing — skipped when reduced motion is active */}
+            {!reducedMotion && !focusMap && (
+              <EffectComposer>
+                <Bloom
+                  luminanceThreshold={0.82}
+                  luminanceSmoothing={0.24}
+                  intensity={0.38}
+                  radius={0.28}
+                />
+              </EffectComposer>
+            )}
+          </Canvas>
+        </div>
       )}
-      <GraphInteraction buffers={buffers} />
-      <CameraFocusController buffers={buffers} />
-      <OrbitControls
-        makeDefault
-        enableRotate={false}
-        enableDamping
-        dampingFactor={0.1}
-        minZoom={0.1}
-        maxZoom={100}
-        mouseButtons={{ LEFT: 0, MIDDLE: 2, RIGHT: 2 }}
-      />
-      {/* Bloom post-processing — skipped when reduced motion is active */}
-      {!reducedMotion && (
-        <EffectComposer>
-          <Bloom
-            luminanceThreshold={0.82}
-            luminanceSmoothing={0.24}
-            intensity={0.38}
-            radius={0.28}
-          />
-        </EffectComposer>
-      )}
-    </Canvas>
+    </div>
   );
 }

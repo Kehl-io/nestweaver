@@ -79,7 +79,7 @@ export const createGraphSlice: StateCreator<
     calls: true, imports: true, extends: true, implements: true, includes: true,
   },
   forceParams: { repulsion: 2, gravity: 1, settling: 10 },
-  layoutMode: "panels" as const,
+  layoutMode: "zen" as const,
   activeStyleRules: {
     colorByDir: false, sizeByCallers: false,
     highlightEntryPoints: false, highlightHighPageRank: false,

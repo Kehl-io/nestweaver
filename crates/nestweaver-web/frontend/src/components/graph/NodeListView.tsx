@@ -124,7 +124,7 @@ export function NodeListView() {
                 key={node.uid}
                 className={`border-b border-[var(--color-border)] ${
                   selectedNodeId === node.uid
-                    ? "bg-blue-500/10"
+                    ? "bg-[var(--color-surface-alt)]"
                     : "hover:bg-[var(--color-surface-alt)]"
                 }`}
               >
@@ -133,7 +133,7 @@ export function NodeListView() {
                     type="button"
                     onClick={() => selectNode(node.uid, node.kind)}
                     onDoubleClick={() => exploreNode(node.uid, node.kind)}
-                    className="max-w-full truncate font-medium text-[var(--color-text)] hover:text-blue-600"
+                    className="max-w-full truncate font-medium text-[var(--color-text)] hover:text-[var(--color-graph-selection)]"
                   >
                     {node.name}
                   </button>
