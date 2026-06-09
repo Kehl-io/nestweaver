@@ -1,8 +1,7 @@
 import { useStore } from "../stores";
-import { api } from "../api/client";
+import { loadGapItems } from "../api/client";
 import { GlassPanel } from "./panels/GlassPanel";
 import { KindBadge } from "./shared/KindBadge";
-import type { GapItem } from "../stores/analysisSlice";
 
 interface SearchDropdownProps {
   onSelect: (uid: string, kind: string) => void;
@@ -32,21 +31,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const impactText = searchQuery.replace(/^impact of\s+/i, "").trim();
 
   async function showGaps() {
-    const report = await api.gaps();
-    const items: GapItem[] = [
-      ...report.undocumented.map((m) => ({
-        type: "undocumented" as const,
-        label: m.module,
-        detail: `${m.symbol_count} symbols with no documentation`,
-        nodeUids: [] as string[],
-      })),
-      ...report.untested.map((uid) => ({
-        type: "untested" as const,
-        label: uid.split(":").pop() || uid,
-        detail: "Entry point with no test coverage",
-        nodeUids: [uid],
-      })),
-    ];
+    const items = await loadGapItems();
     setGapItems(items);
     if (!gapActive) toggleGapPanel();
   }
@@ -154,8 +139,10 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               key={s.uid}
               id={`search-option-${s.uid}`}
               role="option"
+              tabIndex={0}
               aria-selected={activeDescendant === `search-option-${s.uid}`}
               onClick={() => onSelect(s.uid, s.kind)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(s.uid, s.kind); } }}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
@@ -219,8 +206,10 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               key={n.uid}
               id={`search-option-${n.uid}`}
               role="option"
+              tabIndex={0}
               aria-selected={activeDescendant === `search-option-${n.uid}`}
               onClick={() => onSelect(n.uid, n.kind)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(n.uid, n.kind); } }}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button

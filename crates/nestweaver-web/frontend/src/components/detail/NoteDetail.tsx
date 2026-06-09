@@ -147,7 +147,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
       <div
         className={`mb-4 ${
           detailFocus === "source"
-            ? "rounded border border-blue-500/40 bg-blue-500/5 p-2"
+            ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
             : ""
         }`}
       >
@@ -164,7 +164,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         <div
           className={`mb-4 ${
             detailFocus === "related"
-              ? "rounded border border-blue-500/40 bg-blue-500/5 p-2"
+              ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
               : ""
           }`}
         >
@@ -199,7 +199,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         <div
           className={`mb-4 ${
             detailFocus === "related"
-              ? "rounded border border-blue-500/40 bg-blue-500/5 p-2"
+              ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
               : ""
           }`}
         >

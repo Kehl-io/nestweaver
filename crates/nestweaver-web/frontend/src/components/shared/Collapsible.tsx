@@ -25,7 +25,7 @@ export function Collapsible({
     <div
       className={
         active
-          ? "rounded border border-blue-500/40 bg-blue-500/5"
+          ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5"
           : undefined
       }
     >

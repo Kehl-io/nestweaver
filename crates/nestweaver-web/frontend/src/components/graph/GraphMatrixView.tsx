@@ -34,7 +34,12 @@ export function GraphMatrixView() {
   const graphInstance = useStore((s) => s.graphInstance);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectNode = useStore((s) => s.selectNode);
-  const isDark = document.documentElement.classList.contains("dark");
+  const theme = useStore((s) => s.theme);
+  const isDark =
+    theme === "dark" ||
+    (theme === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [selectedCell, setSelectedCell] = useState<SelectedCell | null>(null);
 
   const { nodes, edges, total } = useMemo(() => {

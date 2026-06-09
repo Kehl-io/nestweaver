@@ -7,7 +7,12 @@ export function GraphLegend() {
   const viewMode = useStore((s) => s.viewMode);
   const nodeTypeFilter = useStore((s) => s.nodeTypeFilter);
   const edgeTypeFilter = useStore((s) => s.edgeTypeFilter);
-  const isDark = document.documentElement.classList.contains("dark");
+  const theme = useStore((s) => s.theme);
+  const isDark =
+    theme === "dark" ||
+    (theme === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
   const visuals = perspectiveVisuals(graphMode);
 
   const visibleKinds = Object.entries(nodeTypeFilter)

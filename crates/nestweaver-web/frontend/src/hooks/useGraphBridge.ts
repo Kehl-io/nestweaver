@@ -77,8 +77,6 @@ function edgeColorForType(type: unknown, isDark: boolean): [number, number, numb
   return color ? hexToRgb(color) : null;
 }
 
-const NODE_EDGE_RADIUS_FACTOR = 0;
-
 /**
  * Simple hash of a string into a float in [0, 1) for deterministic phase offsets.
  */
@@ -254,29 +252,13 @@ export function useGraphBridge(): GraphBuffers {
         edgeNodeIndices[ei * 2 + 0] = si;
         edgeNodeIndices[ei * 2 + 1] = ti;
 
-        const sourceX = positions[si * 3 + 0];
-        const sourceY = positions[si * 3 + 1];
-        const targetX = positions[ti * 3 + 0];
-        const targetY = positions[ti * 3 + 1];
-        const dx = targetX - sourceX;
-        const dy = targetY - sourceY;
-        const length = Math.hypot(dx, dy);
-        const sourceRadius = sizes[si] * NODE_EDGE_RADIUS_FACTOR;
-        const targetRadius = sizes[ti] * NODE_EDGE_RADIUS_FACTOR;
-        const ux = length > 0 ? dx / length : 0;
-        const uy = length > 0 ? dy / length : 0;
-        const trimmedSourceX = sourceX + ux * sourceRadius;
-        const trimmedSourceY = sourceY + uy * sourceRadius;
-        const trimmedTargetX = targetX - ux * targetRadius;
-        const trimmedTargetY = targetY - uy * targetRadius;
-
         // Source position
-        edgePositions[ei * 6 + 0] = trimmedSourceX;
-        edgePositions[ei * 6 + 1] = trimmedSourceY;
+        edgePositions[ei * 6 + 0] = positions[si * 3 + 0];
+        edgePositions[ei * 6 + 1] = positions[si * 3 + 1];
         edgePositions[ei * 6 + 2] = positions[si * 3 + 2];
         // Target position
-        edgePositions[ei * 6 + 3] = trimmedTargetX;
-        edgePositions[ei * 6 + 4] = trimmedTargetY;
+        edgePositions[ei * 6 + 3] = positions[ti * 3 + 0];
+        edgePositions[ei * 6 + 4] = positions[ti * 3 + 1];
         edgePositions[ei * 6 + 5] = positions[ti * 3 + 2];
 
         const edgeColor = edgeColorForType(_attrs.type, isDark);
@@ -318,6 +300,5 @@ export function useGraphBridge(): GraphBuffers {
       nodeCount,
       edgeCount,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphInstance, graphVersion, activeStyleRules, seeds, theme]);
 }
