@@ -2361,9 +2361,19 @@ impl GraphStore {
                 if target_roots.contains(&v.root_path) {
                     self.delete_vault_cascade(&v.uid)?;
                 } else {
-                    self.delete_vault_cascade(&v.uid)?;
-                    self.upsert_vault(&Vault {
-                        uid: vault_uid(to, &v.root_path),
+                    let new_uid = vault_uid(to, &v.root_path);
+                    // Delete the old vault row and insert with corrected UID.
+                    // Notes still reference the old vault_uid; a subsequent
+                    // `brain add` reindexes the vault and fixes them.
+                    let conn = self.conn()?;
+                    let _ = exec_params(
+                        &conn,
+                        "MATCH (v:Vault {uid: $uid}) DETACH DELETE v",
+                        vec![("uid", lbug::Value::String(v.uid.clone()))],
+                    );
+                    drop(conn);
+                    self.insert_vault(&Vault {
+                        uid: new_uid,
                         instance_id: to.to_string(),
                         ..v
                     })?;
