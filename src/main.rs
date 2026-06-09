@@ -564,6 +564,8 @@ enum Commands {
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
         )]
         intent: Option<String>,
+        #[arg(long, help = "Maximum number of connected nodes to return")]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2120,27 +2122,8 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
-    let store = match GraphStore::open(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("lock") || msg.contains("Lock") {
-                eprintln!(
-                    "Database is locked (another process is using it). \
-                     Opening in read-only mode..."
-                );
-                GraphStore::open_read_only(path).with_context(|| {
-                    format!(
-                        "failed to open database at {} (read-only fallback also failed)",
-                        path.display()
-                    )
-                })?
-            } else {
-                return Err(e)
-                    .with_context(|| format!("failed to open database at {}", path.display()));
-            }
-        }
-    };
+    let store = GraphStore::open_or_readonly(path)
+        .with_context(|| format!("failed to open database at {}", path.display()))?;
     let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
@@ -2604,6 +2587,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             feature,
             config,
             intent,
+            limit,
             json,
             db,
         } => {
@@ -2631,7 +2615,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let empty_links = vec![];
                 let links = instance_config.links.as_deref().unwrap_or(&empty_links);
 
-                match build_feature_context(&store, feature_config, links) {
+                match build_feature_context(&store, feature_config, links, parsed_intent, limit) {
                     Ok(result) => {
                         let stats = format!(
                             "{} seeds, {} connected nodes in {}",
@@ -2659,7 +2643,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 // Normal seed-based context.
-                match build_context_with_intent(&store, &seeds, parsed_intent) {
+                match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
                     Ok(result) => {
                         let stats = format!(
                             "{} seeds, {} connected nodes in {}",
@@ -3871,8 +3855,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
                     .context("connect to daemon")?;
                 let grpc_client = daemon_client.into_inner();
-                nestweaver_mcp::run_stdio_server_daemon(grpc_client, rt, lite)
-                    .context("mcp server (daemon mode)")?;
+                nestweaver_mcp::run_stdio_server_daemon(
+                    grpc_client,
+                    rt,
+                    lite,
+                    track_interactions,
+                    &db_path,
+                )
+                .context("mcp server (daemon mode)")?;
             } else {
                 nestweaver_mcp::run_stdio_server(
                     &db_path,
