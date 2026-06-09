@@ -38,6 +38,12 @@ message IndexVaultRequest {
 
 message RefreshBrainRequest {}
 
+message ReindexSearchRequest {}
+
+message ReindexSearchResponse {
+  int32 document_count = 1;
+}
+
 // ─── Watching ───────────────────────────────────────────────────────
 
 message WatchVaultRequest {
@@ -198,6 +204,7 @@ service NestWeaverDaemon {
   rpc IndexRepo(IndexRepoRequest) returns (stream IndexProgress);
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
+  rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
 
   // Watching
   rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);

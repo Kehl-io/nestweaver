@@ -503,6 +503,26 @@ impl NestWeaverDaemon for DaemonService {
         Err(Status::unimplemented("RefreshBrain is not yet implemented"))
     }
 
+    async fn reindex_search(
+        &self,
+        _request: Request<ReindexSearchRequest>,
+    ) -> Result<Response<ReindexSearchResponse>, Status> {
+        let tantivy = self
+            .state
+            .tantivy
+            .as_ref()
+            .filter(|t| t.has_writer())
+            .ok_or_else(|| {
+                Status::failed_precondition("daemon has no writer-mode Tantivy index")
+            })?;
+        let count = tantivy
+            .reindex_from_store(&self.state.store)
+            .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
+        Ok(Response::new(ReindexSearchResponse {
+            document_count: count as i32,
+        }))
+    }
+
     // ── Read RPCs — typed hot-path ─────────────────────────────────
 
     async fn search(
