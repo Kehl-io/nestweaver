@@ -123,9 +123,10 @@ impl GraphStore {
         query_embedding: Option<&[f32]>,
         embedding_index: Option<&EmbeddingIndex>,
         limit: usize,
+        test_path_patterns: &[String],
     ) -> Result<Vec<SearchResult>, StoreError> {
         // 1. Text search
-        let text_results = self.search_symbols_by_name(text_query, limit * 2)?;
+        let text_results = self.search_symbols_by_name(text_query, limit * 2, test_path_patterns)?;
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
@@ -293,7 +294,7 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
 
-        let results = store.hybrid_search("greet", None, None, 10).unwrap();
+        let results = store.hybrid_search("greet", None, None, 10, &[]).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "greet");
     }
@@ -303,7 +304,7 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
 
-        let results = store.hybrid_search("zzznomatch", None, None, 10).unwrap();
+        let results = store.hybrid_search("zzznomatch", None, None, 10, &[]).unwrap();
         assert!(results.is_empty());
     }
 
@@ -325,7 +326,7 @@ mod tests {
 
         let query_vec = [1.0_f32, 0.0, 0.0];
         let results = store
-            .hybrid_search("greet", Some(&query_vec), Some(&idx), 10)
+            .hybrid_search("greet", Some(&query_vec), Some(&idx), 10, &[])
             .unwrap();
 
         // Both should appear (greet from text, farewell from vector)
