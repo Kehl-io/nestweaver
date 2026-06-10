@@ -28,6 +28,7 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::ImpactNode;
+pub use write::{MergeResult, UnlinkedVault};
 
 #[cfg(test)]
 mod tests {

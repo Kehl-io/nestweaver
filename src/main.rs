@@ -8130,17 +8130,25 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
         InstanceCommands::Merge { from, to, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
             let store = open_store(Some(&db_path))?;
-            let (vault_count, repo_count, project_count) = store
+            let result = store
                 .merge_instance_ids(&from, &to)
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-            if vault_count + repo_count + project_count == 0 {
+            if result.vaults + result.repos + result.projects == 0 {
                 println!("No rows found with instance_id '{from}'.");
             } else {
                 println!(
-                    "Merged '{from}' -> '{to}': {vault_count} vault(s), \
-                     {repo_count} repo(s), {project_count} project(s)"
+                    "Merged '{from}' -> '{to}': {} vault(s), \
+                     {} repo(s), {} project(s)",
+                    result.vaults, result.repos, result.projects
                 );
+                for u in &result.unlinked {
+                    eprintln!(
+                        "Note: {} notes from '{}' were unlinked. \
+                         Re-run 'brain add {}' to repopulate.",
+                        u.notes_removed, u.root_path, u.root_path
+                    );
+                }
             }
             Ok(EXIT_SUCCESS)
         }
