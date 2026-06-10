@@ -4,7 +4,20 @@ use crate::db::GraphStore;
 use crate::error::StoreError;
 
 fn is_test_path(path: &str, patterns: &[String]) -> bool {
-    let p = path.to_lowercase();
+    // Indexed file paths are stored relative to the repo root
+    // (e.g. `playwright/components/Foo.tsx`), but the default
+    // deboost patterns use `/segment/` form so they anchor on
+    // directory boundaries without matching arbitrary substrings
+    // (e.g. avoiding `myplaywright`).
+    //
+    // Prepend a `/` to the haystack before substring matching so
+    // patterns like `/playwright/`, `/cypress/`, `/__tests__/`
+    // match relative paths whose first segment is the test dir.
+    // Patterns without a leading `/` (e.g. `.cy.`, `_test.go`)
+    // still match as plain case-insensitive substrings.
+    let mut p = String::with_capacity(path.len() + 1);
+    p.push('/');
+    p.push_str(&path.to_lowercase());
     patterns.iter().any(|pat| p.contains(pat.as_str()))
 }
 
@@ -457,5 +470,41 @@ mod tests {
             .unwrap();
         // Both should be present, order is by insertion (no path ranking)
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression: `/segment/` patterns must deboost production-relative
+    /// paths whose first directory segment is the test dir. The earlier
+    /// implementation did a plain `contains` against the raw path, which
+    /// missed `playwright/foo.tsx` because the haystack had no leading `/`.
+    #[test]
+    fn deboost_patterns_match_first_segment_of_relative_path() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut prod = make_symbol("sym-prod", "MultiStageApprovalDialog");
+        prod.file_path = "src/components/MultiStageApprovalDialog.tsx".to_string();
+        store.insert_symbol(&prod).unwrap();
+
+        // Three Playwright tests under playwright/ as a first segment.
+        for (i, p) in [
+            "playwright/components/MultiStageApprovalDialog.spec.ts",
+            "playwright/regression/MultiStageApprovalDialog.spec.ts",
+            "playwright/smoke/MultiStageApprovalDialog.spec.ts",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut s = make_symbol(&format!("sym-pw-{i}"), "MultiStageApprovalDialog");
+            s.file_path = (*p).to_string();
+            store.insert_symbol(&s).unwrap();
+        }
+
+        let patterns = vec!["/playwright/".to_string()];
+        let results = store
+            .search_symbols_by_name("MultiStageApprovalDialog", 10, &patterns)
+            .unwrap();
+        assert_eq!(
+            results[0].file_path, "src/components/MultiStageApprovalDialog.tsx",
+            "production code must outrank playwright/ tests with default /playwright/ pattern"
+        );
     }
 }

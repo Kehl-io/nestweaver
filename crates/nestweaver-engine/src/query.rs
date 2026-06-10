@@ -46,6 +46,13 @@ pub struct HybridSearchConfig {
     /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
     /// the 0.3 boost to surface numerically in the output relevance.
     pub prf: bool,
+    /// Feature F-test-deboost — substring patterns matched (case-insensitive)
+    /// against the haystack `/<path>` of each candidate symbol's file_path to
+    /// deboost test/fixture code in `search_symbols_by_name` seed resolution.
+    ///
+    /// Sourced from `[ranking] test_path_patterns` in instance config.
+    /// Empty → fall back to [`crate::config::default_test_path_patterns`].
+    pub test_path_patterns: Vec<String>,
 }
 
 impl Default for HybridSearchConfig {
@@ -58,9 +65,33 @@ impl Default for HybridSearchConfig {
             bm25_limit: 500,
             semantic_limit: 200,
             prf: false,
+            test_path_patterns: crate::config::default_test_path_patterns(),
         }
     }
 }
+
+impl HybridSearchConfig {
+    /// Return the effective deboost patterns: the configured list if
+    /// non-empty, otherwise the built-in defaults. Useful at call sites
+    /// that build a config from CLI flags without a [`crate::config::RankingConfig`].
+    pub fn effective_test_path_patterns(&self) -> &[String] {
+        if self.test_path_patterns.is_empty() {
+            // `Default` already populates this with the defaults, but a
+            // caller may have explicitly cleared it. Fall back so the
+            // ranking step never silently degrades.
+            // SAFETY: `default_test_path_patterns` always returns a
+            // non-empty `Vec<String>`.
+            DEFAULT_TEST_PATH_PATTERNS_FALLBACK.as_slice()
+        } else {
+            &self.test_path_patterns
+        }
+    }
+}
+
+/// Cached fallback so callers of `effective_test_path_patterns` can return a
+/// borrowed slice without re-allocating on each call.
+static DEFAULT_TEST_PATH_PATTERNS_FALLBACK: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(crate::config::default_test_path_patterns);
 
 /// Full details for a single symbol, including its call graph neighbours.
 #[derive(Debug, Serialize)]
@@ -709,15 +740,29 @@ pub struct BrainNode {
     /// body contains the full source, `false` when the per-body cap forced
     /// truncation. Skipped from JSON when `true` so existing consumers see
     /// unchanged output and only learn about the field when it flags a
-    /// truncated body. (BrainNode is Serialize-only — no Deserialize default
-    /// needed; constructors set this explicitly.)
-    #[serde(skip_serializing_if = "is_true")]
+    /// truncated body.
+    ///
+    /// `#[serde(default = "default_body_complete")]` is required because the
+    /// daemon's JSON-RPC `GetContext` response routes through
+    /// `serde_json::from_str` on the client. When a node serializes with
+    /// `body_complete=true` the field is omitted (per the `skip_serializing_if`
+    /// above); without the default, the client deserialization fails with
+    /// `missing field body_complete`, causing daemon-routed `brain context` to
+    /// hard-error. The default mirrors constructor behavior (no truncation =>
+    /// complete).
+    #[serde(skip_serializing_if = "is_true", default = "default_body_complete")]
     pub body_complete: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_true(b: &bool) -> bool {
     *b
+}
+
+/// Serde default for [`BrainNode::body_complete`]. See the field doc on
+/// `BrainNode::body_complete` for the daemon-deserialization rationale.
+fn default_body_complete() -> bool {
+    true
 }
 
 /// Char-truncate `body` to `max_chars`, preferring the last newline within the
@@ -737,8 +782,16 @@ pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String,
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrainContextResult {
+    /// Resolved seed nodes. The MCP `brain_context` tool omits this field
+    /// when `include_seeds=false` is requested, so deserializing daemon
+    /// `GetContext` responses requires a default.
+    #[serde(default)]
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
+    /// Seed strings that did not resolve to any UID. The MCP
+    /// `brain_context` tool omits this field when empty, so deserializing
+    /// daemon `GetContext` responses requires a default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_seeds: Vec<String>,
     /// Feature F7 (PRF half) — terms mined by pseudo-relevance feedback and
     /// fed into the pass-2 BM25 query. Empty unless PRF was enabled. Surfaced
@@ -899,9 +952,12 @@ pub fn build_brain_context_hybrid_with_aliases(
             continue;
         }
 
-        // Fall back to symbol name search.
+        // Fall back to symbol name search. Respect the caller's configured
+        // [`HybridSearchConfig::test_path_patterns`] (sourced from
+        // `[ranking] test_path_patterns` in instance config) so user overrides
+        // actually take effect at seed resolution.
         let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5, &crate::config::default_test_path_patterns())
+            .search_symbols_by_name(trimmed, 5, config.effective_test_path_patterns())
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_matches.is_empty() {
             for s in symbol_matches {
