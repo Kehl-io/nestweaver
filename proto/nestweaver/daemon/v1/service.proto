@@ -34,6 +34,7 @@ message IndexVaultRequest {
   string vault_path = 1;
   string vault_name = 2;
   repeated string extra_ignore_patterns = 3;
+  string instance_id = 4;
 }
 
 message RefreshBrainRequest {}

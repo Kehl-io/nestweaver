@@ -4711,12 +4711,17 @@ fn dispatch_add_source_via_daemon(
                 })
                 .unwrap_or(false));
 
+    let instance_id = current_instance_config()
+        .map(|c| c.instance_id.clone())
+        .unwrap_or_default();
+
     rt.block_on(async {
         if is_vault || !is_repo {
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
                 vault_name: name,
                 extra_ignore_patterns: vec![],
+                instance_id: instance_id.clone(),
             });
             let mut stream = client
                 .index_vault(req)
