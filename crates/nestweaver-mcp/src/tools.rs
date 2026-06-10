@@ -4633,25 +4633,18 @@ pub fn dispatch_via_daemon(
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_status" => {
-                use nestweaver_proto::BrainStatusRequest;
-                let req = tonic::Request::new(BrainStatusRequest {});
+                // Use the JSON pass-through RPC so per-vault rows (uid +
+                // instance_id), warnings[], and any other engine-side fields
+                // round-trip intact. The typed BrainStatusResponse only
+                // carries the scalar totals.
+                let req = tonic::Request::new(JsonRequest {
+                    args_json: args_json.clone(),
+                });
                 let resp = client
-                    .brain_status(req)
+                    .brain_status_json(req)
                     .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
-                let inner = resp.into_inner();
-                let value = serde_json::json!({
-                    "vault_count": inner.vault_count,
-                    "notes": inner.notes,
-                    "headings": inner.headings,
-                    "sections": inner.sections,
-                    "tags": inner.tags,
-                    "wikilinks": inner.wikilinks,
-                    "repo_count": inner.repo_count,
-                    "tantivy_available": inner.tantivy_available,
-                    "tantivy_doc_count": inner.tantivy_doc_count,
-                });
-                Ok(serde_json::to_string(&value)?)
+                Ok(resp.into_inner().result_json)
             }
             "hub_nodes" => {
                 use nestweaver_proto::HubNodesRequest;
