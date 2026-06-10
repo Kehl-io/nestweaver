@@ -126,7 +126,8 @@ impl GraphStore {
         test_path_patterns: &[String],
     ) -> Result<Vec<SearchResult>, StoreError> {
         // 1. Text search
-        let text_results = self.search_symbols_by_name(text_query, limit * 2, test_path_patterns)?;
+        let text_results =
+            self.search_symbols_by_name(text_query, limit * 2, test_path_patterns)?;
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
@@ -304,7 +305,9 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
 
-        let results = store.hybrid_search("zzznomatch", None, None, 10, &[]).unwrap();
+        let results = store
+            .hybrid_search("zzznomatch", None, None, 10, &[])
+            .unwrap();
         assert!(results.is_empty());
     }
 
