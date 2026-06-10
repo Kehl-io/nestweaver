@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useStore } from "../stores";
+import { EDGE_COLORS } from "../components/graph/utils/graphColors";
 
 export interface GraphBuffers {
   /** [x0, y0, z0, x1, y1, z1, ...] length = nodeCount * 3 */
@@ -10,10 +11,18 @@ export interface GraphBuffers {
   sizes: Float32Array;
   /** [p0, p1, ...] length = nodeCount (per-node phase offset for breathing animation) */
   phases: Float32Array;
+  /** [i0, i1, ...] length = nodeCount, normalized by relevance and degree */
+  importance: Float32Array;
+  /** [s0, s1, ...] length = nodeCount, 1 when the node is an active seed */
+  seedMarkers: Float32Array;
+  /** [b0, b1, ...] length = nodeCount, normalized bridge/hub strength */
+  bridgeStrengths: Float32Array;
   /** [sx0, sy0, sz0, tx0, ty0, tz0, ...] length = edgeCount * 6 */
   edgePositions: Float32Array;
   /** [sr0, sg0, sb0, tr0, tg0, tb0, ...] length = edgeCount * 6 */
   edgeColors: Float32Array;
+  /** [sourceIndex0, targetIndex0, ...] length = edgeCount * 2 */
+  edgeNodeIndices: Int32Array;
   uidToIndex: Map<string, number>;
   indexToUid: string[];
   nodeCount: number;
@@ -25,8 +34,12 @@ export const EMPTY_BUFFERS: GraphBuffers = {
   colors: new Float32Array(0),
   sizes: new Float32Array(0),
   phases: new Float32Array(0),
+  importance: new Float32Array(0),
+  seedMarkers: new Float32Array(0),
+  bridgeStrengths: new Float32Array(0),
   edgePositions: new Float32Array(0),
   edgeColors: new Float32Array(0),
+  edgeNodeIndices: new Int32Array(0),
   uidToIndex: new Map(),
   indexToUid: [],
   nodeCount: 0,
@@ -55,6 +68,15 @@ function hexToRgb(hex: string): [number, number, number] {
   return [0.5, 0.5, 0.5];
 }
 
+function edgeColorForType(type: unknown, isDark: boolean): [number, number, number] | null {
+  if (typeof type !== "string") return null;
+  if (type === "overview") {
+    return isDark ? hexToRgb("#64748b") : hexToRgb("#6b7280");
+  }
+  const color = EDGE_COLORS[type];
+  return color ? hexToRgb(color) : null;
+}
+
 /**
  * Simple hash of a string into a float in [0, 1) for deterministic phase offsets.
  */
@@ -65,6 +87,14 @@ function hashToPhase(uid: string): number {
     h = (h * 0x01000193) >>> 0;
   }
   return (h >>> 0) / 0xffffffff;
+}
+
+function numericMetric(attrs: Record<string, unknown>, names: string[]): number {
+  for (const name of names) {
+    const value = attrs[name];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return 0;
 }
 
 /**
@@ -105,6 +135,8 @@ export function useGraphBridge(): GraphBuffers {
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
   const activeStyleRules = useStore((s) => s.activeStyleRules);
+  const seeds = useStore((s) => s.seeds);
+  const theme = useStore((s) => s.theme);
 
   return useMemo(() => {
     if (!graphInstance || graphInstance.order === 0) {
@@ -112,6 +144,11 @@ export function useGraphBridge(): GraphBuffers {
     }
 
     const graph = graphInstance;
+    const isDark =
+      theme === "dark" ||
+      (theme === "system" &&
+        typeof window !== "undefined" &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
     const nodeCount = graph.order;
     const edgeCount = graph.size;
 
@@ -120,8 +157,24 @@ export function useGraphBridge(): GraphBuffers {
     const colors = new Float32Array(nodeCount * 3);
     const sizes = new Float32Array(nodeCount);
     const phases = new Float32Array(nodeCount);
+    const importance = new Float32Array(nodeCount);
+    const seedMarkers = new Float32Array(nodeCount);
+    const bridgeStrengths = new Float32Array(nodeCount);
     const uidToIndex = new Map<string, number>();
     const indexToUid: string[] = new Array(nodeCount);
+    const seedSet = new Set(seeds);
+
+    let maxRelevance = 0;
+    let maxDegree = 0;
+    graph.forEachNode((uid, attrs) => {
+      const relevance = numericMetric(attrs, [
+        "relevance",
+        "pagerank",
+        "pagerank_score",
+      ]);
+      maxRelevance = Math.max(maxRelevance, relevance);
+      maxDegree = Math.max(maxDegree, graph.degree(uid));
+    });
 
     let ni = 0;
     graph.forEachNode((uid, attrs) => {
@@ -165,6 +218,21 @@ export function useGraphBridge(): GraphBuffers {
       // Phase: deterministic per-node float derived from UID
       phases[ni] = hashToPhase(uid);
 
+      const relevance = numericMetric(attrs, [
+        "relevance",
+        "pagerank",
+        "pagerank_score",
+      ]);
+      const degree = graph.degree(uid);
+      const relevanceScore = maxRelevance > 0 ? relevance / maxRelevance : 0;
+      const degreeScore = maxDegree > 0 ? degree / maxDegree : 0;
+      importance[ni] = Math.min(1, Math.max(relevanceScore, degreeScore * 0.7));
+      seedMarkers[ni] = attrs.isSeed === true || seedSet.has(uid) ? 1 : 0;
+      bridgeStrengths[ni] =
+        degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
+          ? Math.min(1, degreeScore)
+          : 0;
+
       ni++;
     });
 
@@ -173,6 +241,7 @@ export function useGraphBridge(): GraphBuffers {
     // and 6 floats for colors (source rgb + target rgb)
     const edgePositions = new Float32Array(edgeCount * 6);
     const edgeColors = new Float32Array(edgeCount * 6);
+    const edgeNodeIndices = new Int32Array(edgeCount * 2);
 
     let ei = 0;
     graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
@@ -180,6 +249,9 @@ export function useGraphBridge(): GraphBuffers {
       const ti = uidToIndex.get(targetUid);
 
       if (si !== undefined && ti !== undefined) {
+        edgeNodeIndices[ei * 2 + 0] = si;
+        edgeNodeIndices[ei * 2 + 1] = ti;
+
         // Source position
         edgePositions[ei * 6 + 0] = positions[si * 3 + 0];
         edgePositions[ei * 6 + 1] = positions[si * 3 + 1];
@@ -189,14 +261,24 @@ export function useGraphBridge(): GraphBuffers {
         edgePositions[ei * 6 + 4] = positions[ti * 3 + 1];
         edgePositions[ei * 6 + 5] = positions[ti * 3 + 2];
 
-        // Source endpoint color (from source node)
-        edgeColors[ei * 6 + 0] = colors[si * 3 + 0];
-        edgeColors[ei * 6 + 1] = colors[si * 3 + 1];
-        edgeColors[ei * 6 + 2] = colors[si * 3 + 2];
-        // Target endpoint color (from target node) — enables directional gradient
-        edgeColors[ei * 6 + 3] = colors[ti * 3 + 0];
-        edgeColors[ei * 6 + 4] = colors[ti * 3 + 1];
-        edgeColors[ei * 6 + 5] = colors[ti * 3 + 2];
+        const edgeColor = edgeColorForType(_attrs.type, isDark);
+        const sourceColor = edgeColor ?? [
+          colors[si * 3 + 0],
+          colors[si * 3 + 1],
+          colors[si * 3 + 2],
+        ];
+        const targetColor = edgeColor ?? [
+          colors[ti * 3 + 0],
+          colors[ti * 3 + 1],
+          colors[ti * 3 + 2],
+        ];
+
+        edgeColors[ei * 6 + 0] = sourceColor[0];
+        edgeColors[ei * 6 + 1] = sourceColor[1];
+        edgeColors[ei * 6 + 2] = sourceColor[2];
+        edgeColors[ei * 6 + 3] = targetColor[0];
+        edgeColors[ei * 6 + 4] = targetColor[1];
+        edgeColors[ei * 6 + 5] = targetColor[2];
       }
 
       ei++;
@@ -207,13 +289,16 @@ export function useGraphBridge(): GraphBuffers {
       colors,
       sizes,
       phases,
+      importance,
+      seedMarkers,
+      bridgeStrengths,
       edgePositions,
       edgeColors,
+      edgeNodeIndices,
       uidToIndex,
       indexToUid,
       nodeCount,
       edgeCount,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphInstance, graphVersion, activeStyleRules]);
+  }, [graphInstance, graphVersion, activeStyleRules, seeds, theme]);
 }

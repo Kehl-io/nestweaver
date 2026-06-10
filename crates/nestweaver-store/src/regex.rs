@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use lbug::Value;
 use regex_syntax::hir::literal::Extractor;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
@@ -33,7 +33,7 @@ pub const CANDIDATE_CAP: usize = 5000;
 pub const DEFAULT_MAX_MILLIS: u64 = 2000;
 
 /// A single regex match hit.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegexMatch {
     /// Node UID (sym:..., sec:..., note:...).
     pub uid: String,
@@ -50,7 +50,7 @@ pub struct RegexMatch {
 }
 
 /// Result of a `regex_search` call.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegexSearchResult {
     pub results: Vec<RegexMatch>,
     /// True when the candidate cap or time budget was hit and results are partial.

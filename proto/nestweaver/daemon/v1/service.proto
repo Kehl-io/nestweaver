@@ -34,9 +34,16 @@ message IndexVaultRequest {
   string vault_path = 1;
   string vault_name = 2;
   repeated string extra_ignore_patterns = 3;
+  string instance_id = 4;
 }
 
 message RefreshBrainRequest {}
+
+message ReindexSearchRequest {}
+
+message ReindexSearchResponse {
+  int32 document_count = 1;
+}
 
 // ─── Watching ───────────────────────────────────────────────────────
 
@@ -198,6 +205,7 @@ service NestWeaverDaemon {
   rpc IndexRepo(IndexRepoRequest) returns (stream IndexProgress);
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
+  rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
 
   // Watching
   rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);
@@ -209,6 +217,7 @@ service NestWeaverDaemon {
   rpc GetProjectContext(ProjectContextRequest) returns (ProjectContextResponse);
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
+  rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
   rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);
 
   // Read RPCs — JSON pass-through

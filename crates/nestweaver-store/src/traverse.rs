@@ -3,6 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+fn is_test_path(path: &str, patterns: &[String]) -> bool {
+    let p = path.to_lowercase();
+    patterns.iter().any(|pat| p.contains(pat.as_str()))
+}
+
 /// Cached result of a full symbol table scan, keyed on `graph_generation`.
 ///
 /// Stored in `GraphStore::symbol_name_cache` to avoid repeated full-table
@@ -232,6 +237,7 @@ impl GraphStore {
         &self,
         query: &str,
         limit: usize,
+        test_path_patterns: &[String],
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
         let cur_gen = self.graph_generation();
@@ -299,17 +305,36 @@ impl GraphStore {
             }
         };
 
-        // --- Step 3: filter the in-memory list ------------------------------
-        let mut matches = Vec::new();
+        // --- Step 3: filter and rank the in-memory list ----------------------
+        // Collect all substring matches, rank by name quality and path, then
+        // take the top `limit`. This prevents test/playwright files from
+        // dominating when a PascalCase name also appears in production code.
+        let mut matches: Vec<(u8, &nestweaver_schema::Symbol)> = Vec::new();
         for (lower, sym) in &entry.symbols {
-            if lower.contains(&needle) {
-                matches.push(sym.clone());
-                if matches.len() >= limit {
-                    break;
-                }
+            if !lower.contains(&needle) {
+                continue;
             }
+            let name_rank = if *lower == needle {
+                0 // exact
+            } else if lower.starts_with(&needle) {
+                1 // prefix
+            } else {
+                2 // contains
+            };
+            let path_rank = if is_test_path(&sym.file_path, test_path_patterns) {
+                1u8
+            } else {
+                0u8
+            };
+            let rank = name_rank * 2 + path_rank;
+            matches.push((rank, sym));
         }
-        Ok(matches)
+        matches.sort_by_key(|(rank, _)| *rank);
+        Ok(matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, sym)| sym.clone())
+            .collect())
     }
 }
 
@@ -352,11 +377,11 @@ mod tests {
         store.insert_symbol(&make_symbol("s3", "BazBaz")).unwrap();
 
         // First call — cache miss, queries DB.
-        let first = store.search_symbols_by_name("foo", 10).unwrap();
+        let first = store.search_symbols_by_name("foo", 10, &[]).unwrap();
         assert_eq!(first.len(), 2, "expected FooBar and FooQux");
 
         // Second call — should hit the cache. Results must be identical.
-        let second = store.search_symbols_by_name("foo", 10).unwrap();
+        let second = store.search_symbols_by_name("foo", 10, &[]).unwrap();
         assert_eq!(second.len(), 2, "cached call must return the same count");
 
         // The UIDs returned by both calls must be the same set.
@@ -385,7 +410,7 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("s1", "Alpha")).unwrap();
 
-        let first = store.search_symbols_by_name("alpha", 10).unwrap();
+        let first = store.search_symbols_by_name("alpha", 10, &[]).unwrap();
         assert_eq!(first.len(), 1);
 
         // Simulate a reindex bump.
@@ -397,11 +422,40 @@ mod tests {
             .insert_symbol(&make_symbol("s2", "AlphaBeta"))
             .unwrap();
 
-        let second = store.search_symbols_by_name("alpha", 10).unwrap();
+        let second = store.search_symbols_by_name("alpha", 10, &[]).unwrap();
         assert_eq!(
             second.len(),
             2,
             "after generation bump the cache should be refreshed and include the new symbol"
         );
+    }
+
+    #[test]
+    fn search_symbols_respects_custom_test_patterns() {
+        let store = GraphStore::in_memory().unwrap();
+
+        // Production symbol
+        let mut prod = make_symbol("sym-prod", "MyComponent");
+        prod.file_path = "src/components/MyComponent.tsx".to_string();
+        store.insert_symbol(&prod).unwrap();
+
+        // Cypress test symbol
+        let mut test_sym = make_symbol("sym-test", "MyComponent");
+        test_sym.file_path = "cypress/e2e/MyComponent.cy.ts".to_string();
+        store.insert_symbol(&test_sym).unwrap();
+
+        // With custom patterns: prod ranks first (cypress/ is deboosted)
+        let defaults = vec!["/cypress/".to_string(), ".cy.".to_string()];
+        let results = store
+            .search_symbols_by_name("MyComponent", 10, &defaults)
+            .unwrap();
+        assert_eq!(results[0].file_path, "src/components/MyComponent.tsx");
+
+        // With empty patterns: no deboost, both rank equally by name
+        let results = store
+            .search_symbols_by_name("MyComponent", 10, &[])
+            .unwrap();
+        // Both should be present, order is by insertion (no path ranking)
+        assert_eq!(results.len(), 2);
     }
 }

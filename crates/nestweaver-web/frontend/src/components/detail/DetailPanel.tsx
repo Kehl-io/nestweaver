@@ -1,3 +1,4 @@
+import { isSymbolKind } from "../../api/kinds";
 import { useStore } from "../../stores";
 import { GlassPanel } from "../panels/GlassPanel";
 import { DiffDetail } from "./DiffDetail";
@@ -7,8 +8,7 @@ import { LlmResultDetail } from "../llm/LlmResultDetail";
 import { NoteDetail } from "./NoteDetail";
 import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
-
-const SYMBOL_KINDS = new Set(["Function", "Class", "Interface", "Method", "Module"]);
+import { NodeActionBar } from "../actions/NodeActionBar";
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -22,9 +22,25 @@ export function DetailPanel() {
 
   if (!selectedNodeId) {
     return (
-      <GlassPanel data-testid="detail-panel" className="flex h-full flex-col items-center justify-center gap-3 border-l border-[var(--color-border)] bg-[var(--color-surface)] p-6 text-center text-sm text-[var(--color-text-muted)]">
-        <p>Click a node in the graph to see its details here.</p>
-        <div className="space-y-1 text-xs">
+      <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-sm text-[var(--color-text-muted)]">
+        <div className="border-b border-[var(--color-border)] pb-3">
+          <p className="text-xs font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+            Details
+          </p>
+          <h2 className="mt-1 text-base font-semibold text-[var(--color-text)]">
+            Ready when you select a node
+          </h2>
+          <p className="mt-1 text-xs leading-5">
+            Pick a node to open source, trace impact, find paths, or ask a question.
+          </p>
+        </div>
+        <div className="mt-4 space-y-3 text-xs">
+          <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2">
+            <p className="font-medium text-[var(--color-text)]">Fast starts</p>
+            <p className="mt-1 leading-5">
+              Use Start Here to explore the highest-signal symbol, then follow actions here.
+            </p>
+          </div>
           <p>
             <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-1.5 py-0.5 font-mono text-[10px]">
               /
@@ -42,28 +58,41 @@ export function DetailPanel() {
     );
   }
 
-  const isSymbol = selectedNodeKind != null && SYMBOL_KINDS.has(selectedNodeKind);
-  const isNote = selectedNodeId.startsWith("note:") || (!isSymbol && selectedNodeKind !== "file");
+  const isSymbol =
+    selectedNodeId.startsWith("sym:") ||
+    isSymbolKind(selectedNodeKind);
+  const isNote =
+    selectedNodeId.startsWith("note:") ||
+    selectedNodeKind === "note" ||
+    selectedNodeKind === "Note";
 
   return (
-    <GlassPanel data-testid="detail-panel" className="h-full border-l border-[var(--color-border)] bg-[var(--color-surface)]">
-      {llmResult && <LlmResultDetail />}
-      {diffActive && <DiffDetail />}
-      {gapActive && <GapDetail />}
-      {flowTraceActive && <FlowDetail />}
-      {pathfindingActive && pathResults.length > 0 && <PathDetail />}
-      {isSymbol ? (
-        <SymbolDetail uid={selectedNodeId} />
-      ) : isNote ? (
-        <NoteDetail uid={selectedNodeId} />
-      ) : (
-        <div className="p-4">
-          <h2 className="mb-2 text-sm font-semibold">Selected</h2>
-          <p className="break-all text-sm text-[var(--color-text-muted)]">
-            {selectedNodeId}
-          </p>
-        </div>
-      )}
+    <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]">
+      <div className="border-b border-[var(--color-border)] p-2">
+        <NodeActionBar
+          node={{ uid: selectedNodeId, kind: selectedNodeKind }}
+          compact
+        />
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {llmResult && <LlmResultDetail />}
+        {diffActive && <DiffDetail />}
+        {gapActive && <GapDetail />}
+        {flowTraceActive && <FlowDetail />}
+        {pathfindingActive && pathResults.length > 0 && <PathDetail />}
+        {isSymbol ? (
+          <SymbolDetail uid={selectedNodeId} />
+        ) : isNote ? (
+          <NoteDetail uid={selectedNodeId} />
+        ) : (
+          <div className="p-4">
+            <h2 className="mb-2 text-sm font-semibold">Selected</h2>
+            <p className="break-all text-sm text-[var(--color-text-muted)]">
+              {selectedNodeId}
+            </p>
+          </div>
+        )}
+      </div>
     </GlassPanel>
   );
 }

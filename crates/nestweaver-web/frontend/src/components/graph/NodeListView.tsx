@@ -1,107 +1,173 @@
-import { useState, useMemo, useCallback } from "react";
+import { useMemo, useState } from "react";
+import { ArrowDownUp } from "lucide-react";
 import { useStore } from "../../stores";
+import { NodeActionBar } from "../actions/NodeActionBar";
+
+type SortKey = "name" | "kind" | "relevance" | "degree" | "location";
+type SortDirection = "asc" | "desc";
+
+interface TableNode {
+  uid: string;
+  name: string;
+  kind: string;
+  location: string;
+  relevance: number;
+  degree: number;
+}
+
+function compareValues(a: string | number, b: string | number): number {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  return String(a).localeCompare(String(b));
+}
 
 export function NodeListView() {
   const graphInstance = useStore((s) => s.graphInstance);
-  const selectNode = useStore((s) => s.selectNode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const selectNode = useStore((s) => s.selectNode);
+  const exploreNode = useStore((s) => s.exploreNode);
   const [filter, setFilter] = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("relevance");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
 
-  // Build sorted list from graphology
-  const nodes = useMemo(() => {
+  const nodes = useMemo<TableNode[]>(() => {
     if (!graphInstance) return [];
-    const list: Array<{
-      uid: string;
-      name: string;
-      kind: string;
-      location: string;
-      relevance: number;
-    }> = [];
+    const list: TableNode[] = [];
     graphInstance.forEachNode((uid, attrs) => {
       list.push({
         uid,
         name: (attrs.label as string) || uid.split(":").pop() || uid,
         kind: (attrs.kind as string) || "Unknown",
-        location: (attrs.location as string) || "",
+        location:
+          (attrs.location as string) ||
+          (attrs.filePath as string) ||
+          "",
         relevance: (attrs.relevance as number) || 0,
+        degree: graphInstance.degree(uid),
       });
     });
-    // Sort by relevance descending (proxy for PageRank)
-    list.sort((a, b) => b.relevance - a.relevance);
     return list;
   }, [graphInstance]);
 
   const filtered = useMemo(() => {
-    if (!filter) return nodes;
     const lower = filter.toLowerCase();
-    return nodes.filter(
-      (n) => n.name.toLowerCase().includes(lower) || n.kind.toLowerCase().includes(lower),
-    );
-  }, [nodes, filter]);
+    const next = lower
+      ? nodes.filter(
+          (node) =>
+            node.name.toLowerCase().includes(lower) ||
+            node.kind.toLowerCase().includes(lower) ||
+            node.location.toLowerCase().includes(lower),
+        )
+      : nodes;
+    return [...next].sort((a, b) => {
+      const base = compareValues(a[sortKey], b[sortKey]);
+      return sortDirection === "asc" ? base : -base;
+    });
+  }, [nodes, filter, sortKey, sortDirection]);
 
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent, uid: string) => {
-      if (e.key === "Enter") {
-        selectNode(uid);
-      } else if (e.key === " ") {
-        e.preventDefault();
-        setSeeds([uid]);
-      }
-    },
-    [selectNode, setSeeds],
+  const setSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDirection(key === "name" || key === "kind" ? "asc" : "desc");
+    }
+  };
+
+  const header = (key: SortKey, label: string) => (
+    <button
+      type="button"
+      onClick={() => setSort(key)}
+      className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+    >
+      {label}
+      <ArrowDownUp className="h-3 w-3" />
+    </button>
   );
 
   return (
     <div
-      className="flex flex-col h-full bg-[var(--color-surface)]"
+      className="flex h-full flex-col bg-[var(--color-surface)]"
       role="region"
-      aria-label="Node list view"
+      aria-label="Ranked node table"
     >
-      <div className="p-2 border-b border-[var(--color-border)]">
+      <div className="flex items-center gap-2 border-b border-[var(--color-border)] p-2">
         <input
           type="search"
-          placeholder="Filter nodes..."
+          placeholder="Filter nodes by name, kind, or location..."
           value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          className="w-full px-2 py-1 text-sm rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]"
+          onChange={(event) => setFilter(event.target.value)}
+          className="h-8 min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]"
           aria-label="Filter nodes"
         />
+        <span className="shrink-0 text-[11px] text-[var(--color-text-muted)]">
+          {filtered.length} of {nodes.length}
+        </span>
       </div>
-      <div className="flex-1 overflow-y-auto" role="listbox" aria-label="Graph nodes">
-        {filtered.map((node) => (
-          <div
-            key={node.uid}
-            role="option"
-            aria-selected={selectedNodeId === node.uid}
-            tabIndex={0}
-            onClick={() => selectNode(node.uid)}
-            onDoubleClick={() => setSeeds([node.uid])}
-            onKeyDown={(e) => handleKeyDown(e, node.uid)}
-            className={`flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer border-b border-[var(--color-border)] hover:bg-[var(--color-surface-alt)] ${
-              selectedNodeId === node.uid
-                ? "bg-blue-500/10 border-l-2 border-l-blue-500"
-                : ""
-            }`}
-          >
-            <span className="font-mono text-[10px] px-1 rounded bg-[var(--color-surface-alt)] text-[var(--color-text-muted)]">
-              {node.kind}
-            </span>
-            <span className="flex-1 truncate text-[var(--color-text)]">{node.name}</span>
-            <span className="text-[var(--color-text-muted)] text-[10px]">
-              {node.relevance > 0 ? node.relevance.toFixed(3) : ""}
-            </span>
-          </div>
-        ))}
+
+      <div className="min-h-0 flex-1 overflow-auto">
+        <table className="w-full min-w-[760px] border-collapse text-left text-xs">
+          <thead className="sticky top-0 z-10 bg-[var(--color-surface)] shadow-sm">
+            <tr className="border-b border-[var(--color-border)]">
+              <th className="px-3 py-2">{header("name", "Name")}</th>
+              <th className="px-3 py-2">{header("kind", "Kind")}</th>
+              <th className="px-3 py-2">{header("relevance", "Rank")}</th>
+              <th className="px-3 py-2">{header("degree", "Degree")}</th>
+              <th className="px-3 py-2">{header("location", "Location")}</th>
+              <th className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+                Actions
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((node) => (
+              <tr
+                key={node.uid}
+                className={`border-b border-[var(--color-border)] ${
+                  selectedNodeId === node.uid
+                    ? "bg-[var(--color-surface-alt)]"
+                    : "hover:bg-[var(--color-surface-alt)]"
+                }`}
+              >
+                <td className="max-w-[240px] px-3 py-2">
+                  <button
+                    type="button"
+                    onClick={() => selectNode(node.uid, node.kind)}
+                    onDoubleClick={() => exploreNode(node.uid, node.kind)}
+                    className="max-w-full truncate font-medium text-[var(--color-text)] hover:text-[var(--color-graph-selection)]"
+                  >
+                    {node.name}
+                  </button>
+                </td>
+                <td className="px-3 py-2">
+                  <span className="rounded bg-[var(--color-surface-alt)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                    {node.kind}
+                  </span>
+                </td>
+                <td className="px-3 py-2 text-[var(--color-text-muted)]">
+                  {node.relevance > 0 ? node.relevance.toFixed(3) : "-"}
+                </td>
+                <td className="px-3 py-2 text-[var(--color-text-muted)]">
+                  {node.degree}
+                </td>
+                <td className="max-w-[260px] truncate px-3 py-2 text-[var(--color-text-muted)]">
+                  {node.location || "-"}
+                </td>
+                <td className="px-3 py-2">
+                  <NodeActionBar
+                    node={{ uid: node.uid, kind: node.kind, label: node.name }}
+                    ids={["explore", "impact", "path", "ask"]}
+                    compact
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
         {filtered.length === 0 && (
-          <div className="p-4 text-center text-sm text-[var(--color-text-muted)]">
+          <div className="p-6 text-center text-sm text-[var(--color-text-muted)]">
             {nodes.length === 0 ? "No graph loaded" : "No matching nodes"}
           </div>
         )}
-      </div>
-      <div className="px-3 py-1 text-[10px] text-[var(--color-text-muted)] border-t border-[var(--color-border)]">
-        {filtered.length} node{filtered.length !== 1 ? "s" : ""} · Enter to select · Space to
-        explore
       </div>
     </div>
   );

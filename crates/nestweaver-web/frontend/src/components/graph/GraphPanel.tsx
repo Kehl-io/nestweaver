@@ -1,16 +1,21 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
+import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { NodeFilterBar } from "./NodeFilterBar";
 import { ModeTabs } from "./ModeTabs";
-import { GraphToolbar } from "./GraphToolbar";
+import { ControlDock } from "./ControlDock";
+import { ActiveFilterSummary } from "./ActiveFilterSummary";
+import { GraphLegend } from "./GraphLegend";
 import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { LlmQueryBar } from "../llm/LlmQueryBar";
+import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
+import { OverviewContextSurface } from "../overview/OverviewContextSurface";
 import { TimelineSlider } from "../timeline/TimelineSlider";
+import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
 import { useReposMode } from "./modes/useReposMode";
@@ -33,7 +38,7 @@ function useGraphKeyboardNav(
   const graphInstance = useStore((s) => s.graphInstance);
   const graphVersion = useStore((s) => s.graphVersion);
   const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
 
   // Keep a ref to a pagerank-sorted node list so the keydown handler is stable
   const sortedNodesRef = useRef<string[]>([]);
@@ -78,7 +83,11 @@ function useGraphKeyboardNav(
       if (e.key === "Enter") {
         if (currentId) {
           e.preventDefault();
-          setSeeds([currentId]);
+          const kind =
+            graph?.hasNode(currentId)
+              ? (graph.getNodeAttribute(currentId, "kind") as string | null)
+              : null;
+          exploreNode(currentId, kind);
         }
         return;
       }
@@ -163,7 +172,7 @@ function useGraphKeyboardNav(
 
     el.addEventListener("keydown", handleKeyDown);
     return () => el.removeEventListener("keydown", handleKeyDown);
-  }, [panelRef, selectNode, setSeeds]);
+  }, [panelRef, selectNode, exploreNode]);
 }
 
 /**
@@ -171,6 +180,7 @@ function useGraphKeyboardNav(
  * Hooks read and write graph state via zustand.
  */
 function GraphModeHooks() {
+  const overviewState = useOverviewMode();
   useContextMode();
   useImpactMode();
   useReposMode();
@@ -178,11 +188,21 @@ function GraphModeHooks() {
   const { hops, setHops } = useLocalMode();
 
   const graphMode = useStore((s) => s.graphMode);
+  const viewMode = useStore((s) => s.viewMode);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const setGraphMode = useStore((s) => s.setGraphMode);
   const semanticLayoutRequested = useStore((s) => s.semanticLayoutRequested);
   const clearSemanticLayoutRequest = useStore(
     (s) => s.clearSemanticLayoutRequest,
   );
   const { applySemanticLayout } = useSemanticLayout();
+
+  useEffect(() => {
+    if ((graphMode === "local" || graphMode === "impact") && !selectedNodeId) {
+      setGraphMode("overview");
+    }
+  }, [graphMode, selectedNodeId, setGraphMode]);
 
   useEffect(() => {
     if (semanticLayoutRequested) {
@@ -193,6 +213,14 @@ function GraphModeHooks() {
 
   return (
     <>
+      {graphMode === "overview" && viewMode === "graph" && layoutMode !== "zen" && (
+        <>
+          <OverviewCommandShelf {...overviewState} />
+          <OverviewContextSurface
+            overview={overviewState.overview}
+          />
+        </>
+      )}
       {graphMode === "local" && (
         <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded bg-[var(--color-surface-alt)] shadow text-xs text-[var(--color-text)]">
           <label htmlFor="local-hops-slider" className="whitespace-nowrap">
@@ -205,7 +233,7 @@ function GraphModeHooks() {
             max={4}
             value={hops}
             onChange={(e) => setHops(Number(e.target.value))}
-            className="w-24 accent-blue-500"
+            className="w-24 accent-[var(--color-graph-selection)]"
           />
         </div>
       )}
@@ -221,7 +249,10 @@ export function GraphPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const viewMode = useStore((s) => s.viewMode);
+  const graphMode = useStore((s) => s.graphMode);
   const minimapVisible = useStore((s) => s.minimapVisible);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const focusMap = layoutMode === "zen";
 
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
@@ -255,13 +286,20 @@ export function GraphPanel() {
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
         >
-          {viewMode === "list" ? <NodeListView /> : <GraphCanvas />}
+          {viewMode === "list" ? (
+            <NodeListView />
+          ) : viewMode === "matrix" ? (
+            <GraphMatrixView />
+          ) : (
+            <GraphCanvas />
+          )}
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
-        <GraphToolbar />
-        {minimapVisible && (
-          <div className="absolute top-2 right-12 z-10">
+        <ControlDock />
+        {viewMode === "graph" && !focusMap && <GraphLegend />}
+        {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
+          <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
             <GraphMinimap />
           </div>
         )}
@@ -282,10 +320,10 @@ export function GraphPanel() {
           )}
         </div>
       </div>
-      <TimelineSlider />
-      <NodeFilterBar />
-      <ModeTabs />
-      <LlmQueryBar />
+      {!focusMap && <TimelineSlider />}
+      {!focusMap && <ActiveFilterSummary />}
+      {!focusMap && <ModeTabs />}
+      {!focusMap && <LlmQueryBar />}
     </div>
   );
 }

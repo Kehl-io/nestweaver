@@ -33,6 +33,10 @@ async fn all_endpoints_respond() {
         check(&app, Method::GET, "/api/v1/health", None).await,
         StatusCode::OK
     );
+    assert_eq!(
+        check(&app, Method::GET, "/api/v1/overview", None).await,
+        StatusCode::OK
+    );
 
     // ── Search ───────────────────────────────────────────────────────────────
     assert_eq!(

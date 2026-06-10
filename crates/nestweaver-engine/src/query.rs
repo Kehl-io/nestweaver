@@ -1,6 +1,6 @@
 use nestweaver_schema::{Repo, Service, Symbol};
 use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex, detect_intent};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
 
@@ -158,7 +158,7 @@ pub fn search_symbols(
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
     let syms = store
-        .search_symbols_by_name(query, limit)
+        .search_symbols_by_name(query, limit, &crate::config::default_test_path_patterns())
         .context("search_symbols_by_name")?;
     Ok(syms.iter().map(SymbolCandidate::from).collect())
 }
@@ -218,7 +218,7 @@ pub fn build_context(
     store: &GraphStore,
     inputs: &[String],
 ) -> Result<ContextResult, anyhow::Error> {
-    build_context_with_intent(store, inputs, None)
+    build_context_with_intent(store, inputs, None, None)
 }
 
 /// Like [`build_context`] but accepts an optional [`QueryIntent`] to
@@ -231,6 +231,7 @@ pub fn build_context_with_intent(
     store: &GraphStore,
     inputs: &[String],
     intent: Option<QueryIntent>,
+    limit: Option<usize>,
 ) -> Result<ContextResult, anyhow::Error> {
     let mut seed_uids: Vec<String> = Vec::new();
     let mut file_paths_tried: Vec<String> = Vec::new();
@@ -260,7 +261,7 @@ pub fn build_context_with_intent(
         } else {
             // Name search — take up to 5 matches.
             let matches = store
-                .search_symbols_by_name(input, 5)
+                .search_symbols_by_name(input, 5, &crate::config::default_test_path_patterns())
                 .map_err(|e| anyhow::anyhow!(e))?;
             for sym in matches {
                 seed_uids.push(sym.uid);
@@ -303,6 +304,7 @@ pub fn build_context_with_intent(
 
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
+    let effective_limit = limit.unwrap_or(usize::MAX);
 
     // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
     let ppr_uids: Vec<&str> = ppr_results.iter().map(|(u, _)| u.as_str()).collect();
@@ -328,7 +330,7 @@ pub fn build_context_with_intent(
 
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
-        } else {
+        } else if connected.len() < effective_limit {
             connected.push(node);
         }
     }
@@ -492,7 +494,7 @@ mod context_tests {
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
 
         // Find the actual file_path stored for a symbol in utils.js.
-        let search = store.search_symbols_by_name("formatDate", 1).unwrap();
+        let search = store.search_symbols_by_name("formatDate", 1, &[]).unwrap();
         if search.is_empty() {
             // Parser may not have indexed this file — skip rather than fail.
             return;
@@ -567,6 +569,8 @@ pub fn build_feature_context(
     store: &GraphStore,
     feature: &FeatureConfig,
     links: &[LinkConfig],
+    intent: Option<QueryIntent>,
+    limit: Option<usize>,
 ) -> Result<FeatureContextResult, anyhow::Error> {
     // Resolve feature repo names to repo_uids.
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
@@ -623,14 +627,15 @@ pub fn build_feature_context(
     }
 
     let ppr_scores = store
-        .personalized_pagerank(&seed_uids, 0.85, 20, &GraphScope::unified())
+        .personalized_pagerank_with_intent(&seed_uids, 0.85, 20, &GraphScope::unified(), intent)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
 
-    // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
+    // Apply limit to PPR results (seeds are always included).
+    let effective_limit = limit.unwrap_or(usize::MAX);
     let ppr_uids: Vec<&str> = ppr_scores.iter().map(|(u, _)| u.as_str()).collect();
     let sym_map = store
         .batch_lookup_symbols(&ppr_uids)
@@ -652,7 +657,7 @@ pub fn build_feature_context(
         };
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
-        } else {
+        } else if connected.len() < effective_limit {
             connected.push(node);
         }
     }
@@ -687,7 +692,7 @@ pub fn build_feature_context(
 /// One ranked node in a brain-context result. Carries the kind discriminator
 /// so the caller can format / filter results by domain (Symbol vs Note vs
 /// Section vs Tag vs Heading).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainNode {
     pub uid: String,
     pub kind: String,
@@ -730,7 +735,7 @@ pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String,
     (truncated, false)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BrainContextResult {
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
@@ -896,7 +901,7 @@ pub fn build_brain_context_hybrid_with_aliases(
 
         // Fall back to symbol name search.
         let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5)
+            .search_symbols_by_name(trimmed, 5, &crate::config::default_test_path_patterns())
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_matches.is_empty() {
             for s in symbol_matches {
@@ -1777,6 +1782,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1794,6 +1800,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 1.5)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1813,6 +1820,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("Projects/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 2.0)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1831,6 +1839,7 @@ mod ranking_prior_tests {
             dampen: vec![],
             boost: vec![dampen("critical/**", 5.0)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut high, &rules_hi);
@@ -1846,6 +1855,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("archive/**", 0.05)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut low, &rules_lo);
@@ -1864,6 +1874,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("src/legacy/**", 0.5)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);

@@ -24,7 +24,7 @@
   --color-graph-label-hover: #111827;
   --color-graph-edge: rgba(107, 114, 128, 0.15);
   --color-graph-dim: #d0d0d0;
-  --color-graph-selection: #2563eb;
+  --color-graph-selection: #0862a7;
 }
 
 :root.dark {
@@ -38,12 +38,13 @@
   --color-graph-label-hover: #f1f5f9;
   --color-graph-edge: rgba(34, 211, 238, 0.12);
   --color-graph-dim: #1a1a2e;
-  --color-graph-selection: #22d3ee;
+  --color-graph-selection: #5ed0fe;
 }
 
 html, body, #root {
   height: 100%;
   margin: 0;
+  overflow: hidden;
   font-family: system-ui, -apple-system, sans-serif;
   background: var(--color-surface);
   color: var(--color-text);
@@ -77,6 +78,59 @@ html, body, #root {
   outline-offset: 2px;
 }
 
+/* Graph labels need to stay readable while the canvas moves underneath them. */
+.graph-canvas-shell,
+.graph-canvas-shell canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.graph-node-label {
+  position: relative;
+  z-index: 1;
+  display: block;
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.68);
+  color: var(--color-graph-label);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+  line-height: 1.15;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+  transform: translateZ(0);
+  filter: drop-shadow(0 1px 1px rgba(15, 23, 42, 0.12));
+}
+
+:root.dark .graph-node-label {
+  background: rgba(6, 8, 15, 0.62);
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.36));
+}
+
+.graph-node-label-focus {
+  background: rgba(255, 255, 255, 0.52);
+  color: color-mix(in srgb, var(--color-graph-label) 84%, transparent);
+}
+
+:root.dark .graph-node-label-focus {
+  background: rgba(6, 8, 15, 0.48);
+}
+
+.graph-node-label-hovered {
+  color: var(--color-graph-label-hover);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.graph-node-label-selected {
+  background: color-mix(in srgb, var(--color-graph-selection) 16%, white);
+  color: var(--color-text);
+}
+
+:root.dark .graph-node-label-selected {
+  background: color-mix(in srgb, var(--color-graph-selection) 30%, var(--color-surface));
+  color: var(--color-text);
+}
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -108,17 +162,19 @@ html, body, #root {
 
 /* Glassmorphism panel */
 .glass-panel {
-  position: relative;
-  background: rgba(6, 8, 15, 0.92);
+  background: rgba(255, 255, 255, 0.92);
   backdrop-filter: blur(16px) saturate(1.2);
-  border: 1px solid rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 12px;
 }
 
-:root.light .glass-panel,
-.light .glass-panel {
-  background: rgba(255, 255, 255, 0.9);
-  border: 1px solid rgba(0, 0, 0, 0.08);
+.glass-panel:not(.absolute):not(.fixed):not(.sticky) {
+  position: relative;
+}
+
+:root.dark .glass-panel {
+  background: rgba(6, 8, 15, 0.92);
+  border: 1px solid rgba(34, 211, 238, 0.08);
 }
 
 /* Cursor-responsive light effect */
