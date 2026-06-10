@@ -1,6 +1,6 @@
 use nestweaver_schema::{Repo, Service, Symbol};
 use nestweaver_store::{GraphScope, GraphStore, QueryIntent, TantivyIndex, detect_intent};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
 
@@ -692,7 +692,7 @@ pub fn build_feature_context(
 /// One ranked node in a brain-context result. Carries the kind discriminator
 /// so the caller can format / filter results by domain (Symbol vs Note vs
 /// Section vs Tag vs Heading).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainNode {
     pub uid: String,
     pub kind: String,
@@ -735,7 +735,7 @@ pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String,
     (truncated, false)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BrainContextResult {
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
