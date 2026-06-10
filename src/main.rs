@@ -2965,74 +2965,72 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard (typed RPC) ──────────────────────────
-            if use_daemon {
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect =
-                        rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                    if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::HubNodesRequest {
-                            top_n: top as i32,
-                            response_format: String::new(),
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .hub_nodes(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                let value: serde_json::Value =
-                                    serde_json::from_str(&resp.result_json)
-                                        .unwrap_or(serde_json::json!({}));
-                                if json {
-                                    println!("{}", serde_json::to_string_pretty(&value)?);
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                if let Ok(mut client) = connect {
+                    let req = nestweaver_proto::HubNodesRequest {
+                        top_n: top as i32,
+                        response_format: String::new(),
+                    };
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .hub_nodes(req)
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let value: serde_json::Value =
+                                serde_json::from_str(&resp.result_json)
+                                    .unwrap_or(serde_json::json!({}));
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&value)?);
+                            } else {
+                                let hubs: Vec<HubNode> = value
+                                    .get("hubs")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                    .unwrap_or_default();
+                                if hubs.is_empty() {
+                                    println!("No hub nodes found (graph may be empty).");
                                 } else {
-                                    let hubs: Vec<HubNode> = value
-                                        .get("hubs")
-                                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                        .unwrap_or_default();
-                                    if hubs.is_empty() {
-                                        println!("No hub nodes found (graph may be empty).");
-                                    } else {
+                                    println!(
+                                        "Top {} hub nodes (by total degree):\n",
+                                        hubs.len()
+                                    );
+                                    for h in &hubs {
+                                        let cluster = h
+                                            .cluster_id
+                                            .map(|id| format!(" cluster={id}"))
+                                            .unwrap_or_default();
                                         println!(
-                                            "Top {} hub nodes (by total degree):\n",
-                                            hubs.len()
+                                            "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                                            h.name,
+                                            h.file_path,
+                                            h.in_degree,
+                                            h.out_degree,
+                                            h.total_degree,
+                                            h.pagerank_score,
                                         );
-                                        for h in &hubs {
-                                            let cluster = h
-                                                .cluster_id
-                                                .map(|id| format!(" cluster={id}"))
-                                                .unwrap_or_default();
-                                            println!(
-                                                "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
-                                                h.name,
-                                                h.file_path,
-                                                h.in_degree,
-                                                h.out_degree,
-                                                h.total_degree,
-                                                h.pagerank_score,
-                                            );
-                                        }
                                     }
                                 }
-                                let stats = format!(
-                                    "{} hubs in {} (via daemon)",
-                                    value
-                                        .get("count")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0),
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
                             }
-                            Err(status) => {
-                                eprintln!(
-                                    "warning: daemon hub_nodes RPC failed ({}); falling back to direct DB read",
-                                    status.message()
-                                );
-                            }
+                            let stats = format!(
+                                "{} hubs in {} (via daemon)",
+                                value
+                                    .get("count")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
+                        }
+                        Err(status) => {
+                            eprintln!(
+                                "warning: daemon hub_nodes RPC failed ({}); falling back to direct DB read",
+                                status.message()
+                            );
                         }
                     }
                 }
@@ -4058,7 +4056,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(|| default_db_path());
+                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({ "pattern": pattern });
                 if let Some(ref pp) = path_prefix {
                     args["path_prefix"] = serde_json::json!(pp);
@@ -7519,13 +7517,12 @@ fn run_brain(
 
             // Route through daemon's GetContext RPC when available and no
             // flags require direct-disk processing.
-            if use_daemon && since.is_none() {
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                        &db_path,
-                        config_path.as_deref(),
-                    ));
-                    if let Ok(mut client) = connect {
+            if use_daemon && since.is_none() && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config_path.as_deref(),
+                ));
+                if let Ok(mut client) = connect {
                         let req = nestweaver_proto::BrainContextRequest {
                             seeds: seeds.clone(),
                             token_budget: token_budget.unwrap_or(0) as i32,
@@ -7587,7 +7584,6 @@ fn run_brain(
                             }
                         }
                     }
-                }
             }
 
             let store = open_store(Some(&db_path))?;
