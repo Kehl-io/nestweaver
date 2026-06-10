@@ -1593,18 +1593,27 @@ enum BrainCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
         /// Filter results to nodes whose kind starts with one of these values
-        /// (e.g. Symbol, Note, Section, Tag, Heading).
+        /// (e.g. Symbol, Note, Section, Tag, Heading). Accepts comma-separated
+        /// values or repeated `--kinds` flags.
         #[arg(
             long = "kinds",
-            help = "Keep only nodes with these kind prefixes (e.g. Symbol, Note)"
+            value_delimiter = ',',
+            help = "Keep only nodes with these kind prefixes (e.g. Symbol,Note)"
         )]
         kinds: Vec<String>,
         /// Filter results to nodes associated with these repo UIDs or names.
-        #[arg(long = "repos", help = "Keep only nodes from these repo UIDs or names")]
+        /// Accepts comma-separated values or repeated `--repos` flags.
+        #[arg(
+            long = "repos",
+            value_delimiter = ',',
+            help = "Keep only nodes from these repo UIDs or names"
+        )]
         repos: Vec<String>,
         /// Filter results to nodes associated with these vault UIDs or names.
+        /// Accepts comma-separated values or repeated `--vaults` flags.
         #[arg(
             long = "vaults",
+            value_delimiter = ',',
             help = "Keep only nodes from these vault UIDs or names"
         )]
         vaults: Vec<String>,
@@ -1614,15 +1623,20 @@ enum BrainCommands {
             help = "Keep only nodes whose location starts with this prefix"
         )]
         path_prefix: Option<String>,
-        /// Include only nodes tagged with any of these tags (note/section nodes only).
+        /// Include only nodes tagged with any of these tags (note/section nodes
+        /// only). Accepts comma-separated values or repeated `--tags` flags.
         #[arg(
             long = "tags",
+            value_delimiter = ',',
             help = "Keep only note/section nodes tagged with any of these tags"
         )]
         tags: Vec<String>,
-        /// Exclude nodes tagged with any of these tags (note/section nodes only).
+        /// Exclude nodes tagged with any of these tags (note/section nodes
+        /// only). Accepts comma-separated values or repeated `--exclude-tags`
+        /// flags.
         #[arg(
             long = "exclude-tags",
+            value_delimiter = ',',
             help = "Exclude note/section nodes tagged with any of these tags"
         )]
         exclude_tags: Vec<String>,
@@ -6401,14 +6415,41 @@ fn run_brain(
                         .unwrap_or(0);
                     println!("  Vaults:    {}", vault_count);
                     if let Some(vaults) = value.get("vaults").and_then(|v| v.as_array()) {
+                        // When two rows share a name we annotate with the
+                        // instance_id so the user can target precise removes.
+                        // Empty-named rows (phantom registrations) always
+                        // get annotated so they don't render as blank lines.
+                        let mut name_counts: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        for v in vaults {
+                            let name = v["name"].as_str().unwrap_or("?");
+                            *name_counts.entry(name).or_insert(0) += 1;
+                        }
                         for v in vaults {
                             let name = v["name"].as_str().unwrap_or("?");
                             let note_count = v["note_count"].as_u64().unwrap_or(0);
-                            let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
-                            println!(
-                                "    - {} ({note_count} notes, last indexed: {last_indexed})",
-                                name
-                            );
+                            let last_indexed = v["last_indexed"]
+                                .as_str()
+                                .unwrap_or("never");
+                            let ambiguous =
+                                name_counts.get(name).copied().unwrap_or(0) > 1;
+                            let unnamed = name.is_empty();
+                            if ambiguous || unnamed {
+                                let instance = v["instance_id"].as_str().unwrap_or("?");
+                                let root_path = v["root_path"].as_str().unwrap_or("?");
+                                let display = if unnamed {
+                                    format!("<unnamed: {root_path}>")
+                                } else {
+                                    name.to_string()
+                                };
+                                println!(
+                                    "    - {display} [instance: {instance}] ({note_count} notes, last indexed: {last_indexed})"
+                                );
+                            } else {
+                                println!(
+                                    "    - {name} ({note_count} notes, last indexed: {last_indexed})"
+                                );
+                            }
                         }
                     }
                     let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -6438,6 +6479,41 @@ fn run_brain(
                             println!(
                                 "  interaction_tracking: disabled (run with --track-interactions to enable)"
                             );
+                        }
+                    }
+                    // Forward structured warnings from the MCP response —
+                    // e.g. duplicate-vault-root collisions. Previously these
+                    // were only emitted on the local (non-daemon) code path.
+                    if let Some(warnings) = value.get("warnings").and_then(|v| v.as_array()) {
+                        for w in warnings {
+                            let kind = w["kind"].as_str().unwrap_or("");
+                            if kind == "duplicate_vault_root" {
+                                let root = w["root_path"].as_str().unwrap_or("?");
+                                let entries =
+                                    w["entries"].as_array().cloned().unwrap_or_default();
+                                eprintln!(
+                                    "Warning: {} vault entries share root path {}:",
+                                    entries.len(),
+                                    root
+                                );
+                                for e in &entries {
+                                    let name = e["name"].as_str().unwrap_or("?");
+                                    let instance = e["instance_id"].as_str().unwrap_or("?");
+                                    let uid = e["uid"].as_str().unwrap_or("?");
+                                    let n = e["note_count"].as_u64().unwrap_or(0);
+                                    eprintln!(
+                                        "    - {name} [instance: {instance}] uid={uid} ({n} notes)"
+                                    );
+                                }
+                                eprintln!(
+                                    "  This usually means brain add was run with different --instance values."
+                                );
+                                eprintln!(
+                                    "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                                     Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
+                                );
+                            }
                         }
                     }
                 }
@@ -6478,6 +6554,14 @@ fn run_brain(
             if json {
                 #[derive(serde::Serialize)]
                 struct VaultDetail {
+                    /// Vault UID (sym `vlt:<instance>:<hash>`). Needed when
+                    /// callers want to pass this row to `brain remove --instance`
+                    /// or `instance merge --from/--to`.
+                    uid: String,
+                    /// Instance the row is registered under. Surfaces the
+                    /// row-to-instance mapping that was previously only visible
+                    /// in aggregate `instance_ids`.
+                    instance_id: String,
                     name: String,
                     root_path: String,
                     note_count: usize,
@@ -6503,6 +6587,8 @@ fn run_brain(
                             store.list_notes(Some(&v.uid)).unwrap_or_default().len();
                         let last_indexed = resolve_last_indexed(db_path, &v.uid, &store);
                         VaultDetail {
+                            uid: v.uid.clone(),
+                            instance_id: v.instance_id.clone(),
                             name: v.name.clone(),
                             root_path: v.root_path.clone(),
                             note_count: vault_note_count,
@@ -6532,14 +6618,38 @@ fn run_brain(
                 println!("Brain status:");
                 println!("  Database:  {}", db_path.display());
                 println!("  Vaults:    {}", vaults.len());
+                // When two rows share a name + root_path we surface
+                // `instance_id` so the user can tell them apart and target
+                // `brain remove --instance <id>` precisely. Empty-named
+                // rows (phantom registrations) are always annotated so they
+                // don't render as blank lines.
+                let mut name_counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for v in &vaults {
+                    *name_counts.entry(v.name.as_str()).or_insert(0) += 1;
+                }
                 for v in &vaults {
                     let vault_note_count = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
                     let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
-                    println!(
-                        "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
-                        v.name
-                    );
+                    let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
+                    let unnamed = v.name.is_empty();
+                    if ambiguous || unnamed {
+                        let display = if unnamed {
+                            format!("<unnamed: {}>", v.root_path)
+                        } else {
+                            v.name.clone()
+                        };
+                        println!(
+                            "    - {display} [instance: {}] ({vault_note_count} notes, last indexed: {last_indexed})",
+                            v.instance_id
+                        );
+                    } else {
+                        println!(
+                            "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
+                            v.name
+                        );
+                    }
                 }
                 println!("  Notes:     {note_count}");
                 println!("  Headings:  {heading_count}");
@@ -6568,29 +6678,37 @@ fn run_brain(
             // Warn when multiple vault UIDs map to the same canonical root
             // path — usually caused by brain add with mismatched --instance
             // or missing --config. This produces phantom 0-note vault rows.
-            let mut root_to_vaults: std::collections::HashMap<&str, Vec<&str>> =
+            // Each entry surfaces name + instance_id + uid so the user can
+            // target `brain remove --instance <id>` precisely.
+            let mut root_to_vaults: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
                 std::collections::HashMap::new();
             for v in &vaults {
                 root_to_vaults
                     .entry(v.root_path.as_str())
                     .or_default()
-                    .push(v.name.as_str());
+                    .push(v);
             }
-            for (root, names) in &root_to_vaults {
-                if names.len() > 1 {
+            for (root, rows) in &root_to_vaults {
+                if rows.len() > 1 {
                     eprintln!(
                         "Warning: {} vault entries share root path {}:",
-                        names.len(),
+                        rows.len(),
                         root
                     );
-                    eprintln!("  {}", names.join(", "));
+                    for v in rows {
+                        let n = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                        eprintln!(
+                            "    - {} [instance: {}] uid={} ({} notes)",
+                            v.name, v.instance_id, v.uid, n
+                        );
+                    }
                     eprintln!(
                         "  This usually means brain add was run with different --instance values."
                     );
                     eprintln!(
-                        "  Fix with: nestweaver brain remove {root}\n  \
-                         Or:    nestweaver instance merge --from <old-id> --to <correct-id>\n  \
-                         Then:  nestweaver brain add {root}",
+                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>",
                     );
                 }
             }
