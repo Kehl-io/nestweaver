@@ -412,6 +412,11 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -429,7 +434,7 @@ impl NestWeaverDaemon for DaemonService {
                 &state.store,
                 &vault_path,
                 &state.db_path,
-                &state.instance_id,
+                &instance_id,
                 &vault_name,
                 &extra_patterns,
             );

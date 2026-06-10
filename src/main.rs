@@ -5956,6 +5956,7 @@ fn run_brain(
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
+                    instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
                     let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
@@ -6611,6 +6612,7 @@ fn run_brain(
                     vault_path: path.display().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
+                    instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
                     let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
