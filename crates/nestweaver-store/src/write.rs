@@ -8,6 +8,22 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// A vault whose notes were removed during an instance merge.
+#[derive(Debug)]
+pub struct UnlinkedVault {
+    pub root_path: String,
+    pub notes_removed: usize,
+}
+
+/// Result of [`GraphStore::merge_instance_ids`].
+#[derive(Debug)]
+pub struct MergeResult {
+    pub vaults: usize,
+    pub repos: usize,
+    pub projects: usize,
+    pub unlinked: Vec<UnlinkedVault>,
+}
+
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
 /// `framework_hint` column stores. Returns an empty string when absent.
 fn encode_framework_hint(symbol: &Symbol) -> String {
@@ -2333,8 +2349,30 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Count notes belonging to a vault.
+    fn vault_note_count(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let safe_vid = vault_uid.replace('\'', "\\'");
+        let rows = conn
+            .query(&format!(
+                "MATCH (n:Note) WHERE n.vault_uid = '{safe_vid}' RETURN count(n)"
+            ))
+            .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
+        Ok(rows
+            .filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0))
+    }
+
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
-    /// match `from` to `to`. Returns `(vaults, repos, projects)` counts.
+    /// match `from` to `to`. Returns a [`MergeResult`] with counts and
+    /// details about any vaults whose notes were unlinked during collision
+    /// resolution.
     ///
     /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
     /// since SET is not supported for property updates.
@@ -2342,36 +2380,65 @@ impl GraphStore {
         &self,
         from: &str,
         to: &str,
-    ) -> Result<(usize, usize, usize), StoreError> {
+    ) -> Result<MergeResult, StoreError> {
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
+        let mut unlinked: Vec<UnlinkedVault> = Vec::new();
 
-        // Collect target-instance vault root paths so we can detect
-        // collisions after rewriting.
-        let target_roots: std::collections::HashSet<String> = self
+        // Build a map of target-instance vaults keyed by root_path so we
+        // can detect collisions and compare child counts.
+        let target_vaults: std::collections::HashMap<String, Vault> = self
             .list_vaults(None)?
             .into_iter()
             .filter(|v| v.instance_id == to)
-            .map(|v| v.root_path)
+            .map(|v| (v.root_path.clone(), v))
             .collect();
 
         for v in self.list_vaults(None)? {
             if v.instance_id == from {
-                if target_roots.contains(&v.root_path) {
-                    self.delete_vault_cascade(&v.uid)?;
+                let root_path = v.root_path.clone();
+                if let Some(target) = target_vaults.get(&root_path) {
+                    // Collision: two vaults with the same root_path in
+                    // different instances. Keep whichever has more notes.
+                    let source_count = self.vault_note_count(&v.uid)?;
+                    let target_count = self.vault_note_count(&target.uid)?;
+                    let total = source_count + target_count;
+
+                    if source_count > target_count {
+                        // Source is more populated — delete target, rewrite source.
+                        self.delete_vault_cascade(&target.uid)?;
+                        let new_uid = vault_uid(to, &root_path);
+                        self.delete_vault_cascade(&v.uid)?;
+                        self.insert_vault(&Vault {
+                            uid: new_uid,
+                            instance_id: to.to_string(),
+                            ..v
+                        })?;
+                    } else {
+                        // Target is equally or more populated — drop source.
+                        self.delete_vault_cascade(&v.uid)?;
+                    }
+                    if total > 0 {
+                        unlinked.push(UnlinkedVault {
+                            root_path,
+                            notes_removed: total,
+                        });
+                    }
                 } else {
-                    let new_uid = vault_uid(to, &v.root_path);
-                    // Cascade-delete the old vault (and its notes/sections/
-                    // headings) so no orphans survive, then insert the vault
-                    // row with the corrected UID. The next `brain add` will
-                    // re-populate the notes from disk.
-                    self.delete_vault_cascade(&v.uid)?;
+                    let new_uid = vault_uid(to, &root_path);
+                    let deleted = self.delete_vault_cascade(&v.uid)?;
                     self.insert_vault(&Vault {
                         uid: new_uid,
                         instance_id: to.to_string(),
                         ..v
                     })?;
+                    if deleted > 0 {
+                        unlinked.push(UnlinkedVault {
+                            root_path,
+                            notes_removed: deleted,
+                        });
+                    }
                 }
                 vault_count += 1;
             }
@@ -2402,6 +2469,11 @@ impl GraphStore {
                 project_count += 1;
             }
         }
-        Ok((vault_count, repo_count, project_count))
+        Ok(MergeResult {
+            vaults: vault_count,
+            repos: repo_count,
+            projects: project_count,
+            unlinked,
+        })
     }
 }
