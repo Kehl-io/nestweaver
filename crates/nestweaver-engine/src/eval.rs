@@ -631,7 +631,7 @@ function hello(name) { return "Hello " + name; }
         // Find the UID of `hello`, which `greet` calls — so seeding on "greet"
         // should surface `hello` as a connected node with high relevance.
         let hello = store
-            .search_symbols_by_name("hello", 5)
+            .search_symbols_by_name("hello", 5, &[])
             .unwrap()
             .into_iter()
             .next()
