@@ -40,6 +40,11 @@ pub struct RankingConfig {
     /// flag and MCP `prf: true` argument override this per call.
     #[serde(default)]
     pub enable_prf: bool,
+    /// Substring patterns matched case-insensitively against a symbol's file
+    /// path to deboost test/fixture code in `search_symbols_by_name` ranking.
+    /// Override via `[ranking] test_path_patterns` in instance config.
+    #[serde(default = "default_test_path_patterns")]
+    pub test_path_patterns: Vec<String>,
     /// Feature F12 — git-activity-dampened CodeRank weight. Controls how
     /// strongly the per-file recency score rescales `pagerank_score` at read
     /// time via `clamp(1 + w*(score - 0.5), 0.4, 1.6)`.
@@ -51,6 +56,32 @@ pub struct RankingConfig {
     /// (populated via `index --with-git-activity`).
     #[serde(default = "default_git_activity_weight")]
     pub git_activity_weight: f64,
+}
+
+/// Default test-path deboost patterns for [`RankingConfig::test_path_patterns`].
+///
+/// These patterns are matched (case-insensitive substring) against a symbol's
+/// file path during `search_symbols_by_name` ranking. Matching symbols are
+/// demoted so production code ranks above test/fixture code of the same name.
+pub fn default_test_path_patterns() -> Vec<String> {
+    vec![
+        "/playwright/".into(),
+        "/__tests__/".into(),
+        "/test/".into(),
+        "/tests/".into(),
+        "/e2e/".into(),
+        "/fixtures/".into(),
+        "/__mocks__/".into(),
+        "/cypress/".into(),
+        "/spec/".into(),
+        "/it/".into(),
+        "/itest/".into(),
+        ".test.".into(),
+        ".spec.".into(),
+        ".cy.".into(),
+        "_test.go".into(),
+        "_spec.rb".into(),
+    ]
 }
 
 /// Default for [`RankingConfig::git_activity_weight`]. See the field doc and
@@ -65,6 +96,7 @@ impl Default for RankingConfig {
             dampen: Vec::new(),
             boost: Vec::new(),
             enable_prf: false,
+            test_path_patterns: default_test_path_patterns(),
             git_activity_weight: default_git_activity_weight(),
         }
     }

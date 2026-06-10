@@ -158,7 +158,7 @@ pub fn search_symbols(
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
     let syms = store
-        .search_symbols_by_name(query, limit)
+        .search_symbols_by_name(query, limit, &crate::config::default_test_path_patterns())
         .context("search_symbols_by_name")?;
     Ok(syms.iter().map(SymbolCandidate::from).collect())
 }
@@ -261,7 +261,7 @@ pub fn build_context_with_intent(
         } else {
             // Name search — take up to 5 matches.
             let matches = store
-                .search_symbols_by_name(input, 5)
+                .search_symbols_by_name(input, 5, &crate::config::default_test_path_patterns())
                 .map_err(|e| anyhow::anyhow!(e))?;
             for sym in matches {
                 seed_uids.push(sym.uid);
@@ -494,7 +494,7 @@ mod context_tests {
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
 
         // Find the actual file_path stored for a symbol in utils.js.
-        let search = store.search_symbols_by_name("formatDate", 1).unwrap();
+        let search = store.search_symbols_by_name("formatDate", 1, &[]).unwrap();
         if search.is_empty() {
             // Parser may not have indexed this file — skip rather than fail.
             return;
@@ -901,7 +901,7 @@ pub fn build_brain_context_hybrid_with_aliases(
 
         // Fall back to symbol name search.
         let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5)
+            .search_symbols_by_name(trimmed, 5, &crate::config::default_test_path_patterns())
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_matches.is_empty() {
             for s in symbol_matches {
@@ -1782,6 +1782,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1799,6 +1800,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("_logs/2020/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 1.5)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1818,6 +1820,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("Projects/**", 0.3)],
             boost: vec![dampen("Projects/*/sync.md", 2.0)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
@@ -1836,6 +1839,7 @@ mod ranking_prior_tests {
             dampen: vec![],
             boost: vec![dampen("critical/**", 5.0)],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut high, &rules_hi);
@@ -1851,6 +1855,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("archive/**", 0.05)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut low, &rules_lo);
@@ -1869,6 +1874,7 @@ mod ranking_prior_tests {
             dampen: vec![dampen("src/legacy/**", 0.5)],
             boost: vec![],
             enable_prf: false,
+            test_path_patterns: vec![],
             git_activity_weight: 1.2,
         };
         apply_ranking_priors(&mut nodes, &rules);
