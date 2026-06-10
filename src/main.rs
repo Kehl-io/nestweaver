@@ -6268,7 +6268,9 @@ fn run_brain(
                         "  This usually means brain add was run with different --instance values."
                     );
                     eprintln!(
-                        "  Fix with: nestweaver instance merge --from <old-id> --to <correct-id>"
+                        "  Fix with: nestweaver brain remove {root}\n  \
+                         Or:    nestweaver instance merge --from <old-id> --to <correct-id>\n  \
+                         Then:  nestweaver brain add {root}",
                     );
                 }
             }
@@ -6723,31 +6725,51 @@ fn run_brain(
 
         BrainCommands::Remove { path, instance, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            let instance_id = instance.as_deref().unwrap_or("default");
 
-            // Resolve the vault UID the same way the indexer / watcher do.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
+            let canon_str = canonical.to_string_lossy();
+            let v_uid = nestweaver_schema::vault_uid(instance_id, &canon_str);
 
             let store = open_store(Some(&db_path))?;
-            // lookup_vault gives us a friendly name for the success line.
-            let vault_name = store
-                .lookup_vault(&v_uid)
-                .map(|v| v.name)
-                .unwrap_or_else(|_| {
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("vault")
-                        .to_string()
-                });
-            let dropped = store
-                .delete_vault_cascade(&v_uid)
-                .context("delete_vault_cascade")?;
+
+            // Collect all vault UIDs that should be removed:
+            // 1. The computed UID (normal case).
+            // 2. Any vault whose root_path matches, regardless of instance
+            //    (catches ghost rows left by buggy merges with wrong UIDs).
+            let mut uids_to_remove: Vec<String> = vec![v_uid];
+            if let Ok(all_vaults) = store.list_vaults(None) {
+                for v in &all_vaults {
+                    let v_canon = std::fs::canonicalize(&v.root_path)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| v.root_path.clone());
+                    if v_canon == *canon_str && !uids_to_remove.contains(&v.uid) {
+                        uids_to_remove.push(v.uid.clone());
+                    }
+                }
+            }
+
+            let mut total_dropped = 0usize;
+            let mut vault_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("vault")
+                .to_string();
+            for uid in &uids_to_remove {
+                if let Ok(v) = store.lookup_vault(uid) {
+                    vault_name = v.name;
+                }
+                if let Ok(n) = store.delete_vault_cascade(uid) {
+                    total_dropped += n;
+                }
+            }
             println!(
-                "Removed vault '{}' ({} note(s) dropped). Tantivy + PPR sidecars \
-                 may be stale; run `nestweaver brain reindex-search` if you want \
-                 to clear them too.",
-                vault_name, dropped
+                "Removed vault '{}' ({} note(s) dropped, {} row(s) cleaned). \
+                 Tantivy + PPR sidecars may be stale; run \
+                 `nestweaver brain reindex-search` if you want to clear them too.",
+                vault_name,
+                total_dropped,
+                uids_to_remove.len()
             );
             Ok((EXIT_SUCCESS, None))
         }
