@@ -826,6 +826,13 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(HubNodesResponse { result_json }))
     }
 
+    async fn brain_status_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        json_rpc!(self, r, "brain_status")
+    }
+
     // ── Read RPCs — JSON pass-through ───────────────────────────────
 
     async fn get_backlinks(

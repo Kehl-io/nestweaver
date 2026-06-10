@@ -217,6 +217,7 @@ service NestWeaverDaemon {
   rpc GetProjectContext(ProjectContextRequest) returns (ProjectContextResponse);
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
+  rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
   rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);
 
   // Read RPCs — JSON pass-through

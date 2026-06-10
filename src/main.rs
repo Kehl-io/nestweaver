@@ -15,7 +15,7 @@ use nestweaver_engine::{
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules, HubNode,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
     generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
@@ -2963,6 +2963,81 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: _,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard (typed RPC) ──────────────────────────
+            if use_daemon {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let connect =
+                        rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                    if let Ok(mut client) = connect {
+                        let req = nestweaver_proto::HubNodesRequest {
+                            top_n: top as i32,
+                            response_format: String::new(),
+                        };
+                        let rpc = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .hub_nodes(req)
+                                .await
+                                .map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                let value: serde_json::Value =
+                                    serde_json::from_str(&resp.result_json)
+                                        .unwrap_or(serde_json::json!({}));
+                                if json {
+                                    println!("{}", serde_json::to_string_pretty(&value)?);
+                                } else {
+                                    let hubs: Vec<HubNode> = value
+                                        .get("hubs")
+                                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                        .unwrap_or_default();
+                                    if hubs.is_empty() {
+                                        println!("No hub nodes found (graph may be empty).");
+                                    } else {
+                                        println!(
+                                            "Top {} hub nodes (by total degree):\n",
+                                            hubs.len()
+                                        );
+                                        for h in &hubs {
+                                            let cluster = h
+                                                .cluster_id
+                                                .map(|id| format!(" cluster={id}"))
+                                                .unwrap_or_default();
+                                            println!(
+                                                "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                                                h.name,
+                                                h.file_path,
+                                                h.in_degree,
+                                                h.out_degree,
+                                                h.total_degree,
+                                                h.pagerank_score,
+                                            );
+                                        }
+                                    }
+                                }
+                                let stats = format!(
+                                    "{} hubs in {} (via daemon)",
+                                    value
+                                        .get("count")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0),
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(status) => {
+                                eprintln!(
+                                    "warning: daemon hub_nodes RPC failed ({}); falling back to direct DB read",
+                                    status.message()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
 
             let mut hubs = find_hub_nodes(&store, top)?;
@@ -3981,6 +4056,66 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(|| default_db_path());
+                let mut args = serde_json::json!({ "pattern": pattern });
+                if let Some(ref pp) = path_prefix {
+                    args["path_prefix"] = serde_json::json!(pp);
+                }
+                if let Some(ref k) = kinds {
+                    args["kinds"] = serde_json::json!(k);
+                }
+                if let Some(l) = limit {
+                    args["limit"] = serde_json::json!(l);
+                }
+                if let Some(ms) = max_millis {
+                    args["max_millis"] = serde_json::json!(ms);
+                }
+                if let Some(value) = try_daemon_json_rpc(
+                    true,
+                    &db_path,
+                    None,
+                    "regex_search",
+                    args,
+                ) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let res: nestweaver_store::regex::RegexSearchResult =
+                            serde_json::from_value(value).unwrap_or_else(|_| {
+                                nestweaver_store::regex::RegexSearchResult {
+                                    results: vec![],
+                                    truncated: false,
+                                    scanned_fallback: false,
+                                }
+                            });
+                        if res.results.is_empty() {
+                            println!("No matches for '{pattern}'.");
+                        } else {
+                            println!("Found {} match(es) for '{pattern}':", res.results.len());
+                            for m in &res.results {
+                                println!(
+                                    "  [{}] {} {} — {}",
+                                    m.kind, m.title, m.location, m.snippet
+                                );
+                            }
+                            if res.truncated {
+                                println!(
+                                    "(results truncated — hit candidate cap or time budget)"
+                                );
+                            }
+                            if res.scanned_fallback {
+                                println!(
+                                    "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                                );
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let res = store
                 .regex_search(
@@ -4190,6 +4325,80 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: _,
             ..
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                if let Some(value) = try_daemon_json_rpc(
+                    true,
+                    &db_path,
+                    None,
+                    "brain_impact",
+                    serde_json::json!({
+                        "symbol": name_or_uid,
+                        "depth": depth,
+                        "min_confidence": confidence,
+                    }),
+                ) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else if let Some(arr) = value.get("impact_nodes") {
+                        #[derive(serde::Deserialize)]
+                        struct DaemonImpactNode {
+                            uid: String,
+                            name: String,
+                            file_path: String,
+                            start_line: u32,
+                            edge_type: String,
+                            confidence: f32,
+                            depth: u32,
+                        }
+                        let nodes: Vec<DaemonImpactNode> =
+                            serde_json::from_value(arr.clone()).unwrap_or_default();
+                        let count = nodes.len();
+                        if nodes.is_empty() {
+                            if !out.quiet {
+                                println!("No impact found for '{name_or_uid}'.");
+                            }
+                        } else {
+                            if !out.quiet {
+                                println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                            }
+                            for n in &nodes {
+                                if out.verbose {
+                                    println!(
+                                        "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
+                                        n.depth,
+                                        n.name,
+                                        n.edge_type,
+                                        n.confidence,
+                                        n.file_path,
+                                        n.start_line,
+                                        n.uid,
+                                    );
+                                } else {
+                                    println!(
+                                        "  [depth {}] {} via {} ({:.2}) — {}:{}",
+                                        n.depth,
+                                        n.name,
+                                        n.edge_type,
+                                        n.confidence,
+                                        n.file_path,
+                                        n.start_line,
+                                    );
+                                }
+                            }
+                        }
+                        let stats = format!(
+                            "{} affected symbols in {} (via daemon)",
+                            count,
+                            format_elapsed(t0.elapsed())
+                        );
+                        return Ok((EXIT_SUCCESS, Some(stats)));
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
 
             // Resolve the symbol UID first (may be a name).
@@ -5935,6 +6144,10 @@ fn try_daemon_json_rpc(
             "brain_topic_clusters" => client.inner_mut().brain_topic_clusters(req).await,
             "brain_tag_graph" => client.inner_mut().brain_tag_graph(req).await,
             "brain_doc_stats" => client.inner_mut().brain_doc_stats(req).await,
+            "brain_impact" => client.inner_mut().impact(req).await,
+            "regex_search" => client.inner_mut().regex_search(req).await,
+            "stale_check" => client.inner_mut().stale_check(req).await,
+            "brain_status" => client.inner_mut().brain_status_json(req).await,
             _ => return None,
         };
         resp.ok().map(|r| r.into_inner().result_json)
@@ -6172,6 +6385,80 @@ fn run_brain(
         BrainCommands::Status { json, db, config } => {
             let db_resolved = resolve_db_with_config(db, config.as_deref())?;
             let db_path = db_resolved.as_path();
+
+            // ── daemon guard ──────────────────────────────────────
+            if let Some(value) = try_daemon_json_rpc(
+                use_daemon,
+                db_path,
+                config.as_deref(),
+                "brain_status",
+                serde_json::json!({}),
+            ) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("Brain status:");
+                    println!("  Database:  {}", db_path.display());
+                    let vault_count = value
+                        .get("vault_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!("  Vaults:    {}", vault_count);
+                    if let Some(vaults) = value.get("vaults").and_then(|v| v.as_array()) {
+                        for v in vaults {
+                            let name = v["name"].as_str().unwrap_or("?");
+                            let note_count = v["note_count"].as_u64().unwrap_or(0);
+                            let last_indexed = v["last_indexed"]
+                                .as_str()
+                                .unwrap_or("never");
+                            println!(
+                                "    - {} ({note_count} notes, last indexed: {last_indexed})",
+                                name
+                            );
+                        }
+                    }
+                    let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let headings = value
+                        .get("headings")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let sections = value
+                        .get("sections")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let tags = value.get("tags").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let wikilinks = value
+                        .get("wikilinks")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let repo_count = value
+                        .get("repo_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!("  Notes:     {notes}");
+                    println!("  Headings:  {headings}");
+                    println!("  Sections:  {sections}");
+                    println!("  Tags:      {tags}");
+                    println!("  Wikilinks: {wikilinks}");
+                    println!("  Repos:     {repo_count}");
+                    // Interaction tracking — local check (not in MCP response).
+                    match nestweaver_engine::load_interaction_data(db_path) {
+                        Some(data) => {
+                            println!(
+                                "  interaction_tracking: enabled ({} nodes scored)",
+                                data.scores.len()
+                            );
+                        }
+                        None => {
+                            println!(
+                                "  interaction_tracking: disabled (run with --track-interactions to enable)"
+                            );
+                        }
+                    }
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
             let note_count = store.count_notes().map_err(|e| anyhow::anyhow!(e))?;
@@ -6328,6 +6615,61 @@ fn run_brain(
 
         BrainCommands::StaleCheck { json, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if let Some(value) = try_daemon_json_rpc(
+                use_daemon,
+                &db_path,
+                None,
+                "stale_check",
+                serde_json::json!({}),
+            ) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    let repo_count = value
+                        .get("repo_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let any_stale = value
+                        .get("any_stale")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let repos = value
+                        .get("repos")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if repos.is_empty() {
+                        println!("No repos indexed.");
+                    } else {
+                        println!(
+                            "Stale check: {} repo(s), {}",
+                            repo_count,
+                            if any_stale {
+                                "INDEX IS STALE"
+                            } else {
+                                "up to date"
+                            }
+                        );
+                        for r in &repos {
+                            let url = r["url"].as_str().unwrap_or("?");
+                            let stale = r["is_stale"].as_bool().unwrap_or(false);
+                            let indexed_full = r["indexed_sha"].as_str().unwrap_or("?");
+                            let indexed = &indexed_full[..8.min(indexed_full.len())];
+                            let head = r["current_head"]
+                                .as_str()
+                                .map(|h| &h[..8.min(h.len())])
+                                .unwrap_or("unknown");
+                            let marker = if stale { "STALE" } else { "ok" };
+                            println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                        }
+                    }
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(&db_path))?;
             let repos = store.list_repos(None).unwrap_or_default();
 
