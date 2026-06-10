@@ -2376,11 +2376,7 @@ impl GraphStore {
     ///
     /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
     /// since SET is not supported for property updates.
-    pub fn merge_instance_ids(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> Result<MergeResult, StoreError> {
+    pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
