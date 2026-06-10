@@ -60,6 +60,37 @@ export interface BrainContextResult {
   unresolved_seeds: string[];
 }
 
+export interface OverviewCounts {
+  repo_count: number;
+  service_count: number;
+  vault_count: number;
+  note_count: number;
+  symbol_count: number;
+  gap_count: number;
+}
+
+export interface OverviewLandmark {
+  uid: string;
+  kind: string;
+  label: string;
+  location: string;
+  score: number;
+  reason: string;
+}
+
+export interface OverviewGap {
+  kind: string;
+  label: string;
+  detail: string;
+}
+
+export interface OverviewResponse {
+  counts: OverviewCounts;
+  landmarks: OverviewLandmark[];
+  start_here: OverviewLandmark[];
+  gaps: OverviewGap[];
+}
+
 export interface Repo {
   uid: string;
   url: string;
@@ -195,6 +226,7 @@ export interface GapReport {
 }
 
 export type GraphMode =
+  | "overview"
   | "context"
   | "impact"
   | "repos"

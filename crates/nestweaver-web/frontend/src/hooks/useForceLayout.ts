@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type Graph from "graphology";
 import { useStore } from "../stores";
 
 interface WorkerTickMessage {
@@ -13,14 +14,13 @@ interface WorkerEndMessage {
 type WorkerOutMessage = WorkerTickMessage | WorkerEndMessage;
 
 export interface ForceLayoutControls {
-  start: () => void;
+  start: (graphOverride?: Graph) => void;
   stop: () => void;
   kill: () => void;
   isRunning: boolean;
 }
 
 export function useForceLayout(): ForceLayoutControls {
-  const graphInstance = useStore((s) => s.graphInstance);
   const forceParams = useStore((s) => s.forceParams);
   const setGraphData = useStore((s) => s.setGraphData);
 
@@ -52,7 +52,8 @@ export function useForceLayout(): ForceLayoutControls {
     setIsRunning(false);
   }, []);
 
-  const start = useCallback(() => {
+  const start = useCallback((graphOverride?: Graph) => {
+    const graphInstance = graphOverride ?? useStore.getState().graphInstance;
     if (!graphInstance || graphInstance.order === 0) return;
 
     const graph = graphInstance;
@@ -113,7 +114,7 @@ export function useForceLayout(): ForceLayoutControls {
     });
 
     setIsRunning(true);
-  }, [graphInstance, forceParams, getOrCreateWorker, setGraphData]);
+  }, [forceParams, getOrCreateWorker, setGraphData]);
 
   useEffect(() => {
     return () => {

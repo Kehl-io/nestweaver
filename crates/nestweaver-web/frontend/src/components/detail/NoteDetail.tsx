@@ -6,6 +6,7 @@ import type {
   UnlinkedMention,
 } from "../../api/types";
 import { useStore } from "../../stores";
+import { NodeActionBar } from "../actions/NodeActionBar";
 import { Collapsible } from "../shared/Collapsible";
 import { KindBadge } from "../shared/KindBadge";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -15,8 +16,8 @@ interface NoteDetailProps {
 }
 
 export function NoteDetail({ uid }: NoteDetailProps) {
-  const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
+  const detailFocus = useStore((s) => s.detailFocus);
 
   const [detail, setDetail] = useState<NoteDetailType | null>(null);
   const [backlinks, setBacklinks] = useState<BacklinkRow[]>([]);
@@ -54,8 +55,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
   }, [uid]);
 
   const handleWikilink = (target: string) => {
-    selectNode(target, "note");
-    setSeeds([target]);
+    exploreNode(target, "note");
   };
 
   if (loading) {
@@ -102,11 +102,21 @@ export function NoteDetail({ uid }: NoteDetailProps) {
           <span>{headings.length} headings</span>
           <span>PageRank: {note.pagerank_score.toFixed(4)}</span>
         </div>
+        <NodeActionBar
+          node={{ uid: note.uid, kind: "note", label: note.title }}
+          ids={["open", "related", "ask"]}
+          compact
+          className="mt-3"
+        />
       </div>
 
       {/* Middle: Outline & References */}
       <div className="mb-4 space-y-1">
-        <Collapsible title="Outline" count={headings.length} defaultOpen={headings.length > 0}>
+        <Collapsible
+          title="Outline"
+          count={headings.length}
+          defaultOpen={headings.length > 0}
+        >
           {headings.length === 0 ? (
             <div className="px-4 py-1 text-[10px] text-[var(--color-text-muted)]">
               No headings.
@@ -134,7 +144,13 @@ export function NoteDetail({ uid }: NoteDetailProps) {
       </div>
 
       {/* Bottom: Body */}
-      <div className="mb-4">
+      <div
+        className={`mb-4 ${
+          detailFocus === "source"
+            ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
+            : ""
+        }`}
+      >
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
           Content
         </h3>
@@ -145,7 +161,13 @@ export function NoteDetail({ uid }: NoteDetailProps) {
 
       {/* Backlinks */}
       {backlinks.length > 0 && (
-        <div className="mb-4">
+        <div
+          className={`mb-4 ${
+            detailFocus === "related"
+              ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
+              : ""
+          }`}
+        >
           <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
             Backlinks ({backlinks.length})
           </h3>
@@ -155,8 +177,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
                 <button
                   type="button"
                   onClick={() => {
-                    selectNode(bl.source_note_uid, "note");
-                    setSeeds([bl.source_note_uid]);
+                    exploreNode(bl.source_note_uid, "note");
                   }}
                   className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-surface-alt)]"
                 >
@@ -175,7 +196,13 @@ export function NoteDetail({ uid }: NoteDetailProps) {
 
       {/* Unlinked mentions */}
       {unlinked.length > 0 && (
-        <div className="mb-4">
+        <div
+          className={`mb-4 ${
+            detailFocus === "related"
+              ? "rounded border border-[var(--color-graph-selection)]/40 bg-[var(--color-graph-selection)]/5 p-2"
+              : ""
+          }`}
+        >
           <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
             Unlinked mentions ({unlinked.length})
           </h3>
@@ -185,8 +212,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
                 <button
                   type="button"
                   onClick={() => {
-                    selectNode(um.note_uid, "note");
-                    setSeeds([um.note_uid]);
+                    exploreNode(um.note_uid, "note");
                   }}
                   className="w-full rounded px-2 py-1 text-left text-xs hover:bg-[var(--color-surface-alt)]"
                 >

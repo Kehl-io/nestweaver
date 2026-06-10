@@ -412,6 +412,11 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -429,7 +434,7 @@ impl NestWeaverDaemon for DaemonService {
                 &state.store,
                 &vault_path,
                 &state.db_path,
-                &state.instance_id,
+                &instance_id,
                 &vault_name,
                 &extra_patterns,
             );
@@ -501,6 +506,26 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<RefreshBrainRequest>,
     ) -> Result<Response<Self::RefreshBrainStream>, Status> {
         Err(Status::unimplemented("RefreshBrain is not yet implemented"))
+    }
+
+    async fn reindex_search(
+        &self,
+        _request: Request<ReindexSearchRequest>,
+    ) -> Result<Response<ReindexSearchResponse>, Status> {
+        let tantivy = self
+            .state
+            .tantivy
+            .as_ref()
+            .filter(|t| t.has_writer())
+            .ok_or_else(|| {
+                Status::failed_precondition("daemon has no writer-mode Tantivy index")
+            })?;
+        let count = tantivy
+            .reindex_from_store(&self.state.store)
+            .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
+        Ok(Response::new(ReindexSearchResponse {
+            document_count: count as i32,
+        }))
     }
 
     // ── Read RPCs — typed hot-path ─────────────────────────────────
@@ -799,6 +824,13 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
 
         Ok(Response::new(HubNodesResponse { result_json }))
+    }
+
+    async fn brain_status_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        json_rpc!(self, r, "brain_status")
     }
 
     // ── Read RPCs — JSON pass-through ───────────────────────────────

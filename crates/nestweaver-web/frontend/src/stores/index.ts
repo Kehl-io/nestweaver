@@ -38,7 +38,18 @@ export const useStore = create<StoreState>()(
       })),
       {
         name: "nestweaver-ui",
-        version: 1,
+        version: 3,
+        migrate: (persistedState: any, version: number) => {
+          if (persistedState && typeof persistedState === "object") {
+            const state = { ...persistedState };
+            if (version < 3) {
+              delete state.graphMode;
+              delete state.layoutMode;
+            }
+            return state;
+          }
+          return persistedState;
+        },
         partialize: (state: any) => ({
           layoutMode: state.layoutMode,
           nodeTypeFilter: state.nodeTypeFilter,
@@ -46,7 +57,6 @@ export const useStore = create<StoreState>()(
           forceParams: state.forceParams,
           activeStyleRules: state.activeStyleRules,
           theme: state.theme,
-          graphMode: state.graphMode,
           explorerTab: state.explorerTab,
           communityOverlay: state.communityOverlay,
           tagsVisible: state.tagsVisible,

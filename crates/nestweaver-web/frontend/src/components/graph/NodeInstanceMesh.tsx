@@ -16,27 +16,43 @@ attribute float aPhase;
 attribute float aSize;
 attribute vec3 aColor;
 attribute float aHighlight;
+attribute float aImportance;
+attribute float aSeed;
+attribute float aBridge;
 
 uniform float u_time;
 uniform float u_breatheAmp;
+uniform float u_motionAmp;
+uniform float u_intro;
 
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_importance;
+varying float v_seed;
+varying float v_bridge;
+varying float v_phase;
 
 void main() {
     v_uv = uv;
     v_color = aColor;
     v_highlight = aHighlight;
+    v_importance = aImportance;
+    v_seed = aSeed;
+    v_bridge = aBridge;
+    v_phase = aPhase;
 
-    // Breathing: per-instance scale oscillation (disabled when u_breatheAmp == 0)
+    // Nodes arrive with a quick scale-in while staying locked to their graph coordinates.
+    float intro = clamp(u_intro, 0.0, 1.0);
+    float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.08 * u_motionAmp;
+    float introScale = mix(0.62, 1.0, intro) + rebound;
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
-    float scale = aSize * breathe;
+    float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
+    float beaconScale = 0.62 + aImportance * 0.06;
+    float scale = aSize * beaconScale * introScale * breathe * focusLift;
 
-    // Scale the quad in local space
     vec3 pos = position * scale;
 
-    // Apply instance matrix (position only — scale handled above)
     vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
 }
@@ -46,32 +62,40 @@ const fragmentShader = /* glsl */ `
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_importance;
+varying float v_seed;
+varying float v_bridge;
+varying float v_phase;
+
+uniform float u_time;
 
 void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
 
-    // SDF circle — crisp edge
-    float circle = 1.0 - smoothstep(0.82, 0.88, dist);
+    // Obsidian-like dot: clean filled center, soft antialiasing, glow only on focus.
+    float body = 1.0 - smoothstep(0.68, 0.78, dist);
+    float hotCore = exp(-7.5 * dist * dist);
+    float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
+    float focusAura = exp(-8.2 * max(0.0, dist - 0.62)) *
+        v_highlight *
+        (0.11 + pulse * 0.08);
 
-    // Radial gradient: bright center → saturated rim (keeps color visible)
-    float t = clamp(dist / 0.82, 0.0, 1.0);
-    vec3 fillColor = v_color * mix(1.3, 0.85, t);
+    vec3 coreColor = mix(v_color * 0.96, v_color * 1.04, hotCore * 0.28);
+    coreColor *= 0.98 + v_importance * 0.08 + v_highlight * 0.24 + v_seed * 0.08;
 
-    // Highlight: selected/hovered nodes burn brighter
-    fillColor *= (1.0 + v_highlight * 1.0);
+    vec3 focusInk = v_color * 1.32;
 
-    // Outer glow: wide, soft, vivid — the "fierce" halo
-    float glowDist = max(0.0, dist - 0.7);
-    float glow = exp(-4.5 * glowDist) * 0.35;
+    vec3 color =
+        coreColor * body +
+        focusInk * hotCore * v_highlight * 0.20 +
+        focusInk * focusAura;
 
-    // Inner core bloom: adds depth, not overwhelming
-    float core = exp(-4.0 * dist) * 0.1;
+    float halo = exp(-8.6 * max(0.0, dist - 0.74)) * (v_highlight * 0.045 + v_seed * 0.018);
+    color += v_color * halo;
+    float alpha = max(body, max(focusAura, halo));
 
-    vec3 color = fillColor * circle + v_color * (glow + core);
-    float alpha = max(circle, max(glow, core));
-
-    if (alpha < 0.005) discard;
+    if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
 }
 `;
@@ -91,12 +115,18 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const hoveredNodeId = useStore((s) => s.hoveredNodeId);
   const graphInstance = useStore((s) => s.graphInstance);
+  const graphKey = useMemo(
+    () => buffers.indexToUid.join("\u0000"),
+    [buffers.indexToUid],
+  );
 
   // Shared uniforms object — stable reference so we mutate in place
   const uniforms = useMemo(
     () => ({
       u_time: { value: 0 },
-      u_breatheAmp: { value: reducedMotion ? 0 : 0.02 },
+      u_breatheAmp: { value: 0 },
+      u_motionAmp: { value: reducedMotion ? 0 : 1 },
+      u_intro: { value: reducedMotion ? 1 : 0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -104,12 +134,26 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
   // Sync reducedMotion -> uniform
   useEffect(() => {
-    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.02;
+    uniforms.u_breatheAmp.value = 0;
+    uniforms.u_motionAmp.value = reducedMotion ? 0 : 1;
+    if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
 
-  // Tick u_time every frame
+  const introStartRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    introStartRef.current = null;
+    uniforms.u_intro.value = reducedMotion ? 1 : 0;
+  }, [graphKey, reducedMotion, uniforms]);
+
+  // Tick animation uniforms every frame.
   useFrame(({ clock }) => {
-    uniforms.u_time.value = clock.getElapsedTime();
+    const elapsed = clock.getElapsedTime();
+    uniforms.u_time.value = elapsed;
+    if (!reducedMotion && uniforms.u_intro.value < 1) {
+      if (introStartRef.current === null) introStartRef.current = elapsed;
+      uniforms.u_intro.value = Math.min(1, (elapsed - introStartRef.current) / 1.2);
+    }
   });
 
   // Update instance matrices when positions change.
@@ -139,7 +183,15 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     const mesh = meshRef.current;
     if (!mesh) return;
 
-    const { nodeCount, colors, sizes, phases } = buffers;
+    const {
+      nodeCount,
+      colors,
+      sizes,
+      phases,
+      importance,
+      seedMarkers,
+      bridgeStrengths,
+    } = buffers;
 
     // aColor
     mesh.geometry.setAttribute(
@@ -157,6 +209,21 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     mesh.geometry.setAttribute(
       "aPhase",
       new InstancedBufferAttribute(phases.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aImportance",
+      new InstancedBufferAttribute(importance.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aSeed",
+      new InstancedBufferAttribute(seedMarkers.slice(), 1),
+    );
+
+    mesh.geometry.setAttribute(
+      "aBridge",
+      new InstancedBufferAttribute(bridgeStrengths.slice(), 1),
     );
 
     // aHighlight — initially all zero
@@ -227,12 +294,13 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
     const { nodeCount, colors, sizes, uidToIndex } = buffers;
 
-    // Determine neighbor set of hovered node (for dim-non-neighbors logic)
+    // Determine neighbor set of the active node (for dim-non-neighbors logic)
     const neighborSet = new Set<number>();
-    if (hoveredNodeId && graphInstance) {
-      neighborSet.add(uidToIndex.get(hoveredNodeId) ?? -1);
+    const focusNodeId = hoveredNodeId ?? selectedNodeId;
+    if (focusNodeId && graphInstance) {
+      neighborSet.add(uidToIndex.get(focusNodeId) ?? -1);
       try {
-        graphInstance.neighbors(hoveredNodeId).forEach((n) => {
+        graphInstance.neighbors(focusNodeId).forEach((n) => {
           const idx = uidToIndex.get(n);
           if (idx !== undefined) neighborSet.add(idx);
         });
@@ -252,16 +320,16 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
 
     if (!colorAttr || !sizeAttr || !highlightAttr) return;
 
-    const dimming = hoveredNodeId !== null;
+    const dimming = focusNodeId !== null;
 
     for (let i = 0; i < nodeCount; i++) {
       const baseR = colors[i * 3];
       const baseG = colors[i * 3 + 1];
       const baseB = colors[i * 3 + 2];
 
-      // Dim factor: 0.15 for non-neighbors when hovering
+      // Dim factor: pull unrelated nodes back when exploring a neighborhood.
       const isNeighbor = !dimming || neighborSet.has(i);
-      const dimFactor = isNeighbor ? 1.0 : 0.15;
+      const dimFactor = isNeighbor ? 1.0 : 0.64;
 
       // Size modifiers
       let sizeMult = 1.0;

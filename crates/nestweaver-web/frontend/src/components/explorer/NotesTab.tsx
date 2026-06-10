@@ -49,8 +49,7 @@ function KindBadge({ kind }: { kind: string }) {
 }
 
 export function NotesTab() {
-  const setSeeds = useStore((s) => s.setSeeds);
-  const setGraphMode = useStore((s) => s.setGraphMode);
+  const exploreNode = useStore((s) => s.exploreNode);
   const selectNode = useStore((s) => s.selectNode);
 
   const [vaults, setVaults] = useState<Vault[]>([]);
@@ -157,8 +156,7 @@ export function NotesTab() {
                         <button
                           type="button"
                           onClick={() => {
-                            setSeeds([note.uid]);
-                            setGraphMode("context");
+                            exploreNode(note.uid, "note");
                           }}
                           className="flex w-full items-center gap-1.5 border-b border-[var(--color-border)] px-4 py-1.5 text-left hover:bg-[var(--color-surface-alt)]"
                         >

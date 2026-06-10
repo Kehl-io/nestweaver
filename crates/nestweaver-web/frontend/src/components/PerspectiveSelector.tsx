@@ -119,9 +119,12 @@ export function PerspectiveSelector() {
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-xs outline-none hover:bg-[var(--color-surface)]"
+        className="shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-xs outline-none hover:bg-[var(--color-surface)]"
       >
-        {activePerspective ? activePerspective.name : "Perspectives"}
+        <span className="hidden sm:inline">
+          {activePerspective ? activePerspective.name : "Perspectives"}
+        </span>
+        <span className="sm:hidden">View</span>
       </button>
 
       {open && (
@@ -171,12 +174,12 @@ export function PerspectiveSelector() {
                   }}
                   placeholder="Name..."
                   autoFocus
-                  className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs outline-none focus:border-blue-500"
+                  className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs outline-none focus:border-[var(--color-graph-selection)]"
                 />
                 <button
                   type="button"
                   onClick={saveCurrentView}
-                  className="rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-500"
+                  className="rounded bg-[var(--color-graph-selection)] px-2 py-1 text-xs text-white opacity-90 hover:opacity-100"
                 >
                   Save
                 </button>
@@ -185,7 +188,7 @@ export function PerspectiveSelector() {
               <button
                 type="button"
                 onClick={() => setSaving(true)}
-                className="w-full px-3 py-1.5 text-left text-sm text-blue-400 hover:bg-[var(--color-surface-alt)]"
+                className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-graph-selection)] hover:bg-[var(--color-surface-alt)]"
               >
                 Save current view
               </button>

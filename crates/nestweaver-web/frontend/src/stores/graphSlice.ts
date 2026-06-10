@@ -2,6 +2,9 @@ import type { StateCreator } from "zustand";
 import type { GraphMode, ScopeFilter } from "../api/types";
 import type { StoreState } from "./index";
 
+export type DetailFocus = "summary" | "source" | "related" | "analysis";
+export type ViewMode = "graph" | "list" | "matrix";
+
 export interface GraphSlice {
   selectedNodeId: string | null;
   selectedNodeKind: string | null;
@@ -21,14 +24,19 @@ export interface GraphSlice {
   activeStyleRules: Record<string, boolean>;
   reducedEffects: boolean;
   toggleReducedEffects: () => void;
-  viewMode: "graph" | "list";
+  viewMode: ViewMode;
+  detailFocus: DetailFocus;
   toggleViewMode: () => void;
+  setViewMode: (mode: ViewMode) => void;
+  setDetailFocus: (focus: DetailFocus) => void;
   cameraZoom: number;
   setCameraZoom: (zoom: number) => void;
   selectNode: (id: string | null, kind?: string | null) => void;
+  exploreNode: (id: string, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
   setSeeds: (seeds: string[]) => void;
+  addSeed: (uid: string) => void;
   setScopeFilter: (filter: ScopeFilter) => void;
   setScopeRepo: (uid: string | null) => void;
   setScopeVault: (uid: string | null) => void;
@@ -55,7 +63,7 @@ export const createGraphSlice: StateCreator<
   selectedNodeId: null,
   selectedNodeKind: null,
   hoveredNodeId: null,
-  graphMode: "context",
+  graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
   scopeRepoUid: null,
@@ -71,13 +79,14 @@ export const createGraphSlice: StateCreator<
     calls: true, imports: true, extends: true, implements: true, includes: true,
   },
   forceParams: { repulsion: 2, gravity: 1, settling: 10 },
-  layoutMode: "panels" as const,
+  layoutMode: "zen" as const,
   activeStyleRules: {
     colorByDir: false, sizeByCallers: false,
     highlightEntryPoints: false, highlightHighPageRank: false,
   },
   reducedEffects: false,
   viewMode: "graph" as const,
+  detailFocus: "summary" as const,
   cameraZoom: 1,
 
   toggleReducedEffects: () =>
@@ -87,7 +96,22 @@ export const createGraphSlice: StateCreator<
 
   toggleViewMode: () =>
     set((s) => {
-      s.viewMode = s.viewMode === "graph" ? "list" : "graph";
+      s.viewMode =
+        s.viewMode === "graph"
+          ? "list"
+          : s.viewMode === "list"
+            ? "matrix"
+            : "graph";
+    }),
+
+  setViewMode: (mode) =>
+    set((s) => {
+      s.viewMode = mode;
+    }),
+
+  setDetailFocus: (focus) =>
+    set((s) => {
+      s.detailFocus = focus;
     }),
 
   setCameraZoom: (zoom) =>
@@ -99,6 +123,16 @@ export const createGraphSlice: StateCreator<
     set((s) => {
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
+      s.detailFocus = "summary";
+    }),
+
+  exploreNode: (id, kind) =>
+    set((s) => {
+      s.selectedNodeId = id;
+      s.selectedNodeKind = kind ?? null;
+      s.seeds = [id];
+      s.graphMode = "context";
+      s.detailFocus = "summary";
     }),
 
   hoverNode: (id) =>
@@ -114,6 +148,12 @@ export const createGraphSlice: StateCreator<
   setSeeds: (seeds) =>
     set((s) => {
       s.seeds = seeds;
+    }),
+
+  addSeed: (uid) =>
+    set((s) => {
+      if (!s.seeds.includes(uid)) s.seeds.push(uid);
+      s.graphMode = "context";
     }),
 
   setScopeFilter: (filter) =>

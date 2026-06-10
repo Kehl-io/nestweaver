@@ -37,13 +37,13 @@ export function StyleRules({ open }: Props) {
             onClick={() => toggleStyleRule(rule.key)}
             className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left transition-colors ${
               active
-                ? "bg-blue-50 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
+                ? "bg-[color-mix(in_srgb,var(--color-graph-selection)_12%,transparent)] text-[var(--color-graph-selection)]"
                 : "text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] dark:hover:bg-white/5"
             }`}
           >
             <span>{rule.label}</span>
             {active && (
-              <span className="ml-2 text-blue-600 dark:text-blue-300" aria-label="active">
+              <span className="ml-2 text-[var(--color-graph-selection)]" aria-label="active">
                 ✓
               </span>
             )}

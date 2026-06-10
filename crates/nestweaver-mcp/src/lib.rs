@@ -234,10 +234,21 @@ pub fn run_stdio_server_daemon(
     mut grpc_client: tools::DaemonGrpcClient,
     rt: tokio::runtime::Runtime,
     lite: bool,
+    track_interactions: bool,
+    db_path: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     tools::set_lite_mode(lite);
 
-    tracing::info!("brain MCP server ready on stdio (daemon proxy mode)");
+    let tracker: Option<nestweaver_engine::InteractionTracker> = if track_interactions {
+        Some(nestweaver_engine::InteractionTracker::new(db_path))
+    } else {
+        None
+    };
+
+    tracing::info!(
+        track_interactions,
+        "brain MCP server ready on stdio (daemon proxy mode)"
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -248,6 +259,12 @@ pub fn run_stdio_server_daemon(
         line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
+            if let Some(tracker) = &tracker {
+                maybe_record_terminal_success(tracker);
+                if let Err(e) = tracker.flush() {
+                    tracing::warn!("failed to flush interaction tracker: {e}");
+                }
+            }
             tracing::info!("client closed stdin; shutting down (daemon proxy)");
             return Ok(());
         }
@@ -293,7 +310,7 @@ pub fn run_stdio_server_daemon(
                     }
                 };
                 let is_notification = req.id.is_none();
-                let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req);
+                let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req, tracker.as_ref());
                 if is_notification {
                     if let Frame::Error(e) = outcome {
                         tracing::warn!(
@@ -330,7 +347,7 @@ pub fn run_stdio_server_daemon(
                 }
             };
             let is_notification = req.id.is_none();
-            let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req);
+            let outcome = dispatch_method_daemon(&mut grpc_client, &rt, &req, tracker.as_ref());
             if is_notification {
                 if let Frame::Error(e) = outcome {
                     tracing::warn!(
@@ -351,6 +368,7 @@ fn dispatch_method_daemon(
     client: &mut tools::DaemonGrpcClient,
     rt: &tokio::runtime::Runtime,
     req: &protocol::Request,
+    tracker: Option<&nestweaver_engine::InteractionTracker>,
 ) -> Frame {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -395,8 +413,13 @@ fn dispatch_method_daemon(
                 ));
             };
 
-            match tools::dispatch_via_daemon(client, rt, &name, arguments) {
-                Ok(result) => Frame::Success(success(id, tools::wrap_tool_result(result))),
+            match tools::dispatch_via_daemon(client, rt, &name, arguments.clone()) {
+                Ok(result) => {
+                    if let Some(tracker) = tracker {
+                        record_interaction(tracker, &name, &arguments, &result);
+                    }
+                    Frame::Success(success(id, tools::wrap_tool_result(result)))
+                }
                 Err(e) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
             }
         }

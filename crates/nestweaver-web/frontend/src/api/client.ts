@@ -7,6 +7,7 @@ import type {
   ImpactNode,
   Note,
   NoteDetail,
+  OverviewResponse,
   Perspective,
   Repo,
   ScopeFilter,
@@ -85,6 +86,10 @@ export const api = {
       token_budget: tokenBudget,
       scope,
     });
+  },
+
+  overview(limit = 24) {
+    return get<OverviewResponse>(`/api/v1/overview?limit=${limit}`);
   },
 
   impact(uid: string, depth = 3, confidence = 0.5) {
@@ -185,6 +190,24 @@ export const api = {
     });
   },
 };
+
+export async function loadGapItems(): Promise<import("../stores/analysisSlice").GapItem[]> {
+  const report = await api.gaps();
+  return [
+    ...report.undocumented.map((m) => ({
+      type: "undocumented" as const,
+      label: m.module,
+      detail: `${m.symbol_count} symbols with no documentation`,
+      nodeUids: [] as string[],
+    })),
+    ...report.untested.map((uid) => ({
+      type: "untested" as const,
+      label: uid.split(":").pop() || uid,
+      detail: "Entry point with no test coverage",
+      nodeUids: [uid],
+    })),
+  ];
+}
 
 /** Return type for suggest-links; not in shared types since it's endpoint-specific. */
 interface CrossRepoLinkSuggestion {

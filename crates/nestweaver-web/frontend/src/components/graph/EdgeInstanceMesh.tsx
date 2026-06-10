@@ -7,20 +7,24 @@ import {
   PlaneGeometry,
 } from "three";
 import type { GraphBuffers } from "../../hooks/useGraphBridge";
+import { useStore } from "../../stores";
 
-const EDGE_THICKNESS = 0.8; // world units — adjust for visual weight
+const EDGE_THICKNESS = 0.78;
 
 const vertexShader = /* glsl */ `
   attribute vec3 aSourceColor;
   attribute vec3 aTargetColor;
+  attribute float aStrength;
 
   varying vec3 v_sourceColor;
   varying vec3 v_targetColor;
   varying float v_t;
+  varying float v_strength;
 
   void main() {
     v_sourceColor = aSourceColor;
     v_targetColor = aTargetColor;
+    v_strength = aStrength;
     // Local X runs from -0.5 (source end) to +0.5 (target end)
     v_t = position.x + 0.5;
     gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0);
@@ -33,10 +37,11 @@ const fragmentShader = /* glsl */ `
   varying vec3 v_sourceColor;
   varying vec3 v_targetColor;
   varying float v_t;
+  varying float v_strength;
 
   void main() {
     vec3 color = mix(v_sourceColor, v_targetColor, v_t);
-    gl_FragColor = vec4(color, u_opacity);
+    gl_FragColor = vec4(color, u_opacity * v_strength);
   }
 `;
 
@@ -47,13 +52,15 @@ interface Props {
 export function EdgeInstanceMesh({ buffers }: Props) {
   const meshRef = useRef<InstancedMesh>(null);
   const tempObj = useMemo(() => new Object3D(), []);
+  const hoveredNodeId = useStore((s) => s.hoveredNodeId);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
 
   const material = useMemo(
     () =>
       new ShaderMaterial({
         vertexShader,
         fragmentShader,
-        uniforms: { u_opacity: { value: 0.45 } },
+        uniforms: { u_opacity: { value: 0.24 } },
         transparent: true,
         depthTest: false,
         depthWrite: false,
@@ -116,7 +123,40 @@ export function EdgeInstanceMesh({ buffers }: Props) {
       "aTargetColor",
       new InstancedBufferAttribute(targetColors, 3),
     );
+    mesh.geometry.setAttribute(
+      "aStrength",
+      new InstancedBufferAttribute(new Float32Array(edgeCount).fill(1), 1),
+    );
   }, [buffers, tempObj]);
+
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+
+    const { edgeCount, edgeNodeIndices, uidToIndex } = buffers;
+    const strengths = new Float32Array(edgeCount);
+    const focusId = hoveredNodeId ?? selectedNodeId;
+    const focusIdx = focusId ? uidToIndex.get(focusId) : undefined;
+
+    for (let i = 0; i < edgeCount; i++) {
+      const sourceIdx = edgeNodeIndices[i * 2 + 0];
+      const targetIdx = edgeNodeIndices[i * 2 + 1];
+      const connected =
+        focusIdx !== undefined &&
+        (sourceIdx === focusIdx || targetIdx === focusIdx);
+      strengths[i] =
+        focusIdx === undefined
+          ? 1
+          : connected
+            ? 2.35
+            : 0.16;
+    }
+
+    mesh.geometry.setAttribute(
+      "aStrength",
+      new InstancedBufferAttribute(strengths, 1),
+    );
+  }, [buffers, hoveredNodeId, selectedNodeId]);
 
   if (buffers.edgeCount === 0) return null;
 
