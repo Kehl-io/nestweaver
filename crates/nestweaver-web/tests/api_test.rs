@@ -85,7 +85,7 @@ fn setup_test_store() -> GraphStore {
 
     let repo = Repo {
         uid: "repo:test".to_string(),
-        url: "https://example.com/test".to_string(),
+        url: "https://example.com/test.git".to_string(),
         indexed_sha: "abc123".to_string(),
         staleness_commits_behind: 0,
         instance_id: String::new(),
@@ -200,6 +200,69 @@ async fn services_returns_empty() {
     assert_eq!(status, StatusCode::OK);
     let arr = json.as_array().expect("response should be an array");
     assert!(arr.is_empty(), "should have no services");
+}
+
+#[tokio::test]
+async fn overview_returns_ranked_landmarks() {
+    let app = make_app();
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(json.get("counts").is_some(), "should include counts");
+    assert_eq!(json["counts"]["repo_count"], 1);
+    assert_eq!(json["counts"]["symbol_count"], 1);
+
+    let landmarks = json["landmarks"]
+        .as_array()
+        .expect("landmarks should be an array");
+    assert!(
+        landmarks.iter().any(|item| item["uid"] == "sym:test:greet"),
+        "overview should include top symbol"
+    );
+    assert!(
+        landmarks
+            .iter()
+            .any(|item| item["uid"] == "repo:test" && item["label"] == "test.git"),
+        "overview should preserve literal repo URL segment"
+    );
+
+    let start_here = json["start_here"]
+        .as_array()
+        .expect("start_here should be an array");
+    assert!(
+        start_here.iter().any(|item| item["kind"] == "symbol"),
+        "start_here should include symbol guidance"
+    );
+}
+
+#[tokio::test]
+async fn overview_keeps_symbol_when_repos_exceed_limit() {
+    let store = setup_test_store();
+    for index in 0..8 {
+        let repo = Repo {
+            uid: format!("repo:extra:{index}"),
+            url: format!("https://example.com/extra-{index}.git"),
+            indexed_sha: format!("extra-{index}"),
+            staleness_commits_behind: 0,
+            instance_id: String::new(),
+            name: None,
+        };
+        store.insert_repo(&repo).unwrap();
+    }
+
+    let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/test.lbug"));
+    let app = create_router(state);
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=6").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let landmarks = json["landmarks"]
+        .as_array()
+        .expect("landmarks should be an array");
+    assert_eq!(landmarks.len(), 6);
+    assert!(
+        landmarks.iter().any(|item| item["uid"] == "sym:test:greet"),
+        "overview should retain a representative symbol when repos exceed limit"
+    );
 }
 
 #[tokio::test]

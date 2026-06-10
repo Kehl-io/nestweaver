@@ -8,6 +8,7 @@ pub mod gaps;
 pub mod health;
 pub mod impact;
 pub mod llm;
+pub mod overview;
 pub mod paths;
 pub mod perspectives;
 pub mod presentations;

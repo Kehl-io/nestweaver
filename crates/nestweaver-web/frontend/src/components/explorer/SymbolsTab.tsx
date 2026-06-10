@@ -9,8 +9,7 @@ const MAX_VISIBLE = 100;
 
 export function SymbolsTab() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
-  const selectNode = useStore((s) => s.selectNode);
-  const setSeeds = useStore((s) => s.setSeeds);
+  const exploreNode = useStore((s) => s.exploreNode);
 
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -94,8 +93,7 @@ export function SymbolsTab() {
                   <button
                     type="button"
                     onClick={() => {
-                      selectNode(sym.uid, sym.kind);
-                      setSeeds([sym.uid]);
+                      exploreNode(sym.uid, sym.kind);
                     }}
                     className={`flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs transition-colors ${
                       selected

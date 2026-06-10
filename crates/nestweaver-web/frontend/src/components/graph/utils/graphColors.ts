@@ -10,6 +10,7 @@ export const KIND_COLORS: Record<string, string> = {
 };
 
 export const EDGE_COLORS: Record<string, string> = {
+  overview: "#6b7280",
   calls: "#67e8f9",
   imports: "#4ade80",
   extends: "#fb923c",

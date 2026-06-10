@@ -41,7 +41,7 @@ export function StatusBar() {
         <span
           className={
             wasm.ready
-              ? "text-blue-400"
+              ? "text-[var(--color-graph-selection)]"
               : "text-[var(--color-text-muted)]"
           }
           title={
