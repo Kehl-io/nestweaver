@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.21.0](https://github.com/Kehl-io/nestweaver/compare/v0.20.0...v0.21.0) (2026-06-10)
+
+
+### Features
+
+* **cli:** add --token-budget to nestweaver context ([91d84b6](https://github.com/Kehl-io/nestweaver/commit/91d84b61aa4099533ba7c116a062d6603996a8eb))
+* improve graph UI readiness ([384a0c2](https://github.com/Kehl-io/nestweaver/commit/384a0c2316faf4e362b9106af54377822b96566a))
+* **store:** config-driven test path deboost patterns ([7bdb2eb](https://github.com/Kehl-io/nestweaver/commit/7bdb2eb1543f8703b301822463c5ef6c5512c002))
+* **web:** add contextual graph actions ([90c5e8d](https://github.com/Kehl-io/nestweaver/commit/90c5e8df54cb675d569188f676ed825425f37ea9))
+* **web:** add dense graph views ([46ec6f9](https://github.com/Kehl-io/nestweaver/commit/46ec6f96408eaed56be6fe3969d9de6723a1f6b5))
+* **web:** add overview API ([9d0814f](https://github.com/Kehl-io/nestweaver/commit/9d0814fc181f1f3d24d972b3d292976af1ed154e))
+* **web:** add overview frontend types ([450d1ab](https://github.com/Kehl-io/nestweaver/commit/450d1aba3e7f12cb105cffee6c857c57aeff0999))
+* **web:** add overview guidance surfaces ([06ac75b](https://github.com/Kehl-io/nestweaver/commit/06ac75bba8fb3c047d407eae9d874c5846a65dd6))
+* **web:** bring graph nodes to life ([88f6e7f](https://github.com/Kehl-io/nestweaver/commit/88f6e7ffa78f2fe46effd54a16765c378fdbb729))
+* **web:** group graph controls ([71b6fa2](https://github.com/Kehl-io/nestweaver/commit/71b6fa286a4bf8b2c3fae55f6d9ab33a70e3864b))
+* **web:** load overview graph by default ([b9cbec1](https://github.com/Kehl-io/nestweaver/commit/b9cbec19bf1a85b7bf5e36c0a75acd36784505e9))
+
+
+### Bug Fixes
+
+* **brain:** remove ghost vault rows by path match, not just computed UID ([b5c162b](https://github.com/Kehl-io/nestweaver/commit/b5c162b9d441d7fbd27af97e4d3b15323b643c80))
+* **cli:** resolve clippy warnings in daemon routing guards ([7c393e7](https://github.com/Kehl-io/nestweaver/commit/7c393e7324cae30fc694a7cf5f567e1eec2a6f44))
+* **cli:** route brain context and 5 docgraph commands through daemon ([a56137f](https://github.com/Kehl-io/nestweaver/commit/a56137f476344c1b8a54ece5c250444ac58ea160))
+* **cli:** route impact, regex-search, hubs, stale-check, status through daemon ([5378550](https://github.com/Kehl-io/nestweaver/commit/5378550b37cbec202174715ec1bbe1636e0e59c8))
+* **daemon:** route `brain reindex-search` through daemon RPC ([ce70e67](https://github.com/Kehl-io/nestweaver/commit/ce70e678c13e475493743631ce182d669b577d16))
+* **proto:** add instance_id to IndexVaultRequest, thread through daemon and MCP ([5b6855e](https://github.com/Kehl-io/nestweaver/commit/5b6855ed781d0ab6002b70fa8df68c06f20ffa02))
+* resolve 6 reported bugs — lock warning, intent, interactions, merge, seed ranking, limit ([cdb97b2](https://github.com/Kehl-io/nestweaver/commit/cdb97b21f340d0ae2c8a73dd83bcfef17eaedf27))
+* restore lock-error semantics in open_store, cascade-delete vault notes during merge ([2335fc2](https://github.com/Kehl-io/nestweaver/commit/2335fc25a9aded6c1d53eda435112cd77b5b05db))
+* **store:** prefer populated vault on collision merge, warn about unlinked notes ([5d40d2d](https://github.com/Kehl-io/nestweaver/commit/5d40d2df592dcdf478aec5f2b98f98d7f3ed9351))
+* **store:** safe vault UID rewrite during instance merge, add --limit docs ([5efa26b](https://github.com/Kehl-io/nestweaver/commit/5efa26b68eb512190e6b7adbcd5d798cb3a3b128))
+* **web:** address review findings — brand colors, a11y, dedup, dead code ([025d003](https://github.com/Kehl-io/nestweaver/commit/025d003d0610f5e174247225ed835838e181f780))
+* **web:** allow search dropdown to escape header bounds ([24e40a6](https://github.com/Kehl-io/nestweaver/commit/24e40a6004125e9d184031f2f9142f9065743bff))
+* **web:** balance overview landmarks ([fbea9d6](https://github.com/Kehl-io/nestweaver/commit/fbea9d6760d14371e6c20585c2916f9d66960c2f))
+* **web:** gate overview actions by supported targets ([f6e9aa8](https://github.com/Kehl-io/nestweaver/commit/f6e9aa8ac761e34e93983f0761f41104d630f48e))
+* **web:** guard overview graph updates ([3ead808](https://github.com/Kehl-io/nestweaver/commit/3ead808dd4bcb81a71d01f570d1eea7f31ee4ece))
+* **web:** make overview entry points actionable ([80694f6](https://github.com/Kehl-io/nestweaver/commit/80694f6b08ad80308e4c3373273d90eb3cd716f5))
+* **web:** migrate persisted graph mode ([03782ac](https://github.com/Kehl-io/nestweaver/commit/03782ac38bdf5ea3abd5aaa9cabb509ec365a323))
+* **web:** polish guided overview verification ([88887cf](https://github.com/Kehl-io/nestweaver/commit/88887cffb19ffa9900dddf910426888026a1f543))
+* **web:** preserve overview landmark labels ([641a732](https://github.com/Kehl-io/nestweaver/commit/641a73237dd8e36aa20c74508155920baed267ef))
+* **web:** preserve repo git suffix in overview ([3e2cd7f](https://github.com/Kehl-io/nestweaver/commit/3e2cd7fe4c16e942bc0b7529a653a1f9aaf23447))
+* **web:** refine guided overview browser pass ([35f3e6a](https://github.com/Kehl-io/nestweaver/commit/35f3e6ab250a653edea4fd847e6b27934ef3bd73))
+* **web:** reset graph mode on page load ([8ead92b](https://github.com/Kehl-io/nestweaver/commit/8ead92b158f2a95282f6f33fd288016a548e1fad))
+* **web:** scope e2e search click to dropdown, not graph label ([9ab17e4](https://github.com/Kehl-io/nestweaver/commit/9ab17e48e2cd5c9a814bdaad60ba763c911e6de5))
+* **web:** sharpen graph nodes and labels ([106a6ef](https://github.com/Kehl-io/nestweaver/commit/106a6ef18e04828b7917100ed580c99402db1540))
+* **web:** simplify graph nodes to led dots ([56bd04e](https://github.com/Kehl-io/nestweaver/commit/56bd04e7fba864d358c5f0cf212821d14bf40fc5))
+* **web:** soften graph node borders ([6ab3b00](https://github.com/Kehl-io/nestweaver/commit/6ab3b00e7848ba598e862ea8f4239aa1422d1d19))
+
 ## [0.20.0](https://github.com/Kehl-io/nestweaver/compare/v0.19.0...v0.20.0) (2026-06-08)
 
 
