@@ -1696,6 +1696,16 @@ enum BrainCommands {
             help = "Rerank the top-N retrieved candidates (Feature F17, heuristic, off by default)"
         )]
         rerank: bool,
+        /// Query intent override that tunes PPR's damping factor and edge
+        /// weights. Same accepted values as `nestweaver context --intent`.
+        /// When omitted, the engine auto-detects an intent from the seed
+        /// kinds. Mirrors the lower-level `context --intent` flag so callers
+        /// can force a specific traversal profile against the unified brain.
+        #[arg(
+            long = "intent",
+            help = "Query intent override: find-definition, understand-architecture, analyze-impact, blast-radius, general-context"
+        )]
+        intent: Option<String>,
     },
     /// List wikilinks whose target is ambiguous or low-confidence
     /// (confidence < 1.0), with suggested target notes for each.
@@ -7091,6 +7101,7 @@ fn run_brain(
 
         BrainCommands::Remove { path, instance, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            let instance_specified = instance.is_some();
             let instance_id = instance.as_deref().unwrap_or("default");
 
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -7099,23 +7110,45 @@ fn run_brain(
 
             let store = open_store(Some(&db_path))?;
 
-            // Collect all vault UIDs that should be removed:
-            // 1. The computed UID (normal case).
-            // 2. Any vault whose root_path matches, regardless of instance
-            //    (catches ghost rows left by buggy merges with wrong UIDs).
-            let mut uids_to_remove: Vec<String> = vec![v_uid];
-            if let Ok(all_vaults) = store.list_vaults(None) {
-                for v in &all_vaults {
-                    let v_canon = std::fs::canonicalize(&v.root_path)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| v.root_path.clone());
-                    if v_canon == *canon_str && !uids_to_remove.contains(&v.uid) {
-                        uids_to_remove.push(v.uid.clone());
+            // If the caller passed `--instance`, treat it as a precise
+            // selector: only the row owned by that instance is removed.
+            // This is required to disambiguate ghost-row situations
+            // without nuking the populated row that lives at the same
+            // path. If the requested row does not exist, fail loudly
+            // rather than silently scrubbing every other instance at
+            // the path.
+            //
+            // If `--instance` is absent, fall back to the historical
+            // ghost-row cleanup behavior: remove the default-UID row
+            // plus any other row whose canonical root_path matches.
+            let mut uids_to_remove: Vec<String> = Vec::new();
+            if instance_specified {
+                if store.lookup_vault(&v_uid).is_ok() {
+                    uids_to_remove.push(v_uid);
+                } else {
+                    eprintln!(
+                        "Error: no vault with instance '{instance_id}' found at {canon_str}.\n  \
+                         Run `nestweaver brain status` to see registered vaults and their instance ids,\n  \
+                         then re-run with the correct --instance (or omit --instance to clean up every row at this path)."
+                    );
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+            } else {
+                uids_to_remove.push(v_uid);
+                if let Ok(all_vaults) = store.list_vaults(None) {
+                    for v in &all_vaults {
+                        let v_canon = std::fs::canonicalize(&v.root_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| v.root_path.clone());
+                        if v_canon == *canon_str && !uids_to_remove.contains(&v.uid) {
+                            uids_to_remove.push(v.uid.clone());
+                        }
                     }
                 }
             }
 
             let mut total_dropped = 0usize;
+            let mut rows_cleaned = 0usize;
             let mut vault_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -7125,17 +7158,26 @@ fn run_brain(
                 if let Ok(v) = store.lookup_vault(uid) {
                     vault_name = v.name;
                 }
-                if let Ok(n) = store.delete_vault_cascade(uid) {
-                    total_dropped += n;
+                match store.delete_vault_cascade(uid) {
+                    Ok(n) => {
+                        total_dropped += n;
+                        rows_cleaned += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Error: failed to remove vault '{uid}': {e}.\n  \
+                             If a daemon is running it may be holding the write lock; \
+                             stop it with `nestweaver daemon stop` and retry."
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
                 }
             }
             println!(
                 "Removed vault '{}' ({} note(s) dropped, {} row(s) cleaned). \
                  Tantivy + PPR sidecars may be stale; run \
                  `nestweaver brain reindex-search` if you want to clear them too.",
-                vault_name,
-                total_dropped,
-                uids_to_remove.len()
+                vault_name, total_dropped, rows_cleaned
             );
             Ok((EXIT_SUCCESS, None))
         }
@@ -7489,8 +7531,18 @@ fn run_brain(
             root,
             prf,
             rerank,
+            intent,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
+
+            // Parse the optional --intent override into a `QueryIntent`.
+            // Surface invalid values as a CLI error rather than silently
+            // ignoring (mirrors `nestweaver context --intent`).
+            let parsed_intent: Option<QueryIntent> = intent
+                .as_deref()
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
 
             // Route through daemon's GetContext RPC when available and no
             // flags require direct-disk processing.
@@ -7503,65 +7555,68 @@ fn run_brain(
                     config_path.as_deref(),
                 ));
                 if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::BrainContextRequest {
-                        seeds: seeds.clone(),
-                        token_budget: token_budget.unwrap_or(0) as i32,
-                        response_format: String::new(),
-                        repos: repos.clone(),
-                        vaults: vaults.clone(),
-                        kinds: kinds.clone(),
-                        path_prefix: path_prefix.clone().unwrap_or_default(),
-                        tags: tags.clone(),
-                        exclude_tags: exclude_tags.clone(),
-                        weight_ppr: weight_ppr.unwrap_or(0.0),
-                        weight_bm25: weight_bm25.unwrap_or(0.0),
-                        intent: String::new(),
-                        include_seeds: true,
-                        include_bodies: inline_bodies,
-                        root: root
-                            .clone()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        prf,
-                        rerank,
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .get_context(req)
-                            .await
-                            .map(|r| r.into_inner())
-                    });
-                    match rpc {
-                        Ok(resp) => {
-                            let result: nestweaver_engine::BrainContextResult =
-                                serde_json::from_str(&resp.result_json)?;
-                            let cut = match token_budget {
-                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
-                                None => limit.min(result.connected.len()),
-                            };
-                            if json {
-                                print_brain_context_json(&result, cut)?;
-                            } else {
-                                print_brain_context_text(&result, cut, token_budget);
+                        let req = nestweaver_proto::BrainContextRequest {
+                            seeds: seeds.clone(),
+                            token_budget: token_budget.unwrap_or(0) as i32,
+                            response_format: String::new(),
+                            repos: repos.clone(),
+                            vaults: vaults.clone(),
+                            kinds: kinds.clone(),
+                            path_prefix: path_prefix.clone().unwrap_or_default(),
+                            tags: tags.clone(),
+                            exclude_tags: exclude_tags.clone(),
+                            weight_ppr: weight_ppr.unwrap_or(0.0),
+                            weight_bm25: weight_bm25.unwrap_or(0.0),
+                            // Pass the parsed --intent through to the daemon
+                            // (empty string = auto-detect on the server).
+                            intent: intent.clone().unwrap_or_default(),
+                            include_seeds: true,
+                            include_bodies: inline_bodies,
+                            root: root
+                                .clone()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                            prf,
+                            rerank,
+                        };
+                        let rpc = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .get_context(req)
+                                .await
+                                .map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                let result: nestweaver_engine::BrainContextResult =
+                                    serde_json::from_str(&resp.result_json)?;
+                                let cut = match token_budget {
+                                    Some(budget) => {
+                                        token_budgeted_truncate(&result.connected, budget)
+                                    }
+                                    None => limit.min(result.connected.len()),
+                                };
+                                if json {
+                                    print_brain_context_json(&result, cut)?;
+                                } else {
+                                    print_brain_context_text(&result, cut, token_budget);
+                                }
+                                let node_count = result.seeds.len() + cut;
+                                let stats = format!(
+                                    "{} nodes in {} (via daemon)",
+                                    node_count,
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
                             }
-                            let node_count = result.seeds.len() + cut;
-                            let stats = format!(
-                                "{} nodes in {} (via daemon)",
-                                node_count,
-                                format_elapsed(t0.elapsed())
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
+                            Err(status) => {
+                                eprintln!(
+                                    "warning: daemon context RPC failed ({}); falling back to direct DB read",
+                                    status.message()
+                                );
+                            }
                         }
-                        Err(status) => {
-                            eprintln!(
-                                "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                status.message()
-                            );
-                        }
-                    }
-                }
             }
 
             let store = open_store(Some(&db_path))?;
@@ -7591,16 +7646,28 @@ fn run_brain(
                     .unwrap_or(false);
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
+            // Feature F-test-deboost: thread `[ranking] test_path_patterns`
+            // from the instance config into the search config so user
+            // overrides reach `search_symbols_by_name` at seed resolution.
             let defaults = HybridSearchConfig::default();
+            let configured_test_patterns: Option<Vec<String>> = instance_cfg
+                .as_ref()
+                .map(|c| c.ranking.test_path_patterns.clone())
+                .filter(|p| !p.is_empty());
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
                 weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
                 prf: prf_enabled,
+                test_path_patterns: configured_test_patterns
+                    .unwrap_or_else(|| defaults.test_path_patterns.clone()),
                 ..defaults
             };
 
             let aliases = load_alias_sidecar(&db_path);
+            // Thread the parsed `--intent` override (if any) into the PPR
+            // engine. None → engine auto-detects from seed kinds, matching
+            // historical behavior.
             match build_brain_context_hybrid_with_aliases(
                 &store,
                 &seeds,
@@ -7608,7 +7675,7 @@ fn run_brain(
                 &config,
                 &aliases,
                 Some(&db_path),
-                None,
+                parsed_intent,
             ) {
                 Ok(mut result) => {
                     // Feature F6: apply per-path ranking priors (dampen/boost)
