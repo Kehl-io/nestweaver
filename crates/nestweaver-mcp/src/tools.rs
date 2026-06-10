@@ -2410,11 +2410,49 @@ fn tool_brain_status(
                 }
             };
             json!({
+                // `uid` + `instance_id` let callers disambiguate rows that
+                // share a name/root_path (collision state) and target precise
+                // operations like `brain remove --instance <id>`.
+                "uid": v.uid,
+                "instance_id": v.instance_id,
                 "name": v.name,
                 "root_path": v.root_path,
                 "note_count": note_count,
                 "last_indexed": last_indexed,
                 "last_indexed_source": last_indexed_source,
+            })
+        })
+        .collect();
+
+    // Detect duplicate-root collisions. The CLI's local (non-daemon) path
+    // emits these warnings to stderr; forward them through the JSON-RPC
+    // response so daemon-routed callers and `--json` consumers see the
+    // same diagnostic.
+    let mut root_to_rows: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
+        std::collections::HashMap::new();
+    for v in &vaults {
+        root_to_rows.entry(v.root_path.as_str()).or_default().push(v);
+    }
+    let warnings: Vec<Value> = root_to_rows
+        .iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(root, rows)| {
+            let entries: Vec<Value> = rows
+                .iter()
+                .map(|v| {
+                    let n = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                    json!({
+                        "uid": v.uid,
+                        "instance_id": v.instance_id,
+                        "name": v.name,
+                        "note_count": n,
+                    })
+                })
+                .collect();
+            json!({
+                "kind": "duplicate_vault_root",
+                "root_path": root,
+                "entries": entries,
             })
         })
         .collect();
@@ -2470,6 +2508,10 @@ fn tool_brain_status(
             "entries": cache_entries,
             "hit_rate_pct": cache_hit_rate_pct,
         },
+        // Structured diagnostics. Each entry describes a vault-level
+        // anomaly (duplicate root, missing index, etc.) so clients can
+        // render an actionable warning without re-deriving it.
+        "warnings": warnings,
     }))
 }
 

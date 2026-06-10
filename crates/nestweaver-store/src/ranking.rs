@@ -140,8 +140,8 @@ impl std::str::FromStr for QueryIntent {
             "project-context" | "project" => Ok(QueryIntent::ProjectContext),
             other => Err(format!(
                 "unknown intent '{}': expected one of find-definition, \
-                 understand-architecture, analyze-impact, general-context, \
-                 project-context",
+                 understand-architecture, analyze-impact, blast-radius, \
+                 general-context, project-context",
                 other
             )),
         }
