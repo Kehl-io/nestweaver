@@ -9,13 +9,13 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
-    FeatureContextResult, HybridSearchConfig, LookupResult, Summary, SummaryLevel, affected_tests,
-    analyze_blast_radius, attach_cluster_ids, attach_communities,
+    FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
+    affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules, HubNode,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
     generate_repo_map, generate_summaries, get_last_indexed_at,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
@@ -566,7 +566,10 @@ enum Commands {
         intent: Option<String>,
         #[arg(long, help = "Maximum number of connected nodes to return")]
         limit: Option<usize>,
-        #[arg(long, help = "Approximate token budget for output (takes precedence over --limit)")]
+        #[arg(
+            long,
+            help = "Approximate token budget for output (takes precedence over --limit)"
+        )]
         token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -2966,8 +2969,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard (typed RPC) ──────────────────────────
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
                 if let Ok(mut client) = connect {
                     let req = nestweaver_proto::HubNodesRequest {
                         top_n: top as i32,
@@ -2982,9 +2984,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     });
                     match rpc {
                         Ok(resp) => {
-                            let value: serde_json::Value =
-                                serde_json::from_str(&resp.result_json)
-                                    .unwrap_or(serde_json::json!({}));
+                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)
+                                .unwrap_or(serde_json::json!({}));
                             if json {
                                 println!("{}", serde_json::to_string_pretty(&value)?);
                             } else {
@@ -2995,10 +2996,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if hubs.is_empty() {
                                     println!("No hub nodes found (graph may be empty).");
                                 } else {
-                                    println!(
-                                        "Top {} hub nodes (by total degree):\n",
-                                        hubs.len()
-                                    );
+                                    println!("Top {} hub nodes (by total degree):\n", hubs.len());
                                     for h in &hubs {
                                         let cluster = h
                                             .cluster_id
@@ -3018,10 +3016,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                             let stats = format!(
                                 "{} hubs in {} (via daemon)",
-                                value
-                                    .get("count")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                                value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
                                 format_elapsed(t0.elapsed())
                             );
                             return Ok((EXIT_SUCCESS, Some(stats)));
@@ -4070,13 +4065,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ms) = max_millis {
                     args["max_millis"] = serde_json::json!(ms);
                 }
-                if let Some(value) = try_daemon_json_rpc(
-                    true,
-                    &db_path,
-                    None,
-                    "regex_search",
-                    args,
-                ) {
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "regex_search", args)
+                {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -4099,9 +4089,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 );
                             }
                             if res.truncated {
-                                println!(
-                                    "(results truncated — hit candidate cap or time budget)"
-                                );
+                                println!("(results truncated — hit candidate cap or time budget)");
                             }
                             if res.scanned_fallback {
                                 println!(
@@ -6406,9 +6394,7 @@ fn run_brain(
                         for v in vaults {
                             let name = v["name"].as_str().unwrap_or("?");
                             let note_count = v["note_count"].as_u64().unwrap_or(0);
-                            let last_indexed = v["last_indexed"]
-                                .as_str()
-                                .unwrap_or("never");
+                            let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
                             println!(
                                 "    - {} ({note_count} notes, last indexed: {last_indexed})",
                                 name
@@ -6416,19 +6402,10 @@ fn run_brain(
                         }
                     }
                     let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let headings = value
-                        .get("headings")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let sections = value
-                        .get("sections")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    let headings = value.get("headings").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let sections = value.get("sections").and_then(|v| v.as_u64()).unwrap_or(0);
                     let tags = value.get("tags").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let wikilinks = value
-                        .get("wikilinks")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    let wikilinks = value.get("wikilinks").and_then(|v| v.as_u64()).unwrap_or(0);
                     let repo_count = value
                         .get("repo_count")
                         .and_then(|v| v.as_u64())
@@ -7517,73 +7494,74 @@ fn run_brain(
 
             // Route through daemon's GetContext RPC when available and no
             // flags require direct-disk processing.
-            if use_daemon && since.is_none() && let Ok(rt) = tokio::runtime::Runtime::new() {
+            if use_daemon
+                && since.is_none()
+                && let Ok(rt) = tokio::runtime::Runtime::new()
+            {
                 let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
                     &db_path,
                     config_path.as_deref(),
                 ));
                 if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::BrainContextRequest {
-                            seeds: seeds.clone(),
-                            token_budget: token_budget.unwrap_or(0) as i32,
-                            response_format: String::new(),
-                            repos: repos.clone(),
-                            vaults: vaults.clone(),
-                            kinds: kinds.clone(),
-                            path_prefix: path_prefix.clone().unwrap_or_default(),
-                            tags: tags.clone(),
-                            exclude_tags: exclude_tags.clone(),
-                            weight_ppr: weight_ppr.unwrap_or(0.0),
-                            weight_bm25: weight_bm25.unwrap_or(0.0),
-                            intent: String::new(),
-                            include_seeds: true,
-                            include_bodies: inline_bodies,
-                            root: root
-                                .clone()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                            prf,
-                            rerank,
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .get_context(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                let result: nestweaver_engine::BrainContextResult =
-                                    serde_json::from_str(&resp.result_json)?;
-                                let cut = match token_budget {
-                                    Some(budget) => {
-                                        token_budgeted_truncate(&result.connected, budget)
-                                    }
-                                    None => limit.min(result.connected.len()),
-                                };
-                                if json {
-                                    print_brain_context_json(&result, cut)?;
-                                } else {
-                                    print_brain_context_text(&result, cut, token_budget);
-                                }
-                                let node_count = result.seeds.len() + cut;
-                                let stats = format!(
-                                    "{} nodes in {} (via daemon)",
-                                    node_count,
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
+                    let req = nestweaver_proto::BrainContextRequest {
+                        seeds: seeds.clone(),
+                        token_budget: token_budget.unwrap_or(0) as i32,
+                        response_format: String::new(),
+                        repos: repos.clone(),
+                        vaults: vaults.clone(),
+                        kinds: kinds.clone(),
+                        path_prefix: path_prefix.clone().unwrap_or_default(),
+                        tags: tags.clone(),
+                        exclude_tags: exclude_tags.clone(),
+                        weight_ppr: weight_ppr.unwrap_or(0.0),
+                        weight_bm25: weight_bm25.unwrap_or(0.0),
+                        intent: String::new(),
+                        include_seeds: true,
+                        include_bodies: inline_bodies,
+                        root: root
+                            .clone()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        prf,
+                        rerank,
+                    };
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .get_context(req)
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let result: nestweaver_engine::BrainContextResult =
+                                serde_json::from_str(&resp.result_json)?;
+                            let cut = match token_budget {
+                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                                None => limit.min(result.connected.len()),
+                            };
+                            if json {
+                                print_brain_context_json(&result, cut)?;
+                            } else {
+                                print_brain_context_text(&result, cut, token_budget);
                             }
-                            Err(status) => {
-                                eprintln!(
-                                    "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                    status.message()
-                                );
-                            }
+                            let node_count = result.seeds.len() + cut;
+                            let stats = format!(
+                                "{} nodes in {} (via daemon)",
+                                node_count,
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
+                        }
+                        Err(status) => {
+                            eprintln!(
+                                "warning: daemon context RPC failed ({}); falling back to direct DB read",
+                                status.message()
+                            );
                         }
                     }
+                }
             }
 
             let store = open_store(Some(&db_path))?;
@@ -8048,8 +8026,7 @@ fn run_brain(
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if tag.is_some() {
                         // Single-tag mode: value is a TagGraph directly.
-                        let tg: nestweaver_engine::TagGraph =
-                            serde_json::from_value(value)?;
+                        let tg: nestweaver_engine::TagGraph = serde_json::from_value(value)?;
                         println!("#{} — {} note(s)", tg.tag, tg.count);
                         if tg.co_occurring.is_empty() {
                             println!("  no co-occurring tags");
@@ -8145,8 +8122,7 @@ fn run_brain(
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
-                    let stats: nestweaver_engine::DocStats =
-                        serde_json::from_value(value)?;
+                    let stats: nestweaver_engine::DocStats = serde_json::from_value(value)?;
                     println!("Document graph stats:");
                     println!("  total notes:      {}", stats.total_notes);
                     println!("  total wikilinks:  {}", stats.total_wikilinks);
@@ -8227,10 +8203,13 @@ fn context_token_budgeted_truncate(
     let mut tokens = 0usize;
     let mut taken = 0usize;
     for n in connected {
-        let cost =
-            (n.uid.len() + n.name.len() + n.kind.len() + n.file_path.len() + n.signature.len()
-                + 20)
-                .div_ceil(4);
+        let cost = (n.uid.len()
+            + n.name.len()
+            + n.kind.len()
+            + n.file_path.len()
+            + n.signature.len()
+            + 20)
+            .div_ceil(4);
         if tokens + cost > budget {
             break;
         }
