@@ -566,6 +566,8 @@ enum Commands {
         intent: Option<String>,
         #[arg(long, help = "Maximum number of connected nodes to return")]
         limit: Option<usize>,
+        #[arg(long, help = "Approximate token budget for output (takes precedence over --limit)")]
+        token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2604,6 +2606,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
             intent,
             limit,
+            token_budget,
             json,
             db,
         } => {
@@ -2632,7 +2635,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let links = instance_config.links.as_deref().unwrap_or(&empty_links);
 
                 match build_feature_context(&store, feature_config, links, parsed_intent, limit) {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        if let Some(budget) = token_budget {
+                            let cut = context_token_budgeted_truncate(&result.connected, budget);
+                            result.connected.truncate(cut);
+                        }
                         let stats = format!(
                             "{} seeds, {} connected nodes in {}",
                             result.seeds.len(),
@@ -2660,7 +2667,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 // Normal seed-based context.
                 match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        if let Some(budget) = token_budget {
+                            let cut = context_token_budgeted_truncate(&result.connected, budget);
+                            result.connected.truncate(cut);
+                        }
                         let stats = format!(
                             "{} seeds, {} connected nodes in {}",
                             result.seeds.len(),
@@ -7563,6 +7574,26 @@ fn token_budgeted_truncate(connected: &[nestweaver_engine::BrainNode], budget: u
     let mut taken = 0usize;
     for n in connected {
         let cost = render_cost_tokens(n);
+        if tokens + cost > budget {
+            break;
+        }
+        tokens += cost;
+        taken += 1;
+    }
+    taken
+}
+
+fn context_token_budgeted_truncate(
+    connected: &[nestweaver_engine::ContextNode],
+    budget: usize,
+) -> usize {
+    let mut tokens = 0usize;
+    let mut taken = 0usize;
+    for n in connected {
+        let cost =
+            (n.uid.len() + n.name.len() + n.kind.len() + n.file_path.len() + n.signature.len()
+                + 20)
+                .div_ceil(4);
         if tokens + cost > budget {
             break;
         }
