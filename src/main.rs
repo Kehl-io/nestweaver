@@ -5906,6 +5906,42 @@ fn run_memory(
     }
 }
 
+/// Try to dispatch a read-only brain command through the daemon's JSON
+/// pass-through RPC. Returns `Some(json_value)` on success, `None` if the
+/// daemon is unavailable or the RPC fails (caller should fall through to
+/// direct-disk mode).
+fn try_daemon_json_rpc(
+    use_daemon: bool,
+    db_path: &std::path::Path,
+    config: Option<&std::path::Path>,
+    rpc_name: &str,
+    args: serde_json::Value,
+) -> Option<serde_json::Value> {
+    if !use_daemon {
+        return None;
+    }
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect(db_path, config))
+        .ok()?;
+    let args_json = serde_json::to_string(&args).ok()?;
+    let req = tonic::Request::new(nestweaver_proto::JsonRequest { args_json });
+    let rpc_name_owned = rpc_name.to_string();
+    let result = rt.block_on(async {
+        // Route to the correct RPC method by name.
+        let resp = match rpc_name_owned.as_str() {
+            "brain_broken_links" => client.inner_mut().brain_broken_links(req).await,
+            "brain_orphan_documents" => client.inner_mut().brain_orphan_documents(req).await,
+            "brain_topic_clusters" => client.inner_mut().brain_topic_clusters(req).await,
+            "brain_tag_graph" => client.inner_mut().brain_tag_graph(req).await,
+            "brain_doc_stats" => client.inner_mut().brain_doc_stats(req).await,
+            _ => return None,
+        };
+        resp.ok().map(|r| r.into_inner().result_json)
+    })?;
+    serde_json::from_str(&result).ok()
+}
+
 fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
@@ -7138,6 +7174,80 @@ fn run_brain(
             rerank,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
+
+            // Route through daemon's GetContext RPC when available and no
+            // flags require direct-disk processing.
+            if use_daemon && since.is_none() {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                        &db_path,
+                        config_path.as_deref(),
+                    ));
+                    if let Ok(mut client) = connect {
+                        let req = nestweaver_proto::BrainContextRequest {
+                            seeds: seeds.clone(),
+                            token_budget: token_budget.unwrap_or(0) as i32,
+                            response_format: String::new(),
+                            repos: repos.clone(),
+                            vaults: vaults.clone(),
+                            kinds: kinds.clone(),
+                            path_prefix: path_prefix.clone().unwrap_or_default(),
+                            tags: tags.clone(),
+                            exclude_tags: exclude_tags.clone(),
+                            weight_ppr: weight_ppr.unwrap_or(0.0),
+                            weight_bm25: weight_bm25.unwrap_or(0.0),
+                            intent: String::new(),
+                            include_seeds: true,
+                            include_bodies: inline_bodies,
+                            root: root
+                                .clone()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                            prf,
+                            rerank,
+                        };
+                        let rpc = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .get_context(req)
+                                .await
+                                .map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                let result: nestweaver_engine::BrainContextResult =
+                                    serde_json::from_str(&resp.result_json)?;
+                                let cut = match token_budget {
+                                    Some(budget) => {
+                                        token_budgeted_truncate(&result.connected, budget)
+                                    }
+                                    None => limit.min(result.connected.len()),
+                                };
+                                if json {
+                                    print_brain_context_json(&result, cut)?;
+                                } else {
+                                    print_brain_context_text(&result, cut, token_budget);
+                                }
+                                let node_count = result.seeds.len() + cut;
+                                let stats = format!(
+                                    "{} nodes in {} (via daemon)",
+                                    node_count,
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(status) => {
+                                eprintln!(
+                                    "warning: daemon context RPC failed ({}); falling back to direct DB read",
+                                    status.message()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -7386,6 +7496,37 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            if let Some(value) = try_daemon_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_broken_links",
+                serde_json::json!({ "max_suggestions": max_suggestions }),
+            ) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else if let Some(arr) = value.get("broken_links") {
+                    let links: Vec<nestweaver_engine::BrokenLink> =
+                        serde_json::from_value(arr.clone())?;
+                    if links.is_empty() {
+                        println!("No broken or ambiguous wikilinks found.");
+                    } else {
+                        println!("Broken / ambiguous wikilinks ({}):", links.len());
+                        for l in &links {
+                            println!(
+                                "  [[{}]] in {} (confidence {:.2})",
+                                l.wikilink_text, l.source_path, l.confidence
+                            );
+                            if !l.suggested_target_uids.is_empty() {
+                                println!("    suggested: {}", l.suggested_target_uids.join(", "));
+                            }
+                        }
+                    }
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(&db_path))?;
             let links = nestweaver_engine::broken_links(&store, max_suggestions)?;
             if json {
@@ -7421,6 +7562,43 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            {
+                let mut args = serde_json::json!({});
+                if let Some(ref v) = vault {
+                    args["vault"] = serde_json::json!(v);
+                }
+                if let Some(ref p) = path_prefix {
+                    args["path_prefix"] = serde_json::json!(p);
+                }
+                if !allow.is_empty() {
+                    args["allowlist"] = serde_json::json!(allow);
+                }
+                if let Some(value) = try_daemon_json_rpc(
+                    use_daemon,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_orphan_documents",
+                    args,
+                ) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else if let Some(arr) = value.get("orphans") {
+                        let orphans: Vec<nestweaver_engine::OrphanDocument> =
+                            serde_json::from_value(arr.clone())?;
+                        if orphans.is_empty() {
+                            println!("No orphan documents found.");
+                        } else {
+                            println!("Orphan documents ({}):", orphans.len());
+                            for o in &orphans {
+                                println!("  {} — {}", o.title, o.file_path);
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let orphans = nestweaver_engine::orphan_documents(
                 &store,
@@ -7453,6 +7631,36 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            if let Some(value) = try_daemon_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_topic_clusters",
+                serde_json::json!({ "resolution": resolution }),
+            ) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else if let Some(arr) = value.get("clusters") {
+                    let clusters: Vec<nestweaver_engine::TopicCluster> =
+                        serde_json::from_value(arr.clone())?;
+                    if clusters.is_empty() {
+                        println!("No topic clusters found.");
+                    } else {
+                        println!("Topic clusters ({}):", clusters.len());
+                        for c in &clusters {
+                            println!(
+                                "  [{}] {} ({} note(s))",
+                                c.cluster_id,
+                                c.label,
+                                c.members.len()
+                            );
+                        }
+                    }
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(&db_path))?;
             let clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
             if json {
@@ -7485,6 +7693,59 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            {
+                let mut args = serde_json::json!({});
+                if let Some(ref t) = tag {
+                    args["tag"] = serde_json::json!(t);
+                }
+                if let Some(value) = try_daemon_json_rpc(
+                    use_daemon,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_tag_graph",
+                    args,
+                ) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else if tag.is_some() {
+                        // Single-tag mode: value is a TagGraph directly.
+                        let tg: nestweaver_engine::TagGraph =
+                            serde_json::from_value(value)?;
+                        println!("#{} — {} note(s)", tg.tag, tg.count);
+                        if tg.co_occurring.is_empty() {
+                            println!("  no co-occurring tags");
+                        } else {
+                            println!("  co-occurring:");
+                            for c in &tg.co_occurring {
+                                println!("    #{} ({})", c.tag, c.count);
+                            }
+                        }
+                    } else if let Some(arr) = value.get("tags") {
+                        // All-tags mode.
+                        let graphs: Vec<nestweaver_engine::TagGraph> =
+                            serde_json::from_value(arr.clone())?;
+                        if graphs.is_empty() {
+                            println!("no tags");
+                        } else {
+                            for tg in &graphs {
+                                let co = if tg.co_occurring.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    tg.co_occurring
+                                        .iter()
+                                        .map(|c| format!("#{} ({})", c.tag, c.count))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                println!("#{} ({}) → {}", tg.tag, tg.count, co);
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             match tag {
                 Some(tag) => {
@@ -7535,6 +7796,44 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+
+            if let Some(value) = try_daemon_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "brain_doc_stats",
+                serde_json::json!({ "top_tags_limit": top_tags_limit }),
+            ) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    let stats: nestweaver_engine::DocStats =
+                        serde_json::from_value(value)?;
+                    println!("Document graph stats:");
+                    println!("  total notes:      {}", stats.total_notes);
+                    println!("  total wikilinks:  {}", stats.total_wikilinks);
+                    println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                    println!("  orphans:          {}", stats.orphans);
+                    println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
+                    if !stats.top_tags.is_empty() {
+                        println!("  top tags:");
+                        for t in &stats.top_tags {
+                            println!("    #{} ({})", t.tag, t.count);
+                        }
+                    }
+                    if !stats.notes_by_year.is_empty() {
+                        let mut years: Vec<(&String, &usize)> =
+                            stats.notes_by_year.iter().collect();
+                        years.sort_by(|a, b| a.0.cmp(b.0));
+                        println!("  notes by year:");
+                        for (year, count) in years {
+                            println!("    {year}: {count}");
+                        }
+                    }
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(&db_path))?;
             let stats = nestweaver_engine::doc_stats(&store, top_tags_limit)?;
             if json {
