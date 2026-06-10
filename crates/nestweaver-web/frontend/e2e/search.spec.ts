@@ -29,7 +29,8 @@ test.describe("Search Flow", () => {
     const searchInput = page.locator('[data-testid="search-input"]');
     await searchInput.waitFor({ timeout: 10_000 });
     await searchInput.fill("greet");
-    const firstResult = page.locator("text=greet").first();
+    const dropdown = page.locator('[role="listbox"]');
+    const firstResult = dropdown.locator('[role="option"]').first();
     await firstResult.waitFor({ timeout: 10_000 });
     await firstResult.click();
     await expect(
