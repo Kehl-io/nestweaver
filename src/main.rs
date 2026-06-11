@@ -1408,6 +1408,7 @@ enum RankingCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum BrainCommands {
     /// Index a markdown vault into the brain. Auto-detects Obsidian vault
     /// (.obsidian/ present) vs plain markdown folder.
@@ -1897,10 +1898,24 @@ enum InstanceCommands {
     },
     /// List all registered instances
     List,
-    /// Remove a registered instance
+    /// Remove a registered instance. With `--purge-graph`, also
+    /// cascade-delete every Repo/File/Symbol/Vault/Note/Project owned by
+    /// the instance from the graph database. Useful for cleaning up a
+    /// ghost instance left behind by a misconfigured `instance merge`.
     Remove {
         /// Instance ID to remove
         id: String,
+        /// Also cascade-delete the instance's data from the graph
+        /// database (Repos and their children, Vaults and their notes,
+        /// Projects). When set, missing registry entries are tolerated
+        /// so ghost instances can be cleaned up.
+        #[arg(long)]
+        purge_graph: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
     /// Pull the latest snapshot for an instance
     Pull {
@@ -9027,11 +9042,48 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             }
             Ok(EXIT_SUCCESS)
         }
-        InstanceCommands::Remove { id } => {
+        InstanceCommands::Remove {
+            id,
+            purge_graph,
+            db,
+        } => {
             let mut registry =
                 nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
-            registry.remove(&id)?;
-            println!("Removed instance '{id}'");
+            let registry_removed = match registry.remove(&id) {
+                Ok(()) => true,
+                Err(e) => {
+                    // With --purge-graph we tolerate a missing registry
+                    // entry so ghost instances (left by a misconfigured
+                    // merge) can still be cleaned out of the graph.
+                    if purge_graph {
+                        eprintln!("Note: {e}; continuing with graph purge");
+                        false
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            if registry_removed {
+                println!("Removed instance '{id}' from registry");
+            }
+            if purge_graph {
+                let db_path = db.unwrap_or_else(default_db_path);
+                let store = open_store(Some(&db_path))?;
+                let r = store
+                    .purge_instance(&id)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let total = r.repos + r.files + r.symbols + r.vaults + r.notes + r.projects;
+                if total == 0 {
+                    println!("No graph rows found for instance '{id}' — database is clean.");
+                } else {
+                    println!(
+                        "Purged instance '{id}' from graph: {} repo(s), \
+                         {} file(s), {} symbol(s), {} vault(s), {} note(s), \
+                         {} project(s)",
+                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects
+                    );
+                }
+            }
             Ok(EXIT_SUCCESS)
         }
         InstanceCommands::Pull { id } => {
