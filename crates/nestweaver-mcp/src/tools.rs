@@ -2437,10 +2437,20 @@ fn tool_brain_status(
         .iter()
         .filter(|(_, rows)| rows.len() > 1)
         .map(|(root, rows)| {
-            let entries: Vec<Value> = rows
+            // Pair each row with its note count so we can both render the
+            // entries and pick the keeper for the remediation hint.
+            let rows_with_counts: Vec<(&&nestweaver_schema::Vault, usize)> = rows
                 .iter()
                 .map(|v| {
-                    let n = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                    (
+                        v,
+                        store.list_notes(Some(&v.uid)).unwrap_or_default().len(),
+                    )
+                })
+                .collect();
+            let entries: Vec<Value> = rows_with_counts
+                .iter()
+                .map(|(v, n)| {
                     json!({
                         "uid": v.uid,
                         "instance_id": v.instance_id,
@@ -2449,10 +2459,50 @@ fn tool_brain_status(
                     })
                 })
                 .collect();
+
+            // Suggest a concrete merge command. The keeper is the row with
+            // the highest note_count (most data); ties break on the
+            // lexicographically smallest instance_id so the suggestion is
+            // deterministic. Emit one command per non-keeper row so callers
+            // collapse all ghosts into the canonical instance.
+            let keeper = rows_with_counts
+                .iter()
+                .max_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| b.0.instance_id.cmp(&a.0.instance_id))
+                })
+                .map(|(v, _)| v);
+            let (remediation_commands, remediation_hint) = match keeper {
+                Some(keeper_v) => {
+                    let cmds: Vec<String> = rows_with_counts
+                        .iter()
+                        .filter(|(v, _)| v.instance_id != keeper_v.instance_id)
+                        .map(|(v, _)| {
+                            format!(
+                                "nestweaver instance merge --from {} --to {}",
+                                v.instance_id, keeper_v.instance_id,
+                            )
+                        })
+                        .collect();
+                    let hint = format!(
+                        "Multiple instance_ids share this vault root. Keep '{}' (has the most data) and merge the others into it using the commands below. Take a snapshot of {} first.",
+                        keeper_v.instance_id,
+                        db_path
+                            .as_deref()
+                            .and_then(|p| p.to_str())
+                            .unwrap_or("the database"),
+                    );
+                    (cmds, hint)
+                }
+                None => (Vec::new(), String::new()),
+            };
+
             json!({
                 "kind": "duplicate_vault_root",
                 "root_path": root,
                 "entries": entries,
+                "remediation_commands": remediation_commands,
+                "remediation_hint": remediation_hint,
             })
         })
         .collect();
