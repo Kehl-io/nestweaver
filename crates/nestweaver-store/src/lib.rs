@@ -28,7 +28,7 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::ImpactNode;
-pub use write::{MergeResult, UnlinkedVault};
+pub use write::{MergeResult, PurgeInstanceResult, UnlinkedVault};
 
 #[cfg(test)]
 mod tests {
@@ -1448,5 +1448,88 @@ mod tests {
         // but files are gone — verify by checking a lookup would find no symbols).
         let all_syms = store.lookup_symbols_by_name("fn_1").unwrap();
         assert!(all_syms.is_empty());
+    }
+
+    #[test]
+    fn purge_instance_cascade_deletes_repos_and_children() {
+        let store = test_store();
+
+        // Two repos under instance "ghost" — both should disappear.
+        let ghost_repo_a = Repo {
+            uid: "repo:ghost:aaaa".to_string(),
+            url: "file:///ghost/a".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "ghost".to_string(),
+            name: Some("ghost-a".to_string()),
+        };
+        let ghost_repo_b = Repo {
+            uid: "repo:ghost:bbbb".to_string(),
+            url: "file:///ghost/b".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "ghost".to_string(),
+            name: Some("ghost-b".to_string()),
+        };
+        store.insert_repo(&ghost_repo_a).unwrap();
+        store.insert_repo(&ghost_repo_b).unwrap();
+
+        // One repo under a different instance — must survive intact.
+        let keep_repo = Repo {
+            uid: "repo:keep:cccc".to_string(),
+            url: "file:///keep/c".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "keep".to_string(),
+            name: Some("keep-c".to_string()),
+        };
+        store.insert_repo(&keep_repo).unwrap();
+
+        // Children for each repo.
+        store
+            .insert_file(&make_file("file-ghost-a", "repo:ghost:aaaa"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym-ghost-a",
+                "ghost_fn",
+                "repo:ghost:aaaa",
+                "src/file-ghost-a.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service("svc-ghost-a", "repo:ghost:aaaa"))
+            .unwrap();
+        store
+            .insert_file(&make_file("file-keep", "repo:keep:cccc"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym-keep",
+                "keep_fn",
+                "repo:keep:cccc",
+                "src/file-keep.rs",
+            ))
+            .unwrap();
+
+        let result = store.purge_instance("ghost").unwrap();
+        assert_eq!(result.repos, 2);
+        assert_eq!(result.files, 1);
+        assert_eq!(result.symbols, 1);
+
+        // Ghost repos are gone.
+        let remaining = store.list_repos(None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, "repo:keep:cccc");
+
+        // Keep-instance children are intact.
+        let keep_syms = store.lookup_symbols_by_name("keep_fn").unwrap();
+        assert_eq!(keep_syms.len(), 1);
+
+        // Re-running on a clean instance is a no-op.
+        let again = store.purge_instance("ghost").unwrap();
+        assert_eq!(again.repos, 0);
+        assert_eq!(again.files, 0);
+        assert_eq!(again.symbols, 0);
     }
 }

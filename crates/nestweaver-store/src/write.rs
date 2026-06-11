@@ -24,6 +24,18 @@ pub struct MergeResult {
     pub unlinked: Vec<UnlinkedVault>,
 }
 
+/// Result of [`GraphStore::purge_instance`]. Reports how many top-level
+/// rows were cascade-deleted from the graph for the given instance.
+#[derive(Debug, Default)]
+pub struct PurgeInstanceResult {
+    pub repos: usize,
+    pub files: usize,
+    pub symbols: usize,
+    pub vaults: usize,
+    pub notes: usize,
+    pub projects: usize,
+}
+
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
 /// `framework_hint` column stores. Returns an empty string when absent.
 fn encode_framework_hint(symbol: &Symbol) -> String {
@@ -2248,6 +2260,55 @@ impl GraphStore {
             tracing::trace!("clear_repo_derived_nodes: Contract delete skipped: {e}");
         }
         Ok(())
+    }
+
+    /// Cascade-delete every graph row whose `instance_id` matches `id`:
+    /// all Repos (with their files, symbols, services, contracts), all
+    /// Vaults (with their notes/headings/sections via
+    /// `delete_vault_cascade`), and all Projects. Composes the same
+    /// per-Repo cleanup that `index --force` uses, so no novel write
+    /// paths are introduced. Idempotent: returns zero counts on a clean
+    /// DB. Useful for recovering from a misconfigured `instance merge`
+    /// that left an orphan instance ID behind.
+    pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
+        let mut result = PurgeInstanceResult::default();
+
+        // Repos owned by this instance — cascade delete every File,
+        // Symbol, Service, and Contract that hangs off each one before
+        // dropping the Repo node itself.
+        let repos = self.list_repos(Some(id))?;
+        for r in &repos {
+            let (files, syms) = self.bulk_delete_repo_files_and_symbols(&r.uid)?;
+            self.clear_repo_derived_nodes(&r.uid)?;
+            self.delete_repo_node(&r.uid)?;
+            result.files += files;
+            result.symbols += syms;
+        }
+        result.repos = repos.len();
+
+        // Vaults owned by this instance — cascade Note/Heading/Section.
+        let vaults = self.list_vaults(Some(id))?;
+        for v in &vaults {
+            let notes = self.delete_vault_cascade(&v.uid)?;
+            result.notes += notes;
+        }
+        result.vaults = vaults.len();
+
+        // Projects owned by this instance — single DETACH DELETE each.
+        let projects = self.list_projects()?;
+        for p in &projects {
+            if p.instance_id == id {
+                let conn = self.conn()?;
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+                    vec![("uid", lbug::Value::String(p.uid.clone()))],
+                )?;
+                result.projects += 1;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Insert a single CROSS_REPO_LINK edge between two Symbol nodes.
