@@ -2695,7 +2695,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let empty_links = vec![];
                 let links = instance_config.links.as_deref().unwrap_or(&empty_links);
 
-                match build_feature_context(&store, feature_config, links, parsed_intent, limit) {
+                match build_feature_context(
+                    &store,
+                    feature_config,
+                    links,
+                    &instance_config.repos,
+                    parsed_intent,
+                    limit,
+                ) {
                     Ok(mut result) => {
                         if let Some(budget) = token_budget {
                             let cut = context_token_budgeted_truncate(&result.connected, budget);
