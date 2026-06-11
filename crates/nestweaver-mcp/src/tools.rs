@@ -3734,9 +3734,30 @@ fn tool_project_context(
     //    PROJECT_INCLUDES_SYMBOL edges, leaving each PROJECT_INCLUDES_NOTE
     //    target below threshold so it never reaches `connected`. Seeding also
     //    lets the walk explore each note's neighbourhood (sections, links).
+    //
+    //    Member symbols suffer the identical fan-out, so also seed the top-K
+    //    by PageRank (Bug #18 / wave-5 regression). Without this, a project
+    //    that declares any repo returns notes-only context even after
+    //    `materialize-projects` writes hundreds of thousands of
+    //    PROJECT_INCLUDES_SYMBOL edges.
+    const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
+    let mut member_symbol_uids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let top_symbols = store
+        .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+        .map_err(|e| anyhow!("list_project_symbol_uids_by_pagerank: {e}"))?;
+    member_symbol_uids.extend(top_symbols);
+    for comp_uid in &component_uids {
+        let comp_top = store
+            .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+            .unwrap_or_default();
+        member_symbol_uids.extend(comp_top);
+    }
+
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
     ppr_seeds.extend(component_uids);
     ppr_seeds.extend(member_note_uids.iter().cloned());
+    ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
@@ -3764,6 +3785,15 @@ fn tool_project_context(
     //     disjoint from `connected` and not rendered. For project orientation
     //     the curated notes are the answer, so promote them (Bug #12).
     nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+    // 4b'. Mirror the notes promotion for the seeded top-K member symbols
+    //      (Bug #18 / wave-5 regression). Without this, the symbols stay in
+    //      `seeds` and never appear in the rendered `connected` list.
+    nestweaver_engine::promote_member_symbols_into_connected(&mut result, &member_symbol_uids);
+    // 4b''. Drop Heading nodes that duplicate a Section with the same
+    //       `(file, title)`. The Section carries the body, so the bare
+    //       Heading is redundant; notes-heavy projects spend ~25% of a
+    //       2000-token budget on these duplicates without this trim.
+    nestweaver_engine::dedup_heading_section_pairs(&mut result);
 
     // 4c. Post-PPR scope boost: multiply relevance for nodes that belong
     //     to the project (member UIDs are the authoritative membership signal).
@@ -3836,8 +3866,18 @@ fn tool_project_context(
         );
     }
 
-    // 6. Apply token budget: account for seed cost, allocate remainder to connected.
-    let seed_tokens: usize = result.seeds.iter().map(render_cost).sum();
+    // 6. Apply token budget: account for seed cost, allocate remainder to
+    //    connected. Don't double-count items that the promotion helpers above
+    //    copied from `seeds` into `connected` — those tokens belong to the
+    //    connected budget, not the seed overhead.
+    let connected_uids: std::collections::HashSet<&str> =
+        result.connected.iter().map(|n| n.uid.as_str()).collect();
+    let seed_tokens: usize = result
+        .seeds
+        .iter()
+        .filter(|n| !connected_uids.contains(n.uid.as_str()))
+        .map(render_cost)
+        .sum();
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
     let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget);
     let used_tokens = seed_tokens + connected_tokens;
