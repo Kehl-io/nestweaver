@@ -4649,6 +4649,9 @@ pub fn dispatch_via_daemon(
                     include_components: bool_field("include_components"),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
+                    since: str_field("since"),
+                    recency_weight: f64_field("recency_weight"),
+                    recency_half_life_days: f64_field("recency_half_life_days"),
                 });
                 let resp = client
                     .get_project_context(req)
