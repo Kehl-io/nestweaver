@@ -1720,6 +1720,25 @@ enum BrainCommands {
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, blast-radius, general-context"
         )]
         intent: Option<String>,
+        /// Hard-filter test-path nodes out of both seeds and connected
+        /// results. Distinct from the existing soft test-path deboost
+        /// multiplier — this drops the rows entirely. Useful when callers
+        /// want production-only context (e.g. for diffs that should not
+        /// surface fixtures or playwright specs).
+        #[arg(
+            long = "no-tests",
+            help = "Hard-filter test-path nodes out of seeds + connected results (in addition to the soft deboost)"
+        )]
+        no_tests: bool,
+        /// Prefer a specific instance_id when ranking. When the database
+        /// contains rows from multiple instance_ids (e.g. mid-merge), this
+        /// scopes results to nodes registered under the given instance.
+        /// Pass `--prefer-instance <id>` to scope to that instance only.
+        #[arg(
+            long = "prefer-instance",
+            help = "Scope ranking to nodes registered under this instance_id"
+        )]
+        prefer_instance: Option<String>,
     },
     /// List wikilinks whose target is ambiguous or low-confidence
     /// (confidence < 1.0), with suggested target notes for each.
@@ -6468,11 +6487,21 @@ fn run_brain(
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
                     // Interaction tracking — local check (not in MCP response).
+                    // The sidecar is created (empty) by `InteractionTracker::new`
+                    // when an MCP/daemon starts with --track-interactions, so:
+                    //   - file present + scores > 0  -> "enabled, N scored"
+                    //   - file present + scores == 0 -> "enabled (no events yet)"
+                    //   - file absent                -> "disabled"
                     match nestweaver_engine::load_interaction_data(db_path) {
-                        Some(data) => {
+                        Some(data) if !data.scores.is_empty() => {
                             println!(
                                 "  interaction_tracking: enabled ({} nodes scored)",
                                 data.scores.len()
+                            );
+                        }
+                        Some(_) => {
+                            println!(
+                                "  interaction_tracking: enabled (no events recorded yet)"
                             );
                         }
                         None => {
@@ -6508,11 +6537,32 @@ fn run_brain(
                                 eprintln!(
                                     "  This usually means brain add was run with different --instance values."
                                 );
-                                eprintln!(
-                                    "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
-                                     Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
-                                );
+                                // Prefer the targeted remediation produced
+                                // by tool_brain_status when present, fall
+                                // back to the generic three-option guidance
+                                // for older daemon binaries.
+                                let cmds = w["remediation_commands"]
+                                    .as_array()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let hint = w["remediation_hint"].as_str().unwrap_or("");
+                                if !cmds.is_empty() {
+                                    if !hint.is_empty() {
+                                        eprintln!("  {hint}");
+                                    }
+                                    eprintln!("  Run:");
+                                    for c in &cmds {
+                                        if let Some(s) = c.as_str() {
+                                            eprintln!("      {s}");
+                                        }
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
+                                    );
+                                }
                             }
                         }
                     }
@@ -6552,67 +6602,63 @@ fn run_brain(
             }
 
             if json {
-                #[derive(serde::Serialize)]
-                struct VaultDetail {
-                    /// Vault UID (sym `vlt:<instance>:<hash>`). Needed when
-                    /// callers want to pass this row to `brain remove --instance`
-                    /// or `instance merge --from/--to`.
-                    uid: String,
-                    /// Instance the row is registered under. Surfaces the
-                    /// row-to-instance mapping that was previously only visible
-                    /// in aggregate `instance_ids`.
-                    instance_id: String,
-                    name: String,
-                    root_path: String,
-                    note_count: usize,
-                    last_indexed: Option<String>,
-                }
-                #[derive(serde::Serialize)]
-                struct Status {
-                    db: String,
-                    vaults: usize,
-                    vault_details: Vec<VaultDetail>,
-                    notes: usize,
-                    headings: usize,
-                    sections: usize,
-                    tags: usize,
-                    wikilinks: usize,
-                    repos: usize,
-                    instance_ids: Vec<String>,
-                }
-                let vault_details: Vec<VaultDetail> = vaults
+                // Match the canonical schema emitted by `tool_brain_status`
+                // so daemon-routed and local (`--no-daemon`) callers parse
+                // identical shapes:
+                //   - `vaults` is an array of vault detail objects.
+                //   - `vault_count` is the total count.
+                //   - `repos` is an array of repo objects; `repo_count` the total.
+                // `vault_details` is preserved as an alias for `vaults` so
+                // scripts written against the previous local-only shape keep
+                // working through the deprecation window.
+                let vault_details: Vec<serde_json::Value> = vaults
                     .iter()
                     .map(|v| {
                         let vault_note_count =
                             store.list_notes(Some(&v.uid)).unwrap_or_default().len();
                         let last_indexed = resolve_last_indexed(db_path, &v.uid, &store);
-                        VaultDetail {
-                            uid: v.uid.clone(),
-                            instance_id: v.instance_id.clone(),
-                            name: v.name.clone(),
-                            root_path: v.root_path.clone(),
-                            note_count: vault_note_count,
-                            last_indexed,
-                        }
+                        serde_json::json!({
+                            "uid": v.uid,
+                            "instance_id": v.instance_id,
+                            "name": v.name,
+                            "root_path": v.root_path,
+                            "note_count": vault_note_count,
+                            "last_indexed": last_indexed,
+                        })
+                    })
+                    .collect();
+                let repo_details: Vec<serde_json::Value> = repos
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "url": r.url,
+                            "sha": r.indexed_sha,
+                            "instance_id": r.instance_id,
+                            "name": r.name,
+                        })
                     })
                     .collect();
                 let mut instance_ids: std::collections::BTreeSet<&str> =
                     vaults.iter().map(|v| v.instance_id.as_str()).collect();
                 instance_ids.extend(repos.iter().map(|r| r.instance_id.as_str()));
+                let instance_ids_json: Vec<String> =
+                    instance_ids.into_iter().map(|s| s.to_string()).collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&Status {
-                        db: db_path.display().to_string(),
-                        vaults: vaults.len(),
-                        vault_details,
-                        notes: note_count,
-                        headings: heading_count,
-                        sections: section_count,
-                        tags: tag_count,
-                        wikilinks: wikilink_count,
-                        repos: repos.len(),
-                        instance_ids: instance_ids.into_iter().map(|s| s.to_string()).collect(),
-                    })?
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "db": db_path.display().to_string(),
+                        "vaults": vault_details,
+                        "vault_count": vaults.len(),
+                        "vault_details": vault_details,
+                        "notes": note_count,
+                        "headings": heading_count,
+                        "sections": section_count,
+                        "tags": tag_count,
+                        "wikilinks": wikilink_count,
+                        "repos": repo_details,
+                        "repo_count": repos.len(),
+                        "instance_ids": instance_ids_json,
+                    }))?
                 );
             } else {
                 println!("Brain status:");
@@ -6658,14 +6704,20 @@ fn run_brain(
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
                 // Interaction tracking is opt-in (enabled via `mcp
-                // --track-interactions`). Its presence is indicated by an
-                // interaction sidecar; when absent, surface the hint.
+                // --track-interactions`). InteractionTracker::new touches
+                // the sidecar at startup so we can distinguish three states:
+                //   - file present + scores > 0  -> enabled, accumulating
+                //   - file present + scores == 0 -> enabled, no events yet
+                //   - file absent                -> disabled
                 match nestweaver_engine::load_interaction_data(db_path) {
-                    Some(data) => {
+                    Some(data) if !data.scores.is_empty() => {
                         println!(
                             "  interaction_tracking: enabled ({} nodes scored)",
                             data.scores.len()
                         );
+                    }
+                    Some(_) => {
+                        println!("  interaction_tracking: enabled (no events recorded yet)");
                     }
                     None => {
                         println!(
@@ -7650,6 +7702,8 @@ fn run_brain(
             prf,
             rerank,
             intent,
+            no_tests,
+            prefer_instance,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
 
@@ -7663,9 +7717,14 @@ fn run_brain(
                 .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
 
             // Route through daemon's GetContext RPC when available and no
-            // flags require direct-disk processing.
+            // flags require direct-disk processing. `--no-tests` and
+            // `--prefer-instance` are applied client-side and the daemon
+            // proto does not yet carry them, so fall through to the local
+            // path when either is set.
             if use_daemon
                 && since.is_none()
+                && !no_tests
+                && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
             {
                 let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
@@ -7842,6 +7901,47 @@ fn run_brain(
                     };
                     apply_filters(&mut result.seeds);
                     apply_filters(&mut result.connected);
+
+                    // `--no-tests`: drop rows whose location matches any
+                    // test_path_pattern. Distinct from the soft deboost the
+                    // ranking pass already applied — this removes the rows
+                    // entirely so a strict-prod caller never sees them.
+                    if no_tests {
+                        let patterns = &config.test_path_patterns;
+                        if !patterns.is_empty() {
+                            let is_test_path = |loc: &str| -> bool {
+                                let lower = loc.to_lowercase();
+                                patterns.iter().any(|p| {
+                                    let needle = p.trim_start_matches('/').to_lowercase();
+                                    !needle.is_empty() && lower.contains(&needle)
+                                })
+                            };
+                            let drop_tests = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                                nodes.retain(|n| !is_test_path(&n.location));
+                            };
+                            drop_tests(&mut result.seeds);
+                            drop_tests(&mut result.connected);
+                        }
+                    }
+
+                    // `--prefer-instance <id>`: scope ranking to a single
+                    // instance_id. UIDs encode the owning instance as a
+                    // delimited segment: `note:vlt:<inst>:<hash>:...`,
+                    // `sym:repo:<inst>:<hash>:...`, `repo:<inst>:<hash>`,
+                    // etc. Matching on `:<inst>:` is robust to a partially-
+                    // merged DB where some symbol UIDs still encode the
+                    // pre-merge repo UID — both the old and new forms still
+                    // carry an `:<inst>:` segment that uniquely identifies
+                    // the instance, and the leading and trailing colons
+                    // prevent accidental substring collisions with hashes.
+                    if let Some(ref target) = prefer_instance {
+                        let needle = format!(":{target}:");
+                        let filter_inst = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                            nodes.retain(|n| n.uid.contains(needle.as_str()));
+                        };
+                        filter_inst(&mut result.seeds);
+                        filter_inst(&mut result.connected);
+                    }
 
                     // tags filter: keep only note/section nodes tagged with any of these.
                     if !tags.is_empty() {
