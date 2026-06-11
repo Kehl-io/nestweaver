@@ -6,6 +6,7 @@ use anyhow::Context;
 
 use crate::config::{
     FeatureConfig, LinkConfig, RANKING_MULTIPLIER_MAX, RANKING_MULTIPLIER_MIN, RankingConfig,
+    RepoConfig,
 };
 use crate::repo_display_name;
 
@@ -653,7 +654,11 @@ pub struct FeatureContextResult {
 
 /// Build a task-focused context for a declared feature bundle.
 ///
-/// 1. Loads all repos and resolves feature.repos names to repo_uids.
+/// 1. Loads all repos and resolves feature.repos names to repo_uids. Matching
+///    accepts either the DB Repo display name or an `[[repos]]` config alias
+///    (`name = "..."`) whose URL matches an indexed repo — so a feature can
+///    refer to a repo by a friendly name even if it was indexed under its
+///    URL basename.
 /// 2. Resolves all `feature.entry_points` using exact name match, filtered to feature repos.
 /// 3. Runs Personalized PageRank from those seeds.
 /// 4. Returns seeds, connected symbols, declared links, and any unmatched entry points.
@@ -661,14 +666,29 @@ pub fn build_feature_context(
     store: &GraphStore,
     feature: &FeatureConfig,
     links: &[LinkConfig],
+    repo_configs: &[RepoConfig],
     intent: Option<QueryIntent>,
     limit: Option<usize>,
 ) -> Result<FeatureContextResult, anyhow::Error> {
     // Resolve feature repo names to repo_uids.
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
+    // URL allow-list derived from `[[repos]] name = ...` aliases declared by
+    // the feature. Lets `feature.repos = ["redrock"]` resolve to a DB repo
+    // indexed under a different display name when the config aliases it.
+    let alias_urls: std::collections::HashSet<&str> = repo_configs
+        .iter()
+        .filter(|rc| {
+            rc.name
+                .as_deref()
+                .is_some_and(|n| feature.repos.iter().any(|fr| fr == n))
+        })
+        .map(|rc| rc.url.as_str())
+        .collect();
     let feature_repo_uids: std::collections::HashSet<String> = all_repos
         .iter()
-        .filter(|r| feature.repos.contains(&repo_display_name(r)))
+        .filter(|r| {
+            feature.repos.contains(&repo_display_name(r)) || alias_urls.contains(r.url.as_str())
+        })
         .map(|r| r.uid.clone())
         .collect();
 
