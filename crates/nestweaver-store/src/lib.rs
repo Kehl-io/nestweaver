@@ -1512,15 +1512,51 @@ mod tests {
             ))
             .unwrap();
 
+        // Orphan rows: simulate a partial `instance merge` that already
+        // dropped a Repo node but left its Symbol/File children behind
+        // with the source instance still encoded in their UID prefix.
+        // `purge_instance` must catch these via the orphan-sweep path
+        // even though no `repo:ghost:zzzz` exists to walk down from.
+        store
+            .insert_file(&make_file(
+                "file:repo:ghost:zzzz:orphan",
+                "repo:ghost:zzzz",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:repo:ghost:zzzz:orphan",
+                "orphan_fn",
+                "repo:ghost:zzzz",
+                "src/orphan.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service(
+                "svc:repo:ghost:zzzz:orphan",
+                "repo:ghost:zzzz",
+            ))
+            .unwrap();
+
         let result = store.purge_instance("ghost").unwrap();
         assert_eq!(result.repos, 2);
         assert_eq!(result.files, 1);
         assert_eq!(result.symbols, 1);
+        // 1 orphan File + 1 orphan Symbol + 1 orphan Service.
+        assert!(
+            result.orphans_swept >= 3,
+            "expected at least 3 orphan rows swept, got {}",
+            result.orphans_swept
+        );
 
         // Ghost repos are gone.
         let remaining = store.list_repos(None).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].uid, "repo:keep:cccc");
+
+        // Orphan symbols are also gone.
+        let orphan_syms = store.lookup_symbols_by_name("orphan_fn").unwrap();
+        assert!(orphan_syms.is_empty());
 
         // Keep-instance children are intact.
         let keep_syms = store.lookup_symbols_by_name("keep_fn").unwrap();
@@ -1531,5 +1567,6 @@ mod tests {
         assert_eq!(again.repos, 0);
         assert_eq!(again.files, 0);
         assert_eq!(again.symbols, 0);
+        assert_eq!(again.orphans_swept, 0);
     }
 }
