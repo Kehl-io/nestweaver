@@ -25,7 +25,11 @@ pub struct MergeResult {
 }
 
 /// Result of [`GraphStore::purge_instance`]. Reports how many top-level
-/// rows were cascade-deleted from the graph for the given instance.
+/// rows were cascade-deleted from the graph for the given instance,
+/// plus a separate count for orphan nodes (Symbol/File/Service/Note/
+/// Heading/Section/Tag rows whose UID prefix encodes the instance but
+/// whose parent Repo or Vault no longer exists — typically left behind
+/// by a partially-applied `instance merge`).
 #[derive(Debug, Default)]
 pub struct PurgeInstanceResult {
     pub repos: usize,
@@ -34,6 +38,7 @@ pub struct PurgeInstanceResult {
     pub vaults: usize,
     pub notes: usize,
     pub projects: usize,
+    pub orphans_swept: usize,
 }
 
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
@@ -2308,7 +2313,71 @@ impl GraphStore {
             }
         }
 
+        // Orphan sweep: a partial `instance merge` can drop the Repo or
+        // Vault node while leaving its child Symbol/File/Service/Note
+        // rows behind. Those children still encode the source instance
+        // in their UID prefix, so we can find and drop them even after
+        // the parent is gone. Order matters only for telemetry — every
+        // statement is `DETACH DELETE` so incident edges are cleaned.
+        for (label, prefix) in [
+            ("Symbol", format!("sym:repo:{id}:")),
+            ("File", format!("file:repo:{id}:")),
+            ("Service", format!("svc:repo:{id}:")),
+            ("Note", format!("note:vlt:{id}:")),
+            ("Heading", format!("head:note:vlt:{id}:")),
+            ("Section", format!("sec:note:vlt:{id}:")),
+            ("Tag", format!("tag:vlt:{id}:")),
+            // Defensive: also catch Repo/Vault/Project rows that the
+            // registry-walk above missed (e.g. stale rows whose
+            // instance_id column was scrambled but whose UID is intact).
+            ("Repo", format!("repo:{id}:")),
+            ("Vault", format!("vlt:{id}:")),
+            ("Project", format!("proj:{id}:")),
+        ] {
+            result.orphans_swept += self.sweep_orphan_nodes(label, &prefix)?;
+        }
+
         Ok(result)
+    }
+
+    /// Count and DETACH DELETE every node of `label` whose `uid` starts
+    /// with `prefix`. Returns the number of rows removed. Idempotent.
+    /// Used by [`purge_instance`] to clean up orphans left by a
+    /// partial `instance merge` that already dropped the parent
+    /// Repo/Vault node.
+    fn sweep_orphan_nodes(&self, label: &str, prefix: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let count_query = format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p RETURN count(n)");
+        let count: usize = {
+            let mut stmt = conn.prepare(&count_query).map_err(|e| {
+                StoreError::Query(format!("prepare count {label} orphans: {e}"))
+            })?;
+            let rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![("p", lbug::Value::String(prefix.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("count {label} orphans: {e}")))?;
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+        if count == 0 {
+            return Ok(0);
+        }
+        let delete_query =
+            format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n");
+        exec_params(
+            &conn,
+            &delete_query,
+            vec![("p", lbug::Value::String(prefix.to_string()))],
+        )?;
+        Ok(count)
     }
 
     /// Insert a single CROSS_REPO_LINK edge between two Symbol nodes.

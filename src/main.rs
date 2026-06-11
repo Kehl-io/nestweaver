@@ -9111,15 +9111,27 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 let r = store
                     .purge_instance(&id)
                     .map_err(|e| anyhow::anyhow!(e))?;
-                let total = r.repos + r.files + r.symbols + r.vaults + r.notes + r.projects;
+                let total = r.repos
+                    + r.files
+                    + r.symbols
+                    + r.vaults
+                    + r.notes
+                    + r.projects
+                    + r.orphans_swept;
                 if total == 0 {
                     println!("No graph rows found for instance '{id}' — database is clean.");
                 } else {
                     println!(
                         "Purged instance '{id}' from graph: {} repo(s), \
                          {} file(s), {} symbol(s), {} vault(s), {} note(s), \
-                         {} project(s)",
-                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects
+                         {} project(s), {} orphan(s)",
+                        r.repos,
+                        r.files,
+                        r.symbols,
+                        r.vaults,
+                        r.notes,
+                        r.projects,
+                        r.orphans_swept
                     );
                 }
             }
