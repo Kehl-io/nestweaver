@@ -392,7 +392,10 @@ pub fn build_context_with_intent(
 
 #[cfg(test)]
 mod promote_tests {
-    use super::{BrainContextResult, BrainNode, promote_member_notes_into_connected};
+    use super::{
+        BrainContextResult, BrainNode, promote_member_notes_into_connected,
+        promote_member_symbols_into_connected,
+    };
     use std::collections::HashSet;
 
     fn note(uid: &str) -> BrainNode {
@@ -475,6 +478,64 @@ mod promote_tests {
             !result.connected.iter().any(|n| n.uid == "proj:x"),
             "non-member seed must not be promoted"
         );
+    }
+
+    // Wave-5 regression fix: when a project declares repos, the project node's
+    // mass fans out across thousands of PROJECT_INCLUDES_SYMBOL edges, leaving
+    // each member symbol below the PPR min_score filter. The CLI seeds the
+    // top-K member symbols by PageRank to keep them alive, and this helper
+    // surfaces them into `connected` (mirror of the notes promotion).
+    #[test]
+    fn promotes_member_symbols_from_seeds_into_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![
+                symbol("sym:foo"),
+                symbol("sym:bar"),
+                note("note:non-member"),
+            ],
+            connected: vec![note("note:overview")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
+            .into_iter()
+            .collect();
+
+        promote_member_symbols_into_connected(&mut result, &members);
+
+        let connected_uids: Vec<&str> = result.connected.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            connected_uids.contains(&"sym:foo"),
+            "member symbol 'sym:foo' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            connected_uids.contains(&"sym:bar"),
+            "member symbol 'sym:bar' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            !connected_uids.contains(&"note:non-member"),
+            "non-member seed must not be promoted; got {connected_uids:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_promotion_does_not_duplicate_already_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![symbol("sym:foo")],
+            connected: vec![symbol("sym:foo")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
+
+        promote_member_symbols_into_connected(&mut result, &members);
+
+        let count = result
+            .connected
+            .iter()
+            .filter(|n| n.uid == "sym:foo")
+            .count();
+        assert_eq!(count, 1, "already-present member symbol must not duplicate");
     }
 }
 
@@ -823,6 +884,30 @@ pub fn promote_member_notes_into_connected(
         .seeds
         .iter()
         .filter(|n| member_note_uids.contains(&n.uid) && !present.contains(&n.uid))
+        .cloned()
+        .collect();
+    result.connected.extend(promoted);
+}
+
+/// Surface a project's curated member symbols into the rendered `connected`
+/// list.
+///
+/// Companion to [`promote_member_notes_into_connected`]. When `project-context`
+/// seeds PPR with the top-K project symbols by PageRank, those seeds survive
+/// the `min_score` filter but land in `result.seeds` — which is *not* rendered
+/// by the CLI / MCP project responses. Promote any seeded symbol UID present
+/// in `member_symbol_uids` into `connected`, de-duplicated by UID, so the
+/// architecturally important code surfaces alongside the curated notes.
+pub fn promote_member_symbols_into_connected(
+    result: &mut BrainContextResult,
+    member_symbol_uids: &std::collections::HashSet<String>,
+) {
+    let present: std::collections::HashSet<String> =
+        result.connected.iter().map(|n| n.uid.clone()).collect();
+    let promoted: Vec<BrainNode> = result
+        .seeds
+        .iter()
+        .filter(|n| member_symbol_uids.contains(&n.uid) && !present.contains(&n.uid))
         .cloned()
         .collect();
     result.connected.extend(promoted);

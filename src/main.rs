@@ -4728,9 +4728,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // declares repos, the project node's mass is split across tens of
             // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
             // below threshold so it never reaches `connected`.
+            //
+            // Member symbols suffer the identical fan-out, so seed the
+            // top-K of them by PageRank as well. Without this, a project
+            // that declares any repo returns notes-only context even after
+            // `materialize-projects` writes hundreds of thousands of
+            // PROJECT_INCLUDES_SYMBOL edges (Bug #18 / wave-5 regression).
+            const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
+            let mut member_symbol_uids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let top_symbols = store
+                .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            member_symbol_uids.extend(top_symbols.iter().cloned());
+            for comp_uid in &comp_uids {
+                let comp_top = store
+                    .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+                    .unwrap_or_default();
+                member_symbol_uids.extend(comp_top);
+            }
+
             let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
             ppr_seeds.extend(comp_uids);
             ppr_seeds.extend(member_note_uids.iter().cloned());
+            ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
             let defaults = HybridSearchConfig::default();
             let aliases = load_alias_sidecar(&db_path);
@@ -4750,6 +4771,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     nestweaver_engine::promote_member_notes_into_connected(
                         &mut result,
                         &member_note_uids,
+                    );
+                    // Surface the seeded member symbols into `connected`
+                    // for the same reason (companion to the notes promotion).
+                    nestweaver_engine::promote_member_symbols_into_connected(
+                        &mut result,
+                        &member_symbol_uids,
                     );
 
                     // Post-PPR scope boost: multiply relevance for nodes that
@@ -4803,8 +4830,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                     }
 
-                    // Compute seed token cost and allocate the remainder to connected.
-                    let seed_tokens: usize = result.seeds.iter().map(render_cost_tokens).sum();
+                    // Compute seed token cost and allocate the remainder to
+                    // connected. Don't double-count items the promotion helpers
+                    // copied from `seeds` into `connected` — those tokens belong
+                    // to the connected budget, not the seed overhead.
+                    let connected_uids: std::collections::HashSet<&str> = result
+                        .connected
+                        .iter()
+                        .map(|n| n.uid.as_str())
+                        .collect();
+                    let seed_tokens: usize = result
+                        .seeds
+                        .iter()
+                        .filter(|n| !connected_uids.contains(n.uid.as_str()))
+                        .map(render_cost_tokens)
+                        .sum();
                     let remaining_budget = token_budget.saturating_sub(seed_tokens);
                     let cut = token_budgeted_truncate(&result.connected, remaining_budget);
                     if json {

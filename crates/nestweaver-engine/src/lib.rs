@@ -181,7 +181,7 @@ pub use query::{
     build_brain_context_hybrid_with_aliases, build_context, build_context_with_intent,
     build_feature_context, expand_query_with_aliases, explain_ranking_prior, generate_repo_map,
     list_repos, list_services, lookup_symbol, populate_inline_bodies,
-    promote_member_notes_into_connected, search_symbols,
+    promote_member_notes_into_connected, promote_member_symbols_into_connected, search_symbols,
 };
 pub use recency::parse_iso8601_to_epoch;
 pub use registry::*;
