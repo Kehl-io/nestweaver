@@ -7291,26 +7291,68 @@ fn run_brain(
 
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let canon_str = canonical.to_string_lossy();
-            let v_uid = nestweaver_schema::vault_uid(instance_id, &canon_str);
+            let raw_str = path.to_string_lossy();
+            let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
+            let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
             let store = open_store(Some(&db_path))?;
 
+            // Helper: a stored vault matches the caller's path if any of its
+            // representations (canonical, literal, shell-expanded `~`)
+            // resolve to the same absolute path. `brain add` may have
+            // registered the vault with a literal `~/...` string (from a
+            // config file or programmatic call) while the caller of
+            // `brain remove` typically passes a shell-expanded absolute
+            // path. A naive `vault_uid` lookup misses these cases even
+            // though `brain status` clearly shows the row.
+            let home = std::env::var("HOME").ok();
+            let path_matches = |stored: &str| -> bool {
+                if stored == canon_str || stored == raw_str {
+                    return true;
+                }
+                let stored_canon = std::fs::canonicalize(stored)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| stored.to_string());
+                if stored_canon == *canon_str {
+                    return true;
+                }
+                if let (Some(h), Some(rest)) = (home.as_deref(), stored.strip_prefix("~/")) {
+                    let expanded = format!("{h}/{rest}");
+                    if expanded == *canon_str {
+                        return true;
+                    }
+                    if let Ok(c) = std::fs::canonicalize(&expanded)
+                        && c.to_string_lossy() == *canon_str
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+
             // If the caller passed `--instance`, treat it as a precise
-            // selector: only the row owned by that instance is removed.
-            // This is required to disambiguate ghost-row situations
-            // without nuking the populated row that lives at the same
-            // path. If the requested row does not exist, fail loudly
-            // rather than silently scrubbing every other instance at
-            // the path.
+            // selector. If the direct vault_uid lookup misses (path
+            // stored under a non-canonical form like a literal `~/...`),
+            // fall back to a list-scan scoped to the requested instance
+            // before failing.
             //
             // If `--instance` is absent, fall back to the historical
             // ghost-row cleanup behavior: remove the default-UID row
             // plus any other row whose canonical root_path matches.
             let mut uids_to_remove: Vec<String> = Vec::new();
             if instance_specified {
-                if store.lookup_vault(&v_uid).is_ok() {
-                    uids_to_remove.push(v_uid);
-                } else {
+                if store.lookup_vault(&v_uid_canon).is_ok() {
+                    uids_to_remove.push(v_uid_canon);
+                } else if store.lookup_vault(&v_uid_raw).is_ok() {
+                    uids_to_remove.push(v_uid_raw);
+                } else if let Ok(all_vaults) = store.list_vaults(Some(instance_id)) {
+                    for v in &all_vaults {
+                        if path_matches(&v.root_path) {
+                            uids_to_remove.push(v.uid.clone());
+                        }
+                    }
+                }
+                if uids_to_remove.is_empty() {
                     eprintln!(
                         "Error: no vault with instance '{instance_id}' found at {canon_str}.\n  \
                          Run `nestweaver brain status` to see registered vaults and their instance ids,\n  \
@@ -7319,13 +7361,10 @@ fn run_brain(
                     return Ok((EXIT_NOT_FOUND, None));
                 }
             } else {
-                uids_to_remove.push(v_uid);
+                uids_to_remove.push(v_uid_canon);
                 if let Ok(all_vaults) = store.list_vaults(None) {
                     for v in &all_vaults {
-                        let v_canon = std::fs::canonicalize(&v.root_path)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| v.root_path.clone());
-                        if v_canon == *canon_str && !uids_to_remove.contains(&v.uid) {
+                        if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
                             uids_to_remove.push(v.uid.clone());
                         }
                     }
