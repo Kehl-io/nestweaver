@@ -1808,6 +1808,18 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_to_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert note→symbol edges using an externally-provided connection
+    /// (for transaction batching across many notes — avoids one fsync per call).
+    pub fn batch_insert_note_to_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (s:Symbol {uid: $sid}) \
@@ -1836,6 +1848,18 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_section_to_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert section→symbol edges using an externally-provided connection
+    /// (for transaction batching across many notes — avoids one fsync per call).
+    pub fn batch_insert_section_to_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let mut stmt = conn
             .prepare(
                 "MATCH (sec:Section {uid: $sid}), (sym:Symbol {uid: $symid}) \
@@ -1863,8 +1887,17 @@ impl GraphStore {
     /// idempotency.
     pub fn delete_cross_domain_edges_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_cross_domain_edges_for_note_on(&conn, note_uid)
+    }
+
+    /// Delete cross-domain edges for a note using an externally-provided
+    /// connection (for transaction batching across many notes).
+    pub fn delete_cross_domain_edges_for_note_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() DELETE r",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -1890,7 +1923,7 @@ impl GraphStore {
         };
         for s_uid in &section_uids {
             exec_params(
-                &conn,
+                conn,
                 "MATCH (s:Section {uid: $uid})-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() DELETE r",
                 vec![("uid", lbug::Value::String(s_uid.clone()))],
             )?;
