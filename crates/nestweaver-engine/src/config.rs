@@ -320,6 +320,12 @@ pub struct GitConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RepoConfig {
     pub url: String,
+    /// Optional repo display-name alias. When set, project and feature
+    /// configs may refer to the repo by this name even if the DB-indexed
+    /// repo is stored under a different display name (typically the
+    /// URL-derived basename).
+    #[serde(default)]
+    pub name: Option<String>,
     pub sparse: Option<bool>,
     pub pin_sha: Option<String>,
     /// Feature F12 — per-repo opt-out for git-activity-dampened CodeRank.

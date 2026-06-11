@@ -118,11 +118,28 @@ pub fn materialize_projects(
             let mut symbol_uids: Vec<String> = Vec::new();
 
             for repo_name in &project_cfg.repos {
-                // Match by display name (respects --name override) or URL fragment.
+                // Resolve the project's declared repo name to one or more DB
+                // repos. Match order:
+                //   a) DB Repo.name override matches (e.g. `--name redrock`),
+                //   b) URL-derived display name matches,
+                //   c) an `[[repos]]` config entry whose `name = repo_name`
+                //      points at a URL that an indexed repo carries — covers
+                //      the case where the repo was indexed under its URL
+                //      basename but the config aliases it to a friendlier
+                //      name (e.g. redrock ↔ web-application),
+                //   d) URL substring match (legacy fallback).
+                let cfg_url_for_name: Option<&str> = config
+                    .repos
+                    .iter()
+                    .find(|rc| rc.name.as_deref() == Some(repo_name.as_str()))
+                    .map(|rc| rc.url.as_str());
+
                 let matched: Vec<_> = all_repos
                     .iter()
                     .filter(|r| {
-                        repo_display_name(r) == *repo_name || r.url.contains(repo_name.as_str())
+                        repo_display_name(r) == *repo_name
+                            || cfg_url_for_name.is_some_and(|u| r.url == u)
+                            || r.url.contains(repo_name.as_str())
                     })
                     .collect();
 
@@ -131,6 +148,12 @@ pub fn materialize_projects(
                     symbol_uids.extend(syms.into_iter().map(|(sym_uid, _, _)| sym_uid));
                 }
             }
+
+            // Deduplicate — a project may declare two aliases that resolve to
+            // the same DB repo, and (s)-[:PROJECT_INCLUDES_SYMBOL]->(p)
+            // tolerates only one edge per pair.
+            symbol_uids.sort();
+            symbol_uids.dedup();
 
             let count = symbol_uids.len();
             if !symbol_uids.is_empty() {
