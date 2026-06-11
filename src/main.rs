@@ -4621,6 +4621,48 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             recency_half_life_days,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            if use_daemon
+                && let Ok(rt) = tokio::runtime::Runtime::new()
+            {
+                let connect =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                if let Ok(mut client) = connect {
+                    let req = nestweaver_proto::ProjectContextRequest {
+                        project: name.clone(),
+                        token_budget: token_budget as i32,
+                        kinds: vec![],
+                        include_components,
+                        intent: String::new(),
+                        include_seeds: false,
+                        since: since.clone().unwrap_or_default(),
+                        recency_weight,
+                        recency_half_life_days,
+                    };
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .get_project_context(req)
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let value: serde_json::Value =
+                                serde_json::from_str(&resp.result_json)?;
+                            render_project_context_daemon_response(&value, json, token_budget);
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        Err(status) => {
+                            tracing::info!(
+                                "daemon GetProjectContext failed ({}); falling back to direct mode",
+                                status.message()
+                            );
+                        }
+                    }
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -4785,6 +4827,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         &mut result,
                         &member_symbol_uids,
                     );
+                    // Drop Heading/Section duplicates: notes-heavy projects
+                    // would otherwise spend ~25% of a 2000-token budget on
+                    // pairs that share `(file, title)` and add no information.
+                    nestweaver_engine::dedup_heading_section_pairs(&mut result);
 
                     // Post-PPR scope boost: multiply relevance for nodes that
                     // belong to the project so declared content ranks highest.
@@ -8905,6 +8951,53 @@ fn render_brain_search_response(
         }
     }
     Ok(())
+}
+
+/// Render the daemon's `project_context` JSON response (shape produced by
+/// `tool_project_context` in nestweaver-mcp). When `json` is true, emit the
+/// response verbatim; otherwise print a project header followed by the
+/// connected nodes.
+fn render_project_context_daemon_response(
+    value: &serde_json::Value,
+    json: bool,
+    token_budget: usize,
+) {
+    if json {
+        match serde_json::to_string_pretty(value) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("warning: failed to serialize daemon response: {e}"),
+        }
+        return;
+    }
+    let project = value.get("project").and_then(|v| v.as_str()).unwrap_or("");
+    let project_uid = value
+        .get("project_uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let used = value
+        .get("tokens_used")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    println!("Project: {project}  ({project_uid})");
+    if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
+        println!("  {note}");
+    }
+    println!();
+    let empty = vec![];
+    let connected = value
+        .get("connected")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    println!("Connected ({} item(s)):", connected.len());
+    for n in connected {
+        let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let location = n.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let rel = n.get("relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        println!("  [{rel:.4}] {kind}  {title}  @{location}");
+    }
+    println!();
+    println!("Tokens used: {used} / budget: {token_budget}");
 }
 
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {

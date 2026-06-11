@@ -933,6 +933,52 @@ pub fn promote_member_symbols_into_connected(
     result.connected.extend(promoted);
 }
 
+/// Drop `Heading` nodes from `connected` when a `Section` node sharing the
+/// same `(file, title)` is already present.
+///
+/// The vault graph emits both a `Heading` node (the heading line itself) and
+/// a `Section` node (the heading plus its body) for every markdown heading.
+/// They land in retrieval results with near-identical PPR scores and identical
+/// titles — the Section strictly dominates because it carries the body text.
+/// In notes-heavy projects this overlap consumes ~25% of a 2000-token budget
+/// on duplicate entries that add no information.
+///
+/// Location normalisation: a Heading's `location` is typically `<file>` or
+/// `<file>:<line>` and a Section's is `<file>` or `<file>#<anchor>`; both
+/// collapse to the same file stem so the pair is detected regardless of
+/// whether anchors / line suffixes are present.
+pub fn dedup_heading_section_pairs(result: &mut BrainContextResult) {
+    fn loc_stem(loc: &str) -> &str {
+        let no_anchor = loc.split_once('#').map(|(p, _)| p).unwrap_or(loc);
+        if let Some((p, tail)) = no_anchor.rsplit_once(':')
+            && !tail.is_empty()
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            return p;
+        }
+        no_anchor
+    }
+
+    let section_keys: std::collections::HashSet<(String, String)> = result
+        .connected
+        .iter()
+        .filter(|n| n.kind.eq_ignore_ascii_case("Section"))
+        .map(|n| (loc_stem(&n.location).to_string(), n.title.clone()))
+        .collect();
+
+    if section_keys.is_empty() {
+        return;
+    }
+
+    result.connected.retain(|n| {
+        if !n.kind.eq_ignore_ascii_case("Heading") {
+            return true;
+        }
+        let key = (loc_stem(&n.location).to_string(), n.title.clone());
+        !section_keys.contains(&key)
+    });
+}
+
 /// Build a task-focused context subgraph using the unified scope (code +
 /// notes + cross-references). Seeds may be:
 ///
@@ -2371,5 +2417,86 @@ mod expand_query_tests {
             result.contains("Device Pairing"),
             "should expand Pairing; got: {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dedup_heading_section_tests {
+    use super::{BrainContextResult, BrainNode, dedup_heading_section_pairs};
+
+    fn node(uid: &str, kind: &str, title: &str, loc: &str, rel: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            location: loc.to_string(),
+            relevance: rel,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    fn make(connected: Vec<BrainNode>) -> BrainContextResult {
+        BrainContextResult {
+            seeds: vec![],
+            connected,
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        }
+    }
+
+    #[test]
+    fn drops_heading_when_section_with_same_file_and_title_present() {
+        let mut r = make(vec![
+            node("h1", "Heading", "Overview", "notes/foo.md", 0.5),
+            node("s1", "Section", "Overview", "notes/foo.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 1);
+        assert_eq!(r.connected[0].uid, "s1");
+    }
+
+    #[test]
+    fn keeps_heading_when_no_matching_section() {
+        let mut r = make(vec![
+            node("h1", "Heading", "Overview", "notes/foo.md", 0.5),
+            node("s2", "Section", "Different Title", "notes/foo.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 2);
+    }
+
+    #[test]
+    fn collapses_locations_with_line_or_anchor_suffix() {
+        // Heading carries `file:line`, Section carries `file#anchor`; both
+        // should collapse to the same file stem.
+        let mut r = make(vec![
+            node("h1", "Heading", "Setup", "notes/bar.md:42", 0.5),
+            node("s1", "Section", "Setup", "notes/bar.md#setup", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 1);
+        assert_eq!(r.connected[0].kind, "Section");
+    }
+
+    #[test]
+    fn no_op_when_no_sections_present() {
+        let mut r = make(vec![
+            node("h1", "Heading", "A", "x.md", 0.5),
+            node("h2", "Heading", "B", "x.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 2);
+    }
+
+    #[test]
+    fn ignores_unrelated_kinds() {
+        let mut r = make(vec![
+            node("n1", "Note/PRD", "Spec", "notes/spec.md", 0.6),
+            node("s1", "Section", "Spec", "notes/spec.md", 0.5),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        // Note nodes are never dropped, only Heading nodes.
+        assert_eq!(r.connected.len(), 2);
     }
 }
