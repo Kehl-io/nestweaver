@@ -1375,7 +1375,7 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
 /// Resolve a UID to a printable `BrainNode` by dispatching on UID prefix.
 /// Returns Ok(None) if the node can't be found (silently dropped from
 /// results — should only happen for stale/orphan UIDs).
-fn render_brain_node(
+pub(crate) fn render_brain_node(
     store: &GraphStore,
     uid: &str,
     score: f64,

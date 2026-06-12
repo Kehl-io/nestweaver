@@ -155,6 +155,35 @@ impl Default for SeedResolutionConfig {
                     suffix: None,
                     factor: 0.4,
                 },
+                // Vendored test-runtime packages bundled into a repo's
+                // dependencies. These leak into seed candidates and PPR walks
+                // when third-party test packages ship their own framework code
+                // under the repo tree.
+                PathDeboostRule {
+                    prefix: Some("/jasmine/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
+                PathDeboostRule {
+                    prefix: Some("/mocha/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
+                PathDeboostRule {
+                    prefix: Some("/qunit/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
+                PathDeboostRule {
+                    prefix: Some("/jest/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
+                PathDeboostRule {
+                    prefix: Some("/karma/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
                 PathDeboostRule {
                     prefix: None,
                     suffix: Some(".test.tsx".into()),

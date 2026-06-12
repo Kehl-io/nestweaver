@@ -892,11 +892,12 @@ pin_sha = "deadbeef1234"
     #[test]
     fn parses_default_seed_resolution() {
         let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
-        // Defaults populate the full 14-rule path_deboost list.
+        // Defaults populate the full 19-rule path_deboost list (9 test-mirror
+        // prefixes + 5 vendored test-runtime prefixes + 5 .test/.spec suffixes).
         assert_eq!(
             cfg.seed_resolution.path_deboost.len(),
-            14,
-            "default [seed_resolution] must populate 14 rules"
+            19,
+            "default [seed_resolution] must populate 19 rules"
         );
         // First default rule deboosts playwright/ at 0.2.
         let first = &cfg.seed_resolution.path_deboost[0];

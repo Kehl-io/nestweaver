@@ -4900,8 +4900,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .sum();
                     let remaining_budget = token_budget.saturating_sub(seed_tokens);
                     let cut = token_budgeted_truncate(&result.connected, remaining_budget);
+                    let connected_tokens: usize = result
+                        .connected
+                        .iter()
+                        .take(cut)
+                        .map(render_cost_tokens)
+                        .sum();
+                    let used_tokens = seed_tokens + connected_tokens;
+                    // Load external_refs from the extension sidecar so the
+                    // local (--no-daemon) path matches the daemon/MCP wrapper
+                    // shape — agents rely on this for Workfront / wiki PRD
+                    // surfacing.
+                    let ext_store = nestweaver_engine::load_extensions(&db_path);
+                    let external_refs = nestweaver_engine::get_all_properties(
+                        &ext_store,
+                        &project.uid,
+                    )
+                    .get("external_refs")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_project_context_json(
+                            &project,
+                            &result,
+                            cut,
+                            used_tokens,
+                            token_budget,
+                            &external_refs,
+                        )?;
                     } else {
                         println!("Project: {}  ({})", project.name, project.uid);
                         if let Some(ref summary) = project.summary {
@@ -7941,6 +7967,7 @@ fn run_brain(
                                 );
                             }
                         }
+                }
             }
 
             let store = open_store(Some(&db_path))?;
@@ -9020,6 +9047,40 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
 
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+/// Render the `project-context` JSON for the local (--no-daemon) path with
+/// the same wrapper shape the daemon / MCP `project_context` tool emits:
+/// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
+/// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
+/// depend on these fields, so the local and daemon paths must stay aligned.
+fn print_project_context_json(
+    project: &nestweaver_schema::Project,
+    result: &BrainContextResult,
+    limit: usize,
+    tokens_used: usize,
+    token_budget: usize,
+    external_refs: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut resp = serde_json::json!({
+        "project": project.name,
+        "project_uid": project.uid,
+        "seeds_expanded": result.seeds.len(),
+        "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "tokens_used": tokens_used,
+        "token_budget": token_budget,
+    });
+    if !result.unresolved_seeds.is_empty() {
+        resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
+    }
+    if !external_refs.is_null() {
+        resp["external_refs"] = external_refs.clone();
+    }
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
