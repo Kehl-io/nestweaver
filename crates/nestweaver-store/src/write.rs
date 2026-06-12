@@ -2347,36 +2347,27 @@ impl GraphStore {
     /// Repo/Vault node.
     fn sweep_orphan_nodes(&self, label: &str, prefix: &str) -> Result<usize, StoreError> {
         let conn = self.conn()?;
-        let count_query = format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p RETURN count(n)");
-        let count: usize = {
-            let mut stmt = conn.prepare(&count_query).map_err(|e| {
-                StoreError::Query(format!("prepare count {label} orphans: {e}"))
-            })?;
-            let rows = conn
-                .execute(
-                    &mut stmt,
-                    vec![("p", lbug::Value::String(prefix.to_string()))],
-                )
-                .map_err(|e| StoreError::Query(format!("count {label} orphans: {e}")))?;
-            rows.filter_map(|row| {
+        let query = format!(
+            "MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n RETURN count(n)"
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| {
+            StoreError::Query(format!("prepare sweep {label} orphans: {e}"))
+        })?;
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![("p", lbug::Value::String(prefix.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("sweep {label} orphans: {e}")))?;
+        let count = rows
+            .filter_map(|row| {
                 row.first().and_then(|v| match v {
                     lbug::Value::Int64(n) => Some(*n as usize),
                     _ => None,
                 })
             })
             .next()
-            .unwrap_or(0)
-        };
-        if count == 0 {
-            return Ok(0);
-        }
-        let delete_query =
-            format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n");
-        exec_params(
-            &conn,
-            &delete_query,
-            vec![("p", lbug::Value::String(prefix.to_string()))],
-        )?;
+            .unwrap_or(0);
         Ok(count)
     }
 
