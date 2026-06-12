@@ -42,22 +42,28 @@ pub enum SymbolKind {
     Variable,
 }
 
+impl SymbolKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SymbolKind::Function => "Function",
+            SymbolKind::Class => "Class",
+            SymbolKind::Method => "Method",
+            SymbolKind::Interface => "Interface",
+            SymbolKind::Trait => "Trait",
+            SymbolKind::Enum => "Enum",
+            SymbolKind::Module => "Module",
+            SymbolKind::Extension => "Extension",
+            SymbolKind::Constant => "Constant",
+            SymbolKind::Property => "Property",
+            SymbolKind::TypeAlias => "TypeAlias",
+            SymbolKind::Variable => "Variable",
+        }
+    }
+}
+
 impl fmt::Display for SymbolKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SymbolKind::Function => write!(f, "Function"),
-            SymbolKind::Class => write!(f, "Class"),
-            SymbolKind::Method => write!(f, "Method"),
-            SymbolKind::Interface => write!(f, "Interface"),
-            SymbolKind::Trait => write!(f, "Trait"),
-            SymbolKind::Enum => write!(f, "Enum"),
-            SymbolKind::Module => write!(f, "Module"),
-            SymbolKind::Extension => write!(f, "Extension"),
-            SymbolKind::Constant => write!(f, "Constant"),
-            SymbolKind::Property => write!(f, "Property"),
-            SymbolKind::TypeAlias => write!(f, "TypeAlias"),
-            SymbolKind::Variable => write!(f, "Variable"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
