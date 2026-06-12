@@ -39,6 +39,153 @@ pub fn git_activity_multiplier(score: Option<f64>, weight: f64) -> f64 {
     }
 }
 
+/// Lower / upper bounds applied to a [`PathDeboostRule::factor`] on load.
+pub const SEED_PATH_FACTOR_MIN: f64 = 0.0;
+pub const SEED_PATH_FACTOR_MAX: f64 = 10.0;
+
+/// Controls how seed candidates are scored before PPR expansion.
+///
+/// Use this block to deboost candidates whose `file_path` lives in test
+/// mirrors (e.g. `playwright/`, `__tests__/`) so production symbols win
+/// when names collide. Multiple matching rules multiply.
+///
+/// Defaults target JS/TS test mirror paths (`playwright/`, `__tests__/`,
+/// `*.test.ts`, etc.). Tune per-project by adding to
+/// `[seed_resolution].path_deboost` in `nestweaver-instance.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedResolutionConfig {
+    /// Multiplicative factor applied to a seed candidate's match score
+    /// when its file_path matches the given prefix or suffix. Factor < 1.0
+    /// deboosts; factor > 1.0 boosts. Multiple matches multiply.
+    #[serde(default)]
+    pub path_deboost: Vec<PathDeboostRule>,
+    /// When candidates tie on path-factor-adjusted score, prefer the kind
+    /// earlier in this list. Earlier = higher priority.
+    #[serde(default = "default_kind_priority")]
+    pub kind_priority: Vec<String>,
+}
+
+/// A single seed-resolution path deboost / boost rule.
+///
+/// Exactly one of `prefix` / `suffix` must be set. Validation in the engine
+/// layer rejects rules that violate this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathDeboostRule {
+    /// Match if the (`/`-prepended, lowercased) file_path contains this
+    /// substring. Mutually exclusive with `suffix`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Match if file_path ends with this string (case-sensitive).
+    /// Mutually exclusive with `prefix`.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// Multiplier on the candidate's score. Clamped to
+    /// `[SEED_PATH_FACTOR_MIN, SEED_PATH_FACTOR_MAX]` on load.
+    pub factor: f64,
+}
+
+/// Default priority list for tie-breaking seed candidates by `SymbolKind`.
+///
+/// Earlier entries win against later ones. The list covers every variant
+/// of [`nestweaver_schema::SymbolKind`] so any well-typed symbol has a
+/// defined rank.
+pub fn default_kind_priority() -> Vec<String> {
+    vec![
+        "Class".into(),
+        "Interface".into(),
+        "TypeAlias".into(),
+        "Method".into(),
+        "Function".into(),
+        "Constant".into(),
+        "Property".into(),
+        "Variable".into(),
+        "Module".into(),
+        "Enum".into(),
+        "Trait".into(),
+        "Extension".into(),
+    ]
+}
+
+impl Default for SeedResolutionConfig {
+    fn default() -> Self {
+        Self {
+            path_deboost: vec![
+                PathDeboostRule {
+                    prefix: Some("/playwright/".into()),
+                    suffix: None,
+                    factor: 0.2,
+                },
+                PathDeboostRule {
+                    prefix: Some("/__tests__/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/cypress/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/e2e/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/tests/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/test/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/spec/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/__mocks__/".into()),
+                    suffix: None,
+                    factor: 0.3,
+                },
+                PathDeboostRule {
+                    prefix: Some("/fixtures/".into()),
+                    suffix: None,
+                    factor: 0.4,
+                },
+                PathDeboostRule {
+                    prefix: None,
+                    suffix: Some(".test.tsx".into()),
+                    factor: 0.5,
+                },
+                PathDeboostRule {
+                    prefix: None,
+                    suffix: Some(".test.ts".into()),
+                    factor: 0.5,
+                },
+                PathDeboostRule {
+                    prefix: None,
+                    suffix: Some(".test.jsx".into()),
+                    factor: 0.5,
+                },
+                PathDeboostRule {
+                    prefix: None,
+                    suffix: Some(".test.js".into()),
+                    factor: 0.5,
+                },
+                PathDeboostRule {
+                    prefix: None,
+                    suffix: Some(".spec.ts".into()),
+                    factor: 0.5,
+                },
+            ],
+            kind_priority: default_kind_priority(),
+        }
+    }
+}
+
 /// Describes the intent behind a PPR query, allowing the algorithm to
 /// adapt its damping factor (alpha) and edge weights to produce more
 /// relevant results for different use cases.

@@ -47,13 +47,11 @@ pub struct HybridSearchConfig {
     /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
     /// the 0.3 boost to surface numerically in the output relevance.
     pub prf: bool,
-    /// Feature F-test-deboost — substring patterns matched (case-insensitive)
-    /// against the haystack `/<path>` of each candidate symbol's file_path to
-    /// deboost test/fixture code in `search_symbols_by_name` seed resolution.
-    ///
-    /// Sourced from `[ranking] test_path_patterns` in instance config.
-    /// Empty → fall back to [`crate::config::default_test_path_patterns`].
-    pub test_path_patterns: Vec<String>,
+    /// Finding #7 — graduated path-deboost + kind-priority for
+    /// `search_symbols_by_name` seed resolution. Sourced from
+    /// `[seed_resolution]` in instance config (with backward-compat shim
+    /// for the legacy `[ranking].test_path_patterns` block).
+    pub seed_resolution: nestweaver_store::SeedResolutionConfig,
 }
 
 impl Default for HybridSearchConfig {
@@ -66,33 +64,10 @@ impl Default for HybridSearchConfig {
             bm25_limit: 500,
             semantic_limit: 200,
             prf: false,
-            test_path_patterns: crate::config::default_test_path_patterns(),
+            seed_resolution: nestweaver_store::SeedResolutionConfig::default(),
         }
     }
 }
-
-impl HybridSearchConfig {
-    /// Return the effective deboost patterns: the configured list if
-    /// non-empty, otherwise the built-in defaults. Useful at call sites
-    /// that build a config from CLI flags without a [`crate::config::RankingConfig`].
-    pub fn effective_test_path_patterns(&self) -> &[String] {
-        if self.test_path_patterns.is_empty() {
-            // `Default` already populates this with the defaults, but a
-            // caller may have explicitly cleared it. Fall back so the
-            // ranking step never silently degrades.
-            // SAFETY: `default_test_path_patterns` always returns a
-            // non-empty `Vec<String>`.
-            DEFAULT_TEST_PATH_PATTERNS_FALLBACK.as_slice()
-        } else {
-            &self.test_path_patterns
-        }
-    }
-}
-
-/// Cached fallback so callers of `effective_test_path_patterns` can return a
-/// borrowed slice without re-allocating on each call.
-static DEFAULT_TEST_PATH_PATTERNS_FALLBACK: std::sync::LazyLock<Vec<String>> =
-    std::sync::LazyLock::new(crate::config::default_test_path_patterns);
 
 /// Full details for a single symbol, including its call graph neighbours.
 #[derive(Debug, Serialize)]
@@ -190,7 +165,11 @@ pub fn search_symbols(
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
     let syms = store
-        .search_symbols_by_name(query, limit, &crate::config::default_test_path_patterns())
+        .search_symbols_by_name(
+            query,
+            limit,
+            &nestweaver_store::SeedResolutionConfig::default(),
+        )
         .context("search_symbols_by_name")?;
     Ok(syms.iter().map(SymbolCandidate::from).collect())
 }
@@ -293,7 +272,11 @@ pub fn build_context_with_intent(
         } else {
             // Name search — take up to 5 matches.
             let matches = store
-                .search_symbols_by_name(input, 5, &crate::config::default_test_path_patterns())
+                .search_symbols_by_name(
+                    input,
+                    5,
+                    &nestweaver_store::SeedResolutionConfig::default(),
+                )
                 .map_err(|e| anyhow::anyhow!(e))?;
             for sym in matches {
                 seed_uids.push(sym.uid);
@@ -587,7 +570,13 @@ mod context_tests {
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
 
         // Find the actual file_path stored for a symbol in utils.js.
-        let search = store.search_symbols_by_name("formatDate", 1, &[]).unwrap();
+        let search = store
+            .search_symbols_by_name(
+                "formatDate",
+                1,
+                &nestweaver_store::SeedResolutionConfig::default(),
+            )
+            .unwrap();
         if search.is_empty() {
             // Parser may not have indexed this file — skip rather than fail.
             return;
@@ -1104,11 +1093,11 @@ pub fn build_brain_context_hybrid_with_aliases(
         }
 
         // Fall back to symbol name search. Respect the caller's configured
-        // [`HybridSearchConfig::test_path_patterns`] (sourced from
-        // `[ranking] test_path_patterns` in instance config) so user overrides
-        // actually take effect at seed resolution.
+        // [`HybridSearchConfig::seed_resolution`] (sourced from
+        // `[seed_resolution]` in instance config) so user overrides actually
+        // take effect at seed resolution.
         let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5, config.effective_test_path_patterns())
+            .search_symbols_by_name(trimmed, 5, &config.seed_resolution)
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_matches.is_empty() {
             for s in symbol_matches {
