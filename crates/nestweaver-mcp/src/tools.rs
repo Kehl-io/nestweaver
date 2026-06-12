@@ -2431,7 +2431,10 @@ fn tool_brain_status(
     let mut root_to_rows: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
         std::collections::HashMap::new();
     for v in &vaults {
-        root_to_rows.entry(v.root_path.as_str()).or_default().push(v);
+        root_to_rows
+            .entry(v.root_path.as_str())
+            .or_default()
+            .push(v);
     }
     let warnings: Vec<Value> = root_to_rows
         .iter()

@@ -4622,11 +4622,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            if use_daemon
-                && let Ok(rt) = tokio::runtime::Runtime::new()
-            {
-                let connect =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
                 if let Ok(mut client) = connect {
                     let req = nestweaver_proto::ProjectContextRequest {
                         project: name.clone(),
@@ -4648,8 +4645,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     });
                     match rpc {
                         Ok(resp) => {
-                            let value: serde_json::Value =
-                                serde_json::from_str(&resp.result_json)?;
+                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)?;
                             render_project_context_daemon_response(&value, json, token_budget);
                             return Ok((EXIT_SUCCESS, None));
                         }
@@ -4887,11 +4883,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // connected. Don't double-count items the promotion helpers
                     // copied from `seeds` into `connected` — those tokens belong
                     // to the connected budget, not the seed overhead.
-                    let connected_uids: std::collections::HashSet<&str> = result
-                        .connected
-                        .iter()
-                        .map(|n| n.uid.as_str())
-                        .collect();
+                    let connected_uids: std::collections::HashSet<&str> =
+                        result.connected.iter().map(|n| n.uid.as_str()).collect();
                     let seed_tokens: usize = result
                         .seeds
                         .iter()
@@ -4912,13 +4905,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // shape — agents rely on this for Workfront / wiki PRD
                     // surfacing.
                     let ext_store = nestweaver_engine::load_extensions(&db_path);
-                    let external_refs = nestweaver_engine::get_all_properties(
-                        &ext_store,
-                        &project.uid,
-                    )
-                    .get("external_refs")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                    let external_refs =
+                        nestweaver_engine::get_all_properties(&ext_store, &project.uid)
+                            .get("external_refs")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                     if json {
                         print_project_context_json(
                             &project,
@@ -6581,11 +6572,8 @@ fn run_brain(
                         for v in vaults {
                             let name = v["name"].as_str().unwrap_or("?");
                             let note_count = v["note_count"].as_u64().unwrap_or(0);
-                            let last_indexed = v["last_indexed"]
-                                .as_str()
-                                .unwrap_or("never");
-                            let ambiguous =
-                                name_counts.get(name).copied().unwrap_or(0) > 1;
+                            let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
+                            let ambiguous = name_counts.get(name).copied().unwrap_or(0) > 1;
                             let unnamed = name.is_empty();
                             if ambiguous || unnamed {
                                 let instance = v["instance_id"].as_str().unwrap_or("?");
@@ -6634,9 +6622,7 @@ fn run_brain(
                             );
                         }
                         Some(_) => {
-                            println!(
-                                "  interaction_tracking: enabled (no events recorded yet)"
-                            );
+                            println!("  interaction_tracking: enabled (no events recorded yet)");
                         }
                         None => {
                             println!(
@@ -6652,8 +6638,7 @@ fn run_brain(
                             let kind = w["kind"].as_str().unwrap_or("");
                             if kind == "duplicate_vault_root" {
                                 let root = w["root_path"].as_str().unwrap_or("?");
-                                let entries =
-                                    w["entries"].as_array().cloned().unwrap_or_default();
+                                let entries = w["entries"].as_array().cloned().unwrap_or_default();
                                 eprintln!(
                                     "Warning: {} vault entries share root path {}:",
                                     entries.len(),
@@ -6866,8 +6851,10 @@ fn run_brain(
             // or missing --config. This produces phantom 0-note vault rows.
             // Each entry surfaces name + instance_id + uid so the user can
             // target `brain remove --instance <id>` precisely.
-            let mut root_to_vaults: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
-                std::collections::HashMap::new();
+            let mut root_to_vaults: std::collections::HashMap<
+                &str,
+                Vec<&nestweaver_schema::Vault>,
+            > = std::collections::HashMap::new();
             for v in &vaults {
                 root_to_vaults
                     .entry(v.root_path.as_str())
@@ -7905,68 +7892,66 @@ fn run_brain(
                     config_path.as_deref(),
                 ));
                 if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::BrainContextRequest {
-                            seeds: seeds.clone(),
-                            token_budget: token_budget.unwrap_or(0) as i32,
-                            response_format: String::new(),
-                            repos: repos.clone(),
-                            vaults: vaults.clone(),
-                            kinds: kinds.clone(),
-                            path_prefix: path_prefix.clone().unwrap_or_default(),
-                            tags: tags.clone(),
-                            exclude_tags: exclude_tags.clone(),
-                            weight_ppr: weight_ppr.unwrap_or(0.0),
-                            weight_bm25: weight_bm25.unwrap_or(0.0),
-                            // Pass the parsed --intent through to the daemon
-                            // (empty string = auto-detect on the server).
-                            intent: intent.clone().unwrap_or_default(),
-                            include_seeds: true,
-                            include_bodies: inline_bodies,
-                            root: root
-                                .clone()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                            prf,
-                            rerank,
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .get_context(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                let result: nestweaver_engine::BrainContextResult =
-                                    serde_json::from_str(&resp.result_json)?;
-                                let cut = match token_budget {
-                                    Some(budget) => {
-                                        token_budgeted_truncate(&result.connected, budget)
-                                    }
-                                    None => limit.min(result.connected.len()),
-                                };
-                                if json {
-                                    print_brain_context_json(&result, cut)?;
-                                } else {
-                                    print_brain_context_text(&result, cut, token_budget);
-                                }
-                                let node_count = result.seeds.len() + cut;
-                                let stats = format!(
-                                    "{} nodes in {} (via daemon)",
-                                    node_count,
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
+                    let req = nestweaver_proto::BrainContextRequest {
+                        seeds: seeds.clone(),
+                        token_budget: token_budget.unwrap_or(0) as i32,
+                        response_format: String::new(),
+                        repos: repos.clone(),
+                        vaults: vaults.clone(),
+                        kinds: kinds.clone(),
+                        path_prefix: path_prefix.clone().unwrap_or_default(),
+                        tags: tags.clone(),
+                        exclude_tags: exclude_tags.clone(),
+                        weight_ppr: weight_ppr.unwrap_or(0.0),
+                        weight_bm25: weight_bm25.unwrap_or(0.0),
+                        // Pass the parsed --intent through to the daemon
+                        // (empty string = auto-detect on the server).
+                        intent: intent.clone().unwrap_or_default(),
+                        include_seeds: true,
+                        include_bodies: inline_bodies,
+                        root: root
+                            .clone()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        prf,
+                        rerank,
+                    };
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .get_context(req)
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let result: nestweaver_engine::BrainContextResult =
+                                serde_json::from_str(&resp.result_json)?;
+                            let cut = match token_budget {
+                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                                None => limit.min(result.connected.len()),
+                            };
+                            if json {
+                                print_brain_context_json(&result, cut)?;
+                            } else {
+                                print_brain_context_text(&result, cut, token_budget);
                             }
-                            Err(status) => {
-                                eprintln!(
-                                    "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                    status.message()
-                                );
-                            }
+                            let node_count = result.seeds.len() + cut;
+                            let stats = format!(
+                                "{} nodes in {} (via daemon)",
+                                node_count,
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
                         }
+                        Err(status) => {
+                            eprintln!(
+                                "warning: daemon context RPC failed ({}); falling back to direct DB read",
+                                status.message()
+                            );
+                        }
+                    }
                 }
             }
 
@@ -8002,9 +7987,8 @@ fn run_brain(
             // instance config into the search config so user overrides reach
             // `search_symbols_by_name` at seed resolution.
             let defaults = HybridSearchConfig::default();
-            let configured_seed_resolution = instance_cfg
-                .as_ref()
-                .map(|c| c.seed_resolution.clone());
+            let configured_seed_resolution =
+                instance_cfg.as_ref().map(|c| c.seed_resolution.clone());
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
@@ -9314,9 +9298,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             if purge_graph {
                 let db_path = db.unwrap_or_else(default_db_path);
                 let store = open_store(Some(&db_path))?;
-                let r = store
-                    .purge_instance(&id)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let r = store.purge_instance(&id).map_err(|e| anyhow::anyhow!(e))?;
                 let total = r.repos
                     + r.files
                     + r.symbols
@@ -9331,13 +9313,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                         "Purged instance '{id}' from graph: {} repo(s), \
                          {} file(s), {} symbol(s), {} vault(s), {} note(s), \
                          {} project(s), {} orphan(s)",
-                        r.repos,
-                        r.files,
-                        r.symbols,
-                        r.vaults,
-                        r.notes,
-                        r.projects,
-                        r.orphans_swept
+                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects, r.orphans_swept
                     );
                 }
             }
