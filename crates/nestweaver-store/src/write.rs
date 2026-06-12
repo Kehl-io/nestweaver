@@ -2347,12 +2347,11 @@ impl GraphStore {
     /// Repo/Vault node.
     fn sweep_orphan_nodes(&self, label: &str, prefix: &str) -> Result<usize, StoreError> {
         let conn = self.conn()?;
-        let query = format!(
-            "MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n RETURN count(n)"
-        );
-        let mut stmt = conn.prepare(&query).map_err(|e| {
-            StoreError::Query(format!("prepare sweep {label} orphans: {e}"))
-        })?;
+        let query =
+            format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n RETURN count(n)");
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| StoreError::Query(format!("prepare sweep {label} orphans: {e}")))?;
         let rows = conn
             .execute(
                 &mut stmt,
