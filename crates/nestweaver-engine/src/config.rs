@@ -1,3 +1,7 @@
+use nestweaver_store::{PathDeboostRule, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN};
+// Re-export seed-resolution primitives so callers can construct/observe them
+// without depending on `nestweaver-store` directly.
+pub use nestweaver_store::{SeedResolutionConfig, default_kind_priority};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -195,6 +199,12 @@ pub struct InstanceConfig {
     /// multipliers on result relevance, keyed by file-path glob.
     #[serde(default)]
     pub ranking: RankingConfig,
+    /// Finding #7 — graduated path-aware deboost + kind-aware tiebreak applied
+    /// during `search_symbols_by_name` seed resolution. Replaces the binary
+    /// `[ranking].test_path_patterns` mechanism (which remains parseable for
+    /// one release as a deprecation shim).
+    #[serde(default)]
+    pub seed_resolution: SeedResolutionConfig,
     /// Feature F16 — response cache tuning (`[cache]`).
     #[serde(default)]
     pub cache: CacheConfig,
@@ -407,6 +417,10 @@ impl InstanceConfig {
         // Feature F6: clamp ranking-prior multipliers into bounds on load so
         // downstream code can trust the values without re-validating.
         config.ranking.clamp_multipliers();
+        // Finding #7: validate seed-resolution rules, clamp factors, and
+        // synthesize a deprecation shim from `[ranking].test_path_patterns`
+        // when callers haven't moved to `[seed_resolution]` yet.
+        validate_and_normalize_seed_resolution(&mut config.seed_resolution, &config.ranking)?;
         if config.inference.endpoint.is_empty() {
             anyhow::bail!("inference.endpoint must be set (no global default allowed)");
         }
@@ -447,6 +461,86 @@ impl InstanceConfig {
         let contents = std::fs::read_to_string(path)?;
         Self::from_toml_str(&contents)
     }
+}
+
+/// Set of `SymbolKind` variant names accepted by [`SeedResolutionConfig::kind_priority`].
+/// Kept in sync with the variants at `crates/nestweaver-schema/src/nodes.rs`.
+const VALID_SYMBOL_KINDS: &[&str] = &[
+    "Function",
+    "Class",
+    "Method",
+    "Interface",
+    "Trait",
+    "Enum",
+    "Module",
+    "Extension",
+    "Constant",
+    "Property",
+    "TypeAlias",
+    "Variable",
+];
+
+/// Validate `[seed_resolution]` rules, clamp out-of-range factors, and
+/// synthesize a deprecation shim from `[ranking].test_path_patterns` when
+/// the new block is empty but the old field was customized.
+fn validate_and_normalize_seed_resolution(
+    seed_resolution: &mut SeedResolutionConfig,
+    ranking: &RankingConfig,
+) -> Result<(), anyhow::Error> {
+    // 1) Validate exactly-one-of {prefix, suffix} per rule and clamp factors.
+    for (idx, rule) in seed_resolution.path_deboost.iter_mut().enumerate() {
+        match (&rule.prefix, &rule.suffix) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[seed_resolution.path_deboost][{idx}]: rule must set exactly one of prefix or suffix (got both)"
+            ),
+            (None, None) => anyhow::bail!(
+                "[seed_resolution.path_deboost][{idx}]: rule must set exactly one of prefix or suffix (got neither)"
+            ),
+            _ => {}
+        }
+        let original = rule.factor;
+        rule.factor = rule
+            .factor
+            .clamp(SEED_PATH_FACTOR_MIN, SEED_PATH_FACTOR_MAX);
+        if (rule.factor - original).abs() > f64::EPSILON {
+            tracing::warn!(
+                "[seed_resolution.path_deboost][{idx}]: factor {original} out of range [{SEED_PATH_FACTOR_MIN}, {SEED_PATH_FACTOR_MAX}]; clamped to {}",
+                rule.factor
+            );
+        }
+    }
+
+    // 2) Validate every kind_priority entry against the SymbolKind variants.
+    for kind_name in &seed_resolution.kind_priority {
+        if !VALID_SYMBOL_KINDS.contains(&kind_name.as_str()) {
+            anyhow::bail!(
+                "[seed_resolution].kind_priority: unknown SymbolKind '{kind_name}' (valid: {})",
+                VALID_SYMBOL_KINDS.join(", ")
+            );
+        }
+    }
+
+    // 3) Deprecation shim — translate [ranking].test_path_patterns into
+    //    prefix rules when the new block is empty but the legacy field is
+    //    customized. Keeps backward compatibility for one release.
+    if seed_resolution.path_deboost.is_empty() {
+        let defaults = default_test_path_patterns();
+        if ranking.test_path_patterns != defaults && !ranking.test_path_patterns.is_empty() {
+            tracing::warn!(
+                "[ranking].test_path_patterns is deprecated; migrate to [seed_resolution].path_deboost for graduated multiplicative deboost"
+            );
+            seed_resolution.path_deboost = ranking
+                .test_path_patterns
+                .iter()
+                .map(|pat| PathDeboostRule {
+                    prefix: Some(pat.clone()),
+                    suffix: None,
+                    factor: 0.3,
+                })
+                .collect();
+        }
+    }
+    Ok(())
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -791,5 +885,166 @@ pin_sha = "deadbeef1234"
         assert_eq!(sparse.url, "https://github.com/example/sparse");
         assert_eq!(sparse.sparse, Some(true));
         assert_eq!(sparse.pin_sha.as_deref(), Some("deadbeef1234"));
+    }
+
+    // ── Finding #7 — [seed_resolution] config block ───────────────────────
+
+    #[test]
+    fn parses_default_seed_resolution() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+        // Defaults populate the full 14-rule path_deboost list.
+        assert_eq!(
+            cfg.seed_resolution.path_deboost.len(),
+            14,
+            "default [seed_resolution] must populate 14 rules"
+        );
+        // First default rule deboosts playwright/ at 0.2.
+        let first = &cfg.seed_resolution.path_deboost[0];
+        assert_eq!(first.prefix.as_deref(), Some("/playwright/"));
+        assert!((first.factor - 0.2).abs() < 1e-9);
+        // kind_priority covers every SymbolKind variant.
+        assert_eq!(
+            cfg.seed_resolution.kind_priority,
+            default_kind_priority(),
+            "default kind_priority must equal default_kind_priority()"
+        );
+    }
+
+    #[test]
+    fn parses_explicit_seed_resolution() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[seed_resolution]
+kind_priority = ["Function", "Class"]
+
+[[seed_resolution.path_deboost]]
+prefix = "/playwright/"
+factor = 0.1
+
+[[seed_resolution.path_deboost]]
+suffix = ".spec.ts"
+factor = 0.25
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert_eq!(cfg.seed_resolution.path_deboost.len(), 2);
+        assert_eq!(
+            cfg.seed_resolution.path_deboost[0].prefix.as_deref(),
+            Some("/playwright/")
+        );
+        assert!((cfg.seed_resolution.path_deboost[0].factor - 0.1).abs() < 1e-9);
+        assert_eq!(
+            cfg.seed_resolution.path_deboost[1].suffix.as_deref(),
+            Some(".spec.ts")
+        );
+        assert!((cfg.seed_resolution.path_deboost[1].factor - 0.25).abs() < 1e-9);
+        assert_eq!(
+            cfg.seed_resolution.kind_priority,
+            vec!["Function".to_string(), "Class".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_rule_with_both_prefix_and_suffix() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[seed_resolution.path_deboost]]
+prefix = "/playwright/"
+suffix = ".spec.ts"
+factor = 0.5
+"#
+        );
+        let err = InstanceConfig::from_toml_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of prefix or suffix") && msg.contains("got both"),
+            "error should reject both-fields rule, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_rule_with_neither_prefix_nor_suffix() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[seed_resolution.path_deboost]]
+factor = 0.5
+"#
+        );
+        let err = InstanceConfig::from_toml_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of prefix or suffix") && msg.contains("got neither"),
+            "error should reject empty rule, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn clamps_factor_out_of_range() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[seed_resolution.path_deboost]]
+prefix = "/playwright/"
+factor = 15.0
+
+[[seed_resolution.path_deboost]]
+prefix = "/cypress/"
+factor = -1.0
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert!((cfg.seed_resolution.path_deboost[0].factor - SEED_PATH_FACTOR_MAX).abs() < 1e-9);
+        assert!((cfg.seed_resolution.path_deboost[1].factor - SEED_PATH_FACTOR_MIN).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_unknown_kind_in_priority() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[seed_resolution]
+kind_priority = ["NotARealKind"]
+"#
+        );
+        let err = InstanceConfig::from_toml_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NotARealKind") && msg.contains("unknown SymbolKind"),
+            "error should reject unknown kind, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deprecation_shim_translates_legacy_test_path_patterns() {
+        // User has customized [ranking].test_path_patterns but has no
+        // [seed_resolution] block — shim must translate into path_deboost rules.
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[ranking]
+test_path_patterns = ["/legacy-fixtures/", "/_old_e2e_/"]
+
+[seed_resolution]
+path_deboost = []
+"#
+        );
+        let cfg = InstanceConfig::from_toml_str(&toml).expect("should parse");
+        assert_eq!(cfg.seed_resolution.path_deboost.len(), 2);
+        assert_eq!(
+            cfg.seed_resolution.path_deboost[0].prefix.as_deref(),
+            Some("/legacy-fixtures/")
+        );
+        // Shim translates with factor 0.3 each.
+        assert!((cfg.seed_resolution.path_deboost[0].factor - 0.3).abs() < 1e-9);
+        assert!((cfg.seed_resolution.path_deboost[1].factor - 0.3).abs() < 1e-9);
     }
 }

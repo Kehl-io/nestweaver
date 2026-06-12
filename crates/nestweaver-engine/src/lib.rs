@@ -117,8 +117,8 @@ pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_
 pub use config::{
     CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
     InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
-    ResponseConfig, SchemaExtensions, StorageConfig, WikiSourceConfig, WorkspaceConfig,
-    default_test_path_patterns,
+    ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, WikiSourceConfig,
+    WorkspaceConfig, default_kind_priority, default_test_path_patterns,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,

@@ -7970,21 +7970,21 @@ fn run_brain(
                     .unwrap_or(false);
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
-            // Feature F-test-deboost: thread `[ranking] test_path_patterns`
-            // from the instance config into the search config so user
-            // overrides reach `search_symbols_by_name` at seed resolution.
+            // Finding #7: thread `[seed_resolution]` (with backward-compat
+            // shim for legacy `[ranking].test_path_patterns`) from the
+            // instance config into the search config so user overrides reach
+            // `search_symbols_by_name` at seed resolution.
             let defaults = HybridSearchConfig::default();
-            let configured_test_patterns: Option<Vec<String>> = instance_cfg
+            let configured_seed_resolution = instance_cfg
                 .as_ref()
-                .map(|c| c.ranking.test_path_patterns.clone())
-                .filter(|p| !p.is_empty());
+                .map(|c| c.seed_resolution.clone());
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
                 weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
                 prf: prf_enabled,
-                test_path_patterns: configured_test_patterns
-                    .unwrap_or_else(|| defaults.test_path_patterns.clone()),
+                seed_resolution: configured_seed_resolution
+                    .unwrap_or_else(|| defaults.seed_resolution.clone()),
                 ..defaults
             };
 
@@ -8050,17 +8050,22 @@ fn run_brain(
                     apply_filters(&mut result.connected);
 
                     // `--no-tests`: drop rows whose location matches any
-                    // test_path_pattern. Distinct from the soft deboost the
-                    // ranking pass already applied — this removes the rows
-                    // entirely so a strict-prod caller never sees them.
+                    // configured seed-resolution path rule (prefix or
+                    // suffix). Distinct from the soft deboost the ranking
+                    // pass already applied — this removes the rows entirely
+                    // so a strict-prod caller never sees them.
                     if no_tests {
-                        let patterns = &config.test_path_patterns;
-                        if !patterns.is_empty() {
+                        let rules = &config.seed_resolution.path_deboost;
+                        if !rules.is_empty() {
                             let is_test_path = |loc: &str| -> bool {
                                 let lower = loc.to_lowercase();
-                                patterns.iter().any(|p| {
-                                    let needle = p.trim_start_matches('/').to_lowercase();
-                                    !needle.is_empty() && lower.contains(&needle)
+                                rules.iter().any(|r| match (&r.prefix, &r.suffix) {
+                                    (Some(prefix), None) => {
+                                        let needle = prefix.trim_start_matches('/').to_lowercase();
+                                        !needle.is_empty() && lower.contains(&needle)
+                                    }
+                                    (None, Some(suffix)) => loc.ends_with(suffix.as_str()),
+                                    _ => false,
                                 })
                             };
                             let drop_tests = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {

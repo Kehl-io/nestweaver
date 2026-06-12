@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+use crate::ranking::SeedResolutionConfig;
 
 // ---------------------------------------------------------------------------
 // EmbeddingIndex
@@ -117,17 +118,17 @@ impl GraphStore {
     /// * `query_embedding`  – embedding of the query (optional)
     /// * `embedding_index`  – pre-loaded `EmbeddingIndex` (optional)
     /// * `limit`            – maximum results to return
+    /// * `seed_resolution`  – path-deboost + kind-priority for seed scoring
     pub fn hybrid_search(
         &self,
         text_query: &str,
         query_embedding: Option<&[f32]>,
         embedding_index: Option<&EmbeddingIndex>,
         limit: usize,
-        test_path_patterns: &[String],
+        seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<SearchResult>, StoreError> {
         // 1. Text search
-        let text_results =
-            self.search_symbols_by_name(text_query, limit * 2, test_path_patterns)?;
+        let text_results = self.search_symbols_by_name(text_query, limit * 2, seed_resolution)?;
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
@@ -290,12 +291,21 @@ mod tests {
         }
     }
 
+    fn empty_seed_resolution() -> SeedResolutionConfig {
+        SeedResolutionConfig {
+            path_deboost: Vec::new(),
+            kind_priority: Vec::new(),
+        }
+    }
+
     #[test]
     fn hybrid_search_text_only() {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
 
-        let results = store.hybrid_search("greet", None, None, 10, &[]).unwrap();
+        let results = store
+            .hybrid_search("greet", None, None, 10, &empty_seed_resolution())
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "greet");
     }
@@ -306,7 +316,7 @@ mod tests {
         store.insert_symbol(&make_symbol("sym:1", "greet")).unwrap();
 
         let results = store
-            .hybrid_search("zzznomatch", None, None, 10, &[])
+            .hybrid_search("zzznomatch", None, None, 10, &empty_seed_resolution())
             .unwrap();
         assert!(results.is_empty());
     }
@@ -329,7 +339,13 @@ mod tests {
 
         let query_vec = [1.0_f32, 0.0, 0.0];
         let results = store
-            .hybrid_search("greet", Some(&query_vec), Some(&idx), 10, &[])
+            .hybrid_search(
+                "greet",
+                Some(&query_vec),
+                Some(&idx),
+                10,
+                &empty_seed_resolution(),
+            )
             .unwrap();
 
         // Both should appear (greet from text, farewell from vector)

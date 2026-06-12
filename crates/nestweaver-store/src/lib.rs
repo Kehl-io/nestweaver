@@ -14,7 +14,8 @@ pub use db::GraphStore;
 pub use error::StoreError;
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
-    QueryIntent, ScopedEdgeQuery, detect_intent, git_activity_multiplier,
+    PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery,
+    SeedResolutionConfig, default_kind_priority, detect_intent, git_activity_multiplier,
 };
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
@@ -1518,10 +1519,7 @@ mod tests {
         // `purge_instance` must catch these via the orphan-sweep path
         // even though no `repo:ghost:zzzz` exists to walk down from.
         store
-            .insert_file(&make_file(
-                "file:repo:ghost:zzzz:orphan",
-                "repo:ghost:zzzz",
-            ))
+            .insert_file(&make_file("file:repo:ghost:zzzz:orphan", "repo:ghost:zzzz"))
             .unwrap();
         store
             .insert_symbol(&make_symbol(
