@@ -43,10 +43,10 @@ fn compute_path_factor(file_path: &str, rules: &[PathDeboostRule]) -> f64 {
 /// priority). Returns `usize::MAX` for kinds not present in the list, which
 /// effectively pushes them to the bottom of any kind-based tiebreak.
 fn kind_rank(kind: SymbolKind, kind_priority: &[String]) -> usize {
-    let name = format!("{kind:?}");
+    let name = kind.as_str();
     kind_priority
         .iter()
-        .position(|k| k == &name)
+        .position(|k| k == name)
         .unwrap_or(usize::MAX)
 }
 
