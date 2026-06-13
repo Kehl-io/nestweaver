@@ -78,7 +78,7 @@ pub struct CrossRepoRef {
 }
 
 /// Extract a String value from a row column, returning an error on type mismatch or out-of-bounds.
-fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreError> {
+pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreError> {
     let val = row
         .get(idx)
         .ok_or_else(|| StoreError::Query(format!("column {idx} out of bounds")))?;
@@ -796,6 +796,42 @@ impl GraphStore {
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(e.to_string()))?;
+        result.map(|row| row_to_section(&row)).collect()
+    }
+
+    /// List all Heading nodes belonging to notes in the given vault.
+    pub fn list_headings_by_vault(&self, vault_uid: &str) -> Result<Vec<Heading>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (n:Note {{vault_uid: $vid}})-[:NOTE_HAS_HEADING]->(h:Heading) RETURN {HEADING_COLUMNS}"
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("vid", Value::String(vault_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_heading(&row)).collect()
+    }
+
+    /// List all Section nodes belonging to notes in the given vault.
+    pub fn list_sections_by_vault(&self, vault_uid: &str) -> Result<Vec<Section>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (n:Note {{vault_uid: $vid}})-[:NOTE_HAS_SECTION]->(s:Section) RETURN {SECTION_COLUMNS}"
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("vid", Value::String(vault_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         result.map(|row| row_to_section(&row)).collect()
     }
 
