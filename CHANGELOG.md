@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.23.0](https://github.com/Kehl-io/nestweaver/compare/v0.22.0...v0.23.0) (2026-06-13)
+
+
+### Features
+
+* **cli:** accept --track-interactions on daemon start with redirect message ([7e99589](https://github.com/Kehl-io/nestweaver/commit/7e995892247c12b48afd11bd230804d6d35401ce))
+* **cli:** add daemon routing to 10 high-frequency CLI commands ([edc58e5](https://github.com/Kehl-io/nestweaver/commit/edc58e55065f2bbc888aea5551bb04fcb3e806e9))
+* **daemon:** extend try_daemon_json_rpc with 19 additional RPC method routes ([3c32110](https://github.com/Kehl-io/nestweaver/commit/3c32110c346d15cec1c7ec7af17461ad24844a73))
+* **interactions:** lower flush threshold to 5 and add time-based auto-flush ([31a0bd7](https://github.com/Kehl-io/nestweaver/commit/31a0bd7b1c6fd5e2e838958e87ff734c02e4ea67))
+* **mcp:** expand interaction tracking to cover more tools ([908ea8e](https://github.com/Kehl-io/nestweaver/commit/908ea8e4e9cfd505c7f7349f147395b2cdd5ac54))
+* **project:** wire tags, parent, and features from ProjectConfig ([c3e059c](https://github.com/Kehl-io/nestweaver/commit/c3e059c584d8616f29f0b556df290041a69bbf80))
+* **proto:** extend BrainContextRequest for daemon parity ([6578e58](https://github.com/Kehl-io/nestweaver/commit/6578e585c51ac020a67aab5850c840db00aed178))
+* **schema:** add ALL_SYMBOL_EDGE_TYPES constant and from_rel_table_name lookup ([57d0cc3](https://github.com/Kehl-io/nestweaver/commit/57d0cc332d90cc8ddf97df38b25bae59ff02cf12))
+
+
+### Bug Fixes
+
+* **cli:** rename UnlinkedVault to DiscardedVault, clarify merge output ([970bf13](https://github.com/Kehl-io/nestweaver/commit/970bf1316d46fd08aa209ff99cb0989abb7e577b))
+* **store:** preserve SECTION_TAGGED_WITH edges during vault reparent ([859b245](https://github.com/Kehl-io/nestweaver/commit/859b24524c678611828fcd1365b906108f2e5008))
+* **store:** prevent data loss in merge_instance_ids via reparent_vault ([0fb6531](https://github.com/Kehl-io/nestweaver/commit/0fb65314261edfe9e379c28af9b08e0afe5e8993))
+* **v0.22.0:** instance merge dataloss, interaction tracking, daemon parity, edge-type centralization ([6738965](https://github.com/Kehl-io/nestweaver/commit/67389652e22acb25e4f3d2fdd665f5e7bcbb0e97))
+
 ## [0.22.0](https://github.com/Kehl-io/nestweaver/compare/v0.21.0...v0.22.0) (2026-06-13)
 
 
