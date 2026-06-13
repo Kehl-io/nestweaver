@@ -2417,9 +2417,7 @@ impl GraphStore {
             .list_vaults(None)?
             .into_iter()
             .find(|v| v.uid == old_vault_uid)
-            .ok_or_else(|| {
-                StoreError::Query(format!("vault not found: {old_vault_uid}"))
-            })?;
+            .ok_or_else(|| StoreError::Query(format!("vault not found: {old_vault_uid}")))?;
 
         // 2. Read all children and edges before deletion.
         let notes = self.list_notes(Some(old_vault_uid))?;
