@@ -24,6 +24,23 @@ pub struct MergeResult {
     pub unlinked: Vec<UnlinkedVault>,
 }
 
+/// Result of [`GraphStore::purge_instance`]. Reports how many top-level
+/// rows were cascade-deleted from the graph for the given instance,
+/// plus a separate count for orphan nodes (Symbol/File/Service/Note/
+/// Heading/Section/Tag rows whose UID prefix encodes the instance but
+/// whose parent Repo or Vault no longer exists — typically left behind
+/// by a partially-applied `instance merge`).
+#[derive(Debug, Default)]
+pub struct PurgeInstanceResult {
+    pub repos: usize,
+    pub files: usize,
+    pub symbols: usize,
+    pub vaults: usize,
+    pub notes: usize,
+    pub projects: usize,
+    pub orphans_swept: usize,
+}
+
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
 /// `framework_hint` column stores. Returns an empty string when absent.
 fn encode_framework_hint(symbol: &Symbol) -> String {
@@ -1808,6 +1825,18 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_note_to_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert note→symbol edges using an externally-provided connection
+    /// (for transaction batching across many notes — avoids one fsync per call).
+    pub fn batch_insert_note_to_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let mut stmt = conn
             .prepare(
                 "MATCH (n:Note {uid: $nid}), (s:Symbol {uid: $sid}) \
@@ -1836,6 +1865,18 @@ impl GraphStore {
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_section_to_symbol_edges_on(&conn, edges)
+    }
+
+    /// Insert section→symbol edges using an externally-provided connection
+    /// (for transaction batching across many notes — avoids one fsync per call).
+    pub fn batch_insert_section_to_symbol_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let mut stmt = conn
             .prepare(
                 "MATCH (sec:Section {uid: $sid}), (sym:Symbol {uid: $symid}) \
@@ -1863,8 +1904,17 @@ impl GraphStore {
     /// idempotency.
     pub fn delete_cross_domain_edges_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_cross_domain_edges_for_note_on(&conn, note_uid)
+    }
+
+    /// Delete cross-domain edges for a note using an externally-provided
+    /// connection (for transaction batching across many notes).
+    pub fn delete_cross_domain_edges_for_note_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() DELETE r",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -1890,7 +1940,7 @@ impl GraphStore {
         };
         for s_uid in &section_uids {
             exec_params(
-                &conn,
+                conn,
                 "MATCH (s:Section {uid: $uid})-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->() DELETE r",
                 vec![("uid", lbug::Value::String(s_uid.clone()))],
             )?;
@@ -2215,6 +2265,109 @@ impl GraphStore {
             tracing::trace!("clear_repo_derived_nodes: Contract delete skipped: {e}");
         }
         Ok(())
+    }
+
+    /// Cascade-delete every graph row whose `instance_id` matches `id`:
+    /// all Repos (with their files, symbols, services, contracts), all
+    /// Vaults (with their notes/headings/sections via
+    /// `delete_vault_cascade`), and all Projects. Composes the same
+    /// per-Repo cleanup that `index --force` uses, so no novel write
+    /// paths are introduced. Idempotent: returns zero counts on a clean
+    /// DB. Useful for recovering from a misconfigured `instance merge`
+    /// that left an orphan instance ID behind.
+    pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
+        let mut result = PurgeInstanceResult::default();
+
+        // Repos owned by this instance — cascade delete every File,
+        // Symbol, Service, and Contract that hangs off each one before
+        // dropping the Repo node itself.
+        let repos = self.list_repos(Some(id))?;
+        for r in &repos {
+            let (files, syms) = self.bulk_delete_repo_files_and_symbols(&r.uid)?;
+            self.clear_repo_derived_nodes(&r.uid)?;
+            self.delete_repo_node(&r.uid)?;
+            result.files += files;
+            result.symbols += syms;
+        }
+        result.repos = repos.len();
+
+        // Vaults owned by this instance — cascade Note/Heading/Section.
+        let vaults = self.list_vaults(Some(id))?;
+        for v in &vaults {
+            let notes = self.delete_vault_cascade(&v.uid)?;
+            result.notes += notes;
+        }
+        result.vaults = vaults.len();
+
+        // Projects owned by this instance — single DETACH DELETE each.
+        let projects = self.list_projects()?;
+        for p in &projects {
+            if p.instance_id == id {
+                let conn = self.conn()?;
+                exec_params(
+                    &conn,
+                    "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+                    vec![("uid", lbug::Value::String(p.uid.clone()))],
+                )?;
+                result.projects += 1;
+            }
+        }
+
+        // Orphan sweep: a partial `instance merge` can drop the Repo or
+        // Vault node while leaving its child Symbol/File/Service/Note
+        // rows behind. Those children still encode the source instance
+        // in their UID prefix, so we can find and drop them even after
+        // the parent is gone. Order matters only for telemetry — every
+        // statement is `DETACH DELETE` so incident edges are cleaned.
+        for (label, prefix) in [
+            ("Symbol", format!("sym:repo:{id}:")),
+            ("File", format!("file:repo:{id}:")),
+            ("Service", format!("svc:repo:{id}:")),
+            ("Note", format!("note:vlt:{id}:")),
+            ("Heading", format!("head:note:vlt:{id}:")),
+            ("Section", format!("sec:note:vlt:{id}:")),
+            ("Tag", format!("tag:vlt:{id}:")),
+            // Defensive: also catch Repo/Vault/Project rows that the
+            // registry-walk above missed (e.g. stale rows whose
+            // instance_id column was scrambled but whose UID is intact).
+            ("Repo", format!("repo:{id}:")),
+            ("Vault", format!("vlt:{id}:")),
+            ("Project", format!("proj:{id}:")),
+        ] {
+            result.orphans_swept += self.sweep_orphan_nodes(label, &prefix)?;
+        }
+
+        Ok(result)
+    }
+
+    /// Count and DETACH DELETE every node of `label` whose `uid` starts
+    /// with `prefix`. Returns the number of rows removed. Idempotent.
+    /// Used by [`purge_instance`] to clean up orphans left by a
+    /// partial `instance merge` that already dropped the parent
+    /// Repo/Vault node.
+    fn sweep_orphan_nodes(&self, label: &str, prefix: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let query =
+            format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n RETURN count(n)");
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| StoreError::Query(format!("prepare sweep {label} orphans: {e}")))?;
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![("p", lbug::Value::String(prefix.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("sweep {label} orphans: {e}")))?;
+        let count = rows
+            .filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0);
+        Ok(count)
     }
 
     /// Insert a single CROSS_REPO_LINK edge between two Symbol nodes.

@@ -14,7 +14,8 @@ pub use db::GraphStore;
 pub use error::StoreError;
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
-    QueryIntent, ScopedEdgeQuery, detect_intent, git_activity_multiplier,
+    PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery,
+    SeedResolutionConfig, default_kind_priority, detect_intent, git_activity_multiplier,
 };
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteLite, SymbolBasic,
@@ -28,7 +29,7 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::ImpactNode;
-pub use write::{MergeResult, UnlinkedVault};
+pub use write::{MergeResult, PurgeInstanceResult, UnlinkedVault};
 
 #[cfg(test)]
 mod tests {
@@ -1448,5 +1449,122 @@ mod tests {
         // but files are gone — verify by checking a lookup would find no symbols).
         let all_syms = store.lookup_symbols_by_name("fn_1").unwrap();
         assert!(all_syms.is_empty());
+    }
+
+    #[test]
+    fn purge_instance_cascade_deletes_repos_and_children() {
+        let store = test_store();
+
+        // Two repos under instance "ghost" — both should disappear.
+        let ghost_repo_a = Repo {
+            uid: "repo:ghost:aaaa".to_string(),
+            url: "file:///ghost/a".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "ghost".to_string(),
+            name: Some("ghost-a".to_string()),
+        };
+        let ghost_repo_b = Repo {
+            uid: "repo:ghost:bbbb".to_string(),
+            url: "file:///ghost/b".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "ghost".to_string(),
+            name: Some("ghost-b".to_string()),
+        };
+        store.insert_repo(&ghost_repo_a).unwrap();
+        store.insert_repo(&ghost_repo_b).unwrap();
+
+        // One repo under a different instance — must survive intact.
+        let keep_repo = Repo {
+            uid: "repo:keep:cccc".to_string(),
+            url: "file:///keep/c".to_string(),
+            indexed_sha: "local".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "keep".to_string(),
+            name: Some("keep-c".to_string()),
+        };
+        store.insert_repo(&keep_repo).unwrap();
+
+        // Children for each repo.
+        store
+            .insert_file(&make_file("file-ghost-a", "repo:ghost:aaaa"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym-ghost-a",
+                "ghost_fn",
+                "repo:ghost:aaaa",
+                "src/file-ghost-a.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service("svc-ghost-a", "repo:ghost:aaaa"))
+            .unwrap();
+        store
+            .insert_file(&make_file("file-keep", "repo:keep:cccc"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym-keep",
+                "keep_fn",
+                "repo:keep:cccc",
+                "src/file-keep.rs",
+            ))
+            .unwrap();
+
+        // Orphan rows: simulate a partial `instance merge` that already
+        // dropped a Repo node but left its Symbol/File children behind
+        // with the source instance still encoded in their UID prefix.
+        // `purge_instance` must catch these via the orphan-sweep path
+        // even though no `repo:ghost:zzzz` exists to walk down from.
+        store
+            .insert_file(&make_file("file:repo:ghost:zzzz:orphan", "repo:ghost:zzzz"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:repo:ghost:zzzz:orphan",
+                "orphan_fn",
+                "repo:ghost:zzzz",
+                "src/orphan.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service(
+                "svc:repo:ghost:zzzz:orphan",
+                "repo:ghost:zzzz",
+            ))
+            .unwrap();
+
+        let result = store.purge_instance("ghost").unwrap();
+        assert_eq!(result.repos, 2);
+        assert_eq!(result.files, 1);
+        assert_eq!(result.symbols, 1);
+        // 1 orphan File + 1 orphan Symbol + 1 orphan Service.
+        assert!(
+            result.orphans_swept >= 3,
+            "expected at least 3 orphan rows swept, got {}",
+            result.orphans_swept
+        );
+
+        // Ghost repos are gone.
+        let remaining = store.list_repos(None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, "repo:keep:cccc");
+
+        // Orphan symbols are also gone.
+        let orphan_syms = store.lookup_symbols_by_name("orphan_fn").unwrap();
+        assert!(orphan_syms.is_empty());
+
+        // Keep-instance children are intact.
+        let keep_syms = store.lookup_symbols_by_name("keep_fn").unwrap();
+        assert_eq!(keep_syms.len(), 1);
+
+        // Re-running on a clean instance is a no-op.
+        let again = store.purge_instance("ghost").unwrap();
+        assert_eq!(again.repos, 0);
+        assert_eq!(again.files, 0);
+        assert_eq!(again.symbols, 0);
+        assert_eq!(again.orphans_swept, 0);
     }
 }

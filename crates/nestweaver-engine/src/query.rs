@@ -6,6 +6,7 @@ use anyhow::Context;
 
 use crate::config::{
     FeatureConfig, LinkConfig, RANKING_MULTIPLIER_MAX, RANKING_MULTIPLIER_MIN, RankingConfig,
+    RepoConfig,
 };
 use crate::repo_display_name;
 
@@ -46,6 +47,11 @@ pub struct HybridSearchConfig {
     /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
     /// the 0.3 boost to surface numerically in the output relevance.
     pub prf: bool,
+    /// Finding #7 — graduated path-deboost + kind-priority for
+    /// `search_symbols_by_name` seed resolution. Sourced from
+    /// `[seed_resolution]` in instance config (with backward-compat shim
+    /// for the legacy `[ranking].test_path_patterns` block).
+    pub seed_resolution: nestweaver_store::SeedResolutionConfig,
 }
 
 impl Default for HybridSearchConfig {
@@ -58,6 +64,7 @@ impl Default for HybridSearchConfig {
             bm25_limit: 500,
             semantic_limit: 200,
             prf: false,
+            seed_resolution: nestweaver_store::SeedResolutionConfig::default(),
         }
     }
 }
@@ -158,7 +165,11 @@ pub fn search_symbols(
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
     let syms = store
-        .search_symbols_by_name(query, limit, &crate::config::default_test_path_patterns())
+        .search_symbols_by_name(
+            query,
+            limit,
+            &nestweaver_store::SeedResolutionConfig::default(),
+        )
         .context("search_symbols_by_name")?;
     Ok(syms.iter().map(SymbolCandidate::from).collect())
 }
@@ -261,7 +272,11 @@ pub fn build_context_with_intent(
         } else {
             // Name search — take up to 5 matches.
             let matches = store
-                .search_symbols_by_name(input, 5, &crate::config::default_test_path_patterns())
+                .search_symbols_by_name(
+                    input,
+                    5,
+                    &nestweaver_store::SeedResolutionConfig::default(),
+                )
                 .map_err(|e| anyhow::anyhow!(e))?;
             for sym in matches {
                 seed_uids.push(sym.uid);
@@ -361,7 +376,10 @@ pub fn build_context_with_intent(
 
 #[cfg(test)]
 mod promote_tests {
-    use super::{BrainContextResult, BrainNode, promote_member_notes_into_connected};
+    use super::{
+        BrainContextResult, BrainNode, promote_member_notes_into_connected,
+        promote_member_symbols_into_connected,
+    };
     use std::collections::HashSet;
 
     fn note(uid: &str) -> BrainNode {
@@ -445,6 +463,64 @@ mod promote_tests {
             "non-member seed must not be promoted"
         );
     }
+
+    // Wave-5 regression fix: when a project declares repos, the project node's
+    // mass fans out across thousands of PROJECT_INCLUDES_SYMBOL edges, leaving
+    // each member symbol below the PPR min_score filter. The CLI seeds the
+    // top-K member symbols by PageRank to keep them alive, and this helper
+    // surfaces them into `connected` (mirror of the notes promotion).
+    #[test]
+    fn promotes_member_symbols_from_seeds_into_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![
+                symbol("sym:foo"),
+                symbol("sym:bar"),
+                note("note:non-member"),
+            ],
+            connected: vec![note("note:overview")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
+            .into_iter()
+            .collect();
+
+        promote_member_symbols_into_connected(&mut result, &members);
+
+        let connected_uids: Vec<&str> = result.connected.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            connected_uids.contains(&"sym:foo"),
+            "member symbol 'sym:foo' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            connected_uids.contains(&"sym:bar"),
+            "member symbol 'sym:bar' must surface in connected; got {connected_uids:?}"
+        );
+        assert!(
+            !connected_uids.contains(&"note:non-member"),
+            "non-member seed must not be promoted; got {connected_uids:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_promotion_does_not_duplicate_already_connected() {
+        let mut result = BrainContextResult {
+            seeds: vec![symbol("sym:foo")],
+            connected: vec![symbol("sym:foo")],
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        };
+        let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
+
+        promote_member_symbols_into_connected(&mut result, &members);
+
+        let count = result
+            .connected
+            .iter()
+            .filter(|n| n.uid == "sym:foo")
+            .count();
+        assert_eq!(count, 1, "already-present member symbol must not duplicate");
+    }
 }
 
 #[cfg(test)]
@@ -494,7 +570,13 @@ mod context_tests {
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
 
         // Find the actual file_path stored for a symbol in utils.js.
-        let search = store.search_symbols_by_name("formatDate", 1, &[]).unwrap();
+        let search = store
+            .search_symbols_by_name(
+                "formatDate",
+                1,
+                &nestweaver_store::SeedResolutionConfig::default(),
+            )
+            .unwrap();
         if search.is_empty() {
             // Parser may not have indexed this file — skip rather than fail.
             return;
@@ -561,7 +643,11 @@ pub struct FeatureContextResult {
 
 /// Build a task-focused context for a declared feature bundle.
 ///
-/// 1. Loads all repos and resolves feature.repos names to repo_uids.
+/// 1. Loads all repos and resolves feature.repos names to repo_uids. Matching
+///    accepts either the DB Repo display name or an `[[repos]]` config alias
+///    (`name = "..."`) whose URL matches an indexed repo — so a feature can
+///    refer to a repo by a friendly name even if it was indexed under its
+///    URL basename.
 /// 2. Resolves all `feature.entry_points` using exact name match, filtered to feature repos.
 /// 3. Runs Personalized PageRank from those seeds.
 /// 4. Returns seeds, connected symbols, declared links, and any unmatched entry points.
@@ -569,14 +655,29 @@ pub fn build_feature_context(
     store: &GraphStore,
     feature: &FeatureConfig,
     links: &[LinkConfig],
+    repo_configs: &[RepoConfig],
     intent: Option<QueryIntent>,
     limit: Option<usize>,
 ) -> Result<FeatureContextResult, anyhow::Error> {
     // Resolve feature repo names to repo_uids.
     let all_repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
+    // URL allow-list derived from `[[repos]] name = ...` aliases declared by
+    // the feature. Lets `feature.repos = ["redrock"]` resolve to a DB repo
+    // indexed under a different display name when the config aliases it.
+    let alias_urls: std::collections::HashSet<&str> = repo_configs
+        .iter()
+        .filter(|rc| {
+            rc.name
+                .as_deref()
+                .is_some_and(|n| feature.repos.iter().any(|fr| fr == n))
+        })
+        .map(|rc| rc.url.as_str())
+        .collect();
     let feature_repo_uids: std::collections::HashSet<String> = all_repos
         .iter()
-        .filter(|r| feature.repos.contains(&repo_display_name(r)))
+        .filter(|r| {
+            feature.repos.contains(&repo_display_name(r)) || alias_urls.contains(r.url.as_str())
+        })
         .map(|r| r.uid.clone())
         .collect();
 
@@ -709,15 +810,29 @@ pub struct BrainNode {
     /// body contains the full source, `false` when the per-body cap forced
     /// truncation. Skipped from JSON when `true` so existing consumers see
     /// unchanged output and only learn about the field when it flags a
-    /// truncated body. (BrainNode is Serialize-only — no Deserialize default
-    /// needed; constructors set this explicitly.)
-    #[serde(skip_serializing_if = "is_true")]
+    /// truncated body.
+    ///
+    /// `#[serde(default = "default_body_complete")]` is required because the
+    /// daemon's JSON-RPC `GetContext` response routes through
+    /// `serde_json::from_str` on the client. When a node serializes with
+    /// `body_complete=true` the field is omitted (per the `skip_serializing_if`
+    /// above); without the default, the client deserialization fails with
+    /// `missing field body_complete`, causing daemon-routed `brain context` to
+    /// hard-error. The default mirrors constructor behavior (no truncation =>
+    /// complete).
+    #[serde(skip_serializing_if = "is_true", default = "default_body_complete")]
     pub body_complete: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_true(b: &bool) -> bool {
     *b
+}
+
+/// Serde default for [`BrainNode::body_complete`]. See the field doc on
+/// `BrainNode::body_complete` for the daemon-deserialization rationale.
+fn default_body_complete() -> bool {
+    true
 }
 
 /// Char-truncate `body` to `max_chars`, preferring the last newline within the
@@ -737,8 +852,16 @@ pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String,
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrainContextResult {
+    /// Resolved seed nodes. The MCP `brain_context` tool omits this field
+    /// when `include_seeds=false` is requested, so deserializing daemon
+    /// `GetContext` responses requires a default.
+    #[serde(default)]
     pub seeds: Vec<BrainNode>,
     pub connected: Vec<BrainNode>,
+    /// Seed strings that did not resolve to any UID. The MCP
+    /// `brain_context` tool omits this field when empty, so deserializing
+    /// daemon `GetContext` responses requires a default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_seeds: Vec<String>,
     /// Feature F7 (PRF half) — terms mined by pseudo-relevance feedback and
     /// fed into the pass-2 BM25 query. Empty unless PRF was enabled. Surfaced
@@ -773,6 +896,76 @@ pub fn promote_member_notes_into_connected(
         .cloned()
         .collect();
     result.connected.extend(promoted);
+}
+
+/// Surface a project's curated member symbols into the rendered `connected`
+/// list.
+///
+/// Companion to [`promote_member_notes_into_connected`]. When `project-context`
+/// seeds PPR with the top-K project symbols by PageRank, those seeds survive
+/// the `min_score` filter but land in `result.seeds` — which is *not* rendered
+/// by the CLI / MCP project responses. Promote any seeded symbol UID present
+/// in `member_symbol_uids` into `connected`, de-duplicated by UID, so the
+/// architecturally important code surfaces alongside the curated notes.
+pub fn promote_member_symbols_into_connected(
+    result: &mut BrainContextResult,
+    member_symbol_uids: &std::collections::HashSet<String>,
+) {
+    let present: std::collections::HashSet<String> =
+        result.connected.iter().map(|n| n.uid.clone()).collect();
+    let promoted: Vec<BrainNode> = result
+        .seeds
+        .iter()
+        .filter(|n| member_symbol_uids.contains(&n.uid) && !present.contains(&n.uid))
+        .cloned()
+        .collect();
+    result.connected.extend(promoted);
+}
+
+/// Drop `Heading` nodes from `connected` when a `Section` node sharing the
+/// same `(file, title)` is already present.
+///
+/// The vault graph emits both a `Heading` node (the heading line itself) and
+/// a `Section` node (the heading plus its body) for every markdown heading.
+/// They land in retrieval results with near-identical PPR scores and identical
+/// titles — the Section strictly dominates because it carries the body text.
+/// In notes-heavy projects this overlap consumes ~25% of a 2000-token budget
+/// on duplicate entries that add no information.
+///
+/// Location normalisation: a Heading's `location` is typically `<file>` or
+/// `<file>:<line>` and a Section's is `<file>` or `<file>#<anchor>`; both
+/// collapse to the same file stem so the pair is detected regardless of
+/// whether anchors / line suffixes are present.
+pub fn dedup_heading_section_pairs(result: &mut BrainContextResult) {
+    fn loc_stem(loc: &str) -> &str {
+        let no_anchor = loc.split_once('#').map(|(p, _)| p).unwrap_or(loc);
+        if let Some((p, tail)) = no_anchor.rsplit_once(':')
+            && !tail.is_empty()
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            return p;
+        }
+        no_anchor
+    }
+
+    let section_keys: std::collections::HashSet<(String, String)> = result
+        .connected
+        .iter()
+        .filter(|n| n.kind.eq_ignore_ascii_case("Section"))
+        .map(|n| (loc_stem(&n.location).to_string(), n.title.clone()))
+        .collect();
+
+    if section_keys.is_empty() {
+        return;
+    }
+
+    result.connected.retain(|n| {
+        if !n.kind.eq_ignore_ascii_case("Heading") {
+            return true;
+        }
+        let key = (loc_stem(&n.location).to_string(), n.title.clone());
+        !section_keys.contains(&key)
+    });
 }
 
 /// Build a task-focused context subgraph using the unified scope (code +
@@ -899,9 +1092,12 @@ pub fn build_brain_context_hybrid_with_aliases(
             continue;
         }
 
-        // Fall back to symbol name search.
+        // Fall back to symbol name search. Respect the caller's configured
+        // [`HybridSearchConfig::seed_resolution`] (sourced from
+        // `[seed_resolution]` in instance config) so user overrides actually
+        // take effect at seed resolution.
         let symbol_matches = store
-            .search_symbols_by_name(trimmed, 5, &crate::config::default_test_path_patterns())
+            .search_symbols_by_name(trimmed, 5, &config.seed_resolution)
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_matches.is_empty() {
             for s in symbol_matches {
@@ -1179,7 +1375,7 @@ fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyh
 /// Resolve a UID to a printable `BrainNode` by dispatching on UID prefix.
 /// Returns Ok(None) if the node can't be found (silently dropped from
 /// results — should only happen for stale/orphan UIDs).
-fn render_brain_node(
+pub(crate) fn render_brain_node(
     store: &GraphStore,
     uid: &str,
     score: f64,
@@ -2210,5 +2406,86 @@ mod expand_query_tests {
             result.contains("Device Pairing"),
             "should expand Pairing; got: {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dedup_heading_section_tests {
+    use super::{BrainContextResult, BrainNode, dedup_heading_section_pairs};
+
+    fn node(uid: &str, kind: &str, title: &str, loc: &str, rel: f64) -> BrainNode {
+        BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            location: loc.to_string(),
+            relevance: rel,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    fn make(connected: Vec<BrainNode>) -> BrainContextResult {
+        BrainContextResult {
+            seeds: vec![],
+            connected,
+            unresolved_seeds: vec![],
+            expansion_terms: vec![],
+        }
+    }
+
+    #[test]
+    fn drops_heading_when_section_with_same_file_and_title_present() {
+        let mut r = make(vec![
+            node("h1", "Heading", "Overview", "notes/foo.md", 0.5),
+            node("s1", "Section", "Overview", "notes/foo.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 1);
+        assert_eq!(r.connected[0].uid, "s1");
+    }
+
+    #[test]
+    fn keeps_heading_when_no_matching_section() {
+        let mut r = make(vec![
+            node("h1", "Heading", "Overview", "notes/foo.md", 0.5),
+            node("s2", "Section", "Different Title", "notes/foo.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 2);
+    }
+
+    #[test]
+    fn collapses_locations_with_line_or_anchor_suffix() {
+        // Heading carries `file:line`, Section carries `file#anchor`; both
+        // should collapse to the same file stem.
+        let mut r = make(vec![
+            node("h1", "Heading", "Setup", "notes/bar.md:42", 0.5),
+            node("s1", "Section", "Setup", "notes/bar.md#setup", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 1);
+        assert_eq!(r.connected[0].kind, "Section");
+    }
+
+    #[test]
+    fn no_op_when_no_sections_present() {
+        let mut r = make(vec![
+            node("h1", "Heading", "A", "x.md", 0.5),
+            node("h2", "Heading", "B", "x.md", 0.4),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        assert_eq!(r.connected.len(), 2);
+    }
+
+    #[test]
+    fn ignores_unrelated_kinds() {
+        let mut r = make(vec![
+            node("n1", "Note/PRD", "Spec", "notes/spec.md", 0.6),
+            node("s1", "Section", "Spec", "notes/spec.md", 0.5),
+        ]);
+        dedup_heading_section_pairs(&mut r);
+        // Note nodes are never dropped, only Heading nodes.
+        assert_eq!(r.connected.len(), 2);
     }
 }

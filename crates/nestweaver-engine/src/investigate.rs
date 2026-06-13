@@ -239,9 +239,11 @@ pub fn investigate(
         prf: true,
         ..Default::default()
     };
-    // Graceful empty handling: when no seed resolves, retrieval returns an
-    // error rather than an empty result. Treat that as an empty investigation
-    // (valid bundle, zero entries) instead of propagating the error.
+    // Graceful empty handling: when no seed resolves (e.g. a natural-language
+    // multi-word query like "indexing pipeline" that matches no symbol/note
+    // title verbatim), hybrid retrieval bails with `No seeds resolved`. Fall
+    // back to BM25-only retrieval against the query text so investigations
+    // remain useful for orientation queries instead of returning an empty map.
     let connected_result = build_brain_context_hybrid_with_aliases(
         store,
         &seed_inputs,
@@ -253,7 +255,7 @@ pub fn investigate(
     );
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => ctx.connected,
-        Err(_) => Vec::new(),
+        Err(_) => bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH),
     };
     if let Some(ref repo_uids) = repo_filter {
         connected.retain(|n| node_in_repo(store, n, repo_uids));
@@ -515,6 +517,39 @@ fn resolve_scope(
 
     // vault / all / empty → no restriction.
     Ok((seeds, None))
+}
+
+/// BM25-only retrieval against the vault index when graph-seed resolution
+/// fails. Returns up to `limit` `BrainNode`s ranked by BM25 score, normalized
+/// so the top hit has relevance 1.0 (matching the hybrid pipeline's score
+/// scale closely enough for downstream consumers). Returns an empty vec when
+/// `tantivy` is absent or the query returns no hits.
+fn bm25_fallback(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    query: &str,
+    limit: usize,
+) -> Vec<BrainNode> {
+    let Some(tantivy) = tantivy else {
+        return Vec::new();
+    };
+    let hits = match tantivy.search(query, limit) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    let max_score = hits.iter().map(|h| h.score as f64).fold(0.0_f64, f64::max);
+    let mut nodes: Vec<BrainNode> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let normalized = if max_score > 0.0 {
+            (hit.score as f64) / max_score
+        } else {
+            0.0
+        };
+        if let Ok(Some(node)) = crate::query::render_brain_node(store, &hit.uid, normalized) {
+            nodes.push(node);
+        }
+    }
+    nodes
 }
 
 /// Whether a node belongs to one of the given repos. Only symbol nodes are

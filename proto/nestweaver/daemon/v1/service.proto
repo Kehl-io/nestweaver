@@ -184,6 +184,13 @@ message ProjectContextRequest {
   bool include_components = 4;
   string intent = 5;
   bool include_seeds = 6;
+  // RFC3339 timestamp; when set, hard-filters Note/Section nodes by
+  // `modified_at >= since`. Empty string = no filter.
+  string since = 7;
+  // Soft recency boost weight [0.0, 1.0+]. 0.0 disables the boost (default).
+  double recency_weight = 8;
+  // Half-life (days) for the recency boost decay. Ignored when weight=0.
+  double recency_half_life_days = 9;
 }
 message ProjectContextResponse { string result_json = 1; }
 

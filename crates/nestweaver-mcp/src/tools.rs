@@ -2410,11 +2410,102 @@ fn tool_brain_status(
                 }
             };
             json!({
+                // `uid` + `instance_id` let callers disambiguate rows that
+                // share a name/root_path (collision state) and target precise
+                // operations like `brain remove --instance <id>`.
+                "uid": v.uid,
+                "instance_id": v.instance_id,
                 "name": v.name,
                 "root_path": v.root_path,
                 "note_count": note_count,
                 "last_indexed": last_indexed,
                 "last_indexed_source": last_indexed_source,
+            })
+        })
+        .collect();
+
+    // Detect duplicate-root collisions. The CLI's local (non-daemon) path
+    // emits these warnings to stderr; forward them through the JSON-RPC
+    // response so daemon-routed callers and `--json` consumers see the
+    // same diagnostic.
+    let mut root_to_rows: std::collections::HashMap<&str, Vec<&nestweaver_schema::Vault>> =
+        std::collections::HashMap::new();
+    for v in &vaults {
+        root_to_rows
+            .entry(v.root_path.as_str())
+            .or_default()
+            .push(v);
+    }
+    let warnings: Vec<Value> = root_to_rows
+        .iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(root, rows)| {
+            // Pair each row with its note count so we can both render the
+            // entries and pick the keeper for the remediation hint.
+            let rows_with_counts: Vec<(&&nestweaver_schema::Vault, usize)> = rows
+                .iter()
+                .map(|v| {
+                    (
+                        v,
+                        store.list_notes(Some(&v.uid)).unwrap_or_default().len(),
+                    )
+                })
+                .collect();
+            let entries: Vec<Value> = rows_with_counts
+                .iter()
+                .map(|(v, n)| {
+                    json!({
+                        "uid": v.uid,
+                        "instance_id": v.instance_id,
+                        "name": v.name,
+                        "note_count": n,
+                    })
+                })
+                .collect();
+
+            // Suggest a concrete merge command. The keeper is the row with
+            // the highest note_count (most data); ties break on the
+            // lexicographically smallest instance_id so the suggestion is
+            // deterministic. Emit one command per non-keeper row so callers
+            // collapse all ghosts into the canonical instance.
+            let keeper = rows_with_counts
+                .iter()
+                .max_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| b.0.instance_id.cmp(&a.0.instance_id))
+                })
+                .map(|(v, _)| v);
+            let (remediation_commands, remediation_hint) = match keeper {
+                Some(keeper_v) => {
+                    let cmds: Vec<String> = rows_with_counts
+                        .iter()
+                        .filter(|(v, _)| v.instance_id != keeper_v.instance_id)
+                        .map(|(v, _)| {
+                            format!(
+                                "nestweaver instance merge --from {} --to {}",
+                                v.instance_id, keeper_v.instance_id,
+                            )
+                        })
+                        .collect();
+                    let hint = format!(
+                        "Multiple instance_ids share this vault root. Keep '{}' (has the most data) and merge the others into it using the commands below. Take a snapshot of {} first.",
+                        keeper_v.instance_id,
+                        db_path
+                            .as_deref()
+                            .and_then(|p| p.to_str())
+                            .unwrap_or("the database"),
+                    );
+                    (cmds, hint)
+                }
+                None => (Vec::new(), String::new()),
+            };
+
+            json!({
+                "kind": "duplicate_vault_root",
+                "root_path": root,
+                "entries": entries,
+                "remediation_commands": remediation_commands,
+                "remediation_hint": remediation_hint,
             })
         })
         .collect();
@@ -2470,6 +2561,10 @@ fn tool_brain_status(
             "entries": cache_entries,
             "hit_rate_pct": cache_hit_rate_pct,
         },
+        // Structured diagnostics. Each entry describes a vault-level
+        // anomaly (duplicate root, missing index, etc.) so clients can
+        // render an actionable warning without re-deriving it.
+        "warnings": warnings,
     }))
 }
 
@@ -3642,9 +3737,30 @@ fn tool_project_context(
     //    PROJECT_INCLUDES_SYMBOL edges, leaving each PROJECT_INCLUDES_NOTE
     //    target below threshold so it never reaches `connected`. Seeding also
     //    lets the walk explore each note's neighbourhood (sections, links).
+    //
+    //    Member symbols suffer the identical fan-out, so also seed the top-K
+    //    by PageRank (Bug #18 / wave-5 regression). Without this, a project
+    //    that declares any repo returns notes-only context even after
+    //    `materialize-projects` writes hundreds of thousands of
+    //    PROJECT_INCLUDES_SYMBOL edges.
+    const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
+    let mut member_symbol_uids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let top_symbols = store
+        .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+        .map_err(|e| anyhow!("list_project_symbol_uids_by_pagerank: {e}"))?;
+    member_symbol_uids.extend(top_symbols);
+    for comp_uid in &component_uids {
+        let comp_top = store
+            .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+            .unwrap_or_default();
+        member_symbol_uids.extend(comp_top);
+    }
+
     let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
     ppr_seeds.extend(component_uids);
     ppr_seeds.extend(member_note_uids.iter().cloned());
+    ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
@@ -3672,6 +3788,15 @@ fn tool_project_context(
     //     disjoint from `connected` and not rendered. For project orientation
     //     the curated notes are the answer, so promote them (Bug #12).
     nestweaver_engine::promote_member_notes_into_connected(&mut result, &member_note_uids);
+    // 4b'. Mirror the notes promotion for the seeded top-K member symbols
+    //      (Bug #18 / wave-5 regression). Without this, the symbols stay in
+    //      `seeds` and never appear in the rendered `connected` list.
+    nestweaver_engine::promote_member_symbols_into_connected(&mut result, &member_symbol_uids);
+    // 4b''. Drop Heading nodes that duplicate a Section with the same
+    //       `(file, title)`. The Section carries the body, so the bare
+    //       Heading is redundant; notes-heavy projects spend ~25% of a
+    //       2000-token budget on these duplicates without this trim.
+    nestweaver_engine::dedup_heading_section_pairs(&mut result);
 
     // 4c. Post-PPR scope boost: multiply relevance for nodes that belong
     //     to the project (member UIDs are the authoritative membership signal).
@@ -3744,8 +3869,18 @@ fn tool_project_context(
         );
     }
 
-    // 6. Apply token budget: account for seed cost, allocate remainder to connected.
-    let seed_tokens: usize = result.seeds.iter().map(render_cost).sum();
+    // 6. Apply token budget: account for seed cost, allocate remainder to
+    //    connected. Don't double-count items that the promotion helpers above
+    //    copied from `seeds` into `connected` — those tokens belong to the
+    //    connected budget, not the seed overhead.
+    let connected_uids: std::collections::HashSet<&str> =
+        result.connected.iter().map(|n| n.uid.as_str()).collect();
+    let seed_tokens: usize = result
+        .seeds
+        .iter()
+        .filter(|n| !connected_uids.contains(n.uid.as_str()))
+        .map(render_cost)
+        .sum();
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
     let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget);
     let used_tokens = seed_tokens + connected_tokens;
@@ -4557,6 +4692,9 @@ pub fn dispatch_via_daemon(
                     include_components: bool_field("include_components"),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
+                    since: str_field("since"),
+                    recency_weight: f64_field("recency_weight"),
+                    recency_half_life_days: f64_field("recency_half_life_days"),
                 });
                 let resp = client
                     .get_project_context(req)
@@ -4591,25 +4729,18 @@ pub fn dispatch_via_daemon(
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_status" => {
-                use nestweaver_proto::BrainStatusRequest;
-                let req = tonic::Request::new(BrainStatusRequest {});
+                // Use the JSON pass-through RPC so per-vault rows (uid +
+                // instance_id), warnings[], and any other engine-side fields
+                // round-trip intact. The typed BrainStatusResponse only
+                // carries the scalar totals.
+                let req = tonic::Request::new(JsonRequest {
+                    args_json: args_json.clone(),
+                });
                 let resp = client
-                    .brain_status(req)
+                    .brain_status_json(req)
                     .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
-                let inner = resp.into_inner();
-                let value = serde_json::json!({
-                    "vault_count": inner.vault_count,
-                    "notes": inner.notes,
-                    "headings": inner.headings,
-                    "sections": inner.sections,
-                    "tags": inner.tags,
-                    "wikilinks": inner.wikilinks,
-                    "repo_count": inner.repo_count,
-                    "tantivy_available": inner.tantivy_available,
-                    "tantivy_doc_count": inner.tantivy_doc_count,
-                });
-                Ok(serde_json::to_string(&value)?)
+                Ok(resp.into_inner().result_json)
             }
             "hub_nodes" => {
                 use nestweaver_proto::HubNodesRequest;
