@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use nestweaver_schema::SymbolKind;
+use nestweaver_schema::{EdgeType, SymbolKind};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
@@ -191,11 +191,11 @@ impl GraphStore {
         let min_conf = min_confidence as f64;
 
         let edge_types = [
-            "CALLS",
-            "IMPORTS",
-            "EXTENDS_SYM",
-            "IMPLEMENTS_SYM",
-            "INCLUDES_SYM",
+            EdgeType::Calls.rel_table_name(),
+            EdgeType::Imports.rel_table_name(),
+            EdgeType::Extends.rel_table_name(),
+            EdgeType::Implements.rel_table_name(),
+            EdgeType::Includes.rel_table_name(),
         ];
         let mut rows: Vec<CallerRow> = Vec::new();
 
