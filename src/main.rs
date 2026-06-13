@@ -9553,11 +9553,12 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                      {} repo(s), {} project(s)",
                     result.vaults, result.repos, result.projects
                 );
-                for u in &result.unlinked {
+                for d in &result.discarded {
                     eprintln!(
-                        "Note: {} notes from '{}' were unlinked. \
-                         Re-run 'brain add {}' to repopulate.",
-                        u.notes_removed, u.root_path, u.root_path
+                        "Note: {} note(s) from '{}' were discarded \
+                         (collision: the other instance had more notes). \
+                         Re-run 'brain add {}' to re-index.",
+                        d.notes_discarded, d.root_path, d.root_path
                     );
                 }
             }

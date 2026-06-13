@@ -29,7 +29,7 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::ImpactNode;
-pub use write::{MergeResult, PurgeInstanceResult, UnlinkedVault};
+pub use write::{DiscardedVault, MergeResult, PurgeInstanceResult};
 
 #[cfg(test)]
 mod tests {
@@ -1761,11 +1761,11 @@ mod tests {
         // Merge src -> tgt (no collision — no target vault exists).
         let result = store.merge_instance_ids("src", "tgt").unwrap();
         assert_eq!(result.vaults, 1);
-        // No notes should be reported as unlinked — they should survive.
+        // No notes should be discarded — they should survive via reparent.
         assert!(
-            result.unlinked.is_empty(),
-            "expected no unlinked vaults, got {:?}",
-            result.unlinked
+            result.discarded.is_empty(),
+            "expected no discarded vaults, got {:?}",
+            result.discarded
         );
 
         // All 3 notes should survive under the new vault UID.
@@ -1846,10 +1846,10 @@ mod tests {
         // Merge — source wins (3 > 1).
         let result = store.merge_instance_ids("src", "tgt").unwrap();
 
-        // The 1 dropped target note should be reported in unlinked.
-        assert_eq!(result.unlinked.len(), 1);
-        assert_eq!(result.unlinked[0].root_path, "/shared");
-        assert_eq!(result.unlinked[0].notes_removed, 1);
+        // The 1 dropped target note should be reported as discarded.
+        assert_eq!(result.discarded.len(), 1);
+        assert_eq!(result.discarded[0].root_path, "/shared");
+        assert_eq!(result.discarded[0].notes_discarded, 1);
 
         // All 3 source notes should survive under the new vault UID.
         let new_vault_uid = vault_uid("tgt", "/shared");
