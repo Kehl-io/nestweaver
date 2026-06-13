@@ -8,11 +8,13 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
-/// A vault whose notes were removed during an instance merge.
+/// A vault whose notes were discarded during a collision in instance merge.
+/// When two instances have vaults at the same root_path, the vault with
+/// fewer notes loses and its notes are cascade-deleted.
 #[derive(Debug)]
-pub struct UnlinkedVault {
+pub struct DiscardedVault {
     pub root_path: String,
-    pub notes_removed: usize,
+    pub notes_discarded: usize,
 }
 
 /// Result of [`GraphStore::merge_instance_ids`].
@@ -21,7 +23,7 @@ pub struct MergeResult {
     pub vaults: usize,
     pub repos: usize,
     pub projects: usize,
-    pub unlinked: Vec<UnlinkedVault>,
+    pub discarded: Vec<DiscardedVault>,
 }
 
 /// Result of [`GraphStore::reparent_vault`].
@@ -2578,16 +2580,16 @@ impl GraphStore {
 
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
     /// match `from` to `to`. Returns a [`MergeResult`] with counts and
-    /// details about any vaults whose notes were unlinked during collision
-    /// resolution.
+    /// details about any vaults whose notes were discarded during collision
+    /// resolution (when two instances have vaults at the same root_path,
+    /// the vault with fewer notes loses).
     ///
-    /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
-    /// since SET is not supported for property updates.
+    /// Uses [`reparent_vault`] to preserve notes in the winning vault.
     pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
-        let mut unlinked: Vec<UnlinkedVault> = Vec::new();
+        let mut discarded: Vec<DiscardedVault> = Vec::new();
 
         // Build a map of target-instance vaults keyed by root_path so we
         // can detect collisions and compare child counts.
@@ -2615,18 +2617,18 @@ impl GraphStore {
                         let target_dropped = self.delete_vault_cascade(&target.uid)?;
                         self.reparent_vault(&v.uid, &new_uid, to)?;
                         if target_dropped > 0 {
-                            unlinked.push(UnlinkedVault {
+                            discarded.push(DiscardedVault {
                                 root_path,
-                                notes_removed: target_dropped,
+                                notes_discarded: target_dropped,
                             });
                         }
                     } else {
                         // Target wins — drop source (intentional discard).
                         let source_dropped = self.delete_vault_cascade(&v.uid)?;
                         if source_dropped > 0 {
-                            unlinked.push(UnlinkedVault {
+                            discarded.push(DiscardedVault {
                                 root_path,
-                                notes_removed: source_dropped,
+                                notes_discarded: source_dropped,
                             });
                         }
                     }
@@ -2667,7 +2669,7 @@ impl GraphStore {
             vaults: vault_count,
             repos: repo_count,
             projects: project_count,
-            unlinked,
+            discarded,
         })
     }
 }
