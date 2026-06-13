@@ -447,94 +447,30 @@ impl GraphStore {
         };
 
         match edge.edge_type {
-            EdgeType::Calls => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:CALLS {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Imports => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:IMPORTS {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Extends => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:EXTENDS_SYM {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Implements => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:IMPLEMENTS_SYM {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Includes => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:INCLUDES_SYM {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Uses => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:USES {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::Accesses => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:ACCESSES {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
-            EdgeType::MemberOf => exec_params(
-                conn,
-                "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                 CREATE (a)-[:MEMBER_OF {confidence: $conf, evidence: $ev}]->(b)",
-                vec![
-                    ("src", lbug::Value::String(src)),
-                    ("tgt", lbug::Value::String(tgt)),
-                    ("conf", lbug::Value::Double(conf)),
-                    ("ev", lbug::Value::String(evidence_json)),
-                ],
-            ),
+            EdgeType::Calls
+            | EdgeType::Imports
+            | EdgeType::Extends
+            | EdgeType::Implements
+            | EdgeType::Includes
+            | EdgeType::Uses
+            | EdgeType::Accesses
+            | EdgeType::MemberOf => {
+                let rel = edge.edge_type.rel_table_name();
+                let q = format!(
+                    "MATCH (a:Symbol {{uid: $src}}), (b:Symbol {{uid: $tgt}}) \
+                     CREATE (a)-[:{rel} {{confidence: $conf, evidence: $ev}}]->(b)"
+                );
+                exec_params(
+                    conn,
+                    &q,
+                    vec![
+                        ("src", lbug::Value::String(src)),
+                        ("tgt", lbug::Value::String(tgt)),
+                        ("conf", lbug::Value::Double(conf)),
+                        ("ev", lbug::Value::String(evidence_json)),
+                    ],
+                )
+            }
             EdgeType::Contains => Err(StoreError::Query(
                 "Use insert_repo_file_edge / insert_file_symbol_edge for CONTAINS edges"
                     .to_string(),
@@ -741,87 +677,19 @@ impl GraphStore {
             };
 
             match edge.edge_type {
-                EdgeType::Calls => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:CALLS {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Imports => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:IMPORTS {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Extends => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:EXTENDS_SYM {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Implements => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:IMPLEMENTS_SYM {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Includes => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:INCLUDES_SYM {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Uses => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:USES {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::Accesses => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:ACCESSES {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
-                    groups.entry(key).or_default().push(vec![
-                        ("src", lbug::Value::String(src)),
-                        ("tgt", lbug::Value::String(tgt)),
-                        ("conf", lbug::Value::Double(conf)),
-                        ("ev", lbug::Value::String(evidence_json)),
-                    ]);
-                }
-                EdgeType::MemberOf => {
-                    let key = "MATCH (a:Symbol {uid: $src}), (b:Symbol {uid: $tgt}) \
-                               CREATE (a)-[:MEMBER_OF {confidence: $conf, evidence: $ev}]->(b)"
-                        .to_string();
+                EdgeType::Calls
+                | EdgeType::Imports
+                | EdgeType::Extends
+                | EdgeType::Implements
+                | EdgeType::Includes
+                | EdgeType::Uses
+                | EdgeType::Accesses
+                | EdgeType::MemberOf => {
+                    let rel = edge.edge_type.rel_table_name();
+                    let key = format!(
+                        "MATCH (a:Symbol {{uid: $src}}), (b:Symbol {{uid: $tgt}}) \
+                         CREATE (a)-[:{rel} {{confidence: $conf, evidence: $ev}}]->(b)"
+                    );
                     groups.entry(key).or_default().push(vec![
                         ("src", lbug::Value::String(src)),
                         ("tgt", lbug::Value::String(tgt)),
