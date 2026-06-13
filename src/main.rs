@@ -1408,6 +1408,7 @@ enum RankingCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum BrainCommands {
     /// Index a markdown vault into the brain. Auto-detects Obsidian vault
     /// (.obsidian/ present) vs plain markdown folder.
@@ -1593,18 +1594,27 @@ enum BrainCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
         /// Filter results to nodes whose kind starts with one of these values
-        /// (e.g. Symbol, Note, Section, Tag, Heading).
+        /// (e.g. Symbol, Note, Section, Tag, Heading). Accepts comma-separated
+        /// values or repeated `--kinds` flags.
         #[arg(
             long = "kinds",
-            help = "Keep only nodes with these kind prefixes (e.g. Symbol, Note)"
+            value_delimiter = ',',
+            help = "Keep only nodes with these kind prefixes (e.g. Symbol,Note)"
         )]
         kinds: Vec<String>,
         /// Filter results to nodes associated with these repo UIDs or names.
-        #[arg(long = "repos", help = "Keep only nodes from these repo UIDs or names")]
+        /// Accepts comma-separated values or repeated `--repos` flags.
+        #[arg(
+            long = "repos",
+            value_delimiter = ',',
+            help = "Keep only nodes from these repo UIDs or names"
+        )]
         repos: Vec<String>,
         /// Filter results to nodes associated with these vault UIDs or names.
+        /// Accepts comma-separated values or repeated `--vaults` flags.
         #[arg(
             long = "vaults",
+            value_delimiter = ',',
             help = "Keep only nodes from these vault UIDs or names"
         )]
         vaults: Vec<String>,
@@ -1614,15 +1624,20 @@ enum BrainCommands {
             help = "Keep only nodes whose location starts with this prefix"
         )]
         path_prefix: Option<String>,
-        /// Include only nodes tagged with any of these tags (note/section nodes only).
+        /// Include only nodes tagged with any of these tags (note/section nodes
+        /// only). Accepts comma-separated values or repeated `--tags` flags.
         #[arg(
             long = "tags",
+            value_delimiter = ',',
             help = "Keep only note/section nodes tagged with any of these tags"
         )]
         tags: Vec<String>,
-        /// Exclude nodes tagged with any of these tags (note/section nodes only).
+        /// Exclude nodes tagged with any of these tags (note/section nodes
+        /// only). Accepts comma-separated values or repeated `--exclude-tags`
+        /// flags.
         #[arg(
             long = "exclude-tags",
+            value_delimiter = ',',
             help = "Exclude note/section nodes tagged with any of these tags"
         )]
         exclude_tags: Vec<String>,
@@ -1696,6 +1711,35 @@ enum BrainCommands {
             help = "Rerank the top-N retrieved candidates (Feature F17, heuristic, off by default)"
         )]
         rerank: bool,
+        /// Query intent override that tunes PPR's damping factor and edge
+        /// weights. Same accepted values as `nestweaver context --intent`.
+        /// When omitted, the engine auto-detects an intent from the seed
+        /// kinds. Mirrors the lower-level `context --intent` flag so callers
+        /// can force a specific traversal profile against the unified brain.
+        #[arg(
+            long = "intent",
+            help = "Query intent override: find-definition, understand-architecture, analyze-impact, blast-radius, general-context"
+        )]
+        intent: Option<String>,
+        /// Hard-filter test-path nodes out of both seeds and connected
+        /// results. Distinct from the existing soft test-path deboost
+        /// multiplier — this drops the rows entirely. Useful when callers
+        /// want production-only context (e.g. for diffs that should not
+        /// surface fixtures or playwright specs).
+        #[arg(
+            long = "no-tests",
+            help = "Hard-filter test-path nodes out of seeds + connected results (in addition to the soft deboost)"
+        )]
+        no_tests: bool,
+        /// Prefer a specific instance_id when ranking. When the database
+        /// contains rows from multiple instance_ids (e.g. mid-merge), this
+        /// scopes results to nodes registered under the given instance.
+        /// Pass `--prefer-instance <id>` to scope to that instance only.
+        #[arg(
+            long = "prefer-instance",
+            help = "Scope ranking to nodes registered under this instance_id"
+        )]
+        prefer_instance: Option<String>,
     },
     /// List wikilinks whose target is ambiguous or low-confidence
     /// (confidence < 1.0), with suggested target notes for each.
@@ -1854,10 +1898,24 @@ enum InstanceCommands {
     },
     /// List all registered instances
     List,
-    /// Remove a registered instance
+    /// Remove a registered instance. With `--purge-graph`, also
+    /// cascade-delete every Repo/File/Symbol/Vault/Note/Project owned by
+    /// the instance from the graph database. Useful for cleaning up a
+    /// ghost instance left behind by a misconfigured `instance merge`.
     Remove {
         /// Instance ID to remove
         id: String,
+        /// Also cascade-delete the instance's data from the graph
+        /// database (Repos and their children, Vaults and their notes,
+        /// Projects). When set, missing registry entries are tolerated
+        /// so ghost instances can be cleaned up.
+        #[arg(long)]
+        purge_graph: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
     /// Pull the latest snapshot for an instance
     Pull {
@@ -2637,7 +2695,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let empty_links = vec![];
                 let links = instance_config.links.as_deref().unwrap_or(&empty_links);
 
-                match build_feature_context(&store, feature_config, links, parsed_intent, limit) {
+                match build_feature_context(
+                    &store,
+                    feature_config,
+                    links,
+                    &instance_config.repos,
+                    parsed_intent,
+                    limit,
+                ) {
                     Ok(mut result) => {
                         if let Some(budget) = token_budget {
                             let cut = context_token_budgeted_truncate(&result.connected, budget);
@@ -4556,6 +4621,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             recency_half_life_days,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
+                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                if let Ok(mut client) = connect {
+                    let req = nestweaver_proto::ProjectContextRequest {
+                        project: name.clone(),
+                        token_budget: token_budget as i32,
+                        kinds: vec![],
+                        include_components,
+                        intent: String::new(),
+                        include_seeds: false,
+                        since: since.clone().unwrap_or_default(),
+                        recency_weight,
+                        recency_half_life_days,
+                    };
+                    let rpc = rt.block_on(async {
+                        client
+                            .inner_mut()
+                            .get_project_context(req)
+                            .await
+                            .map(|r| r.into_inner())
+                    });
+                    match rpc {
+                        Ok(resp) => {
+                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)?;
+                            render_project_context_daemon_response(&value, json, token_budget);
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        Err(status) => {
+                            tracing::info!(
+                                "daemon GetProjectContext failed ({}); falling back to direct mode",
+                                status.message()
+                            );
+                        }
+                    }
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -4670,9 +4773,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // declares repos, the project node's mass is split across tens of
             // thousands of PROJECT_INCLUDES_SYMBOL edges, leaving each note
             // below threshold so it never reaches `connected`.
+            //
+            // Member symbols suffer the identical fan-out, so seed the
+            // top-K of them by PageRank as well. Without this, a project
+            // that declares any repo returns notes-only context even after
+            // `materialize-projects` writes hundreds of thousands of
+            // PROJECT_INCLUDES_SYMBOL edges (Bug #18 / wave-5 regression).
+            const PROJECT_SYMBOL_SEED_LIMIT: usize = 100;
+            let mut member_symbol_uids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let top_symbols = store
+                .list_project_symbol_uids_by_pagerank(&project.uid, PROJECT_SYMBOL_SEED_LIMIT)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            member_symbol_uids.extend(top_symbols.iter().cloned());
+            for comp_uid in &comp_uids {
+                let comp_top = store
+                    .list_project_symbol_uids_by_pagerank(comp_uid, PROJECT_SYMBOL_SEED_LIMIT)
+                    .unwrap_or_default();
+                member_symbol_uids.extend(comp_top);
+            }
+
             let mut ppr_seeds: Vec<String> = vec![project.uid.clone()];
             ppr_seeds.extend(comp_uids);
             ppr_seeds.extend(member_note_uids.iter().cloned());
+            ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
             let defaults = HybridSearchConfig::default();
             let aliases = load_alias_sidecar(&db_path);
@@ -4693,6 +4817,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         &mut result,
                         &member_note_uids,
                     );
+                    // Surface the seeded member symbols into `connected`
+                    // for the same reason (companion to the notes promotion).
+                    nestweaver_engine::promote_member_symbols_into_connected(
+                        &mut result,
+                        &member_symbol_uids,
+                    );
+                    // Drop Heading/Section duplicates: notes-heavy projects
+                    // would otherwise spend ~25% of a 2000-token budget on
+                    // pairs that share `(file, title)` and add no information.
+                    nestweaver_engine::dedup_heading_section_pairs(&mut result);
 
                     // Post-PPR scope boost: multiply relevance for nodes that
                     // belong to the project so declared content ranks highest.
@@ -4745,12 +4879,46 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                     }
 
-                    // Compute seed token cost and allocate the remainder to connected.
-                    let seed_tokens: usize = result.seeds.iter().map(render_cost_tokens).sum();
+                    // Compute seed token cost and allocate the remainder to
+                    // connected. Don't double-count items the promotion helpers
+                    // copied from `seeds` into `connected` — those tokens belong
+                    // to the connected budget, not the seed overhead.
+                    let connected_uids: std::collections::HashSet<&str> =
+                        result.connected.iter().map(|n| n.uid.as_str()).collect();
+                    let seed_tokens: usize = result
+                        .seeds
+                        .iter()
+                        .filter(|n| !connected_uids.contains(n.uid.as_str()))
+                        .map(render_cost_tokens)
+                        .sum();
                     let remaining_budget = token_budget.saturating_sub(seed_tokens);
                     let cut = token_budgeted_truncate(&result.connected, remaining_budget);
+                    let connected_tokens: usize = result
+                        .connected
+                        .iter()
+                        .take(cut)
+                        .map(render_cost_tokens)
+                        .sum();
+                    let used_tokens = seed_tokens + connected_tokens;
+                    // Load external_refs from the extension sidecar so the
+                    // local (--no-daemon) path matches the daemon/MCP wrapper
+                    // shape — agents rely on this for Workfront / wiki PRD
+                    // surfacing.
+                    let ext_store = nestweaver_engine::load_extensions(&db_path);
+                    let external_refs =
+                        nestweaver_engine::get_all_properties(&ext_store, &project.uid)
+                            .get("external_refs")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                     if json {
-                        print_brain_context_json(&result, cut)?;
+                        print_project_context_json(
+                            &project,
+                            &result,
+                            cut,
+                            used_tokens,
+                            token_budget,
+                            &external_refs,
+                        )?;
                     } else {
                         println!("Project: {}  ({})", project.name, project.uid);
                         if let Some(ref summary) = project.summary {
@@ -6391,14 +6559,38 @@ fn run_brain(
                         .unwrap_or(0);
                     println!("  Vaults:    {}", vault_count);
                     if let Some(vaults) = value.get("vaults").and_then(|v| v.as_array()) {
+                        // When two rows share a name we annotate with the
+                        // instance_id so the user can target precise removes.
+                        // Empty-named rows (phantom registrations) always
+                        // get annotated so they don't render as blank lines.
+                        let mut name_counts: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        for v in vaults {
+                            let name = v["name"].as_str().unwrap_or("?");
+                            *name_counts.entry(name).or_insert(0) += 1;
+                        }
                         for v in vaults {
                             let name = v["name"].as_str().unwrap_or("?");
                             let note_count = v["note_count"].as_u64().unwrap_or(0);
                             let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
-                            println!(
-                                "    - {} ({note_count} notes, last indexed: {last_indexed})",
-                                name
-                            );
+                            let ambiguous = name_counts.get(name).copied().unwrap_or(0) > 1;
+                            let unnamed = name.is_empty();
+                            if ambiguous || unnamed {
+                                let instance = v["instance_id"].as_str().unwrap_or("?");
+                                let root_path = v["root_path"].as_str().unwrap_or("?");
+                                let display = if unnamed {
+                                    format!("<unnamed: {root_path}>")
+                                } else {
+                                    name.to_string()
+                                };
+                                println!(
+                                    "    - {display} [instance: {instance}] ({note_count} notes, last indexed: {last_indexed})"
+                                );
+                            } else {
+                                println!(
+                                    "    - {name} ({note_count} notes, last indexed: {last_indexed})"
+                                );
+                            }
                         }
                     }
                     let notes = value.get("notes").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -6417,17 +6609,80 @@ fn run_brain(
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
                     // Interaction tracking — local check (not in MCP response).
+                    // The sidecar is created (empty) by `InteractionTracker::new`
+                    // when an MCP/daemon starts with --track-interactions, so:
+                    //   - file present + scores > 0  -> "enabled, N scored"
+                    //   - file present + scores == 0 -> "enabled (no events yet)"
+                    //   - file absent                -> "disabled"
                     match nestweaver_engine::load_interaction_data(db_path) {
-                        Some(data) => {
+                        Some(data) if !data.scores.is_empty() => {
                             println!(
                                 "  interaction_tracking: enabled ({} nodes scored)",
                                 data.scores.len()
                             );
                         }
+                        Some(_) => {
+                            println!("  interaction_tracking: enabled (no events recorded yet)");
+                        }
                         None => {
                             println!(
                                 "  interaction_tracking: disabled (run with --track-interactions to enable)"
                             );
+                        }
+                    }
+                    // Forward structured warnings from the MCP response —
+                    // e.g. duplicate-vault-root collisions. Previously these
+                    // were only emitted on the local (non-daemon) code path.
+                    if let Some(warnings) = value.get("warnings").and_then(|v| v.as_array()) {
+                        for w in warnings {
+                            let kind = w["kind"].as_str().unwrap_or("");
+                            if kind == "duplicate_vault_root" {
+                                let root = w["root_path"].as_str().unwrap_or("?");
+                                let entries = w["entries"].as_array().cloned().unwrap_or_default();
+                                eprintln!(
+                                    "Warning: {} vault entries share root path {}:",
+                                    entries.len(),
+                                    root
+                                );
+                                for e in &entries {
+                                    let name = e["name"].as_str().unwrap_or("?");
+                                    let instance = e["instance_id"].as_str().unwrap_or("?");
+                                    let uid = e["uid"].as_str().unwrap_or("?");
+                                    let n = e["note_count"].as_u64().unwrap_or(0);
+                                    eprintln!(
+                                        "    - {name} [instance: {instance}] uid={uid} ({n} notes)"
+                                    );
+                                }
+                                eprintln!(
+                                    "  This usually means brain add was run with different --instance values."
+                                );
+                                // Prefer the targeted remediation produced
+                                // by tool_brain_status when present, fall
+                                // back to the generic three-option guidance
+                                // for older daemon binaries.
+                                let cmds = w["remediation_commands"]
+                                    .as_array()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let hint = w["remediation_hint"].as_str().unwrap_or("");
+                                if !cmds.is_empty() {
+                                    if !hint.is_empty() {
+                                        eprintln!("  {hint}");
+                                    }
+                                    eprintln!("  Run:");
+                                    for c in &cmds {
+                                        if let Some(s) = c.as_str() {
+                                            eprintln!("      {s}");
+                                        }
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -6466,70 +6721,100 @@ fn run_brain(
             }
 
             if json {
-                #[derive(serde::Serialize)]
-                struct VaultDetail {
-                    name: String,
-                    root_path: String,
-                    note_count: usize,
-                    last_indexed: Option<String>,
-                }
-                #[derive(serde::Serialize)]
-                struct Status {
-                    db: String,
-                    vaults: usize,
-                    vault_details: Vec<VaultDetail>,
-                    notes: usize,
-                    headings: usize,
-                    sections: usize,
-                    tags: usize,
-                    wikilinks: usize,
-                    repos: usize,
-                    instance_ids: Vec<String>,
-                }
-                let vault_details: Vec<VaultDetail> = vaults
+                // Match the canonical schema emitted by `tool_brain_status`
+                // so daemon-routed and local (`--no-daemon`) callers parse
+                // identical shapes:
+                //   - `vaults` is an array of vault detail objects.
+                //   - `vault_count` is the total count.
+                //   - `repos` is an array of repo objects; `repo_count` the total.
+                // `vault_details` is preserved as an alias for `vaults` so
+                // scripts written against the previous local-only shape keep
+                // working through the deprecation window.
+                let vault_details: Vec<serde_json::Value> = vaults
                     .iter()
                     .map(|v| {
                         let vault_note_count =
                             store.list_notes(Some(&v.uid)).unwrap_or_default().len();
                         let last_indexed = resolve_last_indexed(db_path, &v.uid, &store);
-                        VaultDetail {
-                            name: v.name.clone(),
-                            root_path: v.root_path.clone(),
-                            note_count: vault_note_count,
-                            last_indexed,
-                        }
+                        serde_json::json!({
+                            "uid": v.uid,
+                            "instance_id": v.instance_id,
+                            "name": v.name,
+                            "root_path": v.root_path,
+                            "note_count": vault_note_count,
+                            "last_indexed": last_indexed,
+                        })
+                    })
+                    .collect();
+                let repo_details: Vec<serde_json::Value> = repos
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "url": r.url,
+                            "sha": r.indexed_sha,
+                            "instance_id": r.instance_id,
+                            "name": r.name,
+                        })
                     })
                     .collect();
                 let mut instance_ids: std::collections::BTreeSet<&str> =
                     vaults.iter().map(|v| v.instance_id.as_str()).collect();
                 instance_ids.extend(repos.iter().map(|r| r.instance_id.as_str()));
+                let instance_ids_json: Vec<String> =
+                    instance_ids.into_iter().map(|s| s.to_string()).collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&Status {
-                        db: db_path.display().to_string(),
-                        vaults: vaults.len(),
-                        vault_details,
-                        notes: note_count,
-                        headings: heading_count,
-                        sections: section_count,
-                        tags: tag_count,
-                        wikilinks: wikilink_count,
-                        repos: repos.len(),
-                        instance_ids: instance_ids.into_iter().map(|s| s.to_string()).collect(),
-                    })?
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "db": db_path.display().to_string(),
+                        "vaults": vault_details,
+                        "vault_count": vaults.len(),
+                        "vault_details": vault_details,
+                        "notes": note_count,
+                        "headings": heading_count,
+                        "sections": section_count,
+                        "tags": tag_count,
+                        "wikilinks": wikilink_count,
+                        "repos": repo_details,
+                        "repo_count": repos.len(),
+                        "instance_ids": instance_ids_json,
+                    }))?
                 );
             } else {
                 println!("Brain status:");
                 println!("  Database:  {}", db_path.display());
                 println!("  Vaults:    {}", vaults.len());
+                // When two rows share a name + root_path we surface
+                // `instance_id` so the user can tell them apart and target
+                // `brain remove --instance <id>` precisely. Empty-named
+                // rows (phantom registrations) are always annotated so they
+                // don't render as blank lines.
+                let mut name_counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for v in &vaults {
+                    *name_counts.entry(v.name.as_str()).or_insert(0) += 1;
+                }
                 for v in &vaults {
                     let vault_note_count = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
                     let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
                         .unwrap_or_else(|| "never".to_string());
-                    println!(
-                        "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
-                        v.name
-                    );
+                    let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
+                    let unnamed = v.name.is_empty();
+                    if ambiguous || unnamed {
+                        let display = if unnamed {
+                            format!("<unnamed: {}>", v.root_path)
+                        } else {
+                            v.name.clone()
+                        };
+                        println!(
+                            "    - {display} [instance: {}] ({vault_note_count} notes, last indexed: {last_indexed})",
+                            v.instance_id
+                        );
+                    } else {
+                        println!(
+                            "    - {} ({vault_note_count} notes, last indexed: {last_indexed})",
+                            v.name
+                        );
+                    }
                 }
                 println!("  Notes:     {note_count}");
                 println!("  Headings:  {heading_count}");
@@ -6538,14 +6823,20 @@ fn run_brain(
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
                 // Interaction tracking is opt-in (enabled via `mcp
-                // --track-interactions`). Its presence is indicated by an
-                // interaction sidecar; when absent, surface the hint.
+                // --track-interactions`). InteractionTracker::new touches
+                // the sidecar at startup so we can distinguish three states:
+                //   - file present + scores > 0  -> enabled, accumulating
+                //   - file present + scores == 0 -> enabled, no events yet
+                //   - file absent                -> disabled
                 match nestweaver_engine::load_interaction_data(db_path) {
-                    Some(data) => {
+                    Some(data) if !data.scores.is_empty() => {
                         println!(
                             "  interaction_tracking: enabled ({} nodes scored)",
                             data.scores.len()
                         );
+                    }
+                    Some(_) => {
+                        println!("  interaction_tracking: enabled (no events recorded yet)");
                     }
                     None => {
                         println!(
@@ -6558,29 +6849,39 @@ fn run_brain(
             // Warn when multiple vault UIDs map to the same canonical root
             // path — usually caused by brain add with mismatched --instance
             // or missing --config. This produces phantom 0-note vault rows.
-            let mut root_to_vaults: std::collections::HashMap<&str, Vec<&str>> =
-                std::collections::HashMap::new();
+            // Each entry surfaces name + instance_id + uid so the user can
+            // target `brain remove --instance <id>` precisely.
+            let mut root_to_vaults: std::collections::HashMap<
+                &str,
+                Vec<&nestweaver_schema::Vault>,
+            > = std::collections::HashMap::new();
             for v in &vaults {
                 root_to_vaults
                     .entry(v.root_path.as_str())
                     .or_default()
-                    .push(v.name.as_str());
+                    .push(v);
             }
-            for (root, names) in &root_to_vaults {
-                if names.len() > 1 {
+            for (root, rows) in &root_to_vaults {
+                if rows.len() > 1 {
                     eprintln!(
                         "Warning: {} vault entries share root path {}:",
-                        names.len(),
+                        rows.len(),
                         root
                     );
-                    eprintln!("  {}", names.join(", "));
+                    for v in rows {
+                        let n = store.list_notes(Some(&v.uid)).unwrap_or_default().len();
+                        eprintln!(
+                            "    - {} [instance: {}] uid={} ({} notes)",
+                            v.name, v.instance_id, v.uid, n
+                        );
+                    }
                     eprintln!(
                         "  This usually means brain add was run with different --instance values."
                     );
                     eprintln!(
-                        "  Fix with: nestweaver brain remove {root}\n  \
-                         Or:    nestweaver instance merge --from <old-id> --to <correct-id>\n  \
-                         Then:  nestweaver brain add {root}",
+                        "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
+                         Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
+                         Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>",
                     );
                 }
             }
@@ -7091,31 +7392,93 @@ fn run_brain(
 
         BrainCommands::Remove { path, instance, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            let instance_specified = instance.is_some();
             let instance_id = instance.as_deref().unwrap_or("default");
 
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let canon_str = canonical.to_string_lossy();
-            let v_uid = nestweaver_schema::vault_uid(instance_id, &canon_str);
+            let raw_str = path.to_string_lossy();
+            let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
+            let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
             let store = open_store(Some(&db_path))?;
 
-            // Collect all vault UIDs that should be removed:
-            // 1. The computed UID (normal case).
-            // 2. Any vault whose root_path matches, regardless of instance
-            //    (catches ghost rows left by buggy merges with wrong UIDs).
-            let mut uids_to_remove: Vec<String> = vec![v_uid];
-            if let Ok(all_vaults) = store.list_vaults(None) {
-                for v in &all_vaults {
-                    let v_canon = std::fs::canonicalize(&v.root_path)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| v.root_path.clone());
-                    if v_canon == *canon_str && !uids_to_remove.contains(&v.uid) {
-                        uids_to_remove.push(v.uid.clone());
+            // Helper: a stored vault matches the caller's path if any of its
+            // representations (canonical, literal, shell-expanded `~`)
+            // resolve to the same absolute path. `brain add` may have
+            // registered the vault with a literal `~/...` string (from a
+            // config file or programmatic call) while the caller of
+            // `brain remove` typically passes a shell-expanded absolute
+            // path. A naive `vault_uid` lookup misses these cases even
+            // though `brain status` clearly shows the row.
+            let home = std::env::var("HOME").ok();
+            let path_matches = |stored: &str| -> bool {
+                if stored == canon_str || stored == raw_str {
+                    return true;
+                }
+                let stored_canon = std::fs::canonicalize(stored)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| stored.to_string());
+                if stored_canon == *canon_str {
+                    return true;
+                }
+                if let (Some(h), Some(rest)) = (home.as_deref(), stored.strip_prefix("~/")) {
+                    let expanded = format!("{h}/{rest}");
+                    if expanded == *canon_str {
+                        return true;
+                    }
+                    if let Ok(c) = std::fs::canonicalize(&expanded)
+                        && c.to_string_lossy() == *canon_str
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+
+            // If the caller passed `--instance`, treat it as a precise
+            // selector. If the direct vault_uid lookup misses (path
+            // stored under a non-canonical form like a literal `~/...`),
+            // fall back to a list-scan scoped to the requested instance
+            // before failing.
+            //
+            // If `--instance` is absent, fall back to the historical
+            // ghost-row cleanup behavior: remove the default-UID row
+            // plus any other row whose canonical root_path matches.
+            let mut uids_to_remove: Vec<String> = Vec::new();
+            if instance_specified {
+                if store.lookup_vault(&v_uid_canon).is_ok() {
+                    uids_to_remove.push(v_uid_canon);
+                } else if store.lookup_vault(&v_uid_raw).is_ok() {
+                    uids_to_remove.push(v_uid_raw);
+                } else if let Ok(all_vaults) = store.list_vaults(Some(instance_id)) {
+                    for v in &all_vaults {
+                        if path_matches(&v.root_path) {
+                            uids_to_remove.push(v.uid.clone());
+                        }
+                    }
+                }
+                if uids_to_remove.is_empty() {
+                    eprintln!(
+                        "Error: no vault with instance '{instance_id}' found at {canon_str}.\n  \
+                         Run `nestweaver brain status` to see registered vaults and their instance ids,\n  \
+                         then re-run with the correct --instance (or omit --instance to clean up every row at this path)."
+                    );
+                    return Ok((EXIT_NOT_FOUND, None));
+                }
+            } else {
+                uids_to_remove.push(v_uid_canon);
+                if let Ok(all_vaults) = store.list_vaults(None) {
+                    for v in &all_vaults {
+                        if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
+                            uids_to_remove.push(v.uid.clone());
+                        }
                     }
                 }
             }
 
             let mut total_dropped = 0usize;
+            let mut rows_cleaned = 0usize;
             let mut vault_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -7125,17 +7488,26 @@ fn run_brain(
                 if let Ok(v) = store.lookup_vault(uid) {
                     vault_name = v.name;
                 }
-                if let Ok(n) = store.delete_vault_cascade(uid) {
-                    total_dropped += n;
+                match store.delete_vault_cascade(uid) {
+                    Ok(n) => {
+                        total_dropped += n;
+                        rows_cleaned += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Error: failed to remove vault '{uid}': {e}.\n  \
+                             If a daemon is running it may be holding the write lock; \
+                             stop it with `nestweaver daemon stop` and retry."
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
                 }
             }
             println!(
                 "Removed vault '{}' ({} note(s) dropped, {} row(s) cleaned). \
                  Tantivy + PPR sidecars may be stale; run \
                  `nestweaver brain reindex-search` if you want to clear them too.",
-                vault_name,
-                total_dropped,
-                uids_to_remove.len()
+                vault_name, total_dropped, rows_cleaned
             );
             Ok((EXIT_SUCCESS, None))
         }
@@ -7489,13 +7861,30 @@ fn run_brain(
             root,
             prf,
             rerank,
+            intent,
+            no_tests,
+            prefer_instance,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
 
+            // Parse the optional --intent override into a `QueryIntent`.
+            // Surface invalid values as a CLI error rather than silently
+            // ignoring (mirrors `nestweaver context --intent`).
+            let parsed_intent: Option<QueryIntent> = intent
+                .as_deref()
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
+
             // Route through daemon's GetContext RPC when available and no
-            // flags require direct-disk processing.
+            // flags require direct-disk processing. `--no-tests` and
+            // `--prefer-instance` are applied client-side and the daemon
+            // proto does not yet carry them, so fall through to the local
+            // path when either is set.
             if use_daemon
                 && since.is_none()
+                && !no_tests
+                && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
             {
                 let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
@@ -7515,7 +7904,9 @@ fn run_brain(
                         exclude_tags: exclude_tags.clone(),
                         weight_ppr: weight_ppr.unwrap_or(0.0),
                         weight_bm25: weight_bm25.unwrap_or(0.0),
-                        intent: String::new(),
+                        // Pass the parsed --intent through to the daemon
+                        // (empty string = auto-detect on the server).
+                        intent: intent.clone().unwrap_or_default(),
                         include_seeds: true,
                         include_bodies: inline_bodies,
                         root: root
@@ -7591,16 +7982,27 @@ fn run_brain(
                     .unwrap_or(false);
 
             // RFC #6: build custom HybridSearchConfig from optional CLI flags.
+            // Finding #7: thread `[seed_resolution]` (with backward-compat
+            // shim for legacy `[ranking].test_path_patterns`) from the
+            // instance config into the search config so user overrides reach
+            // `search_symbols_by_name` at seed resolution.
             let defaults = HybridSearchConfig::default();
+            let configured_seed_resolution =
+                instance_cfg.as_ref().map(|c| c.seed_resolution.clone());
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
                 weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
                 prf: prf_enabled,
+                seed_resolution: configured_seed_resolution
+                    .unwrap_or_else(|| defaults.seed_resolution.clone()),
                 ..defaults
             };
 
             let aliases = load_alias_sidecar(&db_path);
+            // Thread the parsed `--intent` override (if any) into the PPR
+            // engine. None → engine auto-detects from seed kinds, matching
+            // historical behavior.
             match build_brain_context_hybrid_with_aliases(
                 &store,
                 &seeds,
@@ -7608,7 +8010,7 @@ fn run_brain(
                 &config,
                 &aliases,
                 Some(&db_path),
-                None,
+                parsed_intent,
             ) {
                 Ok(mut result) => {
                     // Feature F6: apply per-path ranking priors (dampen/boost)
@@ -7657,6 +8059,52 @@ fn run_brain(
                     };
                     apply_filters(&mut result.seeds);
                     apply_filters(&mut result.connected);
+
+                    // `--no-tests`: drop rows whose location matches any
+                    // configured seed-resolution path rule (prefix or
+                    // suffix). Distinct from the soft deboost the ranking
+                    // pass already applied — this removes the rows entirely
+                    // so a strict-prod caller never sees them.
+                    if no_tests {
+                        let rules = &config.seed_resolution.path_deboost;
+                        if !rules.is_empty() {
+                            let is_test_path = |loc: &str| -> bool {
+                                let lower = loc.to_lowercase();
+                                rules.iter().any(|r| match (&r.prefix, &r.suffix) {
+                                    (Some(prefix), None) => {
+                                        let needle = prefix.trim_start_matches('/').to_lowercase();
+                                        !needle.is_empty() && lower.contains(&needle)
+                                    }
+                                    (None, Some(suffix)) => loc.ends_with(suffix.as_str()),
+                                    _ => false,
+                                })
+                            };
+                            let drop_tests = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                                nodes.retain(|n| !is_test_path(&n.location));
+                            };
+                            drop_tests(&mut result.seeds);
+                            drop_tests(&mut result.connected);
+                        }
+                    }
+
+                    // `--prefer-instance <id>`: scope ranking to a single
+                    // instance_id. UIDs encode the owning instance as a
+                    // delimited segment: `note:vlt:<inst>:<hash>:...`,
+                    // `sym:repo:<inst>:<hash>:...`, `repo:<inst>:<hash>`,
+                    // etc. Matching on `:<inst>:` is robust to a partially-
+                    // merged DB where some symbol UIDs still encode the
+                    // pre-merge repo UID — both the old and new forms still
+                    // carry an `:<inst>:` segment that uniquely identifies
+                    // the instance, and the leading and trailing colons
+                    // prevent accidental substring collisions with hashes.
+                    if let Some(ref target) = prefer_instance {
+                        let needle = format!(":{target}:");
+                        let filter_inst = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                            nodes.retain(|n| n.uid.contains(needle.as_str()));
+                        };
+                        filter_inst(&mut result.seeds);
+                        filter_inst(&mut result.connected);
+                    }
 
                     // tags filter: keep only note/section nodes tagged with any of these.
                     if !tags.is_empty() {
@@ -8521,6 +8969,53 @@ fn render_brain_search_response(
     Ok(())
 }
 
+/// Render the daemon's `project_context` JSON response (shape produced by
+/// `tool_project_context` in nestweaver-mcp). When `json` is true, emit the
+/// response verbatim; otherwise print a project header followed by the
+/// connected nodes.
+fn render_project_context_daemon_response(
+    value: &serde_json::Value,
+    json: bool,
+    token_budget: usize,
+) {
+    if json {
+        match serde_json::to_string_pretty(value) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("warning: failed to serialize daemon response: {e}"),
+        }
+        return;
+    }
+    let project = value.get("project").and_then(|v| v.as_str()).unwrap_or("");
+    let project_uid = value
+        .get("project_uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let used = value
+        .get("tokens_used")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    println!("Project: {project}  ({project_uid})");
+    if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
+        println!("  {note}");
+    }
+    println!();
+    let empty = vec![];
+    let connected = value
+        .get("connected")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    println!("Connected ({} item(s)):", connected.len());
+    for n in connected {
+        let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let location = n.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let rel = n.get("relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        println!("  [{rel:.4}] {kind}  {title}  @{location}");
+    }
+    println!();
+    println!("Tokens used: {used} / budget: {token_budget}");
+}
+
 fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow::Result<()> {
     let mut resp = serde_json::json!({
         "seeds_expanded": result.seeds.len(),
@@ -8536,6 +9031,40 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
         resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
     }
 
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+/// Render the `project-context` JSON for the local (--no-daemon) path with
+/// the same wrapper shape the daemon / MCP `project_context` tool emits:
+/// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
+/// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
+/// depend on these fields, so the local and daemon paths must stay aligned.
+fn print_project_context_json(
+    project: &nestweaver_schema::Project,
+    result: &BrainContextResult,
+    limit: usize,
+    tokens_used: usize,
+    token_budget: usize,
+    external_refs: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut resp = serde_json::json!({
+        "project": project.name,
+        "project_uid": project.uid,
+        "seeds_expanded": result.seeds.len(),
+        "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "tokens_used": tokens_used,
+        "token_budget": token_budget,
+    });
+    if !result.unresolved_seeds.is_empty() {
+        resp["unresolved_seeds"] = serde_json::json!(result.unresolved_seeds);
+    }
+    if !result.expansion_terms.is_empty() {
+        resp["expansion_terms"] = serde_json::json!(result.expansion_terms);
+    }
+    if !external_refs.is_null() {
+        resp["external_refs"] = external_refs.clone();
+    }
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
@@ -8742,11 +9271,52 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             }
             Ok(EXIT_SUCCESS)
         }
-        InstanceCommands::Remove { id } => {
+        InstanceCommands::Remove {
+            id,
+            purge_graph,
+            db,
+        } => {
             let mut registry =
                 nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
-            registry.remove(&id)?;
-            println!("Removed instance '{id}'");
+            let registry_removed = match registry.remove(&id) {
+                Ok(()) => true,
+                Err(e) => {
+                    // With --purge-graph we tolerate a missing registry
+                    // entry so ghost instances (left by a misconfigured
+                    // merge) can still be cleaned out of the graph.
+                    if purge_graph {
+                        eprintln!("Note: {e}; continuing with graph purge");
+                        false
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            if registry_removed {
+                println!("Removed instance '{id}' from registry");
+            }
+            if purge_graph {
+                let db_path = db.unwrap_or_else(default_db_path);
+                let store = open_store(Some(&db_path))?;
+                let r = store.purge_instance(&id).map_err(|e| anyhow::anyhow!(e))?;
+                let total = r.repos
+                    + r.files
+                    + r.symbols
+                    + r.vaults
+                    + r.notes
+                    + r.projects
+                    + r.orphans_swept;
+                if total == 0 {
+                    println!("No graph rows found for instance '{id}' — database is clean.");
+                } else {
+                    println!(
+                        "Purged instance '{id}' from graph: {} repo(s), \
+                         {} file(s), {} symbol(s), {} vault(s), {} note(s), \
+                         {} project(s), {} orphan(s)",
+                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects, r.orphans_swept
+                    );
+                }
+            }
             Ok(EXIT_SUCCESS)
         }
         InstanceCommands::Pull { id } => {

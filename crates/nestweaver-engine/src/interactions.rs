@@ -152,7 +152,20 @@ impl InteractionTracker {
     ///
     /// A random session ID is generated automatically.  Events are
     /// auto-flushed when the in-memory buffer reaches 50 entries.
+    /// Touches the sidecar file (creating an empty store if absent) so
+    /// downstream `brain status` reads can distinguish "tracking enabled
+    /// but no events yet" from "tracking disabled".
     pub fn new(db_path: &Path) -> Self {
+        let path = interaction_sidecar_path(db_path);
+        if !path.exists()
+            && let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+        {
+            let empty = InteractionStore::default();
+            if let Ok(text) = serde_json::to_string(&empty) {
+                let _ = std::fs::write(&path, text);
+            }
+        }
         Self {
             db_path: db_path.to_path_buf(),
             events: Mutex::new(Vec::new()),

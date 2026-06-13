@@ -1,11 +1,53 @@
 use std::collections::{HashMap, VecDeque};
 
+use nestweaver_schema::SymbolKind;
+
 use crate::db::GraphStore;
 use crate::error::StoreError;
+use crate::ranking::{PathDeboostRule, SeedResolutionConfig};
 
-fn is_test_path(path: &str, patterns: &[String]) -> bool {
-    let p = path.to_lowercase();
-    patterns.iter().any(|pat| p.contains(pat.as_str()))
+/// Compute the multiplicative path-factor for a symbol's `file_path` against
+/// a list of [`PathDeboostRule`]s. Matching rules multiply; factor=1.0 when
+/// no rule matches.
+///
+/// Prefixes are matched case-insensitively against the (`/`-prepended,
+/// lowercased) haystack so patterns like `/playwright/`, `/cypress/`, and
+/// `/__tests__/` anchor on the first directory segment of a repo-relative
+/// path (`playwright/components/Foo.tsx` → matched; `myplaywright/...` → not).
+///
+/// Suffixes are matched case-sensitively against the raw `file_path`
+/// (suffix rules like `.test.ts` rely on conventional extensions).
+fn compute_path_factor(file_path: &str, rules: &[PathDeboostRule]) -> f64 {
+    let mut prepended = String::with_capacity(file_path.len() + 1);
+    prepended.push('/');
+    prepended.push_str(&file_path.to_lowercase());
+    let mut factor = 1.0_f64;
+    for rule in rules {
+        let matched = match (&rule.prefix, &rule.suffix) {
+            (Some(prefix), None) => prepended.contains(prefix.as_str()),
+            (None, Some(suffix)) => file_path.ends_with(suffix.as_str()),
+            // Invalid rule shapes are rejected at config-load time, so by
+            // the time we get here a rule is guaranteed to have exactly one
+            // of {prefix, suffix} set. Be tolerant in the store layer just
+            // in case (skip the rule).
+            _ => false,
+        };
+        if matched {
+            factor *= rule.factor;
+        }
+    }
+    factor
+}
+
+/// Index of `kind` in the user-defined `kind_priority` list (lower = higher
+/// priority). Returns `usize::MAX` for kinds not present in the list, which
+/// effectively pushes them to the bottom of any kind-based tiebreak.
+fn kind_rank(kind: SymbolKind, kind_priority: &[String]) -> usize {
+    let name = kind.as_str();
+    kind_priority
+        .iter()
+        .position(|k| k == name)
+        .unwrap_or(usize::MAX)
 }
 
 /// Cached result of a full symbol table scan, keyed on `graph_generation`.
@@ -233,11 +275,21 @@ impl GraphStore {
     /// The full symbol table is loaded once per `graph_generation` and cached in
     /// `symbol_name_cache`. Subsequent calls within the same generation skip the
     /// DB round-trip entirely and filter the in-memory list.
+    ///
+    /// Candidates are scored by:
+    /// 1. **Name quality** — exact (`4.0`), prefix (`2.0`), or contains (`1.0`).
+    /// 2. **Path factor** — multiplicative `[seed_resolution].path_deboost`
+    ///    rules (defaults target JS/TS test mirrors like `playwright/`,
+    ///    `__tests__/`, `*.test.ts`).
+    /// 3. **Kind priority** — ties broken by `[seed_resolution].kind_priority`
+    ///    so `Class` outranks `Property` of the same lowercased name.
+    /// 4. **File path** — final tiebreaker, lexicographic ascending, for
+    ///    deterministic stability across calls.
     pub fn search_symbols_by_name(
         &self,
         query: &str,
         limit: usize,
-        test_path_patterns: &[String],
+        seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
         let cur_gen = self.graph_generation();
@@ -306,31 +358,41 @@ impl GraphStore {
         };
 
         // --- Step 3: filter and rank the in-memory list ----------------------
-        // Collect all substring matches, rank by name quality and path, then
-        // take the top `limit`. This prevents test/playwright files from
-        // dominating when a PascalCase name also appears in production code.
-        let mut matches: Vec<(u8, &nestweaver_schema::Symbol)> = Vec::new();
+        // Collect all substring matches, score by name quality × path factor,
+        // then take the top `limit` by descending adjusted score with
+        // kind-priority + file-path tiebreaks. This prevents test/playwright
+        // files from dominating when a PascalCase name also appears in
+        // production code, and gives a deterministic order across calls.
+        let mut candidates: Vec<(f64, &nestweaver_schema::Symbol)> = Vec::new();
         for (lower, sym) in &entry.symbols {
             if !lower.contains(&needle) {
                 continue;
             }
-            let name_rank = if *lower == needle {
-                0 // exact
+            let base_score = if *lower == needle {
+                4.0_f64 // exact
             } else if lower.starts_with(&needle) {
-                1 // prefix
+                2.0_f64 // prefix
             } else {
-                2 // contains
+                1.0_f64 // contains
             };
-            let path_rank = if is_test_path(&sym.file_path, test_path_patterns) {
-                1u8
-            } else {
-                0u8
-            };
-            let rank = name_rank * 2 + path_rank;
-            matches.push((rank, sym));
+            let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
+            let adjusted = base_score * path_factor;
+            candidates.push((adjusted, sym));
         }
-        matches.sort_by_key(|(rank, _)| *rank);
-        Ok(matches
+        candidates.sort_by(|(a_score, a_sym), (b_score, b_sym)| {
+            // 1) adjusted DESC
+            b_score
+                .partial_cmp(a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // 2) kind_priority ASC (lower index = higher priority)
+                .then_with(|| {
+                    kind_rank(a_sym.kind, &seed_resolution.kind_priority)
+                        .cmp(&kind_rank(b_sym.kind, &seed_resolution.kind_priority))
+                })
+                // 3) file_path lexicographic ASC for deterministic stability
+                .then_with(|| a_sym.file_path.cmp(&b_sym.file_path))
+        });
+        Ok(candidates
             .into_iter()
             .take(limit)
             .map(|(_, sym)| sym.clone())
@@ -342,7 +404,9 @@ impl GraphStore {
 mod tests {
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
+    use super::{compute_path_factor, kind_rank};
     use crate::db::GraphStore;
+    use crate::ranking::{PathDeboostRule, SeedResolutionConfig, default_kind_priority};
 
     fn make_symbol(uid: &str, name: &str) -> Symbol {
         Symbol {
@@ -366,6 +430,15 @@ mod tests {
         }
     }
 
+    /// Convenience: empty [`SeedResolutionConfig`] for legacy cache tests
+    /// where path/kind ranking is irrelevant.
+    fn no_rules() -> SeedResolutionConfig {
+        SeedResolutionConfig {
+            path_deboost: Vec::new(),
+            kind_priority: Vec::new(),
+        }
+    }
+
     /// Verify that `search_symbols_by_name` returns consistent results across
     /// two calls and that the second call is served from the cache.
     #[test]
@@ -377,11 +450,15 @@ mod tests {
         store.insert_symbol(&make_symbol("s3", "BazBaz")).unwrap();
 
         // First call — cache miss, queries DB.
-        let first = store.search_symbols_by_name("foo", 10, &[]).unwrap();
+        let first = store
+            .search_symbols_by_name("foo", 10, &no_rules())
+            .unwrap();
         assert_eq!(first.len(), 2, "expected FooBar and FooQux");
 
         // Second call — should hit the cache. Results must be identical.
-        let second = store.search_symbols_by_name("foo", 10, &[]).unwrap();
+        let second = store
+            .search_symbols_by_name("foo", 10, &no_rules())
+            .unwrap();
         assert_eq!(second.len(), 2, "cached call must return the same count");
 
         // The UIDs returned by both calls must be the same set.
@@ -410,7 +487,9 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         store.insert_symbol(&make_symbol("s1", "Alpha")).unwrap();
 
-        let first = store.search_symbols_by_name("alpha", 10, &[]).unwrap();
+        let first = store
+            .search_symbols_by_name("alpha", 10, &no_rules())
+            .unwrap();
         assert_eq!(first.len(), 1);
 
         // Simulate a reindex bump.
@@ -422,7 +501,9 @@ mod tests {
             .insert_symbol(&make_symbol("s2", "AlphaBeta"))
             .unwrap();
 
-        let second = store.search_symbols_by_name("alpha", 10, &[]).unwrap();
+        let second = store
+            .search_symbols_by_name("alpha", 10, &no_rules())
+            .unwrap();
         assert_eq!(
             second.len(),
             2,
@@ -430,32 +511,182 @@ mod tests {
         );
     }
 
+    // ── Finding #7 — seed_resolution scoring + kind tiebreak ────────────
+
     #[test]
-    fn search_symbols_respects_custom_test_patterns() {
+    fn path_factor_with_no_rules_is_one() {
+        assert!((compute_path_factor("playwright/foo.ts", &[]) - 1.0).abs() < 1e-9);
+        assert!((compute_path_factor("src/main.rs", &[]) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_factor_applies_prefix_rule() {
+        let rules = vec![PathDeboostRule {
+            prefix: Some("/playwright/".into()),
+            suffix: None,
+            factor: 0.2,
+        }];
+        assert!((compute_path_factor("playwright/pages/foo.ts", &rules) - 0.2).abs() < 1e-9);
+        // Non-matching path is untouched.
+        assert!((compute_path_factor("src/main.rs", &rules) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_factor_applies_suffix_rule() {
+        let rules = vec![PathDeboostRule {
+            prefix: None,
+            suffix: Some(".test.ts".into()),
+            factor: 0.5,
+        }];
+        assert!((compute_path_factor("src/foo.test.ts", &rules) - 0.5).abs() < 1e-9);
+        // Suffix is case-sensitive on the raw file_path.
+        assert!((compute_path_factor("src/foo.TEST.ts", &rules) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_factor_multiplies_when_both_match() {
+        let rules = vec![
+            PathDeboostRule {
+                prefix: Some("/playwright/".into()),
+                suffix: None,
+                factor: 0.2,
+            },
+            PathDeboostRule {
+                prefix: None,
+                suffix: Some(".test.ts".into()),
+                factor: 0.5,
+            },
+        ];
+        // 0.2 * 0.5 = 0.1
+        assert!((compute_path_factor("playwright/foo.test.ts", &rules) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_factor_case_insensitive_for_prefix() {
+        let rules = vec![PathDeboostRule {
+            prefix: Some("/playwright/".into()),
+            suffix: None,
+            factor: 0.2,
+        }];
+        assert!((compute_path_factor("Playwright/Pages/Foo.ts", &rules) - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_prefers_class_over_property_on_same_name_when_paths_match_evenly() {
         let store = GraphStore::in_memory().unwrap();
 
-        // Production symbol
-        let mut prod = make_symbol("sym-prod", "MyComponent");
-        prod.file_path = "src/components/MyComponent.tsx".to_string();
+        let mut class_sym = make_symbol("sym-class", "MyWidget");
+        class_sym.kind = SymbolKind::Class;
+        class_sym.file_path = "src/main.ts".to_string();
+        store.insert_symbol(&class_sym).unwrap();
+
+        let mut prop_sym = make_symbol("sym-prop", "myWidget");
+        prop_sym.kind = SymbolKind::Property;
+        prop_sym.file_path = "src/helpers.ts".to_string();
+        store.insert_symbol(&prop_sym).unwrap();
+
+        // Default kind_priority puts Class above Property; neither path
+        // matches any deboost rule (no /test/ etc. segment).
+        let cfg = SeedResolutionConfig {
+            path_deboost: Vec::new(),
+            kind_priority: default_kind_priority(),
+        };
+        let results = store.search_symbols_by_name("mywidget", 10, &cfg).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].uid, "sym-class",
+            "Class must outrank Property under default kind_priority"
+        );
+    }
+
+    #[test]
+    fn search_prefers_production_over_playwright_for_same_lowercased_name() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut prod = make_symbol("sym-prod", "MyWidget");
+        prod.kind = SymbolKind::Class;
+        prod.file_path = "src/components/MyWidget.tsx".to_string();
         store.insert_symbol(&prod).unwrap();
 
-        // Cypress test symbol
-        let mut test_sym = make_symbol("sym-test", "MyComponent");
-        test_sym.file_path = "cypress/e2e/MyComponent.cy.ts".to_string();
-        store.insert_symbol(&test_sym).unwrap();
+        for (i, p) in [
+            "playwright/components/MyWidget.spec.ts",
+            "playwright/regression/MyWidget.spec.ts",
+            "playwright/smoke/MyWidget.spec.ts",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut s = make_symbol(&format!("sym-pw-{i}"), "MyWidget");
+            s.kind = SymbolKind::Class;
+            s.file_path = (*p).to_string();
+            store.insert_symbol(&s).unwrap();
+        }
 
-        // With custom patterns: prod ranks first (cypress/ is deboosted)
-        let defaults = vec!["/cypress/".to_string(), ".cy.".to_string()];
-        let results = store
-            .search_symbols_by_name("MyComponent", 10, &defaults)
-            .unwrap();
-        assert_eq!(results[0].file_path, "src/components/MyComponent.tsx");
+        // With default deboost: prod = 4.0*1.0 = 4.0, playwright = 4.0*0.2 = 0.8.
+        let cfg = SeedResolutionConfig::default();
+        let results = store.search_symbols_by_name("MyWidget", 10, &cfg).unwrap();
+        assert_eq!(
+            results[0].file_path, "src/components/MyWidget.tsx",
+            "production code must outrank playwright/ tests under default deboost"
+        );
+    }
 
-        // With empty patterns: no deboost, both rank equally by name
-        let results = store
-            .search_symbols_by_name("MyComponent", 10, &[])
-            .unwrap();
-        // Both should be present, order is by insertion (no path ranking)
+    #[test]
+    fn search_kind_priority_overridden_by_config() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut class_sym = make_symbol("sym-class", "MyWidget");
+        class_sym.kind = SymbolKind::Class;
+        class_sym.file_path = "src/main.ts".to_string();
+        store.insert_symbol(&class_sym).unwrap();
+
+        let mut prop_sym = make_symbol("sym-prop", "myWidget");
+        prop_sym.kind = SymbolKind::Property;
+        prop_sym.file_path = "src/helpers.ts".to_string();
+        store.insert_symbol(&prop_sym).unwrap();
+
+        // Override kind_priority so Property wins (override is full list,
+        // not append). Paths factor in evenly.
+        let cfg = SeedResolutionConfig {
+            path_deboost: Vec::new(),
+            kind_priority: vec![
+                "Property".into(),
+                "Class".into(),
+                "Interface".into(),
+                "TypeAlias".into(),
+                "Method".into(),
+                "Function".into(),
+                "Constant".into(),
+                "Variable".into(),
+                "Module".into(),
+                "Enum".into(),
+                "Trait".into(),
+                "Extension".into(),
+            ],
+        };
+        let results = store.search_symbols_by_name("mywidget", 10, &cfg).unwrap();
         assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].uid, "sym-prop",
+            "Property must win when kind_priority places it first"
+        );
+    }
+
+    // ── kind_rank sanity ────────────────────────────────────────────────
+
+    #[test]
+    fn kind_rank_returns_index_for_known_kinds() {
+        let priority = default_kind_priority();
+        assert_eq!(kind_rank(SymbolKind::Class, &priority), 0);
+        assert!(
+            kind_rank(SymbolKind::Property, &priority) > kind_rank(SymbolKind::Class, &priority)
+        );
+    }
+
+    #[test]
+    fn kind_rank_returns_max_for_kinds_missing_from_priority() {
+        let priority = vec!["Class".to_string()];
+        assert_eq!(kind_rank(SymbolKind::Class, &priority), 0);
+        assert_eq!(kind_rank(SymbolKind::Function, &priority), usize::MAX);
     }
 }
