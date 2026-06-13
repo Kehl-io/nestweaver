@@ -1282,6 +1282,9 @@ enum DaemonAction {
         /// parity to the direct-disk CLI path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Hidden: redirect users who pass this flag here to the correct command.
+        #[arg(long, hide = true)]
+        track_interactions: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -5395,7 +5398,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 DaemonAction::Start {
                     idle_timeout,
                     config,
+                    track_interactions,
                 } => {
+                    if track_interactions {
+                        eprintln!(
+                            "note: --track-interactions is an MCP flag, not a daemon flag. \
+                             Use: nestweaver mcp --track-interactions"
+                        );
+                    }
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
