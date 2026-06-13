@@ -576,17 +576,20 @@ fn record_interaction(
     result: &Value,
 ) {
     match name {
-        "brain_context" | "brain_search" | "project_context" => {
+        "brain_context" | "brain_search" | "project_context"
+        | "investigate" | "investigate_expand" | "investigate_hydrate" => {
             let seeds = extract_string_array(arguments, "seeds");
             let results = extract_result_uids(result);
             tracker.record_query(name, &seeds, &results);
         }
-        "note_get" | "backlinks" | "get_summary" => {
+        "note_get" | "backlinks" | "get_summary" | "read_symbols"
+        | "hub_nodes" | "bridge_nodes" | "clusters" => {
             if let Some(uid) = arguments.get("uid").and_then(|v| v.as_str()) {
                 tracker.record_access(name, uid);
             }
         }
-        "brain_impact" | "blast_radius" => {
+        "brain_impact" | "blast_radius" | "affected_tests"
+        | "dead_code" | "flow_trace" => {
             let seeds = extract_string_array(arguments, "seeds");
             tracker.record_impact(name, &seeds);
         }
