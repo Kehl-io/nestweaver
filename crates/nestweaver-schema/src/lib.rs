@@ -7,7 +7,7 @@ pub mod uid;
 pub mod version;
 
 pub use confidence::{Language, MatchType, confidence_score};
-pub use edges::{CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge};
+pub use edges::{ALL_SYMBOL_EDGE_TYPES, CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge};
 pub use nodes::{
     Contract, EntryPointKind, File, FrameworkHint, Heading, Note, NoteKind, Project, Repo,
     ResolvedType, Section, Service, Symbol, SymbolKind, Tag, TypeInfo, Vault, Visibility,

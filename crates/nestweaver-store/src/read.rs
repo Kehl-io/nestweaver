@@ -1146,16 +1146,10 @@ impl GraphStore {
             });
         }
 
-        let edge_types = [
-            "CALLS",
-            "IMPORTS",
-            "EXTENDS_SYM",
-            "IMPLEMENTS_SYM",
-            "USES",
-            "ACCESSES",
-            "MEMBER_OF",
-            "INCLUDES_SYM",
-        ];
+        let edge_types: Vec<&str> = nestweaver_schema::ALL_SYMBOL_EDGE_TYPES
+            .iter()
+            .map(|et| et.rel_table_name())
+            .collect();
         let mut edges: Vec<(String, String, f64)> = Vec::new();
         for et in &edge_types {
             let q =
@@ -1187,16 +1181,10 @@ impl GraphStore {
     pub fn load_typed_edges(&self) -> Result<Vec<TypedEdge>, StoreError> {
         let conn = self.conn()?;
 
-        let edge_types = [
-            "CALLS",
-            "IMPORTS",
-            "EXTENDS_SYM",
-            "IMPLEMENTS_SYM",
-            "USES",
-            "ACCESSES",
-            "MEMBER_OF",
-            "INCLUDES_SYM",
-        ];
+        let edge_types: Vec<&str> = nestweaver_schema::ALL_SYMBOL_EDGE_TYPES
+            .iter()
+            .map(|et| et.rel_table_name())
+            .collect();
         let mut edges: Vec<(String, String, String, f64, String)> = Vec::new();
         for et in &edge_types {
             let q = format!(
