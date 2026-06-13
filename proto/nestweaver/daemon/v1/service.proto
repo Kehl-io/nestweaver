@@ -173,6 +173,10 @@ message BrainContextRequest {
   string root = 15;
   bool prf = 16;
   bool rerank = 17;
+  double weight_semantic = 18;
+  string since = 19;
+  double recency_weight = 20;
+  double recency_half_life_days = 21;
 }
 message BrainContextResponse { string result_json = 1; }
 

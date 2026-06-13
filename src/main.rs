@@ -8118,7 +8118,6 @@ fn run_brain(
             // proto does not yet carry them, so fall through to the local
             // path when either is set.
             if use_daemon
-                && since.is_none()
                 && !no_tests
                 && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
@@ -8152,6 +8151,10 @@ fn run_brain(
                             .to_string(),
                         prf,
                         rerank,
+                        weight_semantic: weight_semantic.unwrap_or(0.0),
+                        since: since.as_deref().unwrap_or("").to_string(),
+                        recency_weight,
+                        recency_half_life_days,
                     };
                     let rpc = rt.block_on(async {
                         client
