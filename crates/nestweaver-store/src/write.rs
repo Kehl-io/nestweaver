@@ -2582,6 +2582,29 @@ impl GraphStore {
                 .collect()
         };
 
+        // Capture section-tag edges before cascade destroys them.
+        let section_tag_edges: Vec<(String, String)> = {
+            let conn = self.conn()?;
+            let q = "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section)-[:SECTION_TAGGED_WITH]->(t:Tag) \
+                     RETURN s.uid, t.uid";
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(format!("prepare section_tag edges: {e}")))?;
+            let result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(old_vault_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute section_tag edges: {e}")))?;
+            result
+                .filter_map(|row| {
+                    let suid = crate::read::extract_string(&row, 0).ok()?;
+                    let tuid = crate::read::extract_string(&row, 1).ok()?;
+                    Some((suid, tuid))
+                })
+                .collect()
+        };
+
         let result = ReparentVaultResult {
             notes_migrated: notes.len(),
             headings_migrated: headings.len(),
@@ -2667,6 +2690,15 @@ impl GraphStore {
             .collect();
         if !nt_edges.is_empty() {
             self.batch_insert_note_tag_edges(&nt_edges)?;
+        }
+
+        // Re-create SECTION_TAGGED_WITH edges.
+        let st_edges: Vec<(&str, &str)> = section_tag_edges
+            .iter()
+            .map(|(suid, tuid)| (suid.as_str(), tuid.as_str()))
+            .collect();
+        if !st_edges.is_empty() {
+            self.batch_insert_section_tag_edges(&st_edges)?;
         }
 
         Ok(result)
