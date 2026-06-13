@@ -1522,6 +1522,61 @@ impl GraphStore {
             .collect())
     }
 
+    /// Return up to `limit` Symbol UIDs from a project, ranked by PageRank descending.
+    ///
+    /// Used by `project-context` to seed PPR with the architecturally
+    /// important symbols. Seeding them directly is the only way for member
+    /// symbols to survive the `min_score` filter — a project that declares
+    /// many repos fans out across tens of thousands of
+    /// `PROJECT_INCLUDES_SYMBOL` edges, leaving each individual symbol below
+    /// threshold when only the project node is seeded.
+    pub fn list_project_symbol_uids_by_pagerank(
+        &self,
+        project_uid: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn()?;
+        let q = "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) \
+                 RETURN s.uid, s.pagerank_score \
+                 ORDER BY s.pagerank_score DESC \
+                 LIMIT $limit";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_symbol_uids_by_pagerank: query skipped \
+                     (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![
+                ("uid", Value::String(project_uid.to_string())),
+                ("limit", Value::Int64(limit as i64)),
+            ],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    "list_project_symbol_uids_by_pagerank: query skipped \
+                     (table may not exist): {e}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        Ok(result
+            .filter_map(|row| match row.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// List component Project UIDs that belong to a project via PROJECT_HAS_COMPONENT edges.
     pub fn list_project_component_uids(
         &self,
