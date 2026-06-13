@@ -2402,9 +2402,15 @@ impl GraphStore {
     /// Migrate all child nodes (notes, headings, sections, tags) from one
     /// vault to a new vault with a different UID and instance_id. The old
     /// vault is cascade-deleted and a new vault is created in its place,
-    /// preserving all content.
+    /// preserving all node data and structural edges (NOTE_HAS_HEADING,
+    /// NOTE_HAS_SECTION, NOTE_TAGGED_WITH, SECTION_TAGGED_WITH).
     ///
-    /// This uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
+    /// Cross-domain edges (WIKILINK_TO_NOTE, WIKILINK_TO_HEADING,
+    /// REFERENCES_CODE_*) are NOT preserved — they are rebuilt by
+    /// `discover_cross_domain_links` / `index_markdown_directory` on the
+    /// next `brain add` invocation.
+    ///
+    /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
     /// since SET is not supported for property updates.
     pub fn reparent_vault(
         &self,
