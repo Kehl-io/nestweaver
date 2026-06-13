@@ -24,6 +24,15 @@ pub struct MergeResult {
     pub unlinked: Vec<UnlinkedVault>,
 }
 
+/// Result of [`GraphStore::reparent_vault`].
+#[derive(Debug)]
+pub struct ReparentVaultResult {
+    pub notes_migrated: usize,
+    pub headings_migrated: usize,
+    pub sections_migrated: usize,
+    pub tags_migrated: usize,
+}
+
 /// Result of [`GraphStore::purge_instance`]. Reports how many top-level
 /// rows were cascade-deleted from the graph for the given instance,
 /// plus a separate count for orphan nodes (Symbol/File/Service/Note/
@@ -2522,6 +2531,147 @@ impl GraphStore {
             .unwrap_or(0))
     }
 
+    /// Migrate all child nodes (notes, headings, sections, tags) from one
+    /// vault to a new vault with a different UID and instance_id. The old
+    /// vault is cascade-deleted and a new vault is created in its place,
+    /// preserving all content.
+    ///
+    /// This uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
+    /// since SET is not supported for property updates.
+    pub fn reparent_vault(
+        &self,
+        old_vault_uid: &str,
+        new_vault_uid: &str,
+        new_instance_id: &str,
+    ) -> Result<ReparentVaultResult, StoreError> {
+        // 1. Read the old vault metadata.
+        let old_vault = self
+            .list_vaults(None)?
+            .into_iter()
+            .find(|v| v.uid == old_vault_uid)
+            .ok_or_else(|| {
+                StoreError::Query(format!("vault not found: {old_vault_uid}"))
+            })?;
+
+        // 2. Read all children and edges before deletion.
+        let notes = self.list_notes(Some(old_vault_uid))?;
+        let headings = self.list_headings_by_vault(old_vault_uid)?;
+        let sections = self.list_sections_by_vault(old_vault_uid)?;
+        let tags = self.list_tags(Some(old_vault_uid))?;
+
+        // Capture note-tag edges before cascade destroys them.
+        let note_tag_edges: Vec<(String, String)> = {
+            let conn = self.conn()?;
+            let q = "MATCH (n:Note {vault_uid: $vid})-[:NOTE_TAGGED_WITH]->(t:Tag) \
+                     RETURN n.uid, t.uid";
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(old_vault_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            result
+                .filter_map(|row| {
+                    let nuid = crate::read::extract_string(&row, 0).ok()?;
+                    let tuid = crate::read::extract_string(&row, 1).ok()?;
+                    Some((nuid, tuid))
+                })
+                .collect()
+        };
+
+        let result = ReparentVaultResult {
+            notes_migrated: notes.len(),
+            headings_migrated: headings.len(),
+            sections_migrated: sections.len(),
+            tags_migrated: tags.len(),
+        };
+
+        // 3. Delete old vault and all its children.
+        self.delete_vault_cascade(old_vault_uid)?;
+
+        // 4. Create new vault with updated UID and instance_id.
+        self.insert_vault(&Vault {
+            uid: new_vault_uid.to_string(),
+            name: old_vault.name,
+            root_path: old_vault.root_path,
+            instance_id: new_instance_id.to_string(),
+        })?;
+
+        // 5. Re-insert notes with updated vault_uid.
+        let reparented_notes: Vec<Note> = notes
+            .into_iter()
+            .map(|n| Note {
+                vault_uid: new_vault_uid.to_string(),
+                ..n
+            })
+            .collect();
+        self.batch_insert_notes(&reparented_notes)?;
+
+        // Re-create VAULT_HAS_NOTE edges.
+        let vault_note_edges: Vec<(&str, &str)> = reparented_notes
+            .iter()
+            .map(|n| (new_vault_uid, n.uid.as_str()))
+            .collect();
+        self.batch_insert_vault_note_edges(&vault_note_edges)?;
+
+        // 6. Re-insert headings (note_uid stays the same).
+        self.batch_insert_headings(&headings)?;
+
+        // Re-create NOTE_HAS_HEADING edges.
+        let note_heading_edges: Vec<(&str, &str)> = headings
+            .iter()
+            .map(|h| (h.note_uid.as_str(), h.uid.as_str()))
+            .collect();
+        self.batch_insert_note_heading_edges(&note_heading_edges)?;
+
+        // 7. Re-insert sections (note_uid stays the same).
+        self.batch_insert_sections(&sections)?;
+
+        // Re-create NOTE_HAS_SECTION edges.
+        let note_section_edges: Vec<(&str, &str)> = sections
+            .iter()
+            .map(|s| (s.note_uid.as_str(), s.uid.as_str()))
+            .collect();
+        self.batch_insert_note_section_edges(&note_section_edges)?;
+
+        // Re-create HEADING_HAS_SECTION edges where applicable.
+        let heading_section_edges: Vec<(&str, &str)> = sections
+            .iter()
+            .filter_map(|s| {
+                s.heading_uid
+                    .as_ref()
+                    .map(|huid| (huid.as_str(), s.uid.as_str()))
+            })
+            .collect();
+        if !heading_section_edges.is_empty() {
+            self.batch_insert_heading_section_edges(&heading_section_edges)?;
+        }
+
+        // 8. Re-insert tags with updated vault_uid.
+        let reparented_tags: Vec<Tag> = tags
+            .into_iter()
+            .map(|t| Tag {
+                vault_uid: new_vault_uid.to_string(),
+                ..t
+            })
+            .collect();
+        self.batch_insert_tags(&reparented_tags)?;
+
+        // Re-create NOTE_TAGGED_WITH edges.
+        let nt_edges: Vec<(&str, &str)> = note_tag_edges
+            .iter()
+            .map(|(nuid, tuid)| (nuid.as_str(), tuid.as_str()))
+            .collect();
+        if !nt_edges.is_empty() {
+            self.batch_insert_note_tag_edges(&nt_edges)?;
+        }
+
+        Ok(result)
+    }
+
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
     /// match `from` to `to`. Returns a [`MergeResult`] with counts and
     /// details about any vaults whose notes were unlinked during collision
@@ -2547,47 +2697,38 @@ impl GraphStore {
         for v in self.list_vaults(None)? {
             if v.instance_id == from {
                 let root_path = v.root_path.clone();
+                let new_uid = vault_uid(to, &root_path);
+
                 if let Some(target) = target_vaults.get(&root_path) {
                     // Collision: two vaults with the same root_path in
                     // different instances. Keep whichever has more notes.
                     let source_count = self.vault_note_count(&v.uid)?;
                     let target_count = self.vault_note_count(&target.uid)?;
-                    let total = source_count + target_count;
 
                     if source_count > target_count {
-                        // Source is more populated — delete target, rewrite source.
-                        self.delete_vault_cascade(&target.uid)?;
-                        let new_uid = vault_uid(to, &root_path);
-                        self.delete_vault_cascade(&v.uid)?;
-                        self.insert_vault(&Vault {
-                            uid: new_uid,
-                            instance_id: to.to_string(),
-                            ..v
-                        })?;
+                        // Source wins — delete target (intentional discard),
+                        // then reparent source to preserve its notes.
+                        let target_dropped = self.delete_vault_cascade(&target.uid)?;
+                        self.reparent_vault(&v.uid, &new_uid, to)?;
+                        if target_dropped > 0 {
+                            unlinked.push(UnlinkedVault {
+                                root_path,
+                                notes_removed: target_dropped,
+                            });
+                        }
                     } else {
-                        // Target is equally or more populated — drop source.
-                        self.delete_vault_cascade(&v.uid)?;
-                    }
-                    if total > 0 {
-                        unlinked.push(UnlinkedVault {
-                            root_path,
-                            notes_removed: total,
-                        });
+                        // Target wins — drop source (intentional discard).
+                        let source_dropped = self.delete_vault_cascade(&v.uid)?;
+                        if source_dropped > 0 {
+                            unlinked.push(UnlinkedVault {
+                                root_path,
+                                notes_removed: source_dropped,
+                            });
+                        }
                     }
                 } else {
-                    let new_uid = vault_uid(to, &root_path);
-                    let deleted = self.delete_vault_cascade(&v.uid)?;
-                    self.insert_vault(&Vault {
-                        uid: new_uid,
-                        instance_id: to.to_string(),
-                        ..v
-                    })?;
-                    if deleted > 0 {
-                        unlinked.push(UnlinkedVault {
-                            root_path,
-                            notes_removed: deleted,
-                        });
-                    }
+                    // No collision — reparent source to preserve its notes.
+                    self.reparent_vault(&v.uid, &new_uid, to)?;
                 }
                 vault_count += 1;
             }
