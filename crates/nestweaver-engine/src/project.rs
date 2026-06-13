@@ -170,6 +170,14 @@ pub fn materialize_projects(
             total_component_edges += 1;
         }
 
+        // 4b. Parent declaration (symmetric with components, declared from child side).
+        if let Some(parent_name) = &project_cfg.parent {
+            let parent_uid = project_uid(instance_id, parent_name);
+            store.insert_project_component_edge(&parent_uid, &uid, 1.0)?;
+            store.insert_project_parent_edge(&uid, &parent_uid, 1.0)?;
+            total_component_edges += 1;
+        }
+
         // 5. Store external_refs in the extension sidecar.
         if !project_cfg.external_refs.is_empty() {
             set_property(
@@ -187,6 +195,26 @@ pub fn materialize_projects(
                 &uid,
                 "aliases",
                 serde_json::json!(&project_cfg.aliases),
+            );
+        }
+
+        // 7b. Store tags in the extension sidecar.
+        if !project_cfg.tags.is_empty() {
+            set_property(
+                &mut ext_store,
+                &uid,
+                "tags",
+                serde_json::json!(&project_cfg.tags),
+            );
+        }
+
+        // 7c. Store features in the extension sidecar.
+        if !project_cfg.features.is_empty() {
+            set_property(
+                &mut ext_store,
+                &uid,
+                "features",
+                serde_json::json!(&project_cfg.features),
             );
         }
 
