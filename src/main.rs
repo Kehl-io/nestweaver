@@ -3147,11 +3147,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let args = serde_json::json!({ "top": top });
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "bridge_nodes", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3224,11 +3220,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3297,11 +3289,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["resolution"] = serde_json::json!(r);
                 }
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3568,11 +3556,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "min_confidence": min_confidence });
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "dead_code", args) {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3886,11 +3870,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_daemon_json_rpc(true, &db_path, None, "affected_tests", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -4309,11 +4289,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_daemon_json_rpc(true, &db_path, None, "count_patterns", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -4359,11 +4335,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -5095,11 +5067,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "investigate", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -5197,11 +5165,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_daemon_json_rpc(true, &db_path, None, "investigate_expand", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -5259,11 +5223,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_daemon_json_rpc(true, &db_path, None, "investigate_hydrate", args)
                 {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
