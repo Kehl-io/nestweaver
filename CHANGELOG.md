@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.22.0](https://github.com/Kehl-io/nestweaver/compare/v0.21.0...v0.22.0) (2026-06-13)
+
+
+### Features
+
+* **brain:** wave-3 — diagnostics polish + brain context filters ([c2caeb6](https://github.com/Kehl-io/nestweaver/commit/c2caeb6137f92dff05c905f05131effd4c3cb9de))
+* **instance-remove:** add --purge-graph to cascade-delete instance data ([269635f](https://github.com/Kehl-io/nestweaver/commit/269635f8b535eca630deb1e013a766aafc3bbea3))
+* **proto:** forward since/recency_weight through ProjectContextRequest ([979ef1e](https://github.com/Kehl-io/nestweaver/commit/979ef1eca5ebac329958a9592875b255c5196d25))
+* **seed-resolution:** graduated path-deboost + kind-priority for symbol lookup ([bbfcb22](https://github.com/Kehl-io/nestweaver/commit/bbfcb226e871409ab434f6efc1e3319f267ee36f))
+
+
+### Bug Fixes
+
+* **brain-remove:** match stored vault paths regardless of canonical form ([f813959](https://github.com/Kehl-io/nestweaver/commit/f8139590cf6570f58f327d4c89fa4e4daaf9d24e))
+* **brain-status:** expose instance_id per row + forward collision warnings through daemon ([0a94cbd](https://github.com/Kehl-io/nestweaver/commit/0a94cbd3b9463e524f3d8cfb4d1c40e98caab293))
+* **brain:** close four v0.21.0 regressions surfaced by live-DB audit ([1629156](https://github.com/Kehl-io/nestweaver/commit/16291562ec9f9a0cfb4450e909f7969e01ed435d))
+* **engine,cli:** three minor gaps from v0.21.0 adoption validation ([85f44e1](https://github.com/Kehl-io/nestweaver/commit/85f44e124a3e8906b0df065d436129bc8af920bb))
+* **engine:** RepoConfig.name resolves repo aliases for projects and features ([dee57d9](https://github.com/Kehl-io/nestweaver/commit/dee57d9cfc9f2834340651d5309da26a8eeb71fc))
+* **mcp:** route brain_status through JSON pass-through RPC ([889fa06](https://github.com/Kehl-io/nestweaver/commit/889fa06a17ecc432ee5b8b5b5739328d3d771bb2))
+* **project-context:** surface member symbols, not just notes ([cd753e7](https://github.com/Kehl-io/nestweaver/commit/cd753e7bf25112cfabf59571386ecb8b1ebf6188))
+* **purge-instance:** sweep orphan symbol/file/note rows by UID prefix ([c8c9cdb](https://github.com/Kehl-io/nestweaver/commit/c8c9cdb31ee6c96557bdb92eea3ccfd1c93a0e09))
+* **v0.21.0:** regression fixes, adoption validation, and performance ([326845e](https://github.com/Kehl-io/nestweaver/commit/326845e16e3b08873402dcb4cbb559a7040ef413))
+
+
+### Performance Improvements
+
+* **cross-domain:** batch edge commits in single transactions ([1597555](https://github.com/Kehl-io/nestweaver/commit/15975552fcdb1e631233b324c960c2686c938b63))
+* **engine,cli,mcp:** dedup Heading/Section pairs + daemon path for project-context ([bf95636](https://github.com/Kehl-io/nestweaver/commit/bf956360fce2232f0387bf102671aaa9a7821641))
+* **store:** single-query orphan sweep and allocation-free kind_rank ([c35ec60](https://github.com/Kehl-io/nestweaver/commit/c35ec6052358346bd6004f3c9f337ef971d589ce))
+
 ## [0.21.0](https://github.com/Kehl-io/nestweaver/compare/v0.20.0...v0.21.0) (2026-06-10)
 
 
