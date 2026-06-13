@@ -1661,6 +1661,9 @@ mod tests {
         store
             .batch_insert_note_tag_edges(&[("note:rp:1", "tag:rp:alpha")])
             .unwrap();
+        store
+            .batch_insert_section_tag_edges(&[("sec:rp:1", "tag:rp:alpha")])
+            .unwrap();
 
         // Reparent to new vault.
         let result = store
@@ -1701,6 +1704,15 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "alpha");
         assert_eq!(tags[0].vault_uid, "vlt:new");
+
+        // SECTION_TAGGED_WITH edge survived reparent.
+        let section_uids_with_alpha = store
+            .list_section_uids_with_tags(&["alpha".to_string()])
+            .unwrap();
+        assert!(
+            section_uids_with_alpha.contains("sec:rp:1"),
+            "SECTION_TAGGED_WITH edge was not preserved across reparent"
+        );
 
         // Old vault has no leftovers.
         assert_eq!(store.list_notes(Some("vlt:old")).unwrap().len(), 0);
