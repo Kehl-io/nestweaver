@@ -682,6 +682,18 @@ impl NestWeaverDaemon for DaemonService {
         if !req.root.is_empty() {
             args["root"] = serde_json::json!(req.root);
         }
+        if !req.since.is_empty() {
+            args["since"] = serde_json::json!(req.since);
+        }
+        if req.weight_semantic > 0.0 {
+            args["weight_semantic"] = serde_json::json!(req.weight_semantic);
+        }
+        if req.recency_weight > 0.0 {
+            args["recency_weight"] = serde_json::json!(req.recency_weight);
+        }
+        if req.recency_half_life_days > 0.0 {
+            args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
+        }
 
         let value = self.dispatch_tool_json("brain_context", args).await?;
         let result_json = serde_json::to_string(&value)
