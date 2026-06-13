@@ -1282,6 +1282,9 @@ enum DaemonAction {
         /// parity to the direct-disk CLI path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Hidden: redirect users who pass this flag here to the correct command.
+        #[arg(long, hide = true)]
+        track_interactions: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -3138,6 +3141,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: _,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let args = serde_json::json!({ "top": top });
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "bridge_nodes", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
 
             out.status("Computing betweenness centrality...");
@@ -3194,6 +3208,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let parsed_level: SummaryLevel =
                 level.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({ "level": level });
+                if let Some(tb) = token_budget {
+                    args["token_budget"] = serde_json::json!(tb);
+                }
+                if let Some(ref t) = target {
+                    args["target"] = serde_json::json!(t);
+                }
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
 
             out.status(&format!("Generating {} summaries...", parsed_level));
@@ -3250,6 +3281,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: _,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({});
+                if let Some(r) = resolution {
+                    args["resolution"] = serde_json::json!(r);
+                }
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
 
             // Compute and save inside a block so the store is dropped
             // before any output. LadybugDB's connection finaliser can
@@ -3508,6 +3551,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({ "min_confidence": min_confidence });
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "dead_code", args) {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let min_conf =
                 DeadCodeConfidence::from_str_loose(&min_confidence).unwrap_or_else(|| {
                     eprintln!(
@@ -3804,6 +3857,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({});
+                if let Some(ref f) = files {
+                    args["files"] = serde_json::json!(f);
+                }
+                if let Some(ref br) = base_ref {
+                    args["base_ref"] = serde_json::json!(br);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "affected_tests", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
 
             // Resolve changed files: explicit --files, else git diff against --base-ref.
@@ -4205,6 +4276,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({ "patterns": patterns });
+                if let Some(ref pp) = path_prefix {
+                    args["path_prefix"] = serde_json::json!(pp);
+                }
+                if let Some(ref k) = kinds {
+                    args["kinds"] = serde_json::json!(k);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "count_patterns", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let counts = store
                 .count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref())
@@ -4233,6 +4322,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({
+                    "targets": targets,
+                    "neighbors": neighbors,
+                    "token_budget": token_budget,
+                });
+                if let Some(ref r) = root {
+                    args["root"] = serde_json::json!(r);
+                }
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let res = nestweaver_engine::read_symbols::read_symbols(
@@ -4945,6 +5052,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({
+                    "query": query,
+                    "token_budget": token_budget,
+                });
+                if let Some(ref s) = scope {
+                    args["scope"] = serde_json::json!(s);
+                }
+                if let Some(ref r) = root {
+                    args["root"] = serde_json::json!(r);
+                }
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "investigate", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
@@ -5025,6 +5152,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_ERROR, None));
             }
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({
+                    "bundle_id": bundle_id,
+                    "targets": targets,
+                });
+                if let Some(ref r) = root {
+                    args["root"] = serde_json::json!(r);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "investigate_expand", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let root = root.unwrap_or_else(detect_repo_root);
             let result = nestweaver_engine::investigate_expand(
@@ -5065,6 +5210,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let mut args = serde_json::json!({
+                    "bundle_id": bundle_id,
+                    "token_budget": token_budget,
+                });
+                if let Some(ref r) = root {
+                    args["root"] = serde_json::json!(r);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "investigate_hydrate", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let root = root.unwrap_or_else(detect_repo_root);
             let result = nestweaver_engine::investigate_hydrate(
@@ -5395,7 +5558,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 DaemonAction::Start {
                     idle_timeout,
                     config,
+                    track_interactions,
                 } => {
+                    if track_interactions {
+                        eprintln!(
+                            "note: --track-interactions is an MCP flag, not a daemon flag. \
+                             Use: nestweaver mcp --track-interactions"
+                        );
+                    }
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
@@ -6302,6 +6472,25 @@ fn try_daemon_json_rpc(
             "regex_search" => client.inner_mut().regex_search(req).await,
             "stale_check" => client.inner_mut().stale_check(req).await,
             "brain_status" => client.inner_mut().brain_status_json(req).await,
+            "read_symbols" => client.inner_mut().read_symbols(req).await,
+            "dead_code" => client.inner_mut().dead_code(req).await,
+            "clusters" => client.inner_mut().clusters(req).await,
+            "bridge_nodes" => client.inner_mut().bridge_nodes(req).await,
+            "blast_radius" => client.inner_mut().blast_radius(req).await,
+            "get_summary" => client.inner_mut().get_summary(req).await,
+            "count_patterns" => client.inner_mut().count_patterns(req).await,
+            "affected_tests" => client.inner_mut().affected_tests(req).await,
+            "investigate" => client.inner_mut().investigate(req).await,
+            "investigate_expand" => client.inner_mut().investigate_expand(req).await,
+            "investigate_hydrate" => client.inner_mut().investigate_hydrate(req).await,
+            "flow_trace" => client.inner_mut().flow_trace(req).await,
+            "contract_drift" => client.inner_mut().contract_drift(req).await,
+            "cross_repo_contracts" => client.inner_mut().cross_repo_contracts(req).await,
+            "brain_memory_lint" => client.inner_mut().brain_memory_lint(req).await,
+            "brain_memory_consolidate" => client.inner_mut().brain_memory_consolidate(req).await,
+            "brain_memory_related" => client.inner_mut().brain_memory_related(req).await,
+            "detect_changes" => client.inner_mut().detect_changes(req).await,
+            "brain_guide" => client.inner_mut().brain_guide(req).await,
             _ => return None,
         };
         resp.ok().map(|r| r.into_inner().result_json)
@@ -7882,7 +8071,6 @@ fn run_brain(
             // proto does not yet carry them, so fall through to the local
             // path when either is set.
             if use_daemon
-                && since.is_none()
                 && !no_tests
                 && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
@@ -7916,6 +8104,10 @@ fn run_brain(
                             .to_string(),
                         prf,
                         rerank,
+                        weight_semantic: weight_semantic.unwrap_or(0.0),
+                        since: since.as_deref().unwrap_or("").to_string(),
+                        recency_weight,
+                        recency_half_life_days,
                     };
                     let rpc = rt.block_on(async {
                         client
@@ -9361,11 +9553,12 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                      {} repo(s), {} project(s)",
                     result.vaults, result.repos, result.projects
                 );
-                for u in &result.unlinked {
+                for d in &result.discarded {
                     eprintln!(
-                        "Note: {} notes from '{}' were unlinked. \
-                         Re-run 'brain add {}' to repopulate.",
-                        u.notes_removed, u.root_path, u.root_path
+                        "Note: {} note(s) from '{}' were discarded \
+                         (collision: the other instance had more notes). \
+                         Re-run 'brain add {}' to re-index.",
+                        d.notes_discarded, d.root_path, d.root_path
                     );
                 }
             }

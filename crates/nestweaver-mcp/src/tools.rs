@@ -4676,6 +4676,10 @@ pub fn dispatch_via_daemon(
                     root: str_field("root"),
                     prf: bool_field("prf"),
                     rerank: bool_field("rerank"),
+                    weight_semantic: f64_field("weight_semantic"),
+                    since: str_field("since"),
+                    recency_weight: f64_field("recency_weight"),
+                    recency_half_life_days: f64_field("recency_half_life_days"),
                 });
                 let resp = client
                     .get_context(req)

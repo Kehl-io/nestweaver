@@ -145,6 +145,7 @@ pub struct InteractionTracker {
     /// shutdown heuristic).
     last_tool: Mutex<Option<String>>,
     flush_threshold: usize,
+    last_flush: Mutex<std::time::Instant>,
 }
 
 impl InteractionTracker {
@@ -173,7 +174,8 @@ impl InteractionTracker {
             last_query_time: Mutex::new(0.0),
             last_query_results: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
-            flush_threshold: 50,
+            flush_threshold: 5,
+            last_flush: Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -189,6 +191,7 @@ impl InteractionTracker {
             last_query_results: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
             flush_threshold,
+            last_flush: Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -347,6 +350,15 @@ impl InteractionTracker {
             return Ok(());
         }
 
+        self.flush_events(events)
+    }
+
+    /// Flush a pre-drained batch of events to the sidecar.
+    fn flush_events(&self, events: Vec<InteractionEvent>) -> Result<(), anyhow::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
         // Load existing store (or start fresh).
         let mut store = load_interaction_store(&self.db_path).unwrap_or_default();
 
@@ -367,16 +379,21 @@ impl InteractionTracker {
     }
 
     /// Push an event into the buffer and auto-flush when the threshold is
-    /// reached.
+    /// reached or 30 seconds have elapsed since the last flush.
     fn push_event(&self, event: InteractionEvent) {
-        let should_flush = {
-            let mut buf = self.events.lock().unwrap_or_else(|e| e.into_inner());
-            buf.push(event);
-            buf.len() >= self.flush_threshold
+        let mut buf = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        buf.push(event);
+        let should_flush = buf.len() >= self.flush_threshold || {
+            let last = self.last_flush.lock().unwrap_or_else(|e| e.into_inner());
+            last.elapsed().as_secs() >= 30
         };
-
-        if should_flush && let Err(e) = self.flush() {
-            tracing::warn!("auto-flush failed: {e}");
+        if should_flush {
+            let events: Vec<_> = buf.drain(..).collect();
+            drop(buf);
+            if let Err(e) = self.flush_events(events) {
+                tracing::warn!("auto-flush failed: {e}");
+            }
+            *self.last_flush.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
         }
     }
 }

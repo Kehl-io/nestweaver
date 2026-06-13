@@ -46,6 +46,23 @@ pub enum EdgeType {
     RelatesTo,
 }
 
+/// All symbol-level edge types used in code-graph queries.
+///
+/// This is the canonical list for iterating over code edges (CALLS, IMPORTS,
+/// EXTENDS_SYM, etc.). Use [`EdgeType::rel_table_name`] to get the Cypher
+/// relationship table name, and [`EdgeType::from_rel_table_name`] for the
+/// reverse lookup.
+pub const ALL_SYMBOL_EDGE_TYPES: &[EdgeType] = &[
+    EdgeType::Calls,
+    EdgeType::Imports,
+    EdgeType::Extends,
+    EdgeType::Implements,
+    EdgeType::Includes,
+    EdgeType::Uses,
+    EdgeType::Accesses,
+    EdgeType::MemberOf,
+];
+
 impl EdgeType {
     /// Return the Cypher relationship table name used in the graph store.
     ///
@@ -74,6 +91,18 @@ impl EdgeType {
             EdgeType::CausedBy => "CAUSED_BY",
             EdgeType::RelatesTo => "RELATES_TO",
         }
+    }
+
+    /// Reverse lookup: return the `EdgeType` whose [`Self::rel_table_name`]
+    /// matches `name`, or `None` if no symbol edge type matches.
+    ///
+    /// Only searches [`ALL_SYMBOL_EDGE_TYPES`]; non-symbol edge types
+    /// (Contains, CrossRepoLink, Project*, etc.) are not included.
+    pub fn from_rel_table_name(name: &str) -> Option<EdgeType> {
+        ALL_SYMBOL_EDGE_TYPES
+            .iter()
+            .find(|et| et.rel_table_name() == name)
+            .copied()
     }
 }
 
