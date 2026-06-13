@@ -393,8 +393,7 @@ impl InteractionTracker {
             if let Err(e) = self.flush_events(events) {
                 tracing::warn!("auto-flush failed: {e}");
             }
-            *self.last_flush.lock().unwrap_or_else(|e| e.into_inner()) =
-                std::time::Instant::now();
+            *self.last_flush.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
         }
     }
 }

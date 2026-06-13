@@ -1612,10 +1612,7 @@ mod tests {
         ];
         store.batch_insert_notes(&notes).unwrap();
         store
-            .batch_insert_vault_note_edges(&[
-                ("vlt:old", "note:rp:1"),
-                ("vlt:old", "note:rp:2"),
-            ])
+            .batch_insert_vault_note_edges(&[("vlt:old", "note:rp:1"), ("vlt:old", "note:rp:2")])
             .unwrap();
 
         let heading = Heading {
@@ -1721,8 +1718,8 @@ mod tests {
 
     #[test]
     fn merge_instance_ids_preserves_notes() {
-        use nestweaver_schema::{Note, NoteKind, Vault};
         use nestweaver_schema::uid::vault_uid;
+        use nestweaver_schema::{Note, NoteKind, Vault};
         let store = test_store();
 
         // Create a source vault with 3 notes.
@@ -1747,7 +1744,11 @@ mod tests {
             modified_at: None,
             pagerank_score: None,
         };
-        let notes = vec![make_note("note:m:1", 1), make_note("note:m:2", 2), make_note("note:m:3", 3)];
+        let notes = vec![
+            make_note("note:m:1", 1),
+            make_note("note:m:2", 2),
+            make_note("note:m:3", 3),
+        ];
         store.batch_insert_notes(&notes).unwrap();
         store
             .batch_insert_vault_note_edges(&[
@@ -1775,8 +1776,8 @@ mod tests {
 
     #[test]
     fn merge_instance_ids_collision_source_wins_preserves() {
-        use nestweaver_schema::{Note, NoteKind, Vault};
         use nestweaver_schema::uid::vault_uid;
+        use nestweaver_schema::{Note, NoteKind, Vault};
         let store = test_store();
 
         // Source vault with 3 notes.

@@ -3222,8 +3222,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
                 }
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3297,9 +3296,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "clusters", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3570,9 +3567,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "min_confidence": min_confidence });
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "dead_code", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "dead_code", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -4362,8 +4357,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5099,8 +5093,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "investigate", args)
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "investigate", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
