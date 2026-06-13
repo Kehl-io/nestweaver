@@ -1567,4 +1567,286 @@ mod tests {
         assert_eq!(again.symbols, 0);
         assert_eq!(again.orphans_swept, 0);
     }
+
+    #[test]
+    fn reparent_vault_preserves_notes_and_children() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
+        let store = test_store();
+
+        // Create a vault with 2 notes, 1 heading, 1 section, and 1 tag.
+        let vault = Vault {
+            uid: "vlt:old".to_string(),
+            name: "my-vault".to_string(),
+            root_path: "/tmp/vault".to_string(),
+            instance_id: "inst-old".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+
+        let notes = vec![
+            Note {
+                uid: "note:rp:1".to_string(),
+                vault_uid: "vlt:old".to_string(),
+                file_path: "a.md".to_string(),
+                title: "Note A".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 10,
+                content_hash: "ha".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+            Note {
+                uid: "note:rp:2".to_string(),
+                vault_uid: "vlt:old".to_string(),
+                file_path: "b.md".to_string(),
+                title: "Note B".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 20,
+                content_hash: "hb".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+            },
+        ];
+        store.batch_insert_notes(&notes).unwrap();
+        store
+            .batch_insert_vault_note_edges(&[
+                ("vlt:old", "note:rp:1"),
+                ("vlt:old", "note:rp:2"),
+            ])
+            .unwrap();
+
+        let heading = Heading {
+            uid: "hdg:rp:1".to_string(),
+            note_uid: "note:rp:1".to_string(),
+            level: 1,
+            text: "Heading 1".to_string(),
+            slug: "heading-1".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "hh1".to_string(),
+        };
+        store.insert_heading(&heading).unwrap();
+        store
+            .batch_insert_note_heading_edges(&[("note:rp:1", "hdg:rp:1")])
+            .unwrap();
+
+        let section = Section {
+            uid: "sec:rp:1".to_string(),
+            note_uid: "note:rp:1".to_string(),
+            heading_uid: Some("hdg:rp:1".to_string()),
+            start_line: 2,
+            end_line: 5,
+            text_hash: "th1".to_string(),
+            text_content: "body text".to_string(),
+            word_count: 2,
+            pagerank_score: None,
+        };
+        store.insert_section(&section).unwrap();
+        store
+            .batch_insert_note_section_edges(&[("note:rp:1", "sec:rp:1")])
+            .unwrap();
+        store
+            .batch_insert_heading_section_edges(&[("hdg:rp:1", "sec:rp:1")])
+            .unwrap();
+
+        let tag = Tag {
+            uid: "tag:rp:alpha".to_string(),
+            vault_uid: "vlt:old".to_string(),
+            name: "alpha".to_string(),
+        };
+        store.insert_tag(&tag).unwrap();
+        store
+            .batch_insert_note_tag_edges(&[("note:rp:1", "tag:rp:alpha")])
+            .unwrap();
+
+        // Reparent to new vault.
+        let result = store
+            .reparent_vault("vlt:old", "vlt:new", "inst-new")
+            .unwrap();
+
+        assert_eq!(result.notes_migrated, 2);
+        assert_eq!(result.headings_migrated, 1);
+        assert_eq!(result.sections_migrated, 1);
+        assert_eq!(result.tags_migrated, 1);
+
+        // Old vault is gone.
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].uid, "vlt:new");
+        assert_eq!(vaults[0].instance_id, "inst-new");
+        assert_eq!(vaults[0].root_path, "/tmp/vault");
+
+        // Both notes survived under the new vault_uid.
+        let new_notes = store.list_notes(Some("vlt:new")).unwrap();
+        assert_eq!(new_notes.len(), 2);
+        for n in &new_notes {
+            assert_eq!(n.vault_uid, "vlt:new");
+        }
+
+        // Heading survived.
+        let hdgs = store.list_headings_by_vault("vlt:new").unwrap();
+        assert_eq!(hdgs.len(), 1);
+        assert_eq!(hdgs[0].text, "Heading 1");
+
+        // Section survived.
+        let secs = store.list_sections_by_vault("vlt:new").unwrap();
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].text_content, "body text");
+
+        // Tag survived under new vault_uid.
+        let tags = store.list_tags(Some("vlt:new")).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "alpha");
+        assert_eq!(tags[0].vault_uid, "vlt:new");
+
+        // Old vault has no leftovers.
+        assert_eq!(store.list_notes(Some("vlt:old")).unwrap().len(), 0);
+        assert_eq!(store.list_tags(Some("vlt:old")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn merge_instance_ids_preserves_notes() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        use nestweaver_schema::uid::vault_uid;
+        let store = test_store();
+
+        // Create a source vault with 3 notes.
+        let src_vault = Vault {
+            uid: "vlt:src:v1".to_string(),
+            name: "my-vault".to_string(),
+            root_path: "/tmp/vault".to_string(),
+            instance_id: "src".to_string(),
+        };
+        store.insert_vault(&src_vault).unwrap();
+
+        let make_note = |uid: &str, n: u32| Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:src:v1".to_string(),
+            file_path: format!("n{n}.md"),
+            title: format!("Note {n}"),
+            note_kind: NoteKind::General,
+            word_count: n,
+            content_hash: format!("h{n}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        let notes = vec![make_note("note:m:1", 1), make_note("note:m:2", 2), make_note("note:m:3", 3)];
+        store.batch_insert_notes(&notes).unwrap();
+        store
+            .batch_insert_vault_note_edges(&[
+                ("vlt:src:v1", "note:m:1"),
+                ("vlt:src:v1", "note:m:2"),
+                ("vlt:src:v1", "note:m:3"),
+            ])
+            .unwrap();
+
+        // Merge src -> tgt (no collision — no target vault exists).
+        let result = store.merge_instance_ids("src", "tgt").unwrap();
+        assert_eq!(result.vaults, 1);
+        // No notes should be reported as unlinked — they should survive.
+        assert!(
+            result.unlinked.is_empty(),
+            "expected no unlinked vaults, got {:?}",
+            result.unlinked
+        );
+
+        // All 3 notes should survive under the new vault UID.
+        let new_vault_uid = vault_uid("tgt", "/tmp/vault");
+        let surviving = store.list_notes(Some(&new_vault_uid)).unwrap();
+        assert_eq!(surviving.len(), 3, "expected 3 notes to survive merge");
+    }
+
+    #[test]
+    fn merge_instance_ids_collision_source_wins_preserves() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        use nestweaver_schema::uid::vault_uid;
+        let store = test_store();
+
+        // Source vault with 3 notes.
+        let src_vault = Vault {
+            uid: "vlt:coll:src".to_string(),
+            name: "shared-vault".to_string(),
+            root_path: "/shared".to_string(),
+            instance_id: "src".to_string(),
+        };
+        store.insert_vault(&src_vault).unwrap();
+
+        let make_src_note = |uid: &str, n: u32| Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:coll:src".to_string(),
+            file_path: format!("src{n}.md"),
+            title: format!("SrcNote {n}"),
+            note_kind: NoteKind::General,
+            word_count: n,
+            content_hash: format!("sh{n}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        let src_notes = vec![
+            make_src_note("note:cs:1", 1),
+            make_src_note("note:cs:2", 2),
+            make_src_note("note:cs:3", 3),
+        ];
+        store.batch_insert_notes(&src_notes).unwrap();
+        store
+            .batch_insert_vault_note_edges(&[
+                ("vlt:coll:src", "note:cs:1"),
+                ("vlt:coll:src", "note:cs:2"),
+                ("vlt:coll:src", "note:cs:3"),
+            ])
+            .unwrap();
+
+        // Target vault with 1 note at the same root_path.
+        let tgt_vault = Vault {
+            uid: "vlt:coll:tgt".to_string(),
+            name: "shared-vault".to_string(),
+            root_path: "/shared".to_string(),
+            instance_id: "tgt".to_string(),
+        };
+        store.insert_vault(&tgt_vault).unwrap();
+
+        let tgt_note = Note {
+            uid: "note:ct:1".to_string(),
+            vault_uid: "vlt:coll:tgt".to_string(),
+            file_path: "tgt1.md".to_string(),
+            title: "TgtNote 1".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "th1".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+        };
+        store.insert_note(&tgt_note).unwrap();
+        store
+            .insert_vault_note_edge("vlt:coll:tgt", "note:ct:1")
+            .unwrap();
+
+        // Merge — source wins (3 > 1).
+        let result = store.merge_instance_ids("src", "tgt").unwrap();
+
+        // The 1 dropped target note should be reported in unlinked.
+        assert_eq!(result.unlinked.len(), 1);
+        assert_eq!(result.unlinked[0].root_path, "/shared");
+        assert_eq!(result.unlinked[0].notes_removed, 1);
+
+        // All 3 source notes should survive under the new vault UID.
+        let new_vault_uid = vault_uid("tgt", "/shared");
+        let surviving = store.list_notes(Some(&new_vault_uid)).unwrap();
+        assert_eq!(surviving.len(), 3, "expected 3 source notes to survive");
+
+        // Only one vault should remain.
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].uid, new_vault_uid);
+        assert_eq!(vaults[0].instance_id, "tgt");
+    }
 }
