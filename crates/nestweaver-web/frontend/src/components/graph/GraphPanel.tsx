@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import { GraphCanvas } from "./GraphCanvas";
 import { GraphMatrixView } from "./GraphMatrixView";
@@ -260,11 +260,8 @@ export function GraphPanel() {
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
 
-  const [contextMenu, setContextMenu] = useState<{
-    x: number;
-    y: number;
-    nodeId: string;
-  } | null>(null);
+  const contextMenu = useStore((s) => s.contextMenu);
+  const closeContextMenu = useStore((s) => s.closeContextMenu);
 
   const handleContextMenu = useCallback(
     (e: React.MouseEvent) => {
@@ -312,7 +309,7 @@ export function GraphPanel() {
             x={contextMenu.x}
             y={contextMenu.y}
             nodeId={contextMenu.nodeId}
-            onClose={() => setContextMenu(null)}
+            onClose={closeContextMenu}
           />
         )}
         {pathfindingActive && !pathfindingTo && <PathTargetSelector />}
