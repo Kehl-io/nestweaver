@@ -5,17 +5,14 @@ import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { ModeTabs } from "./ModeTabs";
+import { ModeIndicator } from "./ModeIndicator";
 import { ControlDock } from "./ControlDock";
 import { NodePreviewCard } from "./NodePreviewCard";
-import { ActiveFilterSummary } from "./ActiveFilterSummary";
 import { GraphLegend } from "./GraphLegend";
 import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
-import { LlmQueryBar } from "../llm/LlmQueryBar";
 import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
 import { OverviewContextSurface } from "../overview/OverviewContextSurface";
-import { TimelineSlider } from "../timeline/TimelineSlider";
 import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
@@ -327,10 +324,7 @@ export function GraphPanel() {
           )}
         </div>
       </div>
-      {!focusMap && <TimelineSlider />}
-      {!focusMap && <ActiveFilterSummary />}
-      {!focusMap && <ModeTabs />}
-      {!focusMap && <LlmQueryBar />}
+      <ModeIndicator />
     </div>
   );
 }
