@@ -7,6 +7,7 @@ import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
 import { ModeTabs } from "./ModeTabs";
 import { ControlDock } from "./ControlDock";
+import { NodePreviewCard } from "./NodePreviewCard";
 import { ActiveFilterSummary } from "./ActiveFilterSummary";
 import { GraphLegend } from "./GraphLegend";
 import { PathTargetSelector } from "../PathTargetSelector";
@@ -76,7 +77,12 @@ function useGraphKeyboardNav(
 
       if (e.key === "Escape") {
         e.preventDefault();
-        selectNode(null);
+        const { previewNodeId, closePreview: close } = useStore.getState();
+        if (previewNodeId) {
+          close();
+        } else {
+          selectNode(null);
+        }
         return;
       }
 
@@ -297,6 +303,7 @@ export function GraphPanel() {
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
         <ControlDock />
+        <NodePreviewCard />
         {viewMode === "graph" && !focusMap && <GraphLegend />}
         {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
           <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
