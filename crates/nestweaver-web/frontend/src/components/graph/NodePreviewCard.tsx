@@ -42,12 +42,14 @@ export function NodePreviewCard() {
         {/* Expanded header */}
         <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3 py-2">
           <button
+            type="button"
             onClick={togglePreviewExpanded}
             className="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
           >
             ← Collapse
           </button>
           <button
+            type="button"
             onClick={closePreview}
             className="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
             aria-label="Close preview"
@@ -81,6 +83,7 @@ export function NodePreviewCard() {
               </span>
             </div>
             <button
+              type="button"
               onClick={closePreview}
               className="shrink-0 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
               aria-label="Close preview"
@@ -118,6 +121,7 @@ export function NodePreviewCard() {
               </span>
             </div>
             <button
+              type="button"
               onClick={closePreview}
               className="shrink-0 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
               aria-label="Close preview"
@@ -141,10 +145,15 @@ export function NodePreviewCard() {
                 <p className="text-xs text-[var(--color-text-muted)]">No source available</p>
               )
             ) : (
-              <p className="text-xs leading-5 text-[var(--color-text-muted)]">
-                {stripFrontmatterAndHeadings(data.detail.body).slice(0, 200)}
-                {stripFrontmatterAndHeadings(data.detail.body).length > 200 ? "…" : ""}
-              </p>
+              (() => {
+                const preview = stripFrontmatterAndHeadings(data.detail.body);
+                return (
+                  <p className="text-xs leading-5 text-[var(--color-text-muted)]">
+                    {preview.slice(0, 200)}
+                    {preview.length > 200 ? "…" : ""}
+                  </p>
+                );
+              })()
             )}
           </div>
 
@@ -182,6 +191,7 @@ export function NodePreviewCard() {
               </>
             )}
             <button
+              type="button"
               onClick={togglePreviewExpanded}
               className="ml-auto text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
             >
