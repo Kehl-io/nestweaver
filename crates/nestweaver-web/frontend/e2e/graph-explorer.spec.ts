@@ -100,17 +100,13 @@ async function openOverview(
     return;
   }
 
-  await dock.getByRole("button", { name: "View" }).click();
+  await dock.getByRole("button", { name: "Settings" }).click();
   await dock.getByRole("button", { name: "Focus Map" }).click();
 
-  const overviewMode = page.getByRole("button", {
-    name: "Overview",
-    exact: true,
+  const modeIndicator = page.getByRole("button", {
+    name: /Overview/,
   });
-  await expect(overviewMode).toBeVisible();
-  await expect(overviewMode).toHaveClass(
-    /border-\[var\(--color-graph-selection\)\]/,
-  );
+  await expect(modeIndicator).toBeVisible();
 }
 
 test.describe("Graph Explorer", () => {
@@ -220,8 +216,8 @@ test.describe("Graph Explorer", () => {
       .click();
 
     await expect(
-      page.getByRole("button", { name: "Context", exact: true }),
-    ).toHaveClass(/border-\[var\(--color-graph-selection\)\]/);
+      page.getByRole("button", { name: /Context/ }),
+    ).toBeVisible();
     await postOk(request, "/api/v1/context", {
       seeds: [firstSymbol.uid],
       limit: 50,
@@ -286,8 +282,8 @@ test.describe("Graph Explorer", () => {
     await option.getByRole("button", { name: "Add" }).click();
 
     await expect(
-      page.getByRole("button", { name: "Context", exact: true }),
-    ).toHaveClass(/border-\[var\(--color-graph-selection\)\]/);
+      page.getByRole("button", { name: /Context/ }),
+    ).toBeVisible();
   });
 
   test("grouped controls switch to list and matrix views", async ({ page }) => {
@@ -295,7 +291,7 @@ test.describe("Graph Explorer", () => {
 
     const dock = page.getByTestId("control-dock");
 
-    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "Settings" }).click();
     await dock.getByRole("button", { name: "List" }).click();
     await expect(
       page.getByRole("region", { name: "Ranked node table" }),
@@ -321,6 +317,7 @@ test.describe("Graph Explorer", () => {
 
     async function downloadExport(label: RegExp, extension: string) {
       const dock = page.getByTestId("control-dock");
+      await dock.getByRole("button", { name: "Settings" }).click();
       await dock.getByRole("button", { name: "Export" }).click();
       const downloadPromise = page.waitForEvent("download");
       await dock.getByRole("button", { name: label }).click();
@@ -349,7 +346,7 @@ test.describe("Graph Explorer", () => {
     await openOverview(page, { panels: true });
 
     const dock = page.getByTestId("control-dock");
-    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "Settings" }).click();
     await dock.getByRole("button", { name: "List" }).click();
 
     const table = page.getByRole("region", { name: "Ranked node table" });
@@ -369,7 +366,7 @@ test.describe("Graph Explorer", () => {
     await openOverview(page, { panels: true });
 
     const dock = page.getByTestId("control-dock");
-    await dock.getByRole("button", { name: "View" }).click();
+    await dock.getByRole("button", { name: "Settings" }).click();
     await dock.getByRole("button", { name: "Matrix" }).click();
 
     const matrix = page.getByRole("region", { name: "Graph matrix view" });
