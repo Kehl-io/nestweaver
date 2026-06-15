@@ -5,16 +5,14 @@ import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { ModeTabs } from "./ModeTabs";
+import { ModeIndicator } from "./ModeIndicator";
 import { ControlDock } from "./ControlDock";
-import { ActiveFilterSummary } from "./ActiveFilterSummary";
+import { NodePreviewCard } from "./NodePreviewCard";
 import { GraphLegend } from "./GraphLegend";
 import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
-import { LlmQueryBar } from "../llm/LlmQueryBar";
 import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
 import { OverviewContextSurface } from "../overview/OverviewContextSurface";
-import { TimelineSlider } from "../timeline/TimelineSlider";
 import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
@@ -76,7 +74,12 @@ function useGraphKeyboardNav(
 
       if (e.key === "Escape") {
         e.preventDefault();
-        selectNode(null);
+        const { previewNodeId, closePreview: close } = useStore.getState();
+        if (previewNodeId) {
+          close();
+        } else {
+          selectNode(null);
+        }
         return;
       }
 
@@ -297,6 +300,7 @@ export function GraphPanel() {
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
         <ControlDock />
+        <NodePreviewCard />
         {viewMode === "graph" && !focusMap && <GraphLegend />}
         {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
           <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
@@ -320,10 +324,7 @@ export function GraphPanel() {
           )}
         </div>
       </div>
-      {!focusMap && <TimelineSlider />}
-      {!focusMap && <ActiveFilterSummary />}
-      {!focusMap && <ModeTabs />}
-      {!focusMap && <LlmQueryBar />}
+      <ModeIndicator />
     </div>
   );
 }
