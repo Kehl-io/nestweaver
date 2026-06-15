@@ -26,6 +26,13 @@ test.describe("Search Flow", () => {
 
   test("symbol detail loads when clicking a result", async ({ page }) => {
     await page.goto("/");
+    const dock = page.getByTestId("control-dock");
+    await expect(dock).toBeVisible({ timeout: 15_000 });
+
+    // Switch to panels mode so the detail panel is visible
+    await dock.getByRole("button", { name: "Settings" }).click();
+    await dock.getByRole("button", { name: "Focus Map" }).click();
+
     const searchInput = page.locator('[data-testid="search-input"]');
     await searchInput.waitFor({ timeout: 10_000 });
     await searchInput.fill("greet");
