@@ -9,6 +9,11 @@ export interface GraphSlice {
   selectedNodeId: string | null;
   selectedNodeKind: string | null;
   hoveredNodeId: string | null;
+  previewNodeId: string | null;
+  previewExpanded: boolean;
+  openPreview: (id: string, kind?: string | null) => void;
+  closePreview: () => void;
+  togglePreviewExpanded: () => void;
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
@@ -63,6 +68,8 @@ export const createGraphSlice: StateCreator<
   selectedNodeId: null,
   selectedNodeKind: null,
   hoveredNodeId: null,
+  previewNodeId: null,
+  previewExpanded: false,
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
@@ -124,6 +131,10 @@ export const createGraphSlice: StateCreator<
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.detailFocus = "summary";
+      if (id === null) {
+        s.previewNodeId = null;
+        s.previewExpanded = false;
+      }
     }),
 
   exploreNode: (id, kind) =>
@@ -138,6 +149,25 @@ export const createGraphSlice: StateCreator<
   hoverNode: (id) =>
     set((s) => {
       s.hoveredNodeId = id;
+    }),
+
+  openPreview: (id, kind) =>
+    set((s) => {
+      s.previewNodeId = id;
+      s.previewExpanded = false;
+      s.selectedNodeId = id;
+      s.selectedNodeKind = kind ?? null;
+    }),
+
+  closePreview: () =>
+    set((s) => {
+      s.previewNodeId = null;
+      s.previewExpanded = false;
+    }),
+
+  togglePreviewExpanded: () =>
+    set((s) => {
+      s.previewExpanded = !s.previewExpanded;
     }),
 
   setGraphMode: (mode) =>
