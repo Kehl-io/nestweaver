@@ -75,8 +75,13 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
       hint: "O",
       key: "o",
       action: () => {
-        // Opens the source file for symbol nodes
-        window.open(`vscode://file/${nodeId}`, "_self");
+        const graph = useStore.getState().graphInstance;
+        const filePath = graph?.hasNode(nodeId)
+          ? (graph.getNodeAttribute(nodeId, "file_path") as string | undefined)
+          : undefined;
+        if (filePath) {
+          window.open(`vscode://file/${filePath}`, "_self");
+        }
         onClose();
       },
     },
