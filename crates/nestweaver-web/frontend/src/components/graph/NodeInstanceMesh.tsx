@@ -43,7 +43,8 @@ void main() {
     float introScale = mix(0.62, 1.0, intro) + rebound;
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
     float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
-    float scale = aSize * introScale * breathe * focusLift;
+    float baseScale = 0.62;
+    float scale = aSize * baseScale * introScale * breathe * focusLift;
 
     vec3 pos = position * scale;
 
