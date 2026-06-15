@@ -102,13 +102,14 @@ async function openOverview(
 
   await dock.getByRole("button", { name: "Settings" }).click();
   await dock.getByRole("button", { name: "Focus Map" }).click();
-  // Close the settings flyout so it doesn't cover other elements
-  await dock.getByRole("button", { name: "Settings" }).click();
 
   const modeIndicator = page.getByRole("button", {
     name: /Overview/,
   });
   await expect(modeIndicator).toBeVisible();
+
+  // Close the settings flyout by clicking outside it
+  await page.locator('[data-testid="graph-panel"]').click({ position: { x: 10, y: 10 } });
 }
 
 test.describe("Graph Explorer", () => {
@@ -294,17 +295,23 @@ test.describe("Graph Explorer", () => {
     const dock = page.getByTestId("control-dock");
 
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: "List" }).click();
+    // Wait for the flyout to appear before clicking List
+    await expect(dock.getByRole("button", { name: /Graph/ })).toBeVisible();
+    await dock.getByRole("button", { name: /List/ }).click();
     await expect(
       page.getByRole("region", { name: "Ranked node table" }),
     ).toBeVisible();
 
-    await dock.getByRole("button", { name: "Matrix" }).click();
+    // Re-open settings if it closed after view change
+    await dock.getByRole("button", { name: "Settings" }).click();
+    await expect(dock.getByRole("button", { name: /Matrix/ })).toBeVisible();
+    await dock.getByRole("button", { name: /Matrix/ }).click();
     await expect(
       page.getByRole("region", { name: "Graph matrix view" }),
     ).toBeVisible();
 
-    // Filter controls are inside the Settings flyout (already open)
+    // Re-open settings to check filter
+    await dock.getByRole("button", { name: "Settings" }).click();
     await expect(page.getByLabel("Scope")).toBeVisible();
   });
 
@@ -353,7 +360,8 @@ test.describe("Graph Explorer", () => {
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: "List" }).click();
+    await expect(dock.getByRole("button", { name: /Graph/ })).toBeVisible();
+    await dock.getByRole("button", { name: /List/ }).click();
 
     const table = page.getByRole("region", { name: "Ranked node table" });
     await expect(table).toBeVisible();
@@ -373,7 +381,8 @@ test.describe("Graph Explorer", () => {
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: "Matrix" }).click();
+    await expect(dock.getByRole("button", { name: /Graph/ })).toBeVisible();
+    await dock.getByRole("button", { name: /Matrix/ }).click();
 
     const matrix = page.getByRole("region", { name: "Graph matrix view" });
     await expect(matrix).toBeVisible();
