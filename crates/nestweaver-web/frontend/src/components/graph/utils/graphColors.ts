@@ -1,41 +1,41 @@
 export const KIND_COLORS: Record<string, string> = {
-  Function: "#3B82F6",
-  Class: "#8B5CF6",
-  Interface: "#14B8A6",
-  Method: "#6366F1",
-  Module: "#F59E0B",
-  Note: "#78716C",
-  Section: "#A8A29E",
-  Tag: "#22C55E",
+  Function: "#1e66f5",
+  Class: "#8839ef",
+  Interface: "#179299",
+  Method: "#7287fd",
+  Module: "#df8e1d",
+  Note: "#7c7f93",
+  Section: "#8c8fa1",
+  Tag: "#40a02b",
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  overview: "#6b7280",
-  calls: "#67e8f9",
-  imports: "#4ade80",
-  extends: "#fb923c",
-  implements: "#22d3ee",
-  wikilink: "#94a3b8",
-  references_code: "#fb7185",
-  tagged_with: "#4ade80",
-  cross_repo_declared: "#38bdf8",
-  cross_repo_suggested: "#38bdf8",
+  overview: "#9ca0b0",
+  calls: "#9ca0b0",
+  imports: "#9ca0b0",
+  extends: "#9ca0b0",
+  implements: "#9ca0b0",
+  wikilink: "#9ca0b0",
+  references_code: "#9ca0b0",
+  tagged_with: "#9ca0b0",
+  cross_repo_declared: "#9ca0b0",
+  cross_repo_suggested: "#9ca0b0",
 };
 
 export function kindColor(kind: string, isDark: boolean): string {
   const dark: Record<string, string> = {
-    Function: "#22d3ee", Class: "#a855f7", Method: "#f472b6",
-    Interface: "#2dd4bf", Trait: "#a3e635", Enum: "#fbbf24",
-    Module: "#fb923c", Extension: "#fb7185", Note: "#c084fc",
-    Section: "#94a3b8", Tag: "#4ade80", Constant: "#38bdf8",
+    Function: "#89b4fa", Class: "#cba6f7", Method: "#b4befe",
+    Interface: "#94e2d5", Trait: "#a6e3a1", Enum: "#f9e2af",
+    Module: "#f9e2af", Extension: "#f38ba8", Note: "#9399b2",
+    Section: "#a6adc8", Tag: "#a6e3a1", Constant: "#89b4fa",
   };
   const light: Record<string, string> = {
-    Function: "#0891b2", Class: "#7c3aed", Method: "#db2777",
-    Interface: "#0d9488", Trait: "#65a30d", Enum: "#d97706",
-    Module: "#ea580c", Extension: "#e11d48", Note: "#7c3aed",
-    Section: "#57534e", Tag: "#16a34a", Constant: "#0284c7",
+    Function: "#1e66f5", Class: "#8839ef", Method: "#7287fd",
+    Interface: "#179299", Trait: "#40a02b", Enum: "#df8e1d",
+    Module: "#df8e1d", Extension: "#d20f39", Note: "#7c7f93",
+    Section: "#8c8fa1", Tag: "#40a02b", Constant: "#1e66f5",
   };
-  return (isDark ? dark : light)[kind] ?? (isDark ? "#64748b" : "#6b7280");
+  return (isDark ? dark : light)[kind] ?? (isDark ? "#585b70" : "#9ca0b0");
 }
 
 export function kindToColor(kind: string): string {
