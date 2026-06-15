@@ -117,10 +117,10 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
           openPreview(result.nodeUid, kind);
         }
       } else {
-        // Clicked on background — deselect and close preview
+        // Clicked on background — deselect, close preview and context menu
         selectNode(null);
-        const closePreview = useStore.getState().closePreview;
-        closePreview();
+        useStore.getState().closePreview();
+        useStore.getState().closeContextMenu();
       }
 
       lastClickRef.current = { time: now, nodeUid: result.nodeUid };
