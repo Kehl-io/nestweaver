@@ -300,13 +300,13 @@ test.describe("Graph Explorer", () => {
       page.getByRole("region", { name: "Ranked node table" }),
     ).toBeVisible();
 
-    await dock.getByRole("button", { name: "Settings" }).click();
+    // Flyout stays open after clicking List — no need to re-open
     await dock.getByRole("button", { name: /Matrix/ }).click();
     await expect(
       page.getByRole("region", { name: "Graph matrix view" }),
     ).toBeVisible();
 
-    await dock.getByRole("button", { name: "Settings" }).click();
+    // Flyout still open — check filter section
     await expect(page.getByLabel("Scope")).toBeVisible();
   });
 
