@@ -214,7 +214,7 @@ export function ControlDock() {
             <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
               Export
             </h2>
-            <ExportMenu onClose={() => setOpen(false)} />
+            <ExportMenu onClose={() => setOpen(false)} inline />
           </div>
         )}
       </div>

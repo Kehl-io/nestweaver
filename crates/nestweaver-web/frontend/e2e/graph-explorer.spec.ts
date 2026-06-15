@@ -295,13 +295,13 @@ test.describe("Graph Explorer", () => {
     const dock = page.getByTestId("control-dock");
 
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /List/ }).click({ force: true });
+    await dock.getByRole("button", { name: /List/ }).click();
     await expect(
       page.getByRole("region", { name: "Ranked node table" }),
     ).toBeVisible();
 
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /Matrix/ }).click({ force: true });
+    await dock.getByRole("button", { name: /Matrix/ }).click();
     await expect(
       page.getByRole("region", { name: "Graph matrix view" }),
     ).toBeVisible();
@@ -355,7 +355,7 @@ test.describe("Graph Explorer", () => {
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /List/ }).click({ force: true });
+    await dock.getByRole("button", { name: /List/ }).click();
 
     const table = page.getByRole("region", { name: "Ranked node table" });
     await expect(table).toBeVisible();
@@ -375,7 +375,7 @@ test.describe("Graph Explorer", () => {
 
     const dock = page.getByTestId("control-dock");
     await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /Matrix/ }).click({ force: true });
+    await dock.getByRole("button", { name: /Matrix/ }).click();
 
     const matrix = page.getByRole("region", { name: "Graph matrix view" });
     await expect(matrix).toBeVisible();
