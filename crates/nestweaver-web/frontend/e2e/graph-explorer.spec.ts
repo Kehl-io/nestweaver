@@ -102,6 +102,8 @@ async function openOverview(
 
   await dock.getByRole("button", { name: "Settings" }).click();
   await dock.getByRole("button", { name: "Focus Map" }).click();
+  // Close the settings flyout so it doesn't cover other elements
+  await dock.getByRole("button", { name: "Settings" }).click();
 
   const modeIndicator = page.getByRole("button", {
     name: /Overview/,
@@ -302,7 +304,7 @@ test.describe("Graph Explorer", () => {
       page.getByRole("region", { name: "Graph matrix view" }),
     ).toBeVisible();
 
-    await dock.getByRole("button", { name: "Filter" }).click();
+    // Filter controls are inside the Settings flyout (already open)
     await expect(page.getByLabel("Scope")).toBeVisible();
   });
 
@@ -317,8 +319,12 @@ test.describe("Graph Explorer", () => {
 
     async function downloadExport(label: RegExp, extension: string) {
       const dock = page.getByTestId("control-dock");
-      await dock.getByRole("button", { name: "Settings" }).click();
-      await dock.getByRole("button", { name: "Export" }).click();
+      // Open the settings flyout if not already open
+      const flyout = dock.locator(".max-h-\\[70vh\\]");
+      if (!(await flyout.isVisible().catch(() => false))) {
+        await dock.getByRole("button", { name: "Settings" }).click();
+      }
+      // Export buttons are directly inside the flyout (no separate Export button)
       const downloadPromise = page.waitForEvent("download");
       await dock.getByRole("button", { name: label }).click();
       const download = await downloadPromise;
