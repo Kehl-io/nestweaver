@@ -41,6 +41,7 @@ function useReducedMotion(): boolean {
 function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const { pick } = useGPUPicking(buffers);
   const selectNode = useStore((s) => s.selectNode);
+  const openPreview = useStore((s) => s.openPreview);
   const hoverNode = useStore((s) => s.hoverNode);
   const exploreNode = useStore((s) => s.exploreNode);
   const setGraphData = useStore((s) => s.setGraphData);
@@ -98,17 +99,20 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
         // Double-click detection: same node within 400ms
         if (prev.nodeUid === result.nodeUid && now - prev.time < 400) {
           exploreNode(result.nodeUid, kind);
+          useStore.getState().closePreview();
         } else {
-          selectNode(result.nodeUid, kind);
+          openPreview(result.nodeUid, kind);
         }
       } else {
-        // Clicked on background — deselect
+        // Clicked on background — deselect and close preview
         selectNode(null);
+        const closePreview = useStore.getState().closePreview;
+        closePreview();
       }
 
       lastClickRef.current = { time: now, nodeUid: result.nodeUid };
     },
-    [pick, camera, size, selectNode, exploreNode],
+    [pick, camera, size, selectNode, openPreview, exploreNode],
   );
 
   const handlePointerMove = useCallback(
