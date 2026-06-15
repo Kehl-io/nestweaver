@@ -29,8 +29,6 @@ function AppContent() {
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
-  const selectedNodeId = useStore((s) => s.selectedNodeId);
-
   // Responsive breakpoint detection
   const [width, setWidth] = useState(window.innerWidth);
   useEffect(() => {
@@ -76,33 +74,11 @@ function AppContent() {
     <div className="flex h-full flex-col overflow-hidden">
       <TopBar />
       {isZen ? (
-        // Zen mode: graph takes full area, detail floats
+        // Zen mode: graph takes full area, NodePreviewCard handles selection detail
         <div className="flex-1 min-h-0 relative">
           <ErrorBoundary>
             {graphView}
           </ErrorBoundary>
-          {selectedNodeId && (
-            <div
-              style={{
-                position: "fixed",
-                bottom: "24px",
-                right: "16px",
-                width: "320px",
-                maxHeight: "58vh",
-                overflowY: "auto",
-                background: "var(--color-surface)",
-                opacity: 0.96,
-                borderRadius: "8px",
-                border: "1px solid var(--color-border)",
-                boxShadow: "0 10px 30px rgba(15,23,42,0.14)",
-                zIndex: 50,
-              }}
-            >
-              <ErrorBoundary>
-                <DetailPanel />
-              </ErrorBoundary>
-            </div>
-          )}
         </div>
       ) : (
         // Normal / responsive layout
