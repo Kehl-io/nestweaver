@@ -14,6 +14,9 @@ export interface GraphSlice {
   openPreview: (id: string, kind?: string | null) => void;
   closePreview: () => void;
   togglePreviewExpanded: () => void;
+  contextMenu: { x: number; y: number; nodeId: string } | null;
+  openContextMenu: (x: number, y: number, nodeId: string) => void;
+  closeContextMenu: () => void;
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
@@ -70,6 +73,7 @@ export const createGraphSlice: StateCreator<
   hoveredNodeId: null,
   previewNodeId: null,
   previewExpanded: false,
+  contextMenu: null,
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
@@ -168,6 +172,16 @@ export const createGraphSlice: StateCreator<
   togglePreviewExpanded: () =>
     set((s) => {
       s.previewExpanded = !s.previewExpanded;
+    }),
+
+  openContextMenu: (x, y, nodeId) =>
+    set((s) => {
+      s.contextMenu = { x, y, nodeId };
+    }),
+
+  closeContextMenu: () =>
+    set((s) => {
+      s.contextMenu = null;
     }),
 
   setGraphMode: (mode) =>

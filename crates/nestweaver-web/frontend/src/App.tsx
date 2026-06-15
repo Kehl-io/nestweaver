@@ -48,13 +48,8 @@ function AppContent() {
     { enableOnFormTags: ["INPUT"] },
   );
 
-  useHotkeys(
-    "escape",
-    () => {
-      if (layoutMode === "zen") setLayoutMode("panels");
-    },
-    { enableOnFormTags: false },
-  );
+  // Escape is handled by GraphPanel's keyboard nav (closes preview, then deselects).
+  // Zen ↔ panels toggle is Cmd+Shift+G only.
 
   // Determine effective layout based on zen mode and viewport width
   const isZen = layoutMode === "zen";

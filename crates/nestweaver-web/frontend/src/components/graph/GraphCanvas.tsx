@@ -62,6 +62,19 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const handlePointerDown = useCallback(
     (event: { nativeEvent: PointerEvent }) => {
       const e = event.nativeEvent;
+
+      // Right-click → context menu (skip normal click logic)
+      if (e.button === 2) {
+        const rect = (e.target as HTMLElement).getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const result = pick(cx, cy, camera, size);
+        if (result.nodeUid) {
+          useStore.getState().openContextMenu(e.clientX, e.clientY, result.nodeUid);
+        }
+        return;
+      }
+
       // Get the canvas-relative position from the DOM event
       const rect = (e.target as HTMLElement).getBoundingClientRect();
       const x = e.clientX - rect.left;
