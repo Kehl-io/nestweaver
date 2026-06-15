@@ -20,9 +20,18 @@ export function NodePreviewCard() {
   const togglePreviewExpanded = useStore((s) => s.togglePreviewExpanded);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
 
+  const graphInstance = useStore((s) => s.graphInstance);
   const { data, loading } = useNodePreview(previewNodeId, selectedNodeKind);
 
   if (!previewNodeId) return null;
+
+  // Fallback info from graph when API detail isn't available
+  const graphNode = previewNodeId && graphInstance?.hasNode(previewNodeId)
+    ? {
+        label: (graphInstance.getNodeAttribute(previewNodeId, "label") as string) || previewNodeId.split(":").pop() || previewNodeId,
+        kind: (graphInstance.getNodeAttribute(previewNodeId, "kind") as string) || selectedNodeKind || "Unknown",
+      }
+    : null;
 
   if (previewExpanded) {
     return (
@@ -58,9 +67,30 @@ export function NodePreviewCard() {
       className="absolute bottom-4 right-4 z-40 flex flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-xl"
       style={{ maxWidth: 360, maxHeight: "50vh" }}
     >
-      {loading || !data ? (
+      {loading ? (
         <div className="flex items-center justify-center p-6 text-sm text-[var(--color-text-muted)]">
-          {loading ? "Loading..." : "No data available"}
+          Loading...
+        </div>
+      ) : !data ? (
+        <div className="px-3 py-3">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              {graphNode && <KindBadge kind={graphNode.kind} />}
+              <span className="text-sm font-semibold text-[var(--color-text)]">
+                {graphNode?.label ?? previewNodeId}
+              </span>
+            </div>
+            <button
+              onClick={closePreview}
+              className="shrink-0 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+              aria-label="Close preview"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-[var(--color-text-muted)]">
+            {previewNodeId}
+          </p>
         </div>
       ) : (
         <>
