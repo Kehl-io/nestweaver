@@ -3,6 +3,7 @@ import { useStore } from "../../stores";
 
 interface Props {
   onClose: () => void;
+  inline?: boolean;
 }
 
 interface ExportNode {
@@ -49,7 +50,7 @@ function downloadBlob(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export function ExportMenu({ onClose }: Props) {
+export function ExportMenu({ onClose, inline }: Props) {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const graph = useStore((s) => s.graphInstance);
@@ -176,7 +177,7 @@ export function ExportMenu({ onClose }: Props) {
   };
 
   return (
-    <div className="absolute right-11 top-0 z-50 min-w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] py-1 shadow-xl">
+    <div className={inline ? "py-1" : "absolute right-11 top-0 z-50 min-w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] py-1 shadow-xl"}>
       <button onClick={exportPng} disabled={exporting}
         className="w-full text-left px-3 py-1.5 text-xs hover:bg-[var(--color-surface-alt)]">
         PNG (quick capture)
