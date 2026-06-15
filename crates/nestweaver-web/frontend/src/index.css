@@ -1,44 +1,57 @@
 @import "tailwindcss";
 
 @theme {
-  --color-fn: #3B82F6;
-  --color-cls: #8B5CF6;
-  --color-ifc: #14B8A6;
-  --color-method: #6366F1;
-  --color-module: #F59E0B;
-  --color-note: #78716C;
-  --color-section: #A8A29E;
-  --color-tag: #22C55E;
-  --color-edge-calls: #9CA3AF;
-  --color-edge-imports: #22C55E;
-  --color-edge-extends: #F97316;
-  --color-edge-implements: #06B6D4;
-  --color-edge-crossdomain: #F43F5E;
-  --color-surface: #ffffff;
-  --color-surface-alt: #f9fafb;
-  --color-border: #e5e7eb;
-  --color-text: #111827;
-  --color-text-muted: #6b7280;
-  --color-graph-bg: #fafbfc;
-  --color-graph-label: #374151;
-  --color-graph-label-hover: #111827;
-  --color-graph-edge: rgba(107, 114, 128, 0.15);
-  --color-graph-dim: #d0d0d0;
-  --color-graph-selection: #0862a7;
+  --color-fn: #1e66f5;
+  --color-cls: #8839ef;
+  --color-ifc: #179299;
+  --color-method: #7287fd;
+  --color-module: #df8e1d;
+  --color-note: #7c7f93;
+  --color-section: #8c8fa1;
+  --color-tag: #40a02b;
+  --color-edge-calls: #9ca0b0;
+  --color-edge-imports: #9ca0b0;
+  --color-edge-extends: #9ca0b0;
+  --color-edge-implements: #9ca0b0;
+  --color-edge-crossdomain: #9ca0b0;
+  --color-surface: #eff1f5;
+  --color-surface-alt: #e6e9ef;
+  --color-border: #ccd0da;
+  --color-text: #4c4f69;
+  --color-text-muted: #6c6f85;
+  --color-graph-bg: #eff1f5;
+  --color-graph-label: #6c6f85;
+  --color-graph-label-hover: #4c4f69;
+  --color-graph-edge: rgba(156, 160, 176, 0.45);
+  --color-graph-dim: #ccd0da;
+  --color-graph-selection: #1e66f5;
 }
 
 :root.dark {
-  --color-surface: #0a0e17;
-  --color-surface-alt: #111827;
-  --color-border: #1e293b;
-  --color-text: #e2e8f0;
-  --color-text-muted: #94a3b8;
-  --color-graph-bg: #06080f;
-  --color-graph-label: #cbd5e1;
-  --color-graph-label-hover: #f1f5f9;
-  --color-graph-edge: rgba(34, 211, 238, 0.12);
-  --color-graph-dim: #1a1a2e;
-  --color-graph-selection: #5ed0fe;
+  --color-fn: #89b4fa;
+  --color-cls: #cba6f7;
+  --color-ifc: #94e2d5;
+  --color-method: #b4befe;
+  --color-module: #f9e2af;
+  --color-note: #9399b2;
+  --color-section: #a6adc8;
+  --color-tag: #a6e3a1;
+  --color-edge-calls: #585b70;
+  --color-edge-imports: #585b70;
+  --color-edge-extends: #585b70;
+  --color-edge-implements: #585b70;
+  --color-edge-crossdomain: #585b70;
+  --color-surface: #1e1e2e;
+  --color-surface-alt: #313244;
+  --color-border: #45475a;
+  --color-text: #cdd6f4;
+  --color-text-muted: #a6adc8;
+  --color-graph-bg: #1e1e2e;
+  --color-graph-label: #a6adc8;
+  --color-graph-label-hover: #cdd6f4;
+  --color-graph-edge: rgba(88, 91, 112, 0.5);
+  --color-graph-dim: #313244;
+  --color-graph-selection: #89b4fa;
 }
 
 html, body, #root {
@@ -51,7 +64,7 @@ html, body, #root {
 }
 
 ::selection {
-  background: #3B82F640;
+  background: #89b4fa40;
 }
 
 ::-webkit-scrollbar {
@@ -89,45 +102,30 @@ html, body, #root {
   position: relative;
   z-index: 1;
   display: block;
-  padding: 1px 3px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.68);
+  padding: 0;
+  background: transparent;
   color: var(--color-graph-label);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
   line-height: 1.15;
   text-rendering: geometricPrecision;
   -webkit-font-smoothing: antialiased;
   transform: translateZ(0);
-  filter: drop-shadow(0 1px 1px rgba(15, 23, 42, 0.12));
 }
 
 :root.dark .graph-node-label {
-  background: rgba(6, 8, 15, 0.62);
-  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.36));
+  background: transparent;
 }
 
 .graph-node-label-focus {
-  background: rgba(255, 255, 255, 0.52);
   color: color-mix(in srgb, var(--color-graph-label) 84%, transparent);
-}
-
-:root.dark .graph-node-label-focus {
-  background: rgba(6, 8, 15, 0.48);
 }
 
 .graph-node-label-hovered {
   color: var(--color-graph-label-hover);
-  background: rgba(255, 255, 255, 0.82);
 }
 
 .graph-node-label-selected {
-  background: color-mix(in srgb, var(--color-graph-selection) 16%, white);
-  color: var(--color-text);
-}
-
-:root.dark .graph-node-label-selected {
-  background: color-mix(in srgb, var(--color-graph-selection) 30%, var(--color-surface));
   color: var(--color-text);
 }
 
@@ -173,8 +171,8 @@ html, body, #root {
 }
 
 :root.dark .glass-panel {
-  background: rgba(6, 8, 15, 0.92);
-  border: 1px solid rgba(34, 211, 238, 0.08);
+  background: rgba(30, 30, 46, 0.92);
+  border: 1px solid rgba(69, 71, 90, 0.3);
 }
 
 /* Cursor-responsive light effect */
