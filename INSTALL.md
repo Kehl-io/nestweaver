@@ -7,7 +7,7 @@ Step-by-step guide for installing and configuring NestWeaver.
 ```bash
 npm install -g @kehl-io/nestweaver
 nestweaver --version
-# Expected: nestweaver 0.1.0
+# Expected: nestweaver X.Y.Z
 ```
 
 ## Option 2: Cargo (Rust users)
@@ -15,7 +15,7 @@ nestweaver --version
 ```bash
 cargo install nestweaver
 nestweaver --version
-# Expected: nestweaver 0.1.0
+# Expected: nestweaver X.Y.Z
 ```
 
 ## Option 3: Pre-built binary
