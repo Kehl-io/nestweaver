@@ -23,6 +23,7 @@ use nestweaver_engine::{
     save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
     truncate_to_budget,
 };
+use nestweaver_schema::SymbolKind;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source writes directly using these primitives.
@@ -613,7 +614,21 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let res = store
         .regex_search(pattern, path_prefix, kinds.as_deref(), limit, max_millis)
         .map_err(|e| anyhow!("regex_search: {e}"))?;
-    Ok(serde_json::to_value(res)?)
+    let mut resp = serde_json::to_value(res)?;
+    if resp
+        .get("results")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| a.is_empty())
+        && resp
+            .get("truncated")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false)
+    {
+        resp["note"] = json!(
+            "Pattern matched no candidates within the scan budget. Results may exist beyond the scanned range."
+        );
+    }
+    Ok(resp)
 }
 
 fn tool_schema_regex_search() -> Value {
@@ -2367,11 +2382,35 @@ fn tool_schema_backlinks() -> Value {
     })
 }
 
+fn slug_normalize(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let target_uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
         uid.to_string()
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        let matches = store.lookup_notes_by_title(title)?;
+        let mut matches = store.lookup_notes_by_title(title)?;
+        // Fallback: case-insensitive match
+        if matches.is_empty() {
+            let needle = title.to_lowercase();
+            if let Ok(all_notes) = store.list_notes(None) {
+                matches = all_notes
+                    .into_iter()
+                    .filter(|n| {
+                        n.title.to_lowercase() == needle
+                            || slug_normalize(&n.title) == slug_normalize(title)
+                    })
+                    .collect();
+            }
+        }
         match matches.into_iter().next() {
             Some(n) => n.uid,
             None => return Err(anyhow!("no note found with title '{title}'")),
@@ -3100,6 +3139,39 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     visited.insert(root.uid.clone());
 
     let opts = FlowTraceOpts { max_depth, concise };
+
+    // Classes don't have CALLS edges — only their methods do. When the root
+    // symbol is a class, expand to its methods and return a flow tree per method.
+    if root.kind == SymbolKind::Class {
+        let direct_callees = store.callees_of(&root.uid).unwrap_or_default();
+        if direct_callees.is_empty() {
+            // Fall back: find method/function symbols declared in the same file.
+            let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
+            let method_trees: Vec<Value> = file_symbols
+                .iter()
+                .filter(|s| {
+                    s.uid != root.uid
+                        && (s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
+                })
+                .take(max_depth)
+                .map(|s| {
+                    let mut v = visited.clone();
+                    v.insert(s.uid.clone());
+                    build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
+                })
+                .collect();
+
+            return Ok(json!({
+                "root_uid": root.uid,
+                "root_name": root.name,
+                "root_kind": "class",
+                "max_depth": max_depth,
+                "note": "Class expanded to its methods — classes have no direct CALLS edges",
+                "methods": method_trees,
+            }));
+        }
+    }
+
     let tree = build_flow_tree(
         store,
         &root.uid,
@@ -4309,9 +4381,13 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 
     // Attach cluster IDs if clustering sidecar exists.
     let db_path = current_db_path(store).unwrap_or_default();
-    if let Ok(Some(clustering)) = load_clusters(&db_path) {
-        attach_cluster_ids(&mut hubs, &clustering);
-    }
+    let clustering_available = match load_clusters(&db_path) {
+        Ok(Some(clustering)) => {
+            attach_cluster_ids(&mut hubs, &clustering);
+            true
+        }
+        _ => false,
+    };
 
     let nodes_json: Vec<Value> = hubs
         .iter()
@@ -4336,11 +4412,18 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         })
         .collect();
 
-    Ok(json!({
+    let mut resp = json!({
         "top_n": top_n,
         "count": nodes_json.len(),
         "hubs": nodes_json,
-    }))
+        "clustering_available": clustering_available,
+    });
+    if !clustering_available {
+        resp["note"] = json!(
+            "cluster_id is null because clustering has not been computed. Run 'nestweaver cluster' to populate."
+        );
+    }
+    Ok(resp)
 }
 
 // ── 20. bridge_nodes ──────────────────────────────────────────────────────
