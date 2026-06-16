@@ -165,7 +165,8 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// Skip the daemon and open the database directly (not recommended)
+    /// Open the database directly for reads instead of routing through the daemon.
+    /// Write operations always go through the daemon regardless of this flag.
     #[arg(long, global = true)]
     no_daemon: bool,
 }
@@ -671,7 +672,8 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
-        /// Skip the daemon and open the database directly (not recommended)
+        /// Open the database directly for reads instead of routing through the daemon.
+        /// Write operations always go through the daemon regardless of this flag.
         #[arg(long)]
         no_daemon: bool,
     },
@@ -2209,8 +2211,10 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     Ok(store)
 }
 
-/// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
-/// `.pagerank.json` sidecar convention.
+/// Stop the daemon to acquire the write lock for direct indexing.
+///
+/// Only used in the `!use_daemon` fallback (test/CI via `NESTWEAVER_NO_DAEMON=1`).
+/// In production, all writes route through daemon RPCs and this function is never called.
 fn stop_daemon_if_running(db_path: &Path) -> bool {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
@@ -2232,7 +2236,8 @@ fn stop_daemon_if_running(db_path: &Path) -> bool {
     was_running
 }
 
-/// Restarts the daemon, logging a warning if it fails.
+/// Restarts the daemon after a direct-write operation.
+/// Only used in the `!use_daemon` fallback (test/CI).
 fn restart_daemon(db_path: &Path, config: Option<&Path>) {
     eprintln!("Restarting daemon...");
     if let Err(e) = nestweaver_client::autostart::ensure_daemon(db_path, config) {
@@ -5371,7 +5376,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let repo_url = format!("file://{}", repo_path.display());
 
-            // If a daemon holds the write lock, stop it so we can index directly.
+            // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             let daemon_was_running = stop_daemon_if_running(&db_path);
 
             out.status(&format!("Indexing {}", repo_path.display()));
@@ -6568,7 +6573,7 @@ fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // If a daemon holds the write lock, stop it so we can index directly.
+            // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             let daemon_was_running_brain = stop_daemon_if_running(&db_path);
 
             let result = index_markdown_directory_with_ignore(
