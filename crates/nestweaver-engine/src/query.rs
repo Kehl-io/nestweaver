@@ -1478,10 +1478,15 @@ pub(crate) fn render_brain_node(
             body_complete: true,
         }))
     } else if uid.starts_with("tag:") {
+        let tag_name = uid.rsplit(':').next().unwrap_or(uid).to_string();
         Ok(Some(BrainNode {
             uid: uid.to_string(),
             kind: "Tag".to_string(),
-            title: uid.to_string(),
+            title: if tag_name.is_empty() {
+                uid.to_string()
+            } else {
+                tag_name
+            },
             location: String::new(),
             relevance: score,
             inline_body: None,
