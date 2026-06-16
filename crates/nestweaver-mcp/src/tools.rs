@@ -1753,7 +1753,18 @@ fn tool_brain_search(
                 group.best_title = store
                     .lookup_note(&group.note_uid)
                     .map(|n| n.title)
-                    .unwrap_or_else(|_| group.note_uid.clone());
+                    .unwrap_or_else(|_| {
+                        if group.note_uid.starts_with("tag:") {
+                            group
+                                .note_uid
+                                .rsplit(':')
+                                .next()
+                                .unwrap_or(&group.note_uid)
+                                .to_string()
+                        } else {
+                            group.note_uid.clone()
+                        }
+                    });
             }
         }
 
@@ -2055,6 +2066,7 @@ fn group_search_hits_by_note(
         best_score: f32,
         best_title: String,
         vault_uid: String,
+        file_path: String,
         matched_headings: Vec<String>,
     }
 
@@ -2078,11 +2090,16 @@ fn group_search_hits_by_note(
 
         let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
             note_order.push(parent_note_uid.clone());
+            let file_path = store
+                .lookup_note(&parent_note_uid)
+                .map(|n| n.file_path)
+                .unwrap_or_default();
             NoteGroup {
                 note_uid: parent_note_uid.clone(),
                 best_score: 0.0,
                 best_title: String::new(),
                 vault_uid: h.vault_uid.clone(),
+                file_path,
                 matched_headings: Vec::new(),
             }
         });
@@ -2099,12 +2116,25 @@ fn group_search_hits_by_note(
     }
 
     // For groups that had no direct note title match, look up the note title.
+    // Tag UIDs (tag:...) won't resolve via lookup_note — extract the tag name
+    // from the last UID segment instead of showing the raw UID.
     for group in groups.values_mut() {
         if group.best_title.is_empty() {
             group.best_title = store
                 .lookup_note(&group.note_uid)
                 .map(|n| n.title)
-                .unwrap_or_else(|_| group.note_uid.clone());
+                .unwrap_or_else(|_| {
+                    if group.note_uid.starts_with("tag:") {
+                        group
+                            .note_uid
+                            .rsplit(':')
+                            .next()
+                            .unwrap_or(&group.note_uid)
+                            .to_string()
+                    } else {
+                        group.note_uid.clone()
+                    }
+                });
         }
     }
 
@@ -2132,6 +2162,7 @@ fn group_search_hits_by_note(
                     "kind": "note",
                     "title": g.best_title,
                     "score": g.best_score,
+                    "location": g.file_path,
                     "vault_uid": g.vault_uid,
                     "matched_headings": g.matched_headings,
                 })
@@ -4754,23 +4785,39 @@ pub fn dispatch_via_daemon(
                     .await
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 let inner = resp.into_inner();
-                // Serialize the typed response back to JSON.
+                let is_concise = str_field("response_format").eq_ignore_ascii_case("concise");
+                // Serialize the typed response back to JSON, respecting
+                // concise mode (which deliberately omits uid/score/location).
                 let results: Vec<serde_json::Value> = inner
                     .results
                     .iter()
                     .map(|r| {
-                        let mut obj = serde_json::json!({
-                            "uid": r.uid,
-                            "kind": r.kind,
-                            "title": r.title,
-                            "score": r.score,
-                            "location": r.location,
-                            "matched_headings": r.matched_headings,
-                        });
-                        if !r.inline_body.is_empty() {
-                            obj["inline_body"] = serde_json::json!(r.inline_body);
+                        if is_concise {
+                            let mut obj = serde_json::json!({
+                                "kind": r.kind,
+                                "title": r.title,
+                                "matched_headings": r.matched_headings,
+                            });
+                            if !r.location.is_empty() {
+                                obj["location"] = serde_json::json!(r.location);
+                            }
+                            obj
+                        } else {
+                            let mut obj = serde_json::json!({
+                                "uid": r.uid,
+                                "kind": r.kind,
+                                "title": r.title,
+                                "score": r.score,
+                                "matched_headings": r.matched_headings,
+                            });
+                            if !r.location.is_empty() {
+                                obj["location"] = serde_json::json!(r.location);
+                            }
+                            if !r.inline_body.is_empty() {
+                                obj["inline_body"] = serde_json::json!(r.inline_body);
+                            }
+                            obj
                         }
-                        obj
                     })
                     .collect();
                 let value = serde_json::json!({
