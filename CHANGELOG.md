@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.25.1](https://github.com/Kehl-io/nestweaver/compare/v0.25.0...v0.25.1) (2026-06-16)
+
+
+### Bug Fixes
+
+* address code review findings for production readiness ([4ac2627](https://github.com/Kehl-io/nestweaver/commit/4ac262714641557675bc80e24802bbcb698ffd86))
+* **daemon:** serialize env-mutating lifecycle tests to prevent flaky failures ([ed3eed3](https://github.com/Kehl-io/nestweaver/commit/ed3eed3e8e2b2964b502fa6004dc693f1b1025d4))
+* **engine:** correct contract_drift boundary check, use store lookup for tag titles ([d1f034d](https://github.com/Kehl-io/nestweaver/commit/d1f034d28fb1d253706558d0f15ef07be9a9d9c5))
+* **engine:** prevent double-concatenation of Spring/NestJS route prefixes in contract_drift ([c8110c8](https://github.com/Kehl-io/nestweaver/commit/c8110c8d873dc409113223819c7437ec6ddd4e5f))
+* **engine:** resolve tag titles in brain_context instead of showing raw UIDs ([ac4c3a6](https://github.com/Kehl-io/nestweaver/commit/ac4c3a6cbd1702cadad08cdaed3a18fe88e40364))
+* **mcp:** brain_search concise mode, stale_check commits behind, pagination limits ([b6db270](https://github.com/Kehl-io/nestweaver/commit/b6db270d50b7b86882eea90e4dd1b1ddba74d68f))
+* **mcp:** centralize limit default, fix inner-class flow_trace in tools ([27b53ff](https://github.com/Kehl-io/nestweaver/commit/27b53ff192d7acb0cac6fd545daf8f71f138c3c8))
+* **mcp:** collapse nested if-let blocks to satisfy clippy collapsible_if ([6cbcb75](https://github.com/Kehl-io/nestweaver/commit/6cbcb75476eaf377a87c66a847745faf6f5fa982))
+* **mcp:** compute staleness_commits_behind in stale_check, add limit to broken_links and orphan_documents ([5bab151](https://github.com/Kehl-io/nestweaver/commit/5bab15128d201a9dde68acf7a32b130280e57ffb))
+* **mcp:** fix flow_trace class expansion, add pagination to 8 tools, slug-tolerant note_get ([d796686](https://github.com/Kehl-io/nestweaver/commit/d79668623fefbc8326042aa60df231d5f2cb7938))
+* **mcp:** respect concise mode in daemon search proxy, add note location, fix tag title fallback ([98ce6cc](https://github.com/Kehl-io/nestweaver/commit/98ce6cc5165f74afa0a1b75fc1808524be8a71db))
+* **mcp:** slug-tolerant backlinks lookup, hub_nodes clustering hint, regex_search truncated clarity ([9b57f66](https://github.com/Kehl-io/nestweaver/commit/9b57f6642604b74ce8b7c12ded908c2b1ce0ddd8))
+* **proto:** mark semantically-optional proto3 fields as optional ([e2b59a9](https://github.com/Kehl-io/nestweaver/commit/e2b59a9aa71116492f417b7cc1851d7c33384c6d))
+* **store:** add members_of() query and fix inner-class flow_trace scoping ([f1d0f5c](https://github.com/Kehl-io/nestweaver/commit/f1d0f5c812f4ee647b6fb0d3f3cdae7dafed1a3a))
+
+
+### Performance Improvements
+
+* **store:** add lookup_tag() for O(1) tag resolution, replace list_tags() scans ([1b9f15b](https://github.com/Kehl-io/nestweaver/commit/1b9f15b0bffee59ee25cc820875a8a011c962fe0))
+
 ## [0.25.0](https://github.com/Kehl-io/nestweaver/compare/v0.24.0...v0.25.0) (2026-06-16)
 
 
