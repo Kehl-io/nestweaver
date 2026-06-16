@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
+use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
 use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, affected_tests,
     analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
@@ -704,7 +705,7 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
@@ -728,7 +729,7 @@ fn tool_schema_brain_broken_links() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max broken links to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -743,7 +744,7 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let all_orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
     let total = all_orphans.len();
     let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
@@ -769,7 +770,7 @@ fn tool_schema_brain_orphan_documents() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max orphan documents to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -785,7 +786,7 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let all_clusters = topic_clusters(store, resolution)?;
     let total = all_clusters.len();
     let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
@@ -809,7 +810,7 @@ fn tool_schema_brain_topic_clusters() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max clusters to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -821,7 +822,7 @@ fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
     match args.get("tag") {
@@ -852,7 +853,7 @@ fn tool_schema_brain_tag_graph() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max tags to return in the all-tags listing (default 50). Ignored when a specific tag is queried.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -902,7 +903,7 @@ fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyh
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let mut report = serde_json::to_value(memory_lint(store, now_epoch_secs())?)?;
     // Truncate each lint category to `limit` and report totals.
     if let Some(obj) = report.as_object_mut() {
@@ -932,7 +933,7 @@ fn tool_schema_brain_memory_lint() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max results per lint category (default 50). Totals are always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -945,7 +946,7 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
     // Truncate proposals to limit and report total.
     if let Some(obj) = manifest.as_object_mut() {
@@ -978,7 +979,7 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max proposals to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -3012,7 +3013,7 @@ fn tool_schema_cross_repo_contracts() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max contract links to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -3031,7 +3032,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
 
     let refs = store
         .cross_repo_links(&uid)
@@ -3093,7 +3094,7 @@ fn tool_schema_contract_drift() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max results per drift bucket (default 50). Totals are always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             }
         }
@@ -3106,7 +3107,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
     let dni_total = report.declared_not_implemented.len();
@@ -3146,7 +3147,7 @@ fn tool_schema_brain_impact() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max impact nodes to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 },
                 "response_format": {
                     "type": "string",
@@ -3170,7 +3171,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
     let concise = is_concise(&args);
 
     let uid = resolve_symbol_uid(store, symbol)?;
@@ -3286,36 +3287,57 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     if root.kind == SymbolKind::Class {
         let direct_callees = store.callees_of(&root.uid).unwrap_or_default();
         if direct_callees.is_empty() {
-            // Fall back: find method/function symbols declared in the same file.
+            // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
+            let members = store.members_of(&root.uid).unwrap_or_default();
             let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
 
-            // Filter to only methods whose start_line falls within this class's
-            // range (between root.start_line and the next class's start_line or
-            // EOF). This avoids including methods from other classes in the file.
-            let next_class_line = file_symbols
-                .iter()
-                .filter(|s| s.kind == SymbolKind::Class && s.start_line > root.start_line)
-                .map(|s| s.start_line)
-                .min()
-                .unwrap_or(u32::MAX);
+            let is_method = |s: &nestweaver_schema::Symbol| {
+                s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
+            };
 
-            // Cap at 20 methods, not max_depth (which controls tree depth).
             const MAX_METHODS: usize = 20;
-            let method_trees: Vec<Value> = file_symbols
-                .iter()
-                .filter(|s| {
-                    s.uid != root.uid
-                        && (s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
-                        && s.start_line > root.start_line
-                        && s.start_line < next_class_line
-                })
-                .take(MAX_METHODS)
-                .map(|s| {
-                    let mut v = visited.clone();
-                    v.insert(s.uid.clone());
-                    build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
-                })
-                .collect();
+            let method_trees: Vec<Value> = if !members.is_empty() {
+                members
+                    .iter()
+                    .filter(|s| is_method(s))
+                    .take(MAX_METHODS)
+                    .map(|s| {
+                        let mut v = visited.clone();
+                        v.insert(s.uid.clone());
+                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
+                    })
+                    .collect()
+            } else {
+                // Fallback: line-range heuristic excluding methods inside nested classes.
+                let nested_class_ranges: Vec<(u32, u32)> = file_symbols
+                    .iter()
+                    .filter(|s| {
+                        s.kind == SymbolKind::Class
+                            && s.uid != root.uid
+                            && s.start_line > root.start_line
+                            && s.end_line <= root.end_line
+                    })
+                    .map(|s| (s.start_line, s.end_line))
+                    .collect();
+                file_symbols
+                    .iter()
+                    .filter(|s| {
+                        s.uid != root.uid
+                            && is_method(s)
+                            && s.start_line > root.start_line
+                            && s.start_line <= root.end_line
+                            && !nested_class_ranges
+                                .iter()
+                                .any(|&(start, end)| s.start_line >= start && s.start_line <= end)
+                    })
+                    .take(MAX_METHODS)
+                    .map(|s| {
+                        let mut v = visited.clone();
+                        v.insert(s.uid.clone());
+                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
+                    })
+                    .collect()
+            };
 
             return Ok(json!({
                 "root_uid": root.uid,
@@ -3873,7 +3895,7 @@ fn tool_schema_brain_diff() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Max affected symbols to return (default 50). The total count is always reported.",
-                    "default": 50
+                    "default": DEFAULT_RESULT_LIMIT
                 }
             },
             "required": ["repo"]
@@ -3893,7 +3915,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_RESULT_LIMIT);
 
     // Find the repo in the graph.
     let repos = store.list_repos(None)?;
@@ -5079,14 +5101,18 @@ pub fn dispatch_via_daemon(
             // ── Typed hot-path RPCs ──────────────────────────────────
             "brain_search" => {
                 use nestweaver_proto::BrainSearchRequest;
+                let opt_str = |key: &str| -> Option<String> {
+                    let v = str_field(key);
+                    if v.is_empty() { None } else { Some(v) }
+                };
                 let req = tonic::Request::new(BrainSearchRequest {
                     query: str_field("query"),
                     limit: i32_field("limit"),
-                    response_format: str_field("response_format"),
+                    response_format: opt_str("response_format"),
                     include_bodies: bool_field("include_bodies"),
                     prf: bool_field("prf"),
                     rerank: bool_field("rerank"),
-                    root: str_field("root"),
+                    root: opt_str("root"),
                 });
                 let resp = client
                     .search(req)
@@ -5106,8 +5132,8 @@ pub fn dispatch_via_daemon(
                                 "title": r.title,
                                 "matched_headings": r.matched_headings,
                             });
-                            if !r.location.is_empty() {
-                                obj["location"] = serde_json::json!(r.location);
+                            if let Some(ref loc) = r.location {
+                                obj["location"] = serde_json::json!(loc);
                             }
                             obj
                         } else {
@@ -5118,11 +5144,11 @@ pub fn dispatch_via_daemon(
                                 "score": r.score,
                                 "matched_headings": r.matched_headings,
                             });
-                            if !r.location.is_empty() {
-                                obj["location"] = serde_json::json!(r.location);
+                            if let Some(ref loc) = r.location {
+                                obj["location"] = serde_json::json!(loc);
                             }
-                            if !r.inline_body.is_empty() {
-                                obj["inline_body"] = serde_json::json!(r.inline_body);
+                            if let Some(ref body) = r.inline_body {
+                                obj["inline_body"] = serde_json::json!(body);
                             }
                             obj
                         }
@@ -5188,9 +5214,13 @@ pub fn dispatch_via_daemon(
             }
             "note_get" => {
                 use nestweaver_proto::NoteGetRequest;
+                let opt_str_ng = |key: &str| -> Option<String> {
+                    let v = str_field(key);
+                    if v.is_empty() { None } else { Some(v) }
+                };
                 let req = tonic::Request::new(NoteGetRequest {
-                    uid: str_field("uid"),
-                    title: str_field("title"),
+                    uid: opt_str_ng("uid"),
+                    title: opt_str_ng("title"),
                     include_body: bool_field("include_body"),
                     sections: str_array("sections"),
                 });
@@ -5207,8 +5237,8 @@ pub fn dispatch_via_daemon(
                     "word_count": inner.word_count,
                     "section_count": inner.section_count,
                 });
-                if !inner.body.is_empty() {
-                    value["body"] = serde_json::json!(inner.body);
+                if let Some(ref body) = inner.body {
+                    value["body"] = serde_json::json!(body);
                 }
                 Ok(serde_json::to_string(&value)?)
             }
