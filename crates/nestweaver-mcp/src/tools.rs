@@ -17,14 +17,17 @@ use nestweaver_engine::{
     build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
     detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
-    index_directory, index_markdown_directory, investigate, investigate_expand,
-    investigate_hydrate, load_alias_sidecar, load_clusters, load_extensions, memory_consolidate,
-    memory_lint, memory_related, orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies,
-    query_by_property, render_text, save_extensions, search_symbols, set_property, tag_graph,
-    tag_graph_all, topic_clusters, truncate_to_budget,
+    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
+    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
+    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
+    truncate_to_budget,
 };
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
+// In non-daemon builds, brain_add_source writes directly using these primitives.
+#[cfg(not(feature = "daemon"))]
+use nestweaver_engine::{index_directory, index_markdown_directory};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -2589,102 +2592,222 @@ fn tool_schema_brain_add_source() -> Value {
 }
 
 fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    if !ALLOW_ADD_SOURCES.with(|c| c.get()) {
-        return Err(anyhow!(
-            "brain_add_source is disabled in --no-daemon mode. \
-             Use daemon mode (the default) or pass --allow-mcp-add-sources."
-        ));
-    }
-    let raw_path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'path' must be a string"))?;
-    let expanded = expand_tilde(raw_path);
-    let path = Path::new(&expanded);
-    if !path.exists() {
-        return Err(anyhow!("path does not exist: {}", path.display()));
-    }
-    if !path.is_dir() {
-        return Err(anyhow!("path is not a directory: {}", path.display()));
-    }
-    // SECURITY: refuse paths that contain `..` components after
-    // canonicalisation. Stops the MCP caller (or a prompt-injected
-    // Claude) from descending into system directories via traversal.
-    let canonical =
-        std::fs::canonicalize(path).map_err(|e| anyhow!("could not canonicalize path: {e}"))?;
-    if canonical
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
+    // Always route through the daemon (start it if needed). This ensures
+    // consistent write serialization whether or not the MCP server itself
+    // was started in daemon mode.
+    //
+    // We cannot depend on `nestweaver-client` here because that crate
+    // depends on `nestweaver-daemon`, which depends back on this crate
+    // (`nestweaver-mcp`). Instead, we inline the minimal socket-path
+    // derivation and process-spawn logic that mirrors
+    // `nestweaver_client::autostart::ensure_daemon`.
+    #[cfg(feature = "daemon")]
     {
-        return Err(anyhow!(
-            "path contains '..' components after canonicalisation: {}",
-            canonical.display()
-        ));
+        let db_path = current_db_path(store)?;
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+
+        let mut client = rt.block_on(async {
+            use tonic::transport::{Endpoint, Uri};
+
+            let path = sock_path.clone();
+            let channel = Endpoint::try_from("http://[::]:50051")
+                .map_err(|e| anyhow::anyhow!("failed to create endpoint: {e}"))?
+                .connect_with_connector(tower::service_fn(move |_: Uri| {
+                    let path = path.clone();
+                    async move {
+                        let stream = tokio::net::UnixStream::connect(path).await?;
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
+
+            Ok::<_, anyhow::Error>(
+                nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
+                    .max_decoding_message_size(64 * 1024 * 1024)
+                    .max_encoding_message_size(64 * 1024 * 1024),
+            )
+        })?;
+
+        dispatch_add_source_via_daemon(&mut client, &rt, args)
     }
 
-    let has_obsidian = path.join(".obsidian").is_dir();
-    let has_git = path.join(".git").is_dir();
-    let has_any_md = walk_has_markdown(path);
-
-    // Detection priority: Obsidian vault > markdown folder > git repo.
-    if has_obsidian || has_any_md {
-        let kind = if has_obsidian { "obsidian" } else { "markdown" };
-        let name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("vault")
-                    .to_string()
-            });
-        // We need a db_path for index_markdown_directory; but the server
-        // already opened one. Reuse it indirectly: call the in-memory
-        // primitive? No — that doesn't persist. Reopen the same DB by
-        // path. The store doesn't currently expose its underlying path,
-        // so we re-index via the public function and accept that the
-        // server's open handle and the indexer's open handle are two
-        // connections to the same DB.
-        let db_path = current_db_path(store)?;
-        let result =
-            index_markdown_directory(path, &db_path, "default", &name).context("index vault")?;
-        // Record the indexer run timestamp for this vault.
-        if let Err(e) = nestweaver_engine::record_last_indexed_at(&db_path, &result.vault_uid) {
-            tracing::warn!("failed to record last_indexed_at: {e}");
+    // Non-daemon fallback (daemon feature not compiled in).
+    #[cfg(not(feature = "daemon"))]
+    {
+        if !ALLOW_ADD_SOURCES.with(|c| c.get()) {
+            return Err(anyhow!(
+                "brain_add_source is disabled in --no-daemon mode. \
+             Use daemon mode (the default) or pass --allow-mcp-add-sources."
+            ));
         }
-        return Ok(json!({
-            "kind": kind,
-            "name": result.vault_name,
-            "vault_uid": result.vault_uid,
-            "notes": result.notes_count,
-            "headings": result.headings_count,
-            "sections": result.sections_count,
-            "tags": result.tags_count,
-            "wikilinks_resolved": result.wikilinks_resolved,
-            "wikilinks_unresolved": result.wikilinks_unresolved,
-            "skipped_count": result.skipped.len(),
-        }));
+        let raw_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'path' must be a string"))?;
+        let expanded = expand_tilde(raw_path);
+        let path = Path::new(&expanded);
+        if !path.exists() {
+            return Err(anyhow!("path does not exist: {}", path.display()));
+        }
+        if !path.is_dir() {
+            return Err(anyhow!("path is not a directory: {}", path.display()));
+        }
+        // SECURITY: refuse paths that contain `..` components after
+        // canonicalisation. Stops the MCP caller (or a prompt-injected
+        // Claude) from descending into system directories via traversal.
+        let canonical =
+            std::fs::canonicalize(path).map_err(|e| anyhow!("could not canonicalize path: {e}"))?;
+        if canonical
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!(
+                "path contains '..' components after canonicalisation: {}",
+                canonical.display()
+            ));
+        }
+
+        let has_obsidian = path.join(".obsidian").is_dir();
+        let has_git = path.join(".git").is_dir();
+        let has_any_md = walk_has_markdown(path);
+
+        // Detection priority: Obsidian vault > markdown folder > git repo.
+        if has_obsidian || has_any_md {
+            let kind = if has_obsidian { "obsidian" } else { "markdown" };
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("vault")
+                        .to_string()
+                });
+            // We need a db_path for index_markdown_directory; but the server
+            // already opened one. Reuse it indirectly: call the in-memory
+            // primitive? No — that doesn't persist. Reopen the same DB by
+            // path. The store doesn't currently expose its underlying path,
+            // so we re-index via the public function and accept that the
+            // server's open handle and the indexer's open handle are two
+            // connections to the same DB.
+            let db_path = current_db_path(store)?;
+            let result = index_markdown_directory(path, &db_path, "default", &name)
+                .context("index vault")?;
+            // Record the indexer run timestamp for this vault.
+            if let Err(e) = nestweaver_engine::record_last_indexed_at(&db_path, &result.vault_uid) {
+                tracing::warn!("failed to record last_indexed_at: {e}");
+            }
+            return Ok(json!({
+                "kind": kind,
+                "name": result.vault_name,
+                "vault_uid": result.vault_uid,
+                "notes": result.notes_count,
+                "headings": result.headings_count,
+                "sections": result.sections_count,
+                "tags": result.tags_count,
+                "wikilinks_resolved": result.wikilinks_resolved,
+                "wikilinks_unresolved": result.wikilinks_unresolved,
+                "skipped_count": result.skipped.len(),
+            }));
+        }
+
+        if has_git {
+            let db_path = current_db_path(store)?;
+            let url = format!("file://{}", path.display());
+            let result =
+                index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
+            return Ok(json!({
+                "kind": "repo",
+                "url": url,
+                "files": result.files_count,
+                "symbols": result.symbols_count,
+                "edges": result.edges_count,
+                "skipped_count": result.skipped_files.len(),
+            }));
+        }
+
+        Err(anyhow!(
+            "no .md files, no .git/, no .obsidian/ found at {} — nothing to index",
+            path.display()
+        ))
+    } // end #[cfg(not(feature = "daemon"))]
+}
+
+/// Ensure the daemon is running (spawning it if needed) and return the
+/// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
+///
+/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
+/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
+// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
+#[cfg(feature = "daemon")]
+fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Compute the 8-char hex instance ID (same algorithm as lifecycle.rs).
+    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let instance_id = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
+
+    // Compute the runtime directory (same algorithm as lifecycle.rs).
+    let rt_dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(xdg)
+            .join("nestweaver")
+            .join(&instance_id)
+    } else {
+        let uid = unsafe { libc::getuid() };
+        let base = std::env::var("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        base.join(format!("nw-{uid}")).join(&instance_id)
+    };
+    let sock = rt_dir.join("daemon.sock");
+
+    // If the socket already exists, the daemon is running — return immediately.
+    if sock.exists() {
+        return Ok(sock);
     }
 
-    if has_git {
-        let db_path = current_db_path(store)?;
-        let url = format!("file://{}", path.display());
-        let result =
-            index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
-        return Ok(json!({
-            "kind": "repo",
-            "url": url,
-            "files": result.files_count,
-            "symbols": result.symbols_count,
-            "edges": result.edges_count,
-            "skipped_count": result.skipped_files.len(),
-        }));
-    }
+    // Spawn the daemon: `nestweaver daemon --db <path> start`
+    std::fs::create_dir_all(&rt_dir).ok();
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to determine current exe: {e}"))?;
+    std::process::Command::new(&exe)
+        .args(["daemon", "--db"])
+        .arg(db_path)
+        .arg("start")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
 
-    Err(anyhow!(
-        "no .md files, no .git/, no .obsidian/ found at {} — nothing to index",
-        path.display()
+    // Poll for the socket to appear (up to 5s, same as autostart.rs).
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+    let mut delay = std::time::Duration::from_millis(50);
+    while start.elapsed() < timeout {
+        if sock.exists() {
+            return Ok(sock);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_millis(500));
+    }
+    if sock.exists() {
+        return Ok(sock);
+    }
+    Err(anyhow::anyhow!(
+        "daemon socket did not appear within 5s at {}",
+        sock.display()
     ))
 }
 
@@ -4440,6 +4563,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 
 /// Expand a leading `~/` to the user's home directory. Returns the input
 /// unchanged when no expansion is possible.
+#[cfg(not(feature = "daemon"))]
 fn expand_tilde(input: &str) -> String {
     if let Some(stripped) = input.strip_prefix("~/")
         && let Ok(home) = std::env::var("HOME")
@@ -4451,6 +4575,7 @@ fn expand_tilde(input: &str) -> String {
 
 /// Shallow check: does the directory contain any `.md` file in its tree?
 /// Bounded depth to avoid blowing time on huge monorepos.
+#[cfg(not(feature = "daemon"))]
 fn walk_has_markdown(root: &Path) -> bool {
     fn recurse(p: &Path, depth: u32) -> bool {
         if depth > 4 {

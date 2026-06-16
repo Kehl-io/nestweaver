@@ -291,7 +291,7 @@ NestWeaver exposes 38 tools via the [Model Context Protocol](https://modelcontex
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
-nestweaver mcp --no-daemon --db ./nestweaver.lbug                     # bypass daemon (CI/testing)
+nestweaver mcp --no-daemon --db ./nestweaver.lbug                     # read-only direct mode (CI/testing)
 ```
 
 The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.

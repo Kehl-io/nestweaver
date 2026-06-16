@@ -83,6 +83,37 @@ message IndexProgress {
   uint64 symbols_found = 5;
 }
 
+// ─── Write RPCs ─────────────────────────────────────────────────────
+
+message MaterializeProjectsRequest {
+  string config_path = 1;
+  string instance_id = 2;
+}
+
+message RemoveVaultRequest {
+  string vault_uid = 1;
+}
+
+message RemoveVaultResponse {
+  uint64 notes_deleted = 1;
+}
+
+message MergeInstanceRequest {
+  string from_id = 1;
+  string to_id = 2;
+}
+
+message MergeInstanceResponse {
+  uint64 vaults_reparented = 1;
+  uint64 repos_reparented = 2;
+  uint64 projects_reparented = 3;
+  repeated string discarded_vaults = 4;
+}
+
+message PurgeInstanceRequest {
+  string instance_id = 1;
+}
+
 // ─── JSON pass-through for read RPCs ─────────────────────────────────
 
 message JsonRequest {
@@ -217,6 +248,12 @@ service NestWeaverDaemon {
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
   rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
+
+  // Write RPCs
+  rpc MaterializeProjects(MaterializeProjectsRequest) returns (stream IndexProgress);
+  rpc RemoveVault(RemoveVaultRequest) returns (RemoveVaultResponse);
+  rpc MergeInstance(MergeInstanceRequest) returns (MergeInstanceResponse);
+  rpc PurgeInstance(PurgeInstanceRequest) returns (stream IndexProgress);
 
   // Watching
   rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);
