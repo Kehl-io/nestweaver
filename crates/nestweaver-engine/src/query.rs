@@ -1478,14 +1478,10 @@ pub(crate) fn render_brain_node(
             body_complete: true,
         }))
     } else if uid.starts_with("tag:") {
-        // Resolve the human-readable tag name from the store. Tag UIDs are
-        // content-hashed (e.g. tag:vlt:...:fdbd8732e194) so the last segment
-        // is NOT the name. Look it up via list_tags and match by UID.
         let tag_name = store
-            .list_tags(None)
-            .ok()
-            .and_then(|tags| tags.into_iter().find(|t| t.uid == uid).map(|t| t.name))
-            .unwrap_or_else(|| uid.to_string());
+            .lookup_tag(uid)
+            .map(|t| t.name)
+            .unwrap_or_else(|_| uid.to_string());
         Ok(Some(BrainNode {
             uid: uid.to_string(),
             kind: "Tag".to_string(),

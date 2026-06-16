@@ -1879,14 +1879,9 @@ fn tool_brain_search(
                     .unwrap_or_else(|_| {
                         if group.note_uid.starts_with("tag:") {
                             store
-                                .list_tags(None)
-                                .ok()
-                                .and_then(|tags| {
-                                    tags.into_iter()
-                                        .find(|t| t.uid == group.note_uid)
-                                        .map(|t| t.name)
-                                })
-                                .unwrap_or_else(|| group.note_uid.clone())
+                                .lookup_tag(&group.note_uid)
+                                .map(|t| t.name)
+                                .unwrap_or_else(|_| group.note_uid.clone())
                         } else {
                             group.note_uid.clone()
                         }
@@ -2252,14 +2247,9 @@ fn group_search_hits_by_note(
                 .unwrap_or_else(|_| {
                     if group.note_uid.starts_with("tag:") {
                         store
-                            .list_tags(None)
-                            .ok()
-                            .and_then(|tags| {
-                                tags.into_iter()
-                                    .find(|t| t.uid == group.note_uid)
-                                    .map(|t| t.name)
-                            })
-                            .unwrap_or_else(|| group.note_uid.clone())
+                            .lookup_tag(&group.note_uid)
+                            .map(|t| t.name)
+                            .unwrap_or_else(|_| group.note_uid.clone())
                     } else {
                         group.note_uid.clone()
                     }

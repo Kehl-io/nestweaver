@@ -880,6 +880,26 @@ impl GraphStore {
             .collect()
     }
 
+    /// Look up a single Tag by UID.
+    pub fn lookup_tag(&self, uid: &str) -> Result<Tag, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (t:Tag {uid: $uid}) RETURN t.uid, t.vault_uid, t.name";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Tag {
+                uid: extract_string(&row, 0)?,
+                vault_uid: extract_string(&row, 1)?,
+                name: extract_string(&row, 2)?,
+            }),
+            None => Err(StoreError::NotFound),
+        }
+    }
+
     /// Count of all Tag nodes.
     pub fn count_tags(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
@@ -1085,7 +1105,7 @@ impl GraphStore {
             }
             Err(e) => {
                 // WIKILINK_TO_HEADING table may not exist (no heading wikilinks indexed).
-                tracing::trace!("wikilink_sources_to_note: heading path skipped: {e}");
+                tracing::debug!("wikilink_sources_to_note: heading path skipped: {e}");
             }
         }
 
