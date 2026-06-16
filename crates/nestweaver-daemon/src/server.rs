@@ -541,6 +541,7 @@ impl NestWeaverDaemon for DaemonService {
                         files_total: 0,
                         symbols_found: 0,
                     }));
+                    state.active_connections.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             };
