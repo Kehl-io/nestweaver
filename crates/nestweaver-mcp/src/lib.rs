@@ -36,6 +36,7 @@ pub fn run_stdio_server(
     allow_add_sources: bool,
     lite: bool,
     track_interactions: bool,
+    config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
@@ -80,6 +81,39 @@ pub fn run_stdio_server(
     tools::set_current_db_path(canonical_db);
     tools::set_allow_add_sources(allow_add_sources);
     tools::set_lite_mode(lite);
+
+    // Load instance config so tools can read [limits], [response], [ranking], etc.
+    // Try explicit --config path first, then auto-discover instance.toml next to the DB.
+    let (instance_cfg, cfg_source) = if let Some(p) = config_path {
+        match nestweaver_engine::InstanceConfig::from_file(p) {
+            Ok(c) => (Some(c), Some(p.display().to_string())),
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "failed to load --config");
+                (None, None)
+            }
+        }
+    } else {
+        let sibling = db_path.parent().map(|d| d.join("instance.toml"));
+        match sibling.as_deref().and_then(|s| {
+            nestweaver_engine::InstanceConfig::from_file(s)
+                .ok()
+                .map(|c| (c, s.display().to_string()))
+        }) {
+            Some((c, path)) => (Some(c), Some(path)),
+            None => (None, None),
+        }
+    };
+    if let Some(cfg) = instance_cfg {
+        tracing::info!(
+            config = cfg_source.as_deref().unwrap_or("?"),
+            limits.default_result_limit = cfg.limits.default_result_limit,
+            "loaded instance config"
+        );
+        if cfg.cache.max_size_mb > 0 {
+            tools::set_cache_max_size_mb(cfg.cache.max_size_mb);
+        }
+        tools::set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+    }
 
     let tracker: Option<nestweaver_engine::InteractionTracker> = if track_interactions {
         Some(nestweaver_engine::InteractionTracker::new(db_path))

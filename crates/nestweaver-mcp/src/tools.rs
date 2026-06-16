@@ -705,7 +705,7 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let all_links = broken_links(store, max_suggestions)?;
     let total = all_links.len();
     let links: Vec<_> = all_links.into_iter().take(limit).collect();
@@ -744,7 +744,7 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let all_orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
     let total = all_orphans.len();
     let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
@@ -786,7 +786,7 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let all_clusters = topic_clusters(store, resolution)?;
     let total = all_clusters.len();
     let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
@@ -822,7 +822,7 @@ fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
     match args.get("tag") {
@@ -903,7 +903,7 @@ fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyh
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let mut report = serde_json::to_value(memory_lint(store, now_epoch_secs())?)?;
     // Truncate each lint category to `limit` and report totals.
     if let Some(obj) = report.as_object_mut() {
@@ -946,7 +946,7 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
     // Truncate proposals to limit and report total.
     if let Some(obj) = manifest.as_object_mut() {
@@ -1501,9 +1501,7 @@ fn tool_brain_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if include_bodies {
-        // The MCP server has no instance-config handle here, so use the
-        // built-in [response] defaults (threshold 0.75, cap 800 tokens).
-        let response_config = nestweaver_engine::ResponseConfig::default();
+        let response_config = configured_response();
         let root = args
             .get("root")
             .and_then(|v| v.as_str())
@@ -2102,7 +2100,7 @@ fn tool_brain_search(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if include_bodies && !concise {
-        let response_config = nestweaver_engine::ResponseConfig::default();
+        let response_config = configured_response();
         let root = args
             .get("root")
             .and_then(|v| v.as_str())
@@ -3034,7 +3032,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
 
     let refs = store
         .cross_repo_links(&uid)
@@ -3109,7 +3107,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
     let dni_total = report.declared_not_implemented.len();
@@ -3173,7 +3171,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
     let concise = is_concise(&args);
 
     let uid = resolve_symbol_uid(store, symbol)?;
@@ -3919,7 +3917,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_RESULT_LIMIT);
+        .unwrap_or_else(configured_result_limit);
 
     // Find the repo in the graph.
     let repos = store.list_repos(None)?;
@@ -5016,6 +5014,23 @@ pub(crate) fn current_instance_config() -> Option<std::sync::Arc<nestweaver_engi
     CURRENT_INSTANCE_CONFIG.with(|c| c.borrow().clone())
 }
 
+/// Read the configured default result limit from the instance config's
+/// `[limits]` section, falling back to the compile-time constant if no
+/// instance config is installed for this dispatch context.
+fn configured_result_limit() -> usize {
+    current_instance_config()
+        .map(|cfg| cfg.limits.default_result_limit)
+        .unwrap_or(DEFAULT_RESULT_LIMIT)
+}
+
+/// Read the configured `[response]` settings, falling back to defaults if no
+/// instance config is installed for this dispatch context.
+fn configured_response() -> nestweaver_engine::ResponseConfig {
+    current_instance_config()
+        .map(|cfg| cfg.response.clone())
+        .unwrap_or_default()
+}
+
 /// Set the F16 response-cache size cap in MiB (from `[cache] max_size_mb`).
 pub fn set_cache_max_size_mb(mb: u64) {
     CACHE_MAX_SIZE_MB.with(|c| c.set(mb));
@@ -5914,6 +5929,58 @@ mod cache_dispatch_tests {
             cache.is_empty(),
             "write tools must never populate the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod configured_limit_tests {
+    use super::*;
+
+    fn test_config(limit: usize) -> nestweaver_engine::InstanceConfig {
+        serde_json::from_value(serde_json::json!({
+            "instance_id": "test",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" },
+            "limits": { "default_result_limit": limit }
+        }))
+        .expect("valid test config")
+    }
+
+    #[test]
+    fn configured_result_limit_uses_default_without_config() {
+        set_current_instance_config(None);
+        assert_eq!(configured_result_limit(), DEFAULT_RESULT_LIMIT);
+    }
+
+    #[test]
+    fn configured_result_limit_reads_from_instance_config() {
+        let cfg = test_config(7);
+        assert_eq!(cfg.limits.default_result_limit, 7);
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        assert_eq!(configured_result_limit(), 7);
+        set_current_instance_config(None);
+    }
+
+    #[test]
+    fn configured_response_uses_default_without_config() {
+        set_current_instance_config(None);
+        let resp = configured_response();
+        assert!((resp.inline_body_threshold - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn configured_response_reads_from_instance_config() {
+        let mut cfg = test_config(50);
+        cfg.response.inline_body_threshold = 0.5;
+        cfg.response.inline_max_body_tokens = 200;
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        let resp = configured_response();
+        assert!((resp.inline_body_threshold - 0.5).abs() < f64::EPSILON);
+        assert_eq!(resp.inline_max_body_tokens, 200);
+        set_current_instance_config(None);
     }
 }
 
