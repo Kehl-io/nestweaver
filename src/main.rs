@@ -2189,24 +2189,9 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
-    let store = match GraphStore::open(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("lock") || msg.contains("Lock") {
-                tracing::info!("database locked, opening read-only: {}", path.display());
-                GraphStore::open_read_only(path).with_context(|| {
-                    format!(
-                        "failed to open database at {} (read-only fallback also failed)",
-                        path.display()
-                    )
-                })?
-            } else {
-                return Err(e)
-                    .with_context(|| format!("failed to open database at {}", path.display()));
-            }
-        }
-    };
+    let store = GraphStore::open_read_only(path)
+        .with_context(|| format!("failed to open database at {}", path.display()))?;
+
     let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 

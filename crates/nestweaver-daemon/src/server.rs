@@ -22,7 +22,8 @@ use crate::lifecycle;
 
 /// Shared state held by the daemon process.
 pub struct DaemonState {
-    pub store: Arc<GraphStore>,
+    pub store: Arc<GraphStore>,      // Read-write (for write RPCs only)
+    pub store_read: Arc<GraphStore>, // Read-only (for all read RPCs)
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_id: String,
@@ -75,7 +76,7 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             let value = nestweaver_mcp::tools::dispatch(
-                &state.store,
+                &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
@@ -118,7 +119,7 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             nestweaver_mcp::tools::dispatch(
-                &state.store,
+                &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
@@ -1327,6 +1328,11 @@ pub async fn run_server(
         }
     };
 
+    // Open a second read-only connection for read RPCs. This avoids any
+    // risk of read handlers accidentally mutating the write connection.
+    let store_read =
+        GraphStore::open_read_only(&db_path).context("failed to open read-only store")?;
+
     // Load sidecars (PageRank, interaction scores).
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
     let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
@@ -1398,6 +1404,7 @@ pub async fn run_server(
 
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
+        store_read: Arc::new(store_read),
         tantivy,
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
