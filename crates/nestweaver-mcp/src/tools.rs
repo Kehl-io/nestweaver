@@ -685,8 +685,17 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(5);
-    let links = broken_links(store, max_suggestions)?;
-    Ok(json!({ "broken_links": serde_json::to_value(&links)?, "total": links.len() }))
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let all_links = broken_links(store, max_suggestions)?;
+    let total = all_links.len();
+    let links: Vec<_> = all_links.into_iter().take(limit).collect();
+    Ok(
+        json!({ "broken_links": serde_json::to_value(&links)?, "total": total, "returned": links.len() }),
+    )
 }
 
 fn tool_schema_brain_broken_links() -> Value {
@@ -700,6 +709,11 @@ fn tool_schema_brain_broken_links() -> Value {
                     "type": "integer",
                     "description": "Max suggested target UIDs per broken link (default 5).",
                     "default": 5
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max broken links to return (default 50). The total count is always reported.",
+                    "default": 50
                 }
             }
         }
@@ -710,8 +724,17 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
     let vault = args.get("vault").and_then(|v| v.as_str());
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
-    let orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
-    Ok(json!({ "orphans": serde_json::to_value(&orphans)?, "total": orphans.len() }))
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let all_orphans = orphan_documents(store, vault, path_prefix, &allowlist)?;
+    let total = all_orphans.len();
+    let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
+    Ok(
+        json!({ "orphans": serde_json::to_value(&orphans)?, "total": total, "returned": orphans.len() }),
+    )
 }
 
 fn tool_schema_brain_orphan_documents() -> Value {
@@ -727,6 +750,11 @@ fn tool_schema_brain_orphan_documents() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max orphan documents to return (default 50). The total count is always reported.",
+                    "default": 50
                 }
             }
         }
@@ -3381,9 +3409,17 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             get_remote_head(&repo.url)
         };
 
+        // Compute commits behind for local repos when HEAD differs from indexed SHA.
+        let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+            (Some(head), Some(path)) if *head != repo.indexed_sha => {
+                count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
+            }
+            _ => repo.staleness_commits_behind as u64,
+        };
+
         let is_stale = match &current_head {
             Some(head) => head != &repo.indexed_sha,
-            None => repo.staleness_commits_behind > 0,
+            None => commits_behind > 0,
         };
 
         if is_stale {
@@ -3395,7 +3431,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "indexed_sha": repo.indexed_sha,
             "current_head": current_head,
             "is_stale": is_stale,
-            "staleness_commits_behind": repo.staleness_commits_behind,
+            "staleness_commits_behind": commits_behind,
         }));
     }
 
@@ -3417,6 +3453,25 @@ fn get_git_head(repo_path: &str) -> Option<String> {
         .ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Count commits between two SHAs in a local repo.
+fn count_commits_between(repo_path: &str, from_sha: &str, to_sha: &str) -> Option<u64> {
+    let range = format!("{from_sha}..{to_sha}");
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
     } else {
         None
     }
