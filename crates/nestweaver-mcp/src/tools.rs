@@ -2341,15 +2341,14 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
             let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes_lite(None) {
-                if let Some(hit) = all_notes.iter().find(|n| {
+            if let Ok(all_notes) = store.list_notes_lite(None)
+                && let Some(hit) = all_notes.iter().find(|n| {
                     n.title.to_lowercase() == needle
                         || slug_normalize(&n.title) == slug_normalize(title)
-                }) {
-                    if let Ok(note) = store.lookup_note(&hit.uid) {
-                        matches.push(note);
-                    }
-                }
+                })
+                && let Ok(note) = store.lookup_note(&hit.uid)
+            {
+                matches.push(note);
             }
         }
         match matches.into_iter().next() {
@@ -2494,15 +2493,14 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
             let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes_lite(None) {
-                if let Some(hit) = all_notes.iter().find(|n| {
+            if let Ok(all_notes) = store.list_notes_lite(None)
+                && let Some(hit) = all_notes.iter().find(|n| {
                     n.title.to_lowercase() == needle
                         || slug_normalize(&n.title) == slug_normalize(title)
-                }) {
-                    if let Ok(note) = store.lookup_note(&hit.uid) {
-                        matches.push(note);
-                    }
-                }
+                })
+                && let Ok(note) = store.lookup_note(&hit.uid)
+            {
+                matches.push(note);
             }
         }
         match matches.into_iter().next() {
