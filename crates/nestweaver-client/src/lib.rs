@@ -133,4 +133,68 @@ impl DaemonClient {
     pub fn into_inner(self) -> NestWeaverDaemonClient<Channel> {
         self.inner
     }
+
+    /// Materialize projects from config, streaming progress.
+    pub async fn materialize_projects(
+        &mut self,
+        config_path: &str,
+        instance_id: &str,
+    ) -> Result<tonic::Streaming<nestweaver_proto::IndexProgress>> {
+        let resp = self
+            .inner
+            .materialize_projects(nestweaver_proto::MaterializeProjectsRequest {
+                config_path: config_path.to_string(),
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .context("materialize_projects RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Remove a vault and all its notes, headings, sections, tags.
+    pub async fn remove_vault(
+        &mut self,
+        vault_uid: &str,
+    ) -> Result<nestweaver_proto::RemoveVaultResponse> {
+        let resp = self
+            .inner
+            .remove_vault(nestweaver_proto::RemoveVaultRequest {
+                vault_uid: vault_uid.to_string(),
+            })
+            .await
+            .context("remove_vault RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Merge one instance's data into another.
+    pub async fn merge_instance(
+        &mut self,
+        from_id: &str,
+        to_id: &str,
+    ) -> Result<nestweaver_proto::MergeInstanceResponse> {
+        let resp = self
+            .inner
+            .merge_instance(nestweaver_proto::MergeInstanceRequest {
+                from_id: from_id.to_string(),
+                to_id: to_id.to_string(),
+            })
+            .await
+            .context("merge_instance RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Purge all data for an instance, streaming progress.
+    pub async fn purge_instance(
+        &mut self,
+        instance_id: &str,
+    ) -> Result<tonic::Streaming<nestweaver_proto::IndexProgress>> {
+        let resp = self
+            .inner
+            .purge_instance(nestweaver_proto::PurgeInstanceRequest {
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .context("purge_instance RPC failed")?;
+        Ok(resp.into_inner())
+    }
 }
