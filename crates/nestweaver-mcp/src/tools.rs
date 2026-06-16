@@ -316,7 +316,7 @@ fn dispatch_uncached(
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
         "contract_drift" => tool_contract_drift(store, args),
-        "brain_memory_lint" => tool_brain_memory_lint(store),
+        "brain_memory_lint" => tool_brain_memory_lint(store, args),
         "brain_memory_consolidate" => tool_brain_memory_consolidate(store, args),
         "brain_memory_related" => tool_brain_memory_related(store, args),
         other => Err(anyhow!("unknown tool: {other}")),
@@ -781,8 +781,17 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
         .get("resolution")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.5);
-    let clusters = topic_clusters(store, resolution)?;
-    Ok(json!({ "clusters": serde_json::to_value(&clusters)?, "total": clusters.len() }))
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let all_clusters = topic_clusters(store, resolution)?;
+    let total = all_clusters.len();
+    let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
+    Ok(
+        json!({ "clusters": serde_json::to_value(&clusters)?, "total": total, "returned": clusters.len() }),
+    )
 }
 
 fn tool_schema_brain_topic_clusters() -> Value {
@@ -796,6 +805,11 @@ fn tool_schema_brain_topic_clusters() -> Value {
                     "type": "number",
                     "description": "Leiden resolution — higher yields more, smaller clusters (default 0.5).",
                     "default": 0.5
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max clusters to return (default 50). The total count is always reported.",
+                    "default": 50
                 }
             }
         }
@@ -803,12 +817,21 @@ fn tool_schema_brain_topic_clusters() -> Value {
 }
 
 fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
     match args.get("tag") {
         Some(Value::Null) | None => {
-            let tags = tag_graph_all(store)?;
-            Ok(json!({ "tags": serde_json::to_value(&tags)? }))
+            let all_tags = tag_graph_all(store)?;
+            let total = all_tags.len();
+            let tags: Vec<_> = all_tags.into_iter().take(limit).collect();
+            Ok(
+                json!({ "tags": serde_json::to_value(&tags)?, "total": total, "returned": tags.len() }),
+            )
         }
         Some(Value::String(tag)) => {
             let tg = tag_graph(store, tag)?;
@@ -825,7 +848,12 @@ fn tool_schema_brain_tag_graph() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." }
+                "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max tags to return in the all-tags listing (default 50). Ignored when a specific tag is queried.",
+                    "default": 50
+                }
             }
         }
     })
@@ -869,23 +897,70 @@ fn now_epoch_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn tool_brain_memory_lint(store: &GraphStore) -> Result<Value, anyhow::Error> {
-    let report = memory_lint(store, now_epoch_secs())?;
-    Ok(serde_json::to_value(&report)?)
+fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let mut report = serde_json::to_value(memory_lint(store, now_epoch_secs())?)?;
+    // Truncate each lint category to `limit` and report totals.
+    if let Some(obj) = report.as_object_mut() {
+        let mut totals = serde_json::Map::new();
+        for (key, val) in obj.iter_mut() {
+            if let Some(arr) = val.as_array_mut() {
+                let total = arr.len();
+                arr.truncate(limit);
+                totals.insert(format!("{key}_total"), json!(total));
+            }
+        }
+        for (k, v) in totals {
+            obj.insert(k, v);
+        }
+        obj.insert("limit".to_string(), json!(limit));
+    }
+    Ok(report)
 }
 
 fn tool_schema_brain_memory_lint() -> Value {
     json!({
         "name": "brain_memory_lint",
         "description": "Use to audit a markdown 'memory bank' vault for health problems. Runs SEVEN checks and returns them keyed: `stale` (notes marked status:active but unmodified for >90 days), `contradictions` (Supersedes cycles like A→B→A), `orphans` (notes with no inbound/outbound wikilinks), `broken_wikilinks` (ambiguous/low-confidence links), `supersession_chains` (a superseded note still actively linked), `schema_drift` (note frontmatter keys missing vs the _templates/<kind>.md template), `dangling_relationships` (a typed relationship whose target note does not exist). All keys always present; empty on a no-vault DB. Output: `{stale:[...], contradictions:[...], orphans:[...], broken_wikilinks:[...], supersession_chains:[...], schema_drift:[...], dangling_relationships:[...]}`.",
-        "inputSchema": { "type": "object", "properties": {} }
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results per lint category (default 50). Totals are always reported.",
+                    "default": 50
+                }
+            }
+        }
     })
 }
 
 fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
-    let manifest = memory_consolidate(store, apply, now_epoch_secs())?;
-    Ok(serde_json::to_value(&manifest)?)
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
+    // Truncate proposals to limit and report total.
+    if let Some(obj) = manifest.as_object_mut() {
+        let (total, returned) =
+            if let Some(proposals) = obj.get_mut("proposals").and_then(|v| v.as_array_mut()) {
+                let total = proposals.len();
+                proposals.truncate(limit);
+                (total, proposals.len())
+            } else {
+                (0, 0)
+            };
+        obj.insert("proposals_total".to_string(), json!(total));
+        obj.insert("proposals_returned".to_string(), json!(returned));
+    }
+    Ok(manifest)
 }
 
 fn tool_schema_brain_memory_consolidate() -> Value {
@@ -899,6 +974,11 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                     "type": "boolean",
                     "description": "Opt into write-mode: move files to their promoted destinations (default false = safe dry-run).",
                     "default": false
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max proposals to return (default 50). The total count is always reported.",
+                    "default": 50
                 }
             }
         }
@@ -1798,12 +1878,15 @@ fn tool_brain_search(
                     .map(|n| n.title)
                     .unwrap_or_else(|_| {
                         if group.note_uid.starts_with("tag:") {
-                            group
-                                .note_uid
-                                .rsplit(':')
-                                .next()
-                                .unwrap_or(&group.note_uid)
-                                .to_string()
+                            store
+                                .list_tags(None)
+                                .ok()
+                                .and_then(|tags| {
+                                    tags.into_iter()
+                                        .find(|t| t.uid == group.note_uid)
+                                        .map(|t| t.name)
+                                })
+                                .unwrap_or_else(|| group.note_uid.clone())
                         } else {
                             group.note_uid.clone()
                         }
@@ -2159,8 +2242,8 @@ fn group_search_hits_by_note(
     }
 
     // For groups that had no direct note title match, look up the note title.
-    // Tag UIDs (tag:...) won't resolve via lookup_note — extract the tag name
-    // from the last UID segment instead of showing the raw UID.
+    // Tag UIDs (tag:...) won't resolve via lookup_note — resolve the tag name
+    // from the store (the last UID segment is a content hash, not the name).
     for group in groups.values_mut() {
         if group.best_title.is_empty() {
             group.best_title = store
@@ -2168,12 +2251,15 @@ fn group_search_hits_by_note(
                 .map(|n| n.title)
                 .unwrap_or_else(|_| {
                     if group.note_uid.starts_with("tag:") {
-                        group
-                            .note_uid
-                            .rsplit(':')
-                            .next()
-                            .unwrap_or(&group.note_uid)
-                            .to_string()
+                        store
+                            .list_tags(None)
+                            .ok()
+                            .and_then(|tags| {
+                                tags.into_iter()
+                                    .find(|t| t.uid == group.note_uid)
+                                    .map(|t| t.name)
+                            })
+                            .unwrap_or_else(|| group.note_uid.clone())
                     } else {
                         group.note_uid.clone()
                     }
@@ -2257,9 +2343,22 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let note = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
         store.lookup_note(uid).context("lookup_note")?
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        let matches = store
+        let mut matches = store
             .lookup_notes_by_title(title)
             .context("lookup_notes_by_title")?;
+        // Slug-tolerant fallback: case-insensitive + slug normalization.
+        if matches.is_empty() {
+            let needle = title.to_lowercase();
+            if let Ok(all_notes) = store.list_notes(None) {
+                matches = all_notes
+                    .into_iter()
+                    .filter(|n| {
+                        n.title.to_lowercase() == needle
+                            || slug_normalize(&n.title) == slug_normalize(title)
+                    })
+                    .collect();
+            }
+        }
         match matches.into_iter().next() {
             Some(n) => n,
             None => return Err(anyhow!("no note found with title '{title}'")),
@@ -2919,7 +3018,12 @@ fn tool_schema_cross_repo_contracts() -> Value {
             "type": "object",
             "properties": {
                 "uid": { "type": "string", "description": "Symbol UID (e.g. sym:repo:...:hash:42). Preferred for unambiguous lookup." },
-                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." }
+                "name": { "type": "string", "description": "Symbol name (e.g. \"UserService\"). Uses first match if multiple symbols share the name." },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max contract links to return (default 50). The total count is always reported.",
+                    "default": 50
+                }
             }
         }
     })
@@ -2933,6 +3037,11 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     } else {
         return Err(anyhow!("provide either 'uid' or 'name'"));
     };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
 
     let refs = store
         .cross_repo_links(&uid)
@@ -2968,9 +3077,13 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
         }));
     }
 
+    let total = rows.len();
+    rows.truncate(limit);
+
     Ok(json!({
         "uid": uid,
-        "count": rows.len(),
+        "total": total,
+        "returned": rows.len(),
         "note": "Links are hypotheses, not ground truth — check confidence. \
                  link_type \"contract\" denotes an implemented API contract.",
         "contracts": rows,
@@ -2986,7 +3099,12 @@ fn tool_schema_contract_drift() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." }
+                "repo": { "type": "string", "description": "Optional repo UID to scope the analysis to a single repository." },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results per drift bucket (default 50). Totals are always reported.",
+                    "default": 50
+                }
             }
         }
     })
@@ -2994,13 +3112,33 @@ fn tool_schema_contract_drift() -> Value {
 
 fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let repo = args.get("repo").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
+    let dni_total = report.declared_not_implemented.len();
+    let ind_total = report.implemented_not_declared.len();
+    let dni: Vec<_> = report
+        .declared_not_implemented
+        .into_iter()
+        .take(limit)
+        .collect();
+    let ind: Vec<_> = report
+        .implemented_not_declared
+        .into_iter()
+        .take(limit)
+        .collect();
     Ok(json!({
         "note": "Contract links are hypotheses, not ground truth.",
-        "declared_not_implemented": report.declared_not_implemented,
-        "implemented_not_declared": report.implemented_not_declared,
-        "clean": report.is_clean(),
+        "declared_not_implemented": dni,
+        "declared_not_implemented_total": dni_total,
+        "implemented_not_declared": ind,
+        "implemented_not_declared_total": ind_total,
+        "clean": dni_total == 0 && ind_total == 0,
+        "limit": limit,
     }))
 }
 
@@ -3015,6 +3153,11 @@ fn tool_schema_brain_impact() -> Value {
             "properties": {
                 "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Names are resolved via first-match lookup." },
                 "depth": { "type": "integer", "description": "Max traversal depth. Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max impact nodes to return (default 50). The total count is always reported.",
+                    "default": 50
+                },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
@@ -3033,14 +3176,21 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'symbol' is required"))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
     let concise = is_concise(&args);
 
     let uid = resolve_symbol_uid(store, symbol)?;
 
     let nodes = store.impact(&uid, depth, 0.0)?;
+    let total = nodes.len();
 
     let rows: Vec<Value> = nodes
         .iter()
+        .take(limit)
         .map(|n| {
             if concise {
                 json!({
@@ -3066,7 +3216,8 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     Ok(json!({
         "target": uid,
         "impact_nodes": rows,
-        "total": rows.len(),
+        "total": total,
+        "returned": rows.len(),
     }))
 }
 
@@ -3147,13 +3298,28 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         if direct_callees.is_empty() {
             // Fall back: find method/function symbols declared in the same file.
             let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
+
+            // Filter to only methods whose start_line falls within this class's
+            // range (between root.start_line and the next class's start_line or
+            // EOF). This avoids including methods from other classes in the file.
+            let next_class_line = file_symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Class && s.start_line > root.start_line)
+                .map(|s| s.start_line)
+                .min()
+                .unwrap_or(u32::MAX);
+
+            // Cap at 20 methods, not max_depth (which controls tree depth).
+            const MAX_METHODS: usize = 20;
             let method_trees: Vec<Value> = file_symbols
                 .iter()
                 .filter(|s| {
                     s.uid != root.uid
                         && (s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
+                        && s.start_line > root.start_line
+                        && s.start_line < next_class_line
                 })
-                .take(max_depth)
+                .take(MAX_METHODS)
                 .map(|s| {
                     let mut v = visited.clone();
                     v.insert(s.uid.clone());
@@ -3166,7 +3332,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                 "root_name": root.name,
                 "root_kind": "class",
                 "max_depth": max_depth,
-                "note": "Class expanded to its methods — classes have no direct CALLS edges",
+                "note": "Class expanded to its methods — classes have no direct CALLS edges. Methods filtered to this class only.",
                 "methods": method_trees,
             }));
         }
@@ -3713,6 +3879,11 @@ fn tool_schema_brain_diff() -> Value {
                 "since_sha": {
                     "type": "string",
                     "description": "Git SHA to compare against. Defaults to the repo's indexed_sha. Use a specific SHA to diff against an older baseline."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max affected symbols to return (default 50). The total count is always reported.",
+                    "default": 50
                 }
             },
             "required": ["repo"]
@@ -3728,6 +3899,11 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'repo' must be a string"))?;
     let since_sha_arg = args.get("since_sha").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
 
     // Find the repo in the graph.
     let repos = store.list_repos(None)?;
@@ -3817,6 +3993,9 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .map(String::as_str)
         .collect();
 
+    let total_affected = affected_symbols.len();
+    affected_symbols.truncate(limit);
+
     Ok(json!({
         "repo": repo_name,
         "base_sha": base_sha,
@@ -3829,7 +4008,8 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         "deleted_files": deleted,
         "changed_files": all_changed,
         "affected_symbols": affected_symbols,
-        "affected_symbol_count": affected_symbols.len(),
+        "affected_symbol_count": total_affected,
+        "affected_symbols_returned": affected_symbols.len(),
     }))
 }
 
