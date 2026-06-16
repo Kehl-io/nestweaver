@@ -36,6 +36,7 @@ pub fn run_stdio_server(
     allow_add_sources: bool,
     lite: bool,
     track_interactions: bool,
+    config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
@@ -80,6 +81,21 @@ pub fn run_stdio_server(
     tools::set_current_db_path(canonical_db);
     tools::set_allow_add_sources(allow_add_sources);
     tools::set_lite_mode(lite);
+
+    // Load instance config so tools can read [limits], [response], [ranking], etc.
+    // Try explicit --config path first, then auto-discover instance.toml next to the DB.
+    let instance_cfg = config_path
+        .and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok())
+        .or_else(|| {
+            let sibling = db_path.parent()?.join("instance.toml");
+            nestweaver_engine::InstanceConfig::from_file(&sibling).ok()
+        });
+    if let Some(cfg) = instance_cfg {
+        if cfg.cache.max_size_mb > 0 {
+            tools::set_cache_max_size_mb(cfg.cache.max_size_mb);
+        }
+        tools::set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+    }
 
     let tracker: Option<nestweaver_engine::InteractionTracker> = if track_interactions {
         Some(nestweaver_engine::InteractionTracker::new(db_path))

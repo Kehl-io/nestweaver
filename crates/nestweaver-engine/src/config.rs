@@ -273,10 +273,10 @@ pub const DEFAULT_RESULT_LIMIT: usize = 50;
 
 /// `[limits]` — default pagination limits for tool responses.
 ///
-/// NOTE: MCP tools currently use the compile-time `DEFAULT_RESULT_LIMIT`
-/// constant. This config is deserialized and stored but not yet plumbed
-/// through to the tool dispatch layer. A future change should pass the
-/// resolved limit from `InstanceConfig.limits` into the MCP server context.
+/// MCP tools read `default_result_limit` at dispatch time via the
+/// thread-local `InstanceConfig` (set by the daemon or direct MCP server).
+/// When no instance config is loaded, tools fall back to
+/// `DEFAULT_RESULT_LIMIT`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitsConfig {
     #[serde(default = "default_result_limit")]

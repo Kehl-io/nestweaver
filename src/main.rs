@@ -672,6 +672,10 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
+        /// Path to instance config (TOML) for [limits], [response], [ranking] settings.
+        /// In daemon mode, the daemon's own --config takes precedence.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Open the database directly for reads instead of routing through the daemon.
         /// Write operations always go through the daemon regardless of this flag.
         #[arg(long)]
@@ -4053,6 +4057,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
+            config,
             no_daemon,
         } => {
             if allow_mcp_add_sources {
@@ -4090,6 +4095,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     allow_mcp_add_sources,
                     lite,
                     track_interactions,
+                    config.as_deref(),
                 )
                 .context("mcp server")?;
             }
