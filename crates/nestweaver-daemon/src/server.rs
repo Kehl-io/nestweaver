@@ -499,6 +499,227 @@ impl NestWeaverDaemon for DaemonService {
         )))
     }
 
+    type MaterializeProjectsStream = ProgressStream;
+
+    async fn materialize_projects(
+        &self,
+        request: Request<MaterializeProjectsRequest>,
+    ) -> Result<Response<Self::MaterializeProjectsStream>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let config_path = PathBuf::from(&req.config_path);
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+        let state = self.state.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
+
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Discovering as i32,
+                message: format!("Loading instance config from {}", config_path.display()),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            let instance_config = match nestweaver_engine::InstanceConfig::from_file(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("Failed to load instance config: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                    return;
+                }
+            };
+
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Writing as i32,
+                message: format!(
+                    "Materializing projects for instance {}",
+                    instance_id
+                ),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            match nestweaver_engine::materialize_projects(
+                &state.store,
+                &instance_config,
+                &instance_id,
+                &state.db_path,
+            ) {
+                Ok(result) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: format!(
+                            "Done — {} projects, {} note edges, {} symbol edges, {} component edges",
+                            result.projects_created,
+                            result.note_edges,
+                            result.symbol_edges,
+                            result.component_edges,
+                        ),
+                        files_processed: result.projects_created as u64,
+                        files_total: result.projects_created as u64,
+                        symbols_found: result.symbol_edges as u64,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("MaterializeProjects failed: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn remove_vault(
+        &self,
+        request: Request<RemoveVaultRequest>,
+    ) -> Result<Response<RemoveVaultResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let notes_deleted = self
+            .state
+            .store
+            .delete_vault_cascade(&req.vault_uid)
+            .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
+
+        // Rebuild Tantivy if available so BM25 search reflects the deletion.
+        if let Some(ref tantivy) = self.state.tantivy
+            && tantivy.has_writer()
+        {
+            match tantivy.reindex_from_store(&self.state.store) {
+                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault removal"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Tantivy reindex failed after vault removal")
+                }
+            }
+        }
+
+        Ok(Response::new(RemoveVaultResponse {
+            notes_deleted: notes_deleted as u64,
+        }))
+    }
+
+    async fn merge_instance(
+        &self,
+        request: Request<MergeInstanceRequest>,
+    ) -> Result<Response<MergeInstanceResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let result = self
+            .state
+            .store
+            .merge_instance_ids(&req.from_id, &req.to_id)
+            .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
+
+        let discarded_vaults = result
+            .discarded
+            .into_iter()
+            .map(|d| d.root_path)
+            .collect::<Vec<_>>();
+
+        Ok(Response::new(MergeInstanceResponse {
+            vaults_reparented: result.vaults as u64,
+            repos_reparented: result.repos as u64,
+            projects_reparented: result.projects as u64,
+            discarded_vaults,
+        }))
+    }
+
+    type PurgeInstanceStream = ProgressStream;
+
+    async fn purge_instance(
+        &self,
+        request: Request<PurgeInstanceRequest>,
+    ) -> Result<Response<Self::PurgeInstanceStream>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let instance_id = req.instance_id.clone();
+        let state = self.state.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
+
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Writing as i32,
+                message: format!("Purging instance {instance_id}"),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            match state.store.purge_instance(&instance_id) {
+                Ok(result) => {
+                    // Rebuild Tantivy so BM25 search reflects purged vaults.
+                    if let Some(ref tantivy) = state.tantivy
+                        && tantivy.has_writer()
+                    {
+                        match tantivy.reindex_from_store(&state.store) {
+                            Ok(n) => {
+                                tracing::info!(docs = n, "Tantivy reindexed after instance purge")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Tantivy reindex failed after instance purge")
+                            }
+                        }
+                    }
+
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: format!(
+                            "Done — {} repos, {} files, {} symbols, {} vaults, {} notes, {} projects, {} orphans swept",
+                            result.repos,
+                            result.files,
+                            result.symbols,
+                            result.vaults,
+                            result.notes,
+                            result.projects,
+                            result.orphans_swept,
+                        ),
+                        files_processed: (result.repos + result.vaults) as u64,
+                        files_total: (result.repos + result.vaults) as u64,
+                        symbols_found: result.symbols as u64,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("PurgeInstance failed: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
     type RefreshBrainStream = ProgressStream;
 
     async fn refresh_brain(
