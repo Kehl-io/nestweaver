@@ -1295,6 +1295,7 @@ enum DaemonAction {
     Status,
     /// Stop and restart the daemon
     Restart {
+        /// Idle timeout in seconds
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
         /// Optional path to `nestweaver-instance.toml`, forwarded to the
