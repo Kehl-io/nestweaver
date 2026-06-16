@@ -12,16 +12,17 @@ use nestweaver_engine::{
     FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, detect_implicit_projects,
+    changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
-    generate_repo_map, generate_summaries, get_last_indexed_at,
-    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
-    lookup_symbol, materialize_projects, record_last_indexed_at, render_text, save_clusters,
-    save_summaries, search_symbols, suggest_links, truncate_to_budget,
+    generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
+    index_directory_with_options, index_markdown_directory_since_with_ignore,
+    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
+    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, materialize_projects,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -164,7 +165,8 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// Skip the daemon and open the database directly (not recommended)
+    /// Open the database directly for reads instead of routing through the daemon.
+    /// Write operations always go through the daemon regardless of this flag.
     #[arg(long, global = true)]
     no_daemon: bool,
 }
@@ -670,7 +672,8 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
-        /// Skip the daemon and open the database directly (not recommended)
+        /// Open the database directly for reads instead of routing through the daemon.
+        /// Write operations always go through the daemon regardless of this flag.
         #[arg(long)]
         no_daemon: bool,
     },
@@ -2188,24 +2191,9 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
-    let store = match GraphStore::open(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("lock") || msg.contains("Lock") {
-                tracing::info!("database locked, opening read-only: {}", path.display());
-                GraphStore::open_read_only(path).with_context(|| {
-                    format!(
-                        "failed to open database at {} (read-only fallback also failed)",
-                        path.display()
-                    )
-                })?
-            } else {
-                return Err(e)
-                    .with_context(|| format!("failed to open database at {}", path.display()));
-            }
-        }
-    };
+    let store = GraphStore::open_read_only(path)
+        .with_context(|| format!("failed to open database at {}", path.display()))?;
+
     let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
@@ -2223,8 +2211,10 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     Ok(store)
 }
 
-/// Stops the daemon if it is currently running on `db_path`.
-/// Returns `true` if a daemon was found and sent SIGTERM, `false` otherwise.
+/// Stop the daemon to acquire the write lock for direct indexing.
+///
+/// Only used in the `!use_daemon` fallback (test/CI via `NESTWEAVER_NO_DAEMON=1`).
+/// In production, all writes route through daemon RPCs and this function is never called.
 fn stop_daemon_if_running(db_path: &Path) -> bool {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
@@ -2246,7 +2236,8 @@ fn stop_daemon_if_running(db_path: &Path) -> bool {
     was_running
 }
 
-/// Restarts the daemon, logging a warning if it fails.
+/// Restarts the daemon after a direct-write operation.
+/// Only used in the `!use_daemon` fallback (test/CI).
 fn restart_daemon(db_path: &Path, config: Option<&Path>) {
     eprintln!("Restarting daemon...");
     if let Err(e) = nestweaver_client::autostart::ensure_daemon(db_path, config) {
@@ -2254,8 +2245,6 @@ fn restart_daemon(db_path: &Path, config: Option<&Path>) {
     }
 }
 
-/// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
-/// `.pagerank.json` sidecar convention.
 fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push(".tantivy");
@@ -4118,7 +4107,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             let state = if watch {
-                let store = std::sync::Arc::new(open_store(Some(&db_path))?);
+                // Watch mode needs write access for the CodeWatcher.
+                let store =
+                    std::sync::Arc::new(GraphStore::open_or_create(&db_path).with_context(
+                        || format!("failed to open database at {}", db_path.display()),
+                    )?);
                 nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
             } else {
                 let store = open_store(Some(&db_path))?;
@@ -5267,32 +5260,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let instance_id = &instance_config.instance_id;
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // Materialize requires direct write access — stop the daemon
-            // temporarily if it's running on this DB.
-            let daemon_was_running = !cli.no_daemon && stop_daemon_if_running(&db_path);
+            if cli.no_daemon {
+                eprintln!(
+                    "Warning: --no-daemon is ignored for write operations; routing through daemon."
+                );
+            }
 
-            let store = open_store(Some(&db_path))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    Some(config_path),
+                ))
+                .context("failed to connect to daemon")?;
 
-            let result = materialize_projects(&store, &instance_config, instance_id, &db_path)
-                .context("materialize_projects")?;
+            let mut stream = rt
+                .block_on(client.materialize_projects(&config_path.to_string_lossy(), instance_id))
+                .context("materialize_projects RPC failed")?;
 
-            // Release DB lock before restarting daemon
-            drop(store);
+            let mut had_error = false;
+            rt.block_on(async {
+                while let Some(progress) = stream.message().await? {
+                    eprintln!("{}", progress.message);
+                    if progress.phase == nestweaver_proto::Phase::Error as i32 {
+                        had_error = true;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
 
-            println!(
-                "Materialized {} project(s): {} note edges, {} symbol edges, \
-                 {} component edges, {} wiki notes ingested, {} wiki fetch errors",
-                result.projects_created,
-                result.note_edges,
-                result.symbol_edges,
-                result.component_edges,
-                result.wiki_notes_ingested,
-                result.wiki_fetch_errors,
-            );
-
-            // Restart daemon if we stopped it
-            if daemon_was_running {
-                restart_daemon(&db_path, Some(config.as_path()));
+            if had_error {
+                return Ok((EXIT_ERROR, None));
             }
 
             Ok((EXIT_SUCCESS, None))
@@ -5382,7 +5380,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let repo_url = format!("file://{}", repo_path.display());
 
-            // If a daemon holds the write lock, stop it so we can index directly.
+            // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             let daemon_was_running = stop_daemon_if_running(&db_path);
 
             out.status(&format!("Indexing {}", repo_path.display()));
@@ -5391,7 +5389,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if force {
                 // Full re-index requested explicitly.
-                let result = nestweaver_engine::index_directory_with_options(
+                let result = index_directory_with_options(
                     &repo_path,
                     &db_path,
                     instance_id,
@@ -5419,7 +5417,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 // Incremental index (falls back to full when no prior index exists).
-                let inc = nestweaver_engine::incremental_index_with_name(
+                let inc = incremental_index_with_name(
                     &repo_path,
                     &db_path,
                     instance_id,
@@ -5491,13 +5489,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Co-change mining (piggybacks on --with-git-activity)
             if with_git_activity && !repo_opted_out {
                 out.status("Mining co-changes...");
-                match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
+                match compute_cochanges(&repo_path, 500, 3, 0.30) {
                     Ok(edges) => {
                         let cochange_path =
                             nestweaver_engine::sidecar_path(&db_path, ".cochange.json");
-                        if let Err(e) =
-                            nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path)
-                        {
+                        if let Err(e) = save_cochange_sidecar(&edges, &cochange_path) {
                             tracing::warn!("failed to save co-change sidecar: {e}");
                         }
                         out.status(&format!("Found {} co-change pairs.", edges.len()));
@@ -6581,7 +6577,7 @@ fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // If a daemon holds the write lock, stop it so we can index directly.
+            // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             let daemon_was_running_brain = stop_daemon_if_running(&db_path);
 
             let result = index_markdown_directory_with_ignore(
@@ -7590,7 +7586,8 @@ fn run_brain(
             let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
             let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
-            let store = open_store(Some(&db_path))?;
+            let store = GraphStore::open_read_only(&db_path)
+                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
             // Helper: a stored vault matches the caller's path if any of its
             // representations (canonical, literal, shell-expanded `~`)
@@ -7666,8 +7663,6 @@ fn run_brain(
                 }
             }
 
-            let mut total_dropped = 0usize;
-            let mut rows_cleaned = 0usize;
             let mut vault_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -7677,17 +7672,23 @@ fn run_brain(
                 if let Ok(v) = store.lookup_vault(uid) {
                     vault_name = v.name;
                 }
-                match store.delete_vault_cascade(uid) {
-                    Ok(n) => {
-                        total_dropped += n;
+            }
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            let mut total_dropped = 0usize;
+            let mut rows_cleaned = 0usize;
+            for uid in &uids_to_remove {
+                match rt.block_on(client.remove_vault(uid)) {
+                    Ok(resp) => {
+                        total_dropped += resp.notes_deleted as usize;
                         rows_cleaned += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Error: failed to remove vault '{uid}': {e}.\n  \
-                             If a daemon is running it may be holding the write lock; \
-                             stop it with `nestweaver daemon stop` and retry."
-                        );
+                        eprintln!("Error: failed to remove vault '{uid}': {e}.");
                         return Ok((EXIT_ERROR, None));
                     }
                 }
@@ -9489,24 +9490,27 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             }
             if purge_graph {
                 let db_path = db.unwrap_or_else(default_db_path);
-                let store = open_store(Some(&db_path))?;
-                let r = store.purge_instance(&id).map_err(|e| anyhow::anyhow!(e))?;
-                let total = r.repos
-                    + r.files
-                    + r.symbols
-                    + r.vaults
-                    + r.notes
-                    + r.projects
-                    + r.orphans_swept;
-                if total == 0 {
-                    println!("No graph rows found for instance '{id}' — database is clean.");
-                } else {
-                    println!(
-                        "Purged instance '{id}' from graph: {} repo(s), \
-                         {} file(s), {} symbol(s), {} vault(s), {} note(s), \
-                         {} project(s), {} orphan(s)",
-                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects, r.orphans_swept
-                    );
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                    .context("failed to connect to daemon")?;
+
+                let mut stream = rt
+                    .block_on(client.purge_instance(&id))
+                    .context("purge_instance RPC failed")?;
+
+                let mut had_error = false;
+                rt.block_on(async {
+                    while let Ok(Some(p)) = stream.message().await {
+                        eprintln!("{}", p.message);
+                        if p.phase == nestweaver_proto::Phase::Error as i32 {
+                            had_error = true;
+                        }
+                    }
+                });
+
+                if had_error {
+                    return Err(anyhow::anyhow!("purge_instance failed"));
                 }
             }
             Ok(EXIT_SUCCESS)
@@ -9540,26 +9544,25 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
         }
         InstanceCommands::Merge { from, to, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
-            let result = store
-                .merge_instance_ids(&from, &to)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
 
-            if result.vaults + result.repos + result.projects == 0 {
+            let result = rt
+                .block_on(client.merge_instance(&from, &to))
+                .context("merge_instance RPC failed")?;
+
+            if result.vaults_reparented + result.repos_reparented + result.projects_reparented == 0
+            {
                 println!("No rows found with instance_id '{from}'.");
             } else {
                 println!(
-                    "Merged '{from}' -> '{to}': {} vault(s), \
-                     {} repo(s), {} project(s)",
-                    result.vaults, result.repos, result.projects
+                    "Merged '{from}' -> '{to}': {} vault(s), {} repo(s), {} project(s)",
+                    result.vaults_reparented, result.repos_reparented, result.projects_reparented
                 );
-                for d in &result.discarded {
-                    eprintln!(
-                        "Note: {} note(s) from '{}' were discarded \
-                         (collision: the other instance had more notes). \
-                         Re-run 'brain add {}' to re-index.",
-                        d.notes_discarded, d.root_path, d.root_path
-                    );
+                for d in &result.discarded_vaults {
+                    eprintln!("Note: {d}");
                 }
             }
             Ok(EXIT_SUCCESS)
