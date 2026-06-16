@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.26.0](https://github.com/Kehl-io/nestweaver/compare/v0.25.1...v0.26.0) (2026-06-16)
+
+
+### Features
+
+* **cli:** wire [limits].default_result_limit to CLI search and context commands ([d804176](https://github.com/Kehl-io/nestweaver/commit/d804176a9611fbdeae9610d8da0006a616f510a9))
+* **config:** wire [limits].default_result_limit to runtime tool dispatch ([814c4bd](https://github.com/Kehl-io/nestweaver/commit/814c4bdd9016a9939bda0990bb01039e9eafe1b2))
+* wire [limits].default_result_limit to runtime dispatch ([40a5c80](https://github.com/Kehl-io/nestweaver/commit/40a5c80ba1f3cc6c1a42dd568605bb133e456b75))
+
+
+### Bug Fixes
+
+* **mcp:** log instance config discovery, add automated tests for wired limits ([37e49da](https://github.com/Kehl-io/nestweaver/commit/37e49da5b6fc7947df73aa1c67f4351ea2d53c77))
+
 ## [0.25.1](https://github.com/Kehl-io/nestweaver/compare/v0.25.0...v0.25.1) (2026-06-16)
 
 
