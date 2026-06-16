@@ -4107,7 +4107,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
             let state = if watch {
-                let store = std::sync::Arc::new(open_store(Some(&db_path))?);
+                // Watch mode needs write access for the CodeWatcher.
+                let store =
+                    std::sync::Arc::new(GraphStore::open_or_create(&db_path).with_context(
+                        || format!("failed to open database at {}", db_path.display()),
+                    )?);
                 nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
             } else {
                 let store = open_store(Some(&db_path))?;
