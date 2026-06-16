@@ -543,10 +543,7 @@ impl NestWeaverDaemon for DaemonService {
 
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Writing as i32,
-                message: format!(
-                    "Materializing projects for instance {}",
-                    instance_id
-                ),
+                message: format!("Materializing projects for instance {}", instance_id),
                 files_processed: 0,
                 files_total: 0,
                 symbols_found: 0,
