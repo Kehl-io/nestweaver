@@ -13,7 +13,7 @@ use nestweaver_engine::{
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
+    embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
@@ -2223,36 +2223,6 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     Ok(store)
 }
 
-/// Stops the daemon if it is currently running on `db_path`.
-/// Returns `true` if a daemon was found and sent SIGTERM, `false` otherwise.
-fn stop_daemon_if_running(db_path: &Path) -> bool {
-    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
-    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
-    let was_running = pidfile.exists()
-        && nestweaver_client::autostart::read_pid(&pidfile)
-            .is_some_and(nestweaver_client::autostart::is_process_alive);
-    if was_running {
-        eprintln!("Stopping daemon to acquire write lock (will restart after)...");
-        if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile) {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if !nestweaver_client::autostart::is_process_alive(pid) {
-                    break;
-                }
-            }
-        }
-    }
-    was_running
-}
-
-/// Restarts the daemon, logging a warning if it fails.
-fn restart_daemon(db_path: &Path, config: Option<&Path>) {
-    eprintln!("Restarting daemon...");
-    if let Err(e) = nestweaver_client::autostart::ensure_daemon(db_path, config) {
-        eprintln!("Warning: failed to restart daemon: {e}");
-    }
-}
 
 /// Tantivy index sidecar location: `<db_path>.tantivy/`. Mirrors the
 /// `.pagerank.json` sidecar convention.
@@ -5334,7 +5304,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Index {
             repo,
-            instance,
+            instance: _,
             db,
             force,
             name,
@@ -5348,196 +5318,43 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_index_db_path(db, &repo_path);
 
-            if use_daemon {
-                let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
-                    &db_path,
-                    config.as_deref(),
-                ))?;
-
-                let req = nestweaver_proto::IndexRepoRequest {
-                    repo_path: repo_path.display().to_string(),
-                    name: name.unwrap_or_default(),
-                    force,
-                    with_trigrams,
-                    with_git_activity,
-                };
-
-                rt.block_on(async {
-                    let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
-                        let phase_name = match progress.phase {
-                            0 => "Discovering",
-                            1 => "Parsing",
-                            2 => "Resolving",
-                            3 => "Writing",
-                            4 => "PageRank",
-                            5 => "Done",
-                            6 => "Error",
-                            _ => "Unknown",
-                        };
-                        eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })?;
-
-                return Ok((EXIT_SUCCESS, None));
+            if cli.no_daemon {
+                eprintln!("Warning: --no-daemon is ignored for write operations; routing through daemon.");
             }
 
-            let instance_id = instance.as_deref().unwrap_or("default");
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                &db_path,
+                config.as_deref(),
+            ))?;
 
-            let repo_url = format!("file://{}", repo_path.display());
+            let req = nestweaver_proto::IndexRepoRequest {
+                repo_path: repo_path.display().to_string(),
+                name: name.unwrap_or_default(),
+                force,
+                with_trigrams,
+                with_git_activity,
+            };
 
-            // If a daemon holds the write lock, stop it so we can index directly.
-            let daemon_was_running = stop_daemon_if_running(&db_path);
-
-            out.status(&format!("Indexing {}", repo_path.display()));
-
-            let (files_count, symbols_count, edges_count);
-
-            if force {
-                // Full re-index requested explicitly.
-                let result = nestweaver_engine::index_directory_with_options(
-                    &repo_path,
-                    &db_path,
-                    instance_id,
-                    &repo_url,
-                    "local",
-                    true,
-                    name.as_deref(),
-                )
-                .context("index_directory")?;
-
-                files_count = result.files_count;
-                symbols_count = result.symbols_count;
-                edges_count = result.edges_count;
-
-                println!(
-                    "Indexed {} file(s), {} symbol(s), {} edge(s).",
-                    files_count, symbols_count, edges_count
-                );
-
-                if !result.skipped_files.is_empty() {
-                    out.status(&format!("Skipped {} file(s):", result.skipped_files.len()));
-                    for sf in &result.skipped_files {
-                        out.status(&format!("  {} — {}", sf.path, sf.reason));
-                    }
+            rt.block_on(async {
+                let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
+                while let Some(progress) = stream.message().await? {
+                    let phase_name = match progress.phase {
+                        0 => "Discovering",
+                        1 => "Parsing",
+                        2 => "Resolving",
+                        3 => "Writing",
+                        4 => "PageRank",
+                        5 => "Done",
+                        6 => "Error",
+                        _ => "Unknown",
+                    };
+                    eprintln!("[{phase_name}] {}", progress.message);
                 }
-            } else {
-                // Incremental index (falls back to full when no prior index exists).
-                let inc = nestweaver_engine::incremental_index_with_name(
-                    &repo_path,
-                    &db_path,
-                    instance_id,
-                    &repo_url,
-                    name.as_deref(),
-                )
-                .context("incremental_index")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
 
-                files_count = inc.files_added + inc.files_modified;
-                symbols_count = inc.symbols_added;
-                edges_count = 0; // not tracked separately in incremental
-
-                if inc.fell_back_to_full {
-                    out.status("Incremental: no prior index found, performed full index.");
-                } else {
-                    out.status(&format!(
-                        "Incremental: {} added, {} modified, {} deleted, {} renamed, {} skipped.",
-                        inc.files_added,
-                        inc.files_modified,
-                        inc.files_deleted,
-                        inc.files_renamed,
-                        inc.files_skipped,
-                    ));
-                    out.status(&format!(
-                        "Incremental: {} symbol(s) added, {} symbol(s) removed.",
-                        inc.symbols_added, inc.symbols_removed,
-                    ));
-                }
-            }
-
-            // PageRank is deferred to first query (lazy evaluation in
-            // GraphStore::ensure_pagerank_loaded) so the index path stays fast.
-            out.status("PageRank will be computed on first query.");
-
-            // Feature F12: mine git history and write the recency sidecar so
-            // subsequent commands demote dormant code at rank-read time.
-            // Honor the per-repo `use_git_activity = false` opt-out when a
-            // config matches this repo's URL.
-            let repo_opted_out = load_instance_config_opt(config.as_deref())
-                .map(|cfg| {
-                    cfg.repos
-                        .iter()
-                        .find(|r| r.url == repo_url)
-                        .and_then(|r| r.use_git_activity)
-                        == Some(false)
-                })
-                .unwrap_or(false);
-
-            if with_git_activity && repo_opted_out {
-                out.status(
-                    "Repo has use_git_activity = false in config; skipping git-activity sidecar.",
-                );
-            } else if with_git_activity {
-                out.status("Mining git activity...");
-                let scores = nestweaver_engine::git_activity::compute_git_activity(&repo_path);
-                if scores.is_empty() {
-                    out.status("No usable git history found; git-activity sidecar not written.");
-                } else {
-                    let ga_path = nestweaver_engine::sidecar_path(&db_path, ".gitactivity.json");
-                    nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path)
-                        .with_context(|| "save git activity sidecar")?;
-                    out.status(&format!(
-                        "Git activity sidecar written ({} files scored).",
-                        scores.len()
-                    ));
-                }
-            }
-
-            // Co-change mining (piggybacks on --with-git-activity)
-            if with_git_activity && !repo_opted_out {
-                out.status("Mining co-changes...");
-                match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
-                    Ok(edges) => {
-                        let cochange_path =
-                            nestweaver_engine::sidecar_path(&db_path, ".cochange.json");
-                        if let Err(e) =
-                            nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path)
-                        {
-                            tracing::warn!("failed to save co-change sidecar: {e}");
-                        }
-                        out.status(&format!("Found {} co-change pairs.", edges.len()));
-                    }
-                    Err(e) => {
-                        tracing::warn!("co-change mining failed: {e}");
-                    }
-                }
-            }
-
-            if with_trigrams {
-                out.status("Building trigram index...");
-                let store = GraphStore::open(&db_path)
-                    .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-                let postings = store
-                    .build_trigram_index()
-                    .with_context(|| "build_trigram_index")?;
-                out.status(&format!("Trigram index built ({postings} postings)."));
-            }
-
-            let stats = format!(
-                "{} files, {} symbols, {} edges in {}",
-                files_count,
-                symbols_count,
-                edges_count,
-                format_elapsed(t0.elapsed())
-            );
-
-            // Restart daemon if we stopped it for direct-mode indexing
-            if daemon_was_running {
-                restart_daemon(&db_path, config.as_deref().map(std::path::Path::new));
-            }
-
-            Ok((EXIT_SUCCESS, Some(stats)))
+            Ok((EXIT_SUCCESS, None))
         }
 
         Commands::Daemon { action, db } => {
@@ -6557,123 +6374,37 @@ fn run_brain(
 
             let extra_patterns = parse_ignore_flag(&ignore);
 
-            if use_daemon {
-                let rt = tokio::runtime::Runtime::new()?;
-                let mut client =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
-                let req = nestweaver_proto::IndexVaultRequest {
-                    vault_path: path.display().to_string(),
-                    vault_name: vault_name.clone(),
-                    extra_ignore_patterns: extra_patterns.clone(),
-                    instance_id: instance_id.to_string(),
-                };
-                rt.block_on(async {
-                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
-                        let phase_name = match progress.phase {
-                            0 => "Discovering",
-                            1 => "Parsing",
-                            2 => "Resolving",
-                            3 => "Writing",
-                            4 => "PageRank",
-                            5 => "Done",
-                            6 => "Error",
-                            _ => "Unknown",
-                        };
-                        eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })?;
-                return Ok((EXIT_SUCCESS, None));
+            if !use_daemon {
+                eprintln!("Warning: --no-daemon is ignored for write operations; routing through daemon.");
             }
 
-            // If a daemon holds the write lock, stop it so we can index directly.
-            let daemon_was_running_brain = stop_daemon_if_running(&db_path);
-
-            let result = index_markdown_directory_with_ignore(
-                &path,
-                &db_path,
-                instance_id,
-                &vault_name,
-                &extra_patterns,
-            )
-            .context("index_markdown_directory")?;
-
-            // Record the indexer run timestamp for this vault.
-            if let Err(e) = record_last_indexed_at(&db_path, &result.vault_uid) {
-                tracing::warn!("failed to record last_indexed_at: {e}");
-            }
-
-            let notes_count = result.notes_count;
-
-            if result.notes_count == 0 {
-                // The Vault node was created, but no markdown files were
-                // found. Tell the user clearly rather than print a row of
-                // zeros that looks like an indexing bug.
-                println!(
-                    "No markdown files found in {}. Vault '{}' was registered \
-                     so the watcher can pick up notes added later.",
-                    path.display(),
-                    result.vault_name,
-                );
-            } else {
-                println!(
-                    "Indexed vault '{}': {} note(s), {} heading(s), {} section(s), \
-                     {} tag(s), {} wikilink(s) ({} unresolved).",
-                    result.vault_name,
-                    result.notes_count,
-                    result.headings_count,
-                    result.sections_count,
-                    result.tags_count,
-                    result.wikilinks_resolved,
-                    result.wikilinks_unresolved,
-                );
-            }
-
-            // Auto-discover cross-domain (notes ↔ code) bridges if any
-            // code symbols are indexed. Cheap no-op when there's no code.
-            {
-                let store_for_discovery = open_store(Some(&db_path))?;
-                match discover_cross_domain_links(&store_for_discovery) {
-                    Ok(cd) if cd.note_to_symbol_edges + cd.section_to_symbol_edges > 0 => {
-                        println!(
-                            "Cross-domain: {} note→symbol, {} section→symbol edge(s) created.",
-                            cd.note_to_symbol_edges, cd.section_to_symbol_edges
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("cross-domain discovery failed: {e}"),
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client =
+                rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+            let req = nestweaver_proto::IndexVaultRequest {
+                vault_path: path.display().to_string(),
+                vault_name: vault_name.clone(),
+                extra_ignore_patterns: extra_patterns.clone(),
+                instance_id: instance_id.to_string(),
+            };
+            rt.block_on(async {
+                let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
+                while let Some(progress) = stream.message().await? {
+                    let phase_name = match progress.phase {
+                        0 => "Discovering",
+                        1 => "Parsing",
+                        2 => "Resolving",
+                        3 => "Writing",
+                        4 => "PageRank",
+                        5 => "Done",
+                        6 => "Error",
+                        _ => "Unknown",
+                    };
+                    eprintln!("[{phase_name}] {}", progress.message);
                 }
-            }
-
-            // Auto-populate Tantivy BM25 index after brain add so that
-            // `brain search` works immediately without a manual reindex.
-            let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            match TantivyIndex::open_or_create(&tantivy_path) {
-                Ok(tantivy) => {
-                    let store_for_tantivy = open_store(Some(&db_path))?;
-                    match tantivy.reindex_from_store(&store_for_tantivy) {
-                        Ok(count) => out.status(&format!("Tantivy: indexed {count} document(s)")),
-                        Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
-                    }
-                }
-                Err(e) => tracing::warn!("Tantivy open failed: {e}"),
-            }
-
-            if !result.skipped.is_empty() {
-                out.status(&format!("Skipped {} file(s):", result.skipped.len()));
-                for sf in &result.skipped {
-                    out.status(&format!("  {} - {}", sf.path, sf.reason));
-                }
-            }
-
-            // Restart daemon if we stopped it for direct-mode indexing
-            if daemon_was_running_brain {
-                restart_daemon(&db_path, None);
-            }
-
-            let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
-            Ok((EXIT_SUCCESS, Some(stats)))
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok((EXIT_SUCCESS, None))
         }
 
         BrainCommands::List { json, db } => {
