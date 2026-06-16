@@ -2338,16 +2338,18 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             .lookup_notes_by_title(title)
             .context("lookup_notes_by_title")?;
         // Slug-tolerant fallback: case-insensitive + slug normalization.
+        // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
             let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes(None) {
-                matches = all_notes
-                    .into_iter()
-                    .filter(|n| {
-                        n.title.to_lowercase() == needle
-                            || slug_normalize(&n.title) == slug_normalize(title)
-                    })
-                    .collect();
+            if let Ok(all_notes) = store.list_notes_lite(None) {
+                if let Some(hit) = all_notes.iter().find(|n| {
+                    n.title.to_lowercase() == needle
+                        || slug_normalize(&n.title) == slug_normalize(title)
+                }) {
+                    if let Ok(note) = store.lookup_note(&hit.uid) {
+                        matches.push(note);
+                    }
+                }
             }
         }
         match matches.into_iter().next() {
@@ -2488,17 +2490,19 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         uid.to_string()
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         let mut matches = store.lookup_notes_by_title(title)?;
-        // Fallback: case-insensitive match
+        // Fallback: case-insensitive + slug normalization.
+        // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
             let needle = title.to_lowercase();
-            if let Ok(all_notes) = store.list_notes(None) {
-                matches = all_notes
-                    .into_iter()
-                    .filter(|n| {
-                        n.title.to_lowercase() == needle
-                            || slug_normalize(&n.title) == slug_normalize(title)
-                    })
-                    .collect();
+            if let Ok(all_notes) = store.list_notes_lite(None) {
+                if let Some(hit) = all_notes.iter().find(|n| {
+                    n.title.to_lowercase() == needle
+                        || slug_normalize(&n.title) == slug_normalize(title)
+                }) {
+                    if let Ok(note) = store.lookup_note(&hit.uid) {
+                        matches.push(note);
+                    }
+                }
             }
         }
         match matches.into_iter().next() {
@@ -3289,7 +3293,6 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         if direct_callees.is_empty() {
             // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
             let members = store.members_of(&root.uid).unwrap_or_default();
-            let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
 
             let is_method = |s: &nestweaver_schema::Symbol| {
                 s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
@@ -3309,13 +3312,14 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                     .collect()
             } else {
                 // Fallback: line-range heuristic excluding methods inside nested classes.
+                let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
                 let nested_class_ranges: Vec<(u32, u32)> = file_symbols
                     .iter()
                     .filter(|s| {
                         s.kind == SymbolKind::Class
                             && s.uid != root.uid
                             && s.start_line > root.start_line
-                            && s.end_line <= root.end_line
+                            && s.end_line < root.end_line
                     })
                     .map(|s| (s.start_line, s.end_line))
                     .collect();
@@ -3660,8 +3664,10 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         };
 
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
+        let is_valid_sha = repo.indexed_sha.len() == 40
+            && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
         let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
-            (Some(head), Some(path)) if *head != repo.indexed_sha => {
+            (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                 count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
             }
             _ => repo.staleness_commits_behind as u64,
@@ -5092,6 +5098,10 @@ pub fn dispatch_via_daemon(
     };
     let i32_field =
         |key: &str| -> i32 { args.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+    let opt_str_field = |key: &str| -> Option<String> {
+        let v = str_field(key);
+        if v.is_empty() { None } else { Some(v) }
+    };
     let bool_field =
         |key: &str| -> bool { args.get(key).and_then(|v| v.as_bool()).unwrap_or(false) };
     let f64_field = |key: &str| -> f64 { args.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) };
@@ -5101,18 +5111,14 @@ pub fn dispatch_via_daemon(
             // ── Typed hot-path RPCs ──────────────────────────────────
             "brain_search" => {
                 use nestweaver_proto::BrainSearchRequest;
-                let opt_str = |key: &str| -> Option<String> {
-                    let v = str_field(key);
-                    if v.is_empty() { None } else { Some(v) }
-                };
                 let req = tonic::Request::new(BrainSearchRequest {
                     query: str_field("query"),
                     limit: i32_field("limit"),
-                    response_format: opt_str("response_format"),
+                    response_format: opt_str_field("response_format"),
                     include_bodies: bool_field("include_bodies"),
                     prf: bool_field("prf"),
                     rerank: bool_field("rerank"),
-                    root: opt_str("root"),
+                    root: opt_str_field("root"),
                 });
                 let resp = client
                     .search(req)
@@ -5214,13 +5220,9 @@ pub fn dispatch_via_daemon(
             }
             "note_get" => {
                 use nestweaver_proto::NoteGetRequest;
-                let opt_str_ng = |key: &str| -> Option<String> {
-                    let v = str_field(key);
-                    if v.is_empty() { None } else { Some(v) }
-                };
                 let req = tonic::Request::new(NoteGetRequest {
-                    uid: opt_str_ng("uid"),
-                    title: opt_str_ng("title"),
+                    uid: opt_str_field("uid"),
+                    title: opt_str_field("title"),
                     include_body: bool_field("include_body"),
                     sections: str_array("sections"),
                 });
