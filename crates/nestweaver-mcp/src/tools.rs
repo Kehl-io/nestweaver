@@ -5933,6 +5933,58 @@ mod cache_dispatch_tests {
 }
 
 #[cfg(test)]
+mod configured_limit_tests {
+    use super::*;
+
+    fn test_config(limit: usize) -> nestweaver_engine::InstanceConfig {
+        serde_json::from_value(serde_json::json!({
+            "instance_id": "test",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" },
+            "limits": { "default_result_limit": limit }
+        }))
+        .expect("valid test config")
+    }
+
+    #[test]
+    fn configured_result_limit_uses_default_without_config() {
+        set_current_instance_config(None);
+        assert_eq!(configured_result_limit(), DEFAULT_RESULT_LIMIT);
+    }
+
+    #[test]
+    fn configured_result_limit_reads_from_instance_config() {
+        let cfg = test_config(7);
+        assert_eq!(cfg.limits.default_result_limit, 7);
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        assert_eq!(configured_result_limit(), 7);
+        set_current_instance_config(None);
+    }
+
+    #[test]
+    fn configured_response_uses_default_without_config() {
+        set_current_instance_config(None);
+        let resp = configured_response();
+        assert!((resp.inline_body_threshold - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn configured_response_reads_from_instance_config() {
+        let mut cfg = test_config(50);
+        cfg.response.inline_body_threshold = 0.5;
+        cfg.response.inline_max_body_tokens = 200;
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        let resp = configured_response();
+        assert!((resp.inline_body_threshold - 0.5).abs() < f64::EPSILON);
+        assert_eq!(resp.inline_max_body_tokens, 200);
+        set_current_instance_config(None);
+    }
+}
+
+#[cfg(test)]
 mod tool_doc_tests {
     use super::*;
 
