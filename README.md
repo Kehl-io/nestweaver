@@ -290,6 +290,15 @@ nestweaver suggest-links --db ./all.lbug
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
 ```
 
+**Runtime-configurable defaults** — set `[limits]` in your instance config to override the built-in pagination default (50) for all MCP tools and CLI commands:
+
+```toml
+[limits]
+default_result_limit = 100
+```
+
+CLI commands (`search`, `brain search`, `brain context`) also respect this setting when `--limit` is not explicitly passed. The `[response]` section controls inline body thresholds.
+
 </details>
 
 ## MCP Server
