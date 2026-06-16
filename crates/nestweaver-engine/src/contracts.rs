@@ -407,6 +407,16 @@ fn join_paths(base: &str, sub: &str) -> String {
     normalize_http_path(&combined)
 }
 
+/// Join base and sub paths, but detect when the sub-path already includes the
+/// base prefix to avoid double-concatenation (e.g. base="/api", sub="/api/users").
+fn join_paths_dedup(base: &str, sub: &str) -> String {
+    if !base.is_empty() && (sub == base || sub.starts_with(&format!("{base}/"))) {
+        normalize_http_path(sub)
+    } else {
+        join_paths(base, sub)
+    }
+}
+
 fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<HandlerMatch> {
     // Class-level base path from @RequestMapping("...") on the controller. The
     // first @RequestMapping in the source is the class-level one (methods that
@@ -446,20 +456,7 @@ fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
 
         if let Some((verb, sub)) = matched {
             let (path, confidence) = match sub {
-                Some(s) => {
-                    // If the sub-path already starts with the base path, don't
-                    // join — doing so would double-concatenate the prefix (e.g.
-                    // base="/api", sub="/api/users" → "/api/api/users").
-                    // Use a boundary check to avoid false positives like
-                    // base="/rest", sub="/restore".
-                    let path =
-                        if !base.is_empty() && (s == base || s.starts_with(&format!("{base}/"))) {
-                            normalize_http_path(&s)
-                        } else {
-                            join_paths(&base, &s)
-                        };
-                    (path, 1.0)
-                }
+                Some(s) => (join_paths_dedup(&base, &s), 1.0),
                 // No sub-path → base-path-inferred (lower confidence).
                 None => (
                     if base.is_empty() {
