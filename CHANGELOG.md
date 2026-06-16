@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.25.0](https://github.com/Kehl-io/nestweaver/compare/v0.24.0...v0.25.0) (2026-06-16)
+
+
+### Features
+
+* **client:** add materialize_projects, remove_vault, merge_instance, purge_instance methods ([952cd35](https://github.com/Kehl-io/nestweaver/commit/952cd35cd50546b43ee3f1df8c3b05946df72dfb))
+* **daemon:** implement MaterializeProjects, RemoveVault, MergeInstance, PurgeInstance handlers ([3d17b1b](https://github.com/Kehl-io/nestweaver/commit/3d17b1b6b4ff5267e16ee3139e37eceff7293914))
+* **proto:** add MaterializeProjects, RemoveVault, MergeInstance, PurgeInstance RPCs ([9c9e10d](https://github.com/Kehl-io/nestweaver/commit/9c9e10de2bac7b39f13a49a56a21298166f3cabe))
+* route all database writes through daemon RPC ([ed2396d](https://github.com/Kehl-io/nestweaver/commit/ed2396d6ee54caa2013f8d698c095834fedccfad))
+
+
+### Bug Fixes
+
+* **cli:** keep direct-write fallback for index/brain-add when NESTWEAVER_NO_DAEMON=1 ([aa0ae50](https://github.com/Kehl-io/nestweaver/commit/aa0ae5084ffe3ace0aede3c6a74ea6f52606fc8c))
+* **daemon:** decrement active_connections on early return in materialize_projects, restore dist ([575eae8](https://github.com/Kehl-io/nestweaver/commit/575eae888ff71264793e19b7fed45657b00e79ff))
+* **daemon:** wrap unary handlers in spawn_blocking, add active_connections tracking, include discarded notes count ([6cf7298](https://github.com/Kehl-io/nestweaver/commit/6cf72981775fa628192344ac32653e492e1d9096))
+* **ui:** open store read-write for watch mode, read-only for default UI ([5fc082d](https://github.com/Kehl-io/nestweaver/commit/5fc082d5a2412942ca18cc5da573d591fc445135))
+
 ## [0.24.0](https://github.com/Kehl-io/nestweaver/compare/v0.23.0...v0.24.0) (2026-06-16)
 
 
