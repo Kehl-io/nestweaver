@@ -83,6 +83,11 @@ pub fn log_path(instance_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Tests that mutate environment variables must hold this lock to avoid
+    // racing with each other under `cargo test`'s default parallel execution.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn instance_id_is_8_hex_chars() {
@@ -138,6 +143,7 @@ mod tests {
 
     #[test]
     fn socket_path_under_sun_len_with_long_tmpdir() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let long_tmpdir = "/var/folders/0h/z2kcwz1j0mld0cbrkt15n7w80000gq/T";
         unsafe {
             std::env::set_var("TMPDIR", long_tmpdir);
@@ -155,6 +161,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_uses_xdg_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         }
@@ -167,6 +174,7 @@ mod tests {
 
     #[test]
     fn socket_path_is_under_runtime_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
