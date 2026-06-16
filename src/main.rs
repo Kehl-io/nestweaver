@@ -7596,7 +7596,8 @@ fn run_brain(
             let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
             let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
-            let store = open_store(Some(&db_path))?;
+            let store = GraphStore::open_read_only(&db_path)
+                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
             // Helper: a stored vault matches the caller's path if any of its
             // representations (canonical, literal, shell-expanded `~`)
@@ -7672,8 +7673,6 @@ fn run_brain(
                 }
             }
 
-            let mut total_dropped = 0usize;
-            let mut rows_cleaned = 0usize;
             let mut vault_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -7683,17 +7682,23 @@ fn run_brain(
                 if let Ok(v) = store.lookup_vault(uid) {
                     vault_name = v.name;
                 }
-                match store.delete_vault_cascade(uid) {
-                    Ok(n) => {
-                        total_dropped += n;
+            }
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            let mut total_dropped = 0usize;
+            let mut rows_cleaned = 0usize;
+            for uid in &uids_to_remove {
+                match rt.block_on(client.remove_vault(uid)) {
+                    Ok(resp) => {
+                        total_dropped += resp.notes_deleted as usize;
                         rows_cleaned += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Error: failed to remove vault '{uid}': {e}.\n  \
-                             If a daemon is running it may be holding the write lock; \
-                             stop it with `nestweaver daemon stop` and retry."
-                        );
+                        eprintln!("Error: failed to remove vault '{uid}': {e}.");
                         return Ok((EXIT_ERROR, None));
                     }
                 }
@@ -9495,24 +9500,27 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             }
             if purge_graph {
                 let db_path = db.unwrap_or_else(default_db_path);
-                let store = open_store(Some(&db_path))?;
-                let r = store.purge_instance(&id).map_err(|e| anyhow::anyhow!(e))?;
-                let total = r.repos
-                    + r.files
-                    + r.symbols
-                    + r.vaults
-                    + r.notes
-                    + r.projects
-                    + r.orphans_swept;
-                if total == 0 {
-                    println!("No graph rows found for instance '{id}' — database is clean.");
-                } else {
-                    println!(
-                        "Purged instance '{id}' from graph: {} repo(s), \
-                         {} file(s), {} symbol(s), {} vault(s), {} note(s), \
-                         {} project(s), {} orphan(s)",
-                        r.repos, r.files, r.symbols, r.vaults, r.notes, r.projects, r.orphans_swept
-                    );
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                    .context("failed to connect to daemon")?;
+
+                let mut stream = rt
+                    .block_on(client.purge_instance(&id))
+                    .context("purge_instance RPC failed")?;
+
+                let mut had_error = false;
+                rt.block_on(async {
+                    while let Ok(Some(p)) = stream.message().await {
+                        eprintln!("{}", p.message);
+                        if p.phase == nestweaver_proto::Phase::Error as i32 {
+                            had_error = true;
+                        }
+                    }
+                });
+
+                if had_error {
+                    return Err(anyhow::anyhow!("purge_instance failed"));
                 }
             }
             Ok(EXIT_SUCCESS)
@@ -9546,26 +9554,24 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
         }
         InstanceCommands::Merge { from, to, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
-            let result = store
-                .merge_instance_ids(&from, &to)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
 
-            if result.vaults + result.repos + result.projects == 0 {
+            let result = rt
+                .block_on(client.merge_instance(&from, &to))
+                .context("merge_instance RPC failed")?;
+
+            if result.vaults_reparented + result.repos_reparented + result.projects_reparented == 0 {
                 println!("No rows found with instance_id '{from}'.");
             } else {
                 println!(
-                    "Merged '{from}' -> '{to}': {} vault(s), \
-                     {} repo(s), {} project(s)",
-                    result.vaults, result.repos, result.projects
+                    "Merged '{from}' -> '{to}': {} vault(s), {} repo(s), {} project(s)",
+                    result.vaults_reparented, result.repos_reparented, result.projects_reparented
                 );
-                for d in &result.discarded {
-                    eprintln!(
-                        "Note: {} note(s) from '{}' were discarded \
-                         (collision: the other instance had more notes). \
-                         Re-run 'brain add {}' to re-index.",
-                        d.notes_discarded, d.root_path, d.root_path
-                    );
+                for d in &result.discarded_vaults {
+                    eprintln!("Note: {d}");
                 }
             }
             Ok(EXIT_SUCCESS)
