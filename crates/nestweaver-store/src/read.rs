@@ -1303,6 +1303,20 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Returns direct members of a class/container via MEMBER_OF edges.
+    pub fn members_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let cols = SYMBOL_COLUMNS.replace("s.", "t.");
+        let q = format!("MATCH (t:Symbol)-[:MEMBER_OF]->(s:Symbol {{uid: $uid}}) RETURN {cols}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
     /// Returns the set of Note UIDs that are tagged with any of the given tag names.
     pub fn list_note_uids_with_tags(
         &self,
