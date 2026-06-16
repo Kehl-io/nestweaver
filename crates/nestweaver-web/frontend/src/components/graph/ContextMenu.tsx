@@ -9,6 +9,10 @@ interface Props {
   onClose: () => void;
 }
 
+type MenuItem =
+  | { label: string; hint: string; key: string | null; action: () => void }
+  | "divider";
+
 export function ContextMenu({ x, y, nodeId, onClose }: Props) {
   const exploreNode = useStore((s) => s.exploreNode);
   const setGraphMode = useStore((s) => s.setGraphMode);
@@ -20,12 +24,40 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
-  const actions = [
-    { label: "Re-seed context from here", hint: "Enter", key: null,
-      action: () => { exploreNode(nodeId); onClose(); } },
-    { label: "Impact analysis...", hint: "I", key: "i",
-      action: () => { selectNode(nodeId, null); setGraphMode("impact"); onClose(); } },
-    { label: "Trace flow...", hint: "F", key: "f",
+  const menuItems: MenuItem[] = [
+    // Group 1: Graph mode actions
+    {
+      label: "Explore",
+      hint: "Enter",
+      key: null,
+      action: () => { exploreNode(nodeId); onClose(); },
+    },
+    {
+      label: "Impact analysis",
+      hint: "I",
+      key: "i",
+      action: () => { selectNode(nodeId, null); setGraphMode("impact"); onClose(); },
+    },
+    {
+      label: "Local neighborhood",
+      hint: "L",
+      key: "l",
+      action: () => { selectNode(nodeId, null); setGraphMode("local"); onClose(); },
+    },
+
+    "divider",
+
+    // Group 2: Multi-node actions
+    {
+      label: "Find path to...",
+      hint: "P",
+      key: "p",
+      action: () => { startPathfinding(nodeId); onClose(); },
+    },
+    {
+      label: "Trace flow",
+      hint: "F",
+      key: "f",
       action: async () => {
         try {
           const result = await api.flow(nodeId, 10);
@@ -34,12 +66,37 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
         onClose();
       },
     },
-    { label: "Find path to...", hint: "P", key: "p",
-      action: () => { startPathfinding(nodeId); onClose(); },
+
+    "divider",
+
+    // Group 3: Utilities
+    {
+      label: "Open source file",
+      hint: "O",
+      key: "o",
+      action: () => {
+        const graph = useStore.getState().graphInstance;
+        const filePath = graph?.hasNode(nodeId)
+          ? (graph.getNodeAttribute(nodeId, "file_path") as string | undefined)
+          : undefined;
+        if (filePath) {
+          window.open(`vscode://file/${filePath}`, "_self");
+        }
+        onClose();
+      },
     },
-    { label: "Copy UID", hint: "C", key: "c",
-      action: () => { navigator.clipboard.writeText(nodeId); onClose(); } },
+    {
+      label: "Copy UID",
+      hint: "C",
+      key: "c",
+      action: () => { navigator.clipboard.writeText(nodeId); onClose(); },
+    },
   ];
+
+  // Non-divider items only, for keyboard navigation
+  const actionItems = menuItems.filter(
+    (item): item is Exclude<MenuItem, "divider"> => item !== "divider"
+  );
 
   // Auto-focus the container when the menu opens
   useEffect(() => {
@@ -55,15 +112,15 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
-        setFocusedIndex((i) => (i + 1) % actions.length);
+        setFocusedIndex((i) => (i + 1) % actionItems.length);
         break;
       case "ArrowUp":
         e.preventDefault();
-        setFocusedIndex((i) => (i - 1 + actions.length) % actions.length);
+        setFocusedIndex((i) => (i - 1 + actionItems.length) % actionItems.length);
         break;
       case "Enter":
         e.preventDefault();
-        actions[focusedIndex].action();
+        actionItems[focusedIndex].action();
         break;
       case "Escape":
         e.preventDefault();
@@ -71,10 +128,10 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
         break;
       default: {
         const lower = e.key.toLowerCase();
-        const match = actions.findIndex((a) => a.key === lower);
+        const match = actionItems.findIndex((a) => a.key === lower);
         if (match !== -1) {
           e.preventDefault();
-          actions[match].action();
+          actionItems[match].action();
         }
         break;
       }
@@ -82,6 +139,9 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
   }
 
   const menuId = "context-menu";
+
+  // Track button index separately from menuItems index (skip dividers)
+  let buttonIndex = -1;
 
   return (
     <div
@@ -94,25 +154,40 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
       className="fixed z-50 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-lg py-1 min-w-44 outline-none"
       style={{ left: x, top: y }}
     >
-      {actions.map((a, i) => (
-        <button
-          ref={(el) => { itemRefs.current[i] = el; }}
-          id={`${menuId}-item-${i}`}
-          role="menuitem"
-          key={a.label}
-          onClick={a.action}
-          onMouseEnter={() => setFocusedIndex(i)}
-          className={
-            "w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-4 " +
-            (i === focusedIndex
-              ? "bg-[var(--color-surface-alt)]"
-              : "hover:bg-[var(--color-surface-alt)]")
-          }
-        >
-          <span>{a.label}</span>
-          <span className="text-[var(--color-text-muted)] font-mono shrink-0">{a.hint}</span>
-        </button>
-      ))}
+      {menuItems.map((item, i) => {
+        if (item === "divider") {
+          return (
+            <div
+              key={`divider-${i}`}
+              role="separator"
+              className="my-1 border-t border-[var(--color-border)]"
+            />
+          );
+        }
+
+        buttonIndex += 1;
+        const idx = buttonIndex;
+
+        return (
+          <button
+            ref={(el) => { itemRefs.current[idx] = el; }}
+            id={`${menuId}-item-${idx}`}
+            role="menuitem"
+            key={item.label}
+            onClick={item.action}
+            onMouseEnter={() => setFocusedIndex(idx)}
+            className={
+              "w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-4 " +
+              (idx === focusedIndex
+                ? "bg-[var(--color-surface-alt)]"
+                : "hover:bg-[var(--color-surface-alt)]")
+            }
+          >
+            <span>{item.label}</span>
+            <span className="text-[var(--color-text-muted)] font-mono shrink-0">{item.hint}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }

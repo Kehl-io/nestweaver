@@ -1,7 +1,6 @@
 import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { EdgeParticles } from "./EdgeParticles";
@@ -42,6 +41,7 @@ function useReducedMotion(): boolean {
 function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const { pick } = useGPUPicking(buffers);
   const selectNode = useStore((s) => s.selectNode);
+  const openPreview = useStore((s) => s.openPreview);
   const hoverNode = useStore((s) => s.hoverNode);
   const exploreNode = useStore((s) => s.exploreNode);
   const setGraphData = useStore((s) => s.setGraphData);
@@ -62,6 +62,19 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
   const handlePointerDown = useCallback(
     (event: { nativeEvent: PointerEvent }) => {
       const e = event.nativeEvent;
+
+      // Right-click → context menu (skip normal click logic)
+      if (e.button === 2) {
+        const rect = (e.target as HTMLElement).getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const result = pick(cx, cy, camera, size);
+        if (result.nodeUid) {
+          useStore.getState().openContextMenu(e.clientX, e.clientY, result.nodeUid);
+        }
+        return;
+      }
+
       // Get the canvas-relative position from the DOM event
       const rect = (e.target as HTMLElement).getBoundingClientRect();
       const x = e.clientX - rect.left;
@@ -99,17 +112,20 @@ function GraphInteraction({ buffers }: { buffers: GraphBuffers }) {
         // Double-click detection: same node within 400ms
         if (prev.nodeUid === result.nodeUid && now - prev.time < 400) {
           exploreNode(result.nodeUid, kind);
+          useStore.getState().closePreview();
         } else {
-          selectNode(result.nodeUid, kind);
+          openPreview(result.nodeUid, kind);
         }
       } else {
-        // Clicked on background — deselect
+        // Clicked on background — deselect, close preview and context menu
         selectNode(null);
+        useStore.getState().closePreview();
+        useStore.getState().closeContextMenu();
       }
 
       lastClickRef.current = { time: now, nodeUid: result.nodeUid };
     },
-    [pick, camera, size, selectNode, exploreNode],
+    [pick, camera, size, selectNode, openPreview, exploreNode],
   );
 
   const handlePointerMove = useCallback(
@@ -410,7 +426,7 @@ export function GraphCanvas() {
     (theme === "system" &&
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
-  const bgColor = isDark ? "#06080f" : "#f8fafc";
+  const bgColor = isDark ? "#1e1e2e" : "#eff1f5";
   const pixelRatio =
     typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
@@ -463,17 +479,6 @@ export function GraphCanvas() {
               maxZoom={100}
               mouseButtons={{ LEFT: 0, MIDDLE: 2, RIGHT: 2 }}
             />
-            {/* Bloom post-processing — skipped when reduced motion is active */}
-            {!reducedMotion && !focusMap && (
-              <EffectComposer>
-                <Bloom
-                  luminanceThreshold={0.82}
-                  luminanceSmoothing={0.24}
-                  intensity={0.38}
-                  radius={0.28}
-                />
-              </EffectComposer>
-            )}
           </Canvas>
         </div>
       )}
