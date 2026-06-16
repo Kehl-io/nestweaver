@@ -348,34 +348,31 @@ nestweaver list-links --config ./nestweaver-instance.toml
 nestweaver list-features --config ./nestweaver-instance.toml
 ```
 
-## Watcher and MCP server coexistence
+## Daemon, watcher, and MCP server coexistence
 
-The file-watcher (`nestweaver brain watch`) and the MCP server (`nestweaver mcp`)
-can run concurrently against the same database. KuzuDB (the storage engine)
-supports single-writer, multiple-reader (SWMR) access, so the watcher holds the
-write lock while the MCP server opens the file read-only.
+All write operations route through the daemon process, which holds the single
+write connection to the database. LadybugDB (the storage engine) supports
+single-writer, multiple-reader (SWMR) access — the daemon writes while MCP
+servers and CLI commands read concurrently via read-only connections.
 
 **How it works:**
 
-1. When the watcher starts it writes a PID lock file at `<db>.lock` (e.g.
-   `nestweaver.lbug.lock`). The lock file is removed when the watcher exits
-   cleanly.
-2. When the MCP server starts it calls `open_or_readonly`, which attempts a
-   read-write open first. If that fails (because the watcher holds the write
-   lock), it automatically falls back to read-only mode and logs:
-   `database is locked by another process, opening read-only`.
-3. In read-only mode every MCP query tool (`brain_context`, `brain_search`,
-   `brain_status`, `brain_diff`, etc.) works normally. The only tool that
-   requires write access is `brain_add_source`, which will return an error
-   while the watcher is running — re-index via `nestweaver brain add` instead.
+1. The daemon auto-starts when any CLI write command or MCP server needs it.
+   It holds the write lock for its lifetime and exits after 1 hour of idle.
+2. The file-watcher (`nestweaver brain watch`) runs inside the daemon process,
+   sharing the daemon's write connection for incremental updates.
+3. MCP servers open the database read-only and route write operations
+   (like `brain_add_source`) through the daemon's gRPC service.
+4. CLI read commands open the database read-only. CLI write commands
+   (index, brain add, materialize-projects, etc.) send RPCs to the daemon.
+5. Multiple MCP servers, CLI commands, and IDE integrations can share the
+   same database concurrently without lock contention.
 
 **Recommended workflow:**
 
 ```sh
-# Terminal 1: keep the brain in sync with your vault
-nestweaver brain watch ~/notes --db ./brain.lbug
-
-# Terminal 2 (or in the background): serve the MCP protocol
+# The daemon starts automatically — no manual setup needed.
+# Just use the CLI or MCP server; the daemon manages itself.
 nestweaver mcp --db ./brain.lbug
 ```
 

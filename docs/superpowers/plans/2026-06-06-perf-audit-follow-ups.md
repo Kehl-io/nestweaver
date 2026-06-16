@@ -160,6 +160,8 @@ git commit -m "fix(cli): log daemon restart failures instead of silently discard
 
 ### Task 4: Extract Daemon Stop-Restart Helper
 
+> **Superseded (2026-06-16):** The stop-daemon-take-lock pattern introduced here has been replaced by daemon RPC routing. All write operations now go through the daemon's gRPC service. The `stop_daemon_if_running` / `restart_daemon` helpers remain only as a test/CI fallback (`NESTWEAVER_NO_DAEMON=1`). See `docs/superpowers/plans/2026-06-16-daemon-route-all-writes.md`.
+
 **Files:**
 - Modify: `src/main.rs`
 
