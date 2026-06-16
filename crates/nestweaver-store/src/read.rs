@@ -880,6 +880,26 @@ impl GraphStore {
             .collect()
     }
 
+    /// Look up a single Tag by UID.
+    pub fn lookup_tag(&self, uid: &str) -> Result<Tag, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (t:Tag {uid: $uid}) RETURN t.uid, t.vault_uid, t.name";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Tag {
+                uid: extract_string(&row, 0)?,
+                vault_uid: extract_string(&row, 1)?,
+                name: extract_string(&row, 2)?,
+            }),
+            None => Err(StoreError::NotFound),
+        }
+    }
+
     /// Count of all Tag nodes.
     pub fn count_tags(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
@@ -1008,40 +1028,88 @@ impl GraphStore {
     }
 
     /// Find every Note that links *to* `note_uid` via a WIKILINK_TO_NOTE
-    /// edge. Returns the source note (the linker), the section it came
-    /// from, and the link confidence + display string.
+    /// edge or via a WIKILINK_TO_HEADING edge whose heading belongs to the
+    /// target note. Returns the source note (the linker), the section it
+    /// came from, and the link confidence + display string.
     pub fn wikilink_sources_to_note(&self, note_uid: &str) -> Result<Vec<BacklinkRow>, StoreError> {
         let conn = self.conn()?;
+        let mut rows = Vec::new();
+
+        // Path 1: direct WIKILINK_TO_NOTE edges.
         // Traverse: source Note ← NOTE_HAS_SECTION ← Section -[r:WIKILINK_TO_NOTE]→ target Note.
-        let q = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(s:Section)-[r:WIKILINK_TO_NOTE]->(n:Note {uid: $uid}) \
-                 RETURN src.uid, src.title, src.file_path, s.uid, r.confidence, r.display";
-        let mut stmt = conn
-            .prepare(q)
+        let q1 = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(s:Section)-[r:WIKILINK_TO_NOTE]->(n:Note {uid: $uid}) \
+                  RETURN src.uid, src.title, src.file_path, s.uid, r.confidence, r.display";
+        let mut stmt1 = conn
+            .prepare(q1)
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let result = conn
+        let result1 = conn
             .execute(
-                &mut stmt,
+                &mut stmt1,
                 vec![("uid", Value::String(note_uid.to_string()))],
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        result
-            .map(|row| {
-                let source_note_uid = extract_string(&row, 0)?;
-                let source_note_title = extract_string(&row, 1)?;
-                let source_note_path = extract_string(&row, 2)?;
-                let source_section_uid = extract_string(&row, 3)?;
-                let confidence = extract_f64(&row, 4)? as f32;
-                let display = extract_opt_string(&row, 5)?;
-                Ok(BacklinkRow {
-                    source_note_uid,
-                    source_note_title,
-                    source_note_path,
-                    source_section_uid,
-                    confidence,
-                    display,
-                })
-            })
-            .collect()
+        for row in result1 {
+            let source_note_uid = extract_string(&row, 0)?;
+            let source_note_title = extract_string(&row, 1)?;
+            let source_note_path = extract_string(&row, 2)?;
+            let source_section_uid = extract_string(&row, 3)?;
+            let confidence = extract_f64(&row, 4)? as f32;
+            let display = extract_opt_string(&row, 5)?;
+            rows.push(BacklinkRow {
+                source_note_uid,
+                source_note_title,
+                source_note_path,
+                source_section_uid,
+                confidence,
+                display,
+            });
+        }
+
+        // Path 2: WIKILINK_TO_HEADING edges whose heading belongs to the target note.
+        // Traverse: source Note ← NOTE_HAS_SECTION ← Section -[r:WIKILINK_TO_HEADING]→ Heading ← NOTE_HAS_HEADING ← target Note.
+        let q2 = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(s:Section)-[r:WIKILINK_TO_HEADING]->(h:Heading {note_uid: $uid}) \
+                  RETURN src.uid, src.title, src.file_path, s.uid, r.confidence, r.display";
+        match conn.prepare(q2) {
+            Ok(mut stmt2) => {
+                let result2 = conn
+                    .execute(
+                        &mut stmt2,
+                        vec![("uid", Value::String(note_uid.to_string()))],
+                    )
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                let mut seen_sources: std::collections::HashSet<String> = rows
+                    .iter()
+                    .map(|r| format!("{}:{}", r.source_note_uid, r.source_section_uid))
+                    .collect();
+                for row in result2 {
+                    let source_note_uid = extract_string(&row, 0)?;
+                    let source_section_uid = extract_string(&row, 3)?;
+                    let key = format!("{source_note_uid}:{source_section_uid}");
+                    if seen_sources.contains(&key) {
+                        continue; // Already found via direct note link.
+                    }
+                    seen_sources.insert(key);
+                    let source_note_title = extract_string(&row, 1)?;
+                    let source_note_path = extract_string(&row, 2)?;
+                    let confidence = extract_f64(&row, 4)? as f32;
+                    let display = extract_opt_string(&row, 5)?;
+                    rows.push(BacklinkRow {
+                        source_note_uid,
+                        source_note_title,
+                        source_note_path,
+                        source_section_uid,
+                        confidence,
+                        display,
+                    });
+                }
+            }
+            Err(e) => {
+                // WIKILINK_TO_HEADING table may not exist (no heading wikilinks indexed).
+                tracing::debug!("wikilink_sources_to_note: heading path skipped: {e}");
+            }
+        }
+
+        Ok(rows)
     }
 
     /// Look up a single note by UID.
@@ -1226,6 +1294,20 @@ impl GraphStore {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS.replace("s.", "t.");
         let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:CALLS]->(t:Symbol) RETURN {cols}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Returns direct members of a class/container via MEMBER_OF edges.
+    pub fn members_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let cols = SYMBOL_COLUMNS.replace("s.", "t.");
+        let q = format!("MATCH (t:Symbol)-[:MEMBER_OF]->(s:Symbol {{uid: $uid}}) RETURN {cols}");
         let mut stmt = conn
             .prepare(&q)
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;

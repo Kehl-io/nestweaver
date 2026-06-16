@@ -1,6 +1,6 @@
 use nestweaver_store::GraphStore;
 
-use crate::config::InstanceConfig;
+use crate::config::{DEFAULT_RESULT_LIMIT, InstanceConfig};
 use crate::guide_rules::{self, OwnedRule};
 
 /// Structured metadata for a single MCP tool, used to dynamically generate
@@ -97,7 +97,9 @@ pub fn generate_guide_with_rules(
     }
 
     // Section 3: Cross-repo links discovered in the graph
-    let cross_links = store.list_all_cross_repo_links(50).unwrap_or_default();
+    let cross_links = store
+        .list_all_cross_repo_links(DEFAULT_RESULT_LIMIT)
+        .unwrap_or_default();
     if !cross_links.is_empty() {
         // Build a repo-uid → short name map from indexed repos.
         let repo_name: std::collections::HashMap<String, String> = repos
@@ -687,10 +689,10 @@ fn render_legacy_tool_tables(out: &mut String) {
     out.push_str("### Analysis\n\n");
     out.push_str("| Tool | Purpose | Key parameters |\n");
     out.push_str("|------|---------|----------------|\n");
-    out.push_str("| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. | `symbol`, `depth` |\n");
+    out.push_str("| `brain_impact` | Blast radius: all symbols that call/import/extend the target, grouped by depth. | `symbol`, `depth`, `limit` |\n");
     out.push_str("| `flow_trace` | Forward call chain from a symbol (what it calls, transitively). | `symbol`, `depth` |\n");
     out.push_str("| `detect_changes` | Risk assessment for a list of changed files. Maps files to affected flows. | `files` |\n");
-    out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol` |\n");
+    out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol`, `limit` |\n");
     out.push_str(
         "| `clusters` | Functional communities detected by the Leiden algorithm. | `min_size`, `repo` |\n\n",
     );
