@@ -5267,32 +5267,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let instance_id = &instance_config.instance_id;
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // Materialize requires direct write access — stop the daemon
-            // temporarily if it's running on this DB.
-            let daemon_was_running = !cli.no_daemon && stop_daemon_if_running(&db_path);
+            if cli.no_daemon {
+                eprintln!("Warning: --no-daemon is ignored for write operations; routing through daemon.");
+            }
 
-            let store = open_store(Some(&db_path))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    Some(config_path),
+                ))
+                .context("failed to connect to daemon")?;
 
-            let result = materialize_projects(&store, &instance_config, instance_id, &db_path)
-                .context("materialize_projects")?;
+            let mut stream = rt
+                .block_on(client.materialize_projects(
+                    &config_path.to_string_lossy(),
+                    instance_id,
+                ))
+                .context("materialize_projects RPC failed")?;
 
-            // Release DB lock before restarting daemon
-            drop(store);
+            let mut had_error = false;
+            rt.block_on(async {
+                while let Some(progress) = stream.message().await? {
+                    eprintln!("{}", progress.message);
+                    if progress.phase == nestweaver_proto::Phase::Error as i32 {
+                        had_error = true;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
 
-            println!(
-                "Materialized {} project(s): {} note edges, {} symbol edges, \
-                 {} component edges, {} wiki notes ingested, {} wiki fetch errors",
-                result.projects_created,
-                result.note_edges,
-                result.symbol_edges,
-                result.component_edges,
-                result.wiki_notes_ingested,
-                result.wiki_fetch_errors,
-            );
-
-            // Restart daemon if we stopped it
-            if daemon_was_running {
-                restart_daemon(&db_path, Some(config.as_path()));
+            if had_error {
+                return Ok((EXIT_ERROR, None));
             }
 
             Ok((EXIT_SUCCESS, None))
