@@ -3662,8 +3662,8 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         };
 
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
-        let is_valid_sha = repo.indexed_sha.len() == 40
-            && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
+        let is_valid_sha =
+            repo.indexed_sha.len() == 40 && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
         let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
             (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                 count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
