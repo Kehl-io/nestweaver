@@ -28,28 +28,23 @@ uniform float u_intro;
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
-varying float v_importance;
 varying float v_seed;
-varying float v_bridge;
 varying float v_phase;
 
 void main() {
     v_uv = uv;
     v_color = aColor;
     v_highlight = aHighlight;
-    v_importance = aImportance;
     v_seed = aSeed;
-    v_bridge = aBridge;
     v_phase = aPhase;
 
-    // Nodes arrive with a quick scale-in while staying locked to their graph coordinates.
     float intro = clamp(u_intro, 0.0, 1.0);
     float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.08 * u_motionAmp;
     float introScale = mix(0.62, 1.0, intro) + rebound;
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
     float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
-    float beaconScale = 0.62 + aImportance * 0.06;
-    float scale = aSize * beaconScale * introScale * breathe * focusLift;
+    float baseScale = 0.45;
+    float scale = aSize * baseScale * introScale * breathe * focusLift;
 
     vec3 pos = position * scale;
 
@@ -62,39 +57,29 @@ const fragmentShader = /* glsl */ `
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
-varying float v_importance;
 varying float v_seed;
-varying float v_bridge;
 varying float v_phase;
 
 uniform float u_time;
+uniform vec3 u_strokeColor;
 
 void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
 
-    // Obsidian-like dot: clean filled center, soft antialiasing, glow only on focus.
-    float body = 1.0 - smoothstep(0.68, 0.78, dist);
-    float hotCore = exp(-7.5 * dist * dist);
-    float pulse = 0.5 + 0.5 * sin(u_time * 5.2 + v_phase * 6.2831);
-    float focusAura = exp(-8.2 * max(0.0, dist - 0.62)) *
-        v_highlight *
-        (0.11 + pulse * 0.08);
+    // Hard-edged filled circle with thin AA band
+    float body = 1.0 - smoothstep(0.90, 0.96, dist);
 
-    vec3 coreColor = mix(v_color * 0.96, v_color * 1.04, hotCore * 0.28);
-    coreColor *= 0.98 + v_importance * 0.08 + v_highlight * 0.24 + v_seed * 0.08;
+    // Hover: brighten fill 20%
+    vec3 color = v_color * (1.0 + v_highlight * 0.2);
 
-    vec3 focusInk = v_color * 1.32;
+    // Selection stroke ring: thin annulus at edge
+    float ringInner = smoothstep(0.78, 0.82, dist);
+    float ringOuter = 1.0 - smoothstep(0.90, 0.96, dist);
+    float ring = ringInner * ringOuter * v_highlight;
+    color = mix(color, u_strokeColor, ring * 0.8);
 
-    vec3 color =
-        coreColor * body +
-        focusInk * hotCore * v_highlight * 0.20 +
-        focusInk * focusAura;
-
-    float halo = exp(-8.6 * max(0.0, dist - 0.74)) * (v_highlight * 0.045 + v_seed * 0.018);
-    color += v_color * halo;
-    float alpha = max(body, max(focusAura, halo));
-
+    float alpha = body;
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
 }
@@ -127,6 +112,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
       u_breatheAmp: { value: 0 },
       u_motionAmp: { value: reducedMotion ? 0 : 1 },
       u_intro: { value: reducedMotion ? 1 : 0 },
+      u_strokeColor: { value: [0.804, 0.839, 0.957] },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -138,6 +124,20 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     uniforms.u_motionAmp.value = reducedMotion ? 0 : 1;
     if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
+
+  // Theme-reactive stroke color
+  useEffect(() => {
+    function updateStroke() {
+      const isDark = document.documentElement.classList.contains("dark");
+      uniforms.u_strokeColor.value = isDark
+        ? [0.804, 0.839, 0.957]
+        : [0.298, 0.310, 0.412];
+    }
+    updateStroke();
+    const observer = new MutationObserver(updateStroke);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, [uniforms]);
 
   const introStartRef = useRef<number | null>(null);
 

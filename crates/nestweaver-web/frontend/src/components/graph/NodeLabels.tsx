@@ -146,7 +146,7 @@ export function NodeLabels({ buffers }: Props) {
               } ${focusMap ? "graph-node-label-focus" : ""}`}
               style={{
                 fontSize: `${baseFontSize}px`,
-                fontWeight: isHighlighted ? 700 : 560,
+                fontWeight: isHighlighted ? 600 : 500,
               }}
             >
               {node.label}
