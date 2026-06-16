@@ -507,6 +507,9 @@ impl NestWeaverDaemon for DaemonService {
         request: Request<MaterializeProjectsRequest>,
     ) -> Result<Response<Self::MaterializeProjectsStream>, Status> {
         self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
 
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
@@ -581,6 +584,8 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
+
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -593,29 +598,42 @@ impl NestWeaverDaemon for DaemonService {
         request: Request<RemoveVaultRequest>,
     ) -> Result<Response<RemoveVaultResponse>, Status> {
         self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
 
         let req = request.into_inner();
-        let notes_deleted = self
-            .state
-            .store
-            .delete_vault_cascade(&req.vault_uid)
-            .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
+        let state = self.state.clone();
 
-        // Rebuild Tantivy if available so BM25 search reflects the deletion.
-        if let Some(ref tantivy) = self.state.tantivy
-            && tantivy.has_writer()
-        {
-            match tantivy.reindex_from_store(&self.state.store) {
-                Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault removal"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Tantivy reindex failed after vault removal")
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let notes_deleted = state
+                .store
+                .delete_vault_cascade(&req.vault_uid)
+                .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
+
+            if let Some(ref tantivy) = state.tantivy
+                && tantivy.has_writer()
+            {
+                match tantivy.reindex_from_store(&state.store) {
+                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault removal"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Tantivy reindex failed after vault removal")
+                    }
                 }
             }
-        }
 
-        Ok(Response::new(RemoveVaultResponse {
-            notes_deleted: notes_deleted as u64,
-        }))
+            Ok::<_, Status>(RemoveVaultResponse {
+                notes_deleted: notes_deleted as u64,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
     }
 
     async fn merge_instance(
@@ -623,26 +641,40 @@ impl NestWeaverDaemon for DaemonService {
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
         self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
 
         let req = request.into_inner();
-        let result = self
-            .state
-            .store
-            .merge_instance_ids(&req.from_id, &req.to_id)
-            .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
+        let state = self.state.clone();
 
-        let discarded_vaults = result
-            .discarded
-            .into_iter()
-            .map(|d| d.root_path)
-            .collect::<Vec<_>>();
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let result = state
+                .store
+                .merge_instance_ids(&req.from_id, &req.to_id)
+                .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
 
-        Ok(Response::new(MergeInstanceResponse {
-            vaults_reparented: result.vaults as u64,
-            repos_reparented: result.repos as u64,
-            projects_reparented: result.projects as u64,
-            discarded_vaults,
-        }))
+            let discarded_vaults = result
+                .discarded
+                .into_iter()
+                .map(|d| format!("{} ({} notes discarded)", d.root_path, d.notes_discarded))
+                .collect::<Vec<_>>();
+
+            Ok::<_, Status>(MergeInstanceResponse {
+                vaults_reparented: result.vaults as u64,
+                repos_reparented: result.repos as u64,
+                projects_reparented: result.projects as u64,
+                discarded_vaults,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
     }
 
     type PurgeInstanceStream = ProgressStream;
@@ -652,6 +684,9 @@ impl NestWeaverDaemon for DaemonService {
         request: Request<PurgeInstanceRequest>,
     ) -> Result<Response<Self::PurgeInstanceStream>, Status> {
         self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
 
         let req = request.into_inner();
         let instance_id = req.instance_id.clone();
@@ -711,6 +746,8 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
+
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(

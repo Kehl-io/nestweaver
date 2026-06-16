@@ -2741,13 +2741,12 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
     } // end #[cfg(not(feature = "daemon"))]
 }
 
-/// Compute the daemon socket path for a given db path, mirroring the
-/// algorithm in `nestweaver_daemon::lifecycle`. We inline it here to
-/// avoid a dependency cycle:
-///   nestweaver-mcp → nestweaver-daemon → nestweaver-mcp
-///
 /// Ensure the daemon is running (spawning it if needed) and return the
 /// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
+///
+/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
+/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
+// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
 #[cfg(feature = "daemon")]
 fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use std::collections::hash_map::DefaultHasher;
