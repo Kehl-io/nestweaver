@@ -130,11 +130,11 @@ message JsonResponse {
 message BrainSearchRequest {
   string query = 1;
   int32 limit = 2;
-  string response_format = 3;
+  optional string response_format = 3;
   bool include_bodies = 4;
   bool prf = 5;
   bool rerank = 6;
-  string root = 7;
+  optional string root = 7;
 }
 message BrainSearchResponse {
   string query = 1;
@@ -149,9 +149,9 @@ message SearchResultItem {
   string kind = 2;
   string title = 3;
   double score = 4;
-  string location = 5;
+  optional string location = 5;
   repeated string matched_headings = 6;
-  string inline_body = 7;
+  optional string inline_body = 7;
 }
 
 // brain_status
@@ -170,8 +170,8 @@ message BrainStatusResponse {
 
 // note_get
 message NoteGetRequest {
-  string uid = 1;
-  string title = 2;
+  optional string uid = 1;
+  optional string title = 2;
   bool include_body = 3;
   repeated string sections = 4;
 }
@@ -181,7 +181,7 @@ message NoteGetResponse {
   string path = 3;
   string note_kind = 4;
   int32 word_count = 5;
-  string body = 6;
+  optional string body = 6;
   int32 section_count = 7;
 }
 
