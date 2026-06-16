@@ -290,8 +290,11 @@ enum Commands {
     Search {
         /// Text to search for in symbol names
         query: String,
-        #[arg(long, default_value = "10", help = "Maximum number of results")]
-        limit: usize,
+        #[arg(
+            long,
+            help = "Maximum number of results (default: 10, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -299,6 +302,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Look up a symbol by name or UID
     ///
@@ -672,6 +677,10 @@ enum Commands {
             help = "Record interaction telemetry to a sidecar file for usage-based ranking"
         )]
         track_interactions: bool,
+        /// Path to instance config (TOML) for [limits], [response], [ranking] settings.
+        /// In daemon mode, the daemon's own --config takes precedence.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Open the database directly for reads instead of routing through the daemon.
         /// Write operations always go through the daemon regardless of this flag.
         #[arg(long)]
@@ -1555,8 +1564,11 @@ enum BrainCommands {
     Search {
         /// Search query string.
         query: String,
-        #[arg(long, default_value = "20", help = "Maximum results")]
-        limit: usize,
+        #[arg(
+            long,
+            help = "Maximum results (default: 20, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -1589,8 +1601,11 @@ enum BrainCommands {
         token_budget: Option<usize>,
         /// Hard cap on connected results. Used when --token-budget is not
         /// set; ignored when it is.
-        #[arg(long, default_value = "30", help = "Maximum connected results to show")]
-        limit: usize,
+        #[arg(
+            long,
+            help = "Maximum connected results (default: 30, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -2163,6 +2178,17 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
             None
         }
     }
+}
+
+/// Resolve a CLI `--limit` value: explicit flag > instance config > built-in default.
+fn resolve_limit(
+    explicit: Option<usize>,
+    config: Option<&nestweaver_engine::InstanceConfig>,
+    builtin_default: usize,
+) -> usize {
+    explicit
+        .or_else(|| config.map(|c| c.limits.default_result_limit))
+        .unwrap_or(builtin_default)
 }
 
 fn detect_repo_root() -> PathBuf {
@@ -4053,6 +4079,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             lite,
             tools: tool_allowlist,
             track_interactions,
+            config,
             no_daemon,
         } => {
             if allow_mcp_add_sources {
@@ -4090,6 +4117,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     allow_mcp_add_sources,
                     lite,
                     track_interactions,
+                    config.as_deref(),
                 )
                 .context("mcp server")?;
             }
@@ -4153,7 +4181,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             limit,
             json,
             db,
+            config,
         } => {
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 10);
             let store = open_store(db.as_deref())?;
             let candidates = search_symbols(&store, &query, limit)?;
 
@@ -7759,6 +7790,8 @@ fn run_brain(
             prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 20);
 
             // Route through the daemon's typed `Search` RPC when running. The
             // daemon owns the writer-mode Tantivy index and shares dispatch
@@ -8057,6 +8090,8 @@ fn run_brain(
             prefer_instance,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
+            let cfg = load_instance_config_opt(config_path.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 30);
 
             // Parse the optional --intent override into a `QueryIntent`.
             // Surface invalid values as a CLI error rather than silently
