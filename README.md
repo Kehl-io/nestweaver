@@ -171,6 +171,14 @@ cargo build --release
 | `brain status` | Show vault counts, per-vault staleness, and index health |
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
+| `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
+| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD |
+| `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
+| `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
+| `brain orphans` | List notes with zero inbound and zero outbound wikilinks |
+| `brain topic-clusters` | Detect topic clusters via Leiden community detection over note wikilinks |
+| `brain tag-graph` | Show a tag's note count and co-occurring tags (or dump the full tag graph) |
+| `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
 | `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
 | `memory consolidate` | Propose/apply tier promotions (logs → ideas → project files) |
 | `memory related` | Typed-edge traversal from a note (supersedes, depends-on, etc.) |
