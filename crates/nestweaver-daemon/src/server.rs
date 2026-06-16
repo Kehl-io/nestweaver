@@ -801,11 +801,11 @@ impl NestWeaverDaemon for DaemonService {
         if req.limit > 0 {
             args["limit"] = serde_json::json!(req.limit);
         }
-        if !req.response_format.is_empty() {
-            args["response_format"] = serde_json::json!(req.response_format);
+        if let Some(ref fmt) = req.response_format {
+            args["response_format"] = serde_json::json!(fmt);
         }
-        if !req.root.is_empty() {
-            args["root"] = serde_json::json!(req.root);
+        if let Some(ref root) = req.root {
+            args["root"] = serde_json::json!(root);
         }
 
         let value = self.dispatch_tool_json("brain_search", args).await?;
@@ -851,8 +851,8 @@ impl NestWeaverDaemon for DaemonService {
                         location: item
                             .get("location")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                         matched_headings: item
                             .get("matched_headings")
                             .and_then(|v| v.as_array())
@@ -865,8 +865,8 @@ impl NestWeaverDaemon for DaemonService {
                         inline_body: item
                             .get("inline_body")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                     })
                     .collect()
             })
@@ -1003,11 +1003,11 @@ impl NestWeaverDaemon for DaemonService {
         let mut args = serde_json::json!({
             "include_body": req.include_body,
         });
-        if !req.uid.is_empty() {
-            args["uid"] = serde_json::json!(req.uid);
+        if let Some(ref uid) = req.uid {
+            args["uid"] = serde_json::json!(uid);
         }
-        if !req.title.is_empty() {
-            args["title"] = serde_json::json!(req.title);
+        if let Some(ref title) = req.title {
+            args["title"] = serde_json::json!(title);
         }
         if !req.sections.is_empty() {
             args["sections"] = serde_json::json!(req.sections);
@@ -1043,8 +1043,8 @@ impl NestWeaverDaemon for DaemonService {
             body: value
                 .get("body")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             section_count: value
                 .get("section_count")
                 .and_then(|v| v.as_i64())

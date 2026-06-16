@@ -211,6 +211,9 @@ pub struct InstanceConfig {
     /// Vault file-watching configuration (`[watch]`).
     #[serde(default)]
     pub watch: WatchConfig,
+    /// Default pagination limits for tool responses (`[limits]`).
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 /// `[cache]` — tuning for the F16 response cache (Feature F16).
@@ -261,6 +264,33 @@ impl Default for WatchConfig {
         Self {
             enabled: true,
             debounce_ms: 200,
+        }
+    }
+}
+
+/// Default result limit for paginated MCP tool responses.
+pub const DEFAULT_RESULT_LIMIT: usize = 50;
+
+/// `[limits]` — default pagination limits for tool responses.
+///
+/// NOTE: MCP tools currently use the compile-time `DEFAULT_RESULT_LIMIT`
+/// constant. This config is deserialized and stored but not yet plumbed
+/// through to the tool dispatch layer. A future change should pass the
+/// resolved limit from `InstanceConfig.limits` into the MCP server context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_result_limit")]
+    pub default_result_limit: usize,
+}
+
+fn default_result_limit() -> usize {
+    DEFAULT_RESULT_LIMIT
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            default_result_limit: DEFAULT_RESULT_LIMIT,
         }
     }
 }

@@ -1295,6 +1295,7 @@ enum DaemonAction {
     Status,
     /// Stop and restart the daemon
     Restart {
+        /// Idle timeout in seconds
         #[arg(long, default_value = "3600")]
         idle_timeout: u64,
         /// Optional path to `nestweaver-instance.toml`, forwarded to the
@@ -7775,11 +7776,11 @@ fn run_brain(
                     let req = nestweaver_proto::BrainSearchRequest {
                         query: raw_query.clone(),
                         limit: limit as i32,
-                        response_format: String::new(),
+                        response_format: None,
                         include_bodies: false,
                         prf,
                         rerank: false,
-                        root: String::new(),
+                        root: None,
                     };
                     let rpc = rt.block_on(async {
                         client.inner_mut().search(req).await.map(|r| r.into_inner())
@@ -9095,14 +9096,14 @@ fn render_brain_search_response(
                 "title": item.title,
                 "score": item.score,
             });
-            if !item.location.is_empty() {
-                v["location"] = serde_json::json!(item.location);
+            if let Some(ref loc) = item.location {
+                v["location"] = serde_json::json!(loc);
             }
             if !item.matched_headings.is_empty() {
                 v["matched_headings"] = serde_json::json!(item.matched_headings);
             }
-            if !item.inline_body.is_empty() {
-                v["inline_body"] = serde_json::json!(item.inline_body);
+            if let Some(ref body) = item.inline_body {
+                v["inline_body"] = serde_json::json!(body);
             }
             results.push(v);
         }
@@ -9149,13 +9150,13 @@ fn render_brain_search_response(
         } else {
             // Symbol/<Kind> row: split "kind" prefix off, render with location.
             let kind_short = item.kind.strip_prefix("Symbol/").unwrap_or(&item.kind);
-            if item.location.is_empty() {
-                println!("  [{:.2}] {} [{}]", item.score, item.title, kind_short);
-            } else {
+            if let Some(ref loc) = item.location {
                 println!(
                     "  [{:.2}] {} [{}] @ {}",
-                    item.score, item.title, kind_short, item.location,
+                    item.score, item.title, kind_short, loc,
                 );
+            } else {
+                println!("  [{:.2}] {} [{}]", item.score, item.title, kind_short);
             }
         }
     }

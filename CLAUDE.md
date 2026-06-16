@@ -135,7 +135,7 @@ Sidecar files written alongside the database:
 
 ## Architecture
 
-Cargo workspace with 10 crates + root binary:
+Cargo workspace with 13 crates + root binary:
 
 ```
 nestweaver/                     # CLI entry point (src/main.rs)
@@ -147,6 +147,9 @@ crates/
   nestweaver-storage/           # pluggable snapshot storage backends (local, S3, GitLab)
   nestweaver-engine/            # indexing pipeline, query dispatch, config, registry, snapshots, LLM pipelines
   nestweaver-algorithms/        # pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible
+  nestweaver-proto/             # gRPC protobuf definitions and generated Rust types
+  nestweaver-daemon/            # background daemon process for persistent graph serving
+  nestweaver-client/            # gRPC client for daemon communication
   nestweaver-mcp/               # optional MCP wrapper (feature-gated, delegates to engine)
   nestweaver-web/               # web UI (Three.js/R3F + Axum API) with GPU-accelerated graph rendering
   nestweaver-wasm/              # browser-side WASM module wrapping nestweaver-algorithms
