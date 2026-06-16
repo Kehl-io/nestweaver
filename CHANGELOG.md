@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.24.0](https://github.com/Kehl-io/nestweaver/compare/v0.23.0...v0.24.0) (2026-06-16)
+
+
+### Features
+
+* **graph:** add node preview card component ([a6ea76f](https://github.com/Kehl-io/nestweaver/commit/a6ea76f61084dfbb25b0f2865d90d368bed86939))
+* **graph:** add preview card state to store ([c67e851](https://github.com/Kehl-io/nestweaver/commit/c67e85144e557056fd2ecb733c13901c44392338))
+* **graph:** add useNodePreview hook with LRU cache ([66b378e](https://github.com/Kehl-io/nestweaver/commit/66b378e5aac41559fe5a4043e8aa057041413ed3))
+* **graph:** Obsidian-style visual reskin + click-to-preview UX ([e33eaf5](https://github.com/Kehl-io/nestweaver/commit/e33eaf5a2de5b370e36a62dafe0d27aa1f27c4f0))
+* **graph:** populate context menu with grouped power actions ([5ff9e7a](https://github.com/Kehl-io/nestweaver/commit/5ff9e7a1295754742dfc79bcfc0eccf545392a5f))
+* **graph:** wire click-to-preview and escape dismiss ([cd34cea](https://github.com/Kehl-io/nestweaver/commit/cd34cea1968b580c8bc70d19de0aeb4359c33f37))
+
+
+### Bug Fixes
+
+* **e2e:** don't toggle settings between view switches — flyout stays open ([3ac9efb](https://github.com/Kehl-io/nestweaver/commit/3ac9efb0e7fd77d0aaf6f5f55c95efefb761e6f2))
+* **e2e:** fix settings flyout interactions — close after toggle, remove stale Export/Filter button refs ([0eef514](https://github.com/Kehl-io/nestweaver/commit/0eef5141f06f3550a398e376b1bb1ab3e191d21c))
+* **e2e:** force-click view buttons in settings flyout to bypass visibility check ([966e3f9](https://github.com/Kehl-io/nestweaver/commit/966e3f95eae9eacbe232cc8281af2e5815bf182c))
+* **e2e:** wait for settings flyout visibility before clicking view buttons ([7946460](https://github.com/Kehl-io/nestweaver/commit/7946460b790b26725c47dbd1847399ea66efd3ae))
+* **graph:** render ExportMenu inline inside settings flyout to prevent overlay ([50f3ce5](https://github.com/Kehl-io/nestweaver/commit/50f3ce5c701c35e1d498dd63aa5e1420fc96d344))
+* **graph:** review fixes — open-source-file path, context menu dismiss, button types ([c39effe](https://github.com/Kehl-io/nestweaver/commit/c39effe6b225d51a48449b06514c24bef9715a65))
+* **graph:** show fallback node info when API detail unavailable ([4f08f9f](https://github.com/Kehl-io/nestweaver/commit/4f08f9fae1267e9c9ccb05af0d264789d05d0fc5))
+* **graph:** wire right-click context menu via store, fix Escape handler conflict ([0d57c38](https://github.com/Kehl-io/nestweaver/commit/0d57c38bb2126bc8bae0632a7d8f72303975960f))
+* reduce baseScale to 0.45 to compensate for larger hard-edge circle ([2328926](https://github.com/Kehl-io/nestweaver/commit/23289260997203583b37b07aeed320683a971578))
+* restore base scale factor (0.62) for node sizing ([2bcf49c](https://github.com/Kehl-io/nestweaver/commit/2bcf49c2d8710c63f7e62d4a4b88b571ffc7b246))
+
+
+### Performance Improvements
+
+* remove bloom post-processing, update background to Catppuccin base ([d5a8525](https://github.com/Kehl-io/nestweaver/commit/d5a8525876f9f32db4062343c1a92560393d825c))
+
 ## [0.23.0](https://github.com/Kehl-io/nestweaver/compare/v0.22.0...v0.23.0) (2026-06-13)
 
 
