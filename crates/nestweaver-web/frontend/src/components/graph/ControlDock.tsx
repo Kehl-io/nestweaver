@@ -1,9 +1,6 @@
 import { useState, type ReactNode } from "react";
 import {
   Activity,
-  Download,
-  Eye,
-  Filter,
   GitCompare,
   Grid3X3,
   Layers3,
@@ -12,6 +9,7 @@ import {
   Maximize,
   Network,
   Route,
+  Settings,
   Sparkles,
   Tags,
 } from "lucide-react";
@@ -22,52 +20,6 @@ import { ExportMenu } from "../export/ExportMenu";
 import { ForceControls } from "./ForceControls";
 import { NodeFilterBar } from "./NodeFilterBar";
 import { StyleRules } from "./StyleRules";
-
-type DockMenu = "view" | "group" | "filter" | "analyze" | "export";
-
-interface DockButtonProps {
-  id: DockMenu;
-  label: string;
-  icon: ReactNode;
-  active: boolean;
-  onClick: () => void;
-}
-
-function DockButton({ label, icon, active, onClick }: DockButtonProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={label}
-      aria-label={label}
-      aria-pressed={active}
-      className={`flex h-9 w-9 items-center justify-center rounded border transition-colors ${
-        active
-          ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
-          : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)]"
-      }`}
-    >
-      {icon}
-    </button>
-  );
-}
-
-function MenuPanel({
-  title,
-  children,
-}: {
-  title: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="absolute right-11 top-0 z-50 w-[320px] rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3 text-xs shadow-xl">
-      <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
-        {title}
-      </h2>
-      {children}
-    </div>
-  );
-}
 
 function MenuButton({
   active,
@@ -94,7 +46,7 @@ function MenuButton({
 }
 
 export function ControlDock() {
-  const [open, setOpen] = useState<DockMenu | null>(null);
+  const [open, setOpen] = useState(false);
   const viewMode = useStore((s) => s.viewMode);
   const setViewMode = useStore((s) => s.setViewMode);
   const minimapVisible = useStore((s) => s.minimapVisible);
@@ -121,10 +73,6 @@ export function ControlDock() {
   const gapActive = useStore((s) => s.gapActive);
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
 
-  const toggleMenu = (menu: DockMenu) => {
-    setOpen((current) => (current === menu ? null : menu));
-  };
-
   const analyzeGaps = async () => {
     const items = await loadGapItems();
     setGapItems(items);
@@ -141,18 +89,30 @@ export function ControlDock() {
   return (
     <div
       data-testid="control-dock"
-      className="absolute right-2 top-2 z-50 flex flex-col gap-1.5"
+      className="absolute right-2 top-2 z-50"
     >
       <div className="relative">
-        <DockButton
-          id="view"
-          label="View"
-          icon={<Eye className="h-4 w-4" />}
-          active={open === "view"}
-          onClick={() => toggleMenu("view")}
-        />
-        {open === "view" && (
-          <MenuPanel title="View">
+        <button
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          title="Settings"
+          aria-label="Settings"
+          aria-pressed={open}
+          className={`flex h-9 w-9 items-center justify-center rounded border transition-colors ${
+            open
+              ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
+              : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          <Settings className="h-4 w-4" />
+        </button>
+
+        {open && (
+          <div className="absolute right-0 top-11 z-50 w-[320px] max-h-[70vh] overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3 text-xs shadow-xl">
+            {/* View */}
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              View
+            </h2>
             <div className="flex flex-wrap gap-1.5">
               <MenuButton active={viewMode === "graph"} onClick={() => setViewMode("graph")}>
                 <Network className="h-3.5 w-3.5" /> Graph
@@ -176,20 +136,13 @@ export function ControlDock() {
                 <Maximize className="h-3.5 w-3.5" /> Focus Map
               </MenuButton>
             </div>
-          </MenuPanel>
-        )}
-      </div>
 
-      <div className="relative">
-        <DockButton
-          id="group"
-          label="Group"
-          icon={<Layers3 className="h-4 w-4" />}
-          active={open === "group"}
-          onClick={() => toggleMenu("group")}
-        />
-        {open === "group" && (
-          <MenuPanel title="Group">
+            <hr className="my-3 border-[var(--color-border)]" />
+
+            {/* Group */}
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              Group
+            </h2>
             <div className="mb-3 flex flex-wrap gap-1.5">
               <MenuButton active={communityOverlay} onClick={toggleCommunity}>
                 <Layers3 className="h-3.5 w-3.5" /> Communities
@@ -199,20 +152,13 @@ export function ControlDock() {
               </MenuButton>
             </div>
             <StyleRules open />
-          </MenuPanel>
-        )}
-      </div>
 
-      <div className="relative">
-        <DockButton
-          id="filter"
-          label="Filter"
-          icon={<Filter className="h-4 w-4" />}
-          active={open === "filter"}
-          onClick={() => toggleMenu("filter")}
-        />
-        {open === "filter" && (
-          <MenuPanel title="Filter">
+            <hr className="my-3 border-[var(--color-border)]" />
+
+            {/* Filter */}
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              Filter
+            </h2>
             <label className="mb-2 block text-[11px] font-medium text-[var(--color-text-muted)]">
               Scope
               <select
@@ -226,20 +172,13 @@ export function ControlDock() {
               </select>
             </label>
             <NodeFilterBar />
-          </MenuPanel>
-        )}
-      </div>
 
-      <div className="relative">
-        <DockButton
-          id="analyze"
-          label="Analyze"
-          icon={<Activity className="h-4 w-4" />}
-          active={open === "analyze"}
-          onClick={() => toggleMenu("analyze")}
-        />
-        {open === "analyze" && (
-          <MenuPanel title="Analyze">
+            <hr className="my-3 border-[var(--color-border)]" />
+
+            {/* Analyze */}
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              Analyze
+            </h2>
             <div className="mb-3 flex flex-wrap gap-1.5">
               <MenuButton onClick={requestSemanticLayout}>
                 <Sparkles className="h-3.5 w-3.5" /> Semantic layout
@@ -268,19 +207,16 @@ export function ControlDock() {
               </MenuButton>
             </div>
             <ForceControls open />
-          </MenuPanel>
-        )}
-      </div>
 
-      <div className="relative">
-        <DockButton
-          id="export"
-          label="Export"
-          icon={<Download className="h-4 w-4" />}
-          active={open === "export"}
-          onClick={() => toggleMenu("export")}
-        />
-        {open === "export" && <ExportMenu onClose={() => setOpen(null)} />}
+            <hr className="my-3 border-[var(--color-border)]" />
+
+            {/* Export */}
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              Export
+            </h2>
+            <ExportMenu onClose={() => setOpen(false)} inline />
+          </div>
+        )}
       </div>
     </div>
   );
