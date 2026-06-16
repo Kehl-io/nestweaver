@@ -450,11 +450,14 @@ fn detect_spring_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
                     // If the sub-path already starts with the base path, don't
                     // join — doing so would double-concatenate the prefix (e.g.
                     // base="/api", sub="/api/users" → "/api/api/users").
-                    let path = if !base.is_empty() && s.starts_with(&base) {
-                        normalize_http_path(&s)
-                    } else {
-                        join_paths(&base, &s)
-                    };
+                    // Use a boundary check to avoid false positives like
+                    // base="/rest", sub="/restore".
+                    let path =
+                        if !base.is_empty() && (s == base || s.starts_with(&format!("{base}/"))) {
+                            normalize_http_path(&s)
+                        } else {
+                            join_paths(&base, &s)
+                        };
                     (path, 1.0)
                 }
                 // No sub-path → base-path-inferred (lower confidence).
@@ -533,11 +536,14 @@ fn detect_nestjs_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Handle
                     // If the sub-path already starts with the base path, don't
                     // join — doing so would double-concatenate the prefix (e.g.
                     // base="api", sub="/api/users" → "/api/api/users").
-                    let path = if !base.is_empty() && s.starts_with(&base) {
-                        normalize_http_path(&s)
-                    } else {
-                        join_paths(&base, &s)
-                    };
+                    // Use a boundary check to avoid false positives like
+                    // base="/rest", sub="/restore".
+                    let path =
+                        if !base.is_empty() && (s == base || s.starts_with(&format!("{base}/"))) {
+                            normalize_http_path(&s)
+                        } else {
+                            join_paths(&base, &s)
+                        };
                     (path, 1.0)
                 }
                 None => (

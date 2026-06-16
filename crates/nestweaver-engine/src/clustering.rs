@@ -60,10 +60,21 @@ pub fn modularity(graph: &Graph, assignment: &[u32]) -> f64 {
 /// - `resolution` controls community size (typical range 0.5–2.0; 1.0 = standard modularity).
 /// - `max_iterations` caps the local-moving phase.
 pub fn leiden(graph: &Graph, resolution: f64, max_iterations: u32) -> ClusteringResult {
-    if graph.n == 0 {
+    if graph.n == 0 || graph.total_weight <= 0.0 {
+        // No nodes or no edges — each node is its own singleton community.
+        // Without edges, Leiden's delta-Q formula would divide by zero
+        // (2 * total_weight), so bail out early.
+        let assignment: Vec<u32> = (0..graph.n as u32).collect();
+        let communities: Vec<Community> = (0..graph.n)
+            .map(|i| Community {
+                id: i as u32,
+                members: vec![i],
+                cohesion: 0.0,
+            })
+            .collect();
         return ClusteringResult {
-            assignment: vec![],
-            communities: vec![],
+            assignment,
+            communities,
             modularity: 0.0,
         };
     }
