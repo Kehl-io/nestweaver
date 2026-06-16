@@ -1,6 +1,6 @@
 use nestweaver_store::GraphStore;
 
-use crate::config::InstanceConfig;
+use crate::config::{DEFAULT_RESULT_LIMIT, InstanceConfig};
 use crate::guide_rules::{self, OwnedRule};
 
 /// Structured metadata for a single MCP tool, used to dynamically generate
@@ -97,7 +97,7 @@ pub fn generate_guide_with_rules(
     }
 
     // Section 3: Cross-repo links discovered in the graph
-    let cross_links = store.list_all_cross_repo_links(50).unwrap_or_default();
+    let cross_links = store.list_all_cross_repo_links(DEFAULT_RESULT_LIMIT).unwrap_or_default();
     if !cross_links.is_empty() {
         // Build a repo-uid → short name map from indexed repos.
         let repo_name: std::collections::HashMap<String, String> = repos
