@@ -1768,6 +1768,11 @@ enum BrainCommands {
     BrokenLinks {
         #[arg(long, default_value = "5", help = "Max suggested targets per link")]
         max_suggestions: usize,
+        #[arg(
+            long,
+            help = "Max broken links to return (default: 50, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -1793,6 +1798,11 @@ enum BrainCommands {
             help = "Note path/title to exclude (repeatable; overrides the default allowlist)"
         )]
         allow: Vec<String>,
+        #[arg(
+            long,
+            help = "Max orphan documents to return (default: 50, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -1809,6 +1819,11 @@ enum BrainCommands {
     TopicClusters {
         #[arg(long, default_value = "0.5", help = "Leiden resolution")]
         resolution: f64,
+        #[arg(
+            long,
+            help = "Max clusters to return (default: 50, or [limits].default_result_limit from config)"
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -1825,6 +1840,11 @@ enum BrainCommands {
         /// Optional focus tag (with or without leading #). When omitted,
         /// prints the full tag co-occurrence graph for every tag.
         tag: Option<String>,
+        #[arg(
+            long,
+            help = "Max tags to return (default: 50, or [limits].default_result_limit from config). Ignored when a specific tag is queried."
+        )]
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -7155,8 +7175,15 @@ fn run_brain(
                                 .as_str()
                                 .map(|h| &h[..8.min(h.len())])
                                 .unwrap_or("unknown");
+                            let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                             let marker = if stale { "STALE" } else { "ok" };
-                            println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                            if stale && behind > 0 {
+                                println!(
+                                    "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
+                                );
+                            } else {
+                                println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                            }
                         }
                     }
                 }
@@ -7181,9 +7208,34 @@ fn run_brain(
                     None
                 };
 
+                let is_valid_sha = repo.indexed_sha.len() == 40
+                    && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
+                let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+                    (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
+                        std::process::Command::new("git")
+                            .args([
+                                "-C",
+                                path,
+                                "rev-list",
+                                "--count",
+                                &format!("{}..{}", repo.indexed_sha, head),
+                            ])
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .and_then(|o| {
+                                String::from_utf8_lossy(&o.stdout)
+                                    .trim()
+                                    .parse::<u64>()
+                                    .ok()
+                            })
+                            .unwrap_or(0)
+                    }
+                    _ => repo.staleness_commits_behind as u64,
+                };
                 let is_stale = match &current_head {
                     Some(head) => head != &repo.indexed_sha,
-                    None => repo.staleness_commits_behind > 0,
+                    None => commits_behind > 0,
                 };
                 if is_stale {
                     any_stale = true;
@@ -7194,6 +7246,7 @@ fn run_brain(
                     "indexed_sha": repo.indexed_sha,
                     "current_head": current_head,
                     "is_stale": is_stale,
+                    "staleness_commits_behind": commits_behind,
                 }));
             }
 
@@ -7227,8 +7280,15 @@ fn run_brain(
                         .as_str()
                         .map(|h| &h[..8.min(h.len())])
                         .unwrap_or("unknown");
+                    let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                     let marker = if stale { "STALE" } else { "ok" };
-                    println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                    if stale && behind > 0 {
+                        println!(
+                            "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
+                        );
+                    } else {
+                        println!("  [{marker}] {url}  indexed={indexed}  HEAD={head}");
+                    }
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -8484,18 +8544,21 @@ fn run_brain(
 
         BrainCommands::BrokenLinks {
             max_suggestions,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
             if let Some(value) = try_daemon_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_broken_links",
-                serde_json::json!({ "max_suggestions": max_suggestions }),
+                serde_json::json!({ "max_suggestions": max_suggestions, "limit": limit }),
             ) {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -8521,13 +8584,22 @@ fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
-            let links = nestweaver_engine::broken_links(&store, max_suggestions)?;
+            let all_links = nestweaver_engine::broken_links(&store, max_suggestions)?;
+            let total = all_links.len();
+            let links: Vec<_> = all_links.into_iter().take(limit).collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&links)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "broken_links": links,
+                        "total": total,
+                        "returned": links.len(),
+                    }))?
+                );
             } else if links.is_empty() {
                 println!("No broken or ambiguous wikilinks found.");
             } else {
-                println!("Broken / ambiguous wikilinks ({}):", links.len());
+                println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
                 for l in &links {
                     println!(
                         "  [[{}]] in {} (confidence {:.2})",
@@ -8550,11 +8622,14 @@ fn run_brain(
             vault,
             path_prefix,
             allow,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
             {
                 let mut args = serde_json::json!({});
@@ -8567,6 +8642,7 @@ fn run_brain(
                 if !allow.is_empty() {
                     args["allowlist"] = serde_json::json!(allow);
                 }
+                args["limit"] = serde_json::json!(limit);
                 if let Some(value) = try_daemon_json_rpc(
                     use_daemon,
                     &db_path,
@@ -8593,18 +8669,27 @@ fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
-            let orphans = nestweaver_engine::orphan_documents(
+            let all_orphans = nestweaver_engine::orphan_documents(
                 &store,
                 vault.as_deref(),
                 path_prefix.as_deref(),
                 &allow,
             )?;
+            let total = all_orphans.len();
+            let orphans: Vec<_> = all_orphans.into_iter().take(limit).collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&orphans)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "orphans": orphans,
+                        "total": total,
+                        "returned": orphans.len(),
+                    }))?
+                );
             } else if orphans.is_empty() {
                 println!("No orphan documents found.");
             } else {
-                println!("Orphan documents ({}):", orphans.len());
+                println!("Orphan documents ({} of {total}):", orphans.len());
                 for o in &orphans {
                     println!("  {} — {}", o.title, o.file_path);
                 }
@@ -8619,18 +8704,21 @@ fn run_brain(
 
         BrainCommands::TopicClusters {
             resolution,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
             if let Some(value) = try_daemon_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_topic_clusters",
-                serde_json::json!({ "resolution": resolution }),
+                serde_json::json!({ "resolution": resolution, "limit": limit }),
             ) {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -8655,13 +8743,22 @@ fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
-            let clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
+            let all_clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
+            let total = all_clusters.len();
+            let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&clusters)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "clusters": clusters,
+                        "total": total,
+                        "returned": clusters.len(),
+                    }))?
+                );
             } else if clusters.is_empty() {
                 println!("No topic clusters found.");
             } else {
-                println!("Topic clusters ({}):", clusters.len());
+                println!("Topic clusters ({} of {total}):", clusters.len());
                 for c in &clusters {
                     println!(
                         "  [{}] {} ({} note(s))",
@@ -8681,14 +8778,17 @@ fn run_brain(
 
         BrainCommands::TagGraph {
             tag,
+            limit,
             json,
             db,
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let cfg = load_instance_config_opt(config.as_deref());
+            let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
             {
-                let mut args = serde_json::json!({});
+                let mut args = serde_json::json!({ "limit": limit });
                 if let Some(ref t) = tag {
                     args["tag"] = serde_json::json!(t);
                 }
@@ -8757,9 +8857,18 @@ fn run_brain(
                     }
                 }
                 None => {
-                    let graphs = nestweaver_engine::tag_graph_all(&store)?;
+                    let all_graphs = nestweaver_engine::tag_graph_all(&store)?;
+                    let total = all_graphs.len();
+                    let graphs: Vec<_> = all_graphs.into_iter().take(limit).collect();
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&graphs)?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "tags": graphs,
+                                "total": total,
+                                "returned": graphs.len(),
+                            }))?
+                        );
                     } else if graphs.is_empty() {
                         println!("no tags");
                     } else {
