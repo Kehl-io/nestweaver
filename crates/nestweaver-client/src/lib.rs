@@ -166,6 +166,43 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    pub async fn remove_repo(
+        &mut self,
+        repo_uid: &str,
+    ) -> Result<nestweaver_proto::RemoveRepoResponse> {
+        let resp = self
+            .inner
+            .remove_repo(nestweaver_proto::RemoveRepoRequest {
+                repo_uid: repo_uid.to_string(),
+            })
+            .await
+            .context("remove_repo RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    pub async fn remove_project(
+        &mut self,
+        project_uid: &str,
+    ) -> Result<nestweaver_proto::RemoveProjectResponse> {
+        let resp = self
+            .inner
+            .remove_project(nestweaver_proto::RemoveProjectRequest {
+                project_uid: project_uid.to_string(),
+            })
+            .await
+            .context("remove_project RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    pub async fn prune_stale(&mut self) -> Result<nestweaver_proto::PruneStaleResponse> {
+        let resp = self
+            .inner
+            .prune_stale(nestweaver_proto::PruneStaleRequest {})
+            .await
+            .context("prune_stale RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Merge one instance's data into another.
     pub async fn merge_instance(
         &mut self,

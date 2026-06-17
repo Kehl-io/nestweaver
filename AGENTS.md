@@ -494,12 +494,23 @@ This codebase is indexed by NestWeaver. Available MCP tools:
 | `brain_impact` | Checking blast radius before modifying a function |
 | `cross_repo_contracts` | Finding cross-service symbol relationships |
 | `brain_status` | Checking what's indexed |
+| `brain_remove_source` | Removing a repo or vault from the graph |
+| `prune_stale` | Cleaning up sources whose directories no longer exist on disk |
 
 ## Quick Start
 
 ```bash
 # Re-index (incremental — only changed files)
 nestweaver index --repo .
+
+# Remove a repo from the graph
+nestweaver remove-repo <name-or-path>
+
+# Remove a project from the graph
+nestweaver remove-project <name>
+
+# Remove stale sources whose paths no longer exist
+nestweaver prune-stale
 
 # Search for a symbol
 nestweaver search <name>

@@ -1452,6 +1452,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_repo_cascade_deletes_all_data() {
+        let store = test_store();
+        let repo = make_repo("repo:test:r1");
+        let file = make_file("file:test:f1", "repo:test:r1");
+        let sym = make_symbol("sym:test:s1", "greet", "repo:test:r1", "src/lib.rs");
+
+        store.insert_repo(&repo).unwrap();
+        store.insert_file(&file).unwrap();
+        store
+            .insert_repo_file_edge("repo:test:r1", "file:test:f1")
+            .unwrap();
+        store.insert_symbol(&sym).unwrap();
+        store
+            .insert_file_symbol_edge("file:test:f1", "sym:test:s1")
+            .unwrap();
+
+        // Verify data exists before deletion.
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1);
+
+        // Delete files/symbols, then derived nodes, then the repo node itself.
+        let (file_count, sym_count) = store
+            .bulk_delete_repo_files_and_symbols("repo:test:r1")
+            .unwrap();
+        store.clear_repo_derived_nodes("repo:test:r1").unwrap();
+        store.delete_repo_node("repo:test:r1").unwrap();
+
+        assert_eq!(file_count, 1);
+        assert_eq!(sym_count, 1);
+
+        // Verify everything is gone.
+        let repos = store.list_repos(None).unwrap();
+        assert!(repos.is_empty());
+        let syms = store.lookup_symbols_by_repo("repo:test:r1").unwrap();
+        assert!(syms.is_empty());
+    }
+
+    #[test]
     fn purge_instance_cascade_deletes_repos_and_children() {
         let store = test_store();
 
