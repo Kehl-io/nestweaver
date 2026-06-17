@@ -4142,14 +4142,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             top,
             db,
         } => {
+            let db_default = default_db_path();
+            let db_path = db.as_deref().unwrap_or(&db_default);
+
+            // Stop the daemon so we can open the store directly for export.
+            let daemon_was_running = if use_daemon {
+                stop_daemon_if_running(db_path)
+            } else {
+                false
+            };
+
             let store = open_store(db.as_deref())?;
 
             if format == "msgpack" {
                 let graph = export_in_memory_graph(&store)?;
                 let bytes = rmp_serde::to_vec(&graph)
                     .with_context(|| "failed to serialize graph to msgpack")?;
-                let default_db = default_db_path();
-                let db_path = db.as_deref().unwrap_or(&default_db);
                 let path = match &output {
                     Some(p) => p.clone(),
                     None => {
@@ -4175,6 +4183,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     bytes.len()
                 ));
                 let stats = format!("exported msgpack in {}", format_elapsed(t0.elapsed()));
+                drop(store);
+                if daemon_was_running {
+                    restart_daemon(db_path, None);
+                }
                 return Ok((EXIT_SUCCESS, Some(stats)));
             }
 
@@ -4196,12 +4208,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
                         other
                     );
+                    drop(store);
+                    if daemon_was_running {
+                        restart_daemon(db_path, None);
+                    }
                     return Ok((EXIT_ERROR, None));
                 }
             }
 
             if let Some(path) = &output {
                 out.status(&format!("Exported graph to {}", path.display()));
+            }
+
+            drop(store);
+            if daemon_was_running {
+                restart_daemon(db_path, None);
             }
 
             let stats = format!("exported {} in {}", format, format_elapsed(t0.elapsed()));
@@ -4590,11 +4611,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Ui {
             db,
             port,
-            config: _config,
+            config,
             no_open,
             watch,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // Stop the daemon so we can open the store directly for the UI server.
+            let daemon_was_running = if use_daemon {
+                stop_daemon_if_running(&db_path)
+            } else {
+                false
+            };
+
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
@@ -4635,6 +4664,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
+
+            // Restart daemon if we stopped it.
+            if daemon_was_running {
+                restart_daemon(&db_path, config.as_deref().map(std::path::Path::new));
+            }
 
             Ok((EXIT_SUCCESS, None))
         }
