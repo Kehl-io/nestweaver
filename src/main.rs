@@ -4487,6 +4487,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
+            let daemon_was_running = stop_daemon_if_running(&db_path);
+
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
 
@@ -4554,6 +4556,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let _ = std::fs::remove_file(&lock_path);
             eprintln!("Watcher stopped.");
+            if daemon_was_running {
+                restart_daemon(&db_path, config.as_deref());
+            }
             Ok((EXIT_SUCCESS, None))
         }
 
