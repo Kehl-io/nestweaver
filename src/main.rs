@@ -257,6 +257,20 @@ enum Commands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
+    /// Remove an indexed repository and all its data (symbols, files,
+    /// services, contracts) from the graph.
+    #[command(
+        after_help = "Accepts a repo name, filesystem path, file:// URL, or UID.\n\nExamples:\n  nestweaver remove-repo freeplay-server\n  nestweaver remove-repo /Users/kory/dev/workspaces/freeplay/freeplay-server\n  nestweaver remove-repo repo:051a9ff9:abc123"
+    )]
+    RemoveRepo {
+        /// Repo name, filesystem path, file:// URL, or UID
+        target: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// List all services/modules in the graph
     ListServices {
         #[arg(long, help = "Filter by instance ID")]
@@ -2483,6 +2497,86 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!("  SHA:     {}", repo.indexed_sha);
                     println!("  Instance: {}", repo.instance_id);
                     println!();
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::RemoveRepo { target, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+
+            let store = GraphStore::open_read_only(&db_path)
+                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+
+            let repos = store
+                .list_repos(None)
+                .context("failed to list repos")?;
+
+            // Resolve target → repo UID.  Accept: UID, name, path, or URL.
+            let canonical_target = std::fs::canonicalize(&target)
+                .map(|p| format!("file://{}", p.display()))
+                .unwrap_or_default();
+
+            let url_target = if target.starts_with("file://") {
+                target.clone()
+            } else if std::path::Path::new(&target).is_absolute() {
+                format!("file://{target}")
+            } else {
+                String::new()
+            };
+
+            let matched: Vec<&nestweaver_schema::Repo> = repos
+                .iter()
+                .filter(|r| {
+                    r.uid == target
+                        || r.name.as_deref() == Some(&target)
+                        || r.url == url_target
+                        || r.url == canonical_target
+                        || r.url.ends_with(&format!("/{target}"))
+                })
+                .collect();
+
+            if matched.is_empty() {
+                eprintln!(
+                    "Error: no repo matching '{target}' found.\n  \
+                     Run `nestweaver list-repos` to see indexed repos."
+                );
+                return Ok((EXIT_NOT_FOUND, None));
+            }
+            if matched.len() > 1 {
+                eprintln!("Error: '{target}' matches multiple repos:");
+                for r in &matched {
+                    eprintln!(
+                        "  {} ({})",
+                        r.uid,
+                        r.name.as_deref().unwrap_or(&r.url)
+                    );
+                }
+                eprintln!("Re-run with the full UID to disambiguate.");
+                return Ok((EXIT_ERROR, None));
+            }
+
+            let repo = matched[0];
+            let display_name = repo
+                .name
+                .as_deref()
+                .unwrap_or(&repo.url);
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            match rt.block_on(client.remove_repo(&repo.uid)) {
+                Ok(resp) => {
+                    println!(
+                        "Removed repo '{}' ({} file(s), {} symbol(s) deleted).",
+                        display_name, resp.files_deleted, resp.symbols_deleted
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: failed to remove repo '{}': {e}.", repo.uid);
+                    return Ok((EXIT_ERROR, None));
                 }
             }
             Ok((EXIT_SUCCESS, None))
