@@ -2508,9 +2508,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = GraphStore::open_read_only(&db_path)
                 .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
-            let repos = store
-                .list_repos(None)
-                .context("failed to list repos")?;
+            let repos = store.list_repos(None).context("failed to list repos")?;
 
             // Resolve target → repo UID.  Accept: UID, name, path, or URL.
             let canonical_target = std::fs::canonicalize(&target)
@@ -2546,21 +2544,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if matched.len() > 1 {
                 eprintln!("Error: '{target}' matches multiple repos:");
                 for r in &matched {
-                    eprintln!(
-                        "  {} ({})",
-                        r.uid,
-                        r.name.as_deref().unwrap_or(&r.url)
-                    );
+                    eprintln!("  {} ({})", r.uid, r.name.as_deref().unwrap_or(&r.url));
                 }
                 eprintln!("Re-run with the full UID to disambiguate.");
                 return Ok((EXIT_ERROR, None));
             }
 
             let repo = matched[0];
-            let display_name = repo
-                .name
-                .as_deref()
-                .unwrap_or(&repo.url);
+            let display_name = repo.name.as_deref().unwrap_or(&repo.url);
 
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
