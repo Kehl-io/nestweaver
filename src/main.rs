@@ -2837,6 +2837,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard (JSON pass-through) ─────────────────
+            if json && use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({ "token_budget": token_budget });
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "repo_map", args) {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let map = generate_repo_map(&store, token_budget)?;
             let token_count = map.len().div_ceil(4);
@@ -3243,6 +3253,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             config: _,
         } => {
+            // ── daemon guard (JSON pass-through) ─────────────────
+            if json && use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({});
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "suggest_links", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
@@ -4199,7 +4221,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
 
             // Determine changed files: from --files flag or git diff.
             let changed_files: Vec<PathBuf> = if let Some(files_str) = files {
@@ -4230,6 +4251,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 return Ok((EXIT_SUCCESS, None));
             }
+
+            // ── daemon guard (JSON pass-through) ─────────────────
+            if json && use_daemon {
+                let file_strs: Vec<&str> =
+                    changed_files.iter().filter_map(|p| p.to_str()).collect();
+                let args = serde_json::json!({
+                    "files": file_strs,
+                    "depth": depth,
+                });
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "pr_impact", args) {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
+            let store = open_store(Some(&db_path))?;
 
             out.status(&format!(
                 "Analyzing blast radius for {} file(s) (depth={})...",
@@ -5906,12 +5943,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::DetectImplicitProjects { vault, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            let store = open_store(Some(&db_path))?;
 
             if !vault.exists() || !vault.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", vault.display());
                 return Ok((EXIT_ERROR, None));
             }
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let args = serde_json::json!({
+                    "vault": vault.to_string_lossy(),
+                });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
+                {
+                    let detected: Vec<String> = serde_json::from_value(value).unwrap_or_default();
+                    if detected.is_empty() {
+                        println!("No implicit projects detected in {}", vault.display());
+                    } else {
+                        println!("Detected {} implicit project(s):", detected.len());
+                        for slug in &detected {
+                            println!("  {slug}");
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
+            let store = open_store(Some(&db_path))?;
 
             // Resolve vault UID the same way the indexer does.
             let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
@@ -7101,6 +7160,12 @@ fn try_daemon_json_rpc(
             "list_projects" => client.inner_mut().list_projects_json(req).await,
             "search_symbols" => client.inner_mut().search_symbols(req).await,
             "symbol_lookup" => client.inner_mut().symbol_lookup(req).await,
+            "repo_map" => client.inner_mut().repo_map_json(req).await,
+            "suggest_links" => client.inner_mut().suggest_links_json(req).await,
+            "detect_implicit_projects" => {
+                client.inner_mut().detect_implicit_projects_json(req).await
+            }
+            "pr_impact" => client.inner_mut().pr_impact_json(req).await,
             _ => return None,
         };
         resp.ok().map(|r| r.into_inner().result_json)
