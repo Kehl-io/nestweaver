@@ -220,7 +220,7 @@ cargo build --release
 
 | Command | Description |
 |---------|-------------|
-| `mcp` | Start the MCP server (38 tools, or 6 in lite mode; auto-starts daemon) |
+| `mcp` | Start the MCP server (40 tools, or 6 in lite mode; auto-starts daemon) |
 | `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
@@ -232,6 +232,8 @@ cargo build --release
 | `snapshot` | Manage graph snapshots (build, verify, push) |
 | `list-repos` | List all indexed repositories |
 | `remove-repo` | Remove an indexed repository and all its data (symbols, files, services, contracts) from the graph |
+| `remove-project` | Remove a materialized project and its edges from the graph |
+| `prune-stale` | Remove repos and vaults whose source directories no longer exist on disk |
 | `list-services` | List all detected services |
 | `service-summary` | Display a summary of a specific service |
 
@@ -304,7 +306,7 @@ CLI commands (`search`, `brain search`, `brain context`) also respect this setti
 
 ## MCP Server
 
-NestWeaver exposes 38 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
+NestWeaver exposes 40 tools via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
@@ -320,7 +322,7 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 pgrep -a nestweaver-daemon                        # find running daemons (Linux)
 ```
 
-38 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need.
+40 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need.
 
 ### Key capabilities
 

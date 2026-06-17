@@ -782,9 +782,7 @@ impl NestWeaverDaemon for DaemonService {
                     state
                         .store
                         .delete_repo_node(&repo.uid)
-                        .map_err(|e| {
-                            Status::internal(format!("delete_repo_node failed: {e:#}"))
-                        })?;
+                        .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
                     removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
                 }
             }
@@ -797,26 +795,22 @@ impl NestWeaverDaemon for DaemonService {
 
             for vault in &vaults {
                 if !Path::new(&vault.root_path).exists() {
-                    state
-                        .store
-                        .delete_vault_cascade(&vault.uid)
-                        .map_err(|e| {
-                            Status::internal(format!("delete_vault_cascade failed: {e:#}"))
-                        })?;
+                    state.store.delete_vault_cascade(&vault.uid).map_err(|e| {
+                        Status::internal(format!("delete_vault_cascade failed: {e:#}"))
+                    })?;
                     removed_vaults.push(vault.name.clone());
                 }
             }
 
             // Reindex Tantivy if anything was removed.
-            if !removed_repos.is_empty() || !removed_vaults.is_empty() {
-                if let Some(ref tantivy) = state.tantivy
-                    && tantivy.has_writer()
-                {
-                    match tantivy.reindex_from_store(&state.store) {
-                        Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after prune_stale"),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Tantivy reindex failed after prune_stale")
-                        }
+            if (!removed_repos.is_empty() || !removed_vaults.is_empty())
+                && let Some(ref tantivy) = state.tantivy
+                && tantivy.has_writer()
+            {
+                match tantivy.reindex_from_store(&state.store) {
+                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after prune_stale"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Tantivy reindex failed after prune_stale")
                     }
                 }
             }
