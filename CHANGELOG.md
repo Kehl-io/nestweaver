@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.27.0](https://github.com/Kehl-io/nestweaver/compare/v0.26.3...v0.27.0) (2026-06-17)
+
+
+### Features
+
+* add remove-repo CLI command and daemon RPC ([f9f0bac](https://github.com/Kehl-io/nestweaver/commit/f9f0bac5b1771f3438fa85df3fa5e78eac519e43))
+* **cli:** add remove-project and prune-stale commands ([cc7682a](https://github.com/Kehl-io/nestweaver/commit/cc7682abaca500bb74e20c88bdf9981352fa27eb))
+* **cli:** add remove-repo command ([f0ad081](https://github.com/Kehl-io/nestweaver/commit/f0ad081aeaa6c91f1a05b8c824347ca96d35e19c))
+* **client:** add remove_project and prune_stale methods ([0555361](https://github.com/Kehl-io/nestweaver/commit/05553616a6155879b585e4141da7902ad1ff61de))
+* **client:** add remove_repo method ([1e1d8db](https://github.com/Kehl-io/nestweaver/commit/1e1d8dba04d24fbe54756764a8a856d5e29ad368))
+* **daemon:** implement RemoveProject and PruneStale handlers ([7723612](https://github.com/Kehl-io/nestweaver/commit/772361257d648cdd7e9de0e757aa3017022761d4))
+* **daemon:** implement RemoveRepo RPC handler ([29c3fdc](https://github.com/Kehl-io/nestweaver/commit/29c3fdcfd81b53cfcd7a636d31ae97c2e3cd0c45))
+* **mcp:** add brain_remove_source and prune_stale tools ([f46ca49](https://github.com/Kehl-io/nestweaver/commit/f46ca49e6b2797da22913392a80d3662abfb249e))
+* **proto:** add RemoveProject and PruneStale RPCs ([71a4126](https://github.com/Kehl-io/nestweaver/commit/71a412659a8bfc8555db342bd07164580608a3ce))
+* **proto:** add RemoveRepo RPC message and service method ([5f72262](https://github.com/Kehl-io/nestweaver/commit/5f72262c1d0ad213f3e3bf054d91192ea1a7d0cd))
+
+
+### Bug Fixes
+
+* clippy/fmt fixes + docs for remove-project, prune-stale, brain_remove_source ([020254b](https://github.com/Kehl-io/nestweaver/commit/020254b0a7235aa473eb0c38489adaa62a1c7164))
+
 ## [0.26.3](https://github.com/Kehl-io/nestweaver/compare/v0.26.2...v0.26.3) (2026-06-17)
 
 
