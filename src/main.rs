@@ -2507,6 +2507,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config: _,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({});
+                if let Some(ref inst) = instance {
+                    args["instance"] = serde_json::json!(inst);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "list_repos", args)
+                {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let repos: Vec<nestweaver_schema::Repo> =
+                            serde_json::from_value(value).unwrap_or_default();
+                        if repos.is_empty() {
+                            println!("No repositories found.");
+                        } else {
+                            for repo in &repos {
+                                println!("{}", repo.uid);
+                                println!("  URL:     {}", repo.url);
+                                println!("  SHA:     {}", repo.indexed_sha);
+                                println!("  Instance: {}", repo.instance_id);
+                                println!();
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let repos = list_repos(&store, instance.as_deref())?;
 
@@ -2677,6 +2708,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListServices { instance, json, db } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({});
+                if let Some(ref inst) = instance {
+                    args["instance"] = serde_json::json!(inst);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "list_services", args)
+                {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let services: Vec<nestweaver_schema::Service> =
+                            serde_json::from_value(value).unwrap_or_default();
+                        if services.is_empty() {
+                            println!("No services found.");
+                        } else {
+                            for svc in &services {
+                                println!("{}", svc.name);
+                                println!("  UID:  {}", svc.uid);
+                                println!("  Repo: {}", svc.repo_uid);
+                                if let Some(summary) = &svc.summary {
+                                    println!("  Summary: {summary}");
+                                }
+                                println!();
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let services = list_services(&store, instance.as_deref())?;
 
@@ -2704,6 +2768,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({ "name": name });
+                if let Some(ref inst) = instance {
+                    args["instance"] = serde_json::json!(inst);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "service_summary", args)
+                {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let s: nestweaver_schema::Service =
+                            serde_json::from_value(value).unwrap_or_else(|_| {
+                                nestweaver_schema::Service {
+                                    uid: String::new(),
+                                    name: name.clone(),
+                                    repo_uid: String::new(),
+                                    summary: None,
+                                    summary_hash: None,
+                                    embedding: None,
+                                }
+                            });
+                        println!("Service: {}", s.name);
+                        if let Some(ref summary) = s.summary {
+                            println!("Summary: {summary}");
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let services = list_services(&store, instance.as_deref())?;
             let service = services.iter().find(|s| s.name == name || s.uid == name);
@@ -4508,6 +4605,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 10);
+
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({ "query": query, "limit": limit });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "search_symbols", args)
+                {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let candidates: Vec<nestweaver_engine::SymbolCandidate> =
+                            serde_json::from_value(value).unwrap_or_default();
+                        if candidates.is_empty() {
+                            println!("No symbols found matching '{query}'.");
+                        } else {
+                            println!(
+                                "Found {} symbol(s) matching '{query}':",
+                                candidates.len()
+                            );
+                            for c in &candidates {
+                                println!(
+                                    "  {} ({}) {}:{}",
+                                    c.name, c.kind, c.file_path, c.start_line
+                                );
+                            }
+                        }
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let candidates = search_symbols(&store, &query, limit)?;
 
@@ -4740,6 +4869,115 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             ..
         } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({ "name_or_uid": name_or_uid });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "symbol_lookup", args)
+                {
+                    let status = value
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("not_found");
+                    match status {
+                        "found" => {
+                            if json {
+                                if let Some(detail) = value.get("detail") {
+                                    println!("{}", serde_json::to_string_pretty(detail)?);
+                                }
+                            } else if let Some(detail) = value.get("detail") {
+                                let d: nestweaver_engine::SymbolDetail =
+                                    serde_json::from_value(detail.clone())
+                                        .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
+                                let s = &d.symbol;
+                                if out.verbose {
+                                    println!("Symbol: {} [{}]", s.name, s.uid);
+                                } else {
+                                    println!("Symbol: {}", s.name);
+                                }
+                                println!("Kind: {}", s.kind);
+                                println!("File: {}:{}", s.file_path, s.start_line);
+                                println!("Signature: {}", s.signature);
+                                if !d.callers.is_empty() {
+                                    if !out.quiet {
+                                        println!("\nCallers ({}):", d.callers.len());
+                                    }
+                                    for c in &d.callers {
+                                        if out.verbose {
+                                            println!(
+                                                "  {} ({}:{}) [{}]",
+                                                c.name, c.file_path, c.start_line, c.uid
+                                            );
+                                        } else {
+                                            println!(
+                                                "  {} ({}:{})",
+                                                c.name, c.file_path, c.start_line
+                                            );
+                                        }
+                                    }
+                                }
+                                if !d.callees.is_empty() {
+                                    if !out.quiet {
+                                        println!("\nCallees ({}):", d.callees.len());
+                                    }
+                                    for c in &d.callees {
+                                        if out.verbose {
+                                            println!(
+                                                "  {} ({}:{}) [{}]",
+                                                c.name, c.file_path, c.start_line, c.uid
+                                            );
+                                        } else {
+                                            println!(
+                                                "  {} ({}:{})",
+                                                c.name, c.file_path, c.start_line
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        "ambiguous" => {
+                            if json {
+                                if let Some(candidates) = value.get("candidates") {
+                                    println!("{}", serde_json::to_string_pretty(candidates)?);
+                                }
+                            } else {
+                                let candidates: Vec<nestweaver_engine::SymbolCandidate> = value
+                                    .get("candidates")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "Ambiguous: '{}' matches {} symbols:",
+                                    name_or_uid,
+                                    candidates.len()
+                                );
+                                for c in &candidates {
+                                    eprintln!(
+                                        "  {} [{}] {}:{}",
+                                        c.uid, c.kind, c.file_path, c.start_line
+                                    );
+                                }
+                            }
+                            return Ok((EXIT_AMBIGUOUS, None));
+                        }
+                        _ => {
+                            // not_found
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({"error": "not found", "name": name_or_uid})
+                                );
+                            } else {
+                                eprintln!("Symbol '{name_or_uid}' not found.");
+                            }
+                            return Ok((EXIT_NOT_FOUND, None));
+                        }
+                    }
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             let result = lookup_symbol(&store, &name_or_uid)?;
 
@@ -5001,8 +5239,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListProjects { json, db, config } => {
-            let store = open_store(db.as_deref())?;
-            let materialized = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+            // ── daemon guard ──────────────────────────────────────
+            let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let args = serde_json::json!({});
+                try_daemon_json_rpc(true, &db_path, None, "list_projects", args)
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_else(|| {
+                        let store = open_store(db.as_deref()).expect("open_store");
+                        store.list_projects().unwrap_or_default()
+                    })
+            } else {
+                let store = open_store(db.as_deref())?;
+                store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+            };
 
             // When --config is provided, also surface declared projects from
             // [[projects]] that haven't been materialized into the store yet.
@@ -6842,6 +7092,12 @@ fn try_daemon_json_rpc(
             "brain_memory_related" => client.inner_mut().brain_memory_related(req).await,
             "detect_changes" => client.inner_mut().detect_changes(req).await,
             "brain_guide" => client.inner_mut().brain_guide(req).await,
+            "list_repos" => client.inner_mut().list_repos_json(req).await,
+            "list_services" => client.inner_mut().list_services_json(req).await,
+            "service_summary" => client.inner_mut().service_summary_json(req).await,
+            "list_projects" => client.inner_mut().list_projects_json(req).await,
+            "search_symbols" => client.inner_mut().search_symbols(req).await,
+            "symbol_lookup" => client.inner_mut().symbol_lookup(req).await,
             _ => return None,
         };
         resp.ok().map(|r| r.into_inner().result_json)
