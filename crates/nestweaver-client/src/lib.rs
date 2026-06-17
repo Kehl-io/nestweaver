@@ -220,6 +220,46 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Tell the daemon to serve the web UI on the given port.
+    pub async fn serve_ui(
+        &mut self,
+        port: u16,
+        open_browser: bool,
+        watch: bool,
+        watch_repo_path: &str,
+        watch_instance_id: &str,
+    ) -> Result<nestweaver_proto::ServeUiResponse> {
+        let resp = self
+            .inner
+            .serve_ui(nestweaver_proto::ServeUiRequest {
+                port: port as u32,
+                open_browser,
+                watch,
+                watch_repo_path: watch_repo_path.to_string(),
+                watch_instance_id: watch_instance_id.to_string(),
+            })
+            .await
+            .context("serve_ui RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Tell the daemon to start a code watcher for a repository.
+    pub async fn watch_code(
+        &mut self,
+        repo_path: &str,
+        instance_id: &str,
+    ) -> Result<nestweaver_proto::WatchCodeResponse> {
+        let resp = self
+            .inner
+            .watch_code(nestweaver_proto::WatchCodeRequest {
+                repo_path: repo_path.to_string(),
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .context("watch_code RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Purge all data for an instance, streaming progress.
     pub async fn purge_instance(
         &mut self,
