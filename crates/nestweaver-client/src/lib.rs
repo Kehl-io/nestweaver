@@ -166,6 +166,20 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    pub async fn remove_repo(
+        &mut self,
+        repo_uid: &str,
+    ) -> Result<nestweaver_proto::RemoveRepoResponse> {
+        let resp = self
+            .inner
+            .remove_repo(nestweaver_proto::RemoveRepoRequest {
+                repo_uid: repo_uid.to_string(),
+            })
+            .await
+            .context("remove_repo RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Merge one instance's data into another.
     pub async fn merge_instance(
         &mut self,
