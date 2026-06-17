@@ -1494,6 +1494,199 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "query_extensions")
     }
+
+    // ── Read RPCs — direct store access (no MCP tool) ──────────────
+
+    async fn list_repos_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let repos = state.store_read.list_repos(instance)
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+            serde_json::to_string(&repos)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    async fn list_services_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let services = state.store_read.list_services(instance)
+                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
+            serde_json::to_string(&services)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    async fn service_summary_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let services = state.store_read.list_services(instance)
+                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
+            let service = services.iter().find(|s| s.name == name || s.uid == name);
+            match service {
+                Some(s) => serde_json::to_string(s)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
+                None => Err(Status::not_found(format!("service not found: {name}"))),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    async fn list_projects_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let projects = state.store_read.list_projects()
+                .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
+            serde_json::to_string(&projects)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    async fn search_symbols(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let candidates = nestweaver_engine::search_symbols(&state.store_read, query, limit)
+                .map_err(|e| Status::internal(format!("search_symbols failed: {e:#}")))?;
+            serde_json::to_string(&candidates)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    async fn symbol_lookup(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let name_or_uid = args.get("name_or_uid").and_then(|v| v.as_str()).unwrap_or("");
+            let lookup = nestweaver_engine::lookup_symbol(&state.store_read, name_or_uid)
+                .map_err(|e| Status::internal(format!("lookup_symbol failed: {e:#}")))?;
+            // Serialize the LookupResult as a tagged JSON value.
+            let value = match lookup {
+                nestweaver_engine::LookupResult::Found(detail) => {
+                    serde_json::json!({ "status": "found", "detail": *detail })
+                }
+                nestweaver_engine::LookupResult::NotFound => {
+                    serde_json::json!({ "status": "not_found" })
+                }
+                nestweaver_engine::LookupResult::Ambiguous(candidates) => {
+                    serde_json::json!({ "status": "ambiguous", "candidates": candidates })
+                }
+            };
+            serde_json::to_string(&value)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    // ── Engine-level RPCs — BLOCKED (need engine, not just store) ───
+
+    async fn repo_map_json(
+        &self,
+        _r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        Err(Status::unimplemented("repo_map_json: not yet implemented (engine-level)"))
+    }
+
+    async fn suggest_links_json(
+        &self,
+        _r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        Err(Status::unimplemented("suggest_links_json: not yet implemented (engine-level)"))
+    }
+
+    async fn detect_implicit_projects_json(
+        &self,
+        _r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        Err(Status::unimplemented("detect_implicit_projects_json: not yet implemented (engine-level)"))
+    }
+
+    async fn pr_impact_json(
+        &self,
+        _r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        Err(Status::unimplemented("pr_impact_json: not yet implemented (engine-level)"))
+    }
 }
 
 // ── Server entry point ──────────────────────────────────────────────

@@ -70,7 +70,7 @@ impl Default for HybridSearchConfig {
 }
 
 /// Full details for a single symbol, including its call graph neighbours.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolDetail {
     pub symbol: Symbol,
     pub callers: Vec<Symbol>,
@@ -78,7 +78,7 @@ pub struct SymbolDetail {
 }
 
 /// A lightweight summary used for disambiguation and search results.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolCandidate {
     pub uid: String,
     pub name: String,

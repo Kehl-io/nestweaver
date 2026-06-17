@@ -327,4 +327,16 @@ service NestWeaverDaemon {
   rpc InvestigateHydrate(JsonRequest) returns (JsonResponse);
   rpc SetExtension(JsonRequest) returns (JsonResponse);
   rpc QueryExtensions(JsonRequest) returns (JsonResponse);
+
+  // Read RPCs — JSON pass-through (CLI read commands routed via daemon)
+  rpc ListReposJson(JsonRequest) returns (JsonResponse);
+  rpc ListServicesJson(JsonRequest) returns (JsonResponse);
+  rpc ServiceSummaryJson(JsonRequest) returns (JsonResponse);
+  rpc ListProjectsJson(JsonRequest) returns (JsonResponse);
+  rpc SearchSymbols(JsonRequest) returns (JsonResponse);
+  rpc SymbolLookup(JsonRequest) returns (JsonResponse);
+  rpc RepoMapJson(JsonRequest) returns (JsonResponse);
+  rpc SuggestLinksJson(JsonRequest) returns (JsonResponse);
+  rpc DetectImplicitProjectsJson(JsonRequest) returns (JsonResponse);
+  rpc PrImpactJson(JsonRequest) returns (JsonResponse);
 }
