@@ -69,6 +69,12 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         let _ = fs::remove_file(&sock);
     }
 
+    // Before spawning, check for a legacy daemon that may hold the DB write
+    // lock at an old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR
+    // which varies across launchers on macOS). If found, shut it down so
+    // the new daemon can acquire the lock.
+    stop_legacy_daemon(&instance_id);
+
     // Release the flock before spawning so the daemon can acquire it.
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(file);
@@ -121,6 +127,69 @@ fn spawn_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<()> {
         .with_context(|| format!("failed to spawn daemon via {}", exe.display()))?;
 
     Ok(())
+}
+
+/// Check legacy $TMPDIR-based socket paths for an old daemon and stop it.
+///
+/// Pre-v0.26.2 derived the socket path from `$TMPDIR`, which varies across
+/// macOS launchers. On upgrade, the old daemon may still be running at a
+/// `$TMPDIR`-based path and holding the DB write lock. This function probes
+/// common legacy locations, and if it finds a live daemon, sends SIGTERM to
+/// allow the new daemon to start cleanly.
+fn stop_legacy_daemon(instance_id: &str) {
+    let uid = unsafe { libc::getuid() };
+    // Probe the two bases that the old $TMPDIR-derived logic would have used:
+    // the caller's current $TMPDIR and /tmp (the fallback when $TMPDIR is unset).
+    // These are the exact paths that diverge across macOS launchers.
+    let mut legacy_bases: Vec<PathBuf> = vec![PathBuf::from("/tmp")];
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        let p = PathBuf::from(&tmpdir);
+        if p.as_path() != Path::new("/tmp") {
+            legacy_bases.push(p);
+        }
+    }
+
+    for base in &legacy_bases {
+        let legacy_dir = base.join(format!("nw-{uid}")).join(instance_id);
+        let legacy_pid = legacy_dir.join("daemon.pid");
+        let legacy_sock = legacy_dir.join("daemon.sock");
+
+        if !legacy_pid.exists() && !legacy_sock.exists() {
+            continue;
+        }
+
+        if let Some(pid) = read_pid(&legacy_pid)
+            && is_process_alive(pid)
+        {
+            info!(
+                pid,
+                path = %legacy_dir.display(),
+                "stopping legacy daemon at old TMPDIR-based path"
+            );
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(2) && is_process_alive(pid) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if is_process_alive(pid) {
+                warn!(
+                    pid,
+                    "legacy daemon did not exit after SIGTERM, sending SIGKILL"
+                );
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Clean up stale files.
+        let _ = fs::remove_file(&legacy_sock);
+        let _ = fs::remove_file(&legacy_pid);
+        let _ = fs::remove_dir(&legacy_dir);
+    }
 }
 
 /// Poll for the socket file to appear with exponential backoff.
