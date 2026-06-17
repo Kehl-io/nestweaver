@@ -2760,6 +2760,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard (JSON pass-through) ─────────────────
+            if json && use_daemon {
+                let db_default = default_db_path();
+                let db_path = db.as_deref().unwrap_or(&db_default);
+                let mut args = serde_json::json!({ "name_or_uid": name_or_uid });
+                if let Some(ref rf) = repo_filter {
+                    args["repo"] = serde_json::json!(rf);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, db_path, None, "cross_repo_contracts", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(db.as_deref())?;
             match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
                 ResolveResult::Found(uid) => {
@@ -2898,6 +2914,71 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
+            // ── daemon guard (typed GetContext RPC) ───────────────
+            // Route through the daemon when JSON output is requested and
+            // we're in normal seed-based mode (not --feature, which
+            // requires config-file processing the daemon doesn't handle
+            // for this legacy command).
+            if json && feature.is_none() && use_daemon {
+                let db_default = default_db_path();
+                let db_path = db.as_deref().unwrap_or(&db_default);
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let connect = rt.block_on(
+                        nestweaver_client::DaemonClient::connect(db_path, config.as_deref()),
+                    );
+                    if let Ok(mut client) = connect {
+                        let req = nestweaver_proto::BrainContextRequest {
+                            seeds: seeds.clone(),
+                            token_budget: token_budget.unwrap_or(0) as i32,
+                            response_format: String::new(),
+                            repos: vec![],
+                            vaults: vec![],
+                            kinds: vec![],
+                            path_prefix: String::new(),
+                            tags: vec![],
+                            exclude_tags: vec![],
+                            weight_ppr: 0.0,
+                            weight_bm25: 0.0,
+                            intent: intent.clone().unwrap_or_default(),
+                            include_seeds: true,
+                            include_bodies: false,
+                            root: String::new(),
+                            prf: false,
+                            rerank: false,
+                            weight_semantic: 0.0,
+                            since: String::new(),
+                            recency_weight: 0.0,
+                            recency_half_life_days: 0.0,
+                        };
+                        let rpc = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .get_context(req)
+                                .await
+                                .map(|r| r.into_inner())
+                        });
+                        if let Ok(resp) = rpc {
+                            let result: nestweaver_engine::BrainContextResult =
+                                serde_json::from_str(&resp.result_json)?;
+                            let cut = match token_budget {
+                                Some(budget) => {
+                                    token_budgeted_truncate(&result.connected, budget)
+                                }
+                                None => limit.unwrap_or(30).min(result.connected.len()),
+                            };
+                            print_brain_context_json(&result, cut)?;
+                            let stats = format!(
+                                "{} seeds, {} connected nodes in {} (via daemon)",
+                                result.seeds.len(),
+                                cut,
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
+                        }
+                    }
+                }
+            }
+
             let store = open_store(db.as_deref())?;
 
             let parsed_intent: Option<QueryIntent> = intent
@@ -3137,6 +3218,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             rules_from,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard (JSON pass-through) ─────────────────
+            // When output is stdout (no --output file) and no --rules-from
+            // override, try the daemon first — it can generate the guide
+            // without the CLI opening the DB directly.
+            if output.is_none() && rules_from.is_none() && use_daemon {
+                let mut args = serde_json::json!({ "format": format });
+                if let Some(ref c) = config {
+                    args["config"] = serde_json::json!(c.to_string_lossy());
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
+                {
+                    // brain_guide returns the guide text as a JSON string.
+                    if let Some(text) = value.as_str() {
+                        print!("{text}");
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    }
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
+
             let store = open_store(Some(&db_path))?;
             let instance_config = config
                 .as_deref()
@@ -3581,6 +3685,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+
+            // ── daemon guard (JSON pass-through) ─────────────────
+            if json && use_daemon {
+                let args = serde_json::json!({ "id_or_name": id_or_name });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "clusters", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
 
             // Load cached clusters from sidecar. If none exist, compute them.
             let output = match load_clusters(&db_path)? {
