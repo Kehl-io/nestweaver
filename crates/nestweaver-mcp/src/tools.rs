@@ -2946,17 +2946,22 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
     canonical.hash(&mut hasher);
     let instance_id = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
 
-    // Compute the runtime directory (same algorithm as lifecycle.rs).
+    // Must match nestweaver_daemon::lifecycle::runtime_dir() exactly.
+    // $TMPDIR is deliberately NOT consulted: on macOS, different launchers
+    // see different TMPDIR values, causing socket-path mismatch.
     let rt_dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         std::path::PathBuf::from(xdg)
             .join("nestweaver")
             .join(&instance_id)
     } else {
-        let uid = unsafe { libc::getuid() };
-        let base = std::env::var("TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        base.join(format!("nw-{uid}")).join(&instance_id)
+        dirs::state_dir()
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join(".local/state")
+            })
+            .join("nestweaver")
+            .join(&instance_id)
     };
     let sock = rt_dir.join("daemon.sock");
 
