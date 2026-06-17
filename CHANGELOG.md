@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.26.1](https://github.com/Kehl-io/nestweaver/compare/v0.26.0...v0.26.1) (2026-06-17)
+
+
+### Bug Fixes
+
+* **cli:** add --limit to broken-links, orphans, topic-clusters, tag-graph; surface staleness_commits_behind ([6971396](https://github.com/Kehl-io/nestweaver/commit/6971396a31fac3e8e81df16e9f5821173ee5c338))
+* **cli:** add --limit to broken-links, orphans, topic-clusters, tag-graph; surface staleness_commits_behind ([39b5ba5](https://github.com/Kehl-io/nestweaver/commit/39b5ba5892784b14df025231e259e1731b11334e))
+
 ## [0.26.0](https://github.com/Kehl-io/nestweaver/compare/v0.25.1...v0.26.0) (2026-06-16)
 
 
