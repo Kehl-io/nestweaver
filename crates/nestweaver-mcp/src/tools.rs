@@ -2942,10 +2942,10 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
 
     // Inline tilde expansion (the cfg-gated expand_tilde is not available in daemon builds).
     let expand = |input: &str| -> String {
-        if let Some(stripped) = input.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return format!("{home}/{stripped}");
-            }
+        if let Some(stripped) = input.strip_prefix("~/")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            return format!("{home}/{stripped}");
         }
         input.to_string()
     };
@@ -2979,13 +2979,11 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .collect();
 
     if matched_repo.len() == 1 {
-        let repo = matched_repo[0];
-        let repo_uid = repo.uid.clone();
-        let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
-
-        // Route through daemon
         #[cfg(feature = "daemon")]
         {
+            let repo = matched_repo[0];
+            let repo_uid = repo.uid.clone();
+            let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
             let db_path = current_db_path(store)?;
             let db_path_buf = std::path::PathBuf::from(&db_path);
             let rt = tokio::runtime::Runtime::new()
@@ -2994,11 +2992,9 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                 .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
             let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
             let resp = rt
-                .block_on(
-                    client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                        repo_uid: repo_uid.clone(),
-                    }),
-                )
+                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                    repo_uid: repo_uid.clone(),
+                }))
                 .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
             let inner = resp.into_inner();
             return Ok(json!({
@@ -3030,12 +3026,11 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .collect();
 
     if matched_vault.len() == 1 {
-        let vault = matched_vault[0];
-        let vault_uid = vault.uid.clone();
-        let display = vault.name.clone();
-
         #[cfg(feature = "daemon")]
         {
+            let vault = matched_vault[0];
+            let vault_uid = vault.uid.clone();
+            let display = vault.name.clone();
             let db_path = current_db_path(store)?;
             let db_path_buf = std::path::PathBuf::from(&db_path);
             let rt = tokio::runtime::Runtime::new()
@@ -3044,11 +3039,9 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                 .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
             let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
             let resp = rt
-                .block_on(
-                    client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                        vault_uid: vault_uid.clone(),
-                    }),
-                )
+                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                    vault_uid: vault_uid.clone(),
+                }))
                 .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
             let inner = resp.into_inner();
             return Ok(json!({
@@ -3099,10 +3092,10 @@ fn tool_prune_stale(store: &GraphStore) -> Result<Value, anyhow::Error> {
             .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
             .map_err(|e| anyhow!("prune_stale RPC failed: {e}"))?;
         let inner = resp.into_inner();
-        return Ok(json!({
+        Ok(json!({
             "removed_repos": inner.removed_repos,
             "removed_vaults": inner.removed_vaults
-        }));
+        }))
     }
     #[cfg(not(feature = "daemon"))]
     {
@@ -5325,11 +5318,9 @@ pub fn dispatch_via_daemon(
         // However, the proto only accepts a uid. We need to resolve locally
         // or just try the RPC and fall back. For simplicity, try as repo_uid
         // first (covers uid and name for well-known targets), then vault_uid.
-        let repo_result = rt.block_on(
-            client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                repo_uid: target.clone(),
-            }),
-        );
+        let repo_result = rt.block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+            repo_uid: target.clone(),
+        }));
         if let Ok(resp) = repo_result {
             let inner = resp.into_inner();
             return Ok(json!({
@@ -5340,11 +5331,9 @@ pub fn dispatch_via_daemon(
             }));
         }
 
-        let vault_result = rt.block_on(
-            client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                vault_uid: target.clone(),
-            }),
-        );
+        let vault_result = rt.block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+            vault_uid: target.clone(),
+        }));
         if let Ok(resp) = vault_result {
             let inner = resp.into_inner();
             return Ok(json!({
@@ -5354,7 +5343,9 @@ pub fn dispatch_via_daemon(
             }));
         }
 
-        return Err(anyhow::anyhow!("no repo or vault matching '{target}' found"));
+        return Err(anyhow::anyhow!(
+            "no repo or vault matching '{target}' found"
+        ));
     }
 
     // prune_stale uses a typed PruneStaleRequest RPC.
