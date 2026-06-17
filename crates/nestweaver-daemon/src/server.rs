@@ -637,6 +637,60 @@ impl NestWeaverDaemon for DaemonService {
         result.map(Response::new)
     }
 
+    async fn remove_repo(
+        &self,
+        request: Request<RemoveRepoRequest>,
+    ) -> Result<Response<RemoveRepoResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let (file_count, sym_count) = state
+                .store
+                .bulk_delete_repo_files_and_symbols(&req.repo_uid)
+                .map_err(|e| Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}")))?;
+
+            state
+                .store
+                .clear_repo_derived_nodes(&req.repo_uid)
+                .map_err(|e| Status::internal(format!("clear_repo_derived_nodes failed: {e:#}")))?;
+
+            state
+                .store
+                .delete_repo_node(&req.repo_uid)
+                .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
+
+            if let Some(ref tantivy) = state.tantivy
+                && tantivy.has_writer()
+            {
+                match tantivy.reindex_from_store(&state.store) {
+                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after repo removal"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Tantivy reindex failed after repo removal")
+                    }
+                }
+            }
+
+            Ok::<_, Status>(RemoveRepoResponse {
+                files_deleted: file_count as u64,
+                symbols_deleted: sym_count as u64,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
+    }
+
     async fn merge_instance(
         &self,
         request: Request<MergeInstanceRequest>,
