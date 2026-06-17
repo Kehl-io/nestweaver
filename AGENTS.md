@@ -501,6 +501,9 @@ This codebase is indexed by NestWeaver. Available MCP tools:
 # Re-index (incremental — only changed files)
 nestweaver index --repo .
 
+# Remove a repo from the graph
+nestweaver remove-repo <name-or-path>
+
 # Search for a symbol
 nestweaver search <name>
 
