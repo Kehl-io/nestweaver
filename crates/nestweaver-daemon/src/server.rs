@@ -693,6 +693,148 @@ impl NestWeaverDaemon for DaemonService {
         result.map(Response::new)
     }
 
+    async fn remove_project(
+        &self,
+        request: Request<RemoveProjectRequest>,
+    ) -> Result<Response<RemoveProjectResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            // Look up project name before deleting.
+            let projects = state
+                .store
+                .list_projects()
+                .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
+            let project_name = projects
+                .iter()
+                .find(|p| p.uid == req.project_uid)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+
+            state
+                .store
+                .delete_project_edges(&req.project_uid)
+                .map_err(|e| Status::internal(format!("delete_project_edges failed: {e:#}")))?;
+
+            state
+                .store
+                .delete_project_node(&req.project_uid)
+                .map_err(|e| Status::internal(format!("delete_project_node failed: {e:#}")))?;
+
+            Ok::<_, Status>(RemoveProjectResponse { project_name })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
+    }
+
+    async fn prune_stale(
+        &self,
+        request: Request<PruneStaleRequest>,
+    ) -> Result<Response<PruneStaleResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let _req = request.into_inner();
+        let state = self.state.clone();
+
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let mut removed_repos = Vec::new();
+            let mut removed_vaults = Vec::new();
+
+            // Prune stale repos (path no longer exists on disk).
+            let repos = state
+                .store
+                .list_repos(None)
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+
+            for repo in &repos {
+                let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+                if !Path::new(path).exists() {
+                    state
+                        .store
+                        .bulk_delete_repo_files_and_symbols(&repo.uid)
+                        .map_err(|e| {
+                            Status::internal(format!(
+                                "bulk_delete_repo_files_and_symbols failed: {e:#}"
+                            ))
+                        })?;
+                    state
+                        .store
+                        .clear_repo_derived_nodes(&repo.uid)
+                        .map_err(|e| {
+                            Status::internal(format!("clear_repo_derived_nodes failed: {e:#}"))
+                        })?;
+                    state
+                        .store
+                        .delete_repo_node(&repo.uid)
+                        .map_err(|e| {
+                            Status::internal(format!("delete_repo_node failed: {e:#}"))
+                        })?;
+                    removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
+                }
+            }
+
+            // Prune stale vaults (root_path no longer exists on disk).
+            let vaults = state
+                .store
+                .list_vaults(None)
+                .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
+
+            for vault in &vaults {
+                if !Path::new(&vault.root_path).exists() {
+                    state
+                        .store
+                        .delete_vault_cascade(&vault.uid)
+                        .map_err(|e| {
+                            Status::internal(format!("delete_vault_cascade failed: {e:#}"))
+                        })?;
+                    removed_vaults.push(vault.name.clone());
+                }
+            }
+
+            // Reindex Tantivy if anything was removed.
+            if !removed_repos.is_empty() || !removed_vaults.is_empty() {
+                if let Some(ref tantivy) = state.tantivy
+                    && tantivy.has_writer()
+                {
+                    match tantivy.reindex_from_store(&state.store) {
+                        Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after prune_stale"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Tantivy reindex failed after prune_stale")
+                        }
+                    }
+                }
+            }
+
+            Ok::<_, Status>(PruneStaleResponse {
+                removed_repos,
+                removed_vaults,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
+    }
+
     async fn merge_instance(
         &self,
         request: Request<MergeInstanceRequest>,

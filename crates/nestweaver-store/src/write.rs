@@ -2381,6 +2381,17 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Delete the Project node itself (and any remaining edges).
+    pub fn delete_project_node(&self, project_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+            vec![("uid", lbug::Value::String(project_uid.to_string()))],
+        )?;
+        Ok(())
+    }
+
     /// Count notes belonging to a vault.
     fn vault_note_count(&self, vault_uid: &str) -> Result<usize, StoreError> {
         let conn = self.conn()?;
