@@ -292,6 +292,81 @@ impl NestWeaverDaemon for DaemonService {
         }))
     }
 
+    async fn watch_code(
+        &self,
+        request: Request<WatchCodeRequest>,
+    ) -> Result<Response<WatchCodeResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let repo_path = PathBuf::from(&req.repo_path);
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+
+        if !repo_path.exists() || !repo_path.is_dir() {
+            return Ok(Response::new(WatchCodeResponse {
+                ok: false,
+                message: format!("repo path is not a directory: {}", repo_path.display()),
+            }));
+        }
+
+        let db_path = self.state.db_path.clone();
+
+        let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Hold the lock across check + store to prevent TOCTOU race.
+        {
+            let mut guard = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            if guard.is_some() {
+                return Ok(Response::new(WatchCodeResponse {
+                    ok: false,
+                    message: "A watcher is already running. Stop it first with StopWatch."
+                        .to_string(),
+                }));
+            }
+            *guard = Some(shutdown_handle);
+        }
+
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.state.clone();
+        let store = self.state.store.clone();
+
+        tokio::task::spawn_blocking(move || {
+            tracing::info!(repo = %repo_path.display(), "code watcher thread started");
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher.run_with_store(store, None)
+            }));
+
+            match result {
+                Ok(Ok(())) => tracing::info!("code watcher exited cleanly"),
+                Ok(Err(e)) => tracing::error!(error = %e, "code watcher exited with error"),
+                Err(_) => tracing::error!("code watcher thread panicked"),
+            }
+
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut guard) = state.watcher_stop.lock() {
+                *guard = None;
+            }
+        });
+
+        Ok(Response::new(WatchCodeResponse {
+            ok: true,
+            message: format!("Code watcher started for {}", req.repo_path,),
+        }))
+    }
+
     async fn stop_watch(
         &self,
         _request: Request<StopWatchRequest>,
@@ -309,6 +384,166 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Ok(Response::new(StopWatchResponse { ok: false }))
         }
+    }
+
+    // ── Export ───────────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn export_graph(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cypher");
+            let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let output_path = args.get("output").and_then(|v| v.as_str());
+
+            match format {
+                "cypher" | "graphml" | "mermaid" => {
+                    let mut buf = Vec::new();
+                    match format {
+                        "cypher" => nestweaver_engine::export_cypher(&state.store_read, &mut buf),
+                        "graphml" => nestweaver_engine::export_graphml(&state.store_read, &mut buf),
+                        "mermaid" => {
+                            nestweaver_engine::export_mermaid(&state.store_read, top, &mut buf)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+
+                    let text = String::from_utf8(buf)
+                        .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
+
+                    if let Some(path) = output_path {
+                        std::fs::write(path, &text).map_err(|e| {
+                            Status::internal(format!("failed to write {path}: {e}"))
+                        })?;
+                    }
+
+                    serde_json::to_string(&serde_json::json!({
+                        "format": format,
+                        "bytes": text.len(),
+                        "text": if output_path.is_some() { None } else { Some(&text) },
+                        "output": output_path,
+                    }))
+                    .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
+                }
+                "msgpack" => {
+                    let graph = nestweaver_engine::export_in_memory_graph(&state.store_read)
+                        .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+                    let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
+                        Status::internal(format!("msgpack serialize failed: {e:#}"))
+                    })?;
+
+                    // For msgpack, always write to a file (the binary data is too
+                    // large for JSON transport). If no output path is given, use
+                    // a default next to the DB.
+                    let path = match output_path {
+                        Some(p) => PathBuf::from(p),
+                        None => {
+                            let mut name = state
+                                .db_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            name.push_str(".graph.msgpack");
+                            state
+                                .db_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(name)
+                        }
+                    };
+                    std::fs::write(&path, &bytes).map_err(|e| {
+                        Status::internal(format!("failed to write {}: {e}", path.display()))
+                    })?;
+
+                    serde_json::to_string(&serde_json::json!({
+                        "format": "msgpack",
+                        "output": path.display().to_string(),
+                        "nodes": graph.uids.len(),
+                        "edges": graph.edges.len(),
+                        "bytes": bytes.len(),
+                    }))
+                    .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
+                }
+                other => Err(Status::invalid_argument(format!(
+                    "unknown format '{other}'; supported: cypher, graphml, mermaid, msgpack"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    // ── UI serving ───────────────────────────────────────────────────
+
+    async fn serve_ui(
+        &self,
+        request: Request<ServeUiRequest>,
+    ) -> Result<Response<ServeUiResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
+            state.store_read.clone(),
+            state.tantivy.clone(),
+            state.db_path.clone(),
+        );
+
+        let port = if req.port > 0 { req.port as u16 } else { 3000 };
+        let open_browser = req.open_browser;
+
+        // Spawn web server as a background task inside the daemon.
+        tokio::spawn(async move {
+            if let Err(e) = nestweaver_web::start_server(app_state, port, open_browser).await {
+                tracing::error!("UI server error: {e}");
+            }
+        });
+
+        // If watch mode requested, spawn a CodeWatcher.
+        if req.watch && !req.watch_repo_path.is_empty() {
+            let watch_db = state.db_path.clone();
+            let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
+            let watch_instance = if req.watch_instance_id.is_empty() {
+                "default".to_string()
+            } else {
+                req.watch_instance_id.clone()
+            };
+            let watch_store = state.store.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let watcher =
+                    nestweaver_engine::CodeWatcher::new(&watch_db, &watch_repo, &watch_instance);
+                if let Err(e) = watcher.run_with_store(watch_store, None) {
+                    tracing::error!("CodeWatcher failed: {e}");
+                }
+            });
+        }
+
+        Ok(Response::new(ServeUiResponse {
+            ok: true,
+            message: format!("UI server started on port {port}"),
+        }))
     }
 
     // ── Indexing ─────────────────────────────────────────────────────

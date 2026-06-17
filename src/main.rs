@@ -2309,40 +2309,6 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     Ok(store)
 }
 
-/// Stop the daemon to acquire the write lock for direct indexing.
-///
-/// Only used in the `!use_daemon` fallback (test/CI via `NESTWEAVER_NO_DAEMON=1`).
-/// In production, all writes route through daemon RPCs and this function is never called.
-fn stop_daemon_if_running(db_path: &Path) -> bool {
-    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
-    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
-    let was_running = pidfile.exists()
-        && nestweaver_client::autostart::read_pid(&pidfile)
-            .is_some_and(nestweaver_client::autostart::is_process_alive);
-    if was_running {
-        eprintln!("Stopping daemon to acquire write lock (will restart after)...");
-        if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile) {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if !nestweaver_client::autostart::is_process_alive(pid) {
-                    break;
-                }
-            }
-        }
-    }
-    was_running
-}
-
-/// Restarts the daemon after a direct-write operation.
-/// Only used in the `!use_daemon` fallback (test/CI).
-fn restart_daemon(db_path: &Path, config: Option<&Path>) {
-    eprintln!("Restarting daemon...");
-    if let Err(e) = nestweaver_client::autostart::ensure_daemon(db_path, config) {
-        eprintln!("Warning: failed to restart daemon: {e}");
-    }
-}
-
 fn tantivy_sidecar_path_for(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push(".tantivy");
@@ -4145,13 +4111,48 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
 
-            // Stop the daemon so we can open the store directly for export.
-            let daemon_was_running = if use_daemon {
-                stop_daemon_if_running(db_path)
-            } else {
-                false
-            };
+            // Route through daemon when available.
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(db_path, None))?;
 
+                let mut args = serde_json::json!({ "format": format, "top": top });
+                if let Some(ref p) = output {
+                    args["output"] = serde_json::Value::String(p.display().to_string());
+                }
+
+                let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                    args_json: serde_json::to_string(&args)?,
+                });
+                let resp = rt
+                    .block_on(async { client.inner_mut().export_graph(req).await })
+                    .context("export_graph RPC failed")?;
+                let result: serde_json::Value =
+                    serde_json::from_str(&resp.into_inner().result_json)?;
+
+                // For text formats without an output file, print the text to stdout.
+                if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
+                    print!("{text}");
+                } else if let Some(out_path) = result.get("output").and_then(|v| v.as_str()) {
+                    out.status(&format!("Exported graph to {out_path}"));
+                }
+
+                if let Some(nodes) = result.get("nodes") {
+                    out.status(&format!(
+                        "Exported {} ({} nodes, {} edges, {} bytes)",
+                        format,
+                        nodes,
+                        result.get("edges").unwrap_or(&serde_json::Value::Null),
+                        result.get("bytes").unwrap_or(&serde_json::Value::Null),
+                    ));
+                }
+
+                let stats = format!("exported {} in {}", format, format_elapsed(t0.elapsed()));
+                return Ok((EXIT_SUCCESS, Some(stats)));
+            }
+
+            // Direct-write fallback (NESTWEAVER_NO_DAEMON=1).
             let store = open_store(db.as_deref())?;
 
             if format == "msgpack" {
@@ -4183,10 +4184,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     bytes.len()
                 ));
                 let stats = format!("exported msgpack in {}", format_elapsed(t0.elapsed()));
-                drop(store);
-                if daemon_was_running {
-                    restart_daemon(db_path, None);
-                }
                 return Ok((EXIT_SUCCESS, Some(stats)));
             }
 
@@ -4208,21 +4205,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "Unknown format '{}'. Supported: cypher, graphml, mermaid, msgpack",
                         other
                     );
-                    drop(store);
-                    if daemon_was_running {
-                        restart_daemon(db_path, None);
-                    }
                     return Ok((EXIT_ERROR, None));
                 }
             }
 
             if let Some(path) = &output {
                 out.status(&format!("Exported graph to {}", path.display()));
-            }
-
-            drop(store);
-            if daemon_was_running {
-                restart_daemon(db_path, None);
             }
 
             let stats = format!("exported {} in {}", format, format_elapsed(t0.elapsed()));
@@ -4487,8 +4475,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
-            let daemon_was_running = stop_daemon_if_running(&db_path);
+            // Route through daemon when available.
+            if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
 
+                let resp =
+                    rt.block_on(client.watch_code(&repo_path.display().to_string(), &instance_id))?;
+
+                if !resp.ok {
+                    eprintln!("Error: {}", resp.message);
+                    return Ok((EXIT_ERROR, None));
+                }
+
+                eprintln!(
+                    "Watching {} via daemon (Ctrl-C to stop)",
+                    repo_path.display(),
+                );
+
+                // Block until Ctrl-C, then tell the daemon to stop watching.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = ctrlc_handler(move || {
+                    let _ = tx.send(());
+                });
+                let _ = rx.recv();
+
+                let _ = rt.block_on(async {
+                    client
+                        .inner_mut()
+                        .stop_watch(nestweaver_proto::StopWatchRequest {})
+                        .await
+                });
+                eprintln!("Watcher stopped.");
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            // Direct-write fallback (NESTWEAVER_NO_DAEMON=1).
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
 
@@ -4556,9 +4581,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let _ = std::fs::remove_file(&lock_path);
             eprintln!("Watcher stopped.");
-            if daemon_was_running {
-                restart_daemon(&db_path, config.as_deref());
-            }
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -4622,57 +4644,89 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // Stop the daemon so we can open the store directly for the UI server.
-            let daemon_was_running = if use_daemon {
-                stop_daemon_if_running(&db_path)
-            } else {
-                false
-            };
+            if use_daemon {
+                let rt =
+                    tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+                let mut client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(
+                        &db_path,
+                        config.as_deref().map(std::path::Path::as_ref),
+                    ))
+                    .context("failed to connect to daemon")?;
 
-            let tantivy_path = tantivy_sidecar_path_for(&db_path);
-            let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
+                let watch_repo_path = if watch {
+                    detect_repo_root().display().to_string()
+                } else {
+                    String::new()
+                };
 
-            let state = if watch {
-                // Watch mode needs write access for the CodeWatcher.
-                let store =
-                    std::sync::Arc::new(GraphStore::open_or_create(&db_path).with_context(
-                        || format!("failed to open database at {}", db_path.display()),
-                    )?);
-                nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
-            } else {
-                let store = open_store(Some(&db_path))?;
-                nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
-            };
-
-            if watch {
-                let repo_root = detect_repo_root();
-                let code_store = state.store.clone();
-                let code_tx = state.event_tx.clone();
-                let code_db = db_path.clone();
-                let code_instance = "default".to_string();
-
-                std::thread::spawn(move || {
-                    let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
-                    let store_for_cb = code_store.clone();
-                    let on_change = Box::new(move || {
-                        let generation = store_for_cb.graph_generation();
-                        let _ = code_tx.send(nestweaver_web::state::GraphEvent {
-                            event_type: "graph:updated".to_string(),
-                            payload: serde_json::json!({"source": "code_watcher", "generation": generation}),
+                match rt.block_on(client.serve_ui(
+                    port,
+                    !no_open,
+                    watch,
+                    &watch_repo_path,
+                    "default",
+                )) {
+                    Ok(_resp) => {
+                        println!("NestWeaver UI: http://127.0.0.1:{port}");
+                        if watch {
+                            println!("Watch mode enabled — changes auto-reindex.");
+                        }
+                        println!("Press Ctrl-C to stop.");
+                        // Block until Ctrl-C.
+                        let (tx, rx) = std::sync::mpsc::channel::<()>();
+                        let _ = ctrlc_handler(move || {
+                            let _ = tx.send(());
                         });
-                    });
-                    if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
-                        tracing::error!("CodeWatcher failed: {e}");
+                        let _ = rx.recv();
                     }
-                });
-            }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return Ok((EXIT_ERROR, None));
+                    }
+                }
+            } else {
+                // Fallback: run the UI server directly (no daemon).
+                let tantivy_path = tantivy_sidecar_path_for(&db_path);
+                let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-            rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
+                let state = if watch {
+                    let store =
+                        std::sync::Arc::new(GraphStore::open_or_create(&db_path).with_context(
+                            || format!("failed to open database at {}", db_path.display()),
+                        )?);
+                    nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
+                } else {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
+                };
 
-            // Restart daemon if we stopped it.
-            if daemon_was_running {
-                restart_daemon(&db_path, config.as_deref().map(std::path::Path::new));
+                if watch {
+                    let repo_root = detect_repo_root();
+                    let code_store = state.store.clone();
+                    let code_tx = state.event_tx.clone();
+                    let code_db = db_path.clone();
+                    let code_instance = "default".to_string();
+
+                    std::thread::spawn(move || {
+                        let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
+                        let store_for_cb = code_store.clone();
+                        let on_change = Box::new(move || {
+                            let generation = store_for_cb.graph_generation();
+                            let _ = code_tx.send(nestweaver_web::state::GraphEvent {
+                                event_type: "graph:updated".to_string(),
+                                payload: serde_json::json!({"source": "code_watcher", "generation": generation}),
+                            });
+                        });
+                        if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
+                            tracing::error!("CodeWatcher failed: {e}");
+                        }
+                    });
+                }
+
+                let rt =
+                    tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+                rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
             }
 
             Ok((EXIT_SUCCESS, None))
@@ -6087,8 +6141,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repo_url = format!("file://{}", repo_path.display());
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
-            let daemon_was_running = stop_daemon_if_running(&db_path);
-
             out.status(&format!("Indexing {}", repo_path.display()));
 
             let (files_count, symbols_count, edges_count);
@@ -6227,11 +6279,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 edges_count,
                 format_elapsed(t0.elapsed())
             );
-
-            // Restart daemon if we stopped it for direct-mode indexing
-            if daemon_was_running {
-                restart_daemon(&db_path, config.as_deref().map(std::path::Path::new));
-            }
 
             Ok((EXIT_SUCCESS, Some(stats)))
         }
@@ -7296,8 +7343,6 @@ fn run_brain(
             }
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
-            let daemon_was_running_brain = stop_daemon_if_running(&db_path);
-
             let result = index_markdown_directory_with_ignore(
                 &path,
                 &db_path,
@@ -7373,11 +7418,6 @@ fn run_brain(
                 for sf in &result.skipped {
                     out.status(&format!("  {} - {}", sf.path, sf.reason));
                 }
-            }
-
-            // Restart daemon if we stopped it for direct-mode indexing
-            if daemon_was_running_brain {
-                restart_daemon(&db_path, None);
             }
 
             let stats = format!("{} notes in {}", notes_count, format_elapsed(t0.elapsed()));
