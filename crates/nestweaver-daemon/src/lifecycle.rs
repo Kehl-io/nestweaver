@@ -35,22 +35,32 @@ pub fn instance_label_from_db_path(db_path: &Path) -> String {
 
 /// Runtime directory for the daemon socket and pidfile.
 ///
-/// Prefers `$XDG_RUNTIME_DIR/nestweaver/<instance>/`, falling back to
-/// `$TMPDIR/nw-<uid>/<instance>/` or `/tmp/nw-<uid>/<instance>/`.
+/// Prefers `$XDG_RUNTIME_DIR/nestweaver/<instance>/` (Linux with systemd),
+/// falling back to `~/.local/state/nestweaver/<instance>/` (macOS and
+/// everywhere else).
 ///
-/// The short `nw-` prefix (vs the old `nestweaver-`) is intentional:
-/// macOS limits `sun_path` to 104 bytes and `$TMPDIR` can be ~51 chars.
+/// **`$TMPDIR` is deliberately NOT consulted.** On macOS, different
+/// launchers see different `$TMPDIR` values (per-user
+/// `/var/folders/.../T/` from interactive shells vs. `/tmp/` from
+/// sanitized subprocess environments like Claude Code's MCP launcher).
+/// Using `$TMPDIR` caused a connection loop where two clients for the
+/// same DB instance would disagree on the socket location, each trying
+/// to spawn its own daemon.
 pub fn runtime_dir(instance_id: &str) -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(xdg).join("nestweaver").join(instance_id);
     }
 
-    let uid = unsafe { libc::getuid() };
-    let base = std::env::var("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-
-    base.join(format!("nw-{uid}")).join(instance_id)
+    // Stable per-user directory that doesn't depend on caller env.
+    // Co-located with daemon logs (which already use this path).
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".local/state")
+        })
+        .join("nestweaver")
+        .join(instance_id)
 }
 
 /// Path to the Unix domain socket for the given instance.
@@ -142,11 +152,9 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_under_sun_len_with_long_tmpdir() {
+    fn socket_path_under_sun_len() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let long_tmpdir = "/var/folders/0h/z2kcwz1j0mld0cbrkt15n7w80000gq/T";
         unsafe {
-            std::env::set_var("TMPDIR", long_tmpdir);
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
         let id = "a1b2c3d4"; // 8-char hash
@@ -156,6 +164,26 @@ mod tests {
             path_len < 104,
             "socket path must be < 104 bytes for macOS, got {path_len}: {}",
             sock.display()
+        );
+    }
+
+    #[test]
+    fn runtime_dir_ignores_tmpdir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let dir_before = runtime_dir("test1234");
+        unsafe {
+            std::env::set_var("TMPDIR", "/some/other/tmpdir");
+        }
+        let dir_after = runtime_dir("test1234");
+        unsafe {
+            std::env::remove_var("TMPDIR");
+        }
+        assert_eq!(
+            dir_before, dir_after,
+            "runtime_dir must not change when TMPDIR changes"
         );
     }
 
