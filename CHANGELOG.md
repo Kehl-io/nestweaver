@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.2](https://github.com/Kehl-io/nestweaver/compare/v0.26.1...v0.26.2) (2026-06-17)
+
+
+### Bug Fixes
+
+* **daemon:** derive socket path from stable per-user dir, not $TMPDIR ([#74](https://github.com/Kehl-io/nestweaver/issues/74)) ([2febd6e](https://github.com/Kehl-io/nestweaver/commit/2febd6ee1095b4c04f127d4aaa944cb6b2cf8409))
+
 ## [0.26.1](https://github.com/Kehl-io/nestweaver/compare/v0.26.0...v0.26.1) (2026-06-17)
 
 
