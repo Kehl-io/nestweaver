@@ -98,6 +98,15 @@ message RemoveVaultResponse {
   uint64 notes_deleted = 1;
 }
 
+message RemoveRepoRequest {
+  string repo_uid = 1;
+}
+
+message RemoveRepoResponse {
+  uint64 files_deleted = 1;
+  uint64 symbols_deleted = 2;
+}
+
 message MergeInstanceRequest {
   string from_id = 1;
   string to_id = 2;
@@ -252,6 +261,7 @@ service NestWeaverDaemon {
   // Write RPCs
   rpc MaterializeProjects(MaterializeProjectsRequest) returns (stream IndexProgress);
   rpc RemoveVault(RemoveVaultRequest) returns (RemoveVaultResponse);
+  rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoResponse);
   rpc MergeInstance(MergeInstanceRequest) returns (MergeInstanceResponse);
   rpc PurgeInstance(PurgeInstanceRequest) returns (stream IndexProgress);
 
