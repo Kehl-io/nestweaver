@@ -120,6 +120,8 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_backlinks(),
         tool_schema_brain_status(),
         tool_schema_brain_add_source(),
+        tool_schema_brain_remove_source(),
+        tool_schema_prune_stale(),
         tool_schema_cross_repo_contracts(),
         tool_schema_brain_impact(),
         tool_schema_brain_guide(),
@@ -200,6 +202,8 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         ("brain_diff", "Status & maintenance"),
         ("brain_guide", "Status & maintenance"),
         ("brain_add_source", "Status & maintenance"),
+        ("brain_remove_source", "Status & maintenance"),
+        ("prune_stale", "Status & maintenance"),
         ("get_summary", "Status & maintenance"),
         ("read_symbols", "Code search"),
         ("regex_search", "Code search"),
@@ -288,6 +292,8 @@ fn dispatch_uncached(
         "backlinks" => tool_backlinks(store, args),
         "brain_status" => tool_brain_status(store, tantivy),
         "brain_add_source" => tool_brain_add_source(store, args),
+        "brain_remove_source" => tool_brain_remove_source(store, args),
+        "prune_stale" => tool_prune_stale(store),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
         "brain_impact" => tool_brain_impact(store, args),
         "brain_guide" => tool_brain_guide(store, args),
@@ -2800,28 +2806,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         let sock_path = inline_ensure_daemon(&db_path_buf)
             .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
 
-        let mut client = rt.block_on(async {
-            use tonic::transport::{Endpoint, Uri};
-
-            let path = sock_path.clone();
-            let channel = Endpoint::try_from("http://[::]:50051")
-                .map_err(|e| anyhow::anyhow!("failed to create endpoint: {e}"))?
-                .connect_with_connector(tower::service_fn(move |_: Uri| {
-                    let path = path.clone();
-                    async move {
-                        let stream = tokio::net::UnixStream::connect(path).await?;
-                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                    }
-                }))
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
-
-            Ok::<_, anyhow::Error>(
-                nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
-                    .max_decoding_message_size(64 * 1024 * 1024)
-                    .max_encoding_message_size(64 * 1024 * 1024),
-            )
-        })?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
 
         dispatch_add_source_via_daemon(&mut client, &rt, args)
     }
@@ -2927,6 +2912,236 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             path.display()
         ))
     } // end #[cfg(not(feature = "daemon"))]
+}
+
+// ── 6b. brain_remove_source ─────────────────────────────────────────────────
+
+fn tool_schema_brain_remove_source() -> Value {
+    json!({
+        "name": "brain_remove_source",
+        "description": "Remove an indexed code repository or markdown vault from the brain graph. Accepts a repo name, vault name, filesystem path, file:// URL, or UID. Auto-detects whether the target is a repo or vault.\n\nDo NOT use to re-index — use brain_add_source for that. Use this when you need to permanently remove a source that should no longer be in the graph.\n\nExamples: target=\"freeplay-server\" removes the repo by name. target=\"~/Documents/Obsidian/MyVault\" removes the vault by path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Repo name, vault name, filesystem path, file:// URL, or UID of the source to remove."
+                }
+            },
+            "required": ["target"]
+        }
+    })
+}
+
+fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'target' is required"))?
+        .to_string();
+
+    // Inline tilde expansion (the cfg-gated expand_tilde is not available in daemon builds).
+    let expand = |input: &str| -> String {
+        if let Some(stripped) = input.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return format!("{home}/{stripped}");
+            }
+        }
+        input.to_string()
+    };
+
+    // Try to resolve as a repo first, then as a vault.
+    let repos = store.list_repos(None)?;
+
+    let canonical_target = std::fs::canonicalize(&target)
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap_or_default();
+    let url_target = if target.starts_with("file://") {
+        target.clone()
+    } else if std::path::Path::new(&target).is_absolute() || target.starts_with("~/") {
+        let expanded = expand(&target);
+        std::fs::canonicalize(&expanded)
+            .map(|p| format!("file://{}", p.display()))
+            .unwrap_or_else(|_| format!("file://{}", expanded))
+    } else {
+        String::new()
+    };
+
+    let matched_repo: Vec<&nestweaver_schema::Repo> = repos
+        .iter()
+        .filter(|r| {
+            r.uid == target
+                || r.name.as_deref() == Some(&target)
+                || r.url == url_target
+                || r.url == canonical_target
+                || r.url.ends_with(&format!("/{target}"))
+        })
+        .collect();
+
+    if matched_repo.len() == 1 {
+        let repo = matched_repo[0];
+        let repo_uid = repo.uid.clone();
+        let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
+
+        // Route through daemon
+        #[cfg(feature = "daemon")]
+        {
+            let db_path = current_db_path(store)?;
+            let db_path_buf = std::path::PathBuf::from(&db_path);
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+            let sock_path = inline_ensure_daemon(&db_path_buf)
+                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+            let resp = rt
+                .block_on(
+                    client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                        repo_uid: repo_uid.clone(),
+                    }),
+                )
+                .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
+            let inner = resp.into_inner();
+            return Ok(json!({
+                "kind": "repo",
+                "name": display,
+                "uid": repo_uid,
+                "files_deleted": inner.files_deleted,
+                "symbols_deleted": inner.symbols_deleted
+            }));
+        }
+        #[cfg(not(feature = "daemon"))]
+        return Err(anyhow!("brain_remove_source requires daemon mode"));
+    }
+
+    // Try vaults
+    let vaults = store.list_vaults(None)?;
+    let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
+        .iter()
+        .filter(|v| {
+            v.uid == target
+                || v.name == target
+                || v.root_path == target
+                || v.root_path == canonical_target.strip_prefix("file://").unwrap_or("")
+                || std::fs::canonicalize(&v.root_path)
+                    .map(|p| format!("file://{}", p.display()))
+                    .unwrap_or_default()
+                    == canonical_target
+        })
+        .collect();
+
+    if matched_vault.len() == 1 {
+        let vault = matched_vault[0];
+        let vault_uid = vault.uid.clone();
+        let display = vault.name.clone();
+
+        #[cfg(feature = "daemon")]
+        {
+            let db_path = current_db_path(store)?;
+            let db_path_buf = std::path::PathBuf::from(&db_path);
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+            let sock_path = inline_ensure_daemon(&db_path_buf)
+                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+            let resp = rt
+                .block_on(
+                    client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                        vault_uid: vault_uid.clone(),
+                    }),
+                )
+                .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
+            let inner = resp.into_inner();
+            return Ok(json!({
+                "kind": "vault",
+                "name": display,
+                "uid": vault_uid,
+                "notes_deleted": inner.notes_deleted
+            }));
+        }
+        #[cfg(not(feature = "daemon"))]
+        return Err(anyhow!("brain_remove_source requires daemon mode"));
+    }
+
+    // No match or ambiguous
+    if matched_repo.len() > 1 || matched_vault.len() > 1 {
+        return Err(anyhow!(
+            "'{target}' matches multiple sources. Use a UID to disambiguate."
+        ));
+    }
+    Err(anyhow!("no repo or vault matching '{target}' found"))
+}
+
+// ── 6c. prune_stale ─────────────────────────────────────────────────────────
+
+fn tool_schema_prune_stale() -> Value {
+    json!({
+        "name": "prune_stale",
+        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. Use after moving, renaming, or deleting project directories to clean up stale graph entries.\n\nNo parameters required. Returns the list of removed repos and vaults.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    })
+}
+
+fn tool_prune_stale(store: &GraphStore) -> Result<Value, anyhow::Error> {
+    #[cfg(feature = "daemon")]
+    {
+        let db_path = current_db_path(store)?;
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        let resp = rt
+            .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
+            .map_err(|e| anyhow!("prune_stale RPC failed: {e}"))?;
+        let inner = resp.into_inner();
+        return Ok(json!({
+            "removed_repos": inner.removed_repos,
+            "removed_vaults": inner.removed_vaults
+        }));
+    }
+    #[cfg(not(feature = "daemon"))]
+    {
+        let _ = store;
+        Err(anyhow!("prune_stale requires daemon mode"))
+    }
+}
+
+// ── Daemon connection helper ────────────────────────────────────────────────
+
+/// Connect to a running daemon via UDS. Shared by brain_remove_source and
+/// prune_stale (and brain_add_source's inline block).
+#[cfg(feature = "daemon")]
+async fn inline_connect_daemon(
+    sock_path: &std::path::Path,
+) -> Result<
+    nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>,
+    anyhow::Error,
+> {
+    use tonic::transport::{Endpoint, Uri};
+
+    let path = sock_path.to_path_buf();
+    let channel = Endpoint::try_from("http://[::]:50051")
+        .map_err(|e| anyhow::anyhow!("failed to create endpoint: {e}"))?
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            let path = path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
+
+    Ok(
+        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
+    )
 }
 
 /// Ensure the daemon is running (spawning it if needed) and return the
@@ -5095,6 +5310,63 @@ pub fn dispatch_via_daemon(
     // (streaming RPCs) depending on the path content.
     if name == "brain_add_source" {
         return dispatch_add_source_via_daemon(client, rt, args);
+    }
+
+    // brain_remove_source uses typed RemoveRepo/RemoveVault RPCs.
+    if name == "brain_remove_source" {
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("'target' is required"))?
+            .to_string();
+
+        // Try repo first — ask the daemon for matching repo by name/uid.
+        // We send the target as repo_uid; the daemon resolves it.
+        // However, the proto only accepts a uid. We need to resolve locally
+        // or just try the RPC and fall back. For simplicity, try as repo_uid
+        // first (covers uid and name for well-known targets), then vault_uid.
+        let repo_result = rt.block_on(
+            client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                repo_uid: target.clone(),
+            }),
+        );
+        if let Ok(resp) = repo_result {
+            let inner = resp.into_inner();
+            return Ok(json!({
+                "kind": "repo",
+                "uid": target,
+                "files_deleted": inner.files_deleted,
+                "symbols_deleted": inner.symbols_deleted
+            }));
+        }
+
+        let vault_result = rt.block_on(
+            client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                vault_uid: target.clone(),
+            }),
+        );
+        if let Ok(resp) = vault_result {
+            let inner = resp.into_inner();
+            return Ok(json!({
+                "kind": "vault",
+                "uid": target,
+                "notes_deleted": inner.notes_deleted
+            }));
+        }
+
+        return Err(anyhow::anyhow!("no repo or vault matching '{target}' found"));
+    }
+
+    // prune_stale uses a typed PruneStaleRequest RPC.
+    if name == "prune_stale" {
+        let resp = rt
+            .block_on(client.prune_stale(nestweaver_proto::PruneStaleRequest {}))
+            .map_err(|e| anyhow::anyhow!("prune_stale RPC failed: {}", e.message()))?;
+        let inner = resp.into_inner();
+        return Ok(json!({
+            "removed_repos": inner.removed_repos,
+            "removed_vaults": inner.removed_vaults
+        }));
     }
 
     // Helper to parse string arrays from JSON args.
