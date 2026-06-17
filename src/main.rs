@@ -271,6 +271,30 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Remove a materialized project and its edges from the graph.
+    #[command(
+        after_help = "Accepts a project name or UID.\n\nExamples:\n  nestweaver remove-project freeplay\n  nestweaver remove-project proj:kory-brain:abc123"
+    )]
+    RemoveProject {
+        /// Project name or UID
+        target: String,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Remove repos and vaults whose paths no longer exist on disk.
+    #[command(
+        after_help = "Scans all indexed repos and vaults, removing any whose source\ndirectory has been deleted or moved.\n\nExamples:\n  nestweaver prune-stale\n  nestweaver prune-stale --db ~/brain/.nestweaver/brain.lbug"
+    )]
+    PruneStale {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// List all services/modules in the graph
     ListServices {
         #[arg(long, help = "Filter by instance ID")]
@@ -2567,6 +2591,85 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(e) => {
                     eprintln!("Error: failed to remove repo '{}': {e}.", repo.uid);
+                    return Ok((EXIT_ERROR, None));
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::RemoveProject { target, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+
+            let store = GraphStore::open_read_only(&db_path)
+                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+
+            let projects = store.list_projects().context("failed to list projects")?;
+
+            let matched: Vec<&nestweaver_schema::Project> = projects
+                .iter()
+                .filter(|r| r.uid == target || r.name.eq_ignore_ascii_case(&target))
+                .collect();
+
+            if matched.is_empty() {
+                eprintln!(
+                    "Error: no project matching '{target}' found.\n  \
+                     Run `nestweaver list-projects` to see materialized projects."
+                );
+                return Ok((EXIT_NOT_FOUND, None));
+            }
+            if matched.len() > 1 {
+                eprintln!("Error: '{target}' matches multiple projects:");
+                for p in &matched {
+                    eprintln!("  {} ({})", p.uid, p.name);
+                }
+                eprintln!("Re-run with the full UID to disambiguate.");
+                return Ok((EXIT_ERROR, None));
+            }
+
+            let project = matched[0];
+            let display_name = &project.name;
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            match rt.block_on(client.remove_project(&project.uid)) {
+                Ok(_resp) => {
+                    println!("Removed project '{display_name}'.");
+                }
+                Err(e) => {
+                    eprintln!("Error: failed to remove project '{}': {e}.", project.uid);
+                    return Ok((EXIT_ERROR, None));
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::PruneStale { db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
+
+            match rt.block_on(client.prune_stale()) {
+                Ok(resp) => {
+                    let total = resp.removed_repos.len() + resp.removed_vaults.len();
+                    if total == 0 {
+                        println!("No stale sources found.");
+                    } else {
+                        for name in &resp.removed_repos {
+                            println!("  Removed repo: {name}");
+                        }
+                        for name in &resp.removed_vaults {
+                            println!("  Removed vault: {name}");
+                        }
+                        println!("Pruned {total} stale source(s).");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: prune failed: {e}");
                     return Ok((EXIT_ERROR, None));
                 }
             }
