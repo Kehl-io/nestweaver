@@ -231,6 +231,7 @@ cargo build --release
 | `instance` | Manage instance configuration |
 | `snapshot` | Manage graph snapshots (build, verify, push) |
 | `list-repos` | List all indexed repositories |
+| `remove-repo` | Remove an indexed repository and all its data (symbols, files, services, contracts) from the graph |
 | `list-services` | List all detected services |
 | `service-summary` | Display a summary of a specific service |
 
