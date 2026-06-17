@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.26.3](https://github.com/Kehl-io/nestweaver/compare/v0.26.2...v0.26.3) (2026-06-17)
+
+
+### Bug Fixes
+
+* **mcp:** use stable state_dir for daemon socket path, not $TMPDIR ([6813314](https://github.com/Kehl-io/nestweaver/commit/6813314fa8f7eef6f722754eba8a5ae1f72b5032))
+* **mcp:** use stable state_dir for daemon socket path, not $TMPDIR ([3a1edf6](https://github.com/Kehl-io/nestweaver/commit/3a1edf6476b23813559f5e288d116adf866ede90))
+
 ## [0.26.2](https://github.com/Kehl-io/nestweaver/compare/v0.26.1...v0.26.2) (2026-06-17)
 
 
