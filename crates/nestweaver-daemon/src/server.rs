@@ -654,7 +654,9 @@ impl NestWeaverDaemon for DaemonService {
             let (file_count, sym_count) = state
                 .store
                 .bulk_delete_repo_files_and_symbols(&req.repo_uid)
-                .map_err(|e| Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}")))?;
+                .map_err(|e| {
+                    Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
+                })?;
 
             state
                 .store
