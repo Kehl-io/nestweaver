@@ -2537,10 +2537,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::RemoveRepo { target, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            let store = GraphStore::open_read_only(&db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
 
-            let repos = store.list_repos(None).context("failed to list repos")?;
+            let repos: Vec<nestweaver_schema::Repo> = {
+                let args = serde_json::json!({});
+                let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                    args_json: args.to_string(),
+                });
+                let resp = rt
+                    .block_on(client.inner_mut().list_repos_json(req))
+                    .context("list_repos RPC failed")?;
+                serde_json::from_str(&resp.into_inner().result_json)
+                    .context("failed to parse repo list")?
+            };
 
             // Resolve target → repo UID.  Accept: UID, name, path, or URL.
             let canonical_target = std::fs::canonicalize(&target)
@@ -2585,11 +2597,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repo = matched[0];
             let display_name = repo.name.as_deref().unwrap_or(&repo.url);
 
-            let rt = tokio::runtime::Runtime::new()?;
-            let mut client = rt
-                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
-                .context("failed to connect to daemon")?;
-
             match rt.block_on(client.remove_repo(&repo.uid)) {
                 Ok(resp) => {
                     println!(
@@ -2608,10 +2615,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::RemoveProject { target, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            let store = GraphStore::open_read_only(&db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
+                .context("failed to connect to daemon")?;
 
-            let projects = store.list_projects().context("failed to list projects")?;
+            let projects: Vec<nestweaver_schema::Project> = {
+                let args = serde_json::json!({});
+                let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                    args_json: args.to_string(),
+                });
+                let resp = rt
+                    .block_on(client.inner_mut().list_projects_json(req))
+                    .context("list_projects RPC failed")?;
+                serde_json::from_str(&resp.into_inner().result_json)
+                    .context("failed to parse project list")?
+            };
 
             let matched: Vec<&nestweaver_schema::Project> = projects
                 .iter()
@@ -2636,11 +2655,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let project = matched[0];
             let display_name = &project.name;
-
-            let rt = tokio::runtime::Runtime::new()?;
-            let mut client = rt
-                .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
-                .context("failed to connect to daemon")?;
 
             match rt.block_on(client.remove_project(&project.uid)) {
                 Ok(_resp) => {
