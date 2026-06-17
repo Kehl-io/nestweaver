@@ -1460,9 +1460,13 @@ mod tests {
 
         store.insert_repo(&repo).unwrap();
         store.insert_file(&file).unwrap();
-        store.insert_repo_file_edge("repo:test:r1", "file:test:f1").unwrap();
+        store
+            .insert_repo_file_edge("repo:test:r1", "file:test:f1")
+            .unwrap();
         store.insert_symbol(&sym).unwrap();
-        store.insert_file_symbol_edge("file:test:f1", "sym:test:s1").unwrap();
+        store
+            .insert_file_symbol_edge("file:test:f1", "sym:test:s1")
+            .unwrap();
 
         // Verify data exists before deletion.
         let repos = store.list_repos(None).unwrap();
