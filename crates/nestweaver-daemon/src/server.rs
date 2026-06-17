@@ -1699,42 +1699,161 @@ impl NestWeaverDaemon for DaemonService {
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
-    // ── Engine-level RPCs — BLOCKED (need engine, not just store) ───
+    // ── Engine-level RPCs ──────────────────────────────────────────────
 
+    #[allow(clippy::result_large_err)]
     async fn repo_map_json(
         &self,
-        _r: Request<JsonRequest>,
+        r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        Err(Status::unimplemented(
-            "repo_map_json: not yet implemented (engine-level)",
-        ))
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let token_budget = args
+                .get("token_budget")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize;
+            let map = nestweaver_engine::generate_repo_map(&state.store_read, token_budget)
+                .map_err(|e| Status::internal(format!("generate_repo_map failed: {e:#}")))?;
+            let token_count = map.len().div_ceil(4);
+            serde_json::to_string(&serde_json::json!({
+                "map": map,
+                "token_count": token_count,
+            }))
+            .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn suggest_links_json(
         &self,
-        _r: Request<JsonRequest>,
+        r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        Err(Status::unimplemented(
-            "suggest_links_json: not yet implemented (engine-level)",
-        ))
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let cache_path = state.db_path.with_extension("manifests.json");
+            let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
+            let suggestions = nestweaver_engine::suggest_links(&state.store_read, &manifests)
+                .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
+            serde_json::to_string(&suggestions)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn detect_implicit_projects_json(
         &self,
-        _r: Request<JsonRequest>,
+        r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        Err(Status::unimplemented(
-            "detect_implicit_projects_json: not yet implemented (engine-level)",
-        ))
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let vault_path = args
+                .get("vault")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("missing 'vault' argument"))?;
+            let vault = std::path::PathBuf::from(vault_path);
+            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+            let instance_id = "default";
+            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
+            let detected = nestweaver_engine::detect_implicit_projects(
+                &state.store_read,
+                &vault,
+                &vault_uid,
+                instance_id,
+            )
+            .map_err(|e| Status::internal(format!("detect_implicit_projects failed: {e:#}")))?;
+            serde_json::to_string(&detected)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn pr_impact_json(
         &self,
-        _r: Request<JsonRequest>,
+        r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        Err(Status::unimplemented(
-            "pr_impact_json: not yet implemented (engine-level)",
-        ))
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+            let changed_files: Vec<std::path::PathBuf> = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if changed_files.is_empty() {
+                return Err(Status::invalid_argument(
+                    "missing or empty 'files' array argument",
+                ));
+            }
+            let result = nestweaver_engine::analyze_blast_radius(
+                &state.store_read,
+                &changed_files,
+                depth,
+                Some(&state.db_path),
+            )
+            .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;
+            serde_json::to_string(&result)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 }
 
