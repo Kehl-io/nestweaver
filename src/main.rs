@@ -2276,8 +2276,21 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
-    let store = GraphStore::open_read_only(path)
-        .with_context(|| format!("failed to open database at {}", path.display()))?;
+    let store = GraphStore::open_read_only(path).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("Corrupted wal") || msg.contains("Could not set lock") {
+            anyhow::anyhow!(
+                "The NestWeaver daemon already has the database open at {}.\n\
+                 This command should route through the daemon automatically. \
+                 If you see this error, please report it as a bug.\n\
+                 Workaround: pass --no-daemon to open the database directly \
+                 (only safe when the daemon is stopped).",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!("failed to open database at {}: {e}", path.display())
+        }
+    })?;
 
     let pr_path = path.with_extension("pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
@@ -2514,9 +2527,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "list_repos", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "list_repos", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -2781,16 +2792,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
-                        let s: nestweaver_schema::Service =
-                            serde_json::from_value(value).unwrap_or_else(|_| {
-                                nestweaver_schema::Service {
-                                    uid: String::new(),
-                                    name: name.clone(),
-                                    repo_uid: String::new(),
-                                    summary: None,
-                                    summary_hash: None,
-                                    embedding: None,
-                                }
+                        let s: nestweaver_schema::Service = serde_json::from_value(value)
+                            .unwrap_or_else(|_| nestweaver_schema::Service {
+                                uid: String::new(),
+                                name: name.clone(),
+                                repo_uid: String::new(),
+                                summary: None,
+                                summary_hash: None,
+                                embedding: None,
                             });
                         println!("Service: {}", s.name);
                         if let Some(ref summary) = s.summary {
@@ -3020,9 +3029,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_default = default_db_path();
                 let db_path = db.as_deref().unwrap_or(&db_default);
                 if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect = rt.block_on(
-                        nestweaver_client::DaemonClient::connect(db_path, config.as_deref()),
-                    );
+                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                        db_path,
+                        config.as_deref(),
+                    ));
                     if let Ok(mut client) = connect {
                         let req = nestweaver_proto::BrainContextRequest {
                             seeds: seeds.clone(),
@@ -3058,9 +3068,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let result: nestweaver_engine::BrainContextResult =
                                 serde_json::from_str(&resp.result_json)?;
                             let cut = match token_budget {
-                                Some(budget) => {
-                                    token_budgeted_truncate(&result.connected, budget)
-                                }
+                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
                                 None => limit.unwrap_or(30).min(result.connected.len()),
                             };
                             print_brain_context_json(&result, cut)?;
@@ -3786,9 +3794,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard (JSON pass-through) ─────────────────
             if json && use_daemon {
                 let args = serde_json::json!({ "id_or_name": id_or_name });
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "clusters", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4621,10 +4627,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if candidates.is_empty() {
                             println!("No symbols found matching '{query}'.");
                         } else {
-                            println!(
-                                "Found {} symbol(s) matching '{query}':",
-                                candidates.len()
-                            );
+                            println!("Found {} symbol(s) matching '{query}':", candidates.len());
                             for c in &candidates {
                                 println!(
                                     "  {} ({}) {}:{}",
