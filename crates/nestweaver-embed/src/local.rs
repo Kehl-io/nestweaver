@@ -15,9 +15,6 @@ pub struct LocalModel {
 
 impl LocalModel {
     pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
-        let device = select_device();
-        info!(device = ?device, model = %config.model_id, "Loading embedding model");
-
         let api = Api::new()?;
         let repo = api.model(config.model_id.clone());
 
@@ -38,22 +35,40 @@ impl LocalModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[weights_path],
-                candle_core::DType::F32,
-                &device,
-            )?
-        };
-        let model = BertModel::load(vb, &bert_config)?;
+        // Try Metal first, fall back to CPU if forward pass fails
+        // (candle 0.8 Metal backend lacks some ops like layer-norm)
+        for device in candidate_devices() {
+            info!(device = ?device, model = %config.model_id, "Loading embedding model");
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    &[weights_path.clone()],
+                    candle_core::DType::F32,
+                    &device,
+                )?
+            };
+            let model = BertModel::load(vb, &bert_config)?;
+            let tok = tokenizer.clone();
+            let mut candidate = Self {
+                model,
+                tokenizer: tok,
+                device,
+                dimension,
+            };
 
-        info!(dimension, "Embedding model loaded");
-        Ok(Self {
-            model,
-            tokenizer,
-            device,
-            dimension,
-        })
+            // Probe with a short text to verify the device works end-to-end
+            match candidate.embed(&["test"]) {
+                Ok(_) => {
+                    candidate.tokenizer = tokenizer;
+                    info!(dimension, device = ?candidate.device, "Embedding model loaded");
+                    return Ok(candidate);
+                }
+                Err(e) => {
+                    tracing::warn!(device = ?candidate.device, "Device probe failed ({e}), trying next");
+                }
+            }
+        }
+
+        anyhow::bail!("No working device found for embedding model")
     }
 
     pub fn dimension(&self) -> usize {
@@ -108,12 +123,14 @@ impl LocalModel {
     }
 }
 
-fn select_device() -> Device {
+fn candidate_devices() -> Vec<Device> {
+    let mut devices = Vec::new();
     #[cfg(feature = "metal")]
     {
         if let Ok(device) = Device::new_metal(0) {
-            return device;
+            devices.push(device);
         }
     }
-    Device::Cpu
+    devices.push(Device::Cpu);
+    devices
 }

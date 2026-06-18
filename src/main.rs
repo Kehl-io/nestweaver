@@ -10444,7 +10444,10 @@ fn run_embed(
     }
 
     let t0 = std::time::Instant::now();
-    let store = open_store(db)?;
+    let default = default_db_path();
+    let path = db.unwrap_or(&default);
+    let store = nestweaver_store::GraphStore::open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open database for writing at {}: {e}", path.display()))?;
 
     let do_symbols = scope == "all" || scope == "symbols";
     let do_notes = scope == "all" || scope == "notes";
