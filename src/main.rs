@@ -169,6 +169,10 @@ struct Cli {
     /// Requires NESTWEAVER_NO_DAEMON=1 environment variable.
     #[arg(long, global = true)]
     no_daemon: bool,
+
+    /// Disable semantic embedding for this invocation
+    #[arg(long, global = true)]
+    no_embed: bool,
 }
 
 // ── Output configuration ─────────────────────────────────────────────────────
@@ -1107,26 +1111,34 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
-    /// Generate embeddings for all symbols in the database using an external API.
+    /// Generate embeddings for symbols, notes, and headings in the database.
     ///
-    /// Calls an OpenAI-compatible embedding endpoint for each symbol's signature
-    /// text and stores the result so hybrid retrieval can use the semantic signal.
-    /// Only symbols that do not yet have an embedding are processed (incremental).
+    /// By default uses the bundled local model (sentence-transformers/all-MiniLM-L6-v2).
+    /// Pass --endpoint to use an external OpenAI-compatible API instead.
+    /// Only nodes that do not yet have an embedding are processed (incremental);
+    /// use --force to re-embed everything.
     #[command(
-        after_help = "Examples:\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text --batch-size 8"
+        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
     )]
     Embed {
-        #[arg(
-            long,
-            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
-        )]
+        #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
         db: Option<PathBuf>,
-        #[arg(long, help = "Embedding API endpoint (OpenAI-compatible)")]
-        endpoint: String,
-        #[arg(long, help = "Model name (e.g. text-embedding-3-small, voyage-code-3)")]
-        model: String,
-        #[arg(long, default_value = "32", help = "Batch size for API calls")]
+        #[arg(long, help = "Use the bundled local model (default when no --endpoint)")]
+        local: bool,
+        #[arg(long, help = "OpenAI-compatible embedding API endpoint")]
+        endpoint: Option<String>,
+        #[arg(long, help = "Model name for external API (e.g. text-embedding-3-small)")]
+        model: Option<String>,
+        #[arg(long, default_value = "sentence-transformers/all-MiniLM-L6-v2", help = "HuggingFace model ID for local inference")]
+        model_id: String,
+        #[arg(long, default_value = "32", help = "Batch size")]
         batch_size: usize,
+        #[arg(long, default_value = "all", help = "What to embed: symbols, notes, headings, or all")]
+        scope: String,
+        #[arg(long, help = "Re-embed nodes that already have embeddings")]
+        force: bool,
+        #[arg(long, help = "Print timing and statistics")]
+        stats: bool,
     },
 
     /// Detect potentially dead code via entry point reachability
@@ -2478,6 +2490,8 @@ fn main() {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
+    let no_embed = cli.no_embed;
+    let _ = &no_embed; // suppress unused warning for arms that don't use it
     let use_daemon = if cli.no_daemon {
         if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
             false
@@ -4133,16 +4147,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
-        Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
+        Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::Memory { command } => run_memory(*command, t0),
         Commands::Ranking { command } => run_ranking(command, t0),
         Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
         Commands::Embed {
             db,
+            local,
             endpoint,
             model,
+            model_id,
             batch_size,
-        } => run_embed(db.as_deref(), &endpoint, &model, batch_size).map(|c| (c, None)),
+            scope,
+            force,
+            stats,
+        } => run_embed(
+            db.as_deref(),
+            local,
+            endpoint.as_deref(),
+            model.as_deref(),
+            &model_id,
+            batch_size,
+            &scope,
+            force,
+            stats,
+        )
+        .map(|c| (c, None)),
 
         Commands::DeadCode {
             min_confidence,
@@ -5879,12 +5909,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
             let defaults = HybridSearchConfig::default();
+            let search_config = if no_embed {
+                HybridSearchConfig {
+                    weight_semantic: 0.0,
+                    ..defaults
+                }
+            } else {
+                defaults
+            };
             let aliases = load_alias_sidecar(&db_path);
             match build_brain_context_hybrid_with_aliases(
                 &store,
                 &ppr_seeds,
                 tantivy.as_ref(),
-                &defaults,
+                &search_config,
                 &aliases,
                 Some(&db_path),
                 Some(nestweaver_store::QueryIntent::ProjectContext),
@@ -7510,6 +7548,7 @@ fn run_brain(
     out: &OutputConfig,
     t0: std::time::Instant,
     use_daemon: bool,
+    no_embed: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         BrainCommands::Add {
@@ -9172,7 +9211,11 @@ fn run_brain(
                             .to_string(),
                         prf,
                         rerank,
-                        weight_semantic: weight_semantic.unwrap_or(0.0),
+                        weight_semantic: if no_embed {
+                            0.0
+                        } else {
+                            weight_semantic.unwrap_or(0.0)
+                        },
                         since: since.as_deref().unwrap_or("").to_string(),
                         recency_weight,
                         recency_half_life_days,
@@ -9252,7 +9295,11 @@ fn run_brain(
             let config = HybridSearchConfig {
                 weight_ppr: weight_ppr.unwrap_or(defaults.weight_ppr),
                 weight_bm25: weight_bm25.unwrap_or(defaults.weight_bm25),
-                weight_semantic: weight_semantic.unwrap_or(defaults.weight_semantic),
+                weight_semantic: if no_embed {
+                    0.0
+                } else {
+                    weight_semantic.unwrap_or(defaults.weight_semantic)
+                },
                 prf: prf_enabled,
                 seed_resolution: configured_seed_resolution
                     .unwrap_or_else(|| defaults.seed_resolution.clone()),
@@ -10379,74 +10426,384 @@ fn print_project_context_json(
     Ok(())
 }
 
-/// Generate embeddings for all symbols that don't yet have one.
+/// Generate embeddings for symbols, notes, and/or headings.
 fn run_embed(
     db: Option<&Path>,
-    endpoint: &str,
-    model: &str,
+    local: bool,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    model_id: &str,
     batch_size: usize,
+    scope: &str,
+    force: bool,
+    stats: bool,
 ) -> anyhow::Result<i32> {
-    let store = open_store(db)?;
-
-    let all_symbols = store
-        .list_all_symbols()
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("list_all_symbols")?;
-
-    let to_embed: Vec<_> = all_symbols
-        .iter()
-        .filter(|s| s.embedding.is_none())
-        .collect();
-
-    if to_embed.is_empty() {
-        eprintln!("All symbols already have embeddings. Nothing to do.");
-        return Ok(EXIT_SUCCESS);
+    // Validate flags
+    if local && endpoint.is_some() {
+        anyhow::bail!("--local and --endpoint are mutually exclusive");
     }
 
-    eprintln!(
-        "Generating embeddings for {} symbol(s) (skipping {} with existing embeddings) …",
-        to_embed.len(),
-        all_symbols.len() - to_embed.len()
-    );
+    let t0 = std::time::Instant::now();
+    let store = open_store(db)?;
 
-    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let do_symbols = scope == "all" || scope == "symbols";
+    let do_notes = scope == "all" || scope == "notes";
+    let do_headings = scope == "all" || scope == "headings";
+
+    if !do_symbols && !do_notes && !do_headings {
+        anyhow::bail!(
+            "unknown --scope '{scope}': expected one of: all, symbols, notes, headings"
+        );
+    }
 
     let mut success_count = 0usize;
     let mut error_count = 0usize;
 
-    for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
-        let batch_start = batch_idx * batch_size + 1;
-        let batch_end = (batch_start + batch.len() - 1).min(to_embed.len());
-        eprintln!("  Batch {batch_start}–{batch_end} / {}", to_embed.len());
+    if let Some(ep) = endpoint {
+        // ── External API path ────────────────────────────────────
+        let api_model = model.unwrap_or("text-embedding-3-small");
+        let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
-        for sym in batch {
-            let text = if sym.signature.is_empty() {
-                sym.name.clone()
+        if do_symbols {
+            let all = store
+                .list_all_symbols()
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("list_all_symbols")?;
+            let to_embed: Vec<_> = if force {
+                all.iter().collect()
             } else {
-                sym.signature.clone()
+                all.iter().filter(|s| s.embedding.is_none()).collect()
             };
-
-            match rt.block_on(generate_embedding(endpoint, model, &text)) {
-                Ok(embedding) => {
-                    if let Err(e) = store.update_symbol_embedding(&sym.uid, &embedding) {
-                        eprintln!(
-                            "    Warning: failed to store embedding for {}: {e}",
-                            sym.uid
-                        );
-                        error_count += 1;
+            let total = to_embed.len();
+            if total > 0 {
+                eprintln!("Embedding {total} symbol(s) via API…");
+                for (i, sym) in to_embed.iter().enumerate() {
+                    eprint!("\rEmbedding symbols... {}/{total}", i + 1);
+                    let text = if sym.signature.is_empty() {
+                        sym.name.clone()
                     } else {
-                        success_count += 1;
+                        sym.signature.clone()
+                    };
+                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
+                        Ok(embedding) => {
+                            if let Err(e) = store.update_symbol_embedding(&sym.uid, &embedding) {
+                                eprintln!(
+                                    "\n    Warning: failed to store embedding for {}: {e}",
+                                    sym.uid
+                                );
+                                error_count += 1;
+                            } else {
+                                success_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\n    Warning: embedding API error for {}: {e}", sym.uid);
+                            error_count += 1;
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("    Warning: embedding API error for {}: {e}", sym.uid);
-                    error_count += 1;
+                eprintln!();
+            }
+        }
+
+        if do_notes {
+            let all = store
+                .list_notes(None)
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("list_notes")?;
+            let to_embed: Vec<_> = if force {
+                all.iter().collect()
+            } else {
+                all.iter().filter(|n| n.embedding.is_none()).collect()
+            };
+            let total = to_embed.len();
+            if total > 0 {
+                eprintln!("Embedding {total} note(s) via API…");
+                for (i, note) in to_embed.iter().enumerate() {
+                    eprint!("\rEmbedding notes... {}/{total}", i + 1);
+                    let text = note.title.clone();
+                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
+                        Ok(embedding) => {
+                            if let Err(e) = store.update_note_embedding(&note.uid, &embedding) {
+                                eprintln!(
+                                    "\n    Warning: failed to store embedding for {}: {e}",
+                                    note.uid
+                                );
+                                error_count += 1;
+                            } else {
+                                success_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\n    Warning: embedding API error for {}: {e}", note.uid);
+                            error_count += 1;
+                        }
+                    }
+                }
+                eprintln!();
+            }
+        }
+
+        if do_headings {
+            let all_headings = store
+                .list_all_headings()
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("list_all_headings")?;
+            let to_embed: Vec<_> = if force {
+                all_headings.iter().collect()
+            } else {
+                all_headings
+                    .iter()
+                    .filter(|h| h.embedding.is_none())
+                    .collect()
+            };
+            let total = to_embed.len();
+            if total > 0 {
+                // Build note title lookup
+                let notes = store
+                    .list_notes(None)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let note_titles: std::collections::HashMap<&str, &str> = notes
+                    .iter()
+                    .map(|n| (n.uid.as_str(), n.title.as_str()))
+                    .collect();
+
+                eprintln!("Embedding {total} heading(s) via API…");
+                for (i, h) in to_embed.iter().enumerate() {
+                    eprint!("\rEmbedding headings... {}/{total}", i + 1);
+                    let note_title = note_titles
+                        .get(h.note_uid.as_str())
+                        .copied()
+                        .unwrap_or("");
+                    let text = if note_title.is_empty() {
+                        h.text.clone()
+                    } else {
+                        format!("{note_title} > {}", h.text)
+                    };
+                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
+                        Ok(embedding) => {
+                            if let Err(e) =
+                                store.update_heading_embedding(&h.uid, &embedding)
+                            {
+                                eprintln!(
+                                    "\n    Warning: failed to store embedding for {}: {e}",
+                                    h.uid
+                                );
+                                error_count += 1;
+                            } else {
+                                success_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\n    Warning: embedding API error for {}: {e}", h.uid);
+                            error_count += 1;
+                        }
+                    }
+                }
+                eprintln!();
+            }
+        }
+    } else {
+        // ── Local model path (default) ───────────────────────────
+        #[cfg(feature = "embed")]
+        {
+            let config = nestweaver_embed::EmbedConfig {
+                model_id: model_id.to_string(),
+                ..Default::default()
+            };
+            let embed_model = nestweaver_embed::EmbedModel::load(&config)
+                .context("failed to load local embedding model")?;
+
+            if do_symbols {
+                let all = store
+                    .list_all_symbols()
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("list_all_symbols")?;
+                let to_embed: Vec<_> = if force {
+                    all.iter().collect()
+                } else {
+                    all.iter().filter(|s| s.embedding.is_none()).collect()
+                };
+                let total = to_embed.len();
+                if total > 0 {
+                    eprintln!("Embedding {total} symbol(s) with local model…");
+                    for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        let done = batch_idx * batch_size + batch.len();
+                        eprint!("\rEmbedding symbols... {done}/{total}");
+                        let texts: Vec<String> = batch
+                            .iter()
+                            .map(|s| {
+                                nestweaver_embed::preprocess::symbol_embed_text(
+                                    &s.kind.to_string(),
+                                    &s.name,
+                                    None,
+                                )
+                            })
+                            .collect();
+                        let text_refs: Vec<&str> =
+                            texts.iter().map(|t| t.as_str()).collect();
+                        match embed_model.embed(&text_refs) {
+                            Ok(embeddings) => {
+                                for (sym, emb) in batch.iter().zip(embeddings.iter()) {
+                                    if let Err(e) =
+                                        store.update_symbol_embedding(&sym.uid, emb)
+                                    {
+                                        eprintln!(
+                                            "\n    Warning: store error for {}: {e}",
+                                            sym.uid
+                                        );
+                                        error_count += 1;
+                                    } else {
+                                        success_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("\n    Warning: local embed error: {e}");
+                                error_count += batch.len();
+                            }
+                        }
+                    }
+                    eprintln!();
+                }
+            }
+
+            if do_notes {
+                let all = store
+                    .list_notes(None)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("list_notes")?;
+                let to_embed: Vec<_> = if force {
+                    all.iter().collect()
+                } else {
+                    all.iter().filter(|n| n.embedding.is_none()).collect()
+                };
+                let total = to_embed.len();
+                if total > 0 {
+                    eprintln!("Embedding {total} note(s) with local model…");
+                    for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        let done = batch_idx * batch_size + batch.len();
+                        eprint!("\rEmbedding notes... {done}/{total}");
+                        let texts: Vec<String> = batch
+                            .iter()
+                            .map(|n| {
+                                nestweaver_embed::preprocess::note_embed_text(&n.title, None)
+                            })
+                            .collect();
+                        let text_refs: Vec<&str> =
+                            texts.iter().map(|t| t.as_str()).collect();
+                        match embed_model.embed(&text_refs) {
+                            Ok(embeddings) => {
+                                for (note, emb) in batch.iter().zip(embeddings.iter()) {
+                                    if let Err(e) =
+                                        store.update_note_embedding(&note.uid, emb)
+                                    {
+                                        eprintln!(
+                                            "\n    Warning: store error for {}: {e}",
+                                            note.uid
+                                        );
+                                        error_count += 1;
+                                    } else {
+                                        success_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("\n    Warning: local embed error: {e}");
+                                error_count += batch.len();
+                            }
+                        }
+                    }
+                    eprintln!();
+                }
+            }
+
+            if do_headings {
+                let all_headings = store
+                    .list_all_headings()
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("list_all_headings")?;
+                let to_embed: Vec<_> = if force {
+                    all_headings.iter().collect()
+                } else {
+                    all_headings
+                        .iter()
+                        .filter(|h| h.embedding.is_none())
+                        .collect()
+                };
+                let total = to_embed.len();
+                if total > 0 {
+                    let notes = store
+                        .list_notes(None)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let note_titles: std::collections::HashMap<&str, &str> = notes
+                        .iter()
+                        .map(|n| (n.uid.as_str(), n.title.as_str()))
+                        .collect();
+
+                    eprintln!("Embedding {total} heading(s) with local model…");
+                    for (batch_idx, batch) in to_embed.chunks(batch_size).enumerate() {
+                        let done = batch_idx * batch_size + batch.len();
+                        eprint!("\rEmbedding headings... {done}/{total}");
+                        let texts: Vec<String> = batch
+                            .iter()
+                            .map(|h| {
+                                let note_title = note_titles
+                                    .get(h.note_uid.as_str())
+                                    .copied()
+                                    .unwrap_or("");
+                                nestweaver_embed::preprocess::heading_embed_text(
+                                    note_title, &h.text,
+                                )
+                            })
+                            .collect();
+                        let text_refs: Vec<&str> =
+                            texts.iter().map(|t| t.as_str()).collect();
+                        match embed_model.embed(&text_refs) {
+                            Ok(embeddings) => {
+                                for (h, emb) in batch.iter().zip(embeddings.iter()) {
+                                    if let Err(e) =
+                                        store.update_heading_embedding(&h.uid, emb)
+                                    {
+                                        eprintln!(
+                                            "\n    Warning: store error for {}: {e}",
+                                            h.uid
+                                        );
+                                        error_count += 1;
+                                    } else {
+                                        success_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("\n    Warning: local embed error: {e}");
+                                error_count += batch.len();
+                            }
+                        }
+                    }
+                    eprintln!();
                 }
             }
         }
+
+        #[cfg(not(feature = "embed"))]
+        {
+            anyhow::bail!(
+                "local embedding requires the `embed` feature; \
+                 rebuild with `--features embed` or pass --endpoint"
+            );
+        }
     }
 
-    eprintln!("Done: {success_count} embedding(s) generated, {error_count} error(s).");
+    if stats {
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "Embed stats: {success_count} succeeded, {error_count} failed, {:.2}s elapsed",
+            elapsed.as_secs_f64()
+        );
+    } else {
+        eprintln!("Done: {success_count} embedding(s) generated, {error_count} error(s).");
+    }
 
     if error_count > 0 {
         Ok(EXIT_ERROR)
