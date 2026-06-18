@@ -120,3 +120,7 @@ hex = "0.4"
 [[bench]]
 name = "brain_benchmarks"
 harness = false
+
+[[bench]]
+name = "embed_latency"
+harness = false

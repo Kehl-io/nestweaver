@@ -1366,7 +1366,7 @@ fn tanh_normalize(scores: &[f64]) -> Vec<f64> {
 /// as: `score(d) = w_ppr * norm_ppr(d) + w_bm25 * norm_bm25(d) + w_semantic * norm_sem(d)`.
 ///
 /// Returns a fused list sorted descending by combined score.
-fn weighted_score_fuse(
+pub fn weighted_score_fuse(
     ppr: &[(String, f64)],
     bm25: &[nestweaver_store::SearchHit],
     semantic: &[(String, f64)],
