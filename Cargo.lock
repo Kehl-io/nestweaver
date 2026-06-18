@@ -3814,6 +3814,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "libc",
+ "nestweaver-embed",
  "nestweaver-engine",
  "nestweaver-mcp",
  "nestweaver-proto",

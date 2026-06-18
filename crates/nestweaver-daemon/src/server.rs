@@ -36,6 +36,9 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Lazily-loaded embedding model for semantic search. Populated by a
+    /// background task when the `embed` feature is enabled.
+    pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -66,6 +69,13 @@ impl DaemonService {
         let tool_name = tool_name.to_string();
         let args_json = args_json.to_string();
 
+        // Read the embed model Arc outside the blocking thread, then drop
+        // the RwLock guard before any further awaits.
+        let embed_arc = {
+            let guard = self.state.embed_model.read().await;
+            guard.clone()
+        };
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
             let args: serde_json::Value = serde_json::from_str(&args_json)
@@ -75,12 +85,13 @@ impl DaemonService {
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
+            let embed_ref = embed_arc.as_deref();
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
-                None,
+                embed_ref,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
 
@@ -113,18 +124,26 @@ impl DaemonService {
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
 
+        // Read the embed model Arc outside the blocking thread, then drop
+        // the RwLock guard before any further awaits.
+        let embed_arc = {
+            let guard = self.state.embed_model.read().await;
+            guard.clone()
+        };
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
+            let embed_ref = embed_arc.as_deref();
             nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
-                None,
+                embed_ref,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
         })
@@ -2303,7 +2322,51 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         instance_cfg,
+        embed_model: Arc::new(tokio::sync::RwLock::new(None)),
     });
+
+    // Spawn background embedding model loading when the `embed` feature is on.
+    #[cfg(feature = "embed")]
+    {
+        let embed_state = state.embed_model.clone();
+        let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
+        tokio::spawn(async move {
+            let cfg = embedding_cfg.unwrap_or_default();
+            // Expand tilde in cache_dir using the home directory.
+            let cache_dir = if cfg.cache_dir.starts_with("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(&cfg.cache_dir[2..])
+                } else {
+                    std::path::PathBuf::from(&cfg.cache_dir)
+                }
+            } else {
+                std::path::PathBuf::from(&cfg.cache_dir)
+            };
+            let config = nestweaver_embed::EmbedConfig {
+                model_id: cfg.model_id.clone(),
+                cache_dir,
+                external_endpoint: cfg.external_endpoint.clone(),
+                external_model: cfg.external_model.clone(),
+            };
+            match tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config))
+                .await
+            {
+                Ok(Ok(model)) => {
+                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
+                    *embed_state.write().await = Some(
+                        std::sync::Arc::new(model)
+                            as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to load embedding model: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!("Embedding model load task panicked: {e}");
+                }
+            }
+        });
+    }
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
         .max_decoding_message_size(256 * 1024 * 1024)
