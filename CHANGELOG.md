@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.28.0](https://github.com/Kehl-io/nestweaver/compare/v0.27.0...v0.28.0) (2026-06-18)
+
+
+### Features
+
+* **daemon:** eliminate all stop_daemon_if_running calls ([ec6d2c2](https://github.com/Kehl-io/nestweaver/commit/ec6d2c27ff5e6d50e25099f45aacb4528bb9fa04))
+* enrich brain_guide/admin instructions with tool-routing table, add staleness warnings and token hints ([f5db6f7](https://github.com/Kehl-io/nestweaver/commit/f5db6f7d6e4590fa9df9869c26c98c5fd6c8d026))
+
+
+### Bug Fixes
+
+* bump gRPC message size limit from 64MB to 256MB (fixes export cypher) ([6306a48](https://github.com/Kehl-io/nestweaver/commit/6306a48a96224cf2398cbbdb090d7b81a3010d5d))
+* **ci:** set NESTWEAVER_NO_DAEMON=1 for E2E tests ([2cb77a4](https://github.com/Kehl-io/nestweaver/commit/2cb77a497ca005864e1881232c7fa6aa2c011ee1))
+* **cli:** add daemon RPCs for list-repos/services/projects/search/symbol ([55f2b50](https://github.com/Kehl-io/nestweaver/commit/55f2b507f966ac435aff73a7f9d7e42c6c7761a0))
+* **cli:** graceful daemon fallback for ui/watch, fix collapsible-if clippy warnings ([9790a5e](https://github.com/Kehl-io/nestweaver/commit/9790a5eb62336717021e1276eaef3692c3757e2e))
+* **cli:** guard --no-daemon for testing, route brain-remove/snapshot through daemon ([6450281](https://github.com/Kehl-io/nestweaver/commit/645028128aa4267ac0821462d3c81778a9684791))
+* **cli:** guard --no-daemon in MCP server command consistently ([32f8472](https://github.com/Kehl-io/nestweaver/commit/32f8472fd80ee719eaafdcfc9fb87777aa150c0a))
+* **cli:** route 10 read commands through daemon, improve lock error message ([5486618](https://github.com/Kehl-io/nestweaver/commit/5486618d838838be03fc0babd4bbcebfa34952de)), closes [#63](https://github.com/Kehl-io/nestweaver/issues/63)
+* **cli:** route all 5 json-gated commands through daemon unconditionally ([8cb5152](https://github.com/Kehl-io/nestweaver/commit/8cb5152609cd0d907545031f9c8862814190ae86))
+* **cli:** route context/cross-repo-refs/generate-guide/cluster through daemon ([7f8377a](https://github.com/Kehl-io/nestweaver/commit/7f8377af3c55811a1fb047406437f9c99e8dfede))
+* **cli:** route export and ui commands through daemon stop/restart ([9063194](https://github.com/Kehl-io/nestweaver/commit/9063194cda6f38e65c96ad9f689edefd48e6b0bf))
+* **cli:** route remove-repo/remove-project resolution through daemon RPCs ([800f549](https://github.com/Kehl-io/nestweaver/commit/800f549be3cffcd5434de2fa5e371c5559fcdc0e))
+* **cli:** route repo-map/suggest-links/detect-implicit-projects/pr-impact through daemon ([8a57a4c](https://github.com/Kehl-io/nestweaver/commit/8a57a4c84f0cf29e0e9f99777e437794401ccafd))
+* **cli:** route watch/export/ui through daemon (zero bypasses remaining) ([4bda18b](https://github.com/Kehl-io/nestweaver/commit/4bda18bc0ca3da9afaab93461cbe51a83e50d9a5))
+* route CLI read commands through daemon (fixes [#63](https://github.com/Kehl-io/nestweaver/issues/63)) ([d71c53f](https://github.com/Kehl-io/nestweaver/commit/d71c53f7abeec61e743c342ee0b69530afc0bf72))
+* **web:** commit AppState Arc&lt;TantivyIndex&gt; refactor (fixes CI build) ([6274f31](https://github.com/Kehl-io/nestweaver/commit/6274f31ef70653037de4e19d342823b9014ed888))
+
 ## [0.27.0](https://github.com/Kehl-io/nestweaver/compare/v0.26.3...v0.27.0) (2026-06-17)
 
 
