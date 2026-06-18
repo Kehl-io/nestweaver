@@ -1896,6 +1896,7 @@ mod render_brain_node_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
 
@@ -1908,6 +1909,7 @@ mod render_brain_node_tests {
             start_line: 1,
             end_line: 5,
             content_hash: "def".to_string(),
+            embedding: None,
         };
         store.insert_heading(&heading).unwrap();
 
@@ -1946,6 +1948,7 @@ mod render_brain_node_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
 
@@ -2156,6 +2159,7 @@ mod inline_body_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
         let sec = Section {
