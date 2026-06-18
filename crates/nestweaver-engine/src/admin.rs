@@ -22,12 +22,18 @@ use serde_json::{Value, json};
 /// Bundled default for the main (top-level agent) instruction store.
 pub const DEFAULT_MAIN_INSTRUCTIONS: &str = r#"# NestWeaver agent instructions
 
-This workspace is indexed by NestWeaver. Prefer its MCP tools for structural
-questions over ad-hoc grepping:
+This workspace is indexed by NestWeaver. Use its tools instead of grepping:
 
-- Use `brain_context` for "how does X fit together" questions.
-- Use `brain_impact` before modifying a symbol with many callers.
-- Use `project_context <slug>` for project-state questions.
+| Question | Tool | NOT this |
+|---|---|---|
+| Find a symbol/note | `brain_search` | `grep`, `rg`, `find` |
+| Understand connections | `brain_context` | reading files one by one |
+| Read a symbol's source | `read_symbols` | `Read` on the whole file |
+| Check blast radius | `brain_impact` or `blast_radius` | manual caller tracing |
+| Find text by regex | `regex_search` | `rg`, `grep` |
+| Project overview | `project_context <name>` | reading _Overview.md |
+
+For subagents and batch work, prefer CLI (`nestweaver context/search --json`) over MCP — 40-60% cheaper in tokens.
 
 These instructions are guidance, not enforcement — follow them when they apply.
 "#;
@@ -36,14 +42,17 @@ These instructions are guidance, not enforcement — follow them when they apply
 /// it is injected into a subagent's context where attention is scarce.
 pub const DEFAULT_SUBAGENT_INSTRUCTIONS: &str = r#"# Subagent guidance (NestWeaver)
 
-You are a subagent in a NestWeaver-indexed workspace. Before answering:
+You are a subagent in a NestWeaver-indexed workspace. Use CLI for token efficiency:
 
+- `nestweaver context <seed> --json --db $NESTWEAVER_DB` — structural context (NOT grep)
+- `nestweaver search <query> --json --db $NESTWEAVER_DB` — find symbols/notes (NOT grep/rg)
+- `nestweaver impact <symbol> --json --db $NESTWEAVER_DB` — blast radius (NOT manual tracing)
+- `nestweaver brain search <query> --json --db $NESTWEAVER_DB` — unified note+code search
+
+Before answering:
 - If your answer references a file path, read that file first.
-- For any "every X" / "all Y" question, run a regex/grep sweep before answering.
-- For project-state questions, prefer `project_context <slug>` over `brain_search`.
-- For URL-bearing messages, fetch the URL before answering.
-
-This guidance helps but is not enforced.
+- For project-state questions, use `nestweaver project-context <slug> --json`.
+- Never run grep/rg/find on an indexed path — use `nestweaver search` or `nestweaver brain search`.
 "#;
 
 /// Supported hook runtimes. Only `Claude` is implemented for v1; the enum
