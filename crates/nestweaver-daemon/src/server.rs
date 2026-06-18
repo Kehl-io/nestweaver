@@ -156,6 +156,96 @@ impl DaemonService {
 
         result
     }
+
+    /// Build an `on_change` callback that queues un-embedded nodes for
+    /// background embedding after every watcher batch.  Returns `None`
+    /// when the `embed` feature is disabled or the model is not yet loaded.
+    #[cfg(feature = "embed")]
+    fn make_embed_on_change(
+        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        store: Arc<nestweaver_store::GraphStore>,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        Some(Box::new(move || {
+            // Peek at the model without blocking async code — we are already
+            // in a blocking thread (inside spawn_blocking).
+            let model = {
+                let guard = embed_model.blocking_read();
+                guard.clone()
+            };
+            let Some(model) = model else { return };
+
+            let store = store.clone();
+            // Fire-and-forget a new blocking task so the watcher callback
+            // returns quickly and the watcher loop is not stalled.
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut embedded = 0u32;
+                let limit: usize = 64; // Max nodes per watcher cycle
+
+                // Symbols
+                if let Ok(symbols) = store.list_all_symbols() {
+                    for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                        let text = nestweaver_embed::preprocess::symbol_embed_text(
+                            &sym.kind.to_string(),
+                            &sym.name,
+                            None,
+                        );
+                        if let Ok(emb) = model.embed_query(&text) {
+                            let _ = store.update_symbol_embedding(&sym.uid, &emb);
+                            embedded += 1;
+                        }
+                    }
+                }
+
+                let remaining = limit.saturating_sub(embedded as usize);
+
+                // Notes
+                if remaining > 0 {
+                    if let Ok(notes) = store.list_notes(None) {
+                        for note in notes.iter().filter(|n| n.embedding.is_none()).take(remaining) {
+                            let text =
+                                nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                            if let Ok(emb) = model.embed_query(&text) {
+                                let _ = store.update_note_embedding(&note.uid, &emb);
+                                embedded += 1;
+                            }
+                        }
+                    }
+                }
+
+                let remaining = limit.saturating_sub(embedded as usize);
+
+                // Headings
+                if remaining > 0 {
+                    if let Ok(headings) = store.list_all_headings() {
+                        for heading in
+                            headings.iter().filter(|h| h.embedding.is_none()).take(remaining)
+                        {
+                            let text = nestweaver_embed::preprocess::heading_embed_text(
+                                "",
+                                &heading.text,
+                            );
+                            if let Ok(emb) = model.embed_query(&text) {
+                                let _ = store.update_heading_embedding(&heading.uid, &emb);
+                                embedded += 1;
+                            }
+                        }
+                    }
+                }
+
+                if embedded > 0 {
+                    tracing::debug!(count = embedded, "Embedded new nodes from watcher");
+                }
+            });
+        }))
+    }
+
+    #[cfg(not(feature = "embed"))]
+    fn make_embed_on_change(
+        _embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        _store: Arc<nestweaver_store::GraphStore>,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        None
+    }
 }
 
 // ── Trait impl ──────────────────────────────────────────────────────
@@ -284,12 +374,14 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         let store = self.state.store.clone();
+        let on_change =
+            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, None)
+                watcher.run_with_store(store, on_change)
             }));
 
             match result {
@@ -362,12 +454,14 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         let store = self.state.store.clone();
+        let on_change =
+            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, None)
+                watcher.run_with_store(store, on_change)
             }));
 
             match result {
