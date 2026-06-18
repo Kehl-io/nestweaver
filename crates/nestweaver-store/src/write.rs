@@ -2777,4 +2777,36 @@ impl GraphStore {
             discarded,
         })
     }
+
+    // ── DB-level metadata ───────────────────────────────────────────────────
+
+    /// Persist the embedding model ID and vector dimension as a singleton
+    /// `Meta` node in the database. lbug does not support MERGE or SET, so
+    /// we use the established delete-then-create upsert pattern. The node
+    /// is keyed by the fixed string `"embedding"` — only one such record
+    /// can exist at a time. Calling this again replaces any previous value.
+    pub fn set_embedding_metadata(&self, model_id: &str, dimension: u32) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+
+        // Encode both fields into a single JSON string so we can use the
+        // two-column Meta table without widening it.
+        let value = format!(r#"{{"model_id":"{model_id}","dimension":{dimension}}}"#);
+
+        // Delete the existing singleton, if any. Best-effort: silently
+        // ignore errors from tables that were never created (old DBs).
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String("embedding".to_string()))],
+        );
+
+        exec_params(
+            &conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String("embedding".to_string())),
+                ("v", lbug::Value::String(value)),
+            ],
+        )
+    }
 }

@@ -762,6 +762,19 @@ impl GraphStore {
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
+        // ── DB-level metadata (key/value singletons) ────────────────────────
+        // Used to persist configuration that applies to the whole database,
+        // e.g. which embedding model was used to generate stored vectors and
+        // the expected vector dimension. One node per logical key; the upsert
+        // pattern (DETACH DELETE + CREATE) keeps it idempotent.
+        conn.query(
+            "CREATE NODE TABLE IF NOT EXISTS Meta(\
+                key STRING, \
+                value STRING, \
+                PRIMARY KEY(key))",
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?;
+
         Ok(())
     }
 }
