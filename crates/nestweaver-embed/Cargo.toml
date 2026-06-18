@@ -1,0 +1,27 @@
+[package]
+name = "nestweaver-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local embedding inference for NestWeaver semantic search"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = { version = "0.4", features = ["tokio"] }
+tokenizers = "0.21"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tracing = "0.1"
+indicatif = "0.17"
+dirs = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal"]
