@@ -326,6 +326,33 @@ pub fn generate_guide_with_rules(
     out.push_str("| `brain_status` | Checking what's indexed |\n");
     out.push('\n');
 
+    out.push_str("## When to Use MCP vs CLI vs Grep\n\n");
+    out.push_str("NestWeaver provides three retrieval channels. Choose by context:\n\n");
+    out.push_str("| Question type | Best tool | Why |\n");
+    out.push_str("|---|---|---|\n");
+    out.push_str("| \"What's connected to X?\" | MCP `brain_context` | Ranked structural subgraph via PPR |\n");
+    out.push_str("| \"Find symbol/note by name\" | MCP `brain_search` | BM25 over indexed text, returns both code + notes |\n");
+    out.push_str("| \"What calls this function?\" | MCP `brain_impact` | Confidence-weighted reverse dependency walk |\n");
+    out.push_str(
+        "| \"What does this function call?\" | MCP `flow_trace` | Forward call-chain tree |\n",
+    );
+    out.push_str("| \"Read a symbol's source\" | MCP `read_symbols` | Returns just the symbol span, not the whole file |\n");
+    out.push_str("| \"Read a note's content\" | MCP `note_get` | Full markdown body or specific sections |\n");
+    out.push_str("| \"What links to this note?\" | MCP `backlinks` | Reverse wikilink graph |\n");
+    out.push_str("| \"Get project context\" | MCP `project_context` | All notes + symbols for a named project |\n");
+    out.push_str("| \"What will break if I change X?\" | MCP `blast_radius` | File-level change impact with risk scores |\n");
+    out.push_str(
+        "| \"Orient on unfamiliar topic\" | MCP `investigate` | One-call map with summaries |\n",
+    );
+    out.push_str("| \"Find text by regex\" | MCP `regex_search` | Searches indexed text — NOT `grep`/`rg` |\n");
+    out.push_str("| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA comparison |\n");
+    out.push_str("| Batch/scripted queries | CLI `nestweaver context/search/impact --json` | 40-60% fewer tokens (no schema overhead) |\n");
+    out.push_str("| Subagent code exploration | CLI `nestweaver context <seed> --json` | CLI is cheaper for focused lookups |\n");
+    out.push_str("| Known-path file read | `Read` tool | Graph can't beat a direct file read |\n");
+    out.push('\n');
+    out.push_str("**Token economy:** MCP tools cost ~200-500 tokens per call in schema overhead. CLI via Bash costs ~50 tokens. For single targeted queries, the difference is noise. For 5+ queries in a session, CLI saves 1000+ tokens.\n\n");
+    out.push_str("**Key rule:** Never use `grep`/`rg`/`find` on an indexed path when a NestWeaver tool exists for the question. Use `regex_search` instead of `rg`, `read_symbols` instead of `Read` for symbol spans, `brain_search` instead of `grep` for name lookups.\n\n");
+
     // Section 9: CLI + Web
     out.push_str("## Quick Start\n\n");
     out.push_str("```bash\n");
