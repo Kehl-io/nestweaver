@@ -2829,12 +2829,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            // ── daemon guard (JSON pass-through) ─────────────────
-            if json && use_daemon {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "repo_map", args) {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", value["map"].as_str().unwrap_or(""));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -2868,8 +2872,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            // ── daemon guard (JSON pass-through) ─────────────────
-            if json && use_daemon {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
                 let db_default = default_db_path();
                 let db_path = db.as_deref().unwrap_or(&db_default);
                 let mut args = serde_json::json!({ "name_or_uid": name_or_uid });
@@ -2879,7 +2883,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_daemon_json_rpc(true, db_path, None, "cross_repo_contracts", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else if let Some(refs) = value.as_array() {
+                        if refs.is_empty() {
+                            println!("No cross-repo references found for '{name_or_uid}'.");
+                        } else {
+                            println!(
+                                "Cross-repo references for '{}' ({}):",
+                                name_or_uid,
+                                refs.len()
+                            );
+                            for r in refs {
+                                println!(
+                                    "  {} -> {} [{}] ({:.2})",
+                                    r["source_name"].as_str().unwrap_or("?"),
+                                    r["target_name"].as_str().unwrap_or("?"),
+                                    r["link_type"].as_str().unwrap_or("?"),
+                                    r["confidence"].as_f64().unwrap_or(0.0)
+                                );
+                            }
+                        }
+                    } else {
+                        // Unexpected shape — dump as JSON
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3245,14 +3273,93 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             config: _,
         } => {
-            // ── daemon guard (JSON pass-through) ─────────────────
-            if json && use_daemon {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
                 if let Some(value) =
                     try_daemon_json_rpc(true, &db_path, None, "suggest_links", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        let links = value["links"].as_array();
+                        let features = value["features"].as_array();
+                        let links_empty = links.is_none_or(|l| l.is_empty());
+                        let features_empty = features.is_none_or(|f| f.is_empty());
+
+                        if links_empty && features_empty {
+                            println!("No cross-repo connections detected.");
+                            println!("Tip: Index multiple repos into the same database first.");
+                        } else {
+                            if let Some(links) = links.filter(|l| !l.is_empty()) {
+                                println!(
+                                    "# Suggested links (review and add to your instance config)\n"
+                                );
+                                for link in links {
+                                    println!("[[links]]");
+                                    println!("from = \"{}\"", link["from"].as_str().unwrap_or(""));
+                                    println!("to = \"{}\"", link["to"].as_str().unwrap_or(""));
+                                    println!(
+                                        "type = \"{}\"",
+                                        link["link_type"].as_str().unwrap_or("")
+                                    );
+                                    let desc = link["description"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .replace('\\', "\\\\")
+                                        .replace('"', "\\\"");
+                                    println!("description = \"{desc}\"");
+                                    let shared =
+                                        link["shared_symbols"].as_array().map_or(0, |a| a.len());
+                                    println!(
+                                        "# Confidence: {} ({} shared symbols)",
+                                        link["confidence"], shared
+                                    );
+                                    println!();
+                                }
+                            }
+
+                            if let Some(features) = features.filter(|f| !f.is_empty()) {
+                                println!(
+                                    "# Suggested features (review and add to your instance config)\n"
+                                );
+                                for feat in features {
+                                    println!("[[features]]");
+                                    println!("name = \"{}\"", feat["name"].as_str().unwrap_or(""));
+                                    let desc = feat["description"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .replace('\\', "\\\\")
+                                        .replace('"', "\\\"");
+                                    println!("description = \"{desc}\"");
+                                    let repos: Vec<String> = feat["repos"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| {
+                                                    v.as_str().map(|s| format!("\"{s}\""))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    println!("repos = [{}]", repos.join(", "));
+                                    let eps: Vec<String> = feat["entry_points"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| {
+                                                    v.as_str().map(|s| format!("\"{s}\""))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    println!("entry_points = [{}]", eps.join(", "));
+                                    println!();
+                                }
+                            }
+                        }
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -3805,11 +3912,46 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // ── daemon guard (JSON pass-through) ─────────────────
-            if json && use_daemon {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
                 let args = serde_json::json!({ "id_or_name": id_or_name });
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else if let Some(c) = value.as_object() {
+                        println!(
+                            "Cluster [{}]: {}",
+                            c.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+                            c.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                        );
+                        println!(
+                            "  Members: {}  Cohesion: {:.4}",
+                            c.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                            c.get("cohesion").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                        );
+                        println!();
+                        println!("  Key files:");
+                        if let Some(files) = c.get("key_files").and_then(|v| v.as_array()) {
+                            for f in files {
+                                println!("    {}", f.as_str().unwrap_or("?"));
+                            }
+                        }
+                        println!();
+                        println!("  Members:");
+                        if let Some(members) = c.get("members").and_then(|v| v.as_array()) {
+                            for m in members {
+                                println!(
+                                    "    {} ({}) {}",
+                                    m["name"].as_str().unwrap_or("?"),
+                                    m["kind"].as_str().unwrap_or("?"),
+                                    m["file_path"].as_str().unwrap_or("?")
+                                );
+                            }
+                        }
+                    } else {
+                        // Unexpected shape — dump as JSON
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -4287,8 +4429,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // ── daemon guard (JSON pass-through) ─────────────────
-            if json && use_daemon {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
                 let file_strs: Vec<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
                 let args = serde_json::json!({
@@ -4296,7 +4438,73 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "depth": depth,
                 });
                 if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "pr_impact", args) {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        println!("{}", value["summary"].as_str().unwrap_or("(no summary)"));
+                        println!();
+
+                        if let Some(changed) = value["changed_symbols"]
+                            .as_array()
+                            .filter(|a| !a.is_empty())
+                        {
+                            println!("Changed symbols ({}):", changed.len());
+                            for s in changed {
+                                let pr = s["pagerank_score"]
+                                    .as_f64()
+                                    .map(|p| format!(" pr={p:.4}"))
+                                    .unwrap_or_default();
+                                println!(
+                                    "  {} ({}) {}{pr}",
+                                    s["name"].as_str().unwrap_or("?"),
+                                    s["kind"].as_str().unwrap_or("?"),
+                                    s["file_path"].as_str().unwrap_or("?")
+                                );
+                            }
+                            println!();
+                        }
+
+                        if let Some(affected) = value["affected_symbols"]
+                            .as_array()
+                            .filter(|a| !a.is_empty())
+                        {
+                            println!("Affected symbols ({}):", affected.len());
+                            for s in affected {
+                                println!(
+                                    "  [depth {}] {} via {} ({:.2}) — {}",
+                                    s["depth"].as_u64().unwrap_or(0),
+                                    s["name"].as_str().unwrap_or("?"),
+                                    s["edge_type"].as_str().unwrap_or("?"),
+                                    s["confidence"].as_f64().unwrap_or(0.0),
+                                    s["file_path"].as_str().unwrap_or("?")
+                                );
+                            }
+                            println!();
+                        }
+
+                        if let Some(clusters) = value["affected_clusters"]
+                            .as_array()
+                            .filter(|a| !a.is_empty())
+                        {
+                            println!("Affected clusters ({}):", clusters.len());
+                            for c in clusters {
+                                println!(
+                                    "  [{}] {} — {}/{} members affected (cohesion={:.2})",
+                                    c["id"].as_u64().unwrap_or(0),
+                                    c["name"].as_str().unwrap_or("?"),
+                                    c["affected_count"].as_u64().unwrap_or(0),
+                                    c["total_count"].as_u64().unwrap_or(0),
+                                    c["cohesion"].as_f64().unwrap_or(0.0)
+                                );
+                            }
+                            println!();
+                        }
+
+                        println!(
+                            "Risk level: {}",
+                            value["risk_level"].as_str().unwrap_or("Unknown")
+                        );
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
