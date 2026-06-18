@@ -59,6 +59,16 @@ message WatchVaultResponse {
   string message = 2;
 }
 
+message WatchCodeRequest {
+  string repo_path = 1;
+  string instance_id = 2;
+}
+
+message WatchCodeResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
 message StopWatchRequest {}
 
 message StopWatchResponse {
@@ -260,6 +270,21 @@ message HubNodesRequest {
 }
 message HubNodesResponse { string result_json = 1; }
 
+// ─── UI serving ─────────────────────────────────────────────────────
+
+message ServeUiRequest {
+  uint32 port = 1;
+  bool open_browser = 2;
+  bool watch = 3;
+  string watch_repo_path = 4;
+  string watch_instance_id = 5;
+}
+
+message ServeUiResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -284,7 +309,14 @@ service NestWeaverDaemon {
 
   // Watching
   rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);
+  rpc WatchCode(WatchCodeRequest) returns (WatchCodeResponse);
   rpc StopWatch(StopWatchRequest) returns (StopWatchResponse);
+
+  // Export
+  rpc ExportGraph(JsonRequest) returns (JsonResponse);
+
+  // UI
+  rpc ServeUi(ServeUiRequest) returns (ServeUiResponse);
 
   // Read RPCs — typed hot-path
   rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
@@ -327,4 +359,18 @@ service NestWeaverDaemon {
   rpc InvestigateHydrate(JsonRequest) returns (JsonResponse);
   rpc SetExtension(JsonRequest) returns (JsonResponse);
   rpc QueryExtensions(JsonRequest) returns (JsonResponse);
+
+  // Read RPCs — JSON pass-through (CLI read commands routed via daemon)
+  rpc ListReposJson(JsonRequest) returns (JsonResponse);
+  rpc ListVaultsJson(JsonRequest) returns (JsonResponse);
+  rpc EmbeddingDimension(JsonRequest) returns (JsonResponse);
+  rpc ListServicesJson(JsonRequest) returns (JsonResponse);
+  rpc ServiceSummaryJson(JsonRequest) returns (JsonResponse);
+  rpc ListProjectsJson(JsonRequest) returns (JsonResponse);
+  rpc SearchSymbols(JsonRequest) returns (JsonResponse);
+  rpc SymbolLookup(JsonRequest) returns (JsonResponse);
+  rpc RepoMapJson(JsonRequest) returns (JsonResponse);
+  rpc SuggestLinksJson(JsonRequest) returns (JsonResponse);
+  rpc DetectImplicitProjectsJson(JsonRequest) returns (JsonResponse);
+  rpc PrImpactJson(JsonRequest) returns (JsonResponse);
 }

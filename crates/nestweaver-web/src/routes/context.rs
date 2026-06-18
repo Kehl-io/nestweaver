@@ -51,7 +51,7 @@ pub async fn brain_context(
     let result = nestweaver_engine::build_brain_context_hybrid(
         &state.store,
         &body.seeds,
-        state.tantivy.as_ref(),
+        state.tantivy.as_deref(),
         &config,
         None,
     )?;

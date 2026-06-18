@@ -292,6 +292,81 @@ impl NestWeaverDaemon for DaemonService {
         }))
     }
 
+    async fn watch_code(
+        &self,
+        request: Request<WatchCodeRequest>,
+    ) -> Result<Response<WatchCodeResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let repo_path = PathBuf::from(&req.repo_path);
+        let instance_id = if req.instance_id.is_empty() {
+            self.state.instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
+
+        if !repo_path.exists() || !repo_path.is_dir() {
+            return Ok(Response::new(WatchCodeResponse {
+                ok: false,
+                message: format!("repo path is not a directory: {}", repo_path.display()),
+            }));
+        }
+
+        let db_path = self.state.db_path.clone();
+
+        let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
+        let shutdown_handle = watcher.shutdown_handle();
+
+        // Hold the lock across check + store to prevent TOCTOU race.
+        {
+            let mut guard = self
+                .state
+                .watcher_stop
+                .lock()
+                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+            if guard.is_some() {
+                return Ok(Response::new(WatchCodeResponse {
+                    ok: false,
+                    message: "A watcher is already running. Stop it first with StopWatch."
+                        .to_string(),
+                }));
+            }
+            *guard = Some(shutdown_handle);
+        }
+
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.state.clone();
+        let store = self.state.store.clone();
+
+        tokio::task::spawn_blocking(move || {
+            tracing::info!(repo = %repo_path.display(), "code watcher thread started");
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watcher.run_with_store(store, None)
+            }));
+
+            match result {
+                Ok(Ok(())) => tracing::info!("code watcher exited cleanly"),
+                Ok(Err(e)) => tracing::error!(error = %e, "code watcher exited with error"),
+                Err(_) => tracing::error!("code watcher thread panicked"),
+            }
+
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut guard) = state.watcher_stop.lock() {
+                *guard = None;
+            }
+        });
+
+        Ok(Response::new(WatchCodeResponse {
+            ok: true,
+            message: format!("Code watcher started for {}", req.repo_path,),
+        }))
+    }
+
     async fn stop_watch(
         &self,
         _request: Request<StopWatchRequest>,
@@ -309,6 +384,166 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Ok(Response::new(StopWatchResponse { ok: false }))
         }
+    }
+
+    // ── Export ───────────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn export_graph(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cypher");
+            let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let output_path = args.get("output").and_then(|v| v.as_str());
+
+            match format {
+                "cypher" | "graphml" | "mermaid" => {
+                    let mut buf = Vec::new();
+                    match format {
+                        "cypher" => nestweaver_engine::export_cypher(&state.store_read, &mut buf),
+                        "graphml" => nestweaver_engine::export_graphml(&state.store_read, &mut buf),
+                        "mermaid" => {
+                            nestweaver_engine::export_mermaid(&state.store_read, top, &mut buf)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+
+                    let text = String::from_utf8(buf)
+                        .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
+
+                    if let Some(path) = output_path {
+                        std::fs::write(path, &text).map_err(|e| {
+                            Status::internal(format!("failed to write {path}: {e}"))
+                        })?;
+                    }
+
+                    serde_json::to_string(&serde_json::json!({
+                        "format": format,
+                        "bytes": text.len(),
+                        "text": if output_path.is_some() { None } else { Some(&text) },
+                        "output": output_path,
+                    }))
+                    .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
+                }
+                "msgpack" => {
+                    let graph = nestweaver_engine::export_in_memory_graph(&state.store_read)
+                        .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
+                    let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
+                        Status::internal(format!("msgpack serialize failed: {e:#}"))
+                    })?;
+
+                    // For msgpack, always write to a file (the binary data is too
+                    // large for JSON transport). If no output path is given, use
+                    // a default next to the DB.
+                    let path = match output_path {
+                        Some(p) => PathBuf::from(p),
+                        None => {
+                            let mut name = state
+                                .db_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            name.push_str(".graph.msgpack");
+                            state
+                                .db_path
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(name)
+                        }
+                    };
+                    std::fs::write(&path, &bytes).map_err(|e| {
+                        Status::internal(format!("failed to write {}: {e}", path.display()))
+                    })?;
+
+                    serde_json::to_string(&serde_json::json!({
+                        "format": "msgpack",
+                        "output": path.display().to_string(),
+                        "nodes": graph.uids.len(),
+                        "edges": graph.edges.len(),
+                        "bytes": bytes.len(),
+                    }))
+                    .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
+                }
+                other => Err(Status::invalid_argument(format!(
+                    "unknown format '{other}'; supported: cypher, graphml, mermaid, msgpack"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    // ── UI serving ───────────────────────────────────────────────────
+
+    async fn serve_ui(
+        &self,
+        request: Request<ServeUiRequest>,
+    ) -> Result<Response<ServeUiResponse>, Status> {
+        self.state.idle_notify.notify_one();
+
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
+            state.store_read.clone(),
+            state.tantivy.clone(),
+            state.db_path.clone(),
+        );
+
+        let port = if req.port > 0 { req.port as u16 } else { 3000 };
+        let open_browser = req.open_browser;
+
+        // Spawn web server as a background task inside the daemon.
+        tokio::spawn(async move {
+            if let Err(e) = nestweaver_web::start_server(app_state, port, open_browser).await {
+                tracing::error!("UI server error: {e}");
+            }
+        });
+
+        // If watch mode requested, spawn a CodeWatcher.
+        if req.watch && !req.watch_repo_path.is_empty() {
+            let watch_db = state.db_path.clone();
+            let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
+            let watch_instance = if req.watch_instance_id.is_empty() {
+                "default".to_string()
+            } else {
+                req.watch_instance_id.clone()
+            };
+            let watch_store = state.store.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let watcher =
+                    nestweaver_engine::CodeWatcher::new(&watch_db, &watch_repo, &watch_instance);
+                if let Err(e) = watcher.run_with_store(watch_store, None) {
+                    tracing::error!("CodeWatcher failed: {e}");
+                }
+            });
+        }
+
+        Ok(Response::new(ServeUiResponse {
+            ok: true,
+            message: format!("UI server started on port {port}"),
+        }))
     }
 
     // ── Indexing ─────────────────────────────────────────────────────
@@ -1494,6 +1729,428 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "query_extensions")
     }
+
+    // ── Read RPCs — direct store access (no MCP tool) ──────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn list_repos_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let repos = state
+                .store_read
+                .list_repos(instance)
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+            serde_json::to_string(&repos)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn list_vaults_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let vaults = state
+                .store_read
+                .list_vaults(instance)
+                .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
+            serde_json::to_string(&vaults)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn embedding_dimension(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let dim = state
+                .store_read
+                .embedding_dimension()
+                .map_err(|e| Status::internal(format!("embedding_dimension failed: {e:#}")))?;
+            serde_json::to_string(&dim)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn list_services_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let services = state
+                .store_read
+                .list_services(instance)
+                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
+            serde_json::to_string(&services)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn service_summary_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let services = state
+                .store_read
+                .list_services(instance)
+                .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
+            let service = services.iter().find(|s| s.name == name || s.uid == name);
+            match service {
+                Some(s) => serde_json::to_string(s)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
+                None => Err(Status::not_found(format!("service not found: {name}"))),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn list_projects_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let projects = state
+                .store_read
+                .list_projects()
+                .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
+            serde_json::to_string(&projects)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn search_symbols(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let candidates = nestweaver_engine::search_symbols(&state.store_read, query, limit)
+                .map_err(|e| Status::internal(format!("search_symbols failed: {e:#}")))?;
+            serde_json::to_string(&candidates)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn symbol_lookup(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let name_or_uid = args
+                .get("name_or_uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let lookup = nestweaver_engine::lookup_symbol(&state.store_read, name_or_uid)
+                .map_err(|e| Status::internal(format!("lookup_symbol failed: {e:#}")))?;
+            // Serialize the LookupResult as a tagged JSON value.
+            let value = match lookup {
+                nestweaver_engine::LookupResult::Found(detail) => {
+                    serde_json::json!({ "status": "found", "detail": *detail })
+                }
+                nestweaver_engine::LookupResult::NotFound => {
+                    serde_json::json!({ "status": "not_found" })
+                }
+                nestweaver_engine::LookupResult::Ambiguous(candidates) => {
+                    serde_json::json!({ "status": "ambiguous", "candidates": candidates })
+                }
+            };
+            serde_json::to_string(&value)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    // ── Engine-level RPCs ──────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn repo_map_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let token_budget = args
+                .get("token_budget")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize;
+            let map = nestweaver_engine::generate_repo_map(&state.store_read, token_budget)
+                .map_err(|e| Status::internal(format!("generate_repo_map failed: {e:#}")))?;
+            let token_count = map.len().div_ceil(4);
+            serde_json::to_string(&serde_json::json!({
+                "map": map,
+                "token_count": token_count,
+            }))
+            .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn suggest_links_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let cache_path = state.db_path.with_extension("manifests.json");
+            let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
+            let suggestions = nestweaver_engine::suggest_links(&state.store_read, &manifests)
+                .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
+            serde_json::to_string(&suggestions)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn detect_implicit_projects_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let vault_path = args
+                .get("vault")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("missing 'vault' argument"))?;
+            let vault = std::path::PathBuf::from(vault_path);
+            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+            let instance_id = "default";
+            let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
+            let detected = nestweaver_engine::detect_implicit_projects(
+                &state.store_read,
+                &vault,
+                &vault_uid,
+                instance_id,
+            )
+            .map_err(|e| Status::internal(format!("detect_implicit_projects failed: {e:#}")))?;
+            serde_json::to_string(&detected)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn pr_impact_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+            let changed_files: Vec<std::path::PathBuf> = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if changed_files.is_empty() {
+                return Err(Status::invalid_argument(
+                    "missing or empty 'files' array argument",
+                ));
+            }
+            let result = nestweaver_engine::analyze_blast_radius(
+                &state.store_read,
+                &changed_files,
+                depth,
+                Some(&state.db_path),
+            )
+            .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;
+            serde_json::to_string(&result)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
 }
 
 // ── Server entry point ──────────────────────────────────────────────
@@ -1647,8 +2304,8 @@ pub async fn run_server(
     });
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024);
+        .max_decoding_message_size(256 * 1024 * 1024)
+        .max_encoding_message_size(256 * 1024 * 1024);
 
     // Prepare the socket path.
     let sock_dir = lifecycle::runtime_dir(&instance_id);

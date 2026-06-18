@@ -1072,7 +1072,7 @@ fn is_concise(args: &Value) -> bool {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Use FIRST when you need codebase or knowledge-base context around a symbol, note, tag, or topic. Runs Personalized PageRank over the unified code + notes graph from the given seeds and returns ranked, mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget. The call graph uses type-aware resolution — method calls like `obj.method()` are linked to the correct class via AST-extracted type bindings and class hierarchy (MRO) walk. This is cheaper than reading files — get the structural picture before opening anything.\n\nDo NOT use for simple text search — use brain_search instead. Do NOT use when you already have a specific note UID and want its full body — use note_get instead.\n\nThe `seeds` parameter accepts note titles (e.g. \"Architecture\"), tag names (\"#status/active\"), symbol names (\"greet\"), free-text terms, or UIDs (sym:, note:, head:, sec:, tag:). Example: seeds=[\"AuthService\", \"#security\"] returns the authentication service symbol and all security-tagged notes, plus their graph neighbors ranked by relevance. Use `response_format` \"concise\" for a quick overview (names and relationships only) or \"detailed\" (default) for full metadata including file paths and relevance scores.",
+        "description": "Use FIRST when you need codebase or knowledge-base context around a symbol, note, tag, or topic. Runs Personalized PageRank over the unified code + notes graph from the given seeds and returns ranked, mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget. The call graph uses type-aware resolution — method calls like `obj.method()` are linked to the correct class via AST-extracted type bindings and class hierarchy (MRO) walk. This is cheaper than reading files — get the structural picture before opening anything.\n\nDo NOT use for simple text search — use brain_search instead. Do NOT use when you already have a specific note UID and want its full body — use note_get instead.\n\nThe `seeds` parameter accepts note titles (e.g. \"Architecture\"), tag names (\"#status/active\"), symbol names (\"greet\"), free-text terms, or UIDs (sym:, note:, head:, sec:, tag:). Example: seeds=[\"AuthService\", \"#security\"] returns the authentication service symbol and all security-tagged notes, plus their graph neighbors ranked by relevance. Use `response_format` \"concise\" for a quick overview (names and relationships only) or \"detailed\" (default) for full metadata including file paths and relevance scores.\n\nTypical: 1-3s, ~2000 tokens at default budget. Increase token_budget for broader context.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1689,7 +1689,7 @@ fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Use when you need to find specific notes, headings, sections, tags, or code symbols by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, plus substring search across code symbol names, returning ranked hits (best match first) with a kind discriminator so you can tell note/symbol hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include scores and location details.\n\nNote: results include both notes AND code symbols in a single call. The `limit` parameter is applied per-kind (up to `limit` notes + up to `limit` symbols), so you never need separate queries to surface both.",
+        "description": "Use when you need to find specific notes, headings, sections, tags, or code symbols by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, plus substring search across code symbol names, returning ranked hits (best match first) with a kind discriminator so you can tell note/symbol hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include scores and location details.\n\nNote: results include both notes AND code symbols in a single call. The `limit` parameter is applied per-kind (up to `limit` notes + up to `limit` symbols), so you never need separate queries to surface both.\n\nTypical: <500ms, ~500 tokens for 20 results in concise mode.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2545,7 +2545,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. When interaction tracking is enabled (--track-interactions), also reports interaction memory status including query count and memory age. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. Do NOT use to check if the index is stale — use stale_check instead.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
+        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. Also surfaces staleness warnings when indexed repos are behind git HEAD or missing from disk. When interaction tracking is enabled (--track-interactions), also reports interaction memory status including query count and memory age. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. For per-repo detailed staleness, use stale_check.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -2711,6 +2711,47 @@ fn tool_brain_status(
         .map(|r| json!({ "url": r.url, "sha": r.indexed_sha }))
         .collect();
 
+    // P0-3: Surface staleness warnings proactively.
+    let mut staleness_warnings: Vec<Value> = Vec::new();
+    for repo in &repos {
+        if repo.indexed_sha == "local" || repo.indexed_sha.is_empty() {
+            staleness_warnings.push(json!({
+                "repo": repo.name.as_deref().unwrap_or(&repo.url),
+                "warning": "indexed without git tracking — staleness unknown",
+                "action": "re-index with git tracking to enable staleness detection"
+            }));
+            continue;
+        }
+        let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+        let repo_path = std::path::Path::new(path);
+        if !repo_path.exists() {
+            staleness_warnings.push(json!({
+                "repo": repo.name.as_deref().unwrap_or(&repo.url),
+                "warning": "path does not exist on disk",
+                "action": "run `nestweaver prune-stale` to clean up"
+            }));
+            continue;
+        }
+        // Check git HEAD vs indexed SHA — fast (no network), just reads .git/HEAD
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            && output.status.success()
+        {
+            let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !head.is_empty() && head != repo.indexed_sha {
+                staleness_warnings.push(json!({
+                    "repo": repo.name.as_deref().unwrap_or(&repo.url),
+                    "indexed_sha": &repo.indexed_sha[..8.min(repo.indexed_sha.len())],
+                    "head_sha": &head[..8.min(head.len())],
+                    "warning": "index is behind git HEAD",
+                    "action": "run `nestweaver index --repo <path>` to update"
+                }));
+            }
+        }
+    }
+
     // Report Tantivy availability so clients can tell whether brain_search
     // will use BM25 or fall back to substring matching.
     let tantivy_available = tantivy.is_some();
@@ -2762,6 +2803,7 @@ fn tool_brain_status(
         // anomaly (duplicate root, missing index, etc.) so clients can
         // render an actionable warning without re-deriving it.
         "warnings": warnings,
+        "staleness_warnings": staleness_warnings,
     }))
 }
 
@@ -3132,8 +3174,8 @@ async fn inline_connect_daemon(
 
     Ok(
         nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
-            .max_decoding_message_size(64 * 1024 * 1024)
-            .max_encoding_message_size(64 * 1024 * 1024),
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024),
     )
 }
 
@@ -3351,7 +3393,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Use BEFORE modifying a function, class, or interface to understand what might break. Performs confidence-weighted reverse-dependency traversal — each affected symbol has an `impact_score` (0.0–1.0) showing how strongly the change propagates through the call graph. Scores decay multiplicatively through edges; low-confidence paths are pruned. Results are sorted by impact_score (highest risk first). Type-aware resolution follows class hierarchies via MRO walk.\n\nDo NOT use for forward call chains (what does this function call?) — use flow_trace instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for file-level change impact — use detect_changes or blast_radius instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"validateUser\") or a full UID. The `depth` parameter controls traversal depth (default 3). Use `response_format` \"concise\" for names only, \"detailed\" (default) for file paths, edge types, confidence scores, and impact_score.",
+        "description": "Use BEFORE modifying a function, class, or interface to understand what might break. Performs confidence-weighted reverse-dependency traversal — each affected symbol has an `impact_score` (0.0–1.0) showing how strongly the change propagates through the call graph. Scores decay multiplicatively through edges; low-confidence paths are pruned. Results are sorted by impact_score (highest risk first). Type-aware resolution follows class hierarchies via MRO walk.\n\nDo NOT use for forward call chains (what does this function call?) — use flow_trace instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for file-level change impact — use detect_changes or blast_radius instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"validateUser\") or a full UID. The `depth` parameter controls traversal depth (default 3). Use `response_format` \"concise\" for names only, \"detailed\" (default) for file paths, edge types, confidence scores, and impact_score.\n\nTypical: <1s, ~300 tokens for depth-3 traversal.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3450,7 +3492,7 @@ fn tool_brain_guide(store: &GraphStore, _args: Value) -> Result<Value, anyhow::E
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Use when you need to understand execution flow: what functions a symbol calls, what those call, and so on. Returns a tree of callees rooted at the given symbol, following call edges forward through the graph. Best for tracing from entry points (e.g. main, request handlers) to understand the full execution path.\n\nDo NOT use for reverse dependencies (\"what calls this?\") — use brain_impact instead. Do NOT use for general context around a symbol — use brain_context instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"handleRequest\") or a full UID. The `max_depth` parameter caps tree depth (default 10). Cycles are detected and pruned. Use `response_format` \"concise\" for a function-name-only chain, or \"detailed\" (default) for full metadata including file paths and UIDs at each node.",
+        "description": "Use when you need to understand execution flow: what functions a symbol calls, what those call, and so on. Returns a tree of callees rooted at the given symbol, following call edges forward through the graph. Best for tracing from entry points (e.g. main, request handlers) to understand the full execution path.\n\nDo NOT use for reverse dependencies (\"what calls this?\") — use brain_impact instead. Do NOT use for general context around a symbol — use brain_context instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"handleRequest\") or a full UID. The `max_depth` parameter caps tree depth (default 10). Cycles are detected and pruned. Use `response_format` \"concise\" for a function-name-only chain, or \"detailed\" (default) for full metadata including file paths and UIDs at each node.\n\nTypical: <1s, ~400 tokens for depth-10 traversal.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4245,7 +4287,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Use when you need the full context for a specific named project. Returns all Notes, Symbols, and Sections associated with the project, ranked by Personalized PageRank within the project's subgraph and bounded by a token budget. For composite projects, optionally includes content from component sub-projects.\n\nDo NOT use for ad-hoc topic queries — use brain_context with seed terms instead. Do NOT use if you don't know the project name — use brain_search to find it first. This tool requires projects to be defined in the graph (via vault taxonomy or instance config).\n\nThe `project` parameter accepts a project name (e.g. \"AuthService\"), alias, or UID. Use `kinds` to filter by node type (e.g. [\"Symbol\"] for code only, [\"Note\", \"Section\"] for docs only). Use `since` and `recency_weight` to prioritize recent content. Example: project_context(project=\"payments\", token_budget=5000, kinds=[\"Symbol\"]) returns the top code symbols in the payments project.",
+        "description": "Use when you need the full context for a specific named project. Returns all Notes, Symbols, and Sections associated with the project, ranked by Personalized PageRank within the project's subgraph and bounded by a token budget. For composite projects, optionally includes content from component sub-projects.\n\nDo NOT use for ad-hoc topic queries — use brain_context with seed terms instead. Do NOT use if you don't know the project name — use brain_search to find it first. This tool requires projects to be defined in the graph (via vault taxonomy or instance config).\n\nThe `project` parameter accepts a project name (e.g. \"AuthService\"), alias, or UID. Use `kinds` to filter by node type (e.g. [\"Symbol\"] for code only, [\"Note\", \"Section\"] for docs only). Use `since` and `recency_weight` to prioritize recent content. Example: project_context(project=\"payments\", token_budget=5000, kinds=[\"Symbol\"]) returns the top code symbols in the payments project.\n\nTypical: 1-3s, ~3000 tokens at default budget.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4906,7 +4948,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Use BEFORE merging a PR or after staging changes to understand the full blast radius. Each affected symbol has an `impact_score` (0.0–1.0) showing change propagation strength — scores decay multiplicatively through the call graph, so direct callers score higher than transitive ones. Results sorted by impact_score (highest risk first).\n\nTakes a list of changed file paths, maps them to symbols, runs confidence-weighted reverse-dependency traversal, groups by cluster/community, and returns risk assessment (Low/Medium/High). Type-aware call resolution ensures method calls through class hierarchies are tracked.\n\nDo NOT use for single-symbol impact — use brain_impact. Do NOT use for cross-repo — use cross_repo_contracts.\n\nThe `changed_files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\"]). Optional `max_depth` controls traversal depth (default 3). Returns changed symbols, affected symbols (with impact_score, depth, edge type), affected clusters, risk level, and summary.",
+        "description": "Use BEFORE merging a PR or after staging changes to understand the full blast radius. Each affected symbol has an `impact_score` (0.0–1.0) showing change propagation strength — scores decay multiplicatively through the call graph, so direct callers score higher than transitive ones. Results sorted by impact_score (highest risk first).\n\nTakes a list of changed file paths, maps them to symbols, runs confidence-weighted reverse-dependency traversal, groups by cluster/community, and returns risk assessment (Low/Medium/High). Type-aware call resolution ensures method calls through class hierarchies are tracked.\n\nDo NOT use for single-symbol impact — use brain_impact. Do NOT use for cross-repo — use cross_repo_contracts.\n\nThe `changed_files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\"]). Optional `max_depth` controls traversal depth (default 3). Returns changed symbols, affected symbols (with impact_score, depth, edge type), affected clusters, risk level, and summary.\n\nTypical: 1-2s, ~800 tokens. Response size scales with number of changed files.",
         "inputSchema": {
             "type": "object",
             "properties": {
