@@ -152,6 +152,8 @@ jobs:
       - name: Run E2E tests
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright test
+        env:
+          NESTWEAVER_NO_DAEMON: "1"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@v7
