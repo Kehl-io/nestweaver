@@ -413,6 +413,7 @@ fn reinsert_single_note(
             created_at,
             modified_at,
             pagerank_score: None,
+            embedding: None,
         })
         .context("insert_note")?;
     store
@@ -438,6 +439,7 @@ fn reinsert_single_note(
             start_line: h.start_line,
             end_line: h.end_line,
             content_hash: sha256_hex_short(&h.text),
+            embedding: None,
         })
         .collect();
     store
@@ -915,6 +917,7 @@ fn index_into_store(
                 created_at,
                 modified_at,
                 pagerank_score: None,
+                embedding: None,
             };
             let vault_note_edge = (v_uid.clone(), n_uid.clone());
 
@@ -937,6 +940,7 @@ fn index_into_store(
                     start_line: h.start_line,
                     end_line: h.end_line,
                     content_hash: sha256_hex_short(&h.text),
+                    embedding: None,
                 });
                 n_h_edges.push((n_uid.clone(), h_uid));
             }

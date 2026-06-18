@@ -258,6 +258,7 @@ pub(crate) fn row_to_heading(row: &[Value]) -> Result<Heading, StoreError> {
         start_line,
         end_line,
         content_hash,
+        embedding: None,
     })
 }
 
@@ -328,6 +329,7 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
         created_at,
         modified_at,
         pagerank_score: Some(pagerank_score),
+        embedding: None,
     })
 }
 
