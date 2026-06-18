@@ -41,8 +41,13 @@ pub async fn query(
 
     let seed_count = seeds.len();
     let config = HybridSearchConfig::default();
-    let result =
-        build_brain_context_hybrid(&state.store, &seeds, state.tantivy.as_ref(), &config, None);
+    let result = build_brain_context_hybrid(
+        &state.store,
+        &seeds,
+        state.tantivy.as_deref(),
+        &config,
+        None,
+    );
 
     let explanation = format!(
         "Keyword extraction fallback: extracted {} seeds from query",

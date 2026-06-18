@@ -57,6 +57,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 rayon = "1"
 dirs = "6"
+rmp-serde = "1"
 
 [package]
 name = "nestweaver"
@@ -75,7 +76,7 @@ nestweaver-storage = { workspace = true }
 nestweaver-schema = { workspace = true }
 nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
-rmp-serde = "1"
+rmp-serde = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 miette = { version = "7", features = ["fancy"] }
