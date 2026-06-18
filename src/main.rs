@@ -4710,16 +4710,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Route through daemon when available.
-            if use_daemon {
-                let rt = tokio::runtime::Runtime::new()?;
-                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+            if use_daemon
+                && let Ok(rt) = tokio::runtime::Runtime::new()
+                && let Ok(mut client) = rt.block_on(nestweaver_client::DaemonClient::connect(
                     &db_path,
                     config.as_deref(),
-                ))?;
-
-                let resp =
-                    rt.block_on(client.watch_code(&repo_path.display().to_string(), &instance_id))?;
-
+                ))
+                && let Ok(resp) =
+                    rt.block_on(client.watch_code(&repo_path.display().to_string(), &instance_id))
+            {
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
                     return Ok((EXIT_ERROR, None));
@@ -4730,7 +4729,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     repo_path.display(),
                 );
 
-                // Block until Ctrl-C, then tell the daemon to stop watching.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let _ = ctrlc_handler(move || {
                     let _ = tx.send(());
@@ -4747,7 +4745,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            // Direct-write fallback (NESTWEAVER_NO_DAEMON=1).
+            // Fallback: run watcher directly.
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id);
             let stop = watcher.shutdown_handle();
 
@@ -4878,16 +4876,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            if use_daemon {
-                let rt =
-                    tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-                let mut client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(
-                        &db_path,
-                        config.as_deref().map(std::path::Path::as_ref),
-                    ))
-                    .context("failed to connect to daemon")?;
-
+            let mut daemon_ok = false;
+            if use_daemon
+                && let Ok(rt) = tokio::runtime::Runtime::new()
+                && let Ok(mut client) = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref().map(std::path::Path::as_ref),
+                ))
+            {
                 let watch_repo_path = if watch {
                     detect_repo_root().display().to_string()
                 } else {
@@ -4902,12 +4898,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "default",
                 )) {
                     Ok(_resp) => {
+                        daemon_ok = true;
                         println!("NestWeaver UI: http://127.0.0.1:{port}");
                         if watch {
                             println!("Watch mode enabled — changes auto-reindex.");
                         }
                         println!("Press Ctrl-C to stop.");
-                        // Block until Ctrl-C.
                         let (tx, rx) = std::sync::mpsc::channel::<()>();
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
@@ -4915,11 +4911,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = rx.recv();
                     }
                     Err(e) => {
-                        eprintln!("Error: {e}");
-                        return Ok((EXIT_ERROR, None));
+                        tracing::warn!("ServeUi RPC failed, falling back to direct: {e}");
                     }
                 }
-            } else {
+            }
+            if !daemon_ok {
                 // Fallback: run the UI server directly (no daemon).
                 let tantivy_path = tantivy_sidecar_path_for(&db_path);
                 let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
