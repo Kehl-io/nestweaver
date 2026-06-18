@@ -1252,6 +1252,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1323,6 +1324,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1339,6 +1341,7 @@ mod tests {
                     start_line: 1,
                     end_line: 1,
                     content_hash: "h".to_string(),
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1430,6 +1433,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -2013,6 +2017,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let member_note_b = Note {
             uid: "note:member_b".to_string(),
@@ -2026,6 +2031,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.upsert_note(&member_note_a).unwrap();
         store.upsert_note(&member_note_b).unwrap();
@@ -2043,6 +2049,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let popular_note_y = Note {
             uid: "note:popular_y".to_string(),
@@ -2056,6 +2063,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.upsert_note(&popular_note_x).unwrap();
         store.upsert_note(&popular_note_y).unwrap();
@@ -2077,6 +2085,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             };
             store.upsert_note(&filler).unwrap();
 

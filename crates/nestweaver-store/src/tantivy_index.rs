@@ -902,6 +902,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }

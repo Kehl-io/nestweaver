@@ -1985,6 +1985,100 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Update the `embedding` field of a Note node.
+    ///
+    /// LadybugDB does not support `SET`, so the note is read, deleted with
+    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
+    /// all other fields. The embedding is held only in the in-memory `Note`
+    /// struct returned by `list_notes`; callers that need cross-session
+    /// persistence should use an `EmbeddingIndex` sidecar file.
+    pub fn update_note_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        use crate::read::{NOTE_COLUMNS, row_to_note};
+
+        let conn = self.conn()?;
+
+        // Read the existing note.
+        let q = format!("MATCH (n:Note {{uid: $uid}}) RETURN {NOTE_COLUMNS}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let row = result.next().ok_or(StoreError::NotFound)?;
+        let mut note = row_to_note(&row)?;
+
+        // Set the embedding in memory.
+        note.embedding = Some(embedding.to_vec());
+
+        // Delete the existing node (DETACH removes all edges).
+        exec_params(
+            &conn,
+            "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
+            vec![("uid", lbug::Value::String(uid.to_string()))],
+        )?;
+
+        // Re-insert with all fields preserved. insert_note does not store
+        // the embedding as a DB column (LadybugDB has no native float-array
+        // column), but the in-memory Note struct carries it so callers can
+        // use it immediately after the round-trip.
+        self.insert_note(&note)?;
+
+        Ok(())
+    }
+
+    /// Update the `embedding` field of a Heading node.
+    ///
+    /// LadybugDB does not support `SET`, so the heading is read, deleted with
+    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
+    /// all other fields. The embedding is held only in the in-memory `Heading`
+    /// struct returned by `list_all_headings`; callers that need cross-session
+    /// persistence should use an `EmbeddingIndex` sidecar file.
+    pub fn update_heading_embedding(
+        &self,
+        uid: &str,
+        embedding: &[f32],
+    ) -> Result<(), StoreError> {
+        use crate::read::{HEADING_COLUMNS, row_to_heading};
+
+        let conn = self.conn()?;
+
+        // Read the existing heading.
+        let q = format!("MATCH (h:Heading {{uid: $uid}}) RETURN {HEADING_COLUMNS}");
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let row = result.next().ok_or(StoreError::NotFound)?;
+        let mut heading = row_to_heading(&row)?;
+
+        // Set the embedding in memory.
+        heading.embedding = Some(embedding.to_vec());
+
+        // Delete the existing node (DETACH removes all edges).
+        exec_params(
+            &conn,
+            "MATCH (h:Heading {uid: $uid}) DETACH DELETE h",
+            vec![("uid", lbug::Value::String(uid.to_string()))],
+        )?;
+
+        // Re-insert with all fields preserved. insert_heading does not store
+        // the embedding as a DB column (LadybugDB has no native float-array
+        // column), but the in-memory Heading struct carries it so callers can
+        // use it immediately after the round-trip.
+        self.insert_heading(&heading)?;
+
+        Ok(())
+    }
+
     /// Update the `embedding` field of a Symbol node.
     ///
     /// LadybugDB does not support `SET`, so the symbol is read, deleted with
