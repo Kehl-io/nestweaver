@@ -1764,6 +1764,67 @@ impl NestWeaverDaemon for DaemonService {
     }
 
     #[allow(clippy::result_large_err)]
+    async fn list_vaults_json(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            let vaults = state
+                .store_read
+                .list_vaults(instance)
+                .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
+            serde_json::to_string(&vaults)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn embedding_dimension(
+        &self,
+        r: Request<JsonRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let state = self.state.clone();
+        let _args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let dim = state
+                .store_read
+                .embedding_dimension()
+                .map_err(|e| Status::internal(format!("embedding_dimension failed: {e:#}")))?;
+            serde_json::to_string(&dim)
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    #[allow(clippy::result_large_err)]
     async fn list_services_json(
         &self,
         r: Request<JsonRequest>,

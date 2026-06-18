@@ -362,6 +362,8 @@ service NestWeaverDaemon {
 
   // Read RPCs — JSON pass-through (CLI read commands routed via daemon)
   rpc ListReposJson(JsonRequest) returns (JsonResponse);
+  rpc ListVaultsJson(JsonRequest) returns (JsonResponse);
+  rpc EmbeddingDimension(JsonRequest) returns (JsonResponse);
   rpc ListServicesJson(JsonRequest) returns (JsonResponse);
   rpc ServiceSummaryJson(JsonRequest) returns (JsonResponse);
   rpc ListProjectsJson(JsonRequest) returns (JsonResponse);
