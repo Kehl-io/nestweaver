@@ -214,6 +214,90 @@ pub struct InstanceConfig {
     /// Default pagination limits for tool responses (`[limits]`).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Local embedding model and hybrid-search blend configuration (`[embedding]`).
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+/// `[embedding]` — local embedding model and hybrid-search blend configuration.
+///
+/// Controls which sentence-transformer model is used for semantic search,
+/// where the model weights are cached, and the BM25/PPR/semantic fusion weights
+/// applied when blending result sets.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmbeddingConfig {
+    /// HuggingFace model ID (or local path) for the sentence-transformer.
+    /// Default: `"sentence-transformers/all-MiniLM-L6-v2"`.
+    #[serde(default = "default_model_id")]
+    pub model_id: String,
+    /// Directory where downloaded model weights are stored.
+    /// Default: `"~/.cache/nestweaver/models"`.
+    #[serde(default = "default_embedding_cache_dir")]
+    pub cache_dir: String,
+    /// Optional HTTP endpoint for an external embedding service (e.g. Ollama,
+    /// OpenAI-compatible). When set, the local model is not loaded.
+    pub external_endpoint: Option<String>,
+    /// Model name to pass to the external endpoint. Required when
+    /// `external_endpoint` is set.
+    pub external_model: Option<String>,
+    /// Blend weight for PPR (Personalized PageRank) scores. Default 0.40.
+    #[serde(default = "default_weight_ppr")]
+    pub weight_ppr: f64,
+    /// Blend weight for BM25 scores. Default 0.25.
+    #[serde(default = "default_weight_bm25")]
+    pub weight_bm25: f64,
+    /// Blend weight for semantic (embedding cosine-similarity) scores. Default 0.35.
+    #[serde(default = "default_weight_semantic")]
+    pub weight_semantic: f64,
+    /// When `true`, semantic scores are always mixed in even if the query
+    /// matched zero BM25 results. Default `true`.
+    #[serde(default = "default_true")]
+    pub always_blend_semantic: bool,
+    /// Maximum number of seeds passed to the semantic re-ranker. Default 5.
+    #[serde(default = "default_semantic_seed_limit")]
+    pub semantic_seed_limit: usize,
+    /// Candidate pool size for the semantic ANN search. Default 200.
+    #[serde(default = "default_semantic_search_limit")]
+    pub semantic_search_limit: usize,
+}
+
+fn default_model_id() -> String {
+    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+}
+fn default_embedding_cache_dir() -> String {
+    "~/.cache/nestweaver/models".to_string()
+}
+fn default_weight_ppr() -> f64 {
+    0.40
+}
+fn default_weight_bm25() -> f64 {
+    0.25
+}
+fn default_weight_semantic() -> f64 {
+    0.35
+}
+fn default_semantic_seed_limit() -> usize {
+    5
+}
+fn default_semantic_search_limit() -> usize {
+    200
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            model_id: default_model_id(),
+            cache_dir: default_embedding_cache_dir(),
+            external_endpoint: None,
+            external_model: None,
+            weight_ppr: default_weight_ppr(),
+            weight_bm25: default_weight_bm25(),
+            weight_semantic: default_weight_semantic(),
+            always_blend_semantic: true,
+            semantic_seed_limit: default_semantic_seed_limit(),
+            semantic_search_limit: default_semantic_search_limit(),
+        }
+    }
 }
 
 /// `[cache]` — tuning for the F16 response cache (Feature F16).
