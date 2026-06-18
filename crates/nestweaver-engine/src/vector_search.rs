@@ -44,6 +44,44 @@ pub fn vector_knn(
     Ok(scored)
 }
 
+/// Search across symbols, notes, AND headings by cosine similarity.
+/// Returns (uid, similarity) pairs sorted descending, limited to `limit`.
+pub fn vector_knn_all(
+    store: &GraphStore,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(String, f64)>, anyhow::Error> {
+    let mut scored: Vec<(String, f64)> = Vec::new();
+
+    // Symbols
+    for sym in store.list_all_symbols()? {
+        if let Some(ref emb) = sym.embedding {
+            let sim = cosine_similarity(emb, query_embedding);
+            scored.push((sym.uid, sim));
+        }
+    }
+
+    // Notes
+    for note in store.list_notes(None)? {
+        if let Some(ref emb) = note.embedding {
+            let sim = cosine_similarity(emb, query_embedding);
+            scored.push((note.uid, sim));
+        }
+    }
+
+    // Headings
+    for heading in store.list_all_headings()? {
+        if let Some(ref emb) = heading.embedding {
+            let sim = cosine_similarity(emb, query_embedding);
+            scored.push((heading.uid, sim));
+        }
+    }
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +113,19 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
     }
 }
