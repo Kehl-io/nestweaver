@@ -48,6 +48,7 @@ pub struct SuggestedFeature {
 }
 
 /// The full set of suggestions returned by `suggest_links`.
+#[derive(Debug, Serialize)]
 pub struct Suggestions {
     pub links: Vec<SuggestedLink>,
     pub features: Vec<SuggestedFeature>,
