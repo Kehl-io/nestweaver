@@ -26,6 +26,7 @@ tracing = { workspace = true }
 
 [features]
 daemon = ["dep:dirs", "dep:nestweaver-proto", "dep:tonic", "dep:tokio", "dep:tokio-stream", "dep:tower", "dep:hyper-util", "dep:libc"]
+embed = ["nestweaver-engine/embed"]
 
 [dev-dependencies]
 tempfile = "3"

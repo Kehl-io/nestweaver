@@ -21,7 +21,8 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    BrainNode, HybridSearchConfig, build_brain_context_hybrid_with_aliases, populate_inline_bodies,
+    BrainNode, EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
+    populate_inline_bodies,
 };
 
 /// Bundle time-to-live: entries older than this are dropped when the sidecar
@@ -226,6 +227,7 @@ pub fn investigate(
     query: &str,
     scope: &str,
     token_budget: Option<usize>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<InvestigateResult, anyhow::Error> {
     let budget = token_budget
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
@@ -252,6 +254,7 @@ pub fn investigate(
         &HashMap::new(),
         db_path,
         None,
+        embed_model,
     );
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => ctx.connected,
@@ -804,6 +807,7 @@ mod tests {
             "greet",
             "vault",
             Some(4000),
+            None,
         )
         .unwrap();
 
@@ -842,7 +846,7 @@ mod tests {
         let db_path = dir.path().join("nestweaver.lbug");
 
         let result =
-            investigate(&store, None, Some(&db_path), &src, "greet", "vault", None).unwrap();
+            investigate(&store, None, Some(&db_path), &src, "greet", "vault", None, None).unwrap();
 
         // Pick a symbol entry to expand.
         let target = result
@@ -887,6 +891,7 @@ mod tests {
             "greet",
             "vault",
             Some(50),
+            None,
         )
         .unwrap();
         // With a tiny budget, most entries lack inline bodies.
@@ -949,6 +954,7 @@ mod tests {
             "greet",
             "vault",
             Some(50),
+            None,
         )
         .unwrap();
 
@@ -1029,6 +1035,7 @@ mod tests {
             &src,
             "zzz_no_such_symbol_xyz",
             "vault",
+            None,
             None,
         )
         .unwrap();

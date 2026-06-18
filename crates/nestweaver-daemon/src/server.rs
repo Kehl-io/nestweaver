@@ -80,6 +80,7 @@ impl DaemonService {
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
+                None,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
 
@@ -123,6 +124,7 @@ impl DaemonService {
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
+                None,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
         })

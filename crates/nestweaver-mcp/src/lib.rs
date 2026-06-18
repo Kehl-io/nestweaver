@@ -537,7 +537,7 @@ fn dispatch_method(
                 ));
             };
 
-            match tools::dispatch(store, tantivy, &name, arguments.clone()) {
+            match tools::dispatch(store, tantivy, &name, arguments.clone(), None) {
                 Ok(result) => {
                     if let Some(tracker) = tracker {
                         record_interaction(tracker, &name, &arguments, &result);

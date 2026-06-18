@@ -13,8 +13,8 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
 use nestweaver_engine::{
-    BrainContextResult, DeadCodeConfidence, HybridSearchConfig, SummaryLevel, affected_tests,
-    analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
+    BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig, SummaryLevel,
+    affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
     build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
     detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
     find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
@@ -257,6 +257,7 @@ pub fn dispatch(
     tantivy: Option<&TantivyIndex>,
     name: &str,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     // Enforce tool allowlist when configured.
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
@@ -272,10 +273,10 @@ pub fn dispatch(
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
     if is_cacheable_tool(name) && !cache_bypassed(&args) {
-        return maybe_cached(store, tantivy, name, args);
+        return maybe_cached(store, tantivy, name, args, embed_model);
     }
 
-    dispatch_uncached(store, tantivy, name, args)
+    dispatch_uncached(store, tantivy, name, args, embed_model)
 }
 
 /// The actual tool dispatch table, after cache handling.
@@ -284,9 +285,10 @@ fn dispatch_uncached(
     tantivy: Option<&TantivyIndex>,
     name: &str,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     match name {
-        "brain_context" => tool_brain_context(store, tantivy, args),
+        "brain_context" => tool_brain_context(store, tantivy, args, embed_model),
         "brain_search" => tool_brain_search(store, tantivy, args),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -304,7 +306,7 @@ fn dispatch_uncached(
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
-        "project_context" => tool_project_context(store, tantivy, args),
+        "project_context" => tool_project_context(store, tantivy, args, embed_model),
         "dead_code" => tool_dead_code(store, args),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
@@ -319,7 +321,7 @@ fn dispatch_uncached(
         "brain_tag_graph" => tool_brain_tag_graph(store, args),
         "brain_doc_stats" => tool_brain_doc_stats(store, args),
         "affected_tests" => tool_affected_tests(store, args),
-        "investigate" => tool_investigate(store, tantivy, args),
+        "investigate" => tool_investigate(store, tantivy, args, embed_model),
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
         "contract_drift" => tool_contract_drift(store, args),
@@ -430,9 +432,10 @@ fn maybe_cached(
     tantivy: Option<&TantivyIndex>,
     name: &str,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     let Ok(db_path) = current_db_path(store) else {
-        return dispatch_uncached(store, tantivy, name, args);
+        return dispatch_uncached(store, tantivy, name, args, embed_model);
     };
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
@@ -458,7 +461,7 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args)?;
+    let result = dispatch_uncached(store, tantivy, name, args, embed_model)?;
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -1186,6 +1189,7 @@ fn tool_brain_context(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
@@ -1289,6 +1293,7 @@ fn tool_brain_context(
         &aliases,
         Some(&db_path),
         intent,
+        embed_model,
     )?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
@@ -4344,6 +4349,7 @@ fn tool_project_context(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     let project_str = args
         .get("project")
@@ -4511,6 +4517,7 @@ fn tool_project_context(
         &aliases,
         Some(&db_path),
         Some(intent),
+        embed_model,
     )?;
 
     // 4b. Surface the project's curated member notes into `connected`. They
@@ -5772,6 +5779,7 @@ fn tool_investigate(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
     let query = args
         .get("query")
@@ -5795,6 +5803,7 @@ fn tool_investigate(
         query,
         scope,
         token_budget,
+        embed_model,
     )?;
     Ok(serde_json::to_value(result)?)
 }
@@ -6109,8 +6118,8 @@ mod cache_dispatch_tests {
             .unwrap();
 
         let args = json!({ "limit": 5 });
-        let first = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
-        let second = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        let first = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
+        let second = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
 
         assert_eq!(
             first, second,
@@ -6141,7 +6150,7 @@ mod cache_dispatch_tests {
             .unwrap();
         let gen_before = store.graph_generation();
         let args = json!({ "limit": 5 });
-        let _ = dispatch(&store, None, "hub_nodes", args.clone()).unwrap();
+        let _ = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
         drop(store);
 
         // Re-index with a new file → generation bumps + persists.
@@ -6164,7 +6173,7 @@ mod cache_dispatch_tests {
         );
 
         reset_session();
-        let _ = dispatch(&store2, None, "hub_nodes", args).unwrap();
+        let _ = dispatch(&store2, None, "hub_nodes", args, None).unwrap();
         // The old entry's generation no longer matches → MISS (recomputed).
         assert_eq!(CACHE_MISSES.with(|c| c.get()), 1, "stale entry must miss");
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
@@ -6181,7 +6190,7 @@ mod cache_dispatch_tests {
             .unwrap();
 
         // Prime the cache.
-        let _ = dispatch(&store, None, "hub_nodes", json!({ "limit": 5 })).unwrap();
+        let _ = dispatch(&store, None, "hub_nodes", json!({ "limit": 5 }), None).unwrap();
         reset_session();
         // cache:"bypass" skips the cache entirely (no hit recorded).
         let _ = dispatch(
@@ -6189,6 +6198,7 @@ mod cache_dispatch_tests {
             None,
             "hub_nodes",
             json!({ "limit": 5, "cache": "bypass" }),
+            None,
         )
         .unwrap();
         // no_cache:true likewise.
@@ -6197,6 +6207,7 @@ mod cache_dispatch_tests {
             None,
             "hub_nodes",
             json!({ "limit": 5, "no_cache": true }),
+            None,
         )
         .unwrap();
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0, "bypass must never hit");
@@ -6230,6 +6241,7 @@ mod cache_dispatch_tests {
             None,
             "set_extension",
             json!({ "uid": "sym:x", "key": "k", "value": "v" }),
+            None,
         );
         let cache = nestweaver_store::cache::ResponseCache::open(
             &db_path,

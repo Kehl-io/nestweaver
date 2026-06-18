@@ -5888,6 +5888,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &aliases,
                 Some(&db_path),
                 Some(nestweaver_store::QueryIntent::ProjectContext),
+                None,
             ) {
                 Ok(mut result) => {
                     // Surface the project's curated member notes into
@@ -6058,6 +6059,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &query,
                 &scope,
                 Some(token_budget),
+                None,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -9269,6 +9271,7 @@ fn run_brain(
                 &aliases,
                 Some(&db_path),
                 parsed_intent,
+                None,
             ) {
                 Ok(mut result) => {
                     // Feature F6: apply per-path ranking priors (dampen/boost)

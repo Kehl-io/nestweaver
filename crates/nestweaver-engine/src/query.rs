@@ -10,6 +10,23 @@ use crate::config::{
 };
 use crate::repo_display_name;
 
+// ── Embed abstraction ─────────────────────────────────────────────────────
+/// Trait abstracting over an embedding model's query-embedding capability.
+///
+/// This is feature-gated behind `embed` so that callers without the
+/// `nestweaver-embed` crate can still compile: they simply pass
+/// `None::<&dyn EmbedQueryFn>` at each call site.
+pub trait EmbedQueryFn: Send + Sync {
+    fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+}
+
+#[cfg(feature = "embed")]
+impl EmbedQueryFn for nestweaver_embed::EmbedModel {
+    fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        nestweaver_embed::EmbedModel::embed_query(self, text)
+    }
+}
+
 /// Tuning knobs for hybrid PPR + BM25 + semantic retrieval.
 ///
 /// Defaults reflect empirical tuning for weighted score fusion
@@ -975,7 +992,7 @@ pub fn build_brain_context(
     store: &GraphStore,
     inputs: &[String],
 ) -> Result<BrainContextResult, anyhow::Error> {
-    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default(), None)
+    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default(), None, None)
 }
 
 /// Hybrid PPR + BM25 retrieval.
@@ -996,6 +1013,7 @@ pub fn build_brain_context_hybrid(
     tantivy: Option<&TantivyIndex>,
     config: &HybridSearchConfig,
     intent: Option<QueryIntent>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     build_brain_context_hybrid_with_aliases(
         store,
@@ -1005,6 +1023,7 @@ pub fn build_brain_context_hybrid(
         &std::collections::HashMap::new(),
         None,
         intent,
+        embed_model,
     )
 }
 
@@ -1027,6 +1046,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     aliases: &std::collections::HashMap<String, Vec<String>>,
     db_path: Option<&std::path::Path>,
     intent: Option<QueryIntent>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -1202,19 +1222,42 @@ pub fn build_brain_context_hybrid_with_aliases(
         );
     }
 
+    // ── Semantic seed blending ────────────────────────────────────────────
+    // When an embedding model is available and the semantic weight is nonzero,
+    // run a vector KNN search over the entire graph. The top-k hits are
+    // injected as PPR seeds (always-blend) so the walk explores semantically
+    // relevant neighborhoods even when the textual seeds miss them. The full
+    // hit list is passed to weighted_score_fuse as the semantic signal.
+    let mut semantic_hits: Vec<(String, f64)> = Vec::new();
+    if let Some(model) = embed_model {
+        if config.weight_semantic > 0.0 {
+            let query_text = inputs.join(" ");
+            if let Ok(query_emb) = model.embed_query(&query_text) {
+                if let Ok(hits) = crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit) {
+                    // Inject top-5 semantic hits as PPR seeds (always-blend).
+                    for (uid, _score) in hits.iter().take(5) {
+                        if !seed_uids.contains(uid) {
+                            seed_uids.push(uid.clone());
+                        }
+                    }
+                    semantic_hits = hits;
+                }
+            }
+        }
+    }
+
     // Run unified PPR with optional intent tuning.
     let damping = intent.map_or(0.85, |i| i.damping());
     let ppr = store
         .personalized_pagerank_with_intent(&seed_uids, damping, 20, &GraphScope::unified(), intent)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // ── Hybrid retrieval: fuse PPR + BM25 via Reciprocal Rank Fusion ───
+    // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
     //
     // Feature F7 (PRF half): when `config.prf` is set, the BM25 leg runs a
     // two-pass pseudo-relevance-feedback expansion (`search_prf`) instead of a
     // single-pass `search`. The mined expansion terms are surfaced on the
-    // result for auditing. RRF is rank-only, so PRF affects the fused result
-    // solely via the reordered BM25 ranks (see `HybridSearchConfig::prf`).
+    // result for auditing.
     let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
         let bm25_query = inputs.join(" ");
@@ -1236,7 +1279,7 @@ pub fn build_brain_context_hybrid_with_aliases(
         weighted_score_fuse(
             &ppr,
             &bm25_hits,
-            &[],
+            &semantic_hits,
             config.weight_ppr,
             config.weight_bm25,
             config.weight_semantic,
