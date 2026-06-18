@@ -4838,7 +4838,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            let use_daemon_mcp = !no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
+            let use_daemon_mcp = if no_daemon {
+                if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
+                    false
+                } else {
+                    eprintln!(
+                        "Warning: --no-daemon is only supported for testing \
+                         (set NESTWEAVER_NO_DAEMON=1). Ignoring flag."
+                    );
+                    true
+                }
+            } else {
+                std::env::var("NESTWEAVER_NO_DAEMON").is_err()
+            };
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
