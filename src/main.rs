@@ -165,8 +165,8 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// Open the database directly for reads instead of routing through the daemon.
-    /// Write operations always go through the daemon regardless of this flag.
+    /// Testing only: open the database directly instead of routing through the daemon.
+    /// Requires NESTWEAVER_NO_DAEMON=1 environment variable.
     #[arg(long, global = true)]
     no_daemon: bool,
 }
@@ -719,8 +719,8 @@ enum Commands {
         /// In daemon mode, the daemon's own --config takes precedence.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Open the database directly for reads instead of routing through the daemon.
-        /// Write operations always go through the daemon regardless of this flag.
+        /// Testing only: open the database directly instead of routing through the daemon.
+        /// Requires NESTWEAVER_NO_DAEMON=1 environment variable.
         #[arg(long)]
         no_daemon: bool,
     },
@@ -2478,7 +2478,19 @@ fn main() {
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
-    let use_daemon = !cli.no_daemon && std::env::var("NESTWEAVER_NO_DAEMON").is_err();
+    let use_daemon = if cli.no_daemon {
+        if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
+            false
+        } else {
+            eprintln!(
+                "Warning: --no-daemon is only supported for testing (set NESTWEAVER_NO_DAEMON=1). \
+                 Ignoring flag and routing through daemon."
+            );
+            true
+        }
+    } else {
+        std::env::var("NESTWEAVER_NO_DAEMON").is_err()
+    };
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -3977,7 +3989,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Contracts { command } => run_contracts(command),
 
-        Commands::Snapshot { command } => run_snapshot(command).map(|c| (c, None)),
+        Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
         Commands::Memory { command } => run_memory(*command, t0),
@@ -7255,6 +7267,8 @@ fn try_daemon_json_rpc(
             "detect_changes" => client.inner_mut().detect_changes(req).await,
             "brain_guide" => client.inner_mut().brain_guide(req).await,
             "list_repos" => client.inner_mut().list_repos_json(req).await,
+            "list_vaults" => client.inner_mut().list_vaults_json(req).await,
+            "embedding_dimension" => client.inner_mut().embedding_dimension(req).await,
             "list_services" => client.inner_mut().list_services_json(req).await,
             "service_summary" => client.inner_mut().service_summary_json(req).await,
             "list_projects" => client.inner_mut().list_projects_json(req).await,
@@ -8398,8 +8412,22 @@ fn run_brain(
             let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
             let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
-            let store = GraphStore::open_read_only(&db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+            // Fetch vault list via daemon RPC (preferred) or direct store open (fallback).
+            let fetch_vaults = |inst_filter: Option<&str>| -> Vec<nestweaver_schema::Vault> {
+                let mut args = serde_json::json!({});
+                if let Some(inst) = inst_filter {
+                    args["instance"] = serde_json::json!(inst);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
+                {
+                    serde_json::from_value(value).unwrap_or_default()
+                } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
+                    store.list_vaults(inst_filter).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
 
             // Helper: a stored vault matches the caller's path if any of its
             // representations (canonical, literal, shell-expanded `~`)
@@ -8445,12 +8473,16 @@ fn run_brain(
             // plus any other row whose canonical root_path matches.
             let mut uids_to_remove: Vec<String> = Vec::new();
             if instance_specified {
-                if store.lookup_vault(&v_uid_canon).is_ok() {
+                // Check if the direct UID exists in the vault list
+                let instance_vaults = fetch_vaults(Some(instance_id));
+                let has_canon = instance_vaults.iter().any(|v| v.uid == v_uid_canon);
+                let has_raw = instance_vaults.iter().any(|v| v.uid == v_uid_raw);
+                if has_canon {
                     uids_to_remove.push(v_uid_canon);
-                } else if store.lookup_vault(&v_uid_raw).is_ok() {
+                } else if has_raw {
                     uids_to_remove.push(v_uid_raw);
-                } else if let Ok(all_vaults) = store.list_vaults(Some(instance_id)) {
-                    for v in &all_vaults {
+                } else {
+                    for v in &instance_vaults {
                         if path_matches(&v.root_path) {
                             uids_to_remove.push(v.uid.clone());
                         }
@@ -8466,11 +8498,10 @@ fn run_brain(
                 }
             } else {
                 uids_to_remove.push(v_uid_canon);
-                if let Ok(all_vaults) = store.list_vaults(None) {
-                    for v in &all_vaults {
-                        if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
-                            uids_to_remove.push(v.uid.clone());
-                        }
+                let all_vaults = fetch_vaults(None);
+                for v in &all_vaults {
+                    if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
+                        uids_to_remove.push(v.uid.clone());
                     }
                 }
             }
@@ -8480,9 +8511,11 @@ fn run_brain(
                 .and_then(|s| s.to_str())
                 .unwrap_or("vault")
                 .to_string();
+            // Resolve vault name from the daemon vault list instead of direct store access
+            let all_known_vaults = fetch_vaults(None);
             for uid in &uids_to_remove {
-                if let Ok(v) = store.lookup_vault(uid) {
-                    vault_name = v.name;
+                if let Some(v) = all_known_vaults.iter().find(|v| v.uid == *uid) {
+                    vault_name.clone_from(&v.name);
                 }
             }
 
@@ -10435,7 +10468,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     }
 }
 
-fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
+fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         SnapshotCommands::Build {
             instance,
@@ -10453,10 +10486,6 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 );
             }
 
-            // Open the store to query repos
-            let store = GraphStore::open_read_only(&db_path)
-                .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
-
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
@@ -10464,6 +10493,39 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
             let instance_id = instance
                 .or_else(|| cfg.as_ref().map(|c| c.instance_id.clone()))
                 .unwrap_or_else(|| "standalone".to_string());
+
+            // Fetch repos via daemon RPC (preferred) or direct store open (fallback).
+            let repos: Vec<nestweaver_schema::Repo> = {
+                let mut args = serde_json::json!({});
+                args["instance"] = serde_json::json!(&instance_id);
+                if let Some(value) =
+                    try_daemon_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
+                {
+                    serde_json::from_value(value).unwrap_or_default()
+                } else {
+                    let store = GraphStore::open_read_only(&db_path)
+                        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+                    nestweaver_engine::list_repos(&store, Some(&instance_id))?
+                }
+            };
+
+            // Fetch embedding dimension via daemon RPC (preferred) or direct store (fallback).
+            let embedding_dim: u32 = {
+                let args = serde_json::json!({});
+                if let Some(value) = try_daemon_json_rpc(
+                    use_daemon,
+                    &db_path,
+                    config.as_deref(),
+                    "embedding_dimension",
+                    args,
+                ) {
+                    serde_json::from_value(value).unwrap_or(0)
+                } else {
+                    let store = GraphStore::open_read_only(&db_path)
+                        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+                    store.embedding_dimension().unwrap_or(0)
+                }
+            };
 
             // Schema hashes
             let core_hash = nestweaver_schema::core_schema_hash();
@@ -10526,9 +10588,6 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
             };
 
-            // Repos
-            let repos = nestweaver_engine::list_repos(&store, Some(&instance_id))?;
-
             let repo_stamps: Vec<nestweaver_engine::RepoStamp> = repos
                 .iter()
                 .map(|r| nestweaver_engine::RepoStamp {
@@ -10546,7 +10605,7 @@ fn run_snapshot(command: SnapshotCommands) -> anyhow::Result<i32> {
                 schema_hash_extensions: ext_hash,
                 schema_hash_effective: effective_hash,
                 embedding_model_id,
-                embedding_dimension: store.embedding_dimension().unwrap_or(0),
+                embedding_dimension: embedding_dim,
                 built_at,
                 repos: repo_stamps,
             };
