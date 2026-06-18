@@ -1,6 +1,8 @@
+pub mod local;
 pub mod preprocess;
 
 use std::path::PathBuf;
+
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
@@ -30,23 +32,28 @@ fn default_cache_dir() -> PathBuf {
 }
 
 pub struct EmbedModel {
-    _config: EmbedConfig,
+    local: local::LocalModel,
+    /// Retained for Task 3 (external API fallback).
+    #[allow(dead_code)]
+    config: EmbedConfig,
 }
 
 impl EmbedModel {
-    pub fn load(_config: &EmbedConfig) -> Result<Self> {
-        // Stub — will be implemented in Task 2 (local.rs) and Task 3 (external.rs)
+    pub fn load(config: &EmbedConfig) -> Result<Self> {
+        let local = local::LocalModel::load(config)?;
         Ok(Self {
-            _config: _config.clone(),
+            local,
+            config: config.clone(),
         })
     }
 
     pub fn dimension(&self) -> usize {
-        384 // MiniLM default — will be dynamic in Task 2
+        self.local.dimension()
     }
 
-    pub fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        anyhow::bail!("EmbedModel not yet implemented — see Task 2")
+    pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        // External API will be added in Task 3 — for now, always use local
+        self.local.embed(texts)
     }
 
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
