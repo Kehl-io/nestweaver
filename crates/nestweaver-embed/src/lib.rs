@@ -1,5 +1,6 @@
 pub mod local;
 pub mod preprocess;
+mod external;
 
 use std::path::PathBuf;
 
@@ -33,8 +34,6 @@ fn default_cache_dir() -> PathBuf {
 
 pub struct EmbedModel {
     local: local::LocalModel,
-    /// Retained for Task 3 (external API fallback).
-    #[allow(dead_code)]
     config: EmbedConfig,
 }
 
@@ -52,7 +51,15 @@ impl EmbedModel {
     }
 
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // External API will be added in Task 3 — for now, always use local
+        if let Some(ref endpoint) = self.config.external_endpoint {
+            let model = self.config.external_model.as_deref().unwrap_or("text-embedding-3-small");
+            match external::embed_via_api(endpoint, model, texts) {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => {
+                    tracing::warn!("External embedding API failed, falling back to local model: {e}");
+                }
+            }
+        }
         self.local.embed(texts)
     }
 
