@@ -78,8 +78,8 @@ impl DaemonClient {
 
         Ok(Self {
             inner: NestWeaverDaemonClient::new(channel)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024),
         })
     }
 
