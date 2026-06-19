@@ -10452,7 +10452,7 @@ fn print_project_context_json(
 }
 
 /// Generate embeddings for symbols, notes, and/or headings.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 fn run_embed(
     db: Option<&Path>,
     local: bool,
