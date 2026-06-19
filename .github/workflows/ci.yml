@@ -38,6 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: build
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
