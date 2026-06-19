@@ -11,7 +11,7 @@ use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
     FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid, build_brain_context_hybrid_with_aliases,
+    build_brain_context_hybrid_with_aliases,
     build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
