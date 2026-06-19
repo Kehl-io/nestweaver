@@ -246,6 +246,7 @@ impl EmbeddingIndex {
     }
 }
 
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -559,7 +560,7 @@ mod tests {
         let path = dir.path().join("short.bin");
         std::fs::write(&path, b"NWEM").unwrap(); // only 4 bytes, need 16
 
-        assert!(matches!(EmbeddingIndex::load_binary(&path), Err(_)));
+        assert!(EmbeddingIndex::load_binary(&path).is_err());
     }
 
     #[test]

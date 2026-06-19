@@ -41,7 +41,7 @@ impl LocalModel {
             info!(device = ?device, model = %config.model_id, "Loading embedding model");
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
-                    &[weights_path.clone()],
+                    std::slice::from_ref(&weights_path),
                     candle_core::DType::F32,
                     &device,
                 )?

@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
-use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr, forward_push_ppr};
+use nestweaver_algorithms::ppr::{PprConfig, forward_push_ppr};
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -854,10 +854,8 @@ impl GraphStore {
             current_gen.hash(&mut hasher);
             // Hash interaction scores so cache is invalidated when they change.
             if let Some(ref scores) = interaction_scores_for_key {
-                let mut sorted_scores: Vec<(&String, u64)> = scores
-                    .iter()
-                    .map(|(k, v)| (k, v.to_bits()))
-                    .collect();
+                let mut sorted_scores: Vec<(&String, u64)> =
+                    scores.iter().map(|(k, v)| (k, v.to_bits())).collect();
                 sorted_scores.sort_by_key(|(k, _)| k.as_str());
                 sorted_scores.hash(&mut hasher);
             }
@@ -865,7 +863,10 @@ impl GraphStore {
         };
 
         {
-            let mut cache = self.ppr_result_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .ppr_result_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.get(&ppr_cache_key) {
                 return Ok(cached.clone());
             }
@@ -937,7 +938,10 @@ impl GraphStore {
         let results = forward_push_ppr(&uids, &adjacency, seed_uids, &config);
 
         {
-            let mut cache = self.ppr_result_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .ppr_result_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cache.put(ppr_cache_key, results.clone());
         }
 

@@ -361,10 +361,10 @@ impl GraphStore {
     /// Returns an empty index when neither file exists or both are corrupt.
     fn load_embedding_index(db_path: &Path) -> crate::search::EmbeddingIndex {
         let binary_path = Self::embedding_sidecar_binary_for(db_path);
-        if binary_path.exists() {
-            if let Ok(idx) = crate::search::EmbeddingIndex::load_binary(&binary_path) {
-                return idx;
-            }
+        if binary_path.exists()
+            && let Ok(idx) = crate::search::EmbeddingIndex::load_binary(&binary_path)
+        {
+            return idx;
         }
         let json_path = Self::embedding_sidecar_json_for(db_path);
         crate::search::EmbeddingIndex::load(&json_path).unwrap_or_default()
@@ -395,20 +395,29 @@ impl GraphStore {
     /// Add an embedding to the in-memory index without saving to disk.
     /// Use `flush_embedding_index` after a batch of additions to persist.
     pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) {
-        let mut idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.add(uid, embedding);
     }
 
     /// Check whether the embedding index already has an entry for `uid`.
     pub fn has_embedding(&self, uid: &str) -> bool {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.get(uid).is_some()
     }
 
     /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(path) = self.embedding_sidecar_path() {
             idx.save_binary(&path)
                 .map_err(|e| StoreError::Query(format!("save binary embedding sidecar: {e}")))?;
@@ -419,7 +428,10 @@ impl GraphStore {
     /// Perform a vector similarity search over the embedding index.
     /// Returns `(uid, cosine_similarity)` pairs sorted descending.
     pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.vector_search(query_embedding, limit)
     }
 
@@ -432,20 +444,29 @@ impl GraphStore {
         limit: usize,
         uid_prefix: Option<&str>,
     ) -> Vec<(String, f64)> {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.vector_search_filtered(query_embedding, limit, uid_prefix)
     }
 
     /// Return the dimensionality of embeddings in the sidecar index,
     /// or `None` if no embeddings are stored.
     pub fn embedding_index_dimension(&self) -> Option<usize> {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.dimension()
     }
 
     /// Number of embeddings in the sidecar index.
     pub fn embedding_count(&self) -> usize {
-        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         idx.len()
     }
 

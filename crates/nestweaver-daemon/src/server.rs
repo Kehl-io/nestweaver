@@ -95,7 +95,10 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             let embed_ref = embed_arc.as_deref();
-            tracing::debug!(has_model = embed_ref.is_some(), "dispatch_json_tool embed_model status");
+            tracing::debug!(
+                has_model = embed_ref.is_some(),
+                "dispatch_json_tool embed_model status"
+            );
 
             let t_dispatch = std::time::Instant::now();
             let value = nestweaver_mcp::tools::dispatch(
@@ -225,7 +228,7 @@ impl DaemonService {
             let store = store.clone();
             // Fire-and-forget a new blocking task so the watcher callback
             // returns quickly and the watcher loop is not stalled.
-            let _ = tokio::task::spawn_blocking(move || {
+            drop(tokio::task::spawn_blocking(move || {
                 let mut embedded = 0u32;
                 let limit: usize = 64; // Max nodes per watcher cycle
 
@@ -252,19 +255,22 @@ impl DaemonService {
                 let remaining = limit.saturating_sub(embedded as usize);
 
                 // Notes
-                if remaining > 0 {
-                    if let Ok(notes) = store.list_notes(None) {
-                        for note in notes.iter().filter(|n| n.embedding.is_none()).take(remaining) {
-                            let text =
-                                nestweaver_embed::preprocess::note_embed_text(&note.title, None);
-                            match model.embed_query(&text) {
-                                Ok(emb) => {
-                                    store.add_embedding(&note.uid, emb);
-                                    embedded += 1;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(uid = %note.uid, "embedding failed: {e}");
-                                }
+                if remaining > 0
+                    && let Ok(notes) = store.list_notes(None)
+                {
+                    for note in notes
+                        .iter()
+                        .filter(|n| n.embedding.is_none())
+                        .take(remaining)
+                    {
+                        let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&note.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %note.uid, "embedding failed: {e}");
                             }
                         }
                     }
@@ -273,23 +279,23 @@ impl DaemonService {
                 let remaining = limit.saturating_sub(embedded as usize);
 
                 // Headings
-                if remaining > 0 {
-                    if let Ok(headings) = store.list_all_headings() {
-                        for heading in
-                            headings.iter().filter(|h| h.embedding.is_none()).take(remaining)
-                        {
-                            let text = nestweaver_embed::preprocess::heading_embed_text(
-                                "",
-                                &heading.text,
-                            );
-                            match model.embed_query(&text) {
-                                Ok(emb) => {
-                                    store.add_embedding(&heading.uid, emb);
-                                    embedded += 1;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
-                                }
+                if remaining > 0
+                    && let Ok(headings) = store.list_all_headings()
+                {
+                    for heading in headings
+                        .iter()
+                        .filter(|h| h.embedding.is_none())
+                        .take(remaining)
+                    {
+                        let text =
+                            nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&heading.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
                             }
                         }
                     }
@@ -301,7 +307,7 @@ impl DaemonService {
                     }
                     tracing::debug!(count = embedded, "embedded new nodes from watcher");
                 }
-            });
+            }));
         }))
     }
 
@@ -2489,11 +2495,9 @@ pub async fn run_server(
     // hits the cache instead of spending ~350ms rebuilding from the DB.
     {
         let store = state.store_read.clone();
-        tokio::task::spawn_blocking(move || {
-            match store.warm_ppr_cache() {
-                Ok(()) => tracing::info!("PPR adjacency cache warmed"),
-                Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
-            }
+        tokio::task::spawn_blocking(move || match store.warm_ppr_cache() {
+            Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+            Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
         });
     }
 
@@ -2528,23 +2532,21 @@ pub async fn run_server(
                 Ok(Ok(model)) => {
                     tracing::info!(dim = model.dimension(), "Embedding model loaded");
                     // Check dimension compatibility with existing embeddings
-                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension() {
-                        if stored_dim != model.dimension() {
-                            tracing::warn!(
-                                model_dim = model.dimension(),
-                                stored_dim,
-                                "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                                 Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                                model.dimension(),
-                                stored_dim
-                            );
-                            return;
-                        }
+                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension()
+                        && stored_dim != model.dimension()
+                    {
+                        tracing::warn!(
+                            model_dim = model.dimension(),
+                            stored_dim,
+                            "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                             Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                            model.dimension(),
+                            stored_dim
+                        );
+                        return;
                     }
-                    *embed_state.write().await = Some(
-                        std::sync::Arc::new(model)
-                            as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
-                    );
+                    *embed_state.write().await = Some(std::sync::Arc::new(model)
+                        as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Failed to load embedding model: {e}");

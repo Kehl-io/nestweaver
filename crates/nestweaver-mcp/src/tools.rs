@@ -5930,6 +5930,7 @@ mod project_context_bug12_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         }
     }
 
@@ -6019,6 +6020,7 @@ mod project_context_bug12_tests {
             &store,
             None,
             json!({ "project": "Parallel Paths", "token_budget": 5000 }),
+            None,
         )
         .unwrap();
 
@@ -6058,6 +6060,7 @@ mod project_context_bug12_tests {
             &store,
             None,
             json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
+            None,
         )
         .unwrap();
         let any_body_off = off["connected"]
@@ -6078,6 +6081,7 @@ mod project_context_bug12_tests {
                 "include_bodies": true,
                 "root": root,
             }),
+            None,
         )
         .unwrap();
         let connected = on["connected"].as_array().unwrap();

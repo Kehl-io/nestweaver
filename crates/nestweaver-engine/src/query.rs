@@ -1000,7 +1000,14 @@ pub fn build_brain_context(
     store: &GraphStore,
     inputs: &[String],
 ) -> Result<BrainContextResult, anyhow::Error> {
-    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default(), None, None)
+    build_brain_context_hybrid(
+        store,
+        inputs,
+        None,
+        &HybridSearchConfig::default(),
+        None,
+        None,
+    )
 }
 
 /// Hybrid PPR + BM25 retrieval.
@@ -1046,6 +1053,7 @@ pub fn build_brain_context_hybrid(
 ///
 /// The optional `intent` parameter tunes PPR's damping factor and edge
 /// weights. When `None`, the standard damping (0.85) is used.
+#[allow(clippy::too_many_arguments)]
 pub fn build_brain_context_hybrid_with_aliases(
     store: &GraphStore,
     inputs: &[String],
@@ -1230,21 +1238,22 @@ pub fn build_brain_context_hybrid_with_aliases(
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
-    if let Some(model) = embed_model {
-        if config.weight_semantic > 0.0 {
-            let query_text = inputs.join(" ");
-            if let Ok(query_emb) = model.embed_query(&query_text) {
-                if let Ok(hits) = crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit) {
-                    if config.always_blend_semantic {
-                        for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
-                            if !seed_uids.contains(uid) {
-                                seed_uids.push(uid.clone());
-                            }
-                        }
+    if let Some(model) = embed_model
+        && config.weight_semantic > 0.0
+    {
+        let query_text = inputs.join(" ");
+        if let Ok(query_emb) = model.embed_query(&query_text)
+            && let Ok(hits) =
+                crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit)
+        {
+            if config.always_blend_semantic {
+                for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                    if !seed_uids.contains(uid) {
+                        seed_uids.push(uid.clone());
                     }
-                    semantic_hits = hits;
                 }
             }
+            semantic_hits = hits;
         }
     }
 
@@ -1401,15 +1410,28 @@ pub fn weighted_score_fuse(
     }
 
     let mut all_uids: Vec<&str> = Vec::new();
-    for uid in ppr_scores.keys().chain(bm25_scores.keys()).chain(sem_scores.keys()) {
+    for uid in ppr_scores
+        .keys()
+        .chain(bm25_scores.keys())
+        .chain(sem_scores.keys())
+    {
         if !all_uids.contains(uid) {
             all_uids.push(uid);
         }
     }
 
-    let ppr_raw: Vec<f64> = all_uids.iter().map(|u| ppr_scores.get(u).copied().unwrap_or(0.0)).collect();
-    let bm25_raw: Vec<f64> = all_uids.iter().map(|u| bm25_scores.get(u).copied().unwrap_or(0.0)).collect();
-    let sem_raw: Vec<f64> = all_uids.iter().map(|u| sem_scores.get(u).copied().unwrap_or(0.0)).collect();
+    let ppr_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| ppr_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
+    let bm25_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| bm25_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
+    let sem_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| sem_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
 
     let ppr_norm = tanh_normalize(&ppr_raw);
     let bm25_norm = tanh_normalize(&bm25_raw);
@@ -2613,8 +2635,20 @@ mod fusion_tests {
     fn test_weighted_score_fuse_three_signals() {
         let ppr = vec![("a".to_string(), 0.5), ("b".to_string(), 0.3)];
         let bm25 = vec![
-            SearchHit { uid: "b".to_string(), kind: "function".into(), title: "b".into(), vault_uid: "v".into(), score: 10.0 },
-            SearchHit { uid: "c".to_string(), kind: "function".into(), title: "c".into(), vault_uid: "v".into(), score: 8.0 },
+            SearchHit {
+                uid: "b".to_string(),
+                kind: "function".into(),
+                title: "b".into(),
+                vault_uid: "v".into(),
+                score: 10.0,
+            },
+            SearchHit {
+                uid: "c".to_string(),
+                kind: "function".into(),
+                title: "c".into(),
+                vault_uid: "v".into(),
+                score: 8.0,
+            },
         ];
         let semantic = vec![("a".to_string(), 0.9), ("c".to_string(), 0.7)];
 
@@ -2628,9 +2662,13 @@ mod fusion_tests {
     #[test]
     fn test_weighted_score_fuse_empty_semantic() {
         let ppr = vec![("a".to_string(), 0.5)];
-        let bm25 = vec![
-            SearchHit { uid: "a".to_string(), kind: "function".into(), title: "a".into(), vault_uid: "v".into(), score: 5.0 },
-        ];
+        let bm25 = vec![SearchHit {
+            uid: "a".to_string(),
+            kind: "function".into(),
+            title: "a".into(),
+            vault_uid: "v".into(),
+            score: 5.0,
+        }];
         let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");

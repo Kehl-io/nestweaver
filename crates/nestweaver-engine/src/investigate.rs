@@ -219,6 +219,7 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
 /// When `db_path` is `Some`, the resulting bundle is persisted to the sidecar.
 /// When `None` (e.g. an in-memory store), the bundle is returned but not saved;
 /// follow-up calls would not find it.
+#[allow(clippy::too_many_arguments)]
 pub fn investigate(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -845,8 +846,17 @@ mod tests {
         let (dir, src, store) = make_store();
         let db_path = dir.path().join("nestweaver.lbug");
 
-        let result =
-            investigate(&store, None, Some(&db_path), &src, "greet", "vault", None, None).unwrap();
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Pick a symbol entry to expand.
         let target = result

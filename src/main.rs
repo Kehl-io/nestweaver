@@ -11,10 +11,9 @@ use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
     FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases,
-    build_context_with_intent, build_feature_context,
+    build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
-    discover_cross_domain_links, embedding::{generate_embedding, generate_embeddings_batch}, expand_query_with_aliases,
+    discover_cross_domain_links, embedding::generate_embeddings_batch, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
@@ -1124,17 +1123,31 @@ enum Commands {
     Embed {
         #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
         db: Option<PathBuf>,
-        #[arg(long, help = "Use the bundled local model (default when no --endpoint)")]
+        #[arg(
+            long,
+            help = "Use the bundled local model (default when no --endpoint)"
+        )]
         local: bool,
         #[arg(long, help = "OpenAI-compatible embedding API endpoint")]
         endpoint: Option<String>,
-        #[arg(long, help = "Model name for external API (e.g. text-embedding-3-small)")]
+        #[arg(
+            long,
+            help = "Model name for external API (e.g. text-embedding-3-small)"
+        )]
         model: Option<String>,
-        #[arg(long, default_value = "sentence-transformers/all-MiniLM-L6-v2", help = "HuggingFace model ID for local inference")]
+        #[arg(
+            long,
+            default_value = "sentence-transformers/all-MiniLM-L6-v2",
+            help = "HuggingFace model ID for local inference"
+        )]
         model_id: String,
         #[arg(long, default_value = "32", help = "Batch size")]
         batch_size: usize,
-        #[arg(long, default_value = "all", help = "What to embed: symbols, notes, headings, or all")]
+        #[arg(
+            long,
+            default_value = "all",
+            help = "What to embed: symbols, notes, headings, or all"
+        )]
         scope: String,
         #[arg(long, help = "Re-embed nodes that already have embeddings")]
         force: bool,
@@ -3195,9 +3208,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 return Ok((EXIT_SUCCESS, Some(stats)));
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "Daemon RPC failed, falling back to local: {e}"
-                                );
+                                eprintln!("Daemon RPC failed, falling back to local: {e}");
                             }
                         }
                     }
@@ -10441,6 +10452,7 @@ fn print_project_context_json(
 }
 
 /// Generate embeddings for symbols, notes, and/or headings.
+#[allow(clippy::too_many_arguments)]
 fn run_embed(
     db: Option<&Path>,
     local: bool,
@@ -10468,27 +10480,39 @@ fn run_embed(
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             if unsafe { libc::kill(pid, 0) } == 0 {
                 eprintln!("Stopping daemon (PID {pid}) for exclusive DB access…");
-                unsafe { libc::kill(pid, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
                 for _ in 0..50 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    if unsafe { libc::kill(pid, 0) } != 0 { break; }
+                    if unsafe { libc::kill(pid, 0) } != 0 {
+                        break;
+                    }
                 }
                 true
-            } else { false }
-        } else { false }
-    } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
-    let store = nestweaver_store::GraphStore::open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open database for writing at {}: {e}", path.display()))?;
+    let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open database for writing at {}: {e}",
+            path.display()
+        )
+    })?;
 
     let do_symbols = scope == "all" || scope == "symbols";
     let do_notes = scope == "all" || scope == "notes";
     let do_headings = scope == "all" || scope == "headings";
 
     if !do_symbols && !do_notes && !do_headings {
-        anyhow::bail!(
-            "unknown --scope '{scope}': expected one of: all, symbols, notes, headings"
-        );
+        anyhow::bail!("unknown --scope '{scope}': expected one of: all, symbols, notes, headings");
     }
 
     let mut success_count = 0usize;
@@ -10507,7 +10531,9 @@ fn run_embed(
             let to_embed: Vec<_> = if force {
                 all.iter().collect()
             } else {
-                all.iter().filter(|s| !store.has_embedding(&s.uid)).collect()
+                all.iter()
+                    .filter(|s| !store.has_embedding(&s.uid))
+                    .collect()
             };
             let total = to_embed.len();
             if total > 0 {
@@ -10515,13 +10541,20 @@ fn run_embed(
                 for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
                     let done = batch_idx * batch_size + chunk.len();
                     eprint!("\rEmbedding symbols... {done}/{total}");
-                    let texts: Vec<String> = chunk.iter().map(|sym| {
-                        if sym.signature.is_empty() { sym.name.clone() } else { sym.signature.clone() }
-                    }).collect();
+                    let texts: Vec<String> = chunk
+                        .iter()
+                        .map(|sym| {
+                            if sym.signature.is_empty() {
+                                sym.name.clone()
+                            } else {
+                                sym.signature.clone()
+                            }
+                        })
+                        .collect();
                     let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
-                            for (sym, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                            for (sym, emb) in chunk.iter().zip(embeddings) {
                                 store.add_embedding(&sym.uid, emb);
                                 success_count += 1;
                             }
@@ -10544,7 +10577,9 @@ fn run_embed(
             let to_embed: Vec<_> = if force {
                 all.iter().collect()
             } else {
-                all.iter().filter(|n| !store.has_embedding(&n.uid)).collect()
+                all.iter()
+                    .filter(|n| !store.has_embedding(&n.uid))
+                    .collect()
             };
             let total = to_embed.len();
             if total > 0 {
@@ -10556,7 +10591,7 @@ fn run_embed(
                     let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
-                            for (note, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                            for (note, emb) in chunk.iter().zip(embeddings) {
                                 store.add_embedding(&note.uid, emb);
                                 success_count += 1;
                             }
@@ -10587,9 +10622,7 @@ fn run_embed(
             let total = to_embed.len();
             if total > 0 {
                 // Build note title lookup
-                let notes = store
-                    .list_notes(None)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
                 let note_titles: std::collections::HashMap<&str, &str> = notes
                     .iter()
                     .map(|n| (n.uid.as_str(), n.title.as_str()))
@@ -10599,21 +10632,22 @@ fn run_embed(
                 for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
                     let done = batch_idx * batch_size + chunk.len();
                     eprint!("\rEmbedding headings... {done}/{total}");
-                    let texts: Vec<String> = chunk.iter().map(|h| {
-                        let note_title = note_titles
-                            .get(h.note_uid.as_str())
-                            .copied()
-                            .unwrap_or("");
-                        if note_title.is_empty() {
-                            h.text.clone()
-                        } else {
-                            format!("{note_title} > {}", h.text)
-                        }
-                    }).collect();
+                    let texts: Vec<String> = chunk
+                        .iter()
+                        .map(|h| {
+                            let note_title =
+                                note_titles.get(h.note_uid.as_str()).copied().unwrap_or("");
+                            if note_title.is_empty() {
+                                h.text.clone()
+                            } else {
+                                format!("{note_title} > {}", h.text)
+                            }
+                        })
+                        .collect();
                     let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
-                            for (h, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                            for (h, emb) in chunk.iter().zip(embeddings) {
                                 store.add_embedding(&h.uid, emb);
                                 success_count += 1;
                             }
@@ -10646,7 +10680,9 @@ fn run_embed(
                 let to_embed: Vec<_> = if force {
                     all.iter().collect()
                 } else {
-                    all.iter().filter(|s| !store.has_embedding(&s.uid)).collect()
+                    all.iter()
+                        .filter(|s| !store.has_embedding(&s.uid))
+                        .collect()
                 };
                 let total = to_embed.len();
                 if total > 0 {
@@ -10664,8 +10700,7 @@ fn run_embed(
                                 )
                             })
                             .collect();
-                        let text_refs: Vec<&str> =
-                            texts.iter().map(|t| t.as_str()).collect();
+                        let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
@@ -10691,7 +10726,9 @@ fn run_embed(
                 let to_embed: Vec<_> = if force {
                     all.iter().collect()
                 } else {
-                    all.iter().filter(|n| !store.has_embedding(&n.uid)).collect()
+                    all.iter()
+                        .filter(|n| !store.has_embedding(&n.uid))
+                        .collect()
                 };
                 let total = to_embed.len();
                 if total > 0 {
@@ -10701,12 +10738,9 @@ fn run_embed(
                         eprint!("\rEmbedding notes... {done}/{total}");
                         let texts: Vec<String> = batch
                             .iter()
-                            .map(|n| {
-                                nestweaver_embed::preprocess::note_embed_text(&n.title, None)
-                            })
+                            .map(|n| nestweaver_embed::preprocess::note_embed_text(&n.title, None))
                             .collect();
-                        let text_refs: Vec<&str> =
-                            texts.iter().map(|t| t.as_str()).collect();
+                        let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
@@ -10739,9 +10773,7 @@ fn run_embed(
                 };
                 let total = to_embed.len();
                 if total > 0 {
-                    let notes = store
-                        .list_notes(None)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
                     let note_titles: std::collections::HashMap<&str, &str> = notes
                         .iter()
                         .map(|n| (n.uid.as_str(), n.title.as_str()))
@@ -10754,17 +10786,14 @@ fn run_embed(
                         let texts: Vec<String> = batch
                             .iter()
                             .map(|h| {
-                                let note_title = note_titles
-                                    .get(h.note_uid.as_str())
-                                    .copied()
-                                    .unwrap_or("");
+                                let note_title =
+                                    note_titles.get(h.note_uid.as_str()).copied().unwrap_or("");
                                 nestweaver_embed::preprocess::heading_embed_text(
                                     note_title, &h.text,
                                 )
                             })
                             .collect();
-                        let text_refs: Vec<&str> =
-                            texts.iter().map(|t| t.as_str()).collect();
+                        let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
@@ -10793,10 +10822,10 @@ fn run_embed(
     }
 
     // Flush the embedding index to the sidecar file once at the end.
-    if success_count > 0 {
-        if let Err(e) = store.flush_embedding_index() {
-            eprintln!("Warning: failed to save embedding sidecar: {e}");
-        }
+    if success_count > 0
+        && let Err(e) = store.flush_embedding_index()
+    {
+        eprintln!("Warning: failed to save embedding sidecar: {e}");
     }
 
     if stats {

@@ -1,14 +1,18 @@
 fn main() {
     #[cfg(feature = "embed")]
     {
-        use std::time::Instant;
         use nestweaver_embed::{EmbedConfig, EmbedModel};
+        use std::time::Instant;
 
         let config = EmbedConfig::default();
         eprintln!("Loading model: {}...", config.model_id);
         let load_start = Instant::now();
         let model = EmbedModel::load(&config).expect("Failed to load model");
-        eprintln!("Model loaded in {:.1}ms (dim={})", load_start.elapsed().as_millis(), model.dimension());
+        eprintln!(
+            "Model loaded in {:.1}ms (dim={})",
+            load_start.elapsed().as_millis(),
+            model.dimension()
+        );
 
         let queries = [
             "how does authentication work",

@@ -1,6 +1,6 @@
 pub fn split_identifier(fqn: &str) -> String {
     let mut words = Vec::new();
-    for segment in fqn.split(|c: char| c == ':' || c == '.' || c == '/' || c == '\\') {
+    for segment in fqn.split([':', '.', '/', '\\']) {
         if segment.is_empty() {
             continue;
         }
@@ -19,7 +19,7 @@ fn split_camel_snake(s: &str, out: &mut Vec<String>) {
         for i in 0..chars.len() {
             let c = chars[i];
             if c.is_uppercase() && !current.is_empty() {
-                let next_is_lower = chars.get(i + 1).map_or(false, |n| n.is_lowercase());
+                let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
                 let prev_is_lower = i > 0 && chars[i - 1].is_lowercase();
                 if prev_is_lower || next_is_lower {
                     out.push(current.clone());
