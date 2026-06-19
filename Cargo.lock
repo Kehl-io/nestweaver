@@ -4023,6 +4023,7 @@ dependencies = [
  "lbug",
  "nestweaver-algorithms",
  "nestweaver-schema",
+ "rayon",
  "regex",
  "regex-syntax",
  "rmp-serde",

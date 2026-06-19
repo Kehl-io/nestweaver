@@ -168,7 +168,7 @@ impl EmbeddingIndex {
 
         let mut scores: Vec<(String, f64)> = self
             .embeddings
-            .iter()
+            .par_iter()
             .map(|(uid, emb)| {
                 // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
                 let dot: f64 = emb
@@ -219,7 +219,7 @@ impl EmbeddingIndex {
 
         let mut scores: Vec<(String, f64)> = self
             .embeddings
-            .iter()
+            .par_iter()
             .filter(|(uid, _)| match uid_prefix {
                 Some(prefix) => uid.contains(prefix),
                 None => true,
@@ -432,12 +432,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("embeddings.json");
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:test", vec![0.1, 0.2, 0.3]);
+        // Use an L2-normalized vector (vector_search assumes pre-normalized embeddings)
+        let norm = (0.1_f32 * 0.1 + 0.2 * 0.2 + 0.3 * 0.3).sqrt();
+        let v = vec![0.1 / norm, 0.2 / norm, 0.3 / norm];
+        idx.add("sym:test", v.clone());
         idx.save(&path).unwrap();
 
         let loaded = EmbeddingIndex::load(&path).unwrap();
         assert_eq!(loaded.len(), 1);
-        let results = loaded.vector_search(&[0.1, 0.2, 0.3], 1);
+        let results = loaded.vector_search(&v, 1);
         assert_eq!(results[0].0, "sym:test");
         assert!((results[0].1 - 1.0).abs() < 1e-5);
     }
