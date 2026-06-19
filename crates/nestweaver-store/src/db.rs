@@ -76,6 +76,11 @@ pub struct GraphStore {
     /// Avoids full-table scans on every seed-resolution call for brain_context,
     /// flow_trace, blast_radius, etc.
     pub(crate) symbol_name_cache: Mutex<Option<Arc<crate::traverse::SymbolNameCached>>>,
+    /// In-memory embedding index backed by a JSON sidecar file
+    /// (`<db>.embeddings`). Embeddings are stored here instead of in
+    /// LadybugDB (which has no float-array column type). Loaded on open,
+    /// saved on mutation via `flush_embedding_index`.
+    pub(crate) embedding_index: Mutex<crate::search::EmbeddingIndex>,
 }
 
 impl GraphStore {
@@ -93,6 +98,7 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            embedding_index: Mutex::new(Self::load_embedding_index(path)),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -115,6 +121,7 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            embedding_index: Mutex::new(Self::load_embedding_index(path)),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -137,6 +144,7 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            embedding_index: Mutex::new(Self::load_embedding_index(path)),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
@@ -183,6 +191,7 @@ impl GraphStore {
             db_path: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            embedding_index: Mutex::new(crate::search::EmbeddingIndex::new()),
         };
         store.init_schema()?;
         Ok(store)
@@ -327,6 +336,71 @@ impl GraphStore {
             }
             None => PathBuf::from(".generation"),
         }
+    }
+
+    // ── Embedding sidecar helpers ────────────────────────────────────────
+
+    /// Load the embedding index from the `<db>.embeddings` sidecar.
+    /// Returns an empty index when the file is absent or corrupt.
+    fn load_embedding_index(db_path: &Path) -> crate::search::EmbeddingIndex {
+        let sidecar = Self::embedding_sidecar_for(db_path);
+        crate::search::EmbeddingIndex::load(&sidecar).unwrap_or_default()
+    }
+
+    /// Compute the sidecar path for a given database path.
+    fn embedding_sidecar_for(db_path: &Path) -> std::path::PathBuf {
+        let mut s = db_path.as_os_str().to_owned();
+        s.push(".embeddings");
+        std::path::PathBuf::from(s)
+    }
+
+    /// Return the path to the embedding sidecar file, or `None` for in-memory stores.
+    pub fn embedding_sidecar_path(&self) -> Option<std::path::PathBuf> {
+        self.db_path.as_ref().map(|p| Self::embedding_sidecar_for(p))
+    }
+
+    /// Add an embedding to the in-memory index without saving to disk.
+    /// Use `flush_embedding_index` after a batch of additions to persist.
+    pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) {
+        let mut idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.add(uid, embedding);
+    }
+
+    /// Check whether the embedding index already has an entry for `uid`.
+    pub fn has_embedding(&self, uid: &str) -> bool {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.get(uid).is_some()
+    }
+
+    /// Persist the in-memory embedding index to the sidecar file.
+    /// No-op for in-memory stores.
+    pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = self.embedding_sidecar_path() {
+            idx.save(&path)
+                .map_err(|e| StoreError::Query(format!("save embedding sidecar: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Perform a vector similarity search over the embedding index.
+    /// Returns `(uid, cosine_similarity)` pairs sorted descending.
+    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.vector_search(query_embedding, limit)
+    }
+
+    /// Return the dimensionality of embeddings in the sidecar index,
+    /// or `None` if no embeddings are stored.
+    pub fn embedding_index_dimension(&self) -> Option<usize> {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.dimension()
+    }
+
+    /// Number of embeddings in the sidecar index.
+    pub fn embedding_count(&self) -> usize {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.len()
     }
 
     /// P0.2: bump the `graph_generation` counter and persist it to this

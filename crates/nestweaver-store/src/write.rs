@@ -1987,149 +1987,38 @@ impl GraphStore {
 
     /// Update the `embedding` field of a Note node.
     ///
-    /// LadybugDB does not support `SET`, so the note is read, deleted with
-    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
-    /// all other fields. The embedding is held only in the in-memory `Note`
-    /// struct returned by `list_notes`; callers that need cross-session
-    /// persistence should use an `EmbeddingIndex` sidecar file.
+    /// Persist a Note embedding to the sidecar `EmbeddingIndex`.
+    ///
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_note_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        use crate::read::{NOTE_COLUMNS, row_to_note};
-
-        let conn = self.conn()?;
-
-        // Read the existing note.
-        let q = format!("MATCH (n:Note {{uid: $uid}}) RETURN {NOTE_COLUMNS}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("uid", lbug::Value::String(uid.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let row = result.next().ok_or(StoreError::NotFound)?;
-        let mut note = row_to_note(&row)?;
-
-        // Set the embedding in memory.
-        note.embedding = Some(embedding.to_vec());
-
-        // Delete the existing node (DETACH removes all edges).
-        exec_params(
-            &conn,
-            "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
-            vec![("uid", lbug::Value::String(uid.to_string()))],
-        )?;
-
-        // Re-insert with all fields preserved. insert_note does not store
-        // the embedding as a DB column (LadybugDB has no native float-array
-        // column), but the in-memory Note struct carries it so callers can
-        // use it immediately after the round-trip.
-        self.insert_note(&note)?;
-
-        Ok(())
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
     }
 
-    /// Update the `embedding` field of a Heading node.
+    /// Persist a Heading embedding to the sidecar `EmbeddingIndex`.
     ///
-    /// LadybugDB does not support `SET`, so the heading is read, deleted with
-    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
-    /// all other fields. The embedding is held only in the in-memory `Heading`
-    /// struct returned by `list_all_headings`; callers that need cross-session
-    /// persistence should use an `EmbeddingIndex` sidecar file.
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_heading_embedding(
         &self,
         uid: &str,
         embedding: &[f32],
     ) -> Result<(), StoreError> {
-        use crate::read::{HEADING_COLUMNS, row_to_heading};
-
-        let conn = self.conn()?;
-
-        // Read the existing heading.
-        let q = format!("MATCH (h:Heading {{uid: $uid}}) RETURN {HEADING_COLUMNS}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("uid", lbug::Value::String(uid.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let row = result.next().ok_or(StoreError::NotFound)?;
-        let mut heading = row_to_heading(&row)?;
-
-        // Set the embedding in memory.
-        heading.embedding = Some(embedding.to_vec());
-
-        // Delete the existing node (DETACH removes all edges).
-        exec_params(
-            &conn,
-            "MATCH (h:Heading {uid: $uid}) DETACH DELETE h",
-            vec![("uid", lbug::Value::String(uid.to_string()))],
-        )?;
-
-        // Re-insert with all fields preserved. insert_heading does not store
-        // the embedding as a DB column (LadybugDB has no native float-array
-        // column), but the in-memory Heading struct carries it so callers can
-        // use it immediately after the round-trip.
-        self.insert_heading(&heading)?;
-
-        Ok(())
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
     }
 
-    /// Update the `embedding` field of a Symbol node.
+    /// Persist a Symbol embedding to the sidecar `EmbeddingIndex`.
     ///
-    /// LadybugDB does not support `SET`, so the symbol is read, deleted with
-    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
-    /// all other fields. The embedding is stored as a JSON-encoded string in
-    /// a separate sidecar structure; the Symbol node itself does not hold a
-    /// native float-array column — instead the embedding is stored in the
-    /// in-memory `Symbol.embedding` field, and callers that need persistence
-    /// across sessions should use an `EmbeddingIndex` sidecar file.
-    ///
-    /// This method updates the in-graph Symbol node so that `list_all_symbols`
-    /// can return embeddings without a separate sidecar.
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_symbol_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
-
-        let conn = self.conn()?;
-
-        // Read the existing symbol.
-        let q = format!("MATCH (s:Symbol {{uid: $uid}}) RETURN {SYMBOL_COLUMNS}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("uid", lbug::Value::String(uid.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let row = result.next().ok_or(StoreError::NotFound)?;
-        let mut sym = row_to_symbol(&row)?;
-
-        // Set the embedding in memory.
-        sym.embedding = Some(embedding.to_vec());
-
-        // Delete the existing node (DETACH removes all edges).
-        exec_params(
-            &conn,
-            "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
-            vec![("uid", lbug::Value::String(uid.to_string()))],
-        )?;
-
-        // Re-insert with the embedding set. The Symbol struct carries
-        // `embedding` but the CREATE statement used by
-        // `insert_symbol_with_conn` does not include it (LadybugDB does
-        // not support arbitrary array columns). The embedding is therefore
-        // held only in the `Symbol` in-memory representation returned by
-        // `list_all_symbols`; the on-disk node is refreshed with all other
-        // fields preserved.
-        self.insert_symbol_with_conn(&conn, &sym)?;
-
-        Ok(())
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
     }
 
     /// Bulk-delete all Symbol and File nodes belonging to `repo_uid` using two

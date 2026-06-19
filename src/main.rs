@@ -10551,7 +10551,7 @@ fn run_embed(
             let to_embed: Vec<_> = if force {
                 all.iter().collect()
             } else {
-                all.iter().filter(|s| s.embedding.is_none()).collect()
+                all.iter().filter(|s| !store.has_embedding(&s.uid)).collect()
             };
             let total = to_embed.len();
             if total > 0 {
@@ -10565,15 +10565,8 @@ fn run_embed(
                     };
                     match rt.block_on(generate_embedding(ep, api_model, &text)) {
                         Ok(embedding) => {
-                            if let Err(e) = store.update_symbol_embedding(&sym.uid, &embedding) {
-                                eprintln!(
-                                    "\n    Warning: failed to store embedding for {}: {e}",
-                                    sym.uid
-                                );
-                                error_count += 1;
-                            } else {
-                                success_count += 1;
-                            }
+                            store.add_embedding(&sym.uid, embedding);
+                            success_count += 1;
                         }
                         Err(e) => {
                             eprintln!("\n    Warning: embedding API error for {}: {e}", sym.uid);
@@ -10593,7 +10586,7 @@ fn run_embed(
             let to_embed: Vec<_> = if force {
                 all.iter().collect()
             } else {
-                all.iter().filter(|n| n.embedding.is_none()).collect()
+                all.iter().filter(|n| !store.has_embedding(&n.uid)).collect()
             };
             let total = to_embed.len();
             if total > 0 {
@@ -10603,15 +10596,8 @@ fn run_embed(
                     let text = note.title.clone();
                     match rt.block_on(generate_embedding(ep, api_model, &text)) {
                         Ok(embedding) => {
-                            if let Err(e) = store.update_note_embedding(&note.uid, &embedding) {
-                                eprintln!(
-                                    "\n    Warning: failed to store embedding for {}: {e}",
-                                    note.uid
-                                );
-                                error_count += 1;
-                            } else {
-                                success_count += 1;
-                            }
+                            store.add_embedding(&note.uid, embedding);
+                            success_count += 1;
                         }
                         Err(e) => {
                             eprintln!("\n    Warning: embedding API error for {}: {e}", note.uid);
@@ -10633,7 +10619,7 @@ fn run_embed(
             } else {
                 all_headings
                     .iter()
-                    .filter(|h| h.embedding.is_none())
+                    .filter(|h| !store.has_embedding(&h.uid))
                     .collect()
             };
             let total = to_embed.len();
@@ -10661,17 +10647,8 @@ fn run_embed(
                     };
                     match rt.block_on(generate_embedding(ep, api_model, &text)) {
                         Ok(embedding) => {
-                            if let Err(e) =
-                                store.update_heading_embedding(&h.uid, &embedding)
-                            {
-                                eprintln!(
-                                    "\n    Warning: failed to store embedding for {}: {e}",
-                                    h.uid
-                                );
-                                error_count += 1;
-                            } else {
-                                success_count += 1;
-                            }
+                            store.add_embedding(&h.uid, embedding);
+                            success_count += 1;
                         }
                         Err(e) => {
                             eprintln!("\n    Warning: embedding API error for {}: {e}", h.uid);
@@ -10701,7 +10678,7 @@ fn run_embed(
                 let to_embed: Vec<_> = if force {
                     all.iter().collect()
                 } else {
-                    all.iter().filter(|s| s.embedding.is_none()).collect()
+                    all.iter().filter(|s| !store.has_embedding(&s.uid)).collect()
                 };
                 let total = to_embed.len();
                 if total > 0 {
@@ -10724,17 +10701,8 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if let Err(e) =
-                                        store.update_symbol_embedding(&sym.uid, emb)
-                                    {
-                                        eprintln!(
-                                            "\n    Warning: store error for {}: {e}",
-                                            sym.uid
-                                        );
-                                        error_count += 1;
-                                    } else {
-                                        success_count += 1;
-                                    }
+                                    store.add_embedding(&sym.uid, emb.clone());
+                                    success_count += 1;
                                 }
                             }
                             Err(e) => {
@@ -10755,7 +10723,7 @@ fn run_embed(
                 let to_embed: Vec<_> = if force {
                     all.iter().collect()
                 } else {
-                    all.iter().filter(|n| n.embedding.is_none()).collect()
+                    all.iter().filter(|n| !store.has_embedding(&n.uid)).collect()
                 };
                 let total = to_embed.len();
                 if total > 0 {
@@ -10774,17 +10742,8 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if let Err(e) =
-                                        store.update_note_embedding(&note.uid, emb)
-                                    {
-                                        eprintln!(
-                                            "\n    Warning: store error for {}: {e}",
-                                            note.uid
-                                        );
-                                        error_count += 1;
-                                    } else {
-                                        success_count += 1;
-                                    }
+                                    store.add_embedding(&note.uid, emb.clone());
+                                    success_count += 1;
                                 }
                             }
                             Err(e) => {
@@ -10807,7 +10766,7 @@ fn run_embed(
                 } else {
                     all_headings
                         .iter()
-                        .filter(|h| h.embedding.is_none())
+                        .filter(|h| !store.has_embedding(&h.uid))
                         .collect()
                 };
                 let total = to_embed.len();
@@ -10841,17 +10800,8 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if let Err(e) =
-                                        store.update_heading_embedding(&h.uid, emb)
-                                    {
-                                        eprintln!(
-                                            "\n    Warning: store error for {}: {e}",
-                                            h.uid
-                                        );
-                                        error_count += 1;
-                                    } else {
-                                        success_count += 1;
-                                    }
+                                    store.add_embedding(&h.uid, emb.clone());
+                                    success_count += 1;
                                 }
                             }
                             Err(e) => {
@@ -10871,6 +10821,13 @@ fn run_embed(
                 "local embedding requires the `embed` feature; \
                  rebuild with `--features embed` or pass --endpoint"
             );
+        }
+    }
+
+    // Flush the embedding index to the sidecar file once at the end.
+    if success_count > 0 {
+        if let Err(e) = store.flush_embedding_index() {
+            eprintln!("Warning: failed to save embedding sidecar: {e}");
         }
     }
 

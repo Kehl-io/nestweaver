@@ -20,66 +20,26 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 
 /// Search for nodes whose stored embedding is closest to `query_embedding`.
 /// Returns (uid, similarity) pairs sorted descending, limited to `limit`.
-/// Loads all embeddings from the store and computes similarity in Rust.
+/// Delegates to the sidecar `EmbeddingIndex` on the store which persists
+/// across DB sessions.
 pub fn vector_knn(
     store: &GraphStore,
     query_embedding: &[f32],
     limit: usize,
 ) -> Result<Vec<(String, f64)>, anyhow::Error> {
-    // Get all symbols with embeddings
-    let symbols = store.list_all_symbols()?;
-    let mut scored: Vec<(String, f64)> = Vec::new();
-
-    for sym in &symbols {
-        if let Some(ref emb) = sym.embedding {
-            let sim = cosine_similarity(query_embedding, emb);
-            if sim > 0.0 {
-                scored.push((sym.uid.clone(), sim));
-            }
-        }
-    }
-
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
-    Ok(scored)
+    Ok(store.vector_search(query_embedding, limit))
 }
 
 /// Search across symbols, notes, AND headings by cosine similarity.
 /// Returns (uid, similarity) pairs sorted descending, limited to `limit`.
+/// Delegates to the sidecar `EmbeddingIndex` which stores all node kinds
+/// in a single index (keyed by UID prefix: `sym:`, `note:`, `heading:`).
 pub fn vector_knn_all(
     store: &GraphStore,
     query_embedding: &[f32],
     limit: usize,
 ) -> Result<Vec<(String, f64)>, anyhow::Error> {
-    let mut scored: Vec<(String, f64)> = Vec::new();
-
-    // Symbols
-    for sym in store.list_all_symbols()? {
-        if let Some(ref emb) = sym.embedding {
-            let sim = cosine_similarity(emb, query_embedding);
-            scored.push((sym.uid, sim));
-        }
-    }
-
-    // Notes
-    for note in store.list_notes(None)? {
-        if let Some(ref emb) = note.embedding {
-            let sim = cosine_similarity(emb, query_embedding);
-            scored.push((note.uid, sim));
-        }
-    }
-
-    // Headings
-    for heading in store.list_all_headings()? {
-        if let Some(ref emb) = heading.embedding {
-            let sim = cosine_similarity(emb, query_embedding);
-            scored.push((heading.uid, sim));
-        }
-    }
-
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
-    Ok(scored)
+    Ok(store.vector_search(query_embedding, limit))
 }
 
 #[cfg(test)]

@@ -64,6 +64,17 @@ impl EmbeddingIndex {
     pub fn is_empty(&self) -> bool {
         self.embeddings.is_empty()
     }
+
+    /// Return the dimensionality of the stored embeddings (length of the first
+    /// vector found), or `None` if the index is empty.
+    pub fn dimension(&self) -> Option<usize> {
+        self.embeddings.values().next().map(|v| v.len())
+    }
+
+    /// Look up the embedding for a given UID.
+    pub fn get(&self, uid: &str) -> Option<&Vec<f32>> {
+        self.embeddings.get(uid)
+    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {

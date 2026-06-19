@@ -922,56 +922,12 @@ impl GraphStore {
 
     /// Returns the dimension of stored embeddings, or 0 if none exist.
     ///
-    /// Checks Symbol embeddings first (most common), then Note, then Heading.
-    /// Returns the first non-zero dimension found, or 0 if none are stored.
+    /// Checks the sidecar `EmbeddingIndex` (the authoritative source since
+    /// lbug has no float-array columns). Returns 0 when the index is empty.
     pub fn embedding_dimension(&self) -> Result<u32, StoreError> {
-        let conn = self.conn()?;
-
-        // Check Symbol embeddings first.
-        let result = conn
-            .query(
-                "MATCH (s:Symbol) WHERE s.embedding IS NOT NULL \
-                 RETURN list_len(s.embedding) LIMIT 1",
-            )
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-        for row in result {
-            if let Ok(dim) = extract_i64(&row, 0) {
-                if dim > 0 {
-                    return Ok(u32::try_from(dim).unwrap_or(0));
-                }
-            }
+        if let Some(dim) = self.embedding_index_dimension() {
+            return Ok(u32::try_from(dim).unwrap_or(0));
         }
-
-        // Fall back to Note embeddings.
-        let result = conn
-            .query(
-                "MATCH (n:Note) WHERE n.embedding IS NOT NULL \
-                 RETURN list_len(n.embedding) LIMIT 1",
-            )
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-        for row in result {
-            if let Ok(dim) = extract_i64(&row, 0) {
-                if dim > 0 {
-                    return Ok(u32::try_from(dim).unwrap_or(0));
-                }
-            }
-        }
-
-        // Fall back to Heading embeddings.
-        let result = conn
-            .query(
-                "MATCH (h:Heading) WHERE h.embedding IS NOT NULL \
-                 RETURN list_len(h.embedding) LIMIT 1",
-            )
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-        for row in result {
-            if let Ok(dim) = extract_i64(&row, 0) {
-                if dim > 0 {
-                    return Ok(u32::try_from(dim).unwrap_or(0));
-                }
-            }
-        }
-
         Ok(0)
     }
 
