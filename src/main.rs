@@ -2492,7 +2492,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
     let no_embed = cli.no_embed;
-    let _ = &no_embed; // suppress unused warning for arms that don't use it
     let use_daemon = if cli.no_daemon {
         if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
             false
