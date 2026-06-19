@@ -190,9 +190,14 @@ impl DaemonService {
                             &sym.name,
                             None,
                         );
-                        if let Ok(emb) = model.embed_query(&text) {
-                            let _ = store.update_symbol_embedding(&sym.uid, &emb);
-                            embedded += 1;
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&sym.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
+                            }
                         }
                     }
                 }
@@ -205,9 +210,14 @@ impl DaemonService {
                         for note in notes.iter().filter(|n| n.embedding.is_none()).take(remaining) {
                             let text =
                                 nestweaver_embed::preprocess::note_embed_text(&note.title, None);
-                            if let Ok(emb) = model.embed_query(&text) {
-                                let _ = store.update_note_embedding(&note.uid, &emb);
-                                embedded += 1;
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&note.uid, emb);
+                                    embedded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %note.uid, "embedding failed: {e}");
+                                }
                             }
                         }
                     }
@@ -225,16 +235,24 @@ impl DaemonService {
                                 "",
                                 &heading.text,
                             );
-                            if let Ok(emb) = model.embed_query(&text) {
-                                let _ = store.update_heading_embedding(&heading.uid, &emb);
-                                embedded += 1;
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&heading.uid, emb);
+                                    embedded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
+                                }
                             }
                         }
                     }
                 }
 
                 if embedded > 0 {
-                    tracing::debug!(count = embedded, "Embedded new nodes from watcher");
+                    if let Err(e) = store.flush_embedding_index() {
+                        tracing::warn!("failed to flush embedding index: {e}");
+                    }
+                    tracing::debug!(count = embedded, "embedded new nodes from watcher");
                 }
             });
         }))
@@ -2421,11 +2439,12 @@ pub async fn run_server(
     });
 
     // Spawn background embedding model loading when the `embed` feature is on.
-    eprintln!("[daemon] embed feature compiled in: {}", cfg!(feature = "embed"));
+    tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
     #[cfg(feature = "embed")]
     {
         let embed_state = state.embed_model.clone();
         let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
+        let store_for_dim_check = state.store_read.clone();
         tokio::spawn(async move {
             let cfg = embedding_cfg.unwrap_or_default();
             // Expand tilde in cache_dir using the home directory.
@@ -2448,7 +2467,21 @@ pub async fn run_server(
                 .await
             {
                 Ok(Ok(model)) => {
-                    eprintln!("[daemon] Embedding model loaded (dim={})", model.dimension());
+                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
+                    // Check dimension compatibility with existing embeddings
+                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension() {
+                        if stored_dim != model.dimension() {
+                            tracing::warn!(
+                                model_dim = model.dimension(),
+                                stored_dim,
+                                "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                                 Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                                model.dimension(),
+                                stored_dim
+                            );
+                            return;
+                        }
+                    }
                     *embed_state.write().await = Some(
                         std::sync::Arc::new(model)
                             as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
@@ -2538,7 +2571,6 @@ pub async fn run_server(
         .context("gRPC server error")?;
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
-    eprintln!("[daemon] shutting down, cleaning up");
     tracing::info!("daemon shutting down, cleaning up");
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);

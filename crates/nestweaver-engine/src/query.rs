@@ -61,6 +61,12 @@ pub struct HybridSearchConfig {
     /// `[seed_resolution]` in instance config (with backward-compat shim
     /// for the legacy `[ranking].test_path_patterns` block).
     pub seed_resolution: nestweaver_store::SeedResolutionConfig,
+    /// When `true`, semantic scores are always mixed in even when the query
+    /// matched zero BM25 results. Sourced from `[embedding].always_blend_semantic`.
+    pub always_blend_semantic: bool,
+    /// Maximum number of top semantic hits injected as PPR seeds.
+    /// Sourced from `[embedding].semantic_seed_limit`.
+    pub semantic_seed_limit: usize,
 }
 
 impl Default for HybridSearchConfig {
@@ -73,6 +79,8 @@ impl Default for HybridSearchConfig {
             semantic_limit: 200,
             prf: false,
             seed_resolution: nestweaver_store::SeedResolutionConfig::default(),
+            always_blend_semantic: true,
+            semantic_seed_limit: 5,
         }
     }
 }
@@ -1227,9 +1235,11 @@ pub fn build_brain_context_hybrid_with_aliases(
             let query_text = inputs.join(" ");
             if let Ok(query_emb) = model.embed_query(&query_text) {
                 if let Ok(hits) = crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit) {
-                    for (uid, _score) in hits.iter().take(5) {
-                        if !seed_uids.contains(uid) {
-                            seed_uids.push(uid.clone());
+                    if config.always_blend_semantic {
+                        for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                            if !seed_uids.contains(uid) {
+                                seed_uids.push(uid.clone());
+                            }
                         }
                     }
                     semantic_hits = hits;
@@ -1353,7 +1363,7 @@ fn tanh_normalize(scores: &[f64]) -> Vec<f64> {
     let median = {
         let mut sorted = nonzero.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        sorted[sorted.len() / 2]
+        sorted[(sorted.len() - 1) / 2]
     };
     let scale = if median > 0.0 { median } else { 1.0 };
     scores.iter().map(|s| (s / scale).tanh()).collect()
