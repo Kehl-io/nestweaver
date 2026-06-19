@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
-use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr};
+use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr, forward_push_ppr};
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -900,7 +900,7 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        Ok(algo_ppr(&uids, &adjacency, seed_uids, &config))
+        Ok(forward_push_ppr(&uids, &adjacency, seed_uids, &config))
     }
 
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
