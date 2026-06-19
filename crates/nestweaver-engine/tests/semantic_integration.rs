@@ -10,15 +10,13 @@ fn test_semantic_leg_improves_nl_query() {
     let ppr: Vec<(String, f64)> = vec![];
 
     // BM25 found a note with "authentication" in the title
-    let bm25 = vec![
-        nestweaver_store::SearchHit {
-            uid: "note:auth-guide".to_string(),
-            kind: "note".to_string(),
-            title: "Authentication Guide".to_string(),
-            vault_uid: "v1".to_string(),
-            score: 12.5,
-        },
-    ];
+    let bm25 = vec![nestweaver_store::SearchHit {
+        uid: "note:auth-guide".to_string(),
+        kind: "note".to_string(),
+        title: "Authentication Guide".to_string(),
+        vault_uid: "v1".to_string(),
+        score: 12.5,
+    }];
 
     // Semantic search found the actual auth middleware symbol
     let semantic = vec![
@@ -29,8 +27,12 @@ fn test_semantic_leg_improves_nl_query() {
 
     let config = HybridSearchConfig::default();
     let results = nestweaver_engine::query::weighted_score_fuse(
-        &ppr, &bm25, &semantic,
-        config.weight_ppr, config.weight_bm25, config.weight_semantic,
+        &ppr,
+        &bm25,
+        &semantic,
+        config.weight_ppr,
+        config.weight_bm25,
+        config.weight_semantic,
     );
 
     // With empty PPR, semantic results should dominate

@@ -2002,11 +2002,7 @@ impl GraphStore {
     /// The embedding is added to the in-memory index and immediately flushed
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
-    pub fn update_heading_embedding(
-        &self,
-        uid: &str,
-        embedding: &[f32],
-    ) -> Result<(), StoreError> {
+    pub fn update_heading_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
         self.add_embedding(uid, embedding.to_vec());
         self.flush_embedding_index()
     }

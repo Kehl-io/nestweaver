@@ -705,8 +705,7 @@ mod tests {
             generation: 0,
         };
         let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
-        let result =
-            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+        let result = forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
         assert!(result.is_empty());
     }
 
@@ -765,8 +764,7 @@ mod tests {
             generation: 0,
         };
         let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
-        let result =
-            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+        let result = forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
 
         // Seed "a" should appear and have a positive score.
         let a_score = result.iter().find(|(uid, _)| uid == "a").unwrap().1;
@@ -839,8 +837,14 @@ mod tests {
 
         // Compare top-10 overlap (or fewer if results are shorter).
         let take = 10.min(pi_result.len()).min(fp_result.len());
-        let pi_top: HashSet<&str> = pi_result[..take].iter().map(|(uid, _)| uid.as_str()).collect();
-        let fp_top: HashSet<&str> = fp_result[..take].iter().map(|(uid, _)| uid.as_str()).collect();
+        let pi_top: HashSet<&str> = pi_result[..take]
+            .iter()
+            .map(|(uid, _)| uid.as_str())
+            .collect();
+        let fp_top: HashSet<&str> = fp_result[..take]
+            .iter()
+            .map(|(uid, _)| uid.as_str())
+            .collect();
         let overlap = pi_top.intersection(&fp_top).count();
 
         assert!(
@@ -866,8 +870,7 @@ mod tests {
             generation: 0,
         };
         let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
-        let result =
-            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+        let result = forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "a");
         assert!(result[0].1 > 0.0);

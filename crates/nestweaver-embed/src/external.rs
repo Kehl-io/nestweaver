@@ -39,11 +39,7 @@ pub fn embed_via_api(endpoint: &str, model: &str, texts: &[&str]) -> Result<Vec<
         .json()
         .context("Failed to parse embedding response")?;
 
-    let mut embeddings: Vec<Vec<f32>> = response
-        .data
-        .into_iter()
-        .map(|d| d.embedding)
-        .collect();
+    let mut embeddings: Vec<Vec<f32>> = response.data.into_iter().map(|d| d.embedding).collect();
 
     if embeddings.len() != texts.len() {
         anyhow::bail!(
