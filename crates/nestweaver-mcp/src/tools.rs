@@ -1232,7 +1232,22 @@ fn tool_brain_context(
         .map(String::from);
 
     // RFC #6: optional hybrid search weight overrides.
-    let defaults = HybridSearchConfig::default();
+    // Read blend weights and limits from the instance config's [embedding]
+    // section when available, falling back to compiled defaults.
+    let defaults = {
+        match current_instance_config() {
+            Some(cfg) => HybridSearchConfig {
+                weight_ppr: cfg.embedding.weight_ppr,
+                weight_bm25: cfg.embedding.weight_bm25,
+                weight_semantic: cfg.embedding.weight_semantic,
+                semantic_limit: cfg.embedding.semantic_search_limit,
+                always_blend_semantic: cfg.embedding.always_blend_semantic,
+                semantic_seed_limit: cfg.embedding.semantic_seed_limit,
+                ..HybridSearchConfig::default()
+            },
+            None => HybridSearchConfig::default(),
+        }
+    };
     let weight_ppr = args
         .get("weight_ppr")
         .and_then(|v| v.as_f64())
@@ -4508,7 +4523,18 @@ fn tool_project_context(
 
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
-    let config = HybridSearchConfig::default();
+    let config = match current_instance_config() {
+        Some(cfg) => HybridSearchConfig {
+            weight_ppr: cfg.embedding.weight_ppr,
+            weight_bm25: cfg.embedding.weight_bm25,
+            weight_semantic: cfg.embedding.weight_semantic,
+            semantic_limit: cfg.embedding.semantic_search_limit,
+            always_blend_semantic: cfg.embedding.always_blend_semantic,
+            semantic_seed_limit: cfg.embedding.semantic_seed_limit,
+            ..HybridSearchConfig::default()
+        },
+        None => HybridSearchConfig::default(),
+    };
     let mut result = build_brain_context_hybrid_with_aliases(
         store,
         &ppr_seeds,
