@@ -670,7 +670,7 @@ impl GraphStore {
     ///
     /// Both forward and reverse directions are included so that PPR propagates
     /// relevance through the full neighbourhood.
-    fn load_ppr_graph(
+    pub(crate) fn load_ppr_graph(
         &self,
         scope: &GraphScope,
         intent: Option<QueryIntent>,
@@ -1030,6 +1030,19 @@ impl GraphStore {
         if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
             tracing::warn!("lazy PageRank computation failed: {e}");
         }
+    }
+
+    /// Pre-build the PPR adjacency cache for the unified graph scope.
+    ///
+    /// Calling this at daemon startup eliminates the ~350ms first-query
+    /// latency caused by building the adjacency list from the database on
+    /// the first PPR request. The result is stored in `ppr_graph_cache`
+    /// and will be reused by subsequent `personalized_pagerank*` calls
+    /// until the graph generation changes.
+    pub fn warm_ppr_cache(&self) -> Result<(), StoreError> {
+        let scope = GraphScope::unified();
+        self.load_ppr_graph(&scope, None)?;
+        Ok(())
     }
 }
 

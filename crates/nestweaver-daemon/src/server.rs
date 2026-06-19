@@ -2485,6 +2485,18 @@ pub async fn run_server(
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
     });
 
+    // Pre-warm PPR adjacency cache so the first PPR query after startup
+    // hits the cache instead of spending ~350ms rebuilding from the DB.
+    {
+        let store = state.store_read.clone();
+        tokio::task::spawn_blocking(move || {
+            match store.warm_ppr_cache() {
+                Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+                Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+            }
+        });
+    }
+
     // Spawn background embedding model loading when the `embed` feature is on.
     tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
     #[cfg(feature = "embed")]
