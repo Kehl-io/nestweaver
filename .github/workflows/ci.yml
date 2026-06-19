@@ -23,8 +23,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy
+  build-and-check:
+    name: Build, Clippy & Tests
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -48,36 +48,19 @@ jobs:
         run: |
           cargo build -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo apt-get clean
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
-      - name: Configure linker for lbug+tantivy zstd coexistence
-        run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (triggers lbug prebuilt download on first run)
-        run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
-          sleep 2
           cargo build --tests
-      - run: cargo test --no-fail-fast -- --skip daemon_
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --no-fail-fast -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
+      - name: Upload binary for E2E
+        uses: actions/upload-artifact@v7
+        with:
+          name: nestweaver-debug
+          path: target/debug/nestweaver
+          retention-days: 1
 
   coverage:
     name: Coverage
@@ -94,6 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: coverage
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
@@ -130,37 +114,29 @@ jobs:
 
   e2e:
     name: E2E Tests
+    needs: build-and-check
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get clean
-          df -h /
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
-      - name: Configure linker for lbug+tantivy zstd coexistence
-        run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+      - name: Download binary
+        uses: actions/download-artifact@v7
+        with:
+          name: nestweaver-debug
+          path: target/debug
+      - name: Make binary executable
+        run: chmod +x target/debug/nestweaver
       - name: Install frontend dependencies
         working-directory: crates/nestweaver-web/frontend
         run: npm ci
-      - name: Build (triggers lbug prebuilt download on first run)
-        run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
-          sleep 2
-          cargo build
       - name: Index test data
         run: ./target/debug/nestweaver --no-daemon index --repo testdata/js --db /tmp/test.lbug
       - name: Install Playwright browsers
