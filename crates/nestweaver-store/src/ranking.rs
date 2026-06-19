@@ -833,6 +833,44 @@ impl GraphStore {
         let current_gen = self.graph_generation();
         let s_hash = scope_hash(scope);
 
+        // PPR result cache: compute a key from all inputs that affect the result,
+        // including the interaction cache content so that loading new interaction
+        // scores correctly bypasses the cache.
+        let interaction_scores_for_key = self
+            .interaction_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ppr_cache_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut sorted_seeds = seed_uids.to_vec();
+            sorted_seeds.sort();
+            sorted_seeds.hash(&mut hasher);
+            damping.to_bits().hash(&mut hasher);
+            max_iterations.hash(&mut hasher);
+            s_hash.hash(&mut hasher);
+            intent.hash(&mut hasher);
+            current_gen.hash(&mut hasher);
+            // Hash interaction scores so cache is invalidated when they change.
+            if let Some(ref scores) = interaction_scores_for_key {
+                let mut sorted_scores: Vec<(&String, u64)> = scores
+                    .iter()
+                    .map(|(k, v)| (k, v.to_bits()))
+                    .collect();
+                sorted_scores.sort_by_key(|(k, _)| k.as_str());
+                sorted_scores.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        {
+            let mut cache = self.ppr_result_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.get(&ppr_cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         // Step 1: check cache (lock, compare key, unlock).
         let cache_hit = {
             let guard = self
@@ -875,12 +913,8 @@ impl GraphStore {
             .as_ref()
             .expect("ppr_graph_cache must be Some after fill");
 
-        // Clone interaction scores out of the mutex for the algorithms crate.
-        let interaction_scores = self
-            .interaction_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // Use the interaction scores already read for the cache key above.
+        let interaction_scores = interaction_scores_for_key;
 
         let adjacency = AdjacencyData {
             uid_to_idx: cached.uid_to_idx.clone(),
@@ -900,7 +934,14 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        Ok(forward_push_ppr(&uids, &adjacency, seed_uids, &config))
+        let results = forward_push_ppr(&uids, &adjacency, seed_uids, &config);
+
+        {
+            let mut cache = self.ppr_result_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.put(ppr_cache_key, results.clone());
+        }
+
+        Ok(results)
     }
 
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.

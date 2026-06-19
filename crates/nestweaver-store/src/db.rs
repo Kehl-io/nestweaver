@@ -81,6 +81,10 @@ pub struct GraphStore {
     /// LadybugDB (which has no float-array column type). Loaded on open,
     /// saved on mutation via `flush_embedding_index`.
     pub(crate) embedding_index: Mutex<crate::search::EmbeddingIndex>,
+    /// LRU cache for PPR result vectors keyed by a hash of
+    /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
+    /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
+    pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
 }
 
 impl GraphStore {
@@ -99,6 +103,9 @@ impl GraphStore {
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -122,6 +129,9 @@ impl GraphStore {
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
@@ -145,6 +155,9 @@ impl GraphStore {
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         Ok(store)
@@ -192,6 +205,9 @@ impl GraphStore {
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
             embedding_index: Mutex::new(crate::search::EmbeddingIndex::new()),
+            ppr_result_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
         };
         store.init_schema()?;
         Ok(store)
