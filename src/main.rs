@@ -11,7 +11,8 @@ use nestweaver_engine::{
     BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
     FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
+    build_brain_context_hybrid, build_brain_context_hybrid_with_aliases,
+    build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
     discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
@@ -3213,6 +3214,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("No matching symbols") {
+                            // Fall back to hybrid retrieval with semantic leg
+                            let hybrid_config = HybridSearchConfig::default();
+                            match build_brain_context_hybrid(
+                                &store, &seeds, None, &hybrid_config, parsed_intent, None,
+                            ) {
+                                Ok(result) if !result.seeds.is_empty() || !result.connected.is_empty() => {
+                                    let stats = format!(
+                                        "{} seeds, {} connected nodes in {} (semantic fallback)",
+                                        result.seeds.len(),
+                                        result.connected.len(),
+                                        format_elapsed(t0.elapsed())
+                                    );
+                                    if json {
+                                        println!("{}", serde_json::to_string_pretty(&result)?);
+                                    } else {
+                                        for node in result.seeds.iter().chain(result.connected.iter()) {
+                                            println!("  {} — {}", node.uid, node.title);
+                                        }
+                                    }
+                                    return Ok((EXIT_SUCCESS, Some(stats)));
+                                }
+                                _ => {}
+                            }
                             eprintln!("{msg}");
                             Ok((EXIT_NOT_FOUND, None))
                         } else if msg.contains("Ambiguous") {
@@ -10446,6 +10470,24 @@ fn run_embed(
     let t0 = std::time::Instant::now();
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+
+    // Stop daemon if running — embed needs exclusive write access
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let daemon_was_running = if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                eprintln!("Stopping daemon (PID {pid}) for exclusive DB access…");
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+                for _ in 0..50 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if unsafe { libc::kill(pid, 0) } != 0 { break; }
+                }
+                true
+            } else { false }
+        } else { false }
+    } else { false };
+
     let store = nestweaver_store::GraphStore::open(path)
         .map_err(|e| anyhow::anyhow!("failed to open database for writing at {}: {e}", path.display()))?;
 
@@ -10806,6 +10848,14 @@ fn run_embed(
         );
     } else {
         eprintln!("Done: {success_count} embedding(s) generated, {error_count} error(s).");
+    }
+
+    // Drop the store before restarting the daemon
+    drop(store);
+
+    if daemon_was_running {
+        eprintln!("Restarting daemon…");
+        let _ = nestweaver_client::autostart::ensure_daemon(path, None);
     }
 
     if error_count > 0 {
