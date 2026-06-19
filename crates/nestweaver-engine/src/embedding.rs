@@ -28,6 +28,49 @@ pub async fn generate_embedding(
     Ok(embedding)
 }
 
+/// Batch-embed multiple texts in a single API call. The endpoint must be
+/// OpenAI-compatible (`POST /v1/embeddings` with `input` as an array).
+/// Returns one embedding per input text, in the same order.
+pub async fn generate_embeddings_batch(
+    endpoint: &str,
+    model: &str,
+    texts: &[&str],
+) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let url = format!("{}/v1/embeddings", endpoint.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+
+    #[derive(serde::Serialize)]
+    struct Req<'a> {
+        model: &'a str,
+        input: Vec<&'a str>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Vec<RespData>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RespData {
+        embedding: Vec<f32>,
+    }
+
+    let resp: Resp = client
+        .post(&url)
+        .json(&Req {
+            model,
+            input: texts.to_vec(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    Ok(resp.data.into_iter().map(|d| d.embedding).collect())
+}
+
 pub fn cache_embedding(
     cache_dir: &Path,
     hash: &str,

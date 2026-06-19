@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
@@ -11,7 +12,21 @@ use crate::ranking::SeedResolutionConfig;
 // EmbeddingIndex
 // ---------------------------------------------------------------------------
 
-/// In-memory embedding index backed by a JSON sidecar file.
+/// In-memory embedding index backed by a binary sidecar file.
+///
+/// Binary format (v1):
+/// ```text
+/// [header: 16 bytes]
+///   magic: b"NWEM" (4 bytes)
+///   version: u32 LE (4 bytes) = 1
+///   dimension: u32 LE (4 bytes)
+///   count: u32 LE (4 bytes)
+/// [uid table: count entries]
+///   uid_len: u16 LE (2 bytes)
+///   uid: [u8; uid_len]
+/// [vectors: count * dimension * 4 bytes]
+///   Contiguous f32 LE array, one vector per row
+/// ```
 pub struct EmbeddingIndex {
     embeddings: HashMap<String, Vec<f32>>, // uid -> embedding vector
 }
@@ -45,13 +60,127 @@ impl EmbeddingIndex {
         Ok(Self { embeddings })
     }
 
-    /// Return the top-`limit` (uid, cosine_similarity) pairs sorted descending.
+    // -- Binary persistence -------------------------------------------------
+
+    /// Write the index in the compact binary sidecar format.
+    pub fn save_binary(&self, path: &Path) -> Result<(), anyhow::Error> {
+        use std::io::Write;
+        let dim = self.dimension().unwrap_or(0);
+        let count = self.embeddings.len() as u32;
+
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+
+        // Header
+        file.write_all(b"NWEM")?;
+        file.write_all(&1u32.to_le_bytes())?; // version
+        file.write_all(&(dim as u32).to_le_bytes())?;
+        file.write_all(&count.to_le_bytes())?;
+
+        // Collect keys in deterministic order
+        let mut entries: Vec<(&String, &Vec<f32>)> = self.embeddings.iter().collect();
+        entries.sort_by_key(|(k, _)| k.as_str());
+
+        // UID table
+        for (uid, _) in &entries {
+            let bytes = uid.as_bytes();
+            file.write_all(&(bytes.len() as u16).to_le_bytes())?;
+            file.write_all(bytes)?;
+        }
+
+        // Vectors (contiguous f32 LE)
+        for (_, vec) in &entries {
+            for &val in vec.iter() {
+                file.write_all(&val.to_le_bytes())?;
+            }
+        }
+
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Read the index from the compact binary sidecar format.
+    pub fn load_binary(path: &Path) -> Result<Self, anyhow::Error> {
+        let data = std::fs::read(path)?;
+        if data.len() < 16 {
+            anyhow::bail!("embedding file too small");
+        }
+        if &data[0..4] != b"NWEM" {
+            anyhow::bail!("invalid embedding file magic");
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into()?);
+        if version != 1 {
+            anyhow::bail!("unsupported embedding file version {version}");
+        }
+        let dim = u32::from_le_bytes(data[8..12].try_into()?) as usize;
+        let count = u32::from_le_bytes(data[12..16].try_into()?) as usize;
+
+        let mut offset = 16;
+        let mut uids = Vec::with_capacity(count);
+
+        // Read UID table
+        for _ in 0..count {
+            if offset + 2 > data.len() {
+                anyhow::bail!("truncated uid table");
+            }
+            let uid_len = u16::from_le_bytes(data[offset..offset + 2].try_into()?) as usize;
+            offset += 2;
+            if offset + uid_len > data.len() {
+                anyhow::bail!("truncated uid");
+            }
+            let uid = std::str::from_utf8(&data[offset..offset + uid_len])?.to_string();
+            offset += uid_len;
+            uids.push(uid);
+        }
+
+        // Read vectors
+        let vec_bytes = count * dim * 4;
+        if offset + vec_bytes > data.len() {
+            anyhow::bail!("truncated vectors");
+        }
+
+        let mut embeddings = HashMap::with_capacity(count);
+        for (i, uid) in uids.into_iter().enumerate() {
+            let start = offset + i * dim * 4;
+            let vec: Vec<f32> = (0..dim)
+                .map(|j| {
+                    f32::from_le_bytes(data[start + j * 4..start + j * 4 + 4].try_into().unwrap())
+                })
+                .collect();
+            embeddings.insert(uid, vec);
+        }
+
+        Ok(Self { embeddings })
+    }
+
+    /// Return the top-`limit` (uid, similarity) pairs sorted descending.
+    ///
+    /// Uses rayon for parallel iteration and assumes stored embeddings are
+    /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
     pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
+        let query_norm: f64 = query_vec
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt();
+        if query_norm == 0.0 {
+            return vec![];
+        }
+
         let mut scores: Vec<(String, f64)> = self
             .embeddings
             .iter()
-            .map(|(uid, emb)| (uid.clone(), cosine_similarity(query_vec, emb)))
+            .map(|(uid, emb)| {
+                // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
+                let dot: f64 = emb
+                    .iter()
+                    .zip(query_vec.iter())
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum();
+                let sim = dot / query_norm;
+                (uid.clone(), sim)
+            })
             .collect();
+
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(limit);
         scores
@@ -69,6 +198,46 @@ impl EmbeddingIndex {
     /// vector found), or `None` if the index is empty.
     pub fn dimension(&self) -> Option<usize> {
         self.embeddings.values().next().map(|v| v.len())
+    }
+
+    /// Like `vector_search`, but pre-filters embeddings whose UID contains `uid_prefix`.
+    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    pub fn vector_search_filtered(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        uid_prefix: Option<&str>,
+    ) -> Vec<(String, f64)> {
+        let query_norm: f64 = query_vec
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt();
+        if query_norm == 0.0 {
+            return vec![];
+        }
+
+        let mut scores: Vec<(String, f64)> = self
+            .embeddings
+            .iter()
+            .filter(|(uid, _)| match uid_prefix {
+                Some(prefix) => uid.contains(prefix),
+                None => true,
+            })
+            .map(|(uid, emb)| {
+                let dot: f64 = emb
+                    .iter()
+                    .zip(query_vec.iter())
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum();
+                let sim = dot / query_norm;
+                (uid.clone(), sim)
+            })
+            .collect();
+
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(limit);
+        scores
     }
 
     /// Look up the embedding for a given UID.
@@ -330,6 +499,64 @@ mod tests {
             .hybrid_search("zzznomatch", None, None, 10, &empty_seed_resolution())
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn binary_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:alpha", vec![0.1, 0.2, 0.3]);
+        idx.add("sym:beta", vec![0.4, 0.5, 0.6]);
+        idx.add("sym:gamma", vec![0.7, 0.8, 0.9]);
+        idx.save_binary(&path).unwrap();
+
+        let loaded = EmbeddingIndex::load_binary(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+
+        // Verify each vector survived the round-trip
+        for uid in &["sym:alpha", "sym:beta", "sym:gamma"] {
+            let orig = idx.get(uid).unwrap();
+            let rt = loaded.get(uid).unwrap();
+            assert_eq!(orig, rt, "round-trip mismatch for {uid}");
+        }
+    }
+
+    #[test]
+    fn binary_empty_index_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+
+        let idx = EmbeddingIndex::new();
+        idx.save_binary(&path).unwrap();
+
+        let loaded = EmbeddingIndex::load_binary(&path).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn binary_load_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.bin");
+        std::fs::write(&path, b"BADMxxxxxxxxxxxx").unwrap();
+
+        match EmbeddingIndex::load_binary(&path) {
+            Ok(_) => panic!("should reject bad magic"),
+            Err(e) => assert!(
+                format!("{e}").contains("invalid embedding file magic"),
+                "unexpected error: {e}",
+            ),
+        }
+    }
+
+    #[test]
+    fn binary_load_rejects_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        std::fs::write(&path, b"NWEM").unwrap(); // only 4 bytes, need 16
+
+        assert!(matches!(EmbeddingIndex::load_binary(&path), Err(_)));
     }
 
     #[test]

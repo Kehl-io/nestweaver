@@ -340,23 +340,40 @@ impl GraphStore {
 
     // ── Embedding sidecar helpers ────────────────────────────────────────
 
-    /// Load the embedding index from the `<db>.embeddings` sidecar.
-    /// Returns an empty index when the file is absent or corrupt.
+    /// Load the embedding index from the binary sidecar (`<db>.embeddings.bin`),
+    /// falling back to the legacy JSON sidecar (`<db>.embeddings`).
+    /// Returns an empty index when neither file exists or both are corrupt.
     fn load_embedding_index(db_path: &Path) -> crate::search::EmbeddingIndex {
-        let sidecar = Self::embedding_sidecar_for(db_path);
-        crate::search::EmbeddingIndex::load(&sidecar).unwrap_or_default()
+        let binary_path = Self::embedding_sidecar_binary_for(db_path);
+        if binary_path.exists() {
+            if let Ok(idx) = crate::search::EmbeddingIndex::load_binary(&binary_path) {
+                return idx;
+            }
+        }
+        let json_path = Self::embedding_sidecar_json_for(db_path);
+        crate::search::EmbeddingIndex::load(&json_path).unwrap_or_default()
     }
 
-    /// Compute the sidecar path for a given database path.
-    fn embedding_sidecar_for(db_path: &Path) -> std::path::PathBuf {
+    /// Compute the legacy JSON sidecar path for a given database path.
+    fn embedding_sidecar_json_for(db_path: &Path) -> std::path::PathBuf {
         let mut s = db_path.as_os_str().to_owned();
         s.push(".embeddings");
         std::path::PathBuf::from(s)
     }
 
-    /// Return the path to the embedding sidecar file, or `None` for in-memory stores.
+    /// Compute the binary sidecar path for a given database path.
+    fn embedding_sidecar_binary_for(db_path: &Path) -> std::path::PathBuf {
+        let mut s = db_path.as_os_str().to_owned();
+        s.push(".embeddings.bin");
+        std::path::PathBuf::from(s)
+    }
+
+    /// Return the path to the embedding sidecar file (binary format),
+    /// or `None` for in-memory stores.
     pub fn embedding_sidecar_path(&self) -> Option<std::path::PathBuf> {
-        self.db_path.as_ref().map(|p| Self::embedding_sidecar_for(p))
+        self.db_path
+            .as_ref()
+            .map(|p| Self::embedding_sidecar_binary_for(p))
     }
 
     /// Add an embedding to the in-memory index without saving to disk.
@@ -372,13 +389,13 @@ impl GraphStore {
         idx.get(uid).is_some()
     }
 
-    /// Persist the in-memory embedding index to the sidecar file.
+    /// Persist the in-memory embedding index to the binary sidecar file.
     /// No-op for in-memory stores.
     pub fn flush_embedding_index(&self) -> Result<(), StoreError> {
         let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(path) = self.embedding_sidecar_path() {
-            idx.save(&path)
-                .map_err(|e| StoreError::Query(format!("save embedding sidecar: {e}")))?;
+            idx.save_binary(&path)
+                .map_err(|e| StoreError::Query(format!("save binary embedding sidecar: {e}")))?;
         }
         Ok(())
     }
@@ -388,6 +405,19 @@ impl GraphStore {
     pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
         let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
         idx.vector_search(query_embedding, limit)
+    }
+
+    /// Perform a filtered vector similarity search over the embedding index.
+    /// Only embeddings whose UID contains `uid_prefix` are considered.
+    /// When `uid_prefix` is `None`, behaves identically to `vector_search`.
+    pub fn vector_search_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        uid_prefix: Option<&str>,
+    ) -> Vec<(String, f64)> {
+        let idx = self.embedding_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.vector_search_filtered(query_embedding, limit, uid_prefix)
     }
 
     /// Return the dimensionality of embeddings in the sidecar index,

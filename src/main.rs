@@ -14,7 +14,7 @@ use nestweaver_engine::{
     build_brain_context_hybrid_with_aliases,
     build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embedding, expand_query_with_aliases,
+    discover_cross_domain_links, embedding::{generate_embedding, generate_embeddings_batch}, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
@@ -10554,22 +10554,24 @@ fn run_embed(
             };
             let total = to_embed.len();
             if total > 0 {
-                eprintln!("Embedding {total} symbol(s) via API…");
-                for (i, sym) in to_embed.iter().enumerate() {
-                    eprint!("\rEmbedding symbols... {}/{total}", i + 1);
-                    let text = if sym.signature.is_empty() {
-                        sym.name.clone()
-                    } else {
-                        sym.signature.clone()
-                    };
-                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
-                        Ok(embedding) => {
-                            store.add_embedding(&sym.uid, embedding);
-                            success_count += 1;
+                eprintln!("Embedding {total} symbol(s) via API (batch size {batch_size})…");
+                for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    let done = batch_idx * batch_size + chunk.len();
+                    eprint!("\rEmbedding symbols... {done}/{total}");
+                    let texts: Vec<String> = chunk.iter().map(|sym| {
+                        if sym.signature.is_empty() { sym.name.clone() } else { sym.signature.clone() }
+                    }).collect();
+                    let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+                    match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
+                        Ok(embeddings) => {
+                            for (sym, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                                store.add_embedding(&sym.uid, emb);
+                                success_count += 1;
+                            }
                         }
                         Err(e) => {
-                            eprintln!("\n    Warning: embedding API error for {}: {e}", sym.uid);
-                            error_count += 1;
+                            eprintln!("\n    Warning: batch embedding API error: {e}");
+                            error_count += chunk.len();
                         }
                     }
                 }
@@ -10589,18 +10591,22 @@ fn run_embed(
             };
             let total = to_embed.len();
             if total > 0 {
-                eprintln!("Embedding {total} note(s) via API…");
-                for (i, note) in to_embed.iter().enumerate() {
-                    eprint!("\rEmbedding notes... {}/{total}", i + 1);
-                    let text = note.title.clone();
-                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
-                        Ok(embedding) => {
-                            store.add_embedding(&note.uid, embedding);
-                            success_count += 1;
+                eprintln!("Embedding {total} note(s) via API (batch size {batch_size})…");
+                for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    let done = batch_idx * batch_size + chunk.len();
+                    eprint!("\rEmbedding notes... {done}/{total}");
+                    let texts: Vec<String> = chunk.iter().map(|n| n.title.clone()).collect();
+                    let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+                    match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
+                        Ok(embeddings) => {
+                            for (note, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                                store.add_embedding(&note.uid, emb);
+                                success_count += 1;
+                            }
                         }
                         Err(e) => {
-                            eprintln!("\n    Warning: embedding API error for {}: {e}", note.uid);
-                            error_count += 1;
+                            eprintln!("\n    Warning: batch embedding API error: {e}");
+                            error_count += chunk.len();
                         }
                     }
                 }
@@ -10632,26 +10638,32 @@ fn run_embed(
                     .map(|n| (n.uid.as_str(), n.title.as_str()))
                     .collect();
 
-                eprintln!("Embedding {total} heading(s) via API…");
-                for (i, h) in to_embed.iter().enumerate() {
-                    eprint!("\rEmbedding headings... {}/{total}", i + 1);
-                    let note_title = note_titles
-                        .get(h.note_uid.as_str())
-                        .copied()
-                        .unwrap_or("");
-                    let text = if note_title.is_empty() {
-                        h.text.clone()
-                    } else {
-                        format!("{note_title} > {}", h.text)
-                    };
-                    match rt.block_on(generate_embedding(ep, api_model, &text)) {
-                        Ok(embedding) => {
-                            store.add_embedding(&h.uid, embedding);
-                            success_count += 1;
+                eprintln!("Embedding {total} heading(s) via API (batch size {batch_size})…");
+                for (batch_idx, chunk) in to_embed.chunks(batch_size).enumerate() {
+                    let done = batch_idx * batch_size + chunk.len();
+                    eprint!("\rEmbedding headings... {done}/{total}");
+                    let texts: Vec<String> = chunk.iter().map(|h| {
+                        let note_title = note_titles
+                            .get(h.note_uid.as_str())
+                            .copied()
+                            .unwrap_or("");
+                        if note_title.is_empty() {
+                            h.text.clone()
+                        } else {
+                            format!("{note_title} > {}", h.text)
+                        }
+                    }).collect();
+                    let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+                    match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
+                        Ok(embeddings) => {
+                            for (h, emb) in chunk.iter().zip(embeddings.into_iter()) {
+                                store.add_embedding(&h.uid, emb);
+                                success_count += 1;
+                            }
                         }
                         Err(e) => {
-                            eprintln!("\n    Warning: embedding API error for {}: {e}", h.uid);
-                            error_count += 1;
+                            eprintln!("\n    Warning: batch embedding API error: {e}");
+                            error_count += chunk.len();
                         }
                     }
                 }
