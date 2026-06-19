@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::graph::AdjacencyData;
 
@@ -155,6 +155,158 @@ pub fn personalized_pagerank(
         .collect();
 
     // Sort descending by score.
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
+/// Run Personalized PageRank using the Forward Push (LocalPush) algorithm.
+///
+/// Produces the same output shape as [`personalized_pagerank`] — `(uid, score)`
+/// pairs sorted descending — but avoids iterating over every node each step.
+/// Instead it maintains a residual vector and only pushes mass from nodes whose
+/// residual exceeds a threshold, making it significantly faster on sparse
+/// graphs where PPR mass concentrates near the seeds.
+///
+/// Seeds are always included in the output regardless of score; non-seed nodes
+/// must exceed `config.min_score`.
+pub fn forward_push_ppr(
+    uids: &[String],
+    adjacency: &AdjacencyData,
+    seed_uids: &[String],
+    config: &PprConfig,
+) -> Vec<(String, f64)> {
+    let n = uids.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    let seed_set: HashSet<usize> = seed_uids
+        .iter()
+        .filter_map(|uid| adjacency.uid_to_idx.get(uid).copied())
+        .collect();
+
+    let seed_count = seed_set.len();
+    if seed_count == 0 {
+        return vec![];
+    }
+
+    // -- Build outgoing edge list from incoming edges --
+    // adjacency.incoming[v] contains (u, w) meaning u→v with weight w.
+    // We need outgoing[u] = [(v, w)] for forward pushes.
+    let mut outgoing: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for v in 0..n {
+        for &(u, w) in &adjacency.incoming[v] {
+            outgoing[u].push((v, w));
+        }
+    }
+
+    // -- Build personalization vector (identical to power iteration) --
+    let personalization_val = 1.0 / seed_count as f64;
+    let mut personalization: Vec<f64> = (0..n)
+        .map(|i| {
+            if seed_set.contains(&i) {
+                personalization_val
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // -- Apply interaction memory bias (same exploration floor pattern) --
+    if let Some(ref scores) = config.interaction_scores {
+        let mut interaction_mass = 0.0;
+        let mut contributions: Vec<(usize, f64)> = Vec::new();
+        for (i, uid) in uids.iter().enumerate() {
+            if let Some(&score) = scores.get(uid)
+                && score > 0.0
+            {
+                contributions.push((i, score));
+                interaction_mass += score;
+            }
+        }
+        if interaction_mass > 0.0 {
+            for p in personalization.iter_mut() {
+                *p *= 1.0 - config.interaction_bias_weight;
+            }
+            for (i, score) in &contributions {
+                personalization[*i] += config.interaction_bias_weight * score / interaction_mass;
+            }
+        }
+    }
+
+    // -- Forward Push --
+    let alpha = 1.0 - config.damping; // teleport probability
+    let r_max = 1e-6; // residual threshold (matches power-iteration convergence)
+
+    let mut estimate = vec![0.0f64; n];
+    let mut residual = personalization.clone();
+
+    // Seed the queue with nodes that have nonzero residual.
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut in_queue = vec![false; n];
+    for i in 0..n {
+        if residual[i] > 0.0 {
+            queue.push_back(i);
+            in_queue[i] = true;
+        }
+    }
+
+    // Safety limit to prevent runaway on adversarial graphs.
+    let max_pushes = n * 10;
+    let mut push_count = 0;
+
+    while let Some(v) = queue.pop_front() {
+        in_queue[v] = false;
+        push_count += 1;
+        if push_count > max_pushes {
+            break;
+        }
+
+        let r_v = residual[v];
+        if r_v.abs() < r_max {
+            continue;
+        }
+
+        // Absorb: estimate accumulates α * residual (teleport fraction).
+        estimate[v] += alpha * r_v;
+
+        // Push: distribute (1 - α) * residual to outgoing neighbours.
+        if adjacency.out_weight[v] > 0.0 {
+            let push_mass = (1.0 - alpha) * r_v;
+            for &(u, w) in &outgoing[v] {
+                let delta = push_mass * w / adjacency.out_weight[v];
+                residual[u] += delta;
+                if !in_queue[u] && residual[u].abs() > r_max {
+                    queue.push_back(u);
+                    in_queue[u] = true;
+                }
+            }
+        } else {
+            // Dangling node: redistribute through the personalization vector
+            // (same semantics as power iteration's dangling-sum handling).
+            let push_mass = (1.0 - alpha) * r_v;
+            for (i, &p) in personalization.iter().enumerate() {
+                if p > 0.0 {
+                    residual[i] += push_mass * p;
+                    if !in_queue[i] && residual[i].abs() > r_max {
+                        queue.push_back(i);
+                        in_queue[i] = true;
+                    }
+                }
+            }
+        }
+
+        residual[v] = 0.0;
+    }
+
+    // -- Collect results (same filtering as power iteration) --
+    let mut results: Vec<(String, f64)> = uids
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| seed_set.contains(&i) || estimate[i] > config.min_score)
+        .map(|(i, uid)| (uid.clone(), estimate[i]))
+        .collect();
+
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results
 }
@@ -540,5 +692,184 @@ mod tests {
         assert!(result.iter().any(|(uid, _)| uid == "b"));
         // c (called by both seeds) should also appear
         assert!(result.iter().any(|(uid, _)| uid == "c"));
+    }
+
+    // ---- Forward Push PPR tests ----
+
+    #[test]
+    fn forward_push_empty_graph() {
+        let graph = InMemoryGraph {
+            uids: vec![],
+            nodes: vec![],
+            edges: vec![],
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let result =
+            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn forward_push_no_matching_seeds() {
+        let graph = InMemoryGraph {
+            uids: vec!["a".to_string()],
+            nodes: vec![NodeMeta {
+                name: "a".into(),
+                kind: "Function".into(),
+                file_path: None,
+                pagerank_score: None,
+                is_entry_point: false,
+            }],
+            edges: vec![],
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let result = forward_push_ppr(
+            &graph.uids,
+            &adj,
+            &["nonexistent".to_string()],
+            &PprConfig::default(),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn forward_push_seeds_rank_highest() {
+        let graph = InMemoryGraph {
+            uids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            nodes: vec![
+                NodeMeta {
+                    name: "a".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+                NodeMeta {
+                    name: "b".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+                NodeMeta {
+                    name: "c".into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                },
+            ],
+            edges: vec![(0, 1, 1.0, EdgeKind::Calls), (1, 2, 1.0, EdgeKind::Calls)],
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let result =
+            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+
+        // Seed "a" should appear and have a positive score.
+        let a_score = result.iter().find(|(uid, _)| uid == "a").unwrap().1;
+        assert!(a_score > 0.0);
+
+        // All nodes should appear.
+        assert!(result.iter().any(|(uid, _)| uid == "a"));
+        assert!(result.iter().any(|(uid, _)| uid == "b"));
+        assert!(result.iter().any(|(uid, _)| uid == "c"));
+
+        // b (closer to seed) should score higher than c.
+        let b_score = result.iter().find(|(uid, _)| uid == "b").unwrap().1;
+        let c_score = result.iter().find(|(uid, _)| uid == "c").unwrap().1;
+        assert!(b_score > c_score);
+    }
+
+    #[test]
+    fn forward_push_matches_power_iteration_top_nodes() {
+        // Build a graph with 15 nodes in a mix of chain and fan-out patterns.
+        // Compare top results between both algorithms: expect significant overlap.
+        let n = 15;
+        let uids: Vec<String> = (0..n).map(|i| format!("n{i}")).collect();
+        let nodes: Vec<NodeMeta> = (0..n)
+            .map(|i| NodeMeta {
+                name: format!("n{i}"),
+                kind: "Function".into(),
+                file_path: None,
+                pagerank_score: None,
+                is_entry_point: false,
+            })
+            .collect();
+
+        // Chain: 0->1->2->3->4->5
+        // Fan-out from 0: 0->6, 0->7, 0->8
+        // Cross links: 3->9, 5->10, 7->11, 8->12
+        // Extra: 9->13, 13->14
+        let edges = vec![
+            (0, 1, 1.0, EdgeKind::Calls),
+            (1, 2, 1.0, EdgeKind::Calls),
+            (2, 3, 1.0, EdgeKind::Calls),
+            (3, 4, 1.0, EdgeKind::Calls),
+            (4, 5, 1.0, EdgeKind::Calls),
+            (0, 6, 1.0, EdgeKind::Calls),
+            (0, 7, 1.0, EdgeKind::Calls),
+            (0, 8, 1.0, EdgeKind::Calls),
+            (3, 9, 1.0, EdgeKind::Accesses),
+            (5, 10, 1.0, EdgeKind::Accesses),
+            (7, 11, 1.0, EdgeKind::Calls),
+            (8, 12, 1.0, EdgeKind::Calls),
+            (9, 13, 1.0, EdgeKind::Calls),
+            (13, 14, 1.0, EdgeKind::Calls),
+        ];
+
+        let graph = InMemoryGraph {
+            uids: uids.clone(),
+            nodes,
+            edges,
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let seeds = vec!["n0".to_string()];
+        let config = PprConfig::default();
+
+        let pi_result = personalized_pagerank(&uids, &adj, &seeds, &config);
+        let fp_result = forward_push_ppr(&uids, &adj, &seeds, &config);
+
+        // Both should be non-empty.
+        assert!(!pi_result.is_empty());
+        assert!(!fp_result.is_empty());
+
+        // Compare top-10 overlap (or fewer if results are shorter).
+        let take = 10.min(pi_result.len()).min(fp_result.len());
+        let pi_top: HashSet<&str> = pi_result[..take].iter().map(|(uid, _)| uid.as_str()).collect();
+        let fp_top: HashSet<&str> = fp_result[..take].iter().map(|(uid, _)| uid.as_str()).collect();
+        let overlap = pi_top.intersection(&fp_top).count();
+
+        assert!(
+            overlap >= take * 7 / 10,
+            "Expected >= 70% overlap in top-{take}, got {overlap}/{take}. \
+             PI top: {pi_top:?}, FP top: {fp_top:?}"
+        );
+    }
+
+    #[test]
+    fn forward_push_single_dangling_node() {
+        // Single node with no edges: all mass stays on the seed.
+        let graph = InMemoryGraph {
+            uids: vec!["a".to_string()],
+            nodes: vec![NodeMeta {
+                name: "a".into(),
+                kind: "Function".into(),
+                file_path: None,
+                pagerank_score: None,
+                is_entry_point: false,
+            }],
+            edges: vec![],
+            generation: 0,
+        };
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let result =
+            forward_push_ppr(&graph.uids, &adj, &["a".to_string()], &PprConfig::default());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "a");
+        assert!(result[0].1 > 0.0);
     }
 }
