@@ -105,6 +105,7 @@ nestweaver-embed = { workspace = true, optional = true }
 [features]
 default = ["embed"]
 embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
+metal = ["nestweaver-embed?/metal"]
 
 [dev-dependencies]
 assert_cmd = "2"

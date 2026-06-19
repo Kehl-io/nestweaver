@@ -123,14 +123,14 @@ impl LocalModel {
     }
 }
 
+#[allow(unused_mut)]
 fn candidate_devices() -> Vec<Device> {
-    let mut devices = Vec::new();
+    let mut devices = vec![Device::Cpu];
     #[cfg(feature = "metal")]
     {
         if let Ok(device) = Device::new_metal(0) {
-            devices.push(device);
+            devices.insert(0, device);
         }
     }
-    devices.push(Device::Cpu);
     devices
 }
