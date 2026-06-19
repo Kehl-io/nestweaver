@@ -24,4 +24,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = ["metal"]
-metal = ["candle-core/metal"]
+metal = ["candle-core/metal", "candle-nn/metal"]
