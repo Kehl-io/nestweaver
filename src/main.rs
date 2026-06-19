@@ -3064,80 +3064,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
         } => {
-            // ── daemon guard (typed GetContext RPC) ───────────────
-            // Route through the daemon when JSON output is requested and
-            // we're in normal seed-based mode (not --feature, which
-            // requires config-file processing the daemon doesn't handle
-            // for this legacy command).
-            if json && feature.is_none() && use_daemon {
-                let db_default = default_db_path();
-                let db_path = db.as_deref().unwrap_or(&db_default);
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                        db_path,
-                        config.as_deref(),
-                    ));
-                    if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::BrainContextRequest {
-                            seeds: seeds.clone(),
-                            token_budget: token_budget.unwrap_or(0) as i32,
-                            response_format: String::new(),
-                            repos: vec![],
-                            vaults: vec![],
-                            kinds: vec![],
-                            path_prefix: String::new(),
-                            tags: vec![],
-                            exclude_tags: vec![],
-                            weight_ppr: 0.0,
-                            weight_bm25: 0.0,
-                            intent: intent.clone().unwrap_or_default(),
-                            include_seeds: true,
-                            include_bodies: false,
-                            root: String::new(),
-                            prf: false,
-                            rerank: false,
-                            weight_semantic: 0.0,
-                            since: String::new(),
-                            recency_weight: 0.0,
-                            recency_half_life_days: 0.0,
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .get_context(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        if let Ok(resp) = rpc {
-                            let result: nestweaver_engine::BrainContextResult =
-                                serde_json::from_str(&resp.result_json)?;
-                            let cut = match token_budget {
-                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
-                                None => limit.unwrap_or(30).min(result.connected.len()),
-                            };
-                            print_brain_context_json(&result, cut)?;
-                            let stats = format!(
-                                "{} seeds, {} connected nodes in {} (via daemon)",
-                                result.seeds.len(),
-                                cut,
-                                format_elapsed(t0.elapsed())
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
-                        }
-                    }
-                }
-            }
-
-            let store = open_store(db.as_deref())?;
-
             let parsed_intent: Option<QueryIntent> = intent
                 .as_deref()
                 .map(|s| s.parse())
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
 
+            // ── Feature-mode: always local (requires config processing) ──
             if let Some(feature_name) = &feature {
-                // Feature-mode: resolve via instance config.
+                let store = open_store(db.as_deref())?;
                 let config_path = config
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
@@ -3176,109 +3111,131 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         } else {
                             print_feature_context_text(&result);
                         }
-                        Ok((EXIT_SUCCESS, Some(stats)))
+                        return Ok((EXIT_SUCCESS, Some(stats)));
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("No symbols found") {
                             eprintln!("{msg}");
-                            Ok((EXIT_NOT_FOUND, None))
+                            return Ok((EXIT_NOT_FOUND, None));
                         } else {
                             eprintln!("Error: {msg}");
-                            Ok((EXIT_ERROR, None))
+                            return Ok((EXIT_ERROR, None));
                         }
                     }
                 }
-            } else {
-                // Normal seed-based context.
-                match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
-                    Ok(mut result) => {
-                        if let Some(budget) = token_budget {
-                            let cut = context_token_budgeted_truncate(&result.connected, budget);
-                            result.connected.truncate(cut);
-                        }
-                        let stats = format!(
-                            "{} seeds, {} connected nodes in {}",
-                            result.seeds.len(),
-                            result.connected.len(),
-                            format_elapsed(t0.elapsed())
-                        );
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&result)?);
-                        } else {
-                            print_context_text(&result);
-                        }
-                        Ok((EXIT_SUCCESS, Some(stats)))
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("No matching symbols") {
-                            // Fall back to daemon-routed brain_context (has semantic leg)
-                            let db_path = db.clone().unwrap_or_else(default_db_path);
-                            let rt = tokio::runtime::Runtime::new()?;
-                            if let Ok(mut client) = rt.block_on(
-                                nestweaver_client::DaemonClient::connect(&db_path, None),
-                            ) {
-                                let req = nestweaver_proto::BrainContextRequest {
-                                    seeds: seeds.clone(),
-                                    token_budget: token_budget.unwrap_or(0) as i32,
-                                    response_format: String::new(),
-                                    repos: vec![],
-                                    vaults: vec![],
-                                    kinds: vec![],
-                                    path_prefix: String::new(),
-                                    tags: vec![],
-                                    exclude_tags: vec![],
-                                    weight_ppr: 0.0,
-                                    weight_bm25: 0.0,
-                                    intent: String::new(),
-                                    include_seeds: true,
-                                    include_bodies: false,
-                                    root: String::new(),
-                                    prf: false,
-                                    rerank: false,
-                                    weight_semantic: 0.0,
-                                    since: String::new(),
-                                    recency_weight: 0.0,
-                                    recency_half_life_days: 0.0,
-                                };
-                                let rpc = rt.block_on(async {
-                                    client
-                                        .inner_mut()
-                                        .get_context(req)
-                                        .await
-                                        .map(|r| r.into_inner())
-                                });
-                                if let Ok(resp) = rpc {
-                                    if let Ok(result) = serde_json::from_str::<nestweaver_engine::BrainContextResult>(&resp.result_json) {
-                                        if !result.seeds.is_empty() || !result.connected.is_empty() {
-                                            let stats = format!(
-                                                "{} seeds, {} connected in {} (semantic fallback)",
-                                                result.seeds.len(),
-                                                result.connected.len(),
-                                                format_elapsed(t0.elapsed())
-                                            );
-                                            if json {
-                                                println!("{}", serde_json::to_string_pretty(&result)?);
-                                            } else {
-                                                for node in result.seeds.iter().chain(result.connected.iter()) {
-                                                    println!("  {} — {}", node.uid, node.title);
-                                                }
-                                            }
-                                            return Ok((EXIT_SUCCESS, Some(stats)));
-                                        }
+            }
+
+            // ── Seed-based context: always try daemon first ──────────
+            // The daemon runs the full hybrid pipeline (PPR + BM25 +
+            // semantic) so we get better results and avoid the ~300ms
+            // double-RPC latency of the old name-resolution-then-fallback
+            // pattern.
+            let effective_limit = limit.unwrap_or(30);
+            if use_daemon {
+                let db_default = default_db_path();
+                let db_path = db.as_deref().unwrap_or(&db_default);
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                        db_path,
+                        config.as_deref(),
+                    ));
+                    if let Ok(mut client) = connect {
+                        let req = nestweaver_proto::BrainContextRequest {
+                            seeds: seeds.clone(),
+                            token_budget: token_budget.unwrap_or(0) as i32,
+                            response_format: String::new(),
+                            repos: vec![],
+                            vaults: vec![],
+                            kinds: vec![],
+                            path_prefix: String::new(),
+                            tags: vec![],
+                            exclude_tags: vec![],
+                            weight_ppr: 0.0,
+                            weight_bm25: 0.0,
+                            intent: intent.clone().unwrap_or_default(),
+                            include_seeds: true,
+                            include_bodies: false,
+                            root: String::new(),
+                            prf: false,
+                            rerank: false,
+                            weight_semantic: 0.0,
+                            since: String::new(),
+                            recency_weight: 0.0,
+                            recency_half_life_days: 0.0,
+                        };
+                        let rpc = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .get_context(req)
+                                .await
+                                .map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                let result: nestweaver_engine::BrainContextResult =
+                                    serde_json::from_str(&resp.result_json)?;
+                                let cut = match token_budget {
+                                    Some(budget) => {
+                                        token_budgeted_truncate(&result.connected, budget)
                                     }
+                                    None => effective_limit.min(result.connected.len()),
+                                };
+                                if json {
+                                    print_brain_context_json(&result, cut)?;
+                                } else {
+                                    print_brain_context_text(&result, cut, token_budget);
                                 }
+                                let stats = format!(
+                                    "{} seeds, {} connected nodes in {} (via daemon)",
+                                    result.seeds.len(),
+                                    cut,
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
                             }
-                            eprintln!("{msg}");
-                            Ok((EXIT_NOT_FOUND, None))
-                        } else if msg.contains("Ambiguous") {
-                            eprintln!("{msg}");
-                            Ok((EXIT_AMBIGUOUS, None))
-                        } else {
-                            eprintln!("Error: {msg}");
-                            Ok((EXIT_ERROR, None))
+                            Err(e) => {
+                                eprintln!(
+                                    "Daemon RPC failed, falling back to local: {e}"
+                                );
+                            }
                         }
+                    }
+                }
+            }
+
+            // ── Local fallback (daemon unavailable) ──────────────────
+            let store = open_store(db.as_deref())?;
+            match build_context_with_intent(&store, &seeds, parsed_intent, limit) {
+                Ok(mut result) => {
+                    if let Some(budget) = token_budget {
+                        let cut = context_token_budgeted_truncate(&result.connected, budget);
+                        result.connected.truncate(cut);
+                    }
+                    let stats = format!(
+                        "{} seeds, {} connected nodes in {} (local fallback)",
+                        result.seeds.len(),
+                        result.connected.len(),
+                        format_elapsed(t0.elapsed())
+                    );
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        print_context_text(&result);
+                    }
+                    Ok((EXIT_SUCCESS, Some(stats)))
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No matching symbols") || msg.contains("No symbols found") {
+                        eprintln!("{msg}");
+                        Ok((EXIT_NOT_FOUND, None))
+                    } else if msg.contains("Ambiguous") {
+                        eprintln!("{msg}");
+                        Ok((EXIT_AMBIGUOUS, None))
+                    } else {
+                        eprintln!("Error: {msg}");
+                        Ok((EXIT_ERROR, None))
                     }
                 }
             }

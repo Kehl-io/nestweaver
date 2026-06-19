@@ -60,6 +60,7 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
+        let t0 = std::time::Instant::now();
         self.state.idle_notify.notify_one();
         self.state
             .active_connections
@@ -76,10 +77,18 @@ impl DaemonService {
             guard.clone()
         };
 
+        let tool_name_for_log = tool_name.clone();
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            let t_parse = std::time::Instant::now();
             let args: serde_json::Value = serde_json::from_str(&args_json)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_us = t_parse.elapsed().as_micros(),
+                "arg parse completed"
+            );
 
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
@@ -87,6 +96,8 @@ impl DaemonService {
 
             let embed_ref = embed_arc.as_deref();
             tracing::debug!(has_model = embed_ref.is_some(), "dispatch_json_tool embed_model status");
+
+            let t_dispatch = std::time::Instant::now();
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
@@ -95,9 +106,22 @@ impl DaemonService {
                 embed_ref,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_ms = t_dispatch.elapsed().as_millis(),
+                "dispatch completed"
+            );
 
-            serde_json::to_string(&value)
-                .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))
+            let t_ser = std::time::Instant::now();
+            let json = serde_json::to_string(&value)
+                .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_us = t_ser.elapsed().as_micros(),
+                bytes = json.len(),
+                "response serialization completed"
+            );
+            Ok(json)
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
@@ -105,6 +129,12 @@ impl DaemonService {
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            tool = %tool_name_for_log,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "dispatch_json_tool total completed"
+        );
 
         result.map(|json| Response::new(JsonResponse { result_json: json }))
     }
@@ -117,6 +147,7 @@ impl DaemonService {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
+        let t0 = std::time::Instant::now();
         self.state.idle_notify.notify_one();
         self.state
             .active_connections
@@ -132,6 +163,8 @@ impl DaemonService {
             guard.clone()
         };
 
+        let tool_name_for_log = tool_name.clone();
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
@@ -139,17 +172,31 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             let embed_ref = embed_arc.as_deref();
-            nestweaver_mcp::tools::dispatch(
+
+            let t_dispatch = std::time::Instant::now();
+            let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
+            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_ms = t_dispatch.elapsed().as_millis(),
+                "dispatch_tool_json dispatch completed"
+            );
+            Ok(value)
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+
+        tracing::debug!(
+            tool = %tool_name_for_log,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "dispatch_tool_json total completed"
+        );
 
         self.state
             .active_connections
