@@ -86,6 +86,7 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
             let embed_ref = embed_arc.as_deref();
+            tracing::debug!(has_model = embed_ref.is_some(), "dispatch_json_tool embed_model status");
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
@@ -2420,6 +2421,7 @@ pub async fn run_server(
     });
 
     // Spawn background embedding model loading when the `embed` feature is on.
+    eprintln!("[daemon] embed feature compiled in: {}", cfg!(feature = "embed"));
     #[cfg(feature = "embed")]
     {
         let embed_state = state.embed_model.clone();
@@ -2446,7 +2448,7 @@ pub async fn run_server(
                 .await
             {
                 Ok(Ok(model)) => {
-                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
+                    eprintln!("[daemon] Embedding model loaded (dim={})", model.dimension());
                     *embed_state.write().await = Some(
                         std::sync::Arc::new(model)
                             as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,

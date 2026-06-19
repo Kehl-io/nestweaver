@@ -1215,13 +1215,6 @@ pub fn build_brain_context_hybrid_with_aliases(
     let mut seen = std::collections::HashSet::new();
     seed_uids.retain(|u| seen.insert(u.clone()));
 
-    if seed_uids.is_empty() {
-        anyhow::bail!(
-            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), and symbol names. Unresolved: {:?}",
-            unresolved,
-        );
-    }
-
     // ── Semantic seed blending ────────────────────────────────────────────
     // When an embedding model is available and the semantic weight is nonzero,
     // run a vector KNN search over the entire graph. The top-k hits are
@@ -1234,7 +1227,6 @@ pub fn build_brain_context_hybrid_with_aliases(
             let query_text = inputs.join(" ");
             if let Ok(query_emb) = model.embed_query(&query_text) {
                 if let Ok(hits) = crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit) {
-                    // Inject top-5 semantic hits as PPR seeds (always-blend).
                     for (uid, _score) in hits.iter().take(5) {
                         if !seed_uids.contains(uid) {
                             seed_uids.push(uid.clone());
@@ -1244,6 +1236,13 @@ pub fn build_brain_context_hybrid_with_aliases(
                 }
             }
         }
+    }
+
+    if seed_uids.is_empty() {
+        anyhow::bail!(
+            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol names, and semantic search. Unresolved: {:?}",
+            unresolved,
+        );
     }
 
     // Run unified PPR with optional intent tuning.

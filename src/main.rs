@@ -3214,28 +3214,62 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("No matching symbols") {
-                            // Fall back to hybrid retrieval with semantic leg
-                            let hybrid_config = HybridSearchConfig::default();
-                            match build_brain_context_hybrid(
-                                &store, &seeds, None, &hybrid_config, parsed_intent, None,
+                            // Fall back to daemon-routed brain_context (has semantic leg)
+                            let db_path = db.clone().unwrap_or_else(default_db_path);
+                            let rt = tokio::runtime::Runtime::new()?;
+                            if let Ok(mut client) = rt.block_on(
+                                nestweaver_client::DaemonClient::connect(&db_path, None),
                             ) {
-                                Ok(result) if !result.seeds.is_empty() || !result.connected.is_empty() => {
-                                    let stats = format!(
-                                        "{} seeds, {} connected nodes in {} (semantic fallback)",
-                                        result.seeds.len(),
-                                        result.connected.len(),
-                                        format_elapsed(t0.elapsed())
-                                    );
-                                    if json {
-                                        println!("{}", serde_json::to_string_pretty(&result)?);
-                                    } else {
-                                        for node in result.seeds.iter().chain(result.connected.iter()) {
-                                            println!("  {} — {}", node.uid, node.title);
+                                let req = nestweaver_proto::BrainContextRequest {
+                                    seeds: seeds.clone(),
+                                    token_budget: token_budget.unwrap_or(0) as i32,
+                                    response_format: String::new(),
+                                    repos: vec![],
+                                    vaults: vec![],
+                                    kinds: vec![],
+                                    path_prefix: String::new(),
+                                    tags: vec![],
+                                    exclude_tags: vec![],
+                                    weight_ppr: 0.0,
+                                    weight_bm25: 0.0,
+                                    intent: String::new(),
+                                    include_seeds: true,
+                                    include_bodies: false,
+                                    root: String::new(),
+                                    prf: false,
+                                    rerank: false,
+                                    weight_semantic: 0.0,
+                                    since: String::new(),
+                                    recency_weight: 0.0,
+                                    recency_half_life_days: 0.0,
+                                };
+                                let rpc = rt.block_on(async {
+                                    client
+                                        .inner_mut()
+                                        .get_context(req)
+                                        .await
+                                        .map(|r| r.into_inner())
+                                });
+                                if let Ok(resp) = rpc {
+                                    if let Ok(result) = serde_json::from_str::<nestweaver_engine::BrainContextResult>(&resp.result_json) {
+                                        if !result.seeds.is_empty() || !result.connected.is_empty() {
+                                            let stats = format!(
+                                                "{} seeds, {} connected in {} (semantic fallback)",
+                                                result.seeds.len(),
+                                                result.connected.len(),
+                                                format_elapsed(t0.elapsed())
+                                            );
+                                            if json {
+                                                println!("{}", serde_json::to_string_pretty(&result)?);
+                                            } else {
+                                                for node in result.seeds.iter().chain(result.connected.iter()) {
+                                                    println!("  {} — {}", node.uid, node.title);
+                                                }
+                                            }
+                                            return Ok((EXIT_SUCCESS, Some(stats)));
                                         }
                                     }
-                                    return Ok((EXIT_SUCCESS, Some(stats)));
                                 }
-                                _ => {}
                             }
                             eprintln!("{msg}");
                             Ok((EXIT_NOT_FOUND, None))
