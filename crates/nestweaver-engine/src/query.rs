@@ -10,28 +10,38 @@ use crate::config::{
 };
 use crate::repo_display_name;
 
+// ── Embed abstraction ─────────────────────────────────────────────────────
+/// Trait abstracting over an embedding model's query-embedding capability.
+///
+/// This is feature-gated behind `embed` so that callers without the
+/// `nestweaver-embed` crate can still compile: they simply pass
+/// `None::<&dyn EmbedQueryFn>` at each call site.
+pub trait EmbedQueryFn: Send + Sync {
+    fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+}
+
+#[cfg(feature = "embed")]
+impl EmbedQueryFn for nestweaver_embed::EmbedModel {
+    fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        nestweaver_embed::EmbedModel::embed_query(self, text)
+    }
+}
+
 /// Tuning knobs for hybrid PPR + BM25 + semantic retrieval.
 ///
-/// Defaults reflect empirical recommendations from the cited research:
-/// - `rrf_k = 60.0` — Cormack-Clarke-Buettcher 2009 standard.
-/// - `weight_ppr = 0.7`, `weight_bm25 = 0.3` — PPR is the primary
-///   structural signal; BM25 covers what graph structure misses
-///   (lexical relevance, freshly-mentioned terms). The 70/30 split is
-///   a defensible default but tunable — callers may set unit weights
-///   (0.5 / 0.5) if their workload is more lexically-driven.
-/// - `weight_semantic = 0.0` — disabled by default until embeddings are
-///   generated via `nestweaver embed`. Set to a non-zero value (e.g.
-///   0.2, reducing ppr/bm25 proportionally) to enable the third signal.
+/// Defaults reflect empirical tuning for weighted score fusion
+/// (convex combination with tanh normalization):
+/// - `weight_ppr = 0.40` — structural signal from Personalized PageRank.
+/// - `weight_bm25 = 0.25` — lexical relevance covers what graph
+///   structure misses (freshly-mentioned terms, exact matches).
+/// - `weight_semantic = 0.35` — embedding-based similarity; set to 0.0
+///   if embeddings are not generated yet (`nestweaver embed`).
 /// - `bm25_limit = 500` — large enough that BM25's tail is comparable
-///   to PPR's. The audit flagged 100 as too low (PPR returns variable-
-///   length results often into the hundreds); 500 keeps the candidate
-///   pool symmetric while staying well under the size where RRF
-///   sorting cost matters.
-/// - `semantic_limit = 200` — cap on the number of vector KNN results
-///   fed into RRF. Bounded to keep the in-process cosine scan tractable.
+///   to PPR's. 500 keeps the candidate pool symmetric.
+/// - `semantic_limit = 200` — cap on vector KNN results fed into
+///   fusion. Bounded to keep the in-process cosine scan tractable.
 #[derive(Debug, Clone)]
 pub struct HybridSearchConfig {
-    pub rrf_k: f64,
     pub weight_ppr: f64,
     pub weight_bm25: f64,
     pub weight_semantic: f64,
@@ -41,30 +51,36 @@ pub struct HybridSearchConfig {
     /// runs a two-pass pseudo-relevance-feedback expansion before fusion.
     /// Off by default → identical behaviour to before.
     ///
-    /// RRF CAVEAT: RRF fuses by *rank only*, so the PRF expansion weight
-    /// ([`nestweaver_store::PRF_EXPANSION_WEIGHT`] = 0.3) never appears in the
-    /// final fused score. PRF reaches the fused result purely by reordering
-    /// the BM25 list — the changed BM25 ranks flow through RRF. Do not expect
-    /// the 0.3 boost to surface numerically in the output relevance.
+    /// PRF NOTE: with weighted score fusion the PRF expansion weight
+    /// ([`nestweaver_store::PRF_EXPANSION_WEIGHT`] = 0.3) affects the raw BM25
+    /// scores that flow into tanh normalization. The expansion terms boost
+    /// matching documents' BM25 scores, which then carry through fusion.
     pub prf: bool,
     /// Finding #7 — graduated path-deboost + kind-priority for
     /// `search_symbols_by_name` seed resolution. Sourced from
     /// `[seed_resolution]` in instance config (with backward-compat shim
     /// for the legacy `[ranking].test_path_patterns` block).
     pub seed_resolution: nestweaver_store::SeedResolutionConfig,
+    /// When `true`, semantic scores are always mixed in even when the query
+    /// matched zero BM25 results. Sourced from `[embedding].always_blend_semantic`.
+    pub always_blend_semantic: bool,
+    /// Maximum number of top semantic hits injected as PPR seeds.
+    /// Sourced from `[embedding].semantic_seed_limit`.
+    pub semantic_seed_limit: usize,
 }
 
 impl Default for HybridSearchConfig {
     fn default() -> Self {
         Self {
-            rrf_k: 60.0,
-            weight_ppr: 0.7,
-            weight_bm25: 0.3,
-            weight_semantic: 0.0,
+            weight_ppr: 0.40,
+            weight_bm25: 0.25,
+            weight_semantic: 0.35,
             bm25_limit: 500,
             semantic_limit: 200,
             prf: false,
             seed_resolution: nestweaver_store::SeedResolutionConfig::default(),
+            always_blend_semantic: true,
+            semantic_seed_limit: 5,
         }
     }
 }
@@ -984,7 +1000,14 @@ pub fn build_brain_context(
     store: &GraphStore,
     inputs: &[String],
 ) -> Result<BrainContextResult, anyhow::Error> {
-    build_brain_context_hybrid(store, inputs, None, &HybridSearchConfig::default(), None)
+    build_brain_context_hybrid(
+        store,
+        inputs,
+        None,
+        &HybridSearchConfig::default(),
+        None,
+        None,
+    )
 }
 
 /// Hybrid PPR + BM25 retrieval.
@@ -1005,6 +1028,7 @@ pub fn build_brain_context_hybrid(
     tantivy: Option<&TantivyIndex>,
     config: &HybridSearchConfig,
     intent: Option<QueryIntent>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     build_brain_context_hybrid_with_aliases(
         store,
@@ -1014,6 +1038,7 @@ pub fn build_brain_context_hybrid(
         &std::collections::HashMap::new(),
         None,
         intent,
+        embed_model,
     )
 }
 
@@ -1028,6 +1053,7 @@ pub fn build_brain_context_hybrid(
 ///
 /// The optional `intent` parameter tunes PPR's damping factor and edge
 /// weights. When `None`, the standard damping (0.85) is used.
+#[allow(clippy::too_many_arguments)]
 pub fn build_brain_context_hybrid_with_aliases(
     store: &GraphStore,
     inputs: &[String],
@@ -1036,6 +1062,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     aliases: &std::collections::HashMap<String, Vec<String>>,
     db_path: Option<&std::path::Path>,
     intent: Option<QueryIntent>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -1204,9 +1231,35 @@ pub fn build_brain_context_hybrid_with_aliases(
     let mut seen = std::collections::HashSet::new();
     seed_uids.retain(|u| seen.insert(u.clone()));
 
+    // ── Semantic seed blending ────────────────────────────────────────────
+    // When an embedding model is available and the semantic weight is nonzero,
+    // run a vector KNN search over the entire graph. The top-k hits are
+    // injected as PPR seeds (always-blend) so the walk explores semantically
+    // relevant neighborhoods even when the textual seeds miss them. The full
+    // hit list is passed to weighted_score_fuse as the semantic signal.
+    let mut semantic_hits: Vec<(String, f64)> = Vec::new();
+    if let Some(model) = embed_model
+        && config.weight_semantic > 0.0
+    {
+        let query_text = inputs.join(" ");
+        if let Ok(query_emb) = model.embed_query(&query_text)
+            && let Ok(hits) =
+                crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit)
+        {
+            if config.always_blend_semantic {
+                for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                    if !seed_uids.contains(uid) {
+                        seed_uids.push(uid.clone());
+                    }
+                }
+            }
+            semantic_hits = hits;
+        }
+    }
+
     if seed_uids.is_empty() {
         anyhow::bail!(
-            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), and symbol names. Unresolved: {:?}",
+            "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol names, and semantic search. Unresolved: {:?}",
             unresolved,
         );
     }
@@ -1217,13 +1270,12 @@ pub fn build_brain_context_hybrid_with_aliases(
         .personalized_pagerank_with_intent(&seed_uids, damping, 20, &GraphScope::unified(), intent)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // ── Hybrid retrieval: fuse PPR + BM25 via Reciprocal Rank Fusion ───
+    // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
     //
     // Feature F7 (PRF half): when `config.prf` is set, the BM25 leg runs a
     // two-pass pseudo-relevance-feedback expansion (`search_prf`) instead of a
     // single-pass `search`. The mined expansion terms are surfaced on the
-    // result for auditing. RRF is rank-only, so PRF affects the fused result
-    // solely via the reordered BM25 ranks (see `HybridSearchConfig::prf`).
+    // result for auditing.
     let mut expansion_terms: Vec<String> = Vec::new();
     let fused: Vec<(String, f64)> = if let Some(tantivy) = tantivy {
         let bm25_query = inputs.join(" ");
@@ -1242,14 +1294,13 @@ pub fn build_brain_context_hybrid_with_aliases(
                 .search(&bm25_query, config.bm25_limit)
                 .unwrap_or_default()
         };
-        rrf_fuse(
+        weighted_score_fuse(
             &ppr,
             &bm25_hits,
-            &[],
-            config.rrf_k,
+            &semantic_hits,
             config.weight_ppr,
             config.weight_bm25,
-            0.0,
+            config.weight_semantic,
         )
     } else {
         ppr.clone()
@@ -1305,49 +1356,98 @@ pub fn nestweaver_store_stoplist() -> &'static [&'static str] {
     })
 }
 
-/// Reciprocal Rank Fusion of PPR scores, BM25 hits, and semantic (vector) hits.
+/// Tanh-based score normalization.
 ///
-/// Standard RRF formula: `score(d) = Σ_i w_i / (k + rank_i(d))`, where
-/// each retrieval method's contribution is weighted by `w_i` and `k`
-/// dampens the curve so ties between top-of-list items in one method
-/// don't completely override the other method.
+/// Divides each score by the median of non-zero scores, then applies `tanh`
+/// to compress into (0, 1]. This is robust to outliers and works across
+/// heterogeneous score distributions (PPR, BM25, cosine similarity).
+fn tanh_normalize(scores: &[f64]) -> Vec<f64> {
+    if scores.is_empty() {
+        return vec![];
+    }
+    let nonzero: Vec<f64> = scores.iter().copied().filter(|s| *s > 0.0).collect();
+    if nonzero.is_empty() {
+        return vec![0.0; scores.len()];
+    }
+    let median = {
+        let mut sorted = nonzero.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted[(sorted.len() - 1) / 2]
+    };
+    let scale = if median > 0.0 { median } else { 1.0 };
+    scores.iter().map(|s| (s / scale).tanh()).collect()
+}
+
+/// Weighted score fusion (convex combination) of PPR, BM25, and semantic signals.
 ///
-/// Returns a fused list sorted descending by combined score. PPR rank
-/// is by descending score (highest score = rank 1). BM25 rank comes
-/// from the hit list's natural order. Semantic rank is by descending
-/// cosine similarity score (highest similarity = rank 1).
-fn rrf_fuse(
+/// Each signal's raw scores are normalized via [`tanh_normalize`], then combined
+/// as: `score(d) = w_ppr * norm_ppr(d) + w_bm25 * norm_bm25(d) + w_semantic * norm_sem(d)`.
+///
+/// Returns a fused list sorted descending by combined score.
+pub fn weighted_score_fuse(
     ppr: &[(String, f64)],
     bm25: &[nestweaver_store::SearchHit],
     semantic: &[(String, f64)],
-    k: f64,
     w_ppr: f64,
     w_bm25: f64,
     w_semantic: f64,
 ) -> Vec<(String, f64)> {
     use std::collections::HashMap;
-    let mut scores: HashMap<String, f64> = HashMap::new();
 
-    // PPR list is already sorted descending by score.
-    for (rank0, (uid, _)) in ppr.iter().enumerate() {
-        let rank = (rank0 + 1) as f64;
-        *scores.entry(uid.clone()).or_insert(0.0) += w_ppr / (k + rank);
+    let mut ppr_scores: HashMap<&str, f64> = HashMap::new();
+    for (uid, score) in ppr {
+        ppr_scores.insert(uid, *score);
     }
 
-    for (rank0, hit) in bm25.iter().enumerate() {
-        let rank = (rank0 + 1) as f64;
-        *scores.entry(hit.uid.clone()).or_insert(0.0) += w_bm25 / (k + rank);
+    let mut bm25_scores: HashMap<&str, f64> = HashMap::new();
+    for hit in bm25 {
+        bm25_scores.insert(&hit.uid, hit.score as f64);
     }
 
-    // Semantic list is sorted descending by similarity score.
-    for (rank0, (uid, _)) in semantic.iter().enumerate() {
-        let rank = (rank0 + 1) as f64;
-        *scores.entry(uid.clone()).or_insert(0.0) += w_semantic / (k + rank);
+    let mut sem_scores: HashMap<&str, f64> = HashMap::new();
+    for (uid, score) in semantic {
+        sem_scores.insert(uid, *score);
     }
 
-    let mut merged: Vec<(String, f64)> = scores.into_iter().collect();
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    merged
+    let mut all_uids: Vec<&str> = Vec::new();
+    for uid in ppr_scores
+        .keys()
+        .chain(bm25_scores.keys())
+        .chain(sem_scores.keys())
+    {
+        if !all_uids.contains(uid) {
+            all_uids.push(uid);
+        }
+    }
+
+    let ppr_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| ppr_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
+    let bm25_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| bm25_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
+    let sem_raw: Vec<f64> = all_uids
+        .iter()
+        .map(|u| sem_scores.get(u).copied().unwrap_or(0.0))
+        .collect();
+
+    let ppr_norm = tanh_normalize(&ppr_raw);
+    let bm25_norm = tanh_normalize(&bm25_raw);
+    let sem_norm = tanh_normalize(&sem_raw);
+
+    let mut results: Vec<(String, f64)> = all_uids
+        .iter()
+        .enumerate()
+        .map(|(i, uid)| {
+            let score = w_ppr * ppr_norm[i] + w_bm25 * bm25_norm[i] + w_semantic * sem_norm[i];
+            (uid.to_string(), score)
+        })
+        .collect();
+
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
 }
 
 fn lookup_note_uids_by_title(
@@ -1870,6 +1970,7 @@ mod render_brain_node_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
 
@@ -1882,6 +1983,7 @@ mod render_brain_node_tests {
             start_line: 1,
             end_line: 5,
             content_hash: "def".to_string(),
+            embedding: None,
         };
         store.insert_heading(&heading).unwrap();
 
@@ -1920,6 +2022,7 @@ mod render_brain_node_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
 
@@ -2130,6 +2233,7 @@ mod inline_body_tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
         let sec = Section {
@@ -2495,5 +2599,78 @@ mod dedup_heading_section_tests {
         dedup_heading_section_pairs(&mut r);
         // Note nodes are never dropped, only Heading nodes.
         assert_eq!(r.connected.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use nestweaver_store::SearchHit;
+
+    #[test]
+    fn test_tanh_normalize_basic() {
+        let scores = vec![0.5, 0.3, 0.1, 0.05, 0.01];
+        let normalized = tanh_normalize(&scores);
+        for v in &normalized {
+            assert!(*v > 0.0 && *v <= 1.0);
+        }
+        for i in 1..normalized.len() {
+            assert!(normalized[i - 1] >= normalized[i]);
+        }
+    }
+
+    #[test]
+    fn test_tanh_normalize_empty() {
+        let normalized = tanh_normalize(&[]);
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn test_tanh_normalize_all_zero() {
+        let normalized = tanh_normalize(&[0.0, 0.0, 0.0]);
+        assert_eq!(normalized, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_weighted_score_fuse_three_signals() {
+        let ppr = vec![("a".to_string(), 0.5), ("b".to_string(), 0.3)];
+        let bm25 = vec![
+            SearchHit {
+                uid: "b".to_string(),
+                kind: "function".into(),
+                title: "b".into(),
+                vault_uid: "v".into(),
+                score: 10.0,
+            },
+            SearchHit {
+                uid: "c".to_string(),
+                kind: "function".into(),
+                title: "c".into(),
+                vault_uid: "v".into(),
+                score: 8.0,
+            },
+        ];
+        let semantic = vec![("a".to_string(), 0.9), ("c".to_string(), 0.7)];
+
+        let results = weighted_score_fuse(&ppr, &bm25, &semantic, 0.40, 0.25, 0.35);
+        let uids: Vec<&str> = results.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(uids.contains(&"a"));
+        assert!(uids.contains(&"b"));
+        assert!(uids.contains(&"c"));
+    }
+
+    #[test]
+    fn test_weighted_score_fuse_empty_semantic() {
+        let ppr = vec![("a".to_string(), 0.5)];
+        let bm25 = vec![SearchHit {
+            uid: "a".to_string(),
+            kind: "function".into(),
+            title: "a".into(),
+            vault_uid: "v".into(),
+            score: 5.0,
+        }];
+        let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "a");
     }
 }

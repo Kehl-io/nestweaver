@@ -332,6 +332,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&note).unwrap();
 
@@ -367,6 +368,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -393,6 +395,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             })
             .unwrap();
 
@@ -428,6 +431,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             })
             .unwrap();
 
@@ -440,6 +444,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             content_hash: "h1".to_string(),
+            embedding: None,
         };
         let h2 = Heading {
             uid: "head:o:2:5".to_string(),
@@ -450,6 +455,7 @@ mod tests {
             start_line: 5,
             end_line: 5,
             content_hash: "h2".to_string(),
+            embedding: None,
         };
         store
             .batch_insert_headings(&[h1.clone(), h2.clone()])
@@ -535,6 +541,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             })
             .unwrap();
 
@@ -568,6 +575,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             })
             .unwrap();
         store
@@ -580,6 +588,7 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
                 content_hash: "h".to_string(),
+                embedding: None,
             })
             .unwrap();
         store
@@ -835,6 +844,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
 
         // First insert.
@@ -874,6 +884,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.upsert_note(&note_v2).unwrap();
 
@@ -903,6 +914,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             })
             .unwrap();
 
@@ -1052,6 +1064,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
             Note {
                 uid: "note:txn:2".to_string(),
@@ -1065,6 +1078,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
         ];
 
@@ -1105,6 +1119,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
             Note {
                 uid: "note:bvw:n2".to_string(),
@@ -1118,6 +1133,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
         ];
 
@@ -1130,6 +1146,7 @@ mod tests {
             start_line: 1,
             end_line: 5,
             content_hash: "hh1".to_string(),
+            embedding: None,
         }];
 
         let sections = vec![Section {
@@ -1259,6 +1276,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
 
         let notes = vec![
@@ -1285,6 +1303,7 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
                 content_hash: "hh1".to_string(),
+                embedding: None,
             },
             Heading {
                 uid: "hdg:cas:2".to_string(),
@@ -1295,6 +1314,7 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
                 content_hash: "hh2".to_string(),
+                embedding: None,
             },
         ];
         store.batch_insert_headings(&headings).unwrap();
@@ -1633,6 +1653,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
             Note {
                 uid: "note:rp:2".to_string(),
@@ -1646,6 +1667,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             },
         ];
         store.batch_insert_notes(&notes).unwrap();
@@ -1662,6 +1684,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             content_hash: "hh1".to_string(),
+            embedding: None,
         };
         store.insert_heading(&heading).unwrap();
         store
@@ -1781,6 +1804,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let notes = vec![
             make_note("note:m:1", 1),
@@ -1839,6 +1863,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let src_notes = vec![
             make_src_note("note:cs:1", 1),
@@ -1875,6 +1900,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.insert_note(&tgt_note).unwrap();
         store

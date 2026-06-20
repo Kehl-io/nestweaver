@@ -54,6 +54,7 @@ pub async fn brain_context(
         state.tantivy.as_deref(),
         &config,
         None,
+        None,
     )?;
     let json = serde_json::to_value(&result)?;
     Ok(Json(json).into_response())

@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
-use nestweaver_algorithms::ppr::{PprConfig, personalized_pagerank as algo_ppr};
+use nestweaver_algorithms::ppr::{PprConfig, forward_push_ppr};
 use nestweaver_schema::{EdgeType, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -670,7 +670,7 @@ impl GraphStore {
     ///
     /// Both forward and reverse directions are included so that PPR propagates
     /// relevance through the full neighbourhood.
-    fn load_ppr_graph(
+    pub(crate) fn load_ppr_graph(
         &self,
         scope: &GraphScope,
         intent: Option<QueryIntent>,
@@ -833,6 +833,45 @@ impl GraphStore {
         let current_gen = self.graph_generation();
         let s_hash = scope_hash(scope);
 
+        // PPR result cache: compute a key from all inputs that affect the result,
+        // including the interaction cache content so that loading new interaction
+        // scores correctly bypasses the cache.
+        let interaction_scores_for_key = self
+            .interaction_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ppr_cache_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut sorted_seeds = seed_uids.to_vec();
+            sorted_seeds.sort();
+            sorted_seeds.hash(&mut hasher);
+            damping.to_bits().hash(&mut hasher);
+            max_iterations.hash(&mut hasher);
+            s_hash.hash(&mut hasher);
+            intent.hash(&mut hasher);
+            current_gen.hash(&mut hasher);
+            // Hash interaction scores so cache is invalidated when they change.
+            if let Some(ref scores) = interaction_scores_for_key {
+                let mut sorted_scores: Vec<(&String, u64)> =
+                    scores.iter().map(|(k, v)| (k, v.to_bits())).collect();
+                sorted_scores.sort_by_key(|(k, _)| k.as_str());
+                sorted_scores.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        {
+            let mut cache = self
+                .ppr_result_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.get(&ppr_cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         // Step 1: check cache (lock, compare key, unlock).
         let cache_hit = {
             let guard = self
@@ -875,12 +914,8 @@ impl GraphStore {
             .as_ref()
             .expect("ppr_graph_cache must be Some after fill");
 
-        // Clone interaction scores out of the mutex for the algorithms crate.
-        let interaction_scores = self
-            .interaction_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // Use the interaction scores already read for the cache key above.
+        let interaction_scores = interaction_scores_for_key;
 
         let adjacency = AdjacencyData {
             uid_to_idx: cached.uid_to_idx.clone(),
@@ -900,7 +935,17 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        Ok(algo_ppr(&uids, &adjacency, seed_uids, &config))
+        let results = forward_push_ppr(&uids, &adjacency, seed_uids, &config);
+
+        {
+            let mut cache = self
+                .ppr_result_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.put(ppr_cache_key, results.clone());
+        }
+
+        Ok(results)
     }
 
     /// Return all Symbol nodes that have a pagerank_score set, ordered descending by score.
@@ -1030,6 +1075,19 @@ impl GraphStore {
         if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
             tracing::warn!("lazy PageRank computation failed: {e}");
         }
+    }
+
+    /// Pre-build the PPR adjacency cache for the unified graph scope.
+    ///
+    /// Calling this at daemon startup eliminates the ~350ms first-query
+    /// latency caused by building the adjacency list from the database on
+    /// the first PPR request. The result is stored in `ppr_graph_cache`
+    /// and will be reused by subsequent `personalized_pagerank*` calls
+    /// until the graph generation changes.
+    pub fn warm_ppr_cache(&self) -> Result<(), StoreError> {
+        let scope = GraphScope::unified();
+        self.load_ppr_graph(&scope, None)?;
+        Ok(())
     }
 }
 
@@ -1252,6 +1310,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1323,6 +1382,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1339,6 +1399,7 @@ mod tests {
                     start_line: 1,
                     end_line: 1,
                     content_hash: "h".to_string(),
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -1430,6 +1491,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     pagerank_score: None,
+                    embedding: None,
                 })
                 .unwrap();
         }
@@ -2013,6 +2075,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let member_note_b = Note {
             uid: "note:member_b".to_string(),
@@ -2026,6 +2089,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.upsert_note(&member_note_a).unwrap();
         store.upsert_note(&member_note_b).unwrap();
@@ -2043,6 +2107,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         let popular_note_y = Note {
             uid: "note:popular_y".to_string(),
@@ -2056,6 +2121,7 @@ mod tests {
             created_at: None,
             modified_at: None,
             pagerank_score: None,
+            embedding: None,
         };
         store.upsert_note(&popular_note_x).unwrap();
         store.upsert_note(&popular_note_y).unwrap();
@@ -2077,6 +2143,7 @@ mod tests {
                 created_at: None,
                 modified_at: None,
                 pagerank_score: None,
+                embedding: None,
             };
             store.upsert_note(&filler).unwrap();
 
