@@ -148,9 +148,9 @@ dependencies = [
 
 [[package]]
 name = "arrayvec"
-version = "0.7.6"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
 name = "assert-json-diff"
@@ -3709,7 +3709,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3756,7 +3756,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-embed"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3806,7 +3806,7 @@ dependencies = [
  "candle-transformers",
  "dirs",
  "hf-hub",
- "indicatif 0.17.11",
+ "indicatif 0.18.4",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -3857,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "comrak",
  "hex",
@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-proto"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "prost",
  "tonic",
@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "glob",
  "insta",
@@ -3955,7 +3955,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "hex",
  "serde",
@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -4004,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
@@ -4036,7 +4036,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
- "tower-http",
+ "tower-http 0.7.0",
  "tracing",
  "uuid",
 ]
@@ -5133,7 +5133,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5177,7 +5177,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5760,9 +5760,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"
-version = "0.3.18"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
  "libc",
  "signal-hook-registry",
@@ -6658,6 +6658,21 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags 2.13.0",
+ "bytes",
+ "http 1.4.2",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
