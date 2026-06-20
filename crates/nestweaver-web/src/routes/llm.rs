@@ -47,6 +47,7 @@ pub async fn query(
         state.tantivy.as_deref(),
         &config,
         None,
+        None,
     );
 
     let explanation = format!(

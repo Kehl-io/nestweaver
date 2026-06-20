@@ -36,6 +36,9 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Lazily-loaded embedding model for semantic search. Populated by a
+    /// background task when the `embed` feature is enabled.
+    pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -57,6 +60,7 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
+        let t0 = std::time::Instant::now();
         self.state.idle_notify.notify_one();
         self.state
             .active_connections
@@ -66,25 +70,61 @@ impl DaemonService {
         let tool_name = tool_name.to_string();
         let args_json = args_json.to_string();
 
+        // Read the embed model Arc outside the blocking thread, then drop
+        // the RwLock guard before any further awaits.
+        let embed_arc = {
+            let guard = self.state.embed_model.read().await;
+            guard.clone()
+        };
+
+        let tool_name_for_log = tool_name.clone();
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            let t_parse = std::time::Instant::now();
             let args: serde_json::Value = serde_json::from_str(&args_json)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_us = t_parse.elapsed().as_micros(),
+                "arg parse completed"
+            );
 
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
+            let embed_ref = embed_arc.as_deref();
+            tracing::debug!(
+                has_model = embed_ref.is_some(),
+                "dispatch_json_tool embed_model status"
+            );
+
+            let t_dispatch = std::time::Instant::now();
             let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
+                embed_ref,
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_ms = t_dispatch.elapsed().as_millis(),
+                "dispatch completed"
+            );
 
-            serde_json::to_string(&value)
-                .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))
+            let t_ser = std::time::Instant::now();
+            let json = serde_json::to_string(&value)
+                .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_us = t_ser.elapsed().as_micros(),
+                bytes = json.len(),
+                "response serialization completed"
+            );
+            Ok(json)
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
@@ -92,6 +132,12 @@ impl DaemonService {
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            tool = %tool_name_for_log,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "dispatch_json_tool total completed"
+        );
 
         result.map(|json| Response::new(JsonResponse { result_json: json }))
     }
@@ -104,6 +150,7 @@ impl DaemonService {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
+        let t0 = std::time::Instant::now();
         self.state.idle_notify.notify_one();
         self.state
             .active_connections
@@ -112,28 +159,164 @@ impl DaemonService {
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
 
+        // Read the embed model Arc outside the blocking thread, then drop
+        // the RwLock guard before any further awaits.
+        let embed_arc = {
+            let guard = self.state.embed_model.read().await;
+            guard.clone()
+        };
+
+        let tool_name_for_log = tool_name.clone();
+
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
 
-            nestweaver_mcp::tools::dispatch(
+            let embed_ref = embed_arc.as_deref();
+
+            let t_dispatch = std::time::Instant::now();
+            let value = nestweaver_mcp::tools::dispatch(
                 &state.store_read,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
+                embed_ref,
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))
+            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            tracing::debug!(
+                tool = %tool_name,
+                elapsed_ms = t_dispatch.elapsed().as_millis(),
+                "dispatch_tool_json dispatch completed"
+            );
+            Ok(value)
         })
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+
+        tracing::debug!(
+            tool = %tool_name_for_log,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "dispatch_tool_json total completed"
+        );
 
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
 
         result
+    }
+
+    /// Build an `on_change` callback that queues un-embedded nodes for
+    /// background embedding after every watcher batch.  Returns `None`
+    /// when the `embed` feature is disabled or the model is not yet loaded.
+    #[cfg(feature = "embed")]
+    fn make_embed_on_change(
+        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        store: Arc<nestweaver_store::GraphStore>,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        Some(Box::new(move || {
+            // Peek at the model without blocking async code — we are already
+            // in a blocking thread (inside spawn_blocking).
+            let model = {
+                let guard = embed_model.blocking_read();
+                guard.clone()
+            };
+            let Some(model) = model else { return };
+
+            let store = store.clone();
+            // Fire-and-forget a new blocking task so the watcher callback
+            // returns quickly and the watcher loop is not stalled.
+            drop(tokio::task::spawn_blocking(move || {
+                let mut embedded = 0u32;
+                let limit: usize = 64; // Max nodes per watcher cycle
+
+                // Symbols
+                if let Ok(symbols) = store.list_all_symbols() {
+                    for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                        let text = nestweaver_embed::preprocess::symbol_embed_text(
+                            &sym.kind.to_string(),
+                            &sym.name,
+                            None,
+                        );
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&sym.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
+                            }
+                        }
+                    }
+                }
+
+                let remaining = limit.saturating_sub(embedded as usize);
+
+                // Notes
+                if remaining > 0
+                    && let Ok(notes) = store.list_notes(None)
+                {
+                    for note in notes
+                        .iter()
+                        .filter(|n| n.embedding.is_none())
+                        .take(remaining)
+                    {
+                        let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&note.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %note.uid, "embedding failed: {e}");
+                            }
+                        }
+                    }
+                }
+
+                let remaining = limit.saturating_sub(embedded as usize);
+
+                // Headings
+                if remaining > 0
+                    && let Ok(headings) = store.list_all_headings()
+                {
+                    for heading in headings
+                        .iter()
+                        .filter(|h| h.embedding.is_none())
+                        .take(remaining)
+                    {
+                        let text =
+                            nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&heading.uid, emb);
+                                embedded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
+                            }
+                        }
+                    }
+                }
+
+                if embedded > 0 {
+                    if let Err(e) = store.flush_embedding_index() {
+                        tracing::warn!("failed to flush embedding index: {e}");
+                    }
+                    tracing::debug!(count = embedded, "embedded new nodes from watcher");
+                }
+            }));
+        }))
+    }
+
+    #[cfg(not(feature = "embed"))]
+    fn make_embed_on_change(
+        _embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        _store: Arc<nestweaver_store::GraphStore>,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        None
     }
 }
 
@@ -263,12 +446,14 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         let store = self.state.store.clone();
+        let on_change =
+            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, None)
+                watcher.run_with_store(store, on_change)
             }));
 
             match result {
@@ -341,12 +526,14 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         let store = self.state.store.clone();
+        let on_change =
+            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                watcher.run_with_store(store, None)
+                watcher.run_with_store(store, on_change)
             }));
 
             match result {
@@ -2301,7 +2488,75 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         instance_cfg,
+        embed_model: Arc::new(tokio::sync::RwLock::new(None)),
     });
+
+    // Pre-warm PPR adjacency cache so the first PPR query after startup
+    // hits the cache instead of spending ~350ms rebuilding from the DB.
+    {
+        let store = state.store_read.clone();
+        tokio::task::spawn_blocking(move || match store.warm_ppr_cache() {
+            Ok(()) => tracing::info!("PPR adjacency cache warmed"),
+            Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+        });
+    }
+
+    // Spawn background embedding model loading when the `embed` feature is on.
+    tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
+    #[cfg(feature = "embed")]
+    {
+        let embed_state = state.embed_model.clone();
+        let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
+        let store_for_dim_check = state.store_read.clone();
+        tokio::spawn(async move {
+            let cfg = embedding_cfg.unwrap_or_default();
+            // Expand tilde in cache_dir using the home directory.
+            let cache_dir = if cfg.cache_dir.starts_with("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(&cfg.cache_dir[2..])
+                } else {
+                    std::path::PathBuf::from(&cfg.cache_dir)
+                }
+            } else {
+                std::path::PathBuf::from(&cfg.cache_dir)
+            };
+            let config = nestweaver_embed::EmbedConfig {
+                model_id: cfg.model_id.clone(),
+                cache_dir,
+                external_endpoint: cfg.external_endpoint.clone(),
+                external_model: cfg.external_model.clone(),
+            };
+            match tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config))
+                .await
+            {
+                Ok(Ok(model)) => {
+                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
+                    // Check dimension compatibility with existing embeddings
+                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension()
+                        && stored_dim != model.dimension()
+                    {
+                        tracing::warn!(
+                            model_dim = model.dimension(),
+                            stored_dim,
+                            "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                             Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                            model.dimension(),
+                            stored_dim
+                        );
+                        return;
+                    }
+                    *embed_state.write().await = Some(std::sync::Arc::new(model)
+                        as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to load embedding model: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!("Embedding model load task panicked: {e}");
+                }
+            }
+        });
+    }
 
     let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
         .max_decoding_message_size(256 * 1024 * 1024)
@@ -2377,7 +2632,6 @@ pub async fn run_server(
         .context("gRPC server error")?;
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
-    eprintln!("[daemon] shutting down, cleaning up");
     tracing::info!("daemon shutting down, cleaning up");
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);

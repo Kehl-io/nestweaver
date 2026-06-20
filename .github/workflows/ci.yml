@@ -23,10 +23,14 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy
+  build-and-check:
+    name: Build, Clippy & Tests
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -34,28 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
-      - name: Configure linker for lbug+tantivy zstd coexistence
-        run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (triggers lbug prebuilt download on first run)
-        run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
-          sleep 2
-          cargo build
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
+          shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
@@ -67,7 +50,10 @@ jobs:
           cargo build -p nestweaver-store 2>/dev/null || true
           sleep 2
           cargo build --tests
-      - run: cargo test --no-fail-fast -- --skip daemon_
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --no-fail-fast -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
 
@@ -75,6 +61,10 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,6 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: coverage
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
@@ -119,12 +110,20 @@ jobs:
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
+    env:
+      NESTWEAVER_NO_DAEMON: "1"
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: build
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -152,8 +151,6 @@ jobs:
       - name: Run E2E tests
         working-directory: crates/nestweaver-web/frontend
         run: npx playwright test
-        env:
-          NESTWEAVER_NO_DAEMON: "1"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@v7

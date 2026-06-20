@@ -1985,57 +1985,36 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Update the `embedding` field of a Symbol node.
+    /// Update the `embedding` field of a Note node.
     ///
-    /// LadybugDB does not support `SET`, so the symbol is read, deleted with
-    /// DETACH DELETE, and re-inserted with the embedding set. This preserves
-    /// all other fields. The embedding is stored as a JSON-encoded string in
-    /// a separate sidecar structure; the Symbol node itself does not hold a
-    /// native float-array column — instead the embedding is stored in the
-    /// in-memory `Symbol.embedding` field, and callers that need persistence
-    /// across sessions should use an `EmbeddingIndex` sidecar file.
+    /// Persist a Note embedding to the sidecar `EmbeddingIndex`.
     ///
-    /// This method updates the in-graph Symbol node so that `list_all_symbols`
-    /// can return embeddings without a separate sidecar.
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
+    pub fn update_note_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
+    }
+
+    /// Persist a Heading embedding to the sidecar `EmbeddingIndex`.
+    ///
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
+    pub fn update_heading_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
+    }
+
+    /// Persist a Symbol embedding to the sidecar `EmbeddingIndex`.
+    ///
+    /// The embedding is added to the in-memory index and immediately flushed
+    /// to disk. For batch operations, prefer `add_embedding` +
+    /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_symbol_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        use crate::read::{SYMBOL_COLUMNS, row_to_symbol};
-
-        let conn = self.conn()?;
-
-        // Read the existing symbol.
-        let q = format!("MATCH (s:Symbol {{uid: $uid}}) RETURN {SYMBOL_COLUMNS}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("uid", lbug::Value::String(uid.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let row = result.next().ok_or(StoreError::NotFound)?;
-        let mut sym = row_to_symbol(&row)?;
-
-        // Set the embedding in memory.
-        sym.embedding = Some(embedding.to_vec());
-
-        // Delete the existing node (DETACH removes all edges).
-        exec_params(
-            &conn,
-            "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
-            vec![("uid", lbug::Value::String(uid.to_string()))],
-        )?;
-
-        // Re-insert with the embedding set. The Symbol struct carries
-        // `embedding` but the CREATE statement used by
-        // `insert_symbol_with_conn` does not include it (LadybugDB does
-        // not support arbitrary array columns). The embedding is therefore
-        // held only in the `Symbol` in-memory representation returned by
-        // `list_all_symbols`; the on-disk node is refreshed with all other
-        // fields preserved.
-        self.insert_symbol_with_conn(&conn, &sym)?;
-
-        Ok(())
+        self.add_embedding(uid, embedding.to_vec());
+        self.flush_embedding_index()
     }
 
     /// Bulk-delete all Symbol and File nodes belonging to `repo_uid` using two
@@ -2682,5 +2661,37 @@ impl GraphStore {
             projects: project_count,
             discarded,
         })
+    }
+
+    // ── DB-level metadata ───────────────────────────────────────────────────
+
+    /// Persist the embedding model ID and vector dimension as a singleton
+    /// `Meta` node in the database. lbug does not support MERGE or SET, so
+    /// we use the established delete-then-create upsert pattern. The node
+    /// is keyed by the fixed string `"embedding"` — only one such record
+    /// can exist at a time. Calling this again replaces any previous value.
+    pub fn set_embedding_metadata(&self, model_id: &str, dimension: u32) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+
+        // Encode both fields into a single JSON string so we can use the
+        // two-column Meta table without widening it.
+        let value = format!(r#"{{"model_id":"{model_id}","dimension":{dimension}}}"#);
+
+        // Delete the existing singleton, if any. Best-effort: silently
+        // ignore errors from tables that were never created (old DBs).
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String("embedding".to_string()))],
+        );
+
+        exec_params(
+            &conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String("embedding".to_string())),
+                ("v", lbug::Value::String(value)),
+            ],
+        )
     }
 }

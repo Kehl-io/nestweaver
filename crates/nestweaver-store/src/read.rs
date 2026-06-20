@@ -258,6 +258,7 @@ pub(crate) fn row_to_heading(row: &[Value]) -> Result<Heading, StoreError> {
         start_line,
         end_line,
         content_hash,
+        embedding: None,
     })
 }
 
@@ -328,6 +329,7 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
         created_at,
         modified_at,
         pagerank_score: Some(pagerank_score),
+        embedding: None,
     })
 }
 
@@ -919,18 +921,12 @@ impl GraphStore {
     }
 
     /// Returns the dimension of stored embeddings, or 0 if none exist.
+    ///
+    /// Checks the sidecar `EmbeddingIndex` (the authoritative source since
+    /// lbug has no float-array columns). Returns 0 when the index is empty.
     pub fn embedding_dimension(&self) -> Result<u32, StoreError> {
-        let conn = self.conn()?;
-        let result = conn
-            .query(
-                "MATCH (s:Symbol) WHERE s.embedding IS NOT NULL \
-                 RETURN list_len(s.embedding) LIMIT 1",
-            )
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-        for row in result {
-            if let Ok(dim) = extract_i64(&row, 0) {
-                return Ok(u32::try_from(dim).unwrap_or(0));
-            }
+        if let Some(dim) = self.embedding_index_dimension() {
+            return Ok(u32::try_from(dim).unwrap_or(0));
         }
         Ok(0)
     }
@@ -1995,5 +1991,56 @@ impl GraphStore {
                 (note, v)
             })
             .collect())
+    }
+
+    // ── DB-level metadata ───────────────────────────────────────────────────
+
+    /// Read the stored embedding metadata (model ID and dimension).
+    ///
+    /// Returns `Some((model_id, dimension))` when a record has been written
+    /// by [`GraphStore::set_embedding_metadata`], or `None` if the Meta table
+    /// does not exist yet (old DB) or the `"embedding"` key has never been set.
+    pub fn get_embedding_metadata(&self) -> Result<Option<(String, u32)>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (m:Meta {key: $k}) RETURN m.value";
+        let mut stmt = match conn.prepare(q) {
+            Ok(s) => s,
+            Err(_) => {
+                // Meta table doesn't exist on older databases — treat as absent.
+                return Ok(None);
+            }
+        };
+        let mut result = match conn.execute(
+            &mut stmt,
+            vec![("k", Value::String("embedding".to_string()))],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let row = match result.next() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let value = extract_string(&row, 0)?;
+        if value.is_empty() {
+            return Ok(None);
+        }
+        // Parse the JSON value stored by set_embedding_metadata.
+        // Expected format: {"model_id":"<id>","dimension":<n>}
+        let parsed: serde_json::Value = serde_json::from_str(&value)
+            .map_err(|e| StoreError::Query(format!("parse embedding metadata: {e}")))?;
+        let model_id = parsed
+            .get("model_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let dimension = parsed
+            .get("dimension")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        if model_id.is_empty() || dimension == 0 {
+            return Ok(None);
+        }
+        Ok(Some((model_id, dimension)))
     }
 }

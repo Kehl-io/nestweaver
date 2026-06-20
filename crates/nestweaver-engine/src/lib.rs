@@ -175,9 +175,9 @@ pub use process::{
 pub use project::{ProjectMaterializationResult, detect_implicit_projects, materialize_projects};
 pub use pull::*;
 pub use query::{
-    BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, FeatureContextResult,
-    FeatureInfo, HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate, SymbolDetail,
-    apply_ranking_priors, build_brain_context, build_brain_context_hybrid,
+    BrainContextResult, BrainNode, ContextNode, ContextResult, CrossRepoLink, EmbedQueryFn,
+    FeatureContextResult, FeatureInfo, HybridSearchConfig, LinkInfo, LookupResult, SymbolCandidate,
+    SymbolDetail, apply_ranking_priors, build_brain_context, build_brain_context_hybrid,
     build_brain_context_hybrid_with_aliases, build_context, build_context_with_intent,
     build_feature_context, dedup_heading_section_pairs, expand_query_with_aliases,
     explain_ranking_prior, generate_repo_map, list_repos, list_services, lookup_symbol,

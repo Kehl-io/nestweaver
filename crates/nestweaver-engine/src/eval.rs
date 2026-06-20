@@ -267,6 +267,7 @@ fn ranked_uids_for_query(
         aliases,
         db_path,
         jq.parsed_intent(),
+        None,
     )?;
     // Feature F17: optionally rerank the leading candidates before scoring, so
     // the harness measures exactly the ordering a `--rerank` caller would get.
