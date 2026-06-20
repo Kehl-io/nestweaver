@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use anyhow::{Context, Result};
 
 use crate::lifecycle;
 
@@ -84,6 +84,11 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
             anyhow::bail!("launchctl bootstrap failed: {stderr}");
         }
     }
+
+    // Kickstart the agent — bootstrap only registers, doesn't start without RunAtLoad
+    let _ = Command::new("launchctl")
+        .args(["kickstart", &format!("gui/{uid}/{label}")])
+        .output();
 
     Ok(())
 }

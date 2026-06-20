@@ -6644,8 +6644,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         #[cfg(target_os = "macos")]
                         {
                             // Resolve binary path
-                            let binary_path = std::env::current_exe()
-                                .context("cannot determine binary path")?;
+                            let binary_path =
+                                std::env::current_exe().context("cannot determine binary path")?;
 
                             let plist = nestweaver_daemon::launchd::generate_plist(
                                 &instance_id,
@@ -6659,9 +6659,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 && let Ok(pid) = pid_str.trim().parse::<i32>()
                                 && unsafe { libc::kill(pid, 0) } == 0
                             {
-                                eprintln!(
-                                    "Migrating from fork-based daemon to launchd agent..."
-                                );
+                                eprintln!("Migrating from fork-based daemon to launchd agent...");
                                 unsafe {
                                     libc::kill(pid, libc::SIGTERM);
                                 }
