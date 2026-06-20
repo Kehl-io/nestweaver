@@ -20,6 +20,9 @@ use std::time::Duration;
 fn daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
     cmd.env_remove("NESTWEAVER_NO_DAEMON");
+    // Use fork-based daemon in tests — launchd agents don't work
+    // reliably in the cargo test environment.
+    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd
 }
 

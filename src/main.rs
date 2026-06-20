@@ -6630,112 +6630,193 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
 
-                    // Atomically detect another running or starting daemon via
-                    // a non-blocking exclusive flock on the pidfile. daemonize2
-                    // holds LOCK_EX on the pidfile for the daemon's entire
-                    // lifetime (see autostart.rs for the matching consumer),
-                    // so a successful flock here proves no daemon owns it.
-                    //
-                    // This replaces a previous `kill(pid, 0)` check that had a
-                    // TOCTOU window: two concurrent `daemon start` invocations
-                    // (e.g. from `launchctl kickstart -k` or rapid respawn)
-                    // could both pass the kill check and race for the DB write
-                    // lock, with the loser dying with "Could not set lock on
-                    // file ... another process may hold the write lock".
-                    use std::os::unix::io::AsRawFd;
-                    let pid_lock = std::fs::OpenOptions::new()
-                        .create(true)
-                        .read(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&pidfile)
-                        .with_context(|| format!("open pidfile: {}", pidfile.display()))?;
-                    let pid_lock_fd = pid_lock.as_raw_fd();
-                    let lock_ret =
-                        unsafe { libc::flock(pid_lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
-                    if lock_ret != 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
-                            let pid_trimmed = pid_text.trim();
-                            if pid_trimmed.is_empty() {
-                                eprintln!("Daemon already running (starting up).");
-                            } else {
-                                eprintln!("Daemon already running (PID {pid_trimmed}).");
-                            }
-                            return Ok((EXIT_SUCCESS, None));
-                        }
-                        anyhow::bail!("flock on pidfile failed: {err}");
-                    }
+                    // On macOS, use launchd to manage the daemon unless
+                    // NESTWEAVER_DAEMON_FORK=1 is set (useful for tests and
+                    // environments where launchd is not available).
+                    #[cfg(target_os = "macos")]
+                    let use_launchd = std::env::var("NESTWEAVER_DAEMON_FORK")
+                        .map(|v| v != "1")
+                        .unwrap_or(true);
+                    #[cfg(not(target_os = "macos"))]
+                    let use_launchd = false;
 
-                    // We hold the lock — no other daemon is running or
-                    // starting. Any PID in the file is stale; daemonize2 will
-                    // overwrite it after the double-fork.
-                    // Release the flock immediately before daemonize2's
-                    // start() so it can acquire its own lock on the same
-                    // pidfile; the race window between release and reacquire
-                    // is microseconds, far smaller than the prior TOCTOU
-                    // window of the kill(pid, 0) check.
+                    if use_launchd {
+                        #[cfg(target_os = "macos")]
+                        {
+                            // Resolve binary path
+                            let binary_path = std::env::current_exe()
+                                .context("cannot determine binary path")?;
 
-                    let stdout_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_file)
-                        .with_context(|| format!("open log file: {}", log_file.display()))?;
-                    let stderr_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_file)
-                        .with_context(|| {
-                            format!("open log file for stderr: {}", log_file.display())
-                        })?;
+                            let plist = nestweaver_daemon::launchd::generate_plist(
+                                &instance_id,
+                                &binary_path,
+                                &db_path,
+                                &log_file,
+                            );
 
-                    eprintln!(
-                        "Starting daemon for {} (instance {instance_id})...",
-                        db_path.display()
-                    );
-                    eprintln!("  PID file: {}", pidfile.display());
-                    eprintln!("  Socket:   {}", socket.display());
-                    eprintln!("  Log:      {}", log_file.display());
-
-                    let daemonize = daemonize2::Daemonize::new()
-                        .pid_file(&pidfile)
-                        .stdout(stdout_file)
-                        .stderr(stderr_file)
-                        .working_directory(".");
-
-                    unsafe { libc::flock(pid_lock_fd, libc::LOCK_UN) };
-                    drop(pid_lock);
-
-                    match unsafe { daemonize.start() } {
-                        Ok(()) => {
-                            // We are now the daemon process.
-                            let idle = if idle_timeout > 0 {
-                                Some(std::time::Duration::from_secs(idle_timeout))
-                            } else {
-                                None
-                            };
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            let config_path = config.clone();
-                            rt.block_on(async {
-                                if let Err(e) = nestweaver_daemon::run_server(
-                                    &db_path,
-                                    idle,
-                                    config_path.as_deref(),
-                                )
-                                .await
-                                {
-                                    eprintln!("Daemon error: {e:#}");
-                                    std::process::exit(1);
+                            // Migrate: stop any existing fork-based daemon
+                            if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+                                && let Ok(pid) = pid_str.trim().parse::<i32>()
+                                && unsafe { libc::kill(pid, 0) } == 0
+                            {
+                                eprintln!(
+                                    "Migrating from fork-based daemon to launchd agent..."
+                                );
+                                unsafe {
+                                    libc::kill(pid, libc::SIGTERM);
                                 }
-                            });
+                                for _ in 0..50 {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    if unsafe { libc::kill(pid, 0) } != 0 {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            nestweaver_daemon::launchd::install_and_start(&instance_id, &plist)?;
+
+                            eprintln!(
+                                "Starting daemon via launchd for {} (instance {})...",
+                                db_path.display(),
+                                instance_id
+                            );
+                            eprintln!(
+                                "  Label:  {}",
+                                nestweaver_daemon::lifecycle::launchd_label(&instance_id)
+                            );
+                            eprintln!(
+                                "  Plist:  {}",
+                                nestweaver_daemon::lifecycle::launchd_plist_path(&instance_id)
+                                    .display()
+                            );
+                            eprintln!("  Socket: {}", socket.display());
+                            eprintln!("  Log:    {}", log_file.display());
+
+                            // Wait for socket to appear (daemon is starting in background via launchd)
+                            for _ in 0..100 {
+                                if socket.exists() {
+                                    return Ok((EXIT_SUCCESS, None));
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+
+                            anyhow::bail!("Daemon did not start within 10 seconds");
                         }
-                        Err(e) => {
-                            anyhow::bail!("Failed to daemonize: {e}");
-                        }
+
+                        #[cfg(not(target_os = "macos"))]
+                        unreachable!("use_launchd is always false on non-macOS");
                     }
-                    Ok((EXIT_SUCCESS, None))
+
+                    // Fork-based daemon path (Linux + macOS with NESTWEAVER_DAEMON_FORK=1)
+                    {
+                        // Atomically detect another running or starting daemon via
+                        // a non-blocking exclusive flock on the pidfile. daemonize2
+                        // holds LOCK_EX on the pidfile for the daemon's entire
+                        // lifetime (see autostart.rs for the matching consumer),
+                        // so a successful flock here proves no daemon owns it.
+                        //
+                        // This replaces a previous `kill(pid, 0)` check that had a
+                        // TOCTOU window: two concurrent `daemon start` invocations
+                        // (e.g. from `launchctl kickstart -k` or rapid respawn)
+                        // could both pass the kill check and race for the DB write
+                        // lock, with the loser dying with "Could not set lock on
+                        // file ... another process may hold the write lock".
+                        use std::os::unix::io::AsRawFd;
+                        let pid_lock = std::fs::OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .truncate(false)
+                            .open(&pidfile)
+                            .with_context(|| format!("open pidfile: {}", pidfile.display()))?;
+                        let pid_lock_fd = pid_lock.as_raw_fd();
+                        let lock_ret =
+                            unsafe { libc::flock(pid_lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+                        if lock_ret != 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::WouldBlock {
+                                let pid_text =
+                                    std::fs::read_to_string(&pidfile).unwrap_or_default();
+                                let pid_trimmed = pid_text.trim();
+                                if pid_trimmed.is_empty() {
+                                    eprintln!("Daemon already running (starting up).");
+                                } else {
+                                    eprintln!("Daemon already running (PID {pid_trimmed}).");
+                                }
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+                            anyhow::bail!("flock on pidfile failed: {err}");
+                        }
+
+                        // We hold the lock — no other daemon is running or
+                        // starting. Any PID in the file is stale; daemonize2 will
+                        // overwrite it after the double-fork.
+                        // Release the flock immediately before daemonize2's
+                        // start() so it can acquire its own lock on the same
+                        // pidfile; the race window between release and reacquire
+                        // is microseconds, far smaller than the prior TOCTOU
+                        // window of the kill(pid, 0) check.
+
+                        let stdout_file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_file)
+                            .with_context(|| format!("open log file: {}", log_file.display()))?;
+                        let stderr_file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_file)
+                            .with_context(|| {
+                                format!("open log file for stderr: {}", log_file.display())
+                            })?;
+
+                        eprintln!(
+                            "Starting daemon for {} (instance {instance_id})...",
+                            db_path.display()
+                        );
+                        eprintln!("  PID file: {}", pidfile.display());
+                        eprintln!("  Socket:   {}", socket.display());
+                        eprintln!("  Log:      {}", log_file.display());
+
+                        let daemonize = daemonize2::Daemonize::new()
+                            .pid_file(&pidfile)
+                            .stdout(stdout_file)
+                            .stderr(stderr_file)
+                            .working_directory(".");
+
+                        unsafe { libc::flock(pid_lock_fd, libc::LOCK_UN) };
+                        drop(pid_lock);
+
+                        match unsafe { daemonize.start() } {
+                            Ok(()) => {
+                                // We are now the daemon process.
+                                let idle = if idle_timeout > 0 {
+                                    Some(std::time::Duration::from_secs(idle_timeout))
+                                } else {
+                                    None
+                                };
+                                let rt = tokio::runtime::Runtime::new()
+                                    .expect("failed to create tokio runtime");
+                                let config_path = config.clone();
+                                rt.block_on(async {
+                                    if let Err(e) = nestweaver_daemon::run_server(
+                                        &db_path,
+                                        idle,
+                                        config_path.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("Daemon error: {e:#}");
+                                        std::process::exit(1);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                anyhow::bail!("Failed to daemonize: {e}");
+                            }
+                        }
+                        Ok((EXIT_SUCCESS, None))
+                    }
                 }
 
                 DaemonAction::Run => {
@@ -6747,6 +6828,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Stop => {
+                    // Try launchd first on macOS (unless it's not managing this instance)
+                    #[cfg(target_os = "macos")]
+                    if nestweaver_daemon::launchd::is_running(&instance_id) {
+                        eprintln!("Stopping daemon via launchd...");
+                        nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)?;
+                        for _ in 0..50 {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            if !nestweaver_daemon::launchd::is_running(&instance_id) {
+                                break;
+                            }
+                        }
+                        eprintln!("Daemon stopped.");
+                        let _ = std::fs::remove_file(&pidfile);
+                        let _ = std::fs::remove_file(&socket);
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+
+                    // SIGTERM-based stop for Linux + legacy macOS fork-based daemons
                     let pid_str = std::fs::read_to_string(&pidfile)
                         .with_context(|| format!("read pidfile: {}", pidfile.display()))?;
                     let pid: i32 = pid_str
@@ -6783,6 +6882,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Status => {
+                    // Check launchd first on macOS
+                    #[cfg(target_os = "macos")]
+                    if nestweaver_daemon::launchd::is_running(&instance_id) {
+                        println!("Daemon is running (launchd agent)");
+                        println!(
+                            "  Label:  {}",
+                            nestweaver_daemon::lifecycle::launchd_label(&instance_id)
+                        );
+                        println!("  DB:     {}", db_path.display());
+                        println!("  Socket: {}", socket.display());
+                        println!("  Log:    {}", log_file.display());
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+
+                    // PID-based status check (Linux + legacy macOS fork-based daemons)
                     if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
                         && let Ok(pid) = pid_str.trim().parse::<i32>()
                         && unsafe { libc::kill(pid, 0) } == 0
