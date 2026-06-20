@@ -86,9 +86,15 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
     }
 
     // Kickstart the agent — bootstrap only registers, doesn't start without RunAtLoad
-    let _ = Command::new("launchctl")
+    let kick = Command::new("launchctl")
         .args(["kickstart", &format!("gui/{uid}/{label}")])
-        .output();
+        .output()
+        .context("failed to run launchctl kickstart")?;
+
+    if !kick.status.success() {
+        let stderr = String::from_utf8_lossy(&kick.stderr);
+        anyhow::bail!("launchctl kickstart failed: {stderr}");
+    }
 
     Ok(())
 }

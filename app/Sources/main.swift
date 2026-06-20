@@ -53,7 +53,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
                let icon = NSImage(contentsOf: iconURL) {
                 icon.size = NSSize(width: 18, height: 18)
-                icon.isTemplate = true
+                icon.isTemplate = false
                 button.image = icon
             } else {
                 button.title = "NW"

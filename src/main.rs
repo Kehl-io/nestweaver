@@ -6654,12 +6654,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &log_file,
                             );
 
-                            // Migrate: stop any existing fork-based daemon
+                            // Clean up any existing agent or fork-based daemon
+                            // before installing the new plist
+                            let _ = nestweaver_daemon::launchd::stop_and_uninstall(&instance_id);
+
                             if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
                                 && let Ok(pid) = pid_str.trim().parse::<i32>()
                                 && unsafe { libc::kill(pid, 0) } == 0
                             {
-                                eprintln!("Migrating from fork-based daemon to launchd agent...");
+                                eprintln!("Stopping existing daemon (PID {pid})...");
                                 unsafe {
                                     libc::kill(pid, libc::SIGTERM);
                                 }
