@@ -40,9 +40,9 @@ nestweaver-proto = { path = "crates/nestweaver-proto" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }
 nestweaver-embed = { path = "crates/nestweaver-embed" }
-tonic = "0.13"
-prost = "0.13"
-tonic-build = "0.13"
+tonic = "0.14"
+prost = "0.14"
+tonic-build = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -52,7 +52,7 @@ tracing = "0.1"
 axum = "0.8"
 axum-embed = "0.1"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tokio-stream = "0.1"
 open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
