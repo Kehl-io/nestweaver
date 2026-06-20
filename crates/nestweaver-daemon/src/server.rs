@@ -2570,9 +2570,37 @@ pub async fn run_server(
     let sock_path = lifecycle::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
 
-    // PID file is written by the `daemonize2` crate during the double-fork.
-    // We only need the path for cleanup on shutdown.
+    // Write PID file and acquire exclusive flock for daemon lifetime detection.
+    // When launched via launchd (daemon run), daemonize2 doesn't run, so we
+    // acquire the flock directly. The flock is released when _pid_guard drops
+    // (on server shutdown).
     let pid_path = lifecycle::pidfile_path(&instance_id);
+    let pid_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&pid_path)
+        .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
+
+    {
+        use std::io::Write;
+        write!(&pid_file, "{}", std::process::id())
+            .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = pid_file.as_raw_fd();
+        // Non-blocking exclusive lock — if another daemon holds it, we fail fast
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            anyhow::bail!("Another daemon instance is already running (pidfile locked)");
+        }
+    }
+
+    // Keep the file handle alive so flock is held for the server's lifetime
+    let _pid_guard = pid_file;
 
     tracing::info!(
         socket = %sock_path.display(),
