@@ -2,6 +2,7 @@ import AppKit
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
+    var statusMenuItem: NSMenuItem?
     var daemonProcess: Process?
     var restartCount = 0
     let maxRestarts = 3
@@ -42,7 +43,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Thread.sleep(forTimeInterval: 0.1)
             }
             if found {
-                DispatchQueue.main.async { self.openWebUI() }
+                // Verify the daemon is actually healthy by checking the port
+                DispatchQueue.main.async {
+                    self.openWebUI()
+                    self.updateStatus("Running")
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.updateStatus("Failed to start")
+                }
             }
         }
     }
@@ -63,12 +72,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: "o"))
         menu.addItem(NSMenuItem.separator())
-        let statusMenuItem = NSMenuItem(title: "Status: Running", action: nil, keyEquivalent: "")
-        statusMenuItem.isEnabled = false
-        menu.addItem(statusMenuItem)
+        let si = NSMenuItem(title: "Status: Starting…", action: nil, keyEquivalent: "")
+        si.isEnabled = false
+        statusMenuItem = si
+        menu.addItem(si)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit NestWeaver", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    func updateStatus(_ status: String) {
+        statusMenuItem?.title = "Status: \(status)"
     }
 
     func startDaemon(dbPath: String) {
@@ -82,10 +96,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         process.terminationHandler = { [weak self] proc in
             guard let self = self else { return }
-            if proc.terminationReason == .uncaughtSignal && self.restartCount < self.maxRestarts {
-                self.restartCount += 1
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    self.startDaemon(dbPath: dbPath)
+            DispatchQueue.main.async {
+                if proc.terminationReason == .uncaughtSignal && self.restartCount < self.maxRestarts {
+                    self.restartCount += 1
+                    self.updateStatus("Restarting (\(self.restartCount)/\(self.maxRestarts))…")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.startDaemon(dbPath: dbPath)
+                    }
+                } else if proc.terminationStatus != 0 && self.restartCount >= self.maxRestarts {
+                    self.updateStatus("Stopped (too many crashes)")
                 }
             }
         }
@@ -123,6 +142,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func detectDatabase() -> String? {
+        // 1. Environment variable
         if let envDb = ProcessInfo.processInfo.environment["NESTWEAVER_DB"], !envDb.isEmpty {
             return envDb
         }
@@ -130,31 +150,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let fm = FileManager.default
         let home = NSHomeDirectory()
 
+        // 2. Parse ~/.nestweaver/instance.toml for db field
         let instanceToml = home + "/.nestweaver/instance.toml"
         if let contents = try? String(contentsOfFile: instanceToml, encoding: .utf8) {
-            for line in contents.components(separatedBy: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix("db") && trimmed.contains("=") {
-                    let value = trimmed.components(separatedBy: "=").last?
-                        .trimmingCharacters(in: .whitespaces)
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                    if let v = value, fm.fileExists(atPath: v) {
-                        return v
-                    }
+            if let dbValue = parseTomlString(contents, key: "db") {
+                // Resolve ~ in path
+                let resolved = dbValue.hasPrefix("~/")
+                    ? home + String(dbValue.dropFirst(1))
+                    : dbValue
+                // Resolve symlinks for consistency with Rust's canonicalize
+                let canonical = (resolved as NSString).resolvingSymlinksInPath
+                if fm.fileExists(atPath: canonical) {
+                    return canonical
                 }
             }
         }
 
+        // 3. Glob ~/.local/share/nestweaver/*/brain.lbug
         let nestDir = home + "/.local/share/nestweaver"
         if let dirs = try? fm.contentsOfDirectory(atPath: nestDir) {
             for dir in dirs.sorted() {
-                let dbPath = nestDir + "/" + dir + "/brain.lbug"
-                if fm.fileExists(atPath: dbPath) {
-                    return dbPath
+                let candidate = nestDir + "/" + dir + "/brain.lbug"
+                if fm.fileExists(atPath: candidate) {
+                    return (candidate as NSString).resolvingSymlinksInPath
                 }
             }
         }
 
+        return nil
+    }
+
+    /// Parse a simple key = "value" or key = 'value' from TOML content.
+    /// Handles quoted values correctly, including values containing '='.
+    func parseTomlString(_ content: String, key: String) -> String? {
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Skip comments and section headers
+            if trimmed.hasPrefix("#") || trimmed.hasPrefix("[") { continue }
+
+            // Match key = value pattern
+            guard let eqIndex = trimmed.firstIndex(of: "=") else { continue }
+            let lineKey = trimmed[trimmed.startIndex..<eqIndex]
+                .trimmingCharacters(in: .whitespaces)
+            if lineKey != key { continue }
+
+            var value = trimmed[trimmed.index(after: eqIndex)...]
+                .trimmingCharacters(in: .whitespaces)
+
+            // Strip matching quotes
+            if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+               (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+
+            return value.isEmpty ? nil : value
+        }
         return nil
     }
 }
