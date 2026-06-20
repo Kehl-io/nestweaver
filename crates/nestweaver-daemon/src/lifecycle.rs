@@ -90,6 +90,20 @@ pub fn log_path(instance_id: &str) -> PathBuf {
     log_dir(instance_id).join("daemon.log")
 }
 
+/// Launchd service label for the given instance.
+pub fn launchd_label(instance_id: &str) -> String {
+    format!("io.kehl.nestweaver.{instance_id}")
+}
+
+/// Path to the launchd plist for the given instance.
+pub fn launchd_plist_path(instance_id: &str) -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", launchd_label(instance_id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
