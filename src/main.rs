@@ -1366,6 +1366,8 @@ enum DaemonAction {
     Stop,
     /// Show daemon status
     Status,
+    /// Run daemon in foreground (used by launchd)
+    Run,
     /// Stop and restart the daemon
     Restart {
         /// Idle timeout in seconds
@@ -6733,6 +6735,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             anyhow::bail!("Failed to daemonize: {e}");
                         }
                     }
+                    Ok((EXIT_SUCCESS, None))
+                }
+
+                DaemonAction::Run => {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        nestweaver_daemon::run_server(&db_path, None, None).await
+                    })?;
                     Ok((EXIT_SUCCESS, None))
                 }
 
