@@ -69,3 +69,4 @@ graphify-out/
 nestweaver.filemeta.json
 .mcp.json
 .github/copilot-mcp.json
+.agents/

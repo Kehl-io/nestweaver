@@ -35,35 +35,46 @@ impl LocalModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
-        // Try Metal first, fall back to CPU if forward pass fails
-        // (candle 0.8 Metal backend lacks some ops like layer-norm)
+        // Try each candidate device. Metal can panic in candle 0.10
+        // when the compiler service is unavailable (common in daemons),
+        // so wrap each attempt in catch_unwind.
         for device in candidate_devices() {
             info!(device = ?device, model = %config.model_id, "Loading embedding model");
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights_path),
-                    candle_core::DType::F32,
-                    &device,
-                )?
-            };
-            let model = BertModel::load(vb, &bert_config)?;
+            let bc = bert_config.clone();
+            let wp = weights_path.clone();
             let tok = tokenizer.clone();
-            let mut candidate = Self {
-                model,
-                tokenizer: tok,
-                device,
-                dimension,
-            };
+            let dim = dimension;
 
-            // Probe with a short text to verify the device works end-to-end
-            match candidate.embed(&["test"]) {
-                Ok(_) => {
-                    candidate.tokenizer = tokenizer;
-                    info!(dimension, device = ?candidate.device, "Embedding model loaded");
-                    return Ok(candidate);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(&wp),
+                        candle_core::DType::F32,
+                        &device,
+                    )?
+                };
+                let model = BertModel::load(vb, &bc)?;
+                let candidate = Self {
+                    model,
+                    tokenizer: tok,
+                    device,
+                    dimension: dim,
+                };
+                candidate.embed(&["test"])?;
+                Ok::<Self, anyhow::Error>(candidate)
+            }));
+
+            match result {
+                Ok(Ok(mut model)) => {
+                    model.tokenizer = tokenizer;
+                    info!(dimension, device = ?model.device, "Embedding model loaded");
+                    return Ok(model);
                 }
-                Err(e) => {
-                    tracing::warn!(device = ?candidate.device, "Device probe failed ({e}), trying next");
+                Ok(Err(e)) => {
+                    tracing::warn!("Device probe failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("Device probe panicked, trying next device");
                 }
             }
         }
@@ -128,7 +139,7 @@ fn candidate_devices() -> Vec<Device> {
     let mut devices = vec![Device::Cpu];
     #[cfg(feature = "metal")]
     {
-        if let Ok(device) = Device::new_metal(0) {
+        if let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) {
             devices.insert(0, device);
         }
     }
