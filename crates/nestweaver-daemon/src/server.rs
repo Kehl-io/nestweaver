@@ -2570,9 +2570,38 @@ pub async fn run_server(
     let sock_path = lifecycle::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
 
-    // PID file is written by the `daemonize2` crate during the double-fork.
-    // We only need the path for cleanup on shutdown.
+    // Write PID file and optionally acquire flock.
+    // In fork mode (daemonize2), the flock is already held by daemonize2.
+    // In foreground mode (launchd / daemon run), we acquire it ourselves.
     let pid_path = lifecycle::pidfile_path(&instance_id);
+    let _pid_guard: Option<std::fs::File> = if std::env::var("NESTWEAVER_DAEMON_FORK").is_err() {
+        let pid_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&pid_path)
+            .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
+
+        {
+            use std::io::Write;
+            write!(&pid_file, "{}", std::process::id())
+                .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = pid_file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                anyhow::bail!("Another daemon instance is already running (pidfile locked)");
+            }
+        }
+
+        Some(pid_file)
+    } else {
+        None
+    };
 
     tracing::info!(
         socket = %sock_path.display(),
