@@ -21,7 +21,8 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    BrainNode, HybridSearchConfig, build_brain_context_hybrid_with_aliases, populate_inline_bodies,
+    BrainNode, EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases,
+    populate_inline_bodies,
 };
 
 /// Bundle time-to-live: entries older than this are dropped when the sidecar
@@ -218,6 +219,7 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
 /// When `db_path` is `Some`, the resulting bundle is persisted to the sidecar.
 /// When `None` (e.g. an in-memory store), the bundle is returned but not saved;
 /// follow-up calls would not find it.
+#[allow(clippy::too_many_arguments)]
 pub fn investigate(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -226,6 +228,7 @@ pub fn investigate(
     query: &str,
     scope: &str,
     token_budget: Option<usize>,
+    embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<InvestigateResult, anyhow::Error> {
     let budget = token_budget
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
@@ -252,6 +255,7 @@ pub fn investigate(
         &HashMap::new(),
         db_path,
         None,
+        embed_model,
     );
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => ctx.connected,
@@ -804,6 +808,7 @@ mod tests {
             "greet",
             "vault",
             Some(4000),
+            None,
         )
         .unwrap();
 
@@ -841,8 +846,17 @@ mod tests {
         let (dir, src, store) = make_store();
         let db_path = dir.path().join("nestweaver.lbug");
 
-        let result =
-            investigate(&store, None, Some(&db_path), &src, "greet", "vault", None).unwrap();
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Pick a symbol entry to expand.
         let target = result
@@ -887,6 +901,7 @@ mod tests {
             "greet",
             "vault",
             Some(50),
+            None,
         )
         .unwrap();
         // With a tiny budget, most entries lack inline bodies.
@@ -949,6 +964,7 @@ mod tests {
             "greet",
             "vault",
             Some(50),
+            None,
         )
         .unwrap();
 
@@ -1029,6 +1045,7 @@ mod tests {
             &src,
             "zzz_no_such_symbol_xyz",
             "vault",
+            None,
             None,
         )
         .unwrap();

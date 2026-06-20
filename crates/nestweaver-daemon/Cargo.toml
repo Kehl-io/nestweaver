@@ -12,6 +12,7 @@ nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
 nestweaver-mcp = { workspace = true }
 nestweaver-web = { workspace = true }
+nestweaver-embed = { workspace = true, optional = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { version = "1", features = ["full"] }
@@ -25,3 +26,6 @@ serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 libc = "0.2"
 dirs = "6"
+
+[features]
+embed = ["dep:nestweaver-embed", "nestweaver-engine/embed", "nestweaver-mcp/embed"]

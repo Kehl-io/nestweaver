@@ -14,6 +14,7 @@ members = [
     "crates/nestweaver-proto",
     "crates/nestweaver-daemon",
     "crates/nestweaver-client",
+    "crates/nestweaver-embed",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ nestweaver-web = { path = "crates/nestweaver-web" }
 nestweaver-proto = { path = "crates/nestweaver-proto" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }
+nestweaver-embed = { path = "crates/nestweaver-embed" }
 tonic = "0.13"
 prost = "0.13"
 tonic-build = "0.13"
@@ -98,6 +100,12 @@ libc = "0.2"
 sha2 = { workspace = true }
 hex = "0.4"
 tonic.workspace = true
+nestweaver-embed = { workspace = true, optional = true }
+
+[features]
+default = ["embed"]
+embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
+metal = ["nestweaver-embed?/metal"]
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -112,4 +120,8 @@ hex = "0.4"
 
 [[bench]]
 name = "brain_benchmarks"
+harness = false
+
+[[bench]]
+name = "embed_latency"
 harness = false

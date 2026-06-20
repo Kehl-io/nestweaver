@@ -229,6 +229,7 @@ pub struct Note {
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
     pub pagerank_score: Option<f64>,
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A heading inside a note. Addressable target of `[[Note#Heading]]` links.
@@ -242,6 +243,7 @@ pub struct Heading {
     pub start_line: u32,
     pub end_line: u32,
     pub content_hash: String,
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// The body text under a heading (or the preamble before the first heading).

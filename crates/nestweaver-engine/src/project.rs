@@ -310,6 +310,7 @@ pub fn materialize_projects(
                             created_at: None,
                             modified_at: None,
                             pagerank_score: None,
+                            embedding: None,
                         };
 
                         if let Err(e) = store.upsert_note(&note) {
@@ -346,6 +347,7 @@ pub fn materialize_projects(
                                     start_line: h.start_line,
                                     end_line: h.end_line,
                                     content_hash: truncated_hash(&h.text),
+                                    embedding: None,
                                 })
                                 .collect();
 
