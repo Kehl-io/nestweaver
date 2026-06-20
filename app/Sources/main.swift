@@ -73,7 +73,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startDaemon(dbPath: String) {
         let bundlePath = Bundle.main.bundlePath
-        let binaryPath = bundlePath + "/Contents/MacOS/nestweaver"
+        let binaryPath = bundlePath + "/Contents/MacOS/nestweaver-cli"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
