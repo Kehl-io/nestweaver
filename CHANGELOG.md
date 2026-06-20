@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/Kehl-io/nestweaver/compare/v1.0.0...v1.0.1) (2026-06-20)
+
+
+### Bug Fixes
+
+* **embed:** use rustls instead of native-tls to fix cross-compilation ([1092704](https://github.com/Kehl-io/nestweaver/commit/1092704b0f0ef26b133a23f170236c673247f7fc))
+
 ## [1.0.0](https://github.com/Kehl-io/nestweaver/compare/v0.28.0...v1.0.0) (2026-06-20)
 
 
