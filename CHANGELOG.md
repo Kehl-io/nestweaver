@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/Kehl-io/nestweaver/compare/v0.28.0...v1.0.0) (2026-06-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* embedding seed layer — local model semantic search with Metal acceleration ([#82](https://github.com/Kehl-io/nestweaver/issues/82))
+
+### Features
+
+* embedding seed layer — local model semantic search with Metal acceleration ([#82](https://github.com/Kehl-io/nestweaver/issues/82)) ([eceb68d](https://github.com/Kehl-io/nestweaver/commit/eceb68da3f685d4e1d71a8e900397506a073beab))
+
 ## [0.28.0](https://github.com/Kehl-io/nestweaver/compare/v0.27.0...v0.28.0) (2026-06-18)
 
 
