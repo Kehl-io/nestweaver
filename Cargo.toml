@@ -54,7 +54,7 @@ tracing = "0.1"
 axum = "0.8"
 axum-embed = "0.1"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tokio-stream = "0.1"
 open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -93,7 +93,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 dirs = { workspace = true }
-signal-hook = "0.3"
+signal-hook = "0.4"
 nestweaver-daemon = { workspace = true }
 nestweaver-client = { workspace = true }
 nestweaver-proto = { workspace = true }
