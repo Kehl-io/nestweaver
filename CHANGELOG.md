@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/Kehl-io/nestweaver/compare/v1.1.0...v1.1.1) (2026-06-21)
+
+
+### Bug Fixes
+
+* normalize repo URLs and update docs for v1.1 ([#91](https://github.com/Kehl-io/nestweaver/issues/91)) ([4e68c38](https://github.com/Kehl-io/nestweaver/commit/4e68c382496156c71ef77cf30055d31d3025b8d0))
+
 ## [1.1.0](https://github.com/Kehl-io/nestweaver/compare/v1.0.1...v1.1.0) (2026-06-20)
 
 
