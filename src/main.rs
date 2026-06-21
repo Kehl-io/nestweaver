@@ -3016,13 +3016,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let repos = store.list_repos(None)?;
 
+            let repo_trimmed = repo.trim_end_matches('/');
             let sha_policy = if pinned {
                 let indexed_sha = repos
                     .iter()
                     .find(|r| {
-                        r.url == repo
+                        r.url.trim_end_matches('/') == repo_trimmed
                             || nestweaver_engine::repo_display_name(r)
-                                == nestweaver_engine::repo_name_from_url(&repo)
+                                == nestweaver_engine::repo_name_from_url(repo_trimmed)
                     })
                     .map(|r| r.indexed_sha.clone())
                     .unwrap_or_default();
@@ -3034,9 +3035,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let indexed_sha = repos
                 .iter()
                 .find(|r| {
-                    r.url == repo
+                    r.url.trim_end_matches('/') == repo_trimmed
                         || nestweaver_engine::repo_display_name(r)
-                            == nestweaver_engine::repo_name_from_url(&repo)
+                            == nestweaver_engine::repo_name_from_url(repo_trimmed)
                 })
                 .map(|r| r.indexed_sha.clone())
                 .unwrap_or_default();
@@ -6449,7 +6450,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let instance_id = instance.as_deref().unwrap_or("default");
 
-            let repo_url = format!("file://{}", repo_path.display());
+            let repo_url = format!("file://{}", repo_path.display())
+                .trim_end_matches('/')
+                .to_string();
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));
