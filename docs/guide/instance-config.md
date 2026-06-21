@@ -90,6 +90,32 @@ embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
 ```
 
+#### `[embedding]`
+
+Controls the local embedding model and hybrid retrieval weights. The embedding
+layer enables natural language queries by finding semantically similar symbols,
+notes, and headings as seeds for the graph walk.
+
+```toml
+[embedding]
+model_id = "sentence-transformers/all-MiniLM-L6-v2"  # any BERT-compatible HuggingFace model
+cache_dir = "~/.cache/nestweaver/models"
+
+# Optional: use an external API instead of the local model (falls back to local on failure)
+# external_endpoint = "https://api.openai.com"
+# external_model = "text-embedding-3-small"
+
+# Retrieval fusion weights (must sum to 1.0)
+weight_ppr = 0.40         # graph structure (Personalized PageRank)
+weight_bm25 = 0.25        # text match
+weight_semantic = 0.35    # embedding similarity
+
+# Seed selection
+always_blend_semantic = true   # add semantic matches to PPR seeds even when name resolution succeeds
+semantic_seed_limit = 5        # top-k semantic hits used as PPR seeds
+semantic_search_limit = 200    # top-k semantic hits fed into fusion
+```
+
 #### `[git]`
 
 How to authenticate git operations.

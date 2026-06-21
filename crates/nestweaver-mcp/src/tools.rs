@@ -3029,14 +3029,16 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         String::new()
     };
 
+    let target_trimmed = target.trim_end_matches('/');
     let matched_repo: Vec<&nestweaver_schema::Repo> = repos
         .iter()
         .filter(|r| {
+            let r_url = r.url.trim_end_matches('/');
             r.uid == target
-                || r.name.as_deref() == Some(&target)
-                || r.url == url_target
-                || r.url == canonical_target
-                || r.url.ends_with(&format!("/{target}"))
+                || r.name.as_deref() == Some(target_trimmed)
+                || r_url == url_target.trim_end_matches('/')
+                || r_url == canonical_target.trim_end_matches('/')
+                || r_url.ends_with(&format!("/{target_trimmed}"))
         })
         .collect();
 
