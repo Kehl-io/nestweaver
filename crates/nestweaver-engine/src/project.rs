@@ -138,7 +138,9 @@ pub fn materialize_projects(
                     .iter()
                     .filter(|r| {
                         repo_display_name(r) == *repo_name
-                            || cfg_url_for_name.is_some_and(|u| r.url == u)
+                            || cfg_url_for_name.is_some_and(|u| {
+                                r.url.trim_end_matches('/') == u.trim_end_matches('/')
+                            })
                             || r.url.contains(repo_name.as_str())
                     })
                     .collect();

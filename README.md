@@ -226,7 +226,7 @@ cargo build --release
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
-| `embed` | Generate vector embeddings for indexed symbols |
+| `embed` | Generate vector embeddings for symbols, notes, and headings using a local model (Metal-accelerated) or external API |
 | `pull` | Pull a snapshot from a remote storage backend |
 | `instance` | Manage instance configuration |
 | `snapshot` | Manage graph snapshots (build, verify, push) |
@@ -256,6 +256,53 @@ nestweaver brain search "architecture"
 # Get unified context spanning code and notes
 nestweaver brain context "MyProject"
 ```
+
+</details>
+
+<details>
+<summary>Semantic Search (Embedding Seed Layer)</summary>
+
+Query with natural language — no need to know exact symbol names. NestWeaver embeds symbols, notes, and headings using a local BERT model (Metal-accelerated on Apple Silicon, CPU fallback elsewhere), then uses semantic similarity to find entry points for the graph walk.
+
+```sh
+# Embed all indexed content (one-time, incremental after)
+nestweaver embed --stats
+
+# Natural language queries just work
+nestweaver context "how does authentication work"
+nestweaver context "BLE bluetooth connection handling"
+nestweaver context "where does the upload pipeline start"
+```
+
+Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use (~80MB).
+
+**Performance:** 7ms query embedding (Metal), 37ms (CPU). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+
+Configure weights in `instance.toml`:
+```toml
+[embedding]
+model_id = "sentence-transformers/all-MiniLM-L6-v2"
+weight_ppr = 0.40
+weight_bm25 = 0.25
+weight_semantic = 0.35
+```
+
+</details>
+
+<details>
+<summary>macOS App</summary>
+
+NestWeaver includes a native macOS app with a menubar status icon. Double-click to start the daemon and open the web UI.
+
+```sh
+# Build the app bundle
+app/build.sh
+
+# Launch
+open target/release/NestWeaver.app
+```
+
+The app auto-detects your database, spawns the daemon with Metal GPU acceleration, opens the web UI at `http://127.0.0.1:9377`, and provides crash recovery. On macOS, the daemon runs via launchd for proper GPU access.
 
 </details>
 

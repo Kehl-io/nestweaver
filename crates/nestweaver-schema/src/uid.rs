@@ -10,7 +10,8 @@ pub fn truncated_hash(input: &str) -> String {
 
 /// "repo:{instance}:{url_hash}"
 pub fn repo_uid(instance: &str, url: &str) -> String {
-    format!("repo:{}:{}", instance, truncated_hash(url))
+    let normalized = url.trim_end_matches('/');
+    format!("repo:{}:{}", instance, truncated_hash(normalized))
 }
 
 /// "file:{repo_uid}:{path_hash}"
