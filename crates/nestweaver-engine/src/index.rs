@@ -360,7 +360,7 @@ fn index_into_store(
     } else {
         let repo = Repo {
             uid: r_uid.clone(),
-            url: repo_url.to_string(),
+            url: repo_url.trim_end_matches('/').to_string(),
             indexed_sha: indexed_sha.to_string(),
             staleness_commits_behind: 0,
             instance_id: instance_id.to_string(),
