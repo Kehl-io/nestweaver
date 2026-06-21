@@ -2596,14 +2596,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             // Resolve target → repo UID.  Accept: UID, name, path, or URL.
-            let canonical_target = std::fs::canonicalize(&target)
+            let target_trimmed = target.trim_end_matches('/');
+            let canonical_target = std::fs::canonicalize(target_trimmed)
                 .map(|p| format!("file://{}", p.display()))
                 .unwrap_or_default();
 
-            let url_target = if target.starts_with("file://") {
-                target.clone()
-            } else if std::path::Path::new(&target).is_absolute() {
-                format!("file://{target}")
+            let url_target = if target_trimmed.starts_with("file://") {
+                target_trimmed.trim_end_matches('/').to_string()
+            } else if std::path::Path::new(target_trimmed).is_absolute() {
+                format!("file://{target_trimmed}")
             } else {
                 String::new()
             };
@@ -2611,11 +2612,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let matched: Vec<&nestweaver_schema::Repo> = repos
                 .iter()
                 .filter(|r| {
+                    let r_url = r.url.trim_end_matches('/');
                     r.uid == target
-                        || r.name.as_deref() == Some(&target)
-                        || r.url == url_target
-                        || r.url == canonical_target
-                        || r.url.ends_with(&format!("/{target}"))
+                        || r.name.as_deref() == Some(target_trimmed)
+                        || r_url == url_target
+                        || r_url == canonical_target
+                        || r_url.ends_with(&format!("/{target_trimmed}"))
                 })
                 .collect();
 
