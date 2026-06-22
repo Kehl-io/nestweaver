@@ -116,6 +116,19 @@ semantic_seed_limit = 5        # top-k semantic hits used as PPR seeds
 semantic_search_limit = 200    # top-k semantic hits fed into fusion
 ```
 
+| Field | Default | Description |
+|-------|---------|-------------|
+| `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID for local embeddings |
+| `cache_dir` | `"~/.cache/nestweaver/models"` | Directory to cache downloaded model weights |
+| `external_endpoint` | — | Optional external embedding API endpoint (falls back to local on failure) |
+| `external_model` | — | Model name for the external endpoint |
+| `weight_ppr` | `0.40` | Fusion weight for graph structure (Personalized PageRank) |
+| `weight_bm25` | `0.25` | Fusion weight for BM25 text match |
+| `weight_semantic` | `0.35` | Fusion weight for embedding similarity |
+| `always_blend_semantic` | `true` | Add semantic matches to PPR seeds even when name resolution finds results |
+| `semantic_seed_limit` | `5` | Top-k semantic hits injected as PPR seeds |
+| `semantic_search_limit` | `200` | Top-k semantic hits fed into fusion scoring |
+
 #### `[git]`
 
 How to authenticate git operations.

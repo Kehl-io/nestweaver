@@ -260,6 +260,25 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Run bulk embedding on the daemon using its Metal-accelerated model.
+    pub async fn embed(
+        &mut self,
+        scope: &str,
+        force: bool,
+        batch_size: u32,
+    ) -> Result<nestweaver_proto::EmbedResponse> {
+        let resp = self
+            .inner
+            .embed(nestweaver_proto::EmbedRequest {
+                scope: scope.to_string(),
+                force,
+                batch_size,
+            })
+            .await
+            .context("embed RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Purge all data for an instance, streaming progress.
     pub async fn purge_instance(
         &mut self,

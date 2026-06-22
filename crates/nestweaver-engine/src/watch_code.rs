@@ -300,7 +300,6 @@ fn reindex_file(
     use nestweaver_parser::{RawReference, RawSymbol, parse_source};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
-    use sha2::{Digest, Sha256};
 
     let abs_path = repo_root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
@@ -316,11 +315,7 @@ fn reindex_file(
         }
     };
 
-    let content_hash = {
-        let mut h = Sha256::new();
-        h.update(source.as_bytes());
-        hex::encode(h.finalize())
-    };
+    let content_hash = crate::hash::blake3_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
 
     // Insert or replace the File node.
@@ -440,7 +435,7 @@ fn reindex_file(
         parsed.references.clone(),
     )];
     let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))

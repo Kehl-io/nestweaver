@@ -147,6 +147,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,6 +866,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,6 +1357,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1518,6 +1544,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -3060,6 +3107,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b915661dd01db3f05050265b2477bcc6527b3792388e2749b41623cc592be67d"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3709,10 +3772,11 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "blake3",
  "clap",
  "clap_complete",
  "criterion",
@@ -3748,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3756,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -3772,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3798,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-embed"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3817,13 +3881,14 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "apollo-parser",
+ "blake3",
  "globset",
- "hex",
  "html2md",
+ "ignore",
  "indicatif 0.17.11",
  "nestweaver-algorithms",
  "nestweaver-embed",
@@ -3845,7 +3910,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serde_yaml_ng",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3857,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3880,8 +3944,9 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
+ "bumpalo",
  "comrak",
  "hex",
  "insta",
@@ -3927,7 +3992,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-proto"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "prost",
  "tonic",
@@ -3938,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "glob",
  "insta",
@@ -3955,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "hex",
  "serde",
@@ -3966,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3981,10 +4046,11 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "cc",
+ "csv",
  "lbug",
  "lru 0.18.0",
  "nestweaver-algorithms",
@@ -4004,7 +4070,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",

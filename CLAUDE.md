@@ -132,6 +132,8 @@ Sidecar files written alongside the database:
 - `<db>.interactions.json` — agent interaction memory (query patterns, access frequency, follow-up signals)
 - `<db>.perspectives.json` — saved web UI perspectives (web crate only)
 - `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read)
+- `<db>.parsed_cache.bin` — Cached parse results (symbols, references, type bindings) keyed by content hash, for skipping re-parsing unchanged files
+- `<db>.resolution_deps.bin` — Per-file resolution dependency tracker for incremental cross-file resolution
 
 ## Architecture
 

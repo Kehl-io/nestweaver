@@ -13,7 +13,6 @@ use nestweaver_schema::{
 };
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 /// Per-file entry accumulated during Phase 2 and consumed in Phase 3.
 /// The 4th field carries the retained source string (up to 2 MB) so Phase 3
@@ -47,7 +46,7 @@ pub struct IndexResult {
 // Before reading & hashing a file we check:
 //   Tier 1 – mtime unchanged → skip (near-zero cost stat)
 //   Tier 2 – mtime changed but size unchanged → skip (likely identical)
-//   Tier 3 – size differs → read file, compute SHA-256, compare hash
+//   Tier 3 – size differs → read file, compute BLAKE3, compare hash
 
 /// Per-file metadata cached between indexing runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +80,7 @@ enum ChangeVerdict {
     /// File is unchanged — skip re-indexing it.
     Unchanged,
     /// File is new or changed — `source` contains the file content and
-    /// `content_hash` is the freshly-computed SHA-256 hex digest.
+    /// `content_hash` is the freshly-computed BLAKE3 hex digest.
     Changed {
         source: String,
         content_hash: String,
@@ -122,7 +121,7 @@ fn tiered_change_check(
         // Tier 3: mtime differs → read file, compute hash, compare.
         let source = std::fs::read_to_string(abs_path)
             .with_context(|| format!("read {}", abs_path.display()))?;
-        let content_hash = sha2_hex(&source);
+        let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
             // Content identical despite mtime/size change — unchanged for the
             // graph. No need to re-parse. (The caller will carry forward the
@@ -142,7 +141,7 @@ fn tiered_change_check(
         // No cache entry → file is new, read and hash it.
         let source = std::fs::read_to_string(abs_path)
             .with_context(|| format!("read {}", abs_path.display()))?;
-        let content_hash = sha2_hex(&source);
+        let content_hash = content_hash_hex(&source);
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
                 mtime_secs,
@@ -264,6 +263,12 @@ pub fn index_directory_with_store(
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let mut new_filemeta = FileMetaCache::new();
 
+    let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
+
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+
     let result = if force {
         index_into_store(
             repo_path,
@@ -273,6 +278,8 @@ pub fn index_directory_with_store(
             indexed_sha,
             None,
             Some(&mut new_filemeta),
+            Some(&mut parsed_cache),
+            Some(&mut resolution_deps),
             name,
         )?
     } else {
@@ -285,12 +292,32 @@ pub fn index_directory_with_store(
             indexed_sha,
             Some(&filemeta_cache),
             Some(&mut new_filemeta),
+            Some(&mut parsed_cache),
+            Some(&mut resolution_deps),
             name,
         )?
     };
 
+    // Evict stale cache entries for deleted/renamed files before saving.
+    {
+        let live_hashes: std::collections::HashSet<String> = new_filemeta
+            .values()
+            .map(|m| m.content_hash.clone())
+            .collect();
+        parsed_cache.retain_hashes(&live_hashes);
+
+        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
+        resolution_deps.retain_files(&live_files);
+    }
+
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
+    }
+    if let Err(e) = parsed_cache.save(&parsed_cache_path) {
+        tracing::warn!("failed to save parsed cache: {e}");
+    }
+    if let Err(e) = resolution_deps.save(&resolution_deps_path) {
+        tracing::warn!("failed to save resolution deps: {e}");
     }
 
     let manifest = crate::manifest::parse_manifest(repo_path);
@@ -325,6 +352,8 @@ pub fn index_directory_in_memory(
         None,
         None,
         None,
+        None,
+        None,
     )?;
     Ok((result, store))
 }
@@ -333,9 +362,14 @@ pub fn index_directory_in_memory(
 ///
 /// When `filemeta_cache` is `Some`, tiered change detection skips files
 /// whose mtime and/or size match the cached values (avoiding expensive
-/// SHA-256 hashing and re-parsing for unchanged files). Entries for all
+/// BLAKE3 hashing and re-parsing for unchanged files). Entries for all
 /// processed files are written to `new_filemeta` so the caller can
 /// persist the updated sidecar after indexing completes.
+///
+/// When `parsed_cache` is provided, unchanged files whose content hash
+/// matches a cache entry will return their symbols/references from the
+/// cache instead of being skipped. Newly parsed files are inserted into
+/// the cache so callers can persist it after indexing.
 #[allow(clippy::too_many_arguments)]
 fn index_into_store(
     repo_path: &Path,
@@ -345,6 +379,8 @@ fn index_into_store(
     indexed_sha: &str,
     filemeta_cache: Option<&FileMetaCache>,
     mut new_filemeta: Option<&mut FileMetaCache>,
+    mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
+    mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     let started = Instant::now();
@@ -370,6 +406,7 @@ fn index_into_store(
     }
 
     // ── Phase 1: Scan files ───────────────────────────────────────────────
+    let _phase1_span = tracing::info_span!("index_phase_scan").entered();
     let scan_pb = ProgressBar::new_spinner();
     scan_pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -383,31 +420,33 @@ fn index_into_store(
     let mut spec_files: Vec<PathBuf> = Vec::new();
 
     // SECURITY: do NOT follow symlinks (see index_md.rs for rationale).
-    let walker = WalkDir::new(repo_path)
+    let walker = ignore::WalkBuilder::new(repo_path)
         .follow_links(false)
-        .into_iter()
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
         .filter_entry(|e| {
-            // Skip pruned directory names.
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
+            if e.file_type().is_some_and(|ft| ft.is_dir())
+                && let Some(name) = e.file_name().to_str()
+                && SKIP_DIRS.contains(&name)
             {
                 return false;
             }
             true
-        });
+        })
+        .build();
 
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                tracing::warn!("walkdir error: {err}");
+                tracing::warn!("walk error: {err}");
                 continue;
             }
         };
 
-        if entry.file_type().is_dir() {
+        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
         }
 
@@ -435,8 +474,15 @@ fn index_into_store(
     }
 
     scan_pb.finish_with_message(format!("Scanned {} files", file_entries.len()));
+    tracing::info!(
+        files_found = file_entries.len(),
+        spec_files_found = spec_files.len(),
+        "phase scan complete"
+    );
+    drop(_phase1_span);
 
     // ── Phase 2: Parse files (parallelised with rayon) ─────────────────
+    let _phase2_span = tracing::info_span!("index_phase_parse").entered();
     let total_files = file_entries.len() as u64;
     let parse_pb = ProgressBar::new(total_files);
     parse_pb.set_style(
@@ -452,8 +498,10 @@ fn index_into_store(
     let cache = filemeta_cache.unwrap_or(&empty_cache);
 
     // Per-file outcome from the parallel phase. Each entry is either
-    // Unchanged (carry forward cached meta), Skipped (error), or Parsed
-    // (with all data needed for the sequential collection phase).
+    // Unchanged (carry forward cached meta), Skipped (error), Parsed
+    // (freshly parsed), or CachedParsed (symbols loaded from the durable
+    // parsed cache — counts as unchanged for reporting, but symbols are
+    // available for resolution).
     enum ParseOutcome {
         Unchanged {
             rel_path: String,
@@ -472,12 +520,24 @@ fn index_into_store(
             /// TypeScript/NestJS), so framework detection can scan it.
             source: Option<String>,
         },
+        /// Unchanged file whose symbols were loaded from the durable parsed
+        /// cache. Treated as unchanged for filemeta carry-forward and
+        /// reporting, but symbols/references are fed into the resolver.
+        CachedParsed {
+            rel_path: String,
+            symbols: Vec<RawSymbol>,
+            references: Vec<RawReference>,
+            type_bindings: Vec<AstTypeBinding>,
+        },
     }
 
     // Run change detection + parsing in parallel. Each file is independent:
     // stat, read, hash, and tree-sitter parse are all CPU/IO-bound work
     // that benefits from multi-core execution.
     use rayon::prelude::*;
+
+    // Immutable borrow of the parsed cache for the parallel phase.
+    let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
     let outcomes: Vec<ParseOutcome> = file_entries
         .par_iter()
@@ -493,6 +553,20 @@ fn index_into_store(
                 match tiered_change_check(path, &display_name, cache) {
                     Ok(ChangeVerdict::Unchanged) => {
                         parse_pb.inc(1);
+                        // Check parsed cache: if we have cached symbols for this
+                        // file's content hash, return CachedParsed so symbols are
+                        // available for resolution while still counting as unchanged.
+                        if let Some(cached_meta) = cache.get(&display_name)
+                            && let Some(pc) = pc_ref
+                            && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
+                        {
+                            return ParseOutcome::CachedParsed {
+                                rel_path: display_name,
+                                symbols: cached_parse.symbols.clone(),
+                                references: cached_parse.references.clone(),
+                                type_bindings: cached_parse.type_bindings.clone(),
+                            };
+                        }
                         return ParseOutcome::Unchanged {
                             rel_path: display_name,
                         };
@@ -551,8 +625,10 @@ fn index_into_store(
         .collect();
 
     parse_pb.finish_and_clear();
+    drop(_phase2_span);
 
     // ── Sequential collection of parallel results ────────────────────────
+    let _phase_collect_span = tracing::info_span!("index_phase_collect").entered();
     let mut all_files: Vec<File> = Vec::new();
     let mut all_symbols: Vec<Symbol> = Vec::new();
     let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
@@ -568,6 +644,8 @@ fn index_into_store(
     let mut files_unchanged = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    let mut actually_changed_files: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for outcome in outcomes {
         match outcome {
@@ -579,6 +657,27 @@ fn index_into_store(
                     new_cache.insert(rel_path, cached.clone());
                 }
                 files_unchanged += 1;
+            }
+            ParseOutcome::CachedParsed {
+                rel_path,
+                symbols: raw_symbols,
+                references: raw_references,
+                type_bindings: raw_type_bindings,
+            } => {
+                // Carry forward the existing filemeta cache entry (file is unchanged).
+                if let (Some(ref mut new_cache), Some(cached)) =
+                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                {
+                    new_cache.insert(rel_path.clone(), cached.clone());
+                }
+                files_unchanged += 1;
+                // Feed cached symbols/references into the resolver so cross-file
+                // resolution works even when no files changed.
+                symbols_count += raw_symbols.len();
+                if !raw_type_bindings.is_empty() {
+                    ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
+                }
+                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, None));
             }
             ParseOutcome::Skipped(sf) => {
                 skipped_files.push(sf);
@@ -593,6 +692,8 @@ fn index_into_store(
                 type_bindings: raw_type_bindings,
                 source,
             } => {
+                actually_changed_files.insert(rel_path.clone());
+
                 // Record in the new filemeta cache.
                 if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
                     new_cache.insert(rel_path.clone(), file_meta);
@@ -717,6 +818,46 @@ fn index_into_store(
         }
     }
 
+    tracing::info!(
+        files_parsed = files_count,
+        files_unchanged = files_unchanged,
+        files_skipped = skipped_files.len(),
+        symbols_collected = symbols_count,
+        "phase collect complete"
+    );
+
+    // Populate the parsed cache with newly parsed files so future warm runs
+    // can retrieve their symbols without re-parsing.
+    if let Some(ref mut pc) = parsed_cache {
+        for (rel_path, raw_symbols, raw_references, _source) in &parsed_files_for_resolver {
+            // Only insert newly-parsed files, not ones loaded from cache.
+            if !actually_changed_files.contains(rel_path.as_str()) {
+                continue;
+            }
+            // Look up the content hash from the new filemeta cache.
+            let content_hash = new_filemeta
+                .as_deref()
+                .and_then(|fm| fm.get(rel_path))
+                .map(|m| m.content_hash.clone());
+            if let Some(hash) = content_hash {
+                pc.insert(
+                    hash,
+                    crate::parsed_cache::CachedParseResult {
+                        symbols: raw_symbols.clone(),
+                        references: raw_references.clone(),
+                        type_bindings: ast_bindings_by_file
+                            .get(rel_path.as_str())
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                );
+            }
+        }
+        tracing::debug!(parsed_cache_entries = pc.len(), "parsed cache updated");
+    }
+
+    drop(_phase_collect_span);
+
     // 2b. When re-indexing over an existing store (tiered detection is active
     //     and some files changed), clean up old File nodes and their symbols
     //     for files we are about to re-insert.
@@ -741,6 +882,7 @@ fn index_into_store(
     }
 
     // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
+    let _phase_write_span = tracing::info_span!("index_phase_write").entered();
     let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
     for sym in &all_symbols {
         let dir = sym
@@ -793,8 +935,16 @@ fn index_into_store(
             &svc_sym_refs,
         )
         .context("bulk_index_write")?;
+    tracing::info!(
+        files_written = all_files.len(),
+        symbols_written = all_symbols.len(),
+        services_written = all_services.len(),
+        "phase write complete"
+    );
+    drop(_phase_write_span);
 
     // ── Phase 3: Resolve cross-file references ────────────────────────────
+    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
     let resolve_pb = ProgressBar::new_spinner();
     resolve_pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -916,13 +1066,50 @@ fn index_into_store(
         .iter()
         .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
         .collect();
-    let resolved_edges = resolve_references_with_context(
-        &resolver_view,
-        language,
-        &r_uid,
-        &workspace_ctx,
-        Some(&type_envs),
-    );
+
+    // Compute the incremental resolution filter: only re-resolve files that
+    // changed plus files that depend on changed files.
+    // When no files changed and we have prior resolution data, skip resolution
+    // entirely — edges from the previous run are still valid in the DB.
+    let skip_resolution = actually_changed_files.is_empty()
+        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty());
+
+    let resolve_filter = if !skip_resolution
+        && !actually_changed_files.is_empty()
+        && files_unchanged > 0
+        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty())
+    {
+        let affected = resolution_deps
+            .as_ref()
+            .unwrap()
+            .affected_files(&actually_changed_files);
+        tracing::info!(
+            changed = actually_changed_files.len(),
+            affected = affected.len(),
+            total = resolver_view.len(),
+            "incremental resolution"
+        );
+        Some(affected)
+    } else {
+        None
+    };
+
+    if skip_resolution {
+        tracing::info!("no files changed, skipping resolution");
+    }
+
+    let resolved_edges = if skip_resolution {
+        Vec::new()
+    } else {
+        resolve_references_with_context(
+            &resolver_view,
+            language,
+            &r_uid,
+            &workspace_ctx,
+            Some(&type_envs),
+            resolve_filter.as_ref(),
+        )
+    };
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
     let insertable_edges: Vec<_> = resolved_edges
@@ -930,10 +1117,50 @@ fn index_into_store(
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
 
+    // When doing incremental resolution, delete old resolved edges for
+    // affected files before inserting the new ones.
+    if let Some(ref filter) = resolve_filter {
+        for file_path in filter {
+            let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
+        }
+    }
+
     let mut edges_count = insertable_edges.len();
     store
         .batch_insert_edges(&insertable_edges)
         .context("batch_insert_edges (resolved)")?;
+
+    // Record file-level dependency information for future incremental runs.
+    if let Some(ref mut rd) = resolution_deps {
+        // Build symbol UID → file path map from ALL files (including cached)
+        // so incremental runs don't lose edges from CachedParsed files.
+        let symbol_file_index: HashMap<String, String> = parsed_files_for_resolver
+            .iter()
+            .flat_map(|(path, syms, _, _)| {
+                let r_uid_ref = &r_uid;
+                syms.iter().map(move |s| {
+                    let uid = symbol_uid(r_uid_ref, path, &s.name, s.start_line);
+                    (uid, path.clone())
+                })
+            })
+            .collect();
+        let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for edge in &insertable_edges {
+            if let (Some(src_file), Some(tgt_file)) = (
+                symbol_file_index.get(&edge.source_uid),
+                symbol_file_index.get(&edge.target_uid),
+            ) && src_file != tgt_file
+            {
+                file_deps
+                    .entry(src_file.clone())
+                    .or_default()
+                    .insert(tgt_file.clone());
+            }
+        }
+        for (file, deps) in file_deps {
+            rd.set_deps(file, deps);
+        }
+    }
 
     // ── Structural MEMBER_OF edges ────────────────────────────────────────
     // Build a lookup: (file_path, type_name) → type_symbol_uid for all
@@ -950,11 +1177,15 @@ fn index_into_store(
             nestweaver_schema::SymbolKind::Trait,
         ];
 
-        // (file_path, type_name) → uid
+        // (file_path, type_name) → uid — built from ALL files (including cached)
+        // so incremental runs don't lose MEMBER_OF edges for CachedParsed files.
         let mut container_map: HashMap<(String, String), String> = HashMap::new();
-        for sym in &all_symbols {
-            if container_kinds.contains(&sym.kind) {
-                container_map.insert((sym.file_path.clone(), sym.name.clone()), sym.uid.clone());
+        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
+            for raw_sym in raw_symbols {
+                if container_kinds.contains(&raw_sym.kind) {
+                    let uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
+                }
             }
         }
 
@@ -989,14 +1220,23 @@ fn index_into_store(
     }
 
     resolve_pb.finish_and_clear();
+    tracing::info!(edges_resolved = edges_count, "phase resolve complete");
+    drop(_phase_resolve_span);
 
     // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
+    let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
     // Best-effort: a malformed spec or unexpected store error here must not
     // fail the whole index. Contracts are hypotheses layered on top of the
     // code graph.
     if let Err(e) = derive_contracts(store, repo_path, &r_uid, &spec_files, &handler_files) {
         tracing::warn!("contract derivation failed (non-fatal): {e}");
     }
+    tracing::info!(
+        spec_files = spec_files.len(),
+        handler_files = handler_files.len(),
+        "phase contracts complete"
+    );
+    drop(_phase_contracts_span);
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -1068,7 +1308,11 @@ fn derive_contracts(
     use nestweaver_schema::{EdgeType, ResolvedEdge};
     use std::collections::HashSet;
 
+    // Bulk delete existing contracts for this repo in one query.
+    store.clear_repo_contracts(r_uid)?;
+
     // 1. Declared contracts from specs.
+    let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
     let mut declared_uids: HashSet<String> = HashSet::new();
     for spec_path in spec_files {
         let rel = spec_path
@@ -1086,7 +1330,7 @@ fn derive_contracts(
         for sc in crate::contracts::parse_spec_file(&rel, &source) {
             let contract = sc.into_contract(r_uid, &rel, 1.0);
             declared_uids.insert(contract.uid.clone());
-            store.insert_contract(&contract)?;
+            all_contracts.push(contract);
         }
     }
 
@@ -1110,7 +1354,7 @@ fn derive_contracts(
                     .contract
                     .clone()
                     .into_contract(r_uid, &hf.rel_path, m.confidence);
-                store.insert_contract(&contract)?;
+                all_contracts.push(contract);
             }
             if let Some((sym_uid, _)) = hf.symbols.get(m.symbol_index) {
                 edges.push(ResolvedEdge {
@@ -1124,6 +1368,10 @@ fn derive_contracts(
             }
         }
     }
+
+    // Batch insert all contracts at once via COPY FROM CSV.
+    store.batch_insert_contracts(&all_contracts)?;
+
     if !edges.is_empty() {
         store.batch_insert_edges(&edges)?;
     }
@@ -1422,7 +1670,7 @@ fn process_added_or_modified_file(
         }
     };
 
-    let content_hash = sha2_hex(&source);
+    let content_hash = content_hash_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
 
     // Insert the File node.
@@ -1505,7 +1753,7 @@ fn process_added_or_modified_file(
         parsed.references.clone(),
     )];
     let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
@@ -1566,6 +1814,12 @@ fn full_index_fallback(
     let filemeta_cache = load_filemeta_cache(&filemeta_path);
     let mut new_filemeta = FileMetaCache::new();
 
+    let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
+
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+
     let result = index_into_store(
         repo_path,
         store,
@@ -1574,12 +1828,32 @@ fn full_index_fallback(
         new_sha,
         Some(&filemeta_cache),
         Some(&mut new_filemeta),
+        Some(&mut parsed_cache),
+        Some(&mut resolution_deps),
         name,
     )?;
+
+    // Evict stale cache entries for deleted/renamed files before saving.
+    {
+        let live_hashes: std::collections::HashSet<String> = new_filemeta
+            .values()
+            .map(|m| m.content_hash.clone())
+            .collect();
+        parsed_cache.retain_hashes(&live_hashes);
+
+        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
+        resolution_deps.retain_files(&live_files);
+    }
 
     // Persist the updated filemeta sidecar.
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
+    }
+    if let Err(e) = parsed_cache.save(&parsed_cache_path) {
+        tracing::warn!("failed to save parsed cache: {e}");
+    }
+    if let Err(e) = resolution_deps.save(&resolution_deps_path) {
+        tracing::warn!("failed to save resolution deps: {e}");
     }
 
     // Update the manifest cache sidecar (same as index_directory does).
@@ -1603,12 +1877,8 @@ fn full_index_fallback(
     })
 }
 
-/// Compute a SHA-256 hex digest of a string (used for file content_hash).
-fn sha2_hex(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    hex::encode(h.finalize())
+fn content_hash_hex(s: &str) -> String {
+    crate::hash::blake3_hex(s)
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -2035,7 +2305,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs,
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex(content),
+                content_hash: content_hash_hex(content),
             },
         );
 
@@ -2062,7 +2332,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1, // different from actual mtime
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex(content),
+                content_hash: content_hash_hex(content),
             },
         );
 
@@ -2078,7 +2348,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1,
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex("different content!"),
+                content_hash: content_hash_hex("different content!"),
             },
         );
 
@@ -2104,7 +2374,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1,
                 size_bytes: 5, // clearly different from actual file
-                content_hash: sha2_hex("old content"),
+                content_hash: content_hash_hex("old content"),
             },
         );
 
@@ -2115,7 +2385,7 @@ function hello(name) { return "Hello " + name; }
                 ..
             } => {
                 assert!(source.contains("return 42"));
-                assert_eq!(content_hash, sha2_hex(new_content));
+                assert_eq!(content_hash, content_hash_hex(new_content));
             }
             ChangeVerdict::Unchanged => panic!("expected Changed for different-size file"),
         }
@@ -2234,6 +2504,46 @@ impl Counter {
             member_of.len() >= 2,
             "expected at least 2 MEMBER_OF edges (new + increment), got {}: {member_of:?}",
             member_of.len()
+        );
+    }
+
+    #[test]
+    fn parsed_cache_avoids_reparse() {
+        // Cold index: parses all files and populates the parsed cache sidecar.
+        // Warm index: files are unchanged, but their symbols should still be
+        // available from the parsed cache (no re-parse needed).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.ts"),
+            "export function hello() { return 1; }\nexport function world() { return 2; }\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        // Cold index — symbols should be parsed.
+        let r1 =
+            index_directory_with_options(&repo, &db, "t", "file:///t", "HEAD", true, None).unwrap();
+        assert!(
+            r1.symbols_count > 0,
+            "cold index should find symbols, got {}",
+            r1.symbols_count
+        );
+
+        // Verify the parsed cache sidecar was created.
+        let parsed_cache_path = crate::sidecar_path(&db, ".parsed_cache.bin");
+        assert!(
+            parsed_cache_path.exists(),
+            "parsed cache sidecar should exist after cold index"
+        );
+
+        // Warm index — all files unchanged, symbols loaded from parsed cache.
+        let r2 = index_directory_with_options(&repo, &db, "t", "file:///t", "HEAD", false, None)
+            .unwrap();
+        assert_eq!(
+            r2.symbols_count, r1.symbols_count,
+            "warm index should have same symbol count as cold index (from parsed cache)"
         );
     }
 }
