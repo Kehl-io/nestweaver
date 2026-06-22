@@ -120,6 +120,7 @@ nestweaver-daemon = { workspace = true }
 libc = "0.2"
 sha2 = { workspace = true }
 hex = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[bench]]
 name = "brain_benchmarks"

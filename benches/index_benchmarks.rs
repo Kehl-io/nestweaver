@@ -13,10 +13,27 @@
 //!   BENCH_FILES=500 cargo bench --bench index_benchmarks
 
 use std::path::PathBuf;
+use std::sync::Once;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nestweaver_engine::index_directory_with_options;
 use tempfile::tempdir;
+
+static INIT_TRACING: Once = Once::new();
+
+fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "nestweaver_engine=info".parse().unwrap()),
+            )
+            .with_span_events(FmtSpan::CLOSE)
+            .with_target(false)
+            .try_init();
+    });
+}
 
 /// Number of TypeScript files to generate. Pull from env to avoid recompile.
 fn bench_files() -> usize {
@@ -87,6 +104,7 @@ export function create{i}(n: number): Item{i} {{
 // ── bench: cold_index ─────────────────────────────────────────────────────
 
 fn bench_cold_index(c: &mut Criterion) {
+    init_tracing();
     let n = bench_files();
     let mut group = c.benchmark_group("code_index");
     group.sample_size(10); // indexing is expensive; keep iteration count low
@@ -121,6 +139,7 @@ fn bench_cold_index(c: &mut Criterion) {
 // ── bench: warm_noop ──────────────────────────────────────────────────────
 
 fn bench_warm_noop(c: &mut Criterion) {
+    init_tracing();
     let n = bench_files();
     let mut group = c.benchmark_group("code_index");
     group.sample_size(10);
