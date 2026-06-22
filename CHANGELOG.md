@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/Kehl-io/nestweaver/compare/v1.1.1...v1.1.2) (2026-06-22)
+
+
+### Performance Improvements
+
+* indexing performance, daemon routing, and agent-friendly setup ([#94](https://github.com/Kehl-io/nestweaver/issues/94)) ([1f75479](https://github.com/Kehl-io/nestweaver/commit/1f7547904a66236969bd539fe9da52be5c269a4e))
+
 ## [1.1.1](https://github.com/Kehl-io/nestweaver/compare/v1.1.0...v1.1.1) (2026-06-21)
 
 
