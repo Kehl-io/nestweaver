@@ -6,6 +6,27 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+/// Check if Metal GPU acceleration is available on this machine.
+pub fn is_metal_available() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        std::panic::catch_unwind(|| candle_core::Device::new_metal(0).is_ok()).unwrap_or(false)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+/// Return a human-readable description of available acceleration.
+pub fn hardware_description() -> String {
+    if is_metal_available() {
+        "Metal GPU (Apple Silicon)".to_string()
+    } else {
+        "CPU only".to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbedConfig {
     pub model_id: String,

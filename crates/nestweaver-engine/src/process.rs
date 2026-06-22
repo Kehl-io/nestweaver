@@ -5,7 +5,6 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use nestweaver_store::GraphStore;
 
@@ -170,11 +169,9 @@ fn trace_single_process(
 
     // UID = hash of entry_point_uid for determinism.
     let uid = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"process:");
-        hasher.update(entry_point.uid.as_bytes());
-        let hash = hasher.finalize();
-        format!("proc:{}", hex::encode(&hash[..8]))
+        let key = format!("process:{}", entry_point.uid);
+        let hash = crate::hash::blake3_hex(&key);
+        format!("proc:{}", &hash[..16])
     };
 
     let name = derive_process_name(entry_point);

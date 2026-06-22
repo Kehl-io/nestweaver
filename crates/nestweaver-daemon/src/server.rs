@@ -747,6 +747,8 @@ impl NestWeaverDaemon for DaemonService {
         let repo_path = PathBuf::from(&req.repo_path);
         let state = self.state.clone();
         let force = req.force;
+        let with_trigrams = req.with_trigrams;
+        let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -793,6 +795,85 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Tantivy indexes notes/markdown only, not code symbols.
                     // No Tantivy update needed after code repo indexing.
+
+                    // Git activity (churn sidecar + co-changes) — runs on
+                    // the repo, writes sidecar files next to the DB.
+                    if with_git_activity {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Mining git activity...".to_string(),
+                            ..Default::default()
+                        }));
+                        let scores =
+                            nestweaver_engine::git_activity::compute_git_activity(&repo_path);
+                        if scores.is_empty() {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                message:
+                                    "No usable git history found; git-activity sidecar not written."
+                                        .to_string(),
+                                ..Default::default()
+                            }));
+                        } else {
+                            let ga_path = nestweaver_engine::sidecar_path(
+                                &state.db_path,
+                                ".gitactivity.json",
+                            );
+                            if let Err(e) = nestweaver_engine::git_activity::save_git_activity(
+                                &scores, &ga_path,
+                            ) {
+                                tracing::warn!("save git activity sidecar failed: {e}");
+                            } else {
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!(
+                                        "Git activity sidecar written ({} files scored).",
+                                        scores.len()
+                                    ),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
+
+                        // Co-change mining (piggybacks on --with-git-activity).
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Mining co-changes...".to_string(),
+                            ..Default::default()
+                        }));
+                        match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
+                            Ok(edges) => {
+                                let cochange_path = nestweaver_engine::sidecar_path(
+                                    &state.db_path,
+                                    ".cochange.json",
+                                );
+                                if let Err(e) =
+                                    nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path)
+                                {
+                                    tracing::warn!("failed to save co-change sidecar: {e}");
+                                }
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!("Found {} co-change pairs.", edges.len()),
+                                    ..Default::default()
+                                }));
+                            }
+                            Err(e) => tracing::warn!("co-change mining failed: {e}"),
+                        }
+                    }
+
+                    // Trigram index.
+                    if with_trigrams {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Building trigram index...".to_string(),
+                            ..Default::default()
+                        }));
+                        match state.store.build_trigram_index() {
+                            Ok(postings) => {
+                                tracing::info!(postings, "trigram index built");
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!("Trigram index built ({postings} postings)."),
+                                    ..Default::default()
+                                }));
+                            }
+                            Err(e) => tracing::warn!("trigram index build failed: {e}"),
+                        }
+                    }
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -2337,6 +2418,167 @@ impl NestWeaverDaemon for DaemonService {
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
+    }
+
+    // ── Embedding ───────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn embed(
+        &self,
+        request: Request<EmbedRequest>,
+    ) -> Result<Response<EmbedResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(not(feature = "embed"))]
+        {
+            self.state
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            let _ = request;
+            return Err(Status::unavailable(
+                "embedding is not available — the daemon was built without the `embed` feature",
+            ));
+        }
+
+        #[cfg(feature = "embed")]
+        {
+            let req = request.into_inner();
+            let scope = req.scope.clone();
+            let force = req.force;
+            let batch_size = if req.batch_size == 0 {
+                32
+            } else {
+                req.batch_size as usize
+            };
+
+            let do_symbols = scope == "all" || scope == "symbols";
+            let do_notes = scope == "all" || scope == "notes";
+            let do_headings = scope == "all" || scope == "headings";
+
+            if !do_symbols && !do_notes && !do_headings {
+                self.state
+                    .active_connections
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(Status::invalid_argument(format!(
+                    "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
+                )));
+            }
+
+            let model = {
+                let guard = self.state.embed_model.read().await;
+                guard.clone()
+            };
+
+            let Some(model) = model else {
+                self.state
+                    .active_connections
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(Status::unavailable(
+                    "embedding model is not loaded — it may still be initializing",
+                ));
+            };
+
+            let store = self.state.store.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                let mut succeeded = 0u32;
+                let mut failed = 0u32;
+
+                if do_symbols && let Ok(symbols) = store.list_all_symbols() {
+                    let to_embed: Vec<_> = if force {
+                        symbols.iter().collect()
+                    } else {
+                        symbols.iter().filter(|s| s.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for sym in chunk {
+                            let text = nestweaver_embed::preprocess::symbol_embed_text(
+                                &sym.kind.to_string(),
+                                &sym.name,
+                                None,
+                            );
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&sym.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
+                                    failed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if do_notes && let Ok(notes) = store.list_notes(None) {
+                    let to_embed: Vec<_> = if force {
+                        notes.iter().collect()
+                    } else {
+                        notes.iter().filter(|n| n.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for note in chunk {
+                            let text =
+                                nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&note.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %note.uid, "embedding failed: {e}");
+                                    failed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if do_headings && let Ok(headings) = store.list_all_headings() {
+                    let to_embed: Vec<_> = if force {
+                        headings.iter().collect()
+                    } else {
+                        headings.iter().filter(|h| h.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for heading in chunk {
+                            let text =
+                                nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&heading.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
+                                    failed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if succeeded > 0
+                    && let Err(e) = store.flush_embedding_index()
+                {
+                    tracing::warn!("failed to flush embedding index: {e}");
+                }
+
+                tracing::info!(succeeded, failed, "embed RPC completed");
+                Ok::<_, Status>(EmbedResponse { succeeded, failed })
+            })
+            .await
+            .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;
+
+            self.state
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            result.map(Response::new)
+        }
     }
 }
 

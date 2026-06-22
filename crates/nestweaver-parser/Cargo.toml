@@ -30,6 +30,7 @@ tree-sitter-elixir = "0.3"
 tree-sitter-groovy = "0.1"
 tree-sitter-zig = "1.1"
 tree-sitter-objc = "3.0"
+bumpalo = { workspace = true }
 regex = "1"
 sha2 = { workspace = true }
 hex = "0.4"

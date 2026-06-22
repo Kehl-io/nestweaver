@@ -480,6 +480,35 @@ pub fn generate_skill_with_tools(
         render_legacy_tool_tables(&mut out);
     }
 
+    // ── Decision tree ────────────────────────────────────────────────────
+    out.push_str("\n## What to Use When\n\n");
+    out.push_str("| I want to... | Use this |\n");
+    out.push_str("|---|---|\n");
+    out.push_str("| Understand a topic or module | `brain_context` seeded with the name, filtered by repo |\n");
+    out.push_str("| Find where something is defined | `brain_search` |\n");
+    out.push_str("| Check impact before changing code | `brain_impact` or `blast_radius` |\n");
+    out.push_str("| Trace execution from a function | `flow_trace` |\n");
+    out.push_str("| Read a symbol's source code | `read_symbols` (not Read on the whole file) |\n");
+    out.push_str("| Read a vault note | `note_get` |\n");
+    out.push_str("| Explore unfamiliar code | `investigate` then `investigate_expand` |\n");
+    out.push_str("| Find which tests to run | `affected_tests` |\n");
+    out.push_str("| Check if the index is current | `stale_check` |\n");
+    out.push_str("| Search by regex | `regex_search` (not grep) |\n");
+    out.push_str("| See architectural hotspots | `hub_nodes` or `bridge_nodes` |\n");
+    out.push_str("| Find module boundaries | `clusters` |\n\n");
+
+    // ── Anti-patterns ────────────────────────────────────────────────────
+    out.push_str("## What NOT to Do\n\n");
+    out.push_str("- **Don't grep or find in indexed repos** — use `brain_search` or `regex_search` instead\n");
+    out.push_str(
+        "- **Don't read entire files** — use `read_symbols` for the specific symbol span\n",
+    );
+    out.push_str(
+        "- **Don't skip the graph** — always query NestWeaver before reading source files\n",
+    );
+    out.push_str("- **Don't use broad seeds** — `brain_context \"auth\"` returns noise; use `brain_context \"AuthService.validate\"` instead\n");
+    out.push_str("- **In subagents:** use the CLI (`nestweaver search --json`) not MCP — 40-60% fewer tokens\n\n");
+
     // ── Workflows ────────────────────────────────────────────────────────
     out.push_str("## Common workflows\n\n");
 

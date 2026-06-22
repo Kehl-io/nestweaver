@@ -29,7 +29,7 @@ pub struct ParsedNote {
     pub note_kind: NoteKind,
     /// Approximate word count of the body (excluding frontmatter).
     pub word_count: u32,
-    /// SHA-256 of the *entire* file (frontmatter + body) — drives change detection.
+    /// BLAKE3 hash of the *entire* file (frontmatter + body) — drives change detection.
     pub content_hash: String,
     /// Raw frontmatter as a JSON object (`{}` when absent or unparseable).
     pub frontmatter: serde_json::Value,
