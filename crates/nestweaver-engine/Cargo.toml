@@ -30,6 +30,7 @@ apollo-parser = "0.8"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 walkdir = "2"
+ignore = "0.4"
 indicatif = "0.17"
 notify = "8"
 notify-debouncer-mini = { version = "0.7", default-features = false }

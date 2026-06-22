@@ -13,7 +13,6 @@ use nestweaver_schema::{
 };
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 /// Per-file entry accumulated during Phase 2 and consumed in Phase 3.
 /// The 4th field carries the retained source string (up to 2 MB) so Phase 3
@@ -384,31 +383,34 @@ fn index_into_store(
     let mut spec_files: Vec<PathBuf> = Vec::new();
 
     // SECURITY: do NOT follow symlinks (see index_md.rs for rationale).
-    let walker = WalkDir::new(repo_path)
+    let walker = ignore::WalkBuilder::new(repo_path)
         .follow_links(false)
-        .into_iter()
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
         .filter_entry(|e| {
-            // Skip pruned directory names.
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            {
-                return false;
+            if e.file_type().map_or(false, |ft| ft.is_dir()) {
+                if let Some(name) = e.file_name().to_str() {
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
             }
             true
-        });
+        })
+        .build();
 
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                tracing::warn!("walkdir error: {err}");
+                tracing::warn!("walk error: {err}");
                 continue;
             }
         };
 
-        if entry.file_type().is_dir() {
+        if entry.file_type().map_or(true, |ft| ft.is_dir()) {
             continue;
         }
 
