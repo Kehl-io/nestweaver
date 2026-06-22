@@ -20,7 +20,7 @@ use nestweaver_engine::{
     generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
     index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, materialize_projects,
+    load_clusters, load_extensions, load_manifest_cache, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
     search_symbols, suggest_links, truncate_to_budget,
 };
@@ -3000,8 +3000,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
-            let store = nestweaver_store::GraphStore::open(db_path)
-                .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
             let workspace_root = dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -3014,7 +3012,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 nestweaver_engine::PullMode::Sparse { files: vec![] }
             };
 
-            let repos = store.list_repos(None)?;
+            // Fetch repo list through the daemon instead of opening the DB
+            // directly.
+            let rt = tokio::runtime::Runtime::new()?;
+            let repos: Vec<nestweaver_schema::Repo> = {
+                let mut client = rt
+                    .block_on(nestweaver_client::DaemonClient::connect(db_path, None))
+                    .context("failed to connect to daemon")?;
+                let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                    args_json: serde_json::json!({}).to_string(),
+                });
+                let resp = rt
+                    .block_on(client.inner_mut().list_repos_json(req))
+                    .context("list_repos RPC failed")?;
+                serde_json::from_str(&resp.into_inner().result_json)
+                    .context("failed to parse repo list")?
+            };
 
             let repo_trimmed = repo.trim_end_matches('/');
             let sha_policy = if pinned {
@@ -4929,25 +4942,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             return;
                         }
                         tracing::info!("periodic wiki refresh triggered");
-                        match nestweaver_engine::InstanceConfig::from_file(&wiki_config_path) {
-                            Ok(cfg) => {
-                                let store = match GraphStore::open_or_create(&wiki_db) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        tracing::warn!("wiki refresh: failed to open store: {e}");
-                                        continue;
-                                    }
-                                };
-                                match materialize_projects(&store, &cfg, &wiki_instance, &wiki_db) {
-                                    Ok(res) => tracing::info!(
-                                        projects = res.projects_created,
-                                        wiki_notes = res.wiki_notes_ingested,
-                                        "wiki refresh complete"
-                                    ),
-                                    Err(e) => tracing::warn!("wiki refresh failed: {e}"),
-                                }
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("wiki refresh: failed to create runtime: {e}");
+                                continue;
                             }
-                            Err(e) => tracing::warn!("wiki refresh: config load failed: {e}"),
+                        };
+                        match rt.block_on(async {
+                            let mut client = nestweaver_client::DaemonClient::connect(
+                                &wiki_db,
+                                Some(wiki_config_path.as_path()),
+                            )
+                            .await?;
+                            let mut stream = client
+                                .materialize_projects(
+                                    wiki_config_path.to_string_lossy().as_ref(),
+                                    &wiki_instance,
+                                )
+                                .await?;
+                            let mut last_msg = String::new();
+                            while let Some(progress) = stream.message().await? {
+                                last_msg = progress.message;
+                            }
+                            Ok::<_, anyhow::Error>(last_msg)
+                        }) {
+                            Ok(msg) => tracing::info!("wiki refresh complete: {msg}"),
+                            Err(e) => tracing::warn!("wiki refresh failed: {e}"),
                         }
                     }
                 });
@@ -8766,25 +8787,33 @@ fn run_brain(
                             return;
                         }
                         tracing::info!("periodic wiki refresh triggered");
-                        match nestweaver_engine::InstanceConfig::from_file(&wiki_config_path) {
-                            Ok(cfg) => {
-                                let store = match GraphStore::open_or_create(&wiki_db) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        tracing::warn!("wiki refresh: failed to open store: {e}");
-                                        continue;
-                                    }
-                                };
-                                match materialize_projects(&store, &cfg, &wiki_instance, &wiki_db) {
-                                    Ok(res) => tracing::info!(
-                                        projects = res.projects_created,
-                                        wiki_notes = res.wiki_notes_ingested,
-                                        "wiki refresh complete"
-                                    ),
-                                    Err(e) => tracing::warn!("wiki refresh failed: {e}"),
-                                }
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("wiki refresh: failed to create runtime: {e}");
+                                continue;
                             }
-                            Err(e) => tracing::warn!("wiki refresh: config load failed: {e}"),
+                        };
+                        match rt.block_on(async {
+                            let mut client = nestweaver_client::DaemonClient::connect(
+                                &wiki_db,
+                                Some(wiki_config_path.as_path()),
+                            )
+                            .await?;
+                            let mut stream = client
+                                .materialize_projects(
+                                    wiki_config_path.to_string_lossy().as_ref(),
+                                    &wiki_instance,
+                                )
+                                .await?;
+                            let mut last_msg = String::new();
+                            while let Some(progress) = stream.message().await? {
+                                last_msg = progress.message;
+                            }
+                            Ok::<_, anyhow::Error>(last_msg)
+                        }) {
+                            Ok(msg) => tracing::info!("wiki refresh complete: {msg}"),
+                            Err(e) => tracing::warn!("wiki refresh failed: {e}"),
                         }
                     }
                 });

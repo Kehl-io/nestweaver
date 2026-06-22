@@ -747,6 +747,8 @@ impl NestWeaverDaemon for DaemonService {
         let repo_path = PathBuf::from(&req.repo_path);
         let state = self.state.clone();
         let force = req.force;
+        let with_trigrams = req.with_trigrams;
+        let with_git_activity = req.with_git_activity;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -793,6 +795,70 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Tantivy indexes notes/markdown only, not code symbols.
                     // No Tantivy update needed after code repo indexing.
+
+                    // Git activity (churn sidecar + co-changes) — runs on
+                    // the repo, writes sidecar files next to the DB.
+                    if with_git_activity {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Mining git activity...".to_string(),
+                            ..Default::default()
+                        }));
+                        let scores = nestweaver_engine::git_activity::compute_git_activity(&repo_path);
+                        if scores.is_empty() {
+                            let _ = tx.blocking_send(Ok(IndexProgress {
+                                message: "No usable git history found; git-activity sidecar not written.".to_string(),
+                                ..Default::default()
+                            }));
+                        } else {
+                            let ga_path = nestweaver_engine::sidecar_path(&state.db_path, ".gitactivity.json");
+                            if let Err(e) = nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path) {
+                                tracing::warn!("save git activity sidecar failed: {e}");
+                            } else {
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!("Git activity sidecar written ({} files scored).", scores.len()),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
+
+                        // Co-change mining (piggybacks on --with-git-activity).
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Mining co-changes...".to_string(),
+                            ..Default::default()
+                        }));
+                        match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
+                            Ok(edges) => {
+                                let cochange_path =
+                                    nestweaver_engine::sidecar_path(&state.db_path, ".cochange.json");
+                                if let Err(e) = nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path) {
+                                    tracing::warn!("failed to save co-change sidecar: {e}");
+                                }
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!("Found {} co-change pairs.", edges.len()),
+                                    ..Default::default()
+                                }));
+                            }
+                            Err(e) => tracing::warn!("co-change mining failed: {e}"),
+                        }
+                    }
+
+                    // Trigram index.
+                    if with_trigrams {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            message: "Building trigram index...".to_string(),
+                            ..Default::default()
+                        }));
+                        match state.store.build_trigram_index() {
+                            Ok(postings) => {
+                                tracing::info!(postings, "trigram index built");
+                                let _ = tx.blocking_send(Ok(IndexProgress {
+                                    message: format!("Trigram index built ({postings} postings)."),
+                                    ..Default::default()
+                                }));
+                            }
+                            Err(e) => tracing::warn!("trigram index build failed: {e}"),
+                        }
+                    }
 
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
