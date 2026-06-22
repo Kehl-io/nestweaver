@@ -28,6 +28,7 @@ pub struct DaemonState {
     pub db_path: PathBuf,
     pub instance_id: String,
     pub start_time: Instant,
+    pub db_opened_at: u64,
     pub active_connections: AtomicU32,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -348,6 +349,7 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
+            db_opened_at: self.state.db_opened_at,
         }))
     }
 
@@ -2734,6 +2736,13 @@ pub async fn run_server(
             }
         });
 
+    let db_opened_at = std::fs::metadata(&db_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
         store_read: Arc::new(store_read),
@@ -2741,6 +2750,7 @@ pub async fn run_server(
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
+        db_opened_at,
         active_connections: AtomicU32::new(0),
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
