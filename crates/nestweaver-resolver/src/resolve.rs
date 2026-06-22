@@ -38,6 +38,7 @@ pub fn resolve_references(
         repo_uid,
         &WorkspaceContext::default(),
         None,
+        None,
     )
 }
 
@@ -53,6 +54,7 @@ pub fn resolve_references_with_context(
     repo_uid: &str,
     workspace_ctx: &WorkspaceContext,
     _type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
+    resolve_only: Option<&std::collections::HashSet<String>>,
 ) -> Vec<ResolvedEdge> {
     let graph = build_import_graph(files, language, workspace_ctx);
 
@@ -111,6 +113,14 @@ pub fn resolve_references_with_context(
         .par_iter()
         .zip(sorted_symbols_per_file.par_iter())
         .flat_map(|((file_path, _symbols, references), sorted_syms)| {
+            // When resolve_only is set, skip files outside the filter.
+            // The symbol index and import graph are still built from ALL files
+            // so references from filtered files can find targets anywhere.
+            if let Some(filter) = resolve_only {
+                if !filter.contains(file_path) {
+                    return Vec::new();
+                }
+            }
             let mut local_edges = Vec::new();
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
@@ -167,6 +177,11 @@ pub fn resolve_references_with_context(
 
     // ── Pass 3a: File-level IMPORTS edges ─────────────────────────────
     for (src_file, _specifier, tgt_file) in graph.all_resolved_imports() {
+        if let Some(filter) = resolve_only {
+            if !filter.contains(src_file) {
+                continue;
+            }
+        }
         let src_sym = file_symbols.get(src_file).and_then(|syms| syms.first());
         let tgt_sym = file_symbols.get(tgt_file).and_then(|syms| syms.first());
 
@@ -191,6 +206,11 @@ pub fn resolve_references_with_context(
 
     // ── Pass 3b: Named-import IMPORTS edges (original precision pass) ─
     for (file_path, _symbols, _references) in files {
+        if let Some(filter) = resolve_only {
+            if !filter.contains(file_path) {
+                continue;
+            }
+        }
         let imports = graph.imports_of(file_path);
         if imports.is_empty() {
             continue;
@@ -1240,6 +1260,7 @@ mod tests {
             "repo:test:abc",
             &WorkspaceContext::default(),
             Some(&type_envs),
+            None,
         );
 
         let call_edges: Vec<_> = edges
@@ -1328,6 +1349,7 @@ mod tests {
             "repo:test:abc",
             &WorkspaceContext::default(),
             Some(&type_envs),
+            None,
         );
 
         let call_edges: Vec<_> = edges
@@ -1439,6 +1461,7 @@ mod tests {
             "repo:test:abc",
             &WorkspaceContext::default(),
             Some(&type_envs),
+            None,
         );
 
         let call_edges: Vec<_> = edges
@@ -1493,6 +1516,7 @@ mod tests {
             Language::TypeScript,
             "repo:test:abc",
             &WorkspaceContext::default(),
+            None,
             None,
         );
 
@@ -1744,6 +1768,7 @@ mod tests {
             "repo:test:abc",
             &WorkspaceContext::default(),
             Some(&type_envs),
+            None,
         );
 
         let call_edges: Vec<_> = edges

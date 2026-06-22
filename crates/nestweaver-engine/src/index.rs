@@ -266,6 +266,9 @@ pub fn index_directory_with_store(
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
     let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
 
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+
     let result = if force {
         index_into_store(
             repo_path,
@@ -276,6 +279,7 @@ pub fn index_directory_with_store(
             None,
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
+            Some(&mut resolution_deps),
             name,
         )?
     } else {
@@ -289,6 +293,7 @@ pub fn index_directory_with_store(
             Some(&filemeta_cache),
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
+            Some(&mut resolution_deps),
             name,
         )?
     };
@@ -298,6 +303,9 @@ pub fn index_directory_with_store(
     }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
+    }
+    if let Err(e) = resolution_deps.save(&resolution_deps_path) {
+        tracing::warn!("failed to save resolution deps: {e}");
     }
 
     let manifest = crate::manifest::parse_manifest(repo_path);
@@ -333,6 +341,7 @@ pub fn index_directory_in_memory(
         None,
         None,
         None,
+        None,
     )?;
     Ok((result, store))
 }
@@ -359,6 +368,7 @@ fn index_into_store(
     filemeta_cache: Option<&FileMetaCache>,
     mut new_filemeta: Option<&mut FileMetaCache>,
     mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
+    mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     let started = Instant::now();
@@ -625,6 +635,8 @@ fn index_into_store(
     let mut files_unchanged = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    let mut actually_changed_files: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for outcome in outcomes {
         match outcome {
@@ -676,6 +688,8 @@ fn index_into_store(
                 type_bindings: raw_type_bindings,
                 source,
             } => {
+                actually_changed_files.insert(rel_path.clone());
+
                 // Record in the new filemeta cache.
                 if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
                     new_cache.insert(rel_path.clone(), file_meta);
@@ -1047,12 +1061,37 @@ fn index_into_store(
         .iter()
         .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
         .collect();
+
+    // Compute the incremental resolution filter: only re-resolve files that
+    // changed plus files that depend on changed files.
+    let resolve_filter = if !actually_changed_files.is_empty()
+        && files_unchanged > 0
+        && resolution_deps
+            .as_ref()
+            .map_or(false, |rd| !rd.is_empty())
+    {
+        let affected = resolution_deps
+            .as_ref()
+            .unwrap()
+            .affected_files(&actually_changed_files);
+        tracing::info!(
+            changed = actually_changed_files.len(),
+            affected = affected.len(),
+            total = resolver_view.len(),
+            "incremental resolution"
+        );
+        Some(affected)
+    } else {
+        None
+    };
+
     let resolved_edges = resolve_references_with_context(
         &resolver_view,
         language,
         &r_uid,
         &workspace_ctx,
         Some(&type_envs),
+        resolve_filter.as_ref(),
     );
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
@@ -1061,10 +1100,43 @@ fn index_into_store(
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
 
+    // When doing incremental resolution, delete old resolved edges for
+    // affected files before inserting the new ones.
+    if let Some(ref filter) = resolve_filter {
+        for file_path in filter {
+            let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
+        }
+    }
+
     let mut edges_count = insertable_edges.len();
     store
         .batch_insert_edges(&insertable_edges)
         .context("batch_insert_edges (resolved)")?;
+
+    // Record file-level dependency information for future incremental runs.
+    if let Some(ref mut rd) = resolution_deps {
+        let symbol_file_index: HashMap<&str, &str> = all_symbols
+            .iter()
+            .map(|s| (s.uid.as_str(), s.file_path.as_str()))
+            .collect();
+        let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for edge in &insertable_edges {
+            if let (Some(&src_file), Some(&tgt_file)) = (
+                symbol_file_index.get(edge.source_uid.as_str()),
+                symbol_file_index.get(edge.target_uid.as_str()),
+            ) {
+                if src_file != tgt_file {
+                    file_deps
+                        .entry(src_file.to_string())
+                        .or_default()
+                        .insert(tgt_file.to_string());
+                }
+            }
+        }
+        for (file, deps) in file_deps {
+            rd.set_deps(file, deps);
+        }
+    }
 
     // ── Structural MEMBER_OF edges ────────────────────────────────────────
     // Build a lookup: (file_path, type_name) → type_symbol_uid for all
@@ -1648,7 +1720,7 @@ fn process_added_or_modified_file(
         parsed.references.clone(),
     )];
     let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None);
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
@@ -1712,6 +1784,9 @@ fn full_index_fallback(
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
     let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
 
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+
     let result = index_into_store(
         repo_path,
         store,
@@ -1721,6 +1796,7 @@ fn full_index_fallback(
         Some(&filemeta_cache),
         Some(&mut new_filemeta),
         Some(&mut parsed_cache),
+        Some(&mut resolution_deps),
         name,
     )?;
 
@@ -1730,6 +1806,9 @@ fn full_index_fallback(
     }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
+    }
+    if let Err(e) = resolution_deps.save(&resolution_deps_path) {
+        tracing::warn!("failed to save resolution deps: {e}");
     }
 
     // Update the manifest cache sidecar (same as index_directory does).

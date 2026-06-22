@@ -72,6 +72,7 @@ pub mod investigate;
 pub mod manifest;
 pub mod mcp_client;
 pub mod parsed_cache;
+pub mod resolution_cache;
 pub mod process;
 pub mod project;
 pub mod pull;

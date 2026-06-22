@@ -1883,6 +1883,44 @@ impl GraphStore {
         Ok(count)
     }
 
+    /// Delete all resolved (semantic) edges originating from symbols in a
+    /// specific file. Used by incremental resolution to clear stale edges
+    /// before re-resolving affected files.
+    ///
+    /// Edge types deleted: CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM,
+    /// INCLUDES_SYM, USES, ACCESSES, MEMBER_OF.
+    pub fn delete_resolved_edges_for_file(
+        &self,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let safe_repo = repo_uid.replace('\'', "\\'");
+        let safe_path = file_path.replace('\'', "\\'");
+
+        // LadybugDB does not support `type(e) IN [...]`, so we issue one
+        // DELETE per relationship type. Each query is cheap because the
+        // WHERE clause narrows to a single file's symbols.
+        for rel in &[
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "USES",
+            "ACCESSES",
+            "MEMBER_OF",
+        ] {
+            conn.query(&format!(
+                "MATCH (s:Symbol)-[r:{rel}]->() \
+                 WHERE s.repo_uid = '{safe_repo}' AND s.file_path = '{safe_path}' \
+                 DELETE r"
+            ))
+            .map_err(|e| StoreError::Query(format!("delete {rel} edges for file: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Delete a File node by its UID using `DETACH DELETE`, which removes all
     /// incident edges (REPO_HAS_FILE, FILE_HAS_SYMBOL) automatically.
     pub fn delete_file_node(&self, file_uid: &str) -> Result<(), StoreError> {
