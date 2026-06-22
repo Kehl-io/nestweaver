@@ -3570,10 +3570,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard (JSON pass-through) ─────────────────
-            // When output is stdout (no --output file) and no --rules-from
-            // override, try the daemon first — it can generate the guide
-            // without the CLI opening the DB directly.
-            if output.is_none() && rules_from.is_none() && use_daemon {
+            // Try the daemon first regardless of --output / --rules-from
+            // flags — it can generate the guide without the CLI opening
+            // the DB directly. When --output is set we write the result
+            // to the file locally; --rules-from is applied CLI-side only
+            // so we skip the daemon when that flag is present.
+            if rules_from.is_none() && use_daemon {
                 let mut args = serde_json::json!({ "format": format });
                 if let Some(ref c) = config {
                     args["config"] = serde_json::json!(c.to_string_lossy());
@@ -3582,10 +3584,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
                 {
                     // brain_guide returns the guide text as a JSON string.
-                    if let Some(text) = value.as_str() {
-                        print!("{text}");
+                    let text = if let Some(s) = value.as_str() {
+                        s.to_string()
                     } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        serde_json::to_string_pretty(&value)?
+                    };
+                    match &output {
+                        Some(path) => {
+                            std::fs::write(path, &text)?;
+                            out.status(&format!("Guide written to {}", path.display()));
+                        }
+                        None => print!("{text}"),
                     }
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4259,8 +4268,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
-        Commands::Ranking { command } => run_ranking(command, t0),
-        Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
+        Commands::Ranking { command } => run_ranking(command, t0, use_daemon),
+        Commands::Eval { command } => run_eval_cmd(command, use_daemon).map(|c| (c, None)),
         Commands::Embed {
             db,
             local,
@@ -7298,7 +7307,7 @@ fn print_eval_report(report: &nestweaver_engine::EvalReport) {
 }
 
 /// Dispatch an `eval` subcommand (P0.3 retrieval-quality harness).
-fn run_eval_cmd(command: EvalCommands) -> anyhow::Result<i32> {
+fn run_eval_cmd(command: EvalCommands, _use_daemon: bool) -> anyhow::Result<i32> {
     // Honest-framing banner shown on every human-readable run.
     const HONEST_NOTE: &str = "Note: meaningful evaluation requires REAL human relevance labels over your actual\n      corpus. A tiny/synthetic set is NOT authoritative — inspect per-query\n      win/loss and confidence, and use time/query-based splits, before trusting a\n      small mean delta.";
 
@@ -7431,6 +7440,7 @@ fn run_eval_cmd(command: EvalCommands) -> anyhow::Result<i32> {
 fn run_ranking(
     command: RankingCommands,
     t0: std::time::Instant,
+    _use_daemon: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         RankingCommands::Explain {
@@ -7994,6 +8004,15 @@ fn run_brain(
         BrainCommands::List { json, db } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
+
+            if use_daemon
+                && let Some(value) =
+                    try_daemon_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
+            {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             let store = open_store(Some(db_path))?;
             let vaults = store.list_vaults(None).map_err(|e| anyhow::anyhow!(e))?;
 
