@@ -2695,3 +2695,227 @@ impl GraphStore {
         )
     }
 }
+
+#[cfg(test)]
+mod copy_from_tests {
+    use super::*;
+    use std::io::Write as IoWrite;
+
+    /// Verify that lbug 0.16 supports COPY FROM CSV for NODE tables (Symbol).
+    ///
+    /// Column order must match the CREATE NODE TABLE definition exactly:
+    /// uid, name, kind, repo_uid, file_path, start_line, end_line,
+    /// signature, summary, content_hash, pagerank_score, is_entry_point,
+    /// entry_point_kind, framework_hint
+    ///
+    /// This test MUST pass — if COPY FROM CSV does not work for node tables
+    /// the bulk-CSV indexing optimization cannot proceed.
+    #[test]
+    fn test_copy_from_csv_node_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_copy_node.lbug");
+        let store = GraphStore::create(&db_path).unwrap();
+
+        // Write a CSV with a header row + 100 Symbol rows.
+        // Column order matches CREATE NODE TABLE Symbol(...) exactly.
+        let csv_path = dir.path().join("symbols.csv");
+        {
+            let mut f = std::fs::File::create(&csv_path).unwrap();
+            // Header — COPY FROM with HEADER=true should skip this line.
+            writeln!(
+                f,
+                "uid,name,kind,repo_uid,file_path,start_line,end_line,\
+                 signature,summary,content_hash,pagerank_score,is_entry_point,\
+                 entry_point_kind,framework_hint"
+            )
+            .unwrap();
+            for i in 0..100 {
+                writeln!(
+                    f,
+                    "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
+                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                )
+                .unwrap();
+            }
+        }
+
+        let csv_str = csv_path.to_str().unwrap();
+
+        // Try COPY FROM with HEADER=true first (Kùzu-standard syntax).
+        let result_with_header = {
+            let conn = store.conn().unwrap();
+            conn.query(&format!(
+                "COPY Symbol FROM '{csv_str}' (HEADER=true)"
+            ))
+        };
+
+        println!("COPY Symbol FROM ... (HEADER=true) result: {:?}", result_with_header);
+
+        let count_after = {
+            let conn = store.conn().unwrap();
+            let rows = conn
+                .query("MATCH (s:Symbol) RETURN count(s)")
+                .expect("count query failed");
+            rows.filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0)
+        };
+
+        println!("Symbol count after COPY FROM (HEADER=true): {count_after}");
+
+        if result_with_header.is_ok() && count_after == 100 {
+            println!("PASS: COPY FROM CSV with HEADER=true inserted 100 symbols correctly.");
+        } else {
+            // Try without HEADER option — lbug may treat the first row as data.
+            // First clear any partial inserts.
+            {
+                let conn = store.conn().unwrap();
+                let _ = conn.query("MATCH (s:Symbol) DETACH DELETE s");
+            }
+
+            // Rewrite CSV without header row.
+            let csv_no_hdr_path = dir.path().join("symbols_no_header.csv");
+            {
+                let mut f = std::fs::File::create(&csv_no_hdr_path).unwrap();
+                for i in 0..100 {
+                    writeln!(
+                        f,
+                        "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
+                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                    )
+                    .unwrap();
+                }
+            }
+
+            let csv_no_hdr_str = csv_no_hdr_path.to_str().unwrap();
+            let result_no_header = {
+                let conn = store.conn().unwrap();
+                conn.query(&format!("COPY Symbol FROM '{csv_no_hdr_str}'"))
+            };
+
+            println!("COPY Symbol FROM ... (no HEADER option) result: {:?}", result_no_header);
+
+            let count_no_hdr = {
+                let conn = store.conn().unwrap();
+                let rows = conn
+                    .query("MATCH (s:Symbol) RETURN count(s)")
+                    .expect("count query failed");
+                rows.filter_map(|row| {
+                    row.first().and_then(|v| match v {
+                        lbug::Value::Int64(n) => Some(*n),
+                        _ => None,
+                    })
+                })
+                .next()
+                .unwrap_or(0)
+            };
+
+            println!("Symbol count after COPY FROM (no header): {count_no_hdr}");
+
+            if result_no_header.is_ok() && count_no_hdr == 100 {
+                println!("PASS: COPY FROM CSV without HEADER option inserted 100 symbols.");
+            } else {
+                panic!(
+                    "FAIL: COPY FROM CSV did not insert 100 symbols. \
+                     with_header_result={result_with_header:?}, count={count_after}; \
+                     no_header_result={result_no_header:?}, count={count_no_hdr}"
+                );
+            }
+        }
+    }
+
+    /// Exploratory: verify whether lbug 0.16 supports COPY FROM CSV for REL
+    /// (relationship/edge) tables. REPO_HAS_FILE has no properties so the CSV
+    /// only needs (from_uid, to_uid) — the primary keys of Repo and File.
+    ///
+    /// If COPY FROM works: asserts the edges were created.
+    /// If COPY FROM fails: prints the error and documents the limitation —
+    /// does NOT panic, because this test is purely exploratory.
+    #[test]
+    fn test_copy_from_csv_rel_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_copy_rel.lbug");
+        let store = GraphStore::create(&db_path).unwrap();
+
+        // Insert prerequisite Repo and File nodes via normal Cypher.
+        {
+            let conn = store.conn().unwrap();
+            conn.query(
+                "CREATE (:Repo {uid: 'repo:test', url: 'https://example.com', \
+                 indexed_sha: 'abc', staleness_commits_behind: 0, \
+                 instance_id: 'inst:test', name: 'testrepo'})",
+            )
+            .expect("insert Repo");
+
+            for i in 0..10 {
+                conn.query(&format!(
+                    "CREATE (:File {{uid: 'file:{i}', path: 'src/file{i}.rs', \
+                     repo_uid: 'repo:test', content_hash: 'hash{i}'}})"
+                ))
+                .expect("insert File");
+            }
+        }
+
+        // Write a CSV with (repo_uid, file_uid) pairs for REPO_HAS_FILE.
+        // Kùzu REL table COPY FROM expects (from_pk, to_pk) in column order.
+        let csv_path = dir.path().join("repo_has_file.csv");
+        {
+            let mut f = std::fs::File::create(&csv_path).unwrap();
+            for i in 0..10 {
+                writeln!(f, "repo:test,file:{i}").unwrap();
+            }
+        }
+
+        let csv_str = csv_path.to_str().unwrap();
+
+        let result = {
+            let conn = store.conn().unwrap();
+            conn.query(&format!("COPY REPO_HAS_FILE FROM '{csv_str}'"))
+        };
+
+        println!("COPY REPO_HAS_FILE FROM CSV result: {:?}", result);
+
+        match result {
+            Ok(_) => {
+                // Verify the edges landed.
+                let conn = store.conn().unwrap();
+                let rows = conn
+                    .query(
+                        "MATCH (r:Repo)-[:REPO_HAS_FILE]->(f:File) RETURN count(r)",
+                    )
+                    .expect("count edges");
+                let edge_count: i64 = rows
+                    .filter_map(|row| {
+                        row.first().and_then(|v| match v {
+                            lbug::Value::Int64(n) => Some(*n),
+                            _ => None,
+                        })
+                    })
+                    .next()
+                    .unwrap_or(0);
+
+                println!("REPO_HAS_FILE edge count after COPY FROM: {edge_count}");
+                assert_eq!(
+                    edge_count, 10,
+                    "expected 10 REPO_HAS_FILE edges after COPY FROM CSV"
+                );
+                println!("PASS: COPY FROM CSV for REL table works in lbug 0.16.");
+            }
+            Err(e) => {
+                // Document the failure — do not panic. The optimization path
+                // for edge tables will need a different approach (e.g. batch
+                // Cypher MATCH+CREATE).
+                eprintln!(
+                    "INFO: COPY FROM CSV for REL table (REPO_HAS_FILE) is NOT supported \
+                     in this lbug build. Error: {e}"
+                );
+                eprintln!("Edge COPY FROM will need a batch Cypher workaround.");
+            }
+        }
+    }
+}
