@@ -28,7 +28,6 @@ use nestweaver_schema::{
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind, new_debouncer};
-use sha2::{Digest, Sha256};
 
 /// Manifest filenames whose changes should trigger a manifest cache refresh.
 const MANIFEST_FILES: &[&str] = &[
@@ -571,7 +570,7 @@ impl BrainWatcher {
                 .sections
                 .iter()
                 .map(|s| {
-                    let th = sha256_full(&s.text);
+                    let th = crate::hash::blake3_hex(&s.text);
                     let s_uid = section_uid(&n_uid, s.start_line, &th[..12]);
                     let heading_title = s
                         .heading_idx
@@ -760,7 +759,7 @@ fn reinsert_note(
             slug: h.slug.clone(),
             start_line: h.start_line,
             end_line: h.end_line,
-            content_hash: sha256_short(&h.text),
+            content_hash: crate::hash::blake3_hex_short(&h.text),
             embedding: None,
         });
     }
@@ -789,7 +788,7 @@ fn reinsert_note(
     let mut ns_edges: Vec<(String, String)> = Vec::new();
     let mut hs_edges: Vec<(String, String)> = Vec::new();
     for sec in &parsed.sections {
-        let text_hash = sha256_full(&sec.text);
+        let text_hash = crate::hash::blake3_hex(&sec.text);
         let s_uid = section_uid(n_uid, sec.start_line, &text_hash[..12]);
         let word_count = u32::try_from(sec.text.split_whitespace().count()).unwrap_or(u32::MAX);
         let heading_link = sec.heading_idx.map(|i| heading_uids[i].clone());
@@ -940,15 +939,6 @@ fn reinsert_note(
     Ok((headings.len(), sections.len(), wl_resolved, tags_count))
 }
 
-fn sha256_full(text: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(text.as_bytes());
-    hex::encode(h.finalize())
-}
-
-fn sha256_short(text: &str) -> String {
-    sha256_full(text)[..12].to_string()
-}
 
 /// Render a `SystemTime` as RFC 3339-ish UTC string. Mirrors index_md.rs.
 fn format_system_time(t: std::time::SystemTime) -> Option<String> {

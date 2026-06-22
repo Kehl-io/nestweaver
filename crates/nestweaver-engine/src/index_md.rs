@@ -20,7 +20,6 @@ use nestweaver_schema::{
     tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
-use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 /// Outcome of a markdown index run.
@@ -438,7 +437,7 @@ fn reinsert_single_note(
             slug: h.slug.clone(),
             start_line: h.start_line,
             end_line: h.end_line,
-            content_hash: sha256_hex_short(&h.text),
+            content_hash: crate::hash::blake3_hex_short(&h.text),
             embedding: None,
         })
         .collect();
@@ -473,7 +472,7 @@ fn reinsert_single_note(
     let mut ns_edges: Vec<(String, String)> = Vec::new();
     let mut hs_edges: Vec<(String, String)> = Vec::new();
     for sec in &parsed.sections {
-        let text_hash = sha256_hex(&sec.text);
+        let text_hash = crate::hash::blake3_hex(&sec.text);
         let s_uid = section_uid(n_uid, sec.start_line, &text_hash[..12]);
         let word_count = u32::try_from(sec.text.split_whitespace().count()).unwrap_or(u32::MAX);
         let heading_link = sec.heading_idx.map(|i| heading_uids[i].clone());
@@ -593,7 +592,7 @@ fn reinsert_single_note(
             let uw_uid = format!(
                 "unresolved:{}:{}",
                 source_section,
-                sha256_hex_short(&wl.target)
+                crate::hash::blake3_hex_short(&wl.target)
             );
             if let Err(e) = store.insert_unresolved_wikilink(
                 &uw_uid,
@@ -939,7 +938,7 @@ fn index_into_store(
                     slug: h.slug.clone(),
                     start_line: h.start_line,
                     end_line: h.end_line,
-                    content_hash: sha256_hex_short(&h.text),
+                    content_hash: crate::hash::blake3_hex_short(&h.text),
                     embedding: None,
                 });
                 n_h_edges.push((n_uid.clone(), h_uid));
@@ -964,7 +963,7 @@ fn index_into_store(
             let mut h_s_edges = Vec::new();
             let mut section_uids: Vec<String> = Vec::with_capacity(parsed.sections.len());
             for sec in &parsed.sections {
-                let text_hash = sha256_hex(&sec.text);
+                let text_hash = crate::hash::blake3_hex(&sec.text);
                 let short = &text_hash[..12];
                 let s_uid = section_uid(&n_uid, sec.start_line, short);
                 let word_count =
@@ -1197,7 +1196,7 @@ fn index_into_store(
                     let uw_uid = format!(
                         "unresolved:{}:{}",
                         source_section_uid,
-                        sha256_hex_short(&wl.target)
+                        crate::hash::blake3_hex_short(&wl.target)
                     );
                     unresolved_records.push((
                         uw_uid,
@@ -1316,15 +1315,6 @@ fn index_into_store(
     })
 }
 
-fn sha256_hex(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn sha256_hex_short(text: &str) -> String {
-    sha256_hex(text)[..12].to_string()
-}
 
 // ── Pass-2 support: wikilink resolution ────────────────────────────────────
 

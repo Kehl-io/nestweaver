@@ -62,6 +62,7 @@ pub mod extensions;
 pub mod git_activity;
 pub mod git_diff;
 pub mod guide_rules;
+pub mod hash;
 pub mod html_to_md;
 pub mod hubs;
 pub mod index;
