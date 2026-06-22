@@ -285,6 +285,17 @@ message ServeUiResponse {
   string message = 2;
 }
 
+message EmbedRequest {
+  string scope = 1;    // "all", "symbols", "notes", "headings"
+  bool force = 2;
+  uint32 batch_size = 3;
+}
+
+message EmbedResponse {
+  uint32 succeeded = 1;
+  uint32 failed = 2;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -297,6 +308,9 @@ service NestWeaverDaemon {
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
   rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
+
+  // Embedding
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
 
   // Write RPCs
   rpc MaterializeProjects(MaterializeProjectsRequest) returns (stream IndexProgress);
