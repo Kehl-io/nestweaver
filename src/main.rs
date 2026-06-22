@@ -165,9 +165,11 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
-    /// Testing only: open the database directly instead of routing through the daemon.
-    /// Requires NESTWEAVER_NO_DAEMON=1 environment variable.
-    #[arg(long, global = true)]
+    /// CI/testing only — bypass the daemon and open the database directly.
+    /// DO NOT use in normal operation. The daemon owns the write lock and
+    /// coordinates concurrent access; bypassing it risks WAL corruption.
+    /// Requires NESTWEAVER_NO_DAEMON=1 environment variable as a safety gate.
+    #[arg(long, global = true, hide = true)]
     no_daemon: bool,
 
     /// Disable semantic embedding for this invocation
@@ -723,9 +725,8 @@ enum Commands {
         /// In daemon mode, the daemon's own --config takes precedence.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Testing only: open the database directly instead of routing through the daemon.
-        /// Requires NESTWEAVER_NO_DAEMON=1 environment variable.
-        #[arg(long)]
+        /// CI/testing only — bypass the daemon. Requires NESTWEAVER_NO_DAEMON=1.
+        #[arg(long, hide = true)]
         no_daemon: bool,
     },
     /// Start the web UI server with interactive graph visualization
@@ -2518,7 +2519,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             false
         } else {
             eprintln!(
-                "Warning: --no-daemon is only supported for testing (set NESTWEAVER_NO_DAEMON=1). \
+                "Warning: --no-daemon bypasses the daemon and risks WAL corruption. \
+                 It is only for CI/testing. Set NESTWEAVER_NO_DAEMON=1 to confirm. \
                  Ignoring flag and routing through daemon."
             );
             true
