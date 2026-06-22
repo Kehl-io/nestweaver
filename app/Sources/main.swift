@@ -59,10 +59,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-               let icon = NSImage(contentsOf: iconURL) {
+            // Try dedicated menubar template image first, fall back to app icon
+            let icon: NSImage? = {
+                if let url = Bundle.main.url(forResource: "MenuIcon", withExtension: "png"),
+                   let img = NSImage(contentsOf: url) {
+                    return img
+                }
+                if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+                   let img = NSImage(contentsOf: url) {
+                    return img
+                }
+                return nil
+            }()
+            if let icon = icon {
                 icon.size = NSSize(width: 18, height: 18)
-                icon.isTemplate = false
+                icon.isTemplate = true
                 button.image = icon
             } else {
                 button.title = "NW"
