@@ -127,3 +127,7 @@ harness = false
 [[bench]]
 name = "embed_latency"
 harness = false
+
+[[bench]]
+name = "index_benchmarks"
+harness = false

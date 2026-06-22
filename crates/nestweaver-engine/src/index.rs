@@ -370,6 +370,7 @@ fn index_into_store(
     }
 
     // ── Phase 1: Scan files ───────────────────────────────────────────────
+    let _phase1_span = tracing::info_span!("index_phase_scan").entered();
     let scan_pb = ProgressBar::new_spinner();
     scan_pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -435,8 +436,15 @@ fn index_into_store(
     }
 
     scan_pb.finish_with_message(format!("Scanned {} files", file_entries.len()));
+    tracing::info!(
+        files_found = file_entries.len(),
+        spec_files_found = spec_files.len(),
+        "phase scan complete"
+    );
+    drop(_phase1_span);
 
     // ── Phase 2: Parse files (parallelised with rayon) ─────────────────
+    let _phase2_span = tracing::info_span!("index_phase_parse").entered();
     let total_files = file_entries.len() as u64;
     let parse_pb = ProgressBar::new(total_files);
     parse_pb.set_style(
@@ -551,8 +559,10 @@ fn index_into_store(
         .collect();
 
     parse_pb.finish_and_clear();
+    drop(_phase2_span);
 
     // ── Sequential collection of parallel results ────────────────────────
+    let _phase_collect_span = tracing::info_span!("index_phase_collect").entered();
     let mut all_files: Vec<File> = Vec::new();
     let mut all_symbols: Vec<Symbol> = Vec::new();
     let mut repo_file_edge_pairs: Vec<(String, String)> = Vec::new();
@@ -717,6 +727,15 @@ fn index_into_store(
         }
     }
 
+    tracing::info!(
+        files_parsed = files_count,
+        files_unchanged = files_unchanged,
+        files_skipped = skipped_files.len(),
+        symbols_collected = symbols_count,
+        "phase collect complete"
+    );
+    drop(_phase_collect_span);
+
     // 2b. When re-indexing over an existing store (tiered detection is active
     //     and some files changed), clean up old File nodes and their symbols
     //     for files we are about to re-insert.
@@ -741,6 +760,7 @@ fn index_into_store(
     }
 
     // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
+    let _phase_write_span = tracing::info_span!("index_phase_write").entered();
     let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
     for sym in &all_symbols {
         let dir = sym
@@ -793,8 +813,16 @@ fn index_into_store(
             &svc_sym_refs,
         )
         .context("bulk_index_write")?;
+    tracing::info!(
+        files_written = all_files.len(),
+        symbols_written = all_symbols.len(),
+        services_written = all_services.len(),
+        "phase write complete"
+    );
+    drop(_phase_write_span);
 
     // ── Phase 3: Resolve cross-file references ────────────────────────────
+    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
     let resolve_pb = ProgressBar::new_spinner();
     resolve_pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -989,14 +1017,26 @@ fn index_into_store(
     }
 
     resolve_pb.finish_and_clear();
+    tracing::info!(
+        edges_resolved = edges_count,
+        "phase resolve complete"
+    );
+    drop(_phase_resolve_span);
 
     // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
+    let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
     // Best-effort: a malformed spec or unexpected store error here must not
     // fail the whole index. Contracts are hypotheses layered on top of the
     // code graph.
     if let Err(e) = derive_contracts(store, repo_path, &r_uid, &spec_files, &handler_files) {
         tracing::warn!("contract derivation failed (non-fatal): {e}");
     }
+    tracing::info!(
+        spec_files = spec_files.len(),
+        handler_files = handler_files.len(),
+        "phase contracts complete"
+    );
+    drop(_phase_contracts_span);
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
