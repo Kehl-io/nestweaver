@@ -16,7 +16,7 @@ nestweaver-storage = { workspace = true }
 rmp-serde = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -27,9 +27,9 @@ openapiv3 = "2"
 protox-parse = "0.9"
 prost-types = "0.14"
 apollo-parser = "0.8"
-hex = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 walkdir = "2"
+ignore = "0.4"
 indicatif = "0.17"
 notify = "8"
 notify-debouncer-mini = { version = "0.7", default-features = false }

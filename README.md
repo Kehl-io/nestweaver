@@ -57,7 +57,7 @@ Personalized PageRank with per-edge-type weights (CALLS, IMPORTS, USES, ACCESSES
 </td>
 <td width="50%" valign="top">
 
-**38-Tool MCP Server**<br>
+**40-Tool MCP Server**<br>
 Model Context Protocol tools for AI agents. Drop-in for any MCP client, lite mode for Cursor. Daemon architecture enables concurrent access from multiple AI tools without lock contention.
 
 </td>
@@ -154,6 +154,11 @@ cargo build --release
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
 | `impact` | Trace the blast radius of a symbol through the dependency graph |
+| `read-symbols` | Read a symbol's source span |
+| `regex-search` | Regex search over indexed text |
+| `count-patterns` | Count regex matches per pattern |
+| `investigate` | Orient on a topic in one call |
+| `affected-tests` | Select tests for changed files |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
 | `summary` | Hierarchical code summaries at symbol, file, or cluster level |
 
@@ -194,6 +199,9 @@ cargo build --release
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
+| `contracts` | Inspect API contract graph |
+| `ranking` | Inspect ranking priors |
+| `eval` | Offline retrieval-quality evaluation |
 | `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format |
 
 </details>
@@ -236,6 +244,8 @@ cargo build --release
 | `prune-stale` | Remove repos and vaults whose source directories no longer exist on disk |
 | `list-services` | List all detected services |
 | `service-summary` | Display a summary of a specific service |
+| `admin` | Subagent guidance instructions |
+| `interactions` | Manage interaction memory |
 
 </details>
 

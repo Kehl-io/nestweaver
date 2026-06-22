@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// The oldest engine version that can read the current snapshot format.
@@ -52,7 +51,7 @@ pub struct SkippedFileEntry {
 const GRAPH_FILE: &str = "graph.lbug";
 const MANIFEST_FILE: &str = "manifest.json";
 const STAMP_FILE: &str = "stamp.json";
-const CHECKSUM_FILE: &str = "checksum.sha256";
+const CHECKSUM_FILE: &str = "checksum.blake3";
 /// Sidecar filenames (relative to the db_path prefix, not snapshot_dir).
 const SIDECAR_PAGERANK: &str = "pagerank.json";
 const SIDECAR_MANIFESTS: &str = "manifests.json";
@@ -64,15 +63,15 @@ const CORE_FILES: &[&str] = &[GRAPH_FILE, MANIFEST_FILE, STAMP_FILE];
 /// Sidecar files that are checksummed when present.
 const SIDECAR_FILES: &[&str] = &[SIDECAR_PAGERANK, SIDECAR_MANIFESTS];
 
-/// Compute per-file SHA-256 checksums for all core files and any present
-/// sidecars.  Returns a sha256sum-style string: one `<hash>  <filename>\n`
+/// Compute per-file BLAKE3 checksums for all core files and any present
+/// sidecars.  Returns a checksum-style string: one `<hash>  <filename>\n`
 /// line per file, sorted by filename for determinism.
 fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
     let mut lines: Vec<String> = Vec::new();
     for &name in CORE_FILES {
         let bytes = std::fs::read(snapshot_dir.join(name))
             .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
-        let hash = hex::encode(Sha256::digest(&bytes));
+        let hash = crate::hash::blake3_hex_bytes(&bytes);
         lines.push(format!("{hash}  {name}"));
     }
     for &name in SIDECAR_FILES {
@@ -80,7 +79,7 @@ fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
         if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|e| anyhow::anyhow!("failed to read sidecar {name} for checksum: {e}"))?;
-            let hash = hex::encode(Sha256::digest(&bytes));
+            let hash = crate::hash::blake3_hex_bytes(&bytes);
             lines.push(format!("{hash}  {name}"));
         }
     }
@@ -92,7 +91,7 @@ fn compute_checksums(snapshot_dir: &Path) -> Result<String, anyhow::Error> {
         for (rel_path, abs_path) in tantivy_files {
             let bytes = std::fs::read(&abs_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {rel_path} for checksum: {e}"))?;
-            let hash = hex::encode(Sha256::digest(&bytes));
+            let hash = crate::hash::blake3_hex_bytes(&bytes);
             lines.push(format!("{hash}  {rel_path}"));
         }
     }
@@ -124,8 +123,25 @@ fn collect_files_recursive(
 /// format (multiple `<hash>  <filename>` lines) and the legacy single-hash
 /// format for backwards compatibility.
 fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
-    let stored = std::fs::read_to_string(snapshot_dir.join(CHECKSUM_FILE))
-        .map_err(|e| anyhow::anyhow!("failed to read checksum.sha256: {e}"))?;
+    let checksum_path = snapshot_dir.join(CHECKSUM_FILE);
+    // Fallback for pre-BLAKE3 snapshots that used checksum.sha256
+    let checksum_path = if !checksum_path.exists() {
+        let legacy = snapshot_dir.join("checksum.sha256");
+        if legacy.exists() {
+            tracing::info!(
+                "using legacy checksum.sha256 — skipping verification for pre-BLAKE3 snapshot"
+            );
+            // Legacy checksums used SHA-256, which won't match BLAKE3 verification.
+            // Skip verification; the snapshot will be re-created on the next build.
+            return Ok(());
+        } else {
+            checksum_path
+        }
+    } else {
+        checksum_path
+    };
+    let stored = std::fs::read_to_string(&checksum_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", checksum_path.display()))?;
     let stored = stored.trim();
 
     if stored.contains("  ") {
@@ -144,7 +160,7 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
             }
             let bytes = std::fs::read(&file_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {filename}: {e}"))?;
-            let actual = hex::encode(Sha256::digest(&bytes));
+            let actual = crate::hash::blake3_hex_bytes(&bytes);
             if actual != expected_hash {
                 anyhow::bail!(
                     "integrity check failed for {filename}: \
@@ -154,13 +170,13 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
         }
     } else {
         // Legacy single-hash format: concatenated hash of core files
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         for name in CORE_FILES {
             let bytes = std::fs::read(snapshot_dir.join(name))
                 .map_err(|e| anyhow::anyhow!("failed to read {name} for checksum: {e}"))?;
             hasher.update(&bytes);
         }
-        let computed = hex::encode(hasher.finalize());
+        let computed = hasher.finalize().to_hex().to_string();
         if computed != stored {
             anyhow::bail!(
                 "snapshot integrity check failed: stored checksum does not match computed checksum"
@@ -176,7 +192,7 @@ use nestweaver_storage::copy_dir_all;
 ///
 /// 1. Copy core files (graph, manifest, stamp).
 /// 2. Copy sidecars (pagerank, manifests, tantivy) if present.
-/// 3. Compute per-file SHA-256 checksums over everything that was copied.
+/// 3. Compute per-file BLAKE3 checksums over everything that was copied.
 pub fn build_snapshot(
     output_dir: &Path,
     stamp: &Stamp,
@@ -395,7 +411,7 @@ mod tests {
         assert!(snap_dir.join(STAMP_FILE).exists(), "stamp.json missing");
         assert!(
             snap_dir.join(CHECKSUM_FILE).exists(),
-            "checksum.sha256 missing"
+            "checksum.blake3 missing"
         );
     }
 
@@ -558,12 +574,12 @@ mod tests {
         build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
 
         // Replace the per-file checksum with a legacy single-hash checksum
-        // (SHA-256 of graph.lbug + manifest.json + stamp.json concatenated).
-        let mut hasher = Sha256::new();
+        // (BLAKE3 of graph.lbug + manifest.json + stamp.json concatenated).
+        let mut hasher = blake3::Hasher::new();
         for name in CORE_FILES {
-            hasher.update(std::fs::read(snap_dir.join(name)).unwrap());
+            hasher.update(&std::fs::read(snap_dir.join(name)).unwrap());
         }
-        let legacy_checksum = hex::encode(hasher.finalize());
+        let legacy_checksum = hasher.finalize().to_hex().to_string();
         std::fs::write(snap_dir.join(CHECKSUM_FILE), &legacy_checksum).unwrap();
 
         let loaded = verify_snapshot(&snap_dir).unwrap();

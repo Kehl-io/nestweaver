@@ -577,7 +577,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Use when you need to READ a symbol's source — return just that symbol's span (start_line..end_line), not the whole file. Far cheaper in tokens than reading entire files. Accepts UIDs (sym:...), bare names, or FQNs; an ambiguous name returns candidate UIDs to disambiguate. Use include_neighbors to also return adjacent symbols in the same file, and token_budget to cap output. `root` is the repository root used to resolve file paths (defaults to the server's working directory).",
+        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -644,7 +644,7 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Use when you need to find text by REGEX across indexed content (markdown section bodies, note titles, code symbol signatures) — a first-party replacement for shelling out to rg/grep. Runs a real Rust `regex` against the indexed text, accelerated by a trigram pre-filter when one was built (`nestweaver index --with-trigrams`). When no trigram index exists, or the pattern has no usable literals (e.g. `.{4,}`), it falls back to scanning all candidate text — still correct, just slower, and `scanned_fallback` is set.\n\nDo NOT use for fuzzy/semantic lookup — use brain_search. Returns `{results:[{uid,kind,title,location,line,snippet}], truncated, scanned_fallback}`. `truncated` is set when the candidate cap (5000) or time budget was hit.",
+        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with trigram-accelerated pre-filtering.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output includes {results:[{uid, kind, title, location, line, snippet}], truncated, scanned_fallback}\n- scanned_fallback is set when no trigram index exists or the pattern has no usable literals\n\nLimitations:\n- Candidate cap of 5000 or time budget (default 2000ms) may truncate results\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -681,7 +681,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Use when you only need COUNTS of regex matches across indexed text, not the matches themselves — e.g. \"how many sections mention TODO?\" Counts one match per node and reports, per pattern, `{pattern, total_matches, files_matched, top_files:[{path,count}]}`. Reuses the same trigram pre-filter as regex_search and the same full-scan fallback when no literals/index are available.\n\nDo NOT use when you need the matching text — use regex_search. Pass multiple patterns to compare counts in one call.",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}]}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts one match per node, not per occurrence within a node\n- Same trigram/fallback behavior as regex_search",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -726,7 +726,7 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Use when auditing a markdown vault for wikilinks that did not resolve cleanly — links whose target is ambiguous or low-confidence (confidence < 1.0). For each, returns the source note, the link text, and suggested target note UIDs (fuzzy title match) so you can repair the link. Returns empty when there is no vault. Output: `{broken_links:[{source_uid, source_path, wikilink_text, confidence, suggested_target_uids:[...]}], total}`.",
+        "description": "Find wikilinks in the vault that did not resolve cleanly — ambiguous or low-confidence targets (confidence < 1.0).\n\nGuidelines:\n- Use when auditing vault health or before bulk link repairs\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -765,7 +765,7 @@ fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value,
 fn tool_schema_brain_orphan_documents() -> Value {
     json!({
         "name": "brain_orphan_documents",
-        "description": "Use to find notes that are disconnected from the knowledge graph — notes with ZERO inbound and ZERO outbound wikilinks. These are candidates to link up or archive. Index/MOC notes are excluded via a configurable allowlist (default includes Projects.md, index.md, README.md, _brain/index.md, and any note whose path/title contains \"MOC\"). Optional `vault` and `path_prefix` filters. Returns empty when there is no vault. Output: `{orphans:[{uid, title, file_path}], total}`.",
+        "description": "Find notes with zero inbound and zero outbound wikilinks — disconnected from the knowledge graph.\n\nGuidelines:\n- Candidates to link up or archive; index/MOC notes are excluded via a configurable allowlist\n- Use vault and path_prefix filters to scope the search\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilinks, not tag co-occurrence or other relationships\n- Default allowlist excludes Projects.md, index.md, README.md, and MOC-containing paths",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -807,7 +807,7 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_brain_topic_clusters() -> Value {
     json!({
         "name": "brain_topic_clusters",
-        "description": "Use to discover the thematic structure of a markdown vault: runs Leiden community detection over the note-to-note wikilink graph and groups notes into topics. Each cluster is labelled by its most central member (highest PageRank, then highest link degree). Returns empty when there is no vault. Output: `{clusters:[{cluster_id, members:[note_uid], label}], total}`.",
+        "description": "Discover thematic structure of a vault by running Leiden community detection over the note-to-note wikilink graph.\n\nGuidelines:\n- Each cluster is labelled by its most central member (highest PageRank)\n- Adjust resolution parameter: higher yields more, smaller clusters\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilink edges between notes, not tags or code references\n- Label quality depends on the most-central note having a descriptive title",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -854,7 +854,7 @@ fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_tag_graph() -> Value {
     json!({
         "name": "brain_tag_graph",
-        "description": "Use to understand how tags relate to each other in a markdown vault. Two modes. (1) With `tag`: returns that focus tag's note count plus the tags that co-occur with it (appear on the same notes), ranked by shared-note count. Output: `{tag, count, co_occurring:[{tag, count}]}`. (2) Without `tag`: returns the WHOLE tag co-occurrence graph — one entry per distinct tag, sorted by note count descending then name — for taxonomy-drift detection. Output: `{tags:[{tag, count, co_occurring:[{tag, count}]}]}`. The `tag` argument may include or omit a leading `#`. Returns count 0 / empty when the tag or vault is absent.",
+        "description": "Explore tag relationships in a vault via co-occurrence analysis. Two modes: (1) with tag — returns co-occurring tags for a focus tag; (2) without tag — returns the full tag co-occurrence graph.\n\nGuidelines:\n- Use without tag for taxonomy-drift detection across the vault\n- The tag argument may include or omit a leading #\n- Results sorted by shared-note count (with tag) or note count descending (without)\n\nLimitations:\n- Co-occurrence is based on shared notes, not semantic similarity\n- Returns count 0 / empty when the tag or vault is absent",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -882,7 +882,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Use for a one-shot health summary of a markdown vault's document graph. Composes the other brain document tools plus counts. Returns all seven keys even on an empty vault (zeros / empty collections). Output: `{total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags:[{tag,count}], notes_by_year:{year:count}}`.",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All seven keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, total_wikilinks, broken_wikilinks, orphans, avg_outdegree, top_tags, notes_by_year}\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -935,7 +935,7 @@ fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyh
 fn tool_schema_brain_memory_lint() -> Value {
     json!({
         "name": "brain_memory_lint",
-        "description": "Use to audit a markdown 'memory bank' vault for health problems. Runs SEVEN checks and returns them keyed: `stale` (notes marked status:active but unmodified for >90 days), `contradictions` (Supersedes cycles like A→B→A), `orphans` (notes with no inbound/outbound wikilinks), `broken_wikilinks` (ambiguous/low-confidence links), `supersession_chains` (a superseded note still actively linked), `schema_drift` (note frontmatter keys missing vs the _templates/<kind>.md template), `dangling_relationships` (a typed relationship whose target note does not exist). All keys always present; empty on a no-vault DB. Output: `{stale:[...], contradictions:[...], orphans:[...], broken_wikilinks:[...], supersession_chains:[...], schema_drift:[...], dangling_relationships:[...]}`.",
+        "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -976,7 +976,7 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
 fn tool_schema_brain_memory_consolidate() -> Value {
     json!({
         "name": "brain_memory_consolidate",
-        "description": "Use to propose promotions of vault notes UP the memory tiers (daily logs → ideas → project files). DRY-RUN BY DEFAULT — it never mutates files. Proposes: (1) a daily log (under _logs/) wikilinked from >=3 distinct idea notes and older than 14 days → _ideas candidate; (2) an idea (under _ideas/) referenced from BOTH a project's sync.md and status.md → project-file candidate. Set `apply:true` to carry out the moves (creates destination dirs, moves files). Output: `{dry_run, applied, proposals:[{source_uid, source_title, source_path, promote_to, rationale, evidence:[...]}], warnings:[...]}`.",
+        "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1012,7 +1012,7 @@ fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_brain_memory_related() -> Value {
     json!({
         "name": "brain_memory_related",
-        "description": "Use to walk the TYPED relationship graph from a note — Supersedes / DependsOn / CausedBy / RelatesTo — without the noise of generic wikilinks. Breadth-first from `uid` over the chosen `edge_types` (default all four) to `depth` hops (default 2). Returns only the typed neighbours. Empty on unknown node / no-vault DB. Output: `{related:[{uid, title, file_path, depth, via_edge}], total}`.",
+        "description": "Walk the typed relationship graph from a note — Supersedes, DependsOn, CausedBy, RelatesTo — without generic wikilink noise.\n\nGuidelines:\n- BFS traversal from seed uid over chosen edge_types to configurable depth (default 2)\n- Returns only typed neighbours, not generic wikilinks\n- Empty on unknown node or no-vault database\n\nLimitations:\n- Only follows the four typed edge types, not wikilinks or tag co-occurrence\n- Maximum traversal depth may miss distant relationships",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1075,7 +1075,7 @@ fn is_concise(args: &Value) -> bool {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Use FIRST when you need codebase or knowledge-base context around a symbol, note, tag, or topic. Runs Personalized PageRank over the unified code + notes graph from the given seeds and returns ranked, mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget. The call graph uses type-aware resolution — method calls like `obj.method()` are linked to the correct class via AST-extracted type bindings and class hierarchy (MRO) walk. This is cheaper than reading files — get the structural picture before opening anything.\n\nDo NOT use for simple text search — use brain_search instead. Do NOT use when you already have a specific note UID and want its full body — use note_get instead.\n\nThe `seeds` parameter accepts note titles (e.g. \"Architecture\"), tag names (\"#status/active\"), symbol names (\"greet\"), free-text terms, or UIDs (sym:, note:, head:, sec:, tag:). Example: seeds=[\"AuthService\", \"#security\"] returns the authentication service symbol and all security-tagged notes, plus their graph neighbors ranked by relevance. Use `response_format` \"concise\" for a quick overview (names and relationships only) or \"detailed\" (default) for full metadata including file paths and relevance scores.\n\nTypical: 1-3s, ~2000 tokens at default budget. Increase token_budget for broader context.",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1709,7 +1709,7 @@ fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Use when you need to find specific notes, headings, sections, tags, or code symbols by keyword or phrase. Performs BM25 full-text search across note titles, heading text, section bodies, and tag names, plus substring search across code symbol names, returning ranked hits (best match first) with a kind discriminator so you can tell note/symbol hits apart.\n\nDo NOT use for structural context (\"what's connected to X\" or \"what calls Y\") — use brain_context instead. Do NOT use to read a full note body — use note_get after finding the note here.\n\nThe `query` parameter accepts natural language (e.g. \"authentication flow\") or exact terms (e.g. \"AuthService\"). Results include UIDs you can pass directly to note_get or brain_context as seeds. Use `response_format` \"concise\" to get just titles and kinds (good for scanning many results), or \"detailed\" (default) to include scores and location details.\n\nNote: results include both notes AND code symbols in a single call. The `limit` parameter is applied per-kind (up to `limit` notes + up to `limit` symbols), so you never need separate queries to surface both.\n\nTypical: <500ms, ~500 tokens for 20 results in concise mode.",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2320,7 +2320,7 @@ fn group_search_hits_by_note(
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Use after brain_context or brain_search indicates a specific note is relevant and you need its full markdown body or specific sections. Loads the note content from disk plus structural metadata (frontmatter, heading outline, tags, outgoing wikilink count).\n\nDo NOT use to discover notes — use brain_search or brain_context first, then call note_get with the UID or title from those results. Do NOT use for code symbols — this is for markdown notes only.\n\nPass either `uid` (e.g. \"note:vlt:MyVault:abc123\") or `title` (case-insensitive, returns first match). Use the `sections` parameter to retrieve only specific named sections instead of the full body — this is much more token-efficient for large notes. Example: sections=[\"Architecture\", \"API Design\"] returns only those two heading sections.",
+        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid for unambiguous lookup, or title for case-insensitive first-match\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2486,7 +2486,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_backlinks() -> Value {
     json!({
         "name": "backlinks",
-        "description": "Use to find every note that wiki-links TO a specific target note. Returns each source note with the linking section, confidence score, and display text. This reveals the reverse link graph — which notes reference the target.\n\nDo NOT use for forward links (what a note links to) — read the note body with note_get instead. Do NOT use for code symbol dependencies — use brain_impact or flow_trace instead.\n\nPass either `uid` (e.g. \"note:vlt:MyVault:abc123\") or `title` (case-insensitive, first match). Example: backlinks for \"API Design\" returns all notes that contain [[API Design]] wikilinks, along with the source note path and the confidence of each link resolution.",
+        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2565,7 +2565,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Use at the start of a session to see what knowledge sources are indexed and available. Returns counts for vaults (with per-vault note counts and last-indexed timestamps), notes, headings, sections, tags, wikilinks, and code repos. Also surfaces staleness warnings when indexed repos are behind git HEAD or missing from disk. When interaction tracking is enabled (--track-interactions), also reports interaction memory status including query count and memory age. This is a cheap metadata-only call with no parameters.\n\nDo NOT use to search for content — use brain_search. For per-repo detailed staleness, use stale_check.\n\nCall this first to verify that the expected vaults and repos are loaded before issuing queries. If counts are zero, the user may need to run brain_add_source to index their content.",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -2832,7 +2832,7 @@ fn tool_brain_status(
 fn tool_schema_brain_add_source() -> Value {
     json!({
         "name": "brain_add_source",
-        "description": "Use when the user mentions notes, vaults, or repos that are not yet indexed, or when brain_status shows missing sources. Auto-detects the source type: Obsidian vault (if .obsidian/ is present), code repo (if .git/ is present), or plain markdown folder, and indexes it into the brain graph.\n\nDo NOT use if the source is already indexed — check brain_status first.\n\nThe `path` parameter must be an absolute path or start with ~/ (tilde is expanded to $HOME). Example: path=\"~/Documents/Obsidian/MyVault\" indexes the vault and returns counts for notes, headings, sections, tags, and wikilinks created. The optional `name` parameter sets a friendly display name for vaults (defaults to the directory name).",
+        "description": "Index a new vault, code repo, or markdown folder into the brain graph. Auto-detects source type from directory contents.\n\nGuidelines:\n- Check brain_status first to avoid re-indexing already-indexed sources\n- Path must be absolute or start with ~/ (tilde expanded to $HOME)\n- Optional name sets a friendly display name for vaults (ignored for repos)\n\nLimitations:\n- Cannot index remote URLs directly — only local filesystem paths\n- Re-indexing an existing source overwrites the previous index",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2981,7 +2981,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
 fn tool_schema_brain_remove_source() -> Value {
     json!({
         "name": "brain_remove_source",
-        "description": "Remove an indexed code repository or markdown vault from the brain graph. Accepts a repo name, vault name, filesystem path, file:// URL, or UID. Auto-detects whether the target is a repo or vault.\n\nDo NOT use to re-index — use brain_add_source for that. Use this when you need to permanently remove a source that should no longer be in the graph.\n\nExamples: target=\"acme-server\" removes the repo by name. target=\"~/Documents/Obsidian/MyVault\" removes the vault by path.",
+        "description": "Remove an indexed code repository or markdown vault from the brain graph permanently.\n\nGuidelines:\n- Accepts repo name, vault name, filesystem path, file:// URL, or UID\n- Auto-detects whether the target is a repo or vault\n- To re-index (not remove), use brain_add_source instead\n\nLimitations:\n- Removal is permanent — the source must be re-indexed with brain_add_source to restore\n- Ambiguous targets (matching multiple sources) require a UID to disambiguate",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3133,7 +3133,7 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
 fn tool_schema_prune_stale() -> Value {
     json!({
         "name": "prune_stale",
-        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. Use after moving, renaming, or deleting project directories to clean up stale graph entries.\n\nNo parameters required. Returns the list of removed repos and vaults.",
+        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -3281,7 +3281,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Use when modifying a symbol that may be shared across multiple repositories to understand cross-repo blast radius. Returns other repos that reference or define the same symbol name, with confidence scores and link types (e.g. imports, re-exports, API contracts).\n\nDo NOT use for single-repo impact analysis — use brain_impact instead. Do NOT use for general search — use brain_search. This tool is only useful when multiple repos are indexed in the same brain.\n\nPass either `uid` (e.g. \"sym:repo:...:hash:42\") or `name` (e.g. \"UserService\"). Example: cross_repo_contracts for \"PaymentAPI\" returns all repos that import or implement that symbol, with confidence scores indicating match quality.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3363,7 +3363,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_contract_drift() -> Value {
     json!({
         "name": "contract_drift",
-        "description": "Use to audit API contract drift in the indexed code graph: routes/methods/operations DECLARED in a spec file (OpenAPI/Swagger, .proto, GraphQL) but not implemented by any handler, and routes IMPLEMENTED by a Spring/NestJS handler but declared in no spec.\n\nContract links are HYPOTHESES, not ground truth — derived from spec parsing and framework handler heuristics (same-repo only). Use this to spot missing endpoints or undocumented APIs.\n\nOptional `repo` filters to a single repo by UID. Returns two buckets: declared_not_implemented and implemented_not_declared, each a list of contract UIDs (e.g. \"contract:http:POST:/v1/approvals\").",
+        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3415,7 +3415,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Use BEFORE modifying a function, class, or interface to understand what might break. Performs confidence-weighted reverse-dependency traversal — each affected symbol has an `impact_score` (0.0–1.0) showing how strongly the change propagates through the call graph. Scores decay multiplicatively through edges; low-confidence paths are pruned. Results are sorted by impact_score (highest risk first). Type-aware resolution follows class hierarchies via MRO walk.\n\nDo NOT use for forward call chains (what does this function call?) — use flow_trace instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for file-level change impact — use detect_changes or blast_radius instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"validateUser\") or a full UID. The `depth` parameter controls traversal depth (default 3). Use `response_format` \"concise\" for names only, \"detailed\" (default) for file paths, edge types, confidence scores, and impact_score.\n\nTypical: <1s, ~300 tokens for depth-3 traversal.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3494,7 +3494,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_brain_guide() -> Value {
     json!({
         "name": "brain_guide",
-        "description": "Use at the very start of a session to get a comprehensive overview of the indexed codebase and knowledge base. Returns an auto-generated intelligence guide covering all indexed repos (with language breakdowns and key entry points), vaults (with note counts and topics), cross-repo relationships, and a summary of available brain tools with usage tips.\n\nDo NOT use for specific queries — use brain_context or brain_search instead. This is a read-once orientation tool, not a query tool. No parameters are required.\n\nThe guide is regenerated from the current graph state on each call, so it always reflects the latest indexed content. Call this before brain_context to understand what seeds are available.",
+        "description": "Generate a comprehensive orientation guide covering all indexed repos, vaults, cross-repo relationships, and available tools. No parameters required.\n\nGuidelines:\n- Call at session start for a read-once overview before issuing specific queries\n- Regenerated from current graph state on each call\n- Not a query tool — use brain_context or brain_search for specific lookups\n\nLimitations:\n- Can be expensive on large graphs; prefer brain_status for lightweight session initialization\n- Output size scales with number of indexed sources",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -3514,7 +3514,7 @@ fn tool_brain_guide(store: &GraphStore, _args: Value) -> Result<Value, anyhow::E
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Use when you need to understand execution flow: what functions a symbol calls, what those call, and so on. Returns a tree of callees rooted at the given symbol, following call edges forward through the graph. Best for tracing from entry points (e.g. main, request handlers) to understand the full execution path.\n\nDo NOT use for reverse dependencies (\"what calls this?\") — use brain_impact instead. Do NOT use for general context around a symbol — use brain_context instead.\n\nThe `symbol` parameter accepts a symbol name (e.g. \"handleRequest\") or a full UID. The `max_depth` parameter caps tree depth (default 10). Cycles are detected and pruned. Use `response_format` \"concise\" for a function-name-only chain, or \"detailed\" (default) for full metadata including file paths and UIDs at each node.\n\nTypical: <1s, ~400 tokens for depth-10 traversal.",
+        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3705,7 +3705,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Use BEFORE committing or reviewing changes to understand their blast radius at the file level. Takes a list of changed file paths, maps them to all symbols defined in those files, traces their transitive dependents, and returns a risk assessment (low/medium/high) with affected execution flows.\n\nDo NOT use for single-symbol impact — use brain_impact instead. Do NOT use for cross-repo impact — use cross_repo_contracts. Do NOT use for git diff details — use brain_diff instead.\n\nThe `files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\", \"src/utils/validate.ts\"]). Returns affected symbols, affected processes/flows, and an overall risk level. Example: passing 3 changed files might return risk=\"high\" with 12 affected symbols across 2 execution flows.",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3782,7 +3782,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Use to prioritize which test files an MR/PR should run for a set of code changes. Maps changed files to the symbols they define, reverse-traverses the call/import graph, and returns the test files that (transitively) depend on the changed code, bucketed into priority tiers: tier_1 = tests that directly reference a changed symbol, tier_2 = tests of a direct caller, tier_3 = transitively reachable tests.\n\nIMPORTANT — this is STATIC, call-graph-based regression test selection. It is a prioritized signal, NOT a provably-safe subset. It misses tests reached via reflection, dependency injection, codegen/macros, and data-driven or integration/e2e tests. \"No tests found\" does NOT mean it is safe to skip testing — keep a periodic full test run in CI. Treat the output as a ranked starting point, not a guarantee.\n\nDo NOT use for symbol-level blast radius — use brain_impact. Do NOT use for risk scoring of a change — use detect_changes.\n\nProvide either `changed_files` (repo-relative paths) or `base_ref` (a git ref such as \"main\"; runs `git diff --name-only base...HEAD` against the locally-indexed repo). Example: affected_tests(base_ref=\"main\") → {tier_1: [...], tier_2: [...], tier_3: [...], summary: \"3 tier-1, 2 tier-2, 0 tier-3 tests affected\"}.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3848,7 +3848,7 @@ fn first_local_repo_path(store: &GraphStore) -> Option<String> {
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
-        "description": "Use to understand the high-level architecture of the codebase by viewing functional communities detected via the Leiden clustering algorithm. Each cluster groups tightly-connected symbols (functions, classes, modules) that form a cohesive unit, with a generated name, cohesion score, and key files.\n\nDo NOT use for specific symbol lookup — use brain_search or brain_context. Do NOT use for dependency analysis — use brain_impact or flow_trace. This is an exploratory tool for understanding overall code organization.\n\nThe optional `resolution` parameter controls cluster granularity: higher values produce more, smaller clusters; lower values produce fewer, larger clusters (default 1.0). Returns up to 20 member symbols per cluster. Example: resolution=0.5 might yield 3 broad architectural layers, while resolution=2.0 might yield 15 fine-grained feature modules.",
+        "description": "View the codebase's high-level architecture via Leiden community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and up to 20 member symbols per cluster\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is computed on demand, not cached\n- Quality depends on the density and accuracy of indexed call/import edges",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3914,7 +3914,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_stale_check() -> Value {
     json!({
         "name": "stale_check",
-        "description": "Use at the start of a session or after the user makes code changes to verify the graph index is current. Compares each repo's indexed git SHA against the current HEAD and reports whether the index is stale. No parameters required.\n\nDo NOT use to see what changed — use brain_diff for that. Do NOT use for vault/note freshness — the brain auto-detects note modifications on query.\n\nReturns per-repo staleness status with indexed SHA, current HEAD SHA, and a boolean `any_stale` flag. If stale, suggest the user re-index with brain_add_source or the CLI `nestweaver index` command to update the graph.",
+        "description": "Check whether the graph index is current by comparing each repo's indexed git SHA against HEAD. No parameters required.\n\nGuidelines:\n- Call at session start or after code changes to verify index freshness\n- Returns per-repo staleness with indexed SHA, HEAD SHA, and commits-behind count\n- If stale, re-index with brain_add_source or CLI nestweaver index\n\nLimitations:\n- Only checks git repos, not vault/note freshness\n- For viewing what actually changed, use brain_diff",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -4031,7 +4031,7 @@ fn get_remote_head(url: &str) -> Option<String> {
 fn tool_schema_set_extension() -> Value {
     json!({
         "name": "set_extension",
-        "description": "Use to attach custom metadata to any node (symbol, note, section, tag) in the brain. Stores key-value properties in a JSON sidecar file alongside the database. Use this for information not in the core schema, such as team ownership, deprecation status, review flags, or custom taxonomies.\n\nDo NOT use for querying existing properties — use query_extensions instead. Properties persist across sessions and are queryable immediately after being set.\n\nThe `uid` parameter is the node's full UID (e.g. \"sym:repo:...:hash:42\" for symbols, \"note:vlt:...:hash\" for notes). The `key` is a property name (e.g. \"team_owner\", \"deprecated\", \"priority\"). The `value` accepts any JSON value: strings, numbers, booleans, arrays, or objects. Example: set_extension(uid=\"sym:...\", key=\"team_owner\", value=\"platform-team\").",
+        "description": "Attach custom key-value metadata to any node (symbol, note, section, tag) in a JSON sidecar alongside the database.\n\nGuidelines:\n- Use for information not in core schema: team ownership, deprecation status, review flags\n- Value accepts any JSON type (string, number, boolean, array, object); overwrites existing\n- Properties persist across sessions and are queryable via query_extensions\n\nLimitations:\n- Stored in a sidecar file, not the main graph — not included in graph traversals\n- To query existing properties use query_extensions, not this tool",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4087,7 +4087,7 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
 fn tool_schema_query_extensions() -> Value {
     json!({
         "name": "query_extensions",
-        "description": "Use to find nodes by custom metadata or to inspect all properties on a specific node. Queries the extension sidecar (set via set_extension) and returns matching UIDs with their full property maps.\n\nDo NOT use to set properties — use set_extension. Do NOT use for core graph queries (symbols, notes, edges) — use brain_search or brain_context.\n\nTwo modes: (1) Pass `uid` alone to get all custom properties for that specific node. (2) Pass `key` + `value` to find all nodes matching that property (e.g. key=\"team_owner\", value=\"platform-team\" returns every node owned by that team). Example: query_extensions(key=\"deprecated\", value=true) returns all nodes marked as deprecated.",
+        "description": "Query custom metadata set via set_extension. Two modes: by uid (all properties for a node) or by key+value (find all nodes matching a property).\n\nGuidelines:\n- Pass uid alone to inspect a node's custom properties\n- Pass key + value to find all nodes matching that property (exact match only)\n- For core graph queries use brain_search or brain_context, not this tool\n\nLimitations:\n- Exact match only — no partial matching, ranges, or regex on values\n- Only queries the extension sidecar, not core graph properties",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4159,7 +4159,7 @@ fn tool_query_extensions(args: Value) -> Result<Value, anyhow::Error> {
 fn tool_schema_brain_diff() -> Value {
     json!({
         "name": "brain_diff",
-        "description": "Use before a code review or after pulling new changes to see what changed since the graph was last indexed. Returns files added, modified, and deleted between a base SHA and the current HEAD, plus all symbols defined in the changed files. Only works with locally-indexed repositories (file:// URLs).\n\nDo NOT use for impact analysis of hypothetical changes — use detect_changes instead. Do NOT use to check if the index is stale — use stale_check (faster, no git diff). Do NOT use for cross-repo change tracking.\n\nThe `repo` parameter is a repo name or substring of its URL (e.g. \"nestweaver\" or \"github.com/org/repo\"). The optional `since_sha` overrides the base SHA (defaults to the repo's last indexed SHA). Example: brain_diff(repo=\"my-app\") shows all files and symbols changed since the last index.",
+        "description": "Show what changed since the graph was last indexed: files added/modified/deleted plus affected symbols. For locally-indexed repos only.\n\nGuidelines:\n- Use before code review or after pulling changes to understand the delta\n- Pass repo name or URL substring; optional since_sha overrides the base\n- For impact analysis of hypothetical changes use detect_changes; for staleness check use stale_check\n\nLimitations:\n- Only works with local repos (file:// URLs), not remote\n- Shows file-level diff, not line-level — use git diff for detailed patches",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4309,7 +4309,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Use when you need the full context for a specific named project. Returns all Notes, Symbols, and Sections associated with the project, ranked by Personalized PageRank within the project's subgraph and bounded by a token budget. For composite projects, optionally includes content from component sub-projects.\n\nDo NOT use for ad-hoc topic queries — use brain_context with seed terms instead. Do NOT use if you don't know the project name — use brain_search to find it first. This tool requires projects to be defined in the graph (via vault taxonomy or instance config).\n\nThe `project` parameter accepts a project name (e.g. \"AuthService\"), alias, or UID. Use `kinds` to filter by node type (e.g. [\"Symbol\"] for code only, [\"Note\", \"Section\"] for docs only). Use `since` and `recency_weight` to prioritize recent content. Example: project_context(project=\"payments\", token_budget=5000, kinds=[\"Symbol\"]) returns the top code symbols in the payments project.\n\nTypical: 1-3s, ~3000 tokens at default budget.",
+        "description": "Retrieve all context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Filter with kinds (e.g. ['Symbol'] for code only), since, and recency_weight\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4762,7 +4762,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Use when you want to find cleanup opportunities or understand code coverage gaps. Walks forward from every entry point (main functions, HTTP handlers, event listeners, test runners) following CALLS, IMPORTS, EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached are flagged as potentially dead, with confidence scoring based on visibility: High (private/internal — very likely dead), Medium (inferred visibility), Low (public — may be a library API consumed externally).\n\nDo NOT use for understanding what depends on a specific symbol — use brain_impact instead. Do NOT use for finding hub nodes or architectural chokepoints — use hub_nodes or bridge_nodes instead.\n\nThe `min_confidence` parameter filters results (default 'low' = show all). Use `response_format` \"concise\" to get only names and confidence levels (good for quick scan), or \"detailed\" (default) for full metadata including UIDs, file paths, kinds, and visibility.",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private/internal), Medium (inferred visibility), Low (public/library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Public symbols flagged as Low confidence may be consumed by external code",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4833,7 +4833,7 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_hub_nodes() -> Value {
     json!({
         "name": "hub_nodes",
-        "description": "Use when you need to identify the most connected symbols in the codebase — the central abstractions that many other parts depend on. Returns nodes ranked by total degree (incoming + outgoing edges), with optional cluster membership. Hub nodes are the architectural core: changing them affects the most code paths.\n\nDo NOT use for finding chokepoints between communities — use bridge_nodes instead. Do NOT use for understanding a specific symbol's dependencies — use brain_impact or flow_trace instead.\n\nThe `top_n` parameter controls how many hubs are returned (default 10). Use `response_format` \"concise\" to get only names and degree counts (good for quick orientation), or \"detailed\" (default) for full metadata including UIDs, file paths, PageRank scores, and cluster IDs.",
+        "description": "Identify the most connected symbols in the codebase ranked by total degree (incoming + outgoing edges). These are the architectural core.\n\nGuidelines:\n- Use for quick orientation on which abstractions are most central\n- Includes optional cluster membership when clustering sidecar exists\n- For chokepoints between communities use bridge_nodes instead\n\nLimitations:\n- Degree centrality only — does not account for path importance (use bridge_nodes for betweenness)\n- For specific symbol dependencies use brain_impact or flow_trace",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4915,7 +4915,7 @@ fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_bridge_nodes() -> Value {
     json!({
         "name": "bridge_nodes",
-        "description": "Use when you need to find architectural chokepoints — symbols that sit on many shortest paths between other nodes and have outsized blast radius if changed. Returns nodes ranked by betweenness centrality (Brandes' algorithm with sampling), plus which community clusters each bridge connects.\n\nDo NOT use for finding the most-connected nodes — use hub_nodes instead (degree centrality). Do NOT use for single-symbol impact analysis — use brain_impact instead.\n\nThe `top_n` parameter controls how many bridges are returned (default 10). Use `response_format` \"concise\" to get only names and betweenness scores (good for quick triage), or \"detailed\" (default) for full metadata including UIDs, file paths, and connected community IDs.",
+        "description": "Find architectural chokepoints — symbols with high betweenness centrality that sit on many shortest paths between other nodes.\n\nGuidelines:\n- Use to identify symbols with outsized blast radius if changed\n- Returns betweenness score plus which community clusters each bridge connects\n- For most-connected nodes (degree centrality) use hub_nodes instead\n\nLimitations:\n- Betweenness computed via Brandes' algorithm with sampling — approximate for large graphs\n- For single-symbol impact analysis use brain_impact",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4983,7 +4983,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Use BEFORE merging a PR or after staging changes to understand the full blast radius. Each affected symbol has an `impact_score` (0.0–1.0) showing change propagation strength — scores decay multiplicatively through the call graph, so direct callers score higher than transitive ones. Results sorted by impact_score (highest risk first).\n\nTakes a list of changed file paths, maps them to symbols, runs confidence-weighted reverse-dependency traversal, groups by cluster/community, and returns risk assessment (Low/Medium/High). Type-aware call resolution ensures method calls through class hierarchies are tracked.\n\nDo NOT use for single-symbol impact — use brain_impact. Do NOT use for cross-repo — use cross_repo_contracts.\n\nThe `changed_files` parameter accepts repo-relative paths (e.g. [\"src/auth/login.ts\"]). Optional `max_depth` controls traversal depth (default 3). Returns changed symbols, affected symbols (with impact_score, depth, edge type), affected clusters, risk level, and summary.\n\nTypical: 1-2s, ~800 tokens. Response size scales with number of changed files.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection\n- Response size scales with number of changed files and graph density",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5095,7 +5095,7 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_get_summary() -> Value {
     json!({
         "name": "get_summary",
-        "description": "Use when you need a compact architectural overview without reading raw code files. Returns hierarchical, deterministic summaries at three granularity levels: symbol (function/class with callers/callees and file location), file (exports and import sources per file), or cluster (community architecture with key types and cross-cluster dependencies). No LLM needed — summaries are derived entirely from graph data and are highly token-efficient.\n\nDo NOT use for specific symbol lookup — use brain_search or brain_context instead. Do NOT use for understanding a single symbol's call chain — use flow_trace or brain_impact instead.\n\nThe `level` parameter selects granularity: 'symbol' for per-function detail, 'file' for per-file exports, 'cluster' for community-level architecture. Use `target` to filter to a specific file path, symbol name, or cluster name. Use `token_budget` to cap output size for context windows.",
+        "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees, 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5789,7 +5789,7 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Use to orient yourself on an unfamiliar topic, feature, or subsystem in ONE call instead of a chain of searches. Runs hybrid PPR + BM25 retrieval (with pseudo-relevance feedback) for your query, groups the results into architectural domains (code directories + notes), inlines a few high-confidence source bodies, and returns a token-budgeted map plus a `bundle_id`. Drill into specific entries afterwards with `investigate_expand` (by asset_id) or fill in all remaining bodies with `investigate_hydrate`.\n\nScope: \"project:<slug>\" restricts seeds to a project's members, \"repo:<name>\" restricts results to a repo, \"vault\"/\"all\"/omitted = no restriction. Returns `{bundle_id, domains:[{label, entry_point, members}], entries:[{asset_id, uid, kind, title, location, summary, inline_body?, body_complete?, relevance}], more_available}`. `more_available` counts entries dropped by the token budget — raise `token_budget` to see them. `body_complete` is present (false) only when `inline_body` was truncated at the per-body cap; absent means the body is complete. When false, call `read_symbols(uid)` or `investigate_expand` to get the full source.",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- more_available counts entries dropped by token budget — raise token_budget to see them\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5839,7 +5839,7 @@ fn tool_investigate(
 fn tool_schema_investigate_expand() -> Value {
     json!({
         "name": "investigate_expand",
-        "description": "Use after `investigate` to drill into specific map entries. Given a `bundle_id` and one or more targets (each an `asset_id` from the map, or a raw node uid), returns each entry's full source body plus its immediate neighbors (callers/callees for symbols, wikilink sources for notes) and marks the entries expanded. Returns `{bundle_id, expanded:[entry], neighbors:[{of, uid, kind, title, relation}], unresolved:[target]}`. Expanded entries always have `body_complete: true` (full untruncated body). Bundles expire 24h after creation.",
+        "description": "Drill into specific investigate map entries: fetch full source bodies and immediate neighbors (callers/callees for symbols, wikilink sources for notes).\n\nGuidelines:\n- Pass bundle_id from a prior investigate call and target asset_ids or raw node uids\n- Expanded entries always have body_complete: true (full untruncated body)\n- Unresolved targets are returned in the unresolved array\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5878,7 +5878,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
 fn tool_schema_investigate_hydrate() -> Value {
     json!({
         "name": "investigate_hydrate",
-        "description": "Use after `investigate` to fill in source bodies/summaries for every map entry that doesn't yet have one — the bulk version of `investigate_expand`, budget-bounded. Given a `bundle_id`, reads bodies for all un-hydrated entries up to the token budget. Returns `{bundle_id, hydrated, entries}` where each entry carries `body_complete: bool` — `true` when the full source is inlined, `false` when the per-body cap truncated it (call `read_symbols(uid)` for the rest). Bundles expire 24h after creation.",
+        "description": "Fill in source bodies for all un-hydrated entries in an investigate bundle — the bulk version of investigate_expand, budget-bounded.\n\nGuidelines:\n- Pass bundle_id from a prior investigate call; bodies are read up to token_budget\n- body_complete: true means full source inlined; false means truncated (use read_symbols for the rest)\n- Token budget hard-capped at 16000\n\nLimitations:\n- Requires a valid bundle_id from a prior investigate call\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {

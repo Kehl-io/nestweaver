@@ -1,14 +1,13 @@
-use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub fn service_content_hash(symbol_hashes: &[&str]) -> String {
-    let mut hasher = Sha256::new();
     let mut sorted: Vec<&str> = symbol_hashes.to_vec();
     sorted.sort();
+    let mut hasher = blake3::Hasher::new();
     for h in sorted {
         hasher.update(h.as_bytes());
     }
-    hex::encode(hasher.finalize())
+    hasher.finalize().to_hex().to_string()
 }
 
 pub fn cache_summary(cache_dir: &Path, hash: &str, summary: &str) -> Result<(), anyhow::Error> {

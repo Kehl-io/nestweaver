@@ -1,5 +1,6 @@
 use crate::entry_points::detect_entry_point;
 use crate::language::detect_language;
+use bumpalo::Bump;
 use nestweaver_schema::{EntryPointKind, Language, SymbolKind, TypeInfo, Visibility};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -682,6 +683,10 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
 
 /// Parse a single source file and extract symbols and references.
 pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError> {
+    // Arena for intermediate string allocations during tree-sitter traversal.
+    // Amortizes hundreds of small heap allocs per file into a single large block,
+    // reducing malloc/free pressure when parsing many files concurrently via rayon.
+    let arena = Bump::new();
     let lang = detect_language(path)
         .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_string_lossy().into_owned()))?;
 
@@ -775,7 +780,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
             let capture_name = &capture_names[capture.index as usize];
             let node = capture.node;
 
-            let node_text = node.utf8_text(source_bytes).unwrap_or("").to_string();
+            // Keep node_text as a &str borrowing directly from the source slice —
+            // utf8_text() returns &str already; .to_string() would be a wasted heap alloc.
+            let node_text: &str = node.utf8_text(source_bytes).unwrap_or("");
             let start_line = node.start_position().row as u32 + 1;
 
             if let Some(kind_str) = capture_name.strip_prefix("definition.") {
@@ -804,14 +811,20 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     }
                 };
 
-                let name = name_text.clone().unwrap_or_else(|| node_text.clone());
+                // Use the arena for the name fallback so we defer the owned-String
+                // allocation until we know this symbol passes the dedup check.
+                let name_arena: &str = match &name_text {
+                    Some(n) => arena.alloc_str(n),
+                    None => node_text,
+                };
+                let name = name_arena.to_string();
 
                 if !seen_symbols.insert((name.clone(), start_line)) {
                     continue;
                 }
 
-                let content_hash = sha256_hex(&node_text);
-                let signature = first_line(&node_text);
+                let content_hash = sha256_hex(node_text);
+                let signature = first_line(node_text);
 
                 let kind_label = match kind {
                     SymbolKind::Function => "function",
@@ -843,7 +856,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     )
                 };
 
-                let visibility = infer_visibility(&name, &node_text, lang);
+                let visibility = infer_visibility(&name, node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     find_parent_name(&node, source_bytes)
@@ -885,9 +898,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     })
                     .unwrap_or_default();
 
-                let name = name_text
-                    .clone()
-                    .unwrap_or_else(|| strip_quotes(&node_text));
+                let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
@@ -933,13 +944,13 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                             }
                         })
                         .and_then(|obj| obj.utf8_text(source_bytes).ok())
-                        .map(|s| s.to_string());
+                        .map(|s| arena.alloc_str(s) as &str);
 
                     // Strategy 2: direct object field (Java method_invocation)
                     let from_direct_object = if from_function_child.is_none() {
                         node.child_by_field_name("object")
                             .and_then(|obj| obj.utf8_text(source_bytes).ok())
-                            .map(|s| s.to_string())
+                            .map(|s| arena.alloc_str(s) as &str)
                     } else {
                         None
                     };
@@ -949,14 +960,17 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         if from_function_child.is_none() && from_direct_object.is_none() {
                             node.child_by_field_name("receiver")
                                 .and_then(|r| r.utf8_text(source_bytes).ok())
-                                .map(|s| s.to_string())
+                                .map(|s| arena.alloc_str(s) as &str)
                         } else {
                             None
                         };
 
+                    // Convert the chosen arena-backed &str to an owned String only once,
+                    // at the point where we need it for RawReference.
                     from_function_child
                         .or(from_direct_object)
                         .or(from_receiver_field)
+                        .map(|s| s.to_string())
                 } else {
                     None
                 };
@@ -1536,7 +1550,7 @@ mod tests {
     // ── Hash test ──────────────────────────────────────────────────────────
 
     #[test]
-    fn content_hash_is_sha256() {
+    fn content_hash_is_256bit_hex() {
         let source = r#"function hello() { return 42; }"#;
         let parsed = parse_source(Path::new("test.js"), source).unwrap();
         assert!(
@@ -1544,7 +1558,7 @@ mod tests {
             "should parse at least one symbol"
         );
         let hash = &parsed.symbols[0].content_hash;
-        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars; got: {hash}");
+        assert_eq!(hash.len(), 64, "256-bit hex is 64 chars; got: {hash}");
         assert!(
             hash.chars().all(|c| c.is_ascii_hexdigit()),
             "hash should be hex; got: {hash}"

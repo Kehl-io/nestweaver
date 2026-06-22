@@ -21,6 +21,29 @@ use protocol::{ErrorResponse, PROTOCOL_VERSION, Response, error, error_code, suc
 const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+const SERVER_INSTRUCTIONS: &str = "\
+NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find for indexed repos.
+
+## Quick Reference
+- Explore a topic: brain_context (seed with symbol/file name, filter by repo/tags)
+- Find a symbol: brain_search (keyword search across code + notes)
+- Check impact before changing code: brain_impact or blast_radius
+- Trace execution flow: flow_trace (forward call graph)
+- Read a symbol's source: read_symbols (cheaper than reading whole files)
+- Read a vault note: note_get (by UID or title)
+- Investigate unfamiliar code: investigate → investigate_expand → investigate_hydrate
+
+## Query Efficiency
+- Always query the graph before reading source files
+- Filter with repos, tags, path_prefix, kinds for precision
+- Use response_format 'concise' unless you need full bodies
+- In subagents/scripts: use CLI (nestweaver search --json) instead of MCP for fewer tokens
+
+## Do NOT
+- grep or find in indexed repos — use brain_search or regex_search
+- Read entire files — use read_symbols for specific symbol spans
+- Re-index manually — use stale_check to verify, the daemon handles re-indexing";
+
 /// Canonical sidecar location for the Tantivy index. Lives next to the
 /// LadybugDB file: `<db>.tantivy/`.
 pub fn tantivy_sidecar_path(db_path: &Path) -> std::path::PathBuf {
@@ -417,7 +440,8 @@ fn dispatch_method_daemon(
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION,
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             }),
         )),
 
@@ -503,7 +527,8 @@ fn dispatch_method(
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION,
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             }),
         )),
 
