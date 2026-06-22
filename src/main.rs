@@ -10718,32 +10718,49 @@ fn run_embed(
     let default = default_db_path();
     let path = db.unwrap_or(&default);
 
-    // Stop daemon if running — embed needs exclusive write access
-    let instance_id = nestweaver_daemon::instance_id_from_db_path(path);
-    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
-    let daemon_was_running = if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if unsafe { libc::kill(pid, 0) } == 0 {
-                eprintln!("Stopping daemon (PID {pid}) for exclusive DB access…");
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-                for _ in 0..50 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if unsafe { libc::kill(pid, 0) } != 0 {
-                        break;
+    // ── Try the daemon path first (Metal-accelerated) ───────────
+    // Only use daemon for local-model embedding (no --endpoint, no --local).
+    if endpoint.is_none() && !local {
+        let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+        match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
+            Ok(mut client) => {
+                eprintln!("Embedding via daemon (Metal-accelerated)…");
+                match rt.block_on(client.embed(scope, force, batch_size as u32)) {
+                    Ok(resp) => {
+                        let elapsed = t0.elapsed();
+                        if stats {
+                            eprintln!(
+                                "Embed stats: {} succeeded, {} failed, {:.2}s elapsed",
+                                resp.succeeded,
+                                resp.failed,
+                                elapsed.as_secs_f64()
+                            );
+                        } else {
+                            eprintln!(
+                                "Done: {} embedding(s) generated, {} error(s).",
+                                resp.succeeded, resp.failed
+                            );
+                        }
+                        return if resp.failed > 0 {
+                            Ok(EXIT_ERROR)
+                        } else {
+                            Ok(EXIT_SUCCESS)
+                        };
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Daemon embed failed ({e:#}), falling back to direct DB path…"
+                        );
                     }
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
+            Err(_) => {
+                eprintln!("Daemon not available, using direct DB path…");
+            }
         }
-    } else {
-        false
-    };
+    }
+
+    // ── Fallback: direct DB access ──────────────────────────────
 
     let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
         anyhow::anyhow!(
@@ -11083,13 +11100,7 @@ fn run_embed(
         eprintln!("Done: {success_count} embedding(s) generated, {error_count} error(s).");
     }
 
-    // Drop the store before restarting the daemon
     drop(store);
-
-    if daemon_was_running {
-        eprintln!("Restarting daemon…");
-        let _ = nestweaver_client::autostart::ensure_daemon(path, None);
-    }
 
     if error_count > 0 {
         Ok(EXIT_ERROR)

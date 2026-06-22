@@ -2338,6 +2338,179 @@ impl NestWeaverDaemon for DaemonService {
             .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
+
+    // ── Embedding ───────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    async fn embed(
+        &self,
+        request: Request<EmbedRequest>,
+    ) -> Result<Response<EmbedResponse>, Status> {
+        self.state.idle_notify.notify_one();
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
+        let req = request.into_inner();
+        let scope = req.scope.clone();
+        let force = req.force;
+        let batch_size = if req.batch_size == 0 {
+            32
+        } else {
+            req.batch_size as usize
+        };
+
+        let do_symbols = scope == "all" || scope == "symbols";
+        let do_notes = scope == "all" || scope == "notes";
+        let do_headings = scope == "all" || scope == "headings";
+
+        if !do_symbols && !do_notes && !do_headings {
+            self.state
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            return Err(Status::invalid_argument(format!(
+                "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
+            )));
+        }
+
+        // Read the embed model outside the blocking thread.
+        let model = {
+            let guard = self.state.embed_model.read().await;
+            guard.clone()
+        };
+
+        let Some(model) = model else {
+            self.state
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            return Err(Status::unavailable(
+                "embedding model is not loaded — the daemon may have been built \
+                 without the `embed` feature or the model is still initializing",
+            ));
+        };
+
+        let store = self.state.store.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut succeeded = 0u32;
+            let mut failed = 0u32;
+
+            // ── Symbols ─────────────────────────────────────────────
+            if do_symbols
+                && let Ok(symbols) = store.list_all_symbols()
+            {
+                let to_embed: Vec<_> = if force {
+                    symbols.iter().collect()
+                } else {
+                    symbols
+                        .iter()
+                        .filter(|s| s.embedding.is_none())
+                        .collect()
+                };
+
+                for chunk in to_embed.chunks(batch_size) {
+                    for sym in chunk {
+                        let text = nestweaver_embed::preprocess::symbol_embed_text(
+                            &sym.kind.to_string(),
+                            &sym.name,
+                            None,
+                        );
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&sym.uid, emb);
+                                succeeded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Notes ───────────────────────────────────────────────
+            if do_notes
+                && let Ok(notes) = store.list_notes(None)
+            {
+                let to_embed: Vec<_> = if force {
+                    notes.iter().collect()
+                } else {
+                    notes
+                        .iter()
+                        .filter(|n| n.embedding.is_none())
+                        .collect()
+                };
+
+                for chunk in to_embed.chunks(batch_size) {
+                    for note in chunk {
+                        let text =
+                            nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&note.uid, emb);
+                                succeeded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %note.uid, "embedding failed: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Headings ────────────────────────────────────────────
+            if do_headings
+                && let Ok(headings) = store.list_all_headings()
+            {
+                let to_embed: Vec<_> = if force {
+                    headings.iter().collect()
+                } else {
+                    headings
+                        .iter()
+                        .filter(|h| h.embedding.is_none())
+                        .collect()
+                };
+
+                for chunk in to_embed.chunks(batch_size) {
+                    for heading in chunk {
+                        let text = nestweaver_embed::preprocess::heading_embed_text(
+                            "",
+                            &heading.text,
+                        );
+                        match model.embed_query(&text) {
+                            Ok(emb) => {
+                                store.add_embedding(&heading.uid, emb);
+                                succeeded += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Flush once at the end.
+            if succeeded > 0
+                && let Err(e) = store.flush_embedding_index()
+            {
+                tracing::warn!("failed to flush embedding index: {e}");
+            }
+
+            tracing::info!(succeeded, failed, "embed RPC completed");
+            Ok::<_, Status>(EmbedResponse { succeeded, failed })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;
+
+        self.state
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        result.map(Response::new)
+    }
 }
 
 // ── Server entry point ──────────────────────────────────────────────
