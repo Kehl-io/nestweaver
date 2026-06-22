@@ -3887,7 +3887,6 @@ dependencies = [
  "apollo-parser",
  "blake3",
  "globset",
- "hex",
  "html2md",
  "ignore",
  "indicatif 0.17.11",

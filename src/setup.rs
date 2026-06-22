@@ -1017,3 +1017,83 @@ fn format_name(name: &str) -> &str {
         _ => name,
     }
 }
+
+/// Check if a tool already has NestWeaver configuration in the current directory.
+/// Uses the primary config file that each tool's setup function writes.
+fn tool_already_configured(tool_name: &str) -> bool {
+    fn json_has_nestweaver(path: &str) -> bool {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("mcpServers")
+                    .and_then(|s| s.get("nestweaver"))
+                    .map(|_| true)
+            })
+            .unwrap_or(false)
+    }
+    fn file_contains(path: &str, needle: &str) -> bool {
+        std::fs::read_to_string(path)
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
+    }
+    match tool_name {
+        "claude-code" => json_has_nestweaver(".mcp.json"),
+        "cursor" => json_has_nestweaver(".cursor/mcp.json"),
+        "codex" => file_contains(".codex/config.toml", "nestweaver"),
+        "windsurf" => dirs::home_dir()
+            .map(|h| {
+                json_has_nestweaver(
+                    h.join(".codeium/windsurf/mcp_config.json")
+                        .to_str()
+                        .unwrap_or(""),
+                )
+            })
+            .unwrap_or(false),
+        "jetbrains" => json_has_nestweaver(".junie/mcp/mcp.json"),
+        "vscode" => json_has_nestweaver(".vscode/mcp.json"),
+        "gemini" => json_has_nestweaver(".gemini/settings.json"),
+        "copilot" => json_has_nestweaver(".github/copilot-mcp.json"),
+        "aider" => file_contains(".aider.conf.yml", "nestweaver"),
+        "kiro" => json_has_nestweaver(".kiro/settings.json"),
+        "continue" => json_has_nestweaver(".continue/config.json"),
+        "cline" => json_has_nestweaver(".cline/settings.json"),
+        "opencode" => json_has_nestweaver(".opencode/config.json"),
+        "trae" => json_has_nestweaver(".trae/config.json"),
+        "devin" => json_has_nestweaver("devin.json"),
+        "hermes" => json_has_nestweaver(".hermes/config.json"),
+        _ => false,
+    }
+}
+
+/// Run setup automatically after first index. Only configures tools that are
+/// detected and don't already have NestWeaver configs. Non-fatal — errors are
+/// logged but don't propagate.
+pub fn run_auto_setup(db_path: &std::path::Path) -> Result<(), anyhow::Error> {
+    let tools = detect_tools();
+    if tools.is_empty() {
+        return Ok(());
+    }
+
+    let mut configured = Vec::new();
+    for tool in &tools {
+        if !tool.detected {
+            continue;
+        }
+        if tool_already_configured(tool.name) {
+            continue;
+        }
+        match run_setup(Some(tool.name), db_path, false, false, false) {
+            Ok(()) => configured.push(tool.name),
+            Err(e) => tracing::debug!("auto-setup skipped {}: {e}", tool.name),
+        }
+    }
+
+    if !configured.is_empty() {
+        eprintln!(
+            "  Auto-configured NestWeaver for: {}. Run `nestweaver setup --help` to customize.",
+            configured.join(", ")
+        );
+    }
+    Ok(())
+}

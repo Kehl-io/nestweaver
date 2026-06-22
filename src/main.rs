@@ -6702,6 +6702,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 out.status(&format!("Trigram index built ({postings} postings)."));
             }
 
+            // Auto-setup AI tool integrations on first index of this repo.
+            // Uses a marker sidecar so it only fires once per db, not on every
+            // incremental re-index. Non-fatal — a failure here never aborts the index.
+            let marker_path = nestweaver_engine::sidecar_path(&db_path, ".setup_done");
+            if !marker_path.exists() {
+                if let Err(e) = setup::run_auto_setup(&db_path) {
+                    tracing::debug!("auto-setup failed (non-fatal): {e}");
+                }
+                let _ = std::fs::write(&marker_path, "");
+            }
+
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
                 files_count,
