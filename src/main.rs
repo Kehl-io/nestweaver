@@ -3088,12 +3088,92 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("invalid --intent value: {e}"))?;
 
-            // ── Feature-mode: always local (requires config processing) ──
+            // ── Feature-mode ──
             if let Some(feature_name) = &feature {
-                let store = open_store(db.as_deref())?;
                 let config_path = config
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
+
+                // ── daemon guard ──────────────────────────────────
+                if use_daemon {
+                    let instance_cfg = nestweaver_engine::InstanceConfig::from_file(config_path)?;
+                    if let Some(fc) = instance_cfg
+                        .features
+                        .as_ref()
+                        .and_then(|fs| fs.iter().find(|f| f.name == *feature_name))
+                    {
+                        let db_default = default_db_path();
+                        let db_path = db.as_deref().unwrap_or(&db_default);
+                        if let Ok(rt) = tokio::runtime::Runtime::new() {
+                            let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                                db_path,
+                                config.as_deref(),
+                            ));
+                            if let Ok(mut client) = connect {
+                                let req = nestweaver_proto::BrainContextRequest {
+                                    seeds: fc.entry_points.clone(),
+                                    token_budget: token_budget.unwrap_or(0) as i32,
+                                    response_format: String::new(),
+                                    repos: fc.repos.clone(),
+                                    vaults: vec![],
+                                    kinds: vec![],
+                                    path_prefix: String::new(),
+                                    tags: vec![],
+                                    exclude_tags: vec![],
+                                    weight_ppr: 0.0,
+                                    weight_bm25: 0.0,
+                                    intent: intent.clone().unwrap_or_default(),
+                                    include_seeds: true,
+                                    include_bodies: false,
+                                    root: String::new(),
+                                    prf: false,
+                                    rerank: false,
+                                    weight_semantic: 0.0,
+                                    since: String::new(),
+                                    recency_weight: 0.0,
+                                    recency_half_life_days: 0.0,
+                                };
+                                let rpc = rt.block_on(async {
+                                    client
+                                        .inner_mut()
+                                        .get_context(req)
+                                        .await
+                                        .map(|r| r.into_inner())
+                                });
+                                match rpc {
+                                    Ok(resp) => {
+                                        let result: nestweaver_engine::BrainContextResult =
+                                            serde_json::from_str(&resp.result_json)?;
+                                        let effective_limit = limit.unwrap_or(30);
+                                        let cut = match token_budget {
+                                            Some(budget) => {
+                                                token_budgeted_truncate(&result.connected, budget)
+                                            }
+                                            None => effective_limit.min(result.connected.len()),
+                                        };
+                                        if json {
+                                            print_brain_context_json(&result, cut)?;
+                                        } else {
+                                            print_brain_context_text(&result, cut, token_budget);
+                                        }
+                                        let stats = format!(
+                                            "{} seeds, {} connected nodes in {} (via daemon)",
+                                            result.seeds.len(),
+                                            cut,
+                                            format_elapsed(t0.elapsed())
+                                        );
+                                        return Ok((EXIT_SUCCESS, Some(stats)));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Daemon RPC failed, falling back to local: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let store = open_store(db.as_deref())?;
                 let instance_config = nestweaver_engine::InstanceConfig::from_file(config_path)?;
                 let feature_config = instance_config
                     .features
@@ -4173,12 +4253,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         },
 
-        Commands::Contracts { command } => run_contracts(command),
+        Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
-        Commands::Memory { command } => run_memory(*command, t0),
+        Commands::Memory { command } => run_memory(*command, t0, use_daemon),
         Commands::Ranking { command } => run_ranking(command, t0),
         Commands::Eval { command } => run_eval_cmd(command).map(|c| (c, None)),
         Commands::Embed {
@@ -7509,10 +7589,21 @@ fn now_epoch_secs() -> f64 {
 fn run_memory(
     command: MemoryCommands,
     t0: std::time::Instant,
+    use_daemon: bool,
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         MemoryCommands::Lint { json, db, config } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let args = serde_json::json!({});
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_lint", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
             let store = open_store(Some(&db_path))?;
             let report = nestweaver_engine::memory_lint(&store, now_epoch_secs())?;
             if json {
@@ -7561,6 +7652,16 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let args = serde_json::json!({ "apply": apply });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_consolidate", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
             let store = open_store(Some(&db_path))?;
             let manifest = nestweaver_engine::memory_consolidate(&store, apply, now_epoch_secs())?;
             if json {
@@ -7599,6 +7700,20 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let args = serde_json::json!({
+                    "uid": uid,
+                    "edge_types": edge_types,
+                    "depth": depth,
+                });
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_related", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
             let store = open_store(Some(&db_path))?;
             let related =
                 nestweaver_engine::memory_related(&store, &uid, &edge_types, Some(depth))?;
@@ -11008,9 +11123,23 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
-fn run_contracts(command: ContractCommands) -> anyhow::Result<(i32, Option<String>)> {
+fn run_contracts(command: ContractCommands, use_daemon: bool) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         ContractCommands::List { repo, json, db } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({});
+                if let Some(ref r) = repo {
+                    args["repo"] = serde_json::json!(r);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
             let store = open_store(db.as_deref())?;
             let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
             let mut contracts = store
@@ -11051,6 +11180,20 @@ fn run_contracts(command: ContractCommands) -> anyhow::Result<(i32, Option<Strin
             Ok((EXIT_SUCCESS, None))
         }
         ContractCommands::Drift { repo, json, db } => {
+            // ── daemon guard ──────────────────────────────────────
+            if use_daemon {
+                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let mut args = serde_json::json!({});
+                if let Some(ref r) = repo {
+                    args["repo"] = serde_json::json!(r);
+                }
+                if let Some(value) =
+                    try_daemon_json_rpc(true, &db_path, None, "contract_drift", args)
+                {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((EXIT_SUCCESS, None));
+                }
+            }
             let store = open_store(db.as_deref())?;
             let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
             let report = nestweaver_engine::contracts::drift_for_store(&store, repo_uid.as_deref())
