@@ -1643,12 +1643,8 @@ fn full_index_fallback(
     })
 }
 
-/// Compute a SHA-256 hex digest of a string (used for file content_hash).
 fn sha2_hex(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    hex::encode(h.finalize())
+    crate::hash::blake3_hex(s)
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
