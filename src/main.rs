@@ -20,9 +20,9 @@ use nestweaver_engine::{
     generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
     index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, load_manifest_cache, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, record_last_indexed_at,
+    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
+    suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::Symbol;
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};

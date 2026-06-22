@@ -128,7 +128,9 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
     let checksum_path = if !checksum_path.exists() {
         let legacy = snapshot_dir.join("checksum.sha256");
         if legacy.exists() {
-            tracing::info!("using legacy checksum.sha256 — skipping verification for pre-BLAKE3 snapshot");
+            tracing::info!(
+                "using legacy checksum.sha256 — skipping verification for pre-BLAKE3 snapshot"
+            );
             // Legacy checksums used SHA-256, which won't match BLAKE3 verification.
             // Skip verification; the snapshot will be re-created on the next build.
             return Ok(());

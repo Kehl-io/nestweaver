@@ -803,19 +803,30 @@ impl NestWeaverDaemon for DaemonService {
                             message: "Mining git activity...".to_string(),
                             ..Default::default()
                         }));
-                        let scores = nestweaver_engine::git_activity::compute_git_activity(&repo_path);
+                        let scores =
+                            nestweaver_engine::git_activity::compute_git_activity(&repo_path);
                         if scores.is_empty() {
                             let _ = tx.blocking_send(Ok(IndexProgress {
-                                message: "No usable git history found; git-activity sidecar not written.".to_string(),
+                                message:
+                                    "No usable git history found; git-activity sidecar not written."
+                                        .to_string(),
                                 ..Default::default()
                             }));
                         } else {
-                            let ga_path = nestweaver_engine::sidecar_path(&state.db_path, ".gitactivity.json");
-                            if let Err(e) = nestweaver_engine::git_activity::save_git_activity(&scores, &ga_path) {
+                            let ga_path = nestweaver_engine::sidecar_path(
+                                &state.db_path,
+                                ".gitactivity.json",
+                            );
+                            if let Err(e) = nestweaver_engine::git_activity::save_git_activity(
+                                &scores, &ga_path,
+                            ) {
                                 tracing::warn!("save git activity sidecar failed: {e}");
                             } else {
                                 let _ = tx.blocking_send(Ok(IndexProgress {
-                                    message: format!("Git activity sidecar written ({} files scored).", scores.len()),
+                                    message: format!(
+                                        "Git activity sidecar written ({} files scored).",
+                                        scores.len()
+                                    ),
                                     ..Default::default()
                                 }));
                             }
@@ -828,9 +839,13 @@ impl NestWeaverDaemon for DaemonService {
                         }));
                         match nestweaver_engine::compute_cochanges(&repo_path, 500, 3, 0.30) {
                             Ok(edges) => {
-                                let cochange_path =
-                                    nestweaver_engine::sidecar_path(&state.db_path, ".cochange.json");
-                                if let Err(e) = nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path) {
+                                let cochange_path = nestweaver_engine::sidecar_path(
+                                    &state.db_path,
+                                    ".cochange.json",
+                                );
+                                if let Err(e) =
+                                    nestweaver_engine::save_cochange_sidecar(&edges, &cochange_path)
+                                {
                                     tracing::warn!("failed to save co-change sidecar: {e}");
                                 }
                                 let _ = tx.blocking_send(Ok(IndexProgress {
@@ -2472,91 +2487,85 @@ impl NestWeaverDaemon for DaemonService {
                 let mut succeeded = 0u32;
                 let mut failed = 0u32;
 
-                if do_symbols {
-                    if let Ok(symbols) = store.list_all_symbols() {
-                        let to_embed: Vec<_> = if force {
-                            symbols.iter().collect()
-                        } else {
-                            symbols.iter().filter(|s| s.embedding.is_none()).collect()
-                        };
-                        for chunk in to_embed.chunks(batch_size) {
-                            for sym in chunk {
-                                let text = nestweaver_embed::preprocess::symbol_embed_text(
-                                    &sym.kind.to_string(),
-                                    &sym.name,
-                                    None,
-                                );
-                                match model.embed_query(&text) {
-                                    Ok(emb) => {
-                                        store.add_embedding(&sym.uid, emb);
-                                        succeeded += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
-                                        failed += 1;
-                                    }
+                if do_symbols && let Ok(symbols) = store.list_all_symbols() {
+                    let to_embed: Vec<_> = if force {
+                        symbols.iter().collect()
+                    } else {
+                        symbols.iter().filter(|s| s.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for sym in chunk {
+                            let text = nestweaver_embed::preprocess::symbol_embed_text(
+                                &sym.kind.to_string(),
+                                &sym.name,
+                                None,
+                            );
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&sym.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
+                                    failed += 1;
                                 }
                             }
                         }
                     }
                 }
 
-                if do_notes {
-                    if let Ok(notes) = store.list_notes(None) {
-                        let to_embed: Vec<_> = if force {
-                            notes.iter().collect()
-                        } else {
-                            notes.iter().filter(|n| n.embedding.is_none()).collect()
-                        };
-                        for chunk in to_embed.chunks(batch_size) {
-                            for note in chunk {
-                                let text =
-                                    nestweaver_embed::preprocess::note_embed_text(&note.title, None);
-                                match model.embed_query(&text) {
-                                    Ok(emb) => {
-                                        store.add_embedding(&note.uid, emb);
-                                        succeeded += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(uid = %note.uid, "embedding failed: {e}");
-                                        failed += 1;
-                                    }
+                if do_notes && let Ok(notes) = store.list_notes(None) {
+                    let to_embed: Vec<_> = if force {
+                        notes.iter().collect()
+                    } else {
+                        notes.iter().filter(|n| n.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for note in chunk {
+                            let text =
+                                nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&note.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %note.uid, "embedding failed: {e}");
+                                    failed += 1;
                                 }
                             }
                         }
                     }
                 }
 
-                if do_headings {
-                    if let Ok(headings) = store.list_all_headings() {
-                        let to_embed: Vec<_> = if force {
-                            headings.iter().collect()
-                        } else {
-                            headings.iter().filter(|h| h.embedding.is_none()).collect()
-                        };
-                        for chunk in to_embed.chunks(batch_size) {
-                            for heading in chunk {
-                                let text =
-                                    nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
-                                match model.embed_query(&text) {
-                                    Ok(emb) => {
-                                        store.add_embedding(&heading.uid, emb);
-                                        succeeded += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
-                                        failed += 1;
-                                    }
+                if do_headings && let Ok(headings) = store.list_all_headings() {
+                    let to_embed: Vec<_> = if force {
+                        headings.iter().collect()
+                    } else {
+                        headings.iter().filter(|h| h.embedding.is_none()).collect()
+                    };
+                    for chunk in to_embed.chunks(batch_size) {
+                        for heading in chunk {
+                            let text =
+                                nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                            match model.embed_query(&text) {
+                                Ok(emb) => {
+                                    store.add_embedding(&heading.uid, emb);
+                                    succeeded += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
+                                    failed += 1;
                                 }
                             }
                         }
                     }
                 }
 
-                if succeeded > 0 {
-                    if let Err(e) = store.flush_embedding_index() {
-                        tracing::warn!("failed to flush embedding index: {e}");
-                    }
+                if succeeded > 0
+                    && let Err(e) = store.flush_embedding_index()
+                {
+                    tracing::warn!("failed to flush embedding index: {e}");
                 }
 
                 tracing::info!(succeeded, failed, "embed RPC completed");

@@ -939,7 +939,6 @@ fn reinsert_note(
     Ok((headings.len(), sections.len(), wl_resolved, tags_count))
 }
 
-
 /// Render a `SystemTime` as RFC 3339-ish UTC string. Mirrors index_md.rs.
 fn format_system_time(t: std::time::SystemTime) -> Option<String> {
     let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;

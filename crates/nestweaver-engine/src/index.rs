@@ -300,12 +300,13 @@ pub fn index_directory_with_store(
 
     // Evict stale cache entries for deleted/renamed files before saving.
     {
-        let live_hashes: std::collections::HashSet<String> =
-            new_filemeta.values().map(|m| m.content_hash.clone()).collect();
+        let live_hashes: std::collections::HashSet<String> = new_filemeta
+            .values()
+            .map(|m| m.content_hash.clone())
+            .collect();
         parsed_cache.retain_hashes(&live_hashes);
 
-        let live_files: std::collections::HashSet<String> =
-            new_filemeta.keys().cloned().collect();
+        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
         resolution_deps.retain_files(&live_files);
     }
 
@@ -426,12 +427,11 @@ fn index_into_store(
         .git_global(true)
         .git_exclude(true)
         .filter_entry(|e| {
-            if e.file_type().map_or(false, |ft| ft.is_dir()) {
-                if let Some(name) = e.file_name().to_str() {
-                    if SKIP_DIRS.contains(&name) {
-                        return false;
-                    }
-                }
+            if e.file_type().is_some_and(|ft| ft.is_dir())
+                && let Some(name) = e.file_name().to_str()
+                && SKIP_DIRS.contains(&name)
+            {
+                return false;
             }
             true
         })
@@ -446,7 +446,7 @@ fn index_into_store(
             }
         };
 
-        if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
         }
 
@@ -537,8 +537,7 @@ fn index_into_store(
     use rayon::prelude::*;
 
     // Immutable borrow of the parsed cache for the parallel phase.
-    let pc_ref: Option<&crate::parsed_cache::ParsedCache> =
-        parsed_cache.as_deref();
+    let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
     let outcomes: Vec<ParseOutcome> = file_entries
         .par_iter()
@@ -557,17 +556,16 @@ fn index_into_store(
                         // Check parsed cache: if we have cached symbols for this
                         // file's content hash, return CachedParsed so symbols are
                         // available for resolution while still counting as unchanged.
-                        if let Some(cached_meta) = cache.get(&display_name) {
-                            if let Some(pc) = pc_ref {
-                                if let Some(cached_parse) = pc.get(&cached_meta.content_hash) {
-                                    return ParseOutcome::CachedParsed {
-                                        rel_path: display_name,
-                                        symbols: cached_parse.symbols.clone(),
-                                        references: cached_parse.references.clone(),
-                                        type_bindings: cached_parse.type_bindings.clone(),
-                                    };
-                                }
-                            }
+                        if let Some(cached_meta) = cache.get(&display_name)
+                            && let Some(pc) = pc_ref
+                            && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
+                        {
+                            return ParseOutcome::CachedParsed {
+                                rel_path: display_name,
+                                symbols: cached_parse.symbols.clone(),
+                                references: cached_parse.references.clone(),
+                                type_bindings: cached_parse.type_bindings.clone(),
+                            };
                         }
                         return ParseOutcome::Unchanged {
                             rel_path: display_name,
@@ -679,12 +677,7 @@ fn index_into_store(
                 if !raw_type_bindings.is_empty() {
                     ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
                 }
-                parsed_files_for_resolver.push((
-                    rel_path,
-                    raw_symbols,
-                    raw_references,
-                    None,
-                ));
+                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, None));
             }
             ParseOutcome::Skipped(sf) => {
                 skipped_files.push(sf);
@@ -860,10 +853,7 @@ fn index_into_store(
                 );
             }
         }
-        tracing::debug!(
-            parsed_cache_entries = pc.len(),
-            "parsed cache updated"
-        );
+        tracing::debug!(parsed_cache_entries = pc.len(), "parsed cache updated");
     }
 
     drop(_phase_collect_span);
@@ -1082,16 +1072,12 @@ fn index_into_store(
     // When no files changed and we have prior resolution data, skip resolution
     // entirely — edges from the previous run are still valid in the DB.
     let skip_resolution = actually_changed_files.is_empty()
-        && resolution_deps
-            .as_ref()
-            .map_or(false, |rd| !rd.is_empty());
+        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty());
 
     let resolve_filter = if !skip_resolution
         && !actually_changed_files.is_empty()
         && files_unchanged > 0
-        && resolution_deps
-            .as_ref()
-            .map_or(false, |rd| !rd.is_empty())
+        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty())
     {
         let affected = resolution_deps
             .as_ref()
@@ -1163,13 +1149,12 @@ fn index_into_store(
             if let (Some(src_file), Some(tgt_file)) = (
                 symbol_file_index.get(&edge.source_uid),
                 symbol_file_index.get(&edge.target_uid),
-            ) {
-                if src_file != tgt_file {
-                    file_deps
-                        .entry(src_file.clone())
-                        .or_default()
-                        .insert(tgt_file.clone());
-                }
+            ) && src_file != tgt_file
+            {
+                file_deps
+                    .entry(src_file.clone())
+                    .or_default()
+                    .insert(tgt_file.clone());
             }
         }
         for (file, deps) in file_deps {
@@ -1235,10 +1220,7 @@ fn index_into_store(
     }
 
     resolve_pb.finish_and_clear();
-    tracing::info!(
-        edges_resolved = edges_count,
-        "phase resolve complete"
-    );
+    tracing::info!(edges_resolved = edges_count, "phase resolve complete");
     drop(_phase_resolve_span);
 
     // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
@@ -1853,12 +1835,13 @@ fn full_index_fallback(
 
     // Evict stale cache entries for deleted/renamed files before saving.
     {
-        let live_hashes: std::collections::HashSet<String> =
-            new_filemeta.values().map(|m| m.content_hash.clone()).collect();
+        let live_hashes: std::collections::HashSet<String> = new_filemeta
+            .values()
+            .map(|m| m.content_hash.clone())
+            .collect();
         parsed_cache.retain_hashes(&live_hashes);
 
-        let live_files: std::collections::HashSet<String> =
-            new_filemeta.keys().cloned().collect();
+        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
         resolution_deps.retain_files(&live_files);
     }
 
@@ -2540,16 +2523,8 @@ impl Counter {
         let db = tmp.path().join("test.lbug");
 
         // Cold index — symbols should be parsed.
-        let r1 = index_directory_with_options(
-            &repo,
-            &db,
-            "t",
-            "file:///t",
-            "HEAD",
-            true,
-            None,
-        )
-        .unwrap();
+        let r1 =
+            index_directory_with_options(&repo, &db, "t", "file:///t", "HEAD", true, None).unwrap();
         assert!(
             r1.symbols_count > 0,
             "cold index should find symbols, got {}",
@@ -2564,16 +2539,8 @@ impl Counter {
         );
 
         // Warm index — all files unchanged, symbols loaded from parsed cache.
-        let r2 = index_directory_with_options(
-            &repo,
-            &db,
-            "t",
-            "file:///t",
-            "HEAD",
-            false,
-            None,
-        )
-        .unwrap();
+        let r2 = index_directory_with_options(&repo, &db, "t", "file:///t", "HEAD", false, None)
+            .unwrap();
         assert_eq!(
             r2.symbols_count, r1.symbols_count,
             "warm index should have same symbol count as cold index (from parsed cache)"

@@ -500,8 +500,12 @@ pub fn generate_skill_with_tools(
     // ── Anti-patterns ────────────────────────────────────────────────────
     out.push_str("## What NOT to Do\n\n");
     out.push_str("- **Don't grep or find in indexed repos** — use `brain_search` or `regex_search` instead\n");
-    out.push_str("- **Don't read entire files** — use `read_symbols` for the specific symbol span\n");
-    out.push_str("- **Don't skip the graph** — always query NestWeaver before reading source files\n");
+    out.push_str(
+        "- **Don't read entire files** — use `read_symbols` for the specific symbol span\n",
+    );
+    out.push_str(
+        "- **Don't skip the graph** — always query NestWeaver before reading source files\n",
+    );
     out.push_str("- **Don't use broad seeds** — `brain_context \"auth\"` returns noise; use `brain_context \"AuthService.validate\"` instead\n");
     out.push_str("- **In subagents:** use the CLI (`nestweaver search --json`) not MCP — 40-60% fewer tokens\n\n");
 

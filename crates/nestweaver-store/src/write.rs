@@ -80,9 +80,12 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
         let summary = s.summary.clone().unwrap_or_default();
         let pagerank = s.pagerank_score.unwrap_or(0.0).to_string();
         let is_ep = if s.is_entry_point { "true" } else { "false" };
-        let epk = s.entry_point_kind.map(|k| k.to_string()).unwrap_or_default();
+        let epk = s
+            .entry_point_kind
+            .map(|k| k.to_string())
+            .unwrap_or_default();
         let fh = encode_framework_hint(s);
-        wtr.write_record(&[
+        wtr.write_record([
             &s.uid,
             &s.name,
             &kind,
@@ -112,7 +115,7 @@ fn write_files_csv(files: &[File], path: &Path) -> Result<(), StoreError> {
         .map_err(|e| StoreError::Query(format!("create files csv: {e}")))?;
     let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
     for file in files {
-        wtr.write_record(&[&file.uid, &file.path, &file.repo_uid, &file.content_hash])
+        wtr.write_record([&file.uid, &file.path, &file.repo_uid, &file.content_hash])
             .map_err(|e| StoreError::Query(format!("write file row: {e}")))?;
     }
     wtr.flush()
@@ -127,7 +130,7 @@ fn write_services_csv(services: &[Service], path: &Path) -> Result<(), StoreErro
         .map_err(|e| StoreError::Query(format!("create services csv: {e}")))?;
     let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
     for svc in services {
-        wtr.write_record(&[
+        wtr.write_record([
             &svc.uid,
             &svc.name,
             &svc.repo_uid,
@@ -149,7 +152,7 @@ fn write_contracts_csv(contracts: &[Contract], path: &Path) -> Result<(), StoreE
     let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
     for c in contracts {
         let conf = c.confidence.to_string();
-        wtr.write_record(&[
+        wtr.write_record([
             &c.uid,
             &c.kind,
             c.verb.as_deref().unwrap_or(""),
@@ -172,7 +175,7 @@ fn write_edge_pair_csv(edges: &[(&str, &str)], path: &Path) -> Result<(), StoreE
         .map_err(|e| StoreError::Query(format!("create edge csv: {e}")))?;
     let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
     for (from_pk, to_pk) in edges {
-        wtr.write_record(&[from_pk, to_pk])
+        wtr.write_record([from_pk, to_pk])
             .map_err(|e| StoreError::Query(format!("write edge row: {e}")))?;
     }
     wtr.flush()
@@ -326,8 +329,8 @@ impl GraphStore {
         if symbols.is_empty() {
             return Ok(());
         }
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("symbols.csv");
         write_symbols_csv(symbols, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
@@ -349,8 +352,8 @@ impl GraphStore {
         if files.is_empty() {
             return Ok(());
         }
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("files.csv");
         write_files_csv(files, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
@@ -401,13 +404,15 @@ impl GraphStore {
         if edges.is_empty() {
             return Ok(());
         }
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("file_has_symbol.csv");
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY FILE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"))
-            .map_err(|e| StoreError::Query(format!("COPY FILE_HAS_SYMBOL: {e}")))?;
+        conn.query(&format!(
+            "COPY FILE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"
+        ))
+        .map_err(|e| StoreError::Query(format!("COPY FILE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
 
@@ -474,13 +479,15 @@ impl GraphStore {
         if edges.is_empty() {
             return Ok(());
         }
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("service_has_symbol.csv");
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY SERVICE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"))
-            .map_err(|e| StoreError::Query(format!("COPY SERVICE_HAS_SYMBOL: {e}")))?;
+        conn.query(&format!(
+            "COPY SERVICE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"
+        ))
+        .map_err(|e| StoreError::Query(format!("COPY SERVICE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
 
@@ -620,8 +627,8 @@ impl GraphStore {
 
         // Insert service nodes.
         if !services.is_empty() {
-            let tmp_dir = tempfile::tempdir()
-                .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+            let tmp_dir =
+                tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
             let csv_path = tmp_dir.path().join("services.csv");
             write_services_csv(services, &csv_path)?;
             let csv_str = csv_path.display().to_string().replace('\\', "/");
@@ -1381,8 +1388,8 @@ impl GraphStore {
         if contracts.is_empty() {
             return Ok(());
         }
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let tmp_dir =
+            tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("contracts.csv");
         write_contracts_csv(contracts, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
@@ -2855,9 +2862,7 @@ mod copy_from_tests {
         // Try COPY FROM with HEADER=true first (Kùzu-standard syntax).
         let result_with_header = {
             let conn = store.conn().unwrap();
-            conn.query(&format!(
-                "COPY Symbol FROM '{csv_str}' (HEADER=true)"
-            ))
+            conn.query(&format!("COPY Symbol FROM '{csv_str}' (HEADER=true)"))
         };
 
         let count_after = {
@@ -2986,9 +2991,7 @@ mod copy_from_tests {
                 // Verify the edges landed.
                 let conn = store.conn().unwrap();
                 let rows = conn
-                    .query(
-                        "MATCH (r:Repo)-[:REPO_HAS_FILE]->(f:File) RETURN count(r)",
-                    )
+                    .query("MATCH (r:Repo)-[:REPO_HAS_FILE]->(f:File) RETURN count(r)")
                     .expect("count edges");
                 let edge_count: i64 = rows
                     .filter_map(|row| {

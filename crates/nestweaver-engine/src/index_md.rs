@@ -1315,7 +1315,6 @@ fn index_into_store(
     })
 }
 
-
 // ── Pass-2 support: wikilink resolution ────────────────────────────────────
 
 /// Per-note context accumulated during pass 1 for use in pass 2.

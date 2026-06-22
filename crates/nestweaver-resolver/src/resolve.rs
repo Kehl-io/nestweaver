@@ -116,10 +116,10 @@ pub fn resolve_references_with_context(
             // When resolve_only is set, skip files outside the filter.
             // The symbol index and import graph are still built from ALL files
             // so references from filtered files can find targets anywhere.
-            if let Some(filter) = resolve_only {
-                if !filter.contains(file_path) {
-                    return Vec::new();
-                }
+            if let Some(filter) = resolve_only
+                && !filter.contains(file_path)
+            {
+                return Vec::new();
             }
             let mut local_edges = Vec::new();
             for reference in references {
@@ -177,10 +177,10 @@ pub fn resolve_references_with_context(
 
     // ── Pass 3a: File-level IMPORTS edges ─────────────────────────────
     for (src_file, _specifier, tgt_file) in graph.all_resolved_imports() {
-        if let Some(filter) = resolve_only {
-            if !filter.contains(src_file) {
-                continue;
-            }
+        if let Some(filter) = resolve_only
+            && !filter.contains(src_file)
+        {
+            continue;
         }
         let src_sym = file_symbols.get(src_file).and_then(|syms| syms.first());
         let tgt_sym = file_symbols.get(tgt_file).and_then(|syms| syms.first());
@@ -206,10 +206,10 @@ pub fn resolve_references_with_context(
 
     // ── Pass 3b: Named-import IMPORTS edges (original precision pass) ─
     for (file_path, _symbols, _references) in files {
-        if let Some(filter) = resolve_only {
-            if !filter.contains(file_path) {
-                continue;
-            }
+        if let Some(filter) = resolve_only
+            && !filter.contains(file_path)
+        {
+            continue;
         }
         let imports = graph.imports_of(file_path);
         if imports.is_empty() {

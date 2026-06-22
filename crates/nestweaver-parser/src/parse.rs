@@ -823,8 +823,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     continue;
                 }
 
-                let content_hash = sha256_hex(&node_text);
-                let signature = first_line(&node_text);
+                let content_hash = sha256_hex(node_text);
+                let signature = first_line(node_text);
 
                 let kind_label = match kind {
                     SymbolKind::Function => "function",
@@ -856,7 +856,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     )
                 };
 
-                let visibility = infer_visibility(&name, &node_text, lang);
+                let visibility = infer_visibility(&name, node_text, lang);
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     find_parent_name(&node, source_bytes)
@@ -898,9 +898,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     })
                     .unwrap_or_default();
 
-                let name = name_text
-                    .clone()
-                    .unwrap_or_else(|| strip_quotes(&node_text));
+                let name = name_text.clone().unwrap_or_else(|| strip_quotes(node_text));
 
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
