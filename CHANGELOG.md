@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.3](https://github.com/Kehl-io/nestweaver/compare/v1.1.2...v1.1.3) (2026-06-22)
+
+
+### Bug Fixes
+
+* **daemon:** detect stale daemon via DB mtime and auto-restart on connect ([a01badd](https://github.com/Kehl-io/nestweaver/commit/a01badd1ede54437df109ffe9b524d7cca31f235))
+* **index:** resolve git HEAD SHA instead of hardcoding 'local' ([37a06dd](https://github.com/Kehl-io/nestweaver/commit/37a06dd65ded6bae4aafc4884b4355bfa4861dba))
+* **mcp:** propagate store errors in brain_status instead of returning empty ([b698edb](https://github.com/Kehl-io/nestweaver/commit/b698edb5488e54f79e6309185f04f81b43c6fe76))
+
 ## [1.1.2](https://github.com/Kehl-io/nestweaver/compare/v1.1.1...v1.1.2) (2026-06-22)
 
 
