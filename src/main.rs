@@ -1343,6 +1343,12 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Show hardware and configuration information
+    Info {
+        /// Show hardware acceleration details
+        #[arg(long)]
+        hardware: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7078,6 +7084,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
             }
+        }
+
+        Commands::Info { hardware } => {
+            if hardware {
+                println!(
+                    "Platform:      {} {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                );
+                #[cfg(feature = "embed")]
+                println!(
+                    "Embedding:     available ({})",
+                    nestweaver_embed::hardware_description()
+                );
+                #[cfg(not(feature = "embed"))]
+                println!("Embedding:     not available (built without embed feature)");
+                println!("BLAKE3 SIMD:   automatic runtime detection");
+                println!(
+                    "CPU cores:     {}",
+                    std::thread::available_parallelism().map_or(1, |n| n.get())
+                );
+            } else {
+                println!("NestWeaver v{}", env!("CARGO_PKG_VERSION"));
+                println!("Run with --hardware for acceleration details");
+            }
+            Ok((EXIT_SUCCESS, None))
         }
     }
 }
