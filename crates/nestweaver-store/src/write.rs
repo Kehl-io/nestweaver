@@ -306,7 +306,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("symbols.csv");
         write_symbols_csv(symbols, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY Symbol FROM '{csv_str}'"))
+        conn.query(&format!("COPY Symbol FROM '{csv_str}' (PARALLEL=FALSE)"))
             .map_err(|e| StoreError::Query(format!("COPY Symbol: {e}")))?;
         Ok(())
     }
@@ -329,7 +329,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("files.csv");
         write_files_csv(files, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY File FROM '{csv_str}'"))
+        conn.query(&format!("COPY File FROM '{csv_str}' (PARALLEL=FALSE)"))
             .map_err(|e| StoreError::Query(format!("COPY File: {e}")))?;
         Ok(())
     }
@@ -381,7 +381,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("file_has_symbol.csv");
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY FILE_HAS_SYMBOL FROM '{csv_str}'"))
+        conn.query(&format!("COPY FILE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"))
             .map_err(|e| StoreError::Query(format!("COPY FILE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
@@ -454,7 +454,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("service_has_symbol.csv");
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY SERVICE_HAS_SYMBOL FROM '{csv_str}'"))
+        conn.query(&format!("COPY SERVICE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"))
             .map_err(|e| StoreError::Query(format!("COPY SERVICE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
@@ -600,7 +600,7 @@ impl GraphStore {
             let csv_path = tmp_dir.path().join("services.csv");
             write_services_csv(services, &csv_path)?;
             let csv_str = csv_path.display().to_string().replace('\\', "/");
-            conn.query(&format!("COPY Service FROM '{csv_str}'"))
+            conn.query(&format!("COPY Service FROM '{csv_str}' (PARALLEL=FALSE)"))
                 .map_err(|e| StoreError::Query(format!("COPY Service: {e}")))?;
         }
 
