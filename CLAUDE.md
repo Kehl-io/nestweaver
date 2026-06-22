@@ -12,6 +12,20 @@ cargo fmt --all -- --check                                  # format check
 cargo fmt --all                                             # format in place
 ```
 
+## Daemon Architecture
+
+All CLI commands and MCP tool calls route through a background daemon process
+that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
+invocation and self-terminates after an idle timeout. The client auto-restarts
+the daemon on version mismatch or when it detects the database has been rebuilt
+(DB mtime check).
+
+**Never bypass the daemon in normal use.** The `--no-daemon` flag and
+`NESTWEAVER_NO_DAEMON=1` env var exist only for CI/testing. Bypassing the
+daemon risks WAL corruption from concurrent access. If you see "database
+locked" errors, stop the daemon (`nestweaver daemon stop`) rather than using
+`--no-daemon`.
+
 ## Run
 
 ```sh
