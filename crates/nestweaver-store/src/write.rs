@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use nestweaver_schema::{
     Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
     Tag, Vault,
@@ -59,6 +61,98 @@ fn encode_framework_hint(symbol: &Symbol) -> String {
         Some(h) => format!("{}:{}", h.framework, h.role),
         None => String::new(),
     }
+}
+
+// ── CSV writers for COPY FROM bulk loading ──────────────────────────────────
+
+/// Write Symbol rows to a CSV file (no header row).
+/// Column order: uid, name, kind, repo_uid, file_path, start_line, end_line,
+/// signature, summary, content_hash, pagerank_score, is_entry_point,
+/// entry_point_kind, framework_hint
+fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create symbols csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    for s in symbols {
+        let kind = s.kind.to_string();
+        let start_line = s.start_line.to_string();
+        let end_line = s.end_line.to_string();
+        let summary = s.summary.clone().unwrap_or_default();
+        let pagerank = s.pagerank_score.unwrap_or(0.0).to_string();
+        let is_ep = if s.is_entry_point { "true" } else { "false" }.to_string();
+        let epk = s.entry_point_kind.map(|k| k.to_string()).unwrap_or_default();
+        let fh = encode_framework_hint(s);
+        wtr.write_record(&[
+            &s.uid,
+            &s.name,
+            &kind,
+            &s.repo_uid,
+            &s.file_path,
+            &start_line,
+            &end_line,
+            &s.signature,
+            &summary,
+            &s.content_hash,
+            &pagerank,
+            &is_ep,
+            &epk,
+            &fh,
+        ])
+        .map_err(|e| StoreError::Query(format!("write symbol row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush symbols csv: {e}")))?;
+    Ok(())
+}
+
+/// Write File rows to a CSV file (no header row).
+/// Column order: uid, path, repo_uid, content_hash
+fn write_files_csv(files: &[File], path: &Path) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create files csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    for file in files {
+        wtr.write_record(&[&file.uid, &file.path, &file.repo_uid, &file.content_hash])
+            .map_err(|e| StoreError::Query(format!("write file row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush files csv: {e}")))?;
+    Ok(())
+}
+
+/// Write Service rows to a CSV file (no header row).
+/// Column order: uid, name, repo_uid, summary, summary_hash
+fn write_services_csv(services: &[Service], path: &Path) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create services csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    for svc in services {
+        wtr.write_record(&[
+            &svc.uid,
+            &svc.name,
+            &svc.repo_uid,
+            svc.summary.as_deref().unwrap_or(""),
+            svc.summary_hash.as_deref().unwrap_or(""),
+        ])
+        .map_err(|e| StoreError::Query(format!("write service row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush services csv: {e}")))?;
+    Ok(())
+}
+
+/// Write edge (from_pk, to_pk) pairs to a CSV file (no header row).
+fn write_edge_pair_csv(edges: &[(&str, &str)], path: &Path) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create edge csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    for (from_pk, to_pk) in edges {
+        wtr.write_record(&[from_pk, to_pk])
+            .map_err(|e| StoreError::Query(format!("write edge row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush edge csv: {e}")))?;
+    Ok(())
 }
 
 fn exec_params(
@@ -204,61 +298,16 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         symbols: &[Symbol],
     ) -> Result<(), StoreError> {
-        let mut stmt = conn
-            .prepare(
-                "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
-                 repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
-                 signature: $sig, summary: $summary, content_hash: $hash, \
-                 pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
-                 framework_hint: $fh})",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for symbol in symbols {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("uid", lbug::Value::String(symbol.uid.clone())),
-                    ("name", lbug::Value::String(symbol.name.clone())),
-                    ("kind", lbug::Value::String(symbol.kind.to_string())),
-                    ("repo", lbug::Value::String(symbol.repo_uid.clone())),
-                    ("fp", lbug::Value::String(symbol.file_path.clone())),
-                    ("sl", lbug::Value::Int64(symbol.start_line as i64)),
-                    ("el", lbug::Value::Int64(symbol.end_line as i64)),
-                    ("sig", lbug::Value::String(symbol.signature.clone())),
-                    (
-                        "summary",
-                        lbug::Value::String(symbol.summary.clone().unwrap_or_default()),
-                    ),
-                    ("hash", lbug::Value::String(symbol.content_hash.clone())),
-                    (
-                        "pr",
-                        lbug::Value::Double(symbol.pagerank_score.unwrap_or(0.0)),
-                    ),
-                    (
-                        "iep",
-                        lbug::Value::String(
-                            if symbol.is_entry_point {
-                                "true"
-                            } else {
-                                "false"
-                            }
-                            .to_string(),
-                        ),
-                    ),
-                    (
-                        "epk",
-                        lbug::Value::String(
-                            symbol
-                                .entry_point_kind
-                                .map(|k| k.to_string())
-                                .unwrap_or_default(),
-                        ),
-                    ),
-                    ("fh", lbug::Value::String(encode_framework_hint(symbol))),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        if symbols.is_empty() {
+            return Ok(());
         }
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join("symbols.csv");
+        write_symbols_csv(symbols, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        conn.query(&format!("COPY Symbol FROM '{csv_str}'"))
+            .map_err(|e| StoreError::Query(format!("COPY Symbol: {e}")))?;
         Ok(())
     }
 
@@ -272,23 +321,16 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         files: &[File],
     ) -> Result<(), StoreError> {
-        let mut stmt = conn
-            .prepare(
-                "CREATE (:File {uid: $uid, path: $path, repo_uid: $repo, content_hash: $hash})",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for file in files {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("uid", lbug::Value::String(file.uid.clone())),
-                    ("path", lbug::Value::String(file.path.clone())),
-                    ("repo", lbug::Value::String(file.repo_uid.clone())),
-                    ("hash", lbug::Value::String(file.content_hash.clone())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        if files.is_empty() {
+            return Ok(());
         }
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join("files.csv");
+        write_files_csv(files, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        conn.query(&format!("COPY File FROM '{csv_str}'"))
+            .map_err(|e| StoreError::Query(format!("COPY File: {e}")))?;
         Ok(())
     }
 
@@ -331,22 +373,16 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
-        let mut stmt = conn
-            .prepare(
-                "MATCH (f:File {uid: $file}), (s:Symbol {uid: $sym}) \
-                 CREATE (f)-[:FILE_HAS_SYMBOL]->(s)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (file_uid, symbol_uid) in edges {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("file", lbug::Value::String(file_uid.to_string())),
-                    ("sym", lbug::Value::String(symbol_uid.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        if edges.is_empty() {
+            return Ok(());
         }
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join("file_has_symbol.csv");
+        write_edge_pair_csv(edges, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        conn.query(&format!("COPY FILE_HAS_SYMBOL FROM '{csv_str}'"))
+            .map_err(|e| StoreError::Query(format!("COPY FILE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
 
@@ -410,22 +446,16 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
-        let mut stmt = conn
-            .prepare(
-                "MATCH (svc:Service {uid: $svc}), (sym:Symbol {uid: $sym}) \
-                 CREATE (svc)-[:SERVICE_HAS_SYMBOL]->(sym)",
-            )
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (service_uid, symbol_uid) in edges {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("svc", lbug::Value::String(service_uid.to_string())),
-                    ("sym", lbug::Value::String(symbol_uid.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        if edges.is_empty() {
+            return Ok(());
         }
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join("service_has_symbol.csv");
+        write_edge_pair_csv(edges, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        conn.query(&format!("COPY SERVICE_HAS_SYMBOL FROM '{csv_str}'"))
+            .map_err(|e| StoreError::Query(format!("COPY SERVICE_HAS_SYMBOL: {e}")))?;
         Ok(())
     }
 
@@ -564,32 +594,14 @@ impl GraphStore {
         Self::batch_insert_file_symbol_edges_on(&conn, file_symbol_edges)?;
 
         // Insert service nodes.
-        {
-            let mut stmt = conn
-                .prepare(
-                    "CREATE (:Service {uid: $uid, name: $name, repo_uid: $repo, \
-                     summary: $summary, summary_hash: $shash})",
-                )
-                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-            for svc in services {
-                conn.execute(
-                    &mut stmt,
-                    vec![
-                        ("uid", lbug::Value::String(svc.uid.clone())),
-                        ("name", lbug::Value::String(svc.name.clone())),
-                        ("repo", lbug::Value::String(svc.repo_uid.clone())),
-                        (
-                            "summary",
-                            lbug::Value::String(svc.summary.clone().unwrap_or_default()),
-                        ),
-                        (
-                            "shash",
-                            lbug::Value::String(svc.summary_hash.clone().unwrap_or_default()),
-                        ),
-                    ],
-                )
-                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-            }
+        if !services.is_empty() {
+            let tmp_dir = tempfile::tempdir()
+                .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+            let csv_path = tmp_dir.path().join("services.csv");
+            write_services_csv(services, &csv_path)?;
+            let csv_str = csv_path.display().to_string().replace('\\', "/");
+            conn.query(&format!("COPY Service FROM '{csv_str}'"))
+                .map_err(|e| StoreError::Query(format!("COPY Service: {e}")))?;
         }
 
         // Insert SERVICE_HAS_SYMBOL edges.
