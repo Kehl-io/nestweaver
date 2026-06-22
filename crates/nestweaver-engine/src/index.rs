@@ -263,6 +263,9 @@ pub fn index_directory_with_store(
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let mut new_filemeta = FileMetaCache::new();
 
+    let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
+
     let result = if force {
         index_into_store(
             repo_path,
@@ -272,6 +275,7 @@ pub fn index_directory_with_store(
             indexed_sha,
             None,
             Some(&mut new_filemeta),
+            Some(&mut parsed_cache),
             name,
         )?
     } else {
@@ -284,12 +288,16 @@ pub fn index_directory_with_store(
             indexed_sha,
             Some(&filemeta_cache),
             Some(&mut new_filemeta),
+            Some(&mut parsed_cache),
             name,
         )?
     };
 
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
+    }
+    if let Err(e) = parsed_cache.save(&parsed_cache_path) {
+        tracing::warn!("failed to save parsed cache: {e}");
     }
 
     let manifest = crate::manifest::parse_manifest(repo_path);
@@ -324,6 +332,7 @@ pub fn index_directory_in_memory(
         None,
         None,
         None,
+        None,
     )?;
     Ok((result, store))
 }
@@ -335,6 +344,11 @@ pub fn index_directory_in_memory(
 /// SHA-256 hashing and re-parsing for unchanged files). Entries for all
 /// processed files are written to `new_filemeta` so the caller can
 /// persist the updated sidecar after indexing completes.
+///
+/// When `parsed_cache` is provided, unchanged files whose content hash
+/// matches a cache entry will return their symbols/references from the
+/// cache instead of being skipped. Newly parsed files are inserted into
+/// the cache so callers can persist it after indexing.
 #[allow(clippy::too_many_arguments)]
 fn index_into_store(
     repo_path: &Path,
@@ -344,6 +358,7 @@ fn index_into_store(
     indexed_sha: &str,
     filemeta_cache: Option<&FileMetaCache>,
     mut new_filemeta: Option<&mut FileMetaCache>,
+    mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     let started = Instant::now();
@@ -462,8 +477,10 @@ fn index_into_store(
     let cache = filemeta_cache.unwrap_or(&empty_cache);
 
     // Per-file outcome from the parallel phase. Each entry is either
-    // Unchanged (carry forward cached meta), Skipped (error), or Parsed
-    // (with all data needed for the sequential collection phase).
+    // Unchanged (carry forward cached meta), Skipped (error), Parsed
+    // (freshly parsed), or CachedParsed (symbols loaded from the durable
+    // parsed cache — counts as unchanged for reporting, but symbols are
+    // available for resolution).
     enum ParseOutcome {
         Unchanged {
             rel_path: String,
@@ -482,12 +499,25 @@ fn index_into_store(
             /// TypeScript/NestJS), so framework detection can scan it.
             source: Option<String>,
         },
+        /// Unchanged file whose symbols were loaded from the durable parsed
+        /// cache. Treated as unchanged for filemeta carry-forward and
+        /// reporting, but symbols/references are fed into the resolver.
+        CachedParsed {
+            rel_path: String,
+            symbols: Vec<RawSymbol>,
+            references: Vec<RawReference>,
+            type_bindings: Vec<AstTypeBinding>,
+        },
     }
 
     // Run change detection + parsing in parallel. Each file is independent:
     // stat, read, hash, and tree-sitter parse are all CPU/IO-bound work
     // that benefits from multi-core execution.
     use rayon::prelude::*;
+
+    // Immutable borrow of the parsed cache for the parallel phase.
+    let pc_ref: Option<&crate::parsed_cache::ParsedCache> =
+        parsed_cache.as_deref();
 
     let outcomes: Vec<ParseOutcome> = file_entries
         .par_iter()
@@ -503,6 +533,21 @@ fn index_into_store(
                 match tiered_change_check(path, &display_name, cache) {
                     Ok(ChangeVerdict::Unchanged) => {
                         parse_pb.inc(1);
+                        // Check parsed cache: if we have cached symbols for this
+                        // file's content hash, return CachedParsed so symbols are
+                        // available for resolution while still counting as unchanged.
+                        if let Some(cached_meta) = cache.get(&display_name) {
+                            if let Some(pc) = pc_ref {
+                                if let Some(cached_parse) = pc.get(&cached_meta.content_hash) {
+                                    return ParseOutcome::CachedParsed {
+                                        rel_path: display_name,
+                                        symbols: cached_parse.symbols.clone(),
+                                        references: cached_parse.references.clone(),
+                                        type_bindings: cached_parse.type_bindings.clone(),
+                                    };
+                                }
+                            }
+                        }
                         return ParseOutcome::Unchanged {
                             rel_path: display_name,
                         };
@@ -591,6 +636,32 @@ fn index_into_store(
                     new_cache.insert(rel_path, cached.clone());
                 }
                 files_unchanged += 1;
+            }
+            ParseOutcome::CachedParsed {
+                rel_path,
+                symbols: raw_symbols,
+                references: raw_references,
+                type_bindings: raw_type_bindings,
+            } => {
+                // Carry forward the existing filemeta cache entry (file is unchanged).
+                if let (Some(ref mut new_cache), Some(cached)) =
+                    (new_filemeta.as_deref_mut(), cache.get(&rel_path))
+                {
+                    new_cache.insert(rel_path.clone(), cached.clone());
+                }
+                files_unchanged += 1;
+                // Feed cached symbols/references into the resolver so cross-file
+                // resolution works even when no files changed.
+                symbols_count += raw_symbols.len();
+                if !raw_type_bindings.is_empty() {
+                    ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
+                }
+                parsed_files_for_resolver.push((
+                    rel_path,
+                    raw_symbols,
+                    raw_references,
+                    None,
+                ));
             }
             ParseOutcome::Skipped(sf) => {
                 skipped_files.push(sf);
@@ -736,6 +807,36 @@ fn index_into_store(
         symbols_collected = symbols_count,
         "phase collect complete"
     );
+
+    // Populate the parsed cache with newly parsed files so future warm runs
+    // can retrieve their symbols without re-parsing.
+    if let Some(ref mut pc) = parsed_cache {
+        for (rel_path, raw_symbols, raw_references, _source) in &parsed_files_for_resolver {
+            // Look up the content hash from the new filemeta cache.
+            let content_hash = new_filemeta
+                .as_deref()
+                .and_then(|fm| fm.get(rel_path))
+                .map(|m| m.content_hash.clone());
+            if let Some(hash) = content_hash {
+                pc.insert(
+                    hash,
+                    crate::parsed_cache::CachedParseResult {
+                        symbols: raw_symbols.clone(),
+                        references: raw_references.clone(),
+                        type_bindings: ast_bindings_by_file
+                            .get(rel_path.as_str())
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                );
+            }
+        }
+        tracing::debug!(
+            parsed_cache_entries = pc.len(),
+            "parsed cache updated"
+        );
+    }
+
     drop(_phase_collect_span);
 
     // 2b. When re-indexing over an existing store (tiered detection is active
@@ -1608,6 +1709,9 @@ fn full_index_fallback(
     let filemeta_cache = load_filemeta_cache(&filemeta_path);
     let mut new_filemeta = FileMetaCache::new();
 
+    let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let mut parsed_cache = crate::parsed_cache::ParsedCache::load(&parsed_cache_path);
+
     let result = index_into_store(
         repo_path,
         store,
@@ -1616,12 +1720,16 @@ fn full_index_fallback(
         new_sha,
         Some(&filemeta_cache),
         Some(&mut new_filemeta),
+        Some(&mut parsed_cache),
         name,
     )?;
 
     // Persist the updated filemeta sidecar.
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
+    }
+    if let Err(e) = parsed_cache.save(&parsed_cache_path) {
+        tracing::warn!("failed to save parsed cache: {e}");
     }
 
     // Update the manifest cache sidecar (same as index_directory does).
@@ -2272,6 +2380,62 @@ impl Counter {
             member_of.len() >= 2,
             "expected at least 2 MEMBER_OF edges (new + increment), got {}: {member_of:?}",
             member_of.len()
+        );
+    }
+
+    #[test]
+    fn parsed_cache_avoids_reparse() {
+        // Cold index: parses all files and populates the parsed cache sidecar.
+        // Warm index: files are unchanged, but their symbols should still be
+        // available from the parsed cache (no re-parse needed).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.ts"),
+            "export function hello() { return 1; }\nexport function world() { return 2; }\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        // Cold index — symbols should be parsed.
+        let r1 = index_directory_with_options(
+            &repo,
+            &db,
+            "t",
+            "file:///t",
+            "HEAD",
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            r1.symbols_count > 0,
+            "cold index should find symbols, got {}",
+            r1.symbols_count
+        );
+
+        // Verify the parsed cache sidecar was created.
+        let parsed_cache_path = crate::sidecar_path(&db, ".parsed_cache.bin");
+        assert!(
+            parsed_cache_path.exists(),
+            "parsed cache sidecar should exist after cold index"
+        );
+
+        // Warm index — all files unchanged, symbols loaded from parsed cache.
+        let r2 = index_directory_with_options(
+            &repo,
+            &db,
+            "t",
+            "file:///t",
+            "HEAD",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            r2.symbols_count, r1.symbols_count,
+            "warm index should have same symbol count as cold index (from parsed cache)"
         );
     }
 }
