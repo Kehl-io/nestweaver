@@ -234,7 +234,7 @@ fn cli_snapshot_build_and_verify() {
     assert!(snapshot_dir.join("graph.lbug").exists());
     assert!(snapshot_dir.join("stamp.json").exists());
     assert!(snapshot_dir.join("manifest.json").exists());
-    assert!(snapshot_dir.join("checksum.sha256").exists());
+    assert!(snapshot_dir.join("checksum.blake3").exists());
 
     // Verify integrity via CLI
     nestweaver_cmd()
@@ -246,8 +246,6 @@ fn cli_snapshot_build_and_verify() {
 
 #[test]
 fn cli_snapshot_push_succeeds() {
-    use sha2::Digest;
-
     let dir = tempfile::tempdir().unwrap();
     let snap_dir = dir.path().join("snapshot");
     let storage_dir = dir.path().join("storage");
@@ -274,18 +272,18 @@ fn cli_snapshot_push_succeeds() {
     std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
     std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
 
-    // Compute per-file checksums (sha256sum format)
+    // Compute per-file checksums (blake3 format)
     let checksums = [
         ("graph.lbug", graph_bytes.as_slice()),
         ("manifest.json", manifest_bytes.as_slice()),
         ("stamp.json", stamp_bytes.as_slice()),
     ]
     .iter()
-    .map(|(name, data)| format!("{}  {name}", hex::encode(sha2::Sha256::digest(data))))
+    .map(|(name, data)| format!("{}  {name}", blake3::hash(data).to_hex()))
     .collect::<Vec<_>>()
     .join("\n")
         + "\n";
-    std::fs::write(snap_dir.join("checksum.sha256"), &checksums).unwrap();
+    std::fs::write(snap_dir.join("checksum.blake3"), &checksums).unwrap();
 
     nestweaver_cmd()
         .args([

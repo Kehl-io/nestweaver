@@ -1552,7 +1552,7 @@ mod tests {
     // ── Hash test ──────────────────────────────────────────────────────────
 
     #[test]
-    fn content_hash_is_sha256() {
+    fn content_hash_is_256bit_hex() {
         let source = r#"function hello() { return 42; }"#;
         let parsed = parse_source(Path::new("test.js"), source).unwrap();
         assert!(
@@ -1560,7 +1560,7 @@ mod tests {
             "should parse at least one symbol"
         );
         let hash = &parsed.symbols[0].content_hash;
-        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars; got: {hash}");
+        assert_eq!(hash.len(), 64, "256-bit hex is 64 chars; got: {hash}");
         assert!(
             hash.chars().all(|c| c.is_ascii_hexdigit()),
             "hash should be hex; got: {hash}"

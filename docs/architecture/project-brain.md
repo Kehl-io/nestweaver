@@ -271,7 +271,7 @@ pub struct ParsedNote {
     pub frontmatter: serde_json::Value,
     pub frontmatter_error: Option<String>,
     pub note_kind: String,           // see §3.1
-    pub content_hash: String,        // sha256 of the whole file
+    pub content_hash: String,        // blake3 hash of the whole file (engine change detection)
     pub headings: Vec<RawHeading>,
     pub sections: Vec<RawSection>,   // exactly one section per heading + optional preamble
     pub wikilinks: Vec<RawWikilink>,
@@ -322,7 +322,7 @@ The file watcher delivers events. Pipeline:
 ```
 event (Modify | Create | Remove, path)
    → if Remove: emit (file_path, ParsedNote::Deleted) to delta computer
-   → if Modify | Create: read file → sha256 → if hash unchanged: drop event
+   → if Modify | Create: read file → blake3 → if hash unchanged: drop event
                                      → else: parse → diff against prior ParsedNote
                                                   → emit delta
 ```

@@ -175,7 +175,7 @@ use nestweaver_storage::copy_dir_all;
 ///
 /// 1. Copy core files (graph, manifest, stamp).
 /// 2. Copy sidecars (pagerank, manifests, tantivy) if present.
-/// 3. Compute per-file SHA-256 checksums over everything that was copied.
+/// 3. Compute per-file BLAKE3 checksums over everything that was copied.
 pub fn build_snapshot(
     output_dir: &Path,
     stamp: &Stamp,

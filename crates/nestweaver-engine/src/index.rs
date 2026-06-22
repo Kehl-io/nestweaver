@@ -46,7 +46,7 @@ pub struct IndexResult {
 // Before reading & hashing a file we check:
 //   Tier 1 – mtime unchanged → skip (near-zero cost stat)
 //   Tier 2 – mtime changed but size unchanged → skip (likely identical)
-//   Tier 3 – size differs → read file, compute SHA-256, compare hash
+//   Tier 3 – size differs → read file, compute BLAKE3, compare hash
 
 /// Per-file metadata cached between indexing runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +80,7 @@ enum ChangeVerdict {
     /// File is unchanged — skip re-indexing it.
     Unchanged,
     /// File is new or changed — `source` contains the file content and
-    /// `content_hash` is the freshly-computed SHA-256 hex digest.
+    /// `content_hash` is the freshly-computed BLAKE3 hex digest.
     Changed {
         source: String,
         content_hash: String,
@@ -350,7 +350,7 @@ pub fn index_directory_in_memory(
 ///
 /// When `filemeta_cache` is `Some`, tiered change detection skips files
 /// whose mtime and/or size match the cached values (avoiding expensive
-/// SHA-256 hashing and re-parsing for unchanged files). Entries for all
+/// BLAKE3 hashing and re-parsing for unchanged files). Entries for all
 /// processed files are written to `new_filemeta` so the caller can
 /// persist the updated sidecar after indexing completes.
 ///
