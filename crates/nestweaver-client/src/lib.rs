@@ -40,13 +40,36 @@ impl DaemonClient {
             .into_inner();
 
         let our_version = env!("CARGO_PKG_VERSION");
-        if resp.version != our_version {
+        let needs_restart = if resp.version != our_version {
             warn!(
                 daemon_version = %resp.version,
                 client_version = %our_version,
                 "version mismatch — restarting daemon"
             );
+            true
+        } else if resp.db_opened_at > 0 {
+            // Check if the DB file has been replaced since the daemon opened it.
+            let current_mtime = std::fs::metadata(db_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if current_mtime > resp.db_opened_at {
+                warn!(
+                    daemon_db_mtime = resp.db_opened_at,
+                    current_db_mtime = current_mtime,
+                    "database rebuilt since daemon started — restarting daemon"
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
+        if needs_restart {
             // Stop the old daemon.
             Self::stop_old_daemon(db_path)?;
 
