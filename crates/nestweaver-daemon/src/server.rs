@@ -760,6 +760,22 @@ impl NestWeaverDaemon for DaemonService {
         tokio::task::spawn_blocking(move || {
             let repo_url = format!("file://{}", repo_path.display());
 
+            let indexed_sha = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo_path)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "local".to_string());
+
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning {}", repo_path.display()),
@@ -774,7 +790,7 @@ impl NestWeaverDaemon for DaemonService {
                 &state.db_path,
                 &state.instance_id,
                 &repo_url,
-                "local",
+                &indexed_sha,
                 force,
                 name.as_deref(),
             ) {
