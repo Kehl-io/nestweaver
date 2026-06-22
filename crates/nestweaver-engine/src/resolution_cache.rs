@@ -61,6 +61,11 @@ impl ResolutionDeps {
     pub fn is_empty(&self) -> bool {
         self.deps.is_empty()
     }
+
+    /// Evict entries for files that no longer exist in the repo.
+    pub fn retain_files(&mut self, live_files: &std::collections::HashSet<String>) {
+        self.deps.retain(|file, _| live_files.contains(file));
+    }
 }
 
 #[cfg(test)]

@@ -73,6 +73,12 @@ impl ParsedCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Evict entries whose content hash is not in `live_hashes`
+    /// (i.e. files that were deleted or renamed since the last run).
+    pub fn retain_hashes(&mut self, live_hashes: &std::collections::HashSet<String>) {
+        self.entries.retain(|hash, _| live_hashes.contains(hash));
+    }
 }
 
 #[cfg(test)]

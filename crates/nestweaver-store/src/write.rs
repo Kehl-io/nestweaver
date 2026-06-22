@@ -1369,12 +1369,11 @@ impl GraphStore {
     /// starts clean without per-contract DELETE round-trips.
     pub fn clear_repo_contracts(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let safe = repo_uid.replace('\'', "''");
-        conn.query(&format!(
-            "MATCH (c:Contract) WHERE c.repo_uid = '{safe}' DETACH DELETE c"
-        ))
-        .map_err(|e| StoreError::Query(format!("clear contracts: {e}")))?;
-        Ok(())
+        exec_params(
+            &conn,
+            "MATCH (c:Contract) WHERE c.repo_uid = $repo DETACH DELETE c",
+            vec![("repo", lbug::Value::String(repo_uid.to_string()))],
+        )
     }
 
     /// Bulk-insert Contract nodes via COPY FROM CSV (one connection, one query).
@@ -1948,8 +1947,6 @@ impl GraphStore {
         file_path: &str,
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let safe_repo = repo_uid.replace('\'', "\\'");
-        let safe_path = file_path.replace('\'', "\\'");
 
         // LadybugDB does not support `type(e) IN [...]`, so we issue one
         // DELETE per relationship type. Each query is cheap because the
@@ -1964,11 +1961,22 @@ impl GraphStore {
             "ACCESSES",
             "MEMBER_OF",
         ] {
-            conn.query(&format!(
+            // The rel type must be interpolated (LadybugDB doesn't support
+            // parameterized relationship types), but the WHERE values are
+            // parameterized to avoid injection.
+            let query = format!(
                 "MATCH (s:Symbol)-[r:{rel}]->() \
-                 WHERE s.repo_uid = '{safe_repo}' AND s.file_path = '{safe_path}' \
+                 WHERE s.repo_uid = $repo AND s.file_path = $path \
                  DELETE r"
-            ))
+            );
+            exec_params(
+                &conn,
+                &query,
+                vec![
+                    ("repo", lbug::Value::String(repo_uid.to_string())),
+                    ("path", lbug::Value::String(file_path.to_string())),
+                ],
+            )
             .map_err(|e| StoreError::Query(format!("delete {rel} edges for file: {e}")))?;
         }
         Ok(())

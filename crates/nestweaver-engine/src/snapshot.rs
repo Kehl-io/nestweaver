@@ -123,8 +123,23 @@ fn collect_files_recursive(
 /// format (multiple `<hash>  <filename>` lines) and the legacy single-hash
 /// format for backwards compatibility.
 fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
-    let stored = std::fs::read_to_string(snapshot_dir.join(CHECKSUM_FILE))
-        .map_err(|e| anyhow::anyhow!("failed to read checksum.blake3: {e}"))?;
+    let checksum_path = snapshot_dir.join(CHECKSUM_FILE);
+    // Fallback for pre-BLAKE3 snapshots that used checksum.sha256
+    let checksum_path = if !checksum_path.exists() {
+        let legacy = snapshot_dir.join("checksum.sha256");
+        if legacy.exists() {
+            tracing::info!("using legacy checksum.sha256 — skipping verification for pre-BLAKE3 snapshot");
+            // Legacy checksums used SHA-256, which won't match BLAKE3 verification.
+            // Skip verification; the snapshot will be re-created on the next build.
+            return Ok(());
+        } else {
+            checksum_path
+        }
+    } else {
+        checksum_path
+    };
+    let stored = std::fs::read_to_string(&checksum_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", checksum_path.display()))?;
     let stored = stored.trim();
 
     if stored.contains("  ") {

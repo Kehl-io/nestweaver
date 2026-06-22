@@ -121,7 +121,7 @@ fn tiered_change_check(
         // Tier 3: mtime differs → read file, compute hash, compare.
         let source = std::fs::read_to_string(abs_path)
             .with_context(|| format!("read {}", abs_path.display()))?;
-        let content_hash = sha2_hex(&source);
+        let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
             // Content identical despite mtime/size change — unchanged for the
             // graph. No need to re-parse. (The caller will carry forward the
@@ -141,7 +141,7 @@ fn tiered_change_check(
         // No cache entry → file is new, read and hash it.
         let source = std::fs::read_to_string(abs_path)
             .with_context(|| format!("read {}", abs_path.display()))?;
-        let content_hash = sha2_hex(&source);
+        let content_hash = content_hash_hex(&source);
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
                 mtime_secs,
@@ -297,6 +297,17 @@ pub fn index_directory_with_store(
             name,
         )?
     };
+
+    // Evict stale cache entries for deleted/renamed files before saving.
+    {
+        let live_hashes: std::collections::HashSet<String> =
+            new_filemeta.values().map(|m| m.content_hash.clone()).collect();
+        parsed_cache.retain_hashes(&live_hashes);
+
+        let live_files: std::collections::HashSet<String> =
+            new_filemeta.keys().cloned().collect();
+        resolution_deps.retain_files(&live_files);
+    }
 
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
@@ -1064,7 +1075,15 @@ fn index_into_store(
 
     // Compute the incremental resolution filter: only re-resolve files that
     // changed plus files that depend on changed files.
-    let resolve_filter = if !actually_changed_files.is_empty()
+    // When no files changed and we have prior resolution data, skip resolution
+    // entirely — edges from the previous run are still valid in the DB.
+    let skip_resolution = actually_changed_files.is_empty()
+        && resolution_deps
+            .as_ref()
+            .map_or(false, |rd| !rd.is_empty());
+
+    let resolve_filter = if !skip_resolution
+        && !actually_changed_files.is_empty()
         && files_unchanged > 0
         && resolution_deps
             .as_ref()
@@ -1085,14 +1104,22 @@ fn index_into_store(
         None
     };
 
-    let resolved_edges = resolve_references_with_context(
-        &resolver_view,
-        language,
-        &r_uid,
-        &workspace_ctx,
-        Some(&type_envs),
-        resolve_filter.as_ref(),
-    );
+    if skip_resolution {
+        tracing::info!("no files changed, skipping resolution");
+    }
+
+    let resolved_edges = if skip_resolution {
+        Vec::new()
+    } else {
+        resolve_references_with_context(
+            &resolver_view,
+            language,
+            &r_uid,
+            &workspace_ctx,
+            Some(&type_envs),
+            resolve_filter.as_ref(),
+        )
+    };
 
     // Filter out unresolved edges whose target doesn't exist in the DB.
     let insertable_edges: Vec<_> = resolved_edges
@@ -1115,21 +1142,29 @@ fn index_into_store(
 
     // Record file-level dependency information for future incremental runs.
     if let Some(ref mut rd) = resolution_deps {
-        let symbol_file_index: HashMap<&str, &str> = all_symbols
+        // Build symbol UID → file path map from ALL files (including cached)
+        // so incremental runs don't lose edges from CachedParsed files.
+        let symbol_file_index: HashMap<String, String> = parsed_files_for_resolver
             .iter()
-            .map(|s| (s.uid.as_str(), s.file_path.as_str()))
+            .flat_map(|(path, syms, _, _)| {
+                let r_uid_ref = &r_uid;
+                syms.iter().map(move |s| {
+                    let uid = symbol_uid(r_uid_ref, path, &s.name, s.start_line);
+                    (uid, path.clone())
+                })
+            })
             .collect();
         let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
         for edge in &insertable_edges {
-            if let (Some(&src_file), Some(&tgt_file)) = (
-                symbol_file_index.get(edge.source_uid.as_str()),
-                symbol_file_index.get(edge.target_uid.as_str()),
+            if let (Some(src_file), Some(tgt_file)) = (
+                symbol_file_index.get(&edge.source_uid),
+                symbol_file_index.get(&edge.target_uid),
             ) {
                 if src_file != tgt_file {
                     file_deps
-                        .entry(src_file.to_string())
+                        .entry(src_file.clone())
                         .or_default()
-                        .insert(tgt_file.to_string());
+                        .insert(tgt_file.clone());
                 }
             }
         }
@@ -1153,11 +1188,15 @@ fn index_into_store(
             nestweaver_schema::SymbolKind::Trait,
         ];
 
-        // (file_path, type_name) → uid
+        // (file_path, type_name) → uid — built from ALL files (including cached)
+        // so incremental runs don't lose MEMBER_OF edges for CachedParsed files.
         let mut container_map: HashMap<(String, String), String> = HashMap::new();
-        for sym in &all_symbols {
-            if container_kinds.contains(&sym.kind) {
-                container_map.insert((sym.file_path.clone(), sym.name.clone()), sym.uid.clone());
+        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
+            for raw_sym in raw_symbols {
+                if container_kinds.contains(&raw_sym.kind) {
+                    let uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
+                }
             }
         }
 
@@ -1645,7 +1684,7 @@ fn process_added_or_modified_file(
         }
     };
 
-    let content_hash = sha2_hex(&source);
+    let content_hash = content_hash_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
 
     // Insert the File node.
@@ -1808,6 +1847,17 @@ fn full_index_fallback(
         name,
     )?;
 
+    // Evict stale cache entries for deleted/renamed files before saving.
+    {
+        let live_hashes: std::collections::HashSet<String> =
+            new_filemeta.values().map(|m| m.content_hash.clone()).collect();
+        parsed_cache.retain_hashes(&live_hashes);
+
+        let live_files: std::collections::HashSet<String> =
+            new_filemeta.keys().cloned().collect();
+        resolution_deps.retain_files(&live_files);
+    }
+
     // Persist the updated filemeta sidecar.
     if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
         tracing::warn!("failed to save filemeta cache: {e}");
@@ -1840,7 +1890,7 @@ fn full_index_fallback(
     })
 }
 
-fn sha2_hex(s: &str) -> String {
+fn content_hash_hex(s: &str) -> String {
     crate::hash::blake3_hex(s)
 }
 
@@ -2268,7 +2318,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs,
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex(content),
+                content_hash: content_hash_hex(content),
             },
         );
 
@@ -2295,7 +2345,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1, // different from actual mtime
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex(content),
+                content_hash: content_hash_hex(content),
             },
         );
 
@@ -2311,7 +2361,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1,
                 size_bytes: fs_meta.len(),
-                content_hash: sha2_hex("different content!"),
+                content_hash: content_hash_hex("different content!"),
             },
         );
 
@@ -2337,7 +2387,7 @@ function hello(name) { return "Hello " + name; }
             CachedFileMeta {
                 mtime_secs: 1,
                 size_bytes: 5, // clearly different from actual file
-                content_hash: sha2_hex("old content"),
+                content_hash: content_hash_hex("old content"),
             },
         );
 
@@ -2348,7 +2398,7 @@ function hello(name) { return "Hello " + name; }
                 ..
             } => {
                 assert!(source.contains("return 42"));
-                assert_eq!(content_hash, sha2_hex(new_content));
+                assert_eq!(content_hash, content_hash_hex(new_content));
             }
             ChangeVerdict::Unchanged => panic!("expected Changed for different-size file"),
         }
