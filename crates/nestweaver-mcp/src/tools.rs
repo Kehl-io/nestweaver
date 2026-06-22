@@ -2577,13 +2577,17 @@ fn tool_brain_status(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
 ) -> Result<Value, anyhow::Error> {
-    let vaults = store.list_vaults(None).unwrap_or_default();
+    let vaults = store
+        .list_vaults(None)
+        .map_err(|e| anyhow::anyhow!("brain_status: failed to list vaults: {e}"))?;
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow::anyhow!("brain_status: failed to list repos: {e}"))?;
     let notes = store.count_notes().unwrap_or(0);
     let headings = store.count_headings().unwrap_or(0);
     let sections = store.count_sections().unwrap_or(0);
     let tags = store.count_tags().unwrap_or(0);
     let wikilinks = store.count_wikilink_edges().unwrap_or(0);
-    let repos = store.list_repos(None).unwrap_or_default();
 
     let db_path = match current_db_path(store) {
         Ok(p) => Some(p),
