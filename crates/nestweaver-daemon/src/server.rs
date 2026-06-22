@@ -2396,16 +2396,11 @@ impl NestWeaverDaemon for DaemonService {
             let mut failed = 0u32;
 
             // ── Symbols ─────────────────────────────────────────────
-            if do_symbols
-                && let Ok(symbols) = store.list_all_symbols()
-            {
+            if do_symbols && let Ok(symbols) = store.list_all_symbols() {
                 let to_embed: Vec<_> = if force {
                     symbols.iter().collect()
                 } else {
-                    symbols
-                        .iter()
-                        .filter(|s| s.embedding.is_none())
-                        .collect()
+                    symbols.iter().filter(|s| s.embedding.is_none()).collect()
                 };
 
                 for chunk in to_embed.chunks(batch_size) {
@@ -2430,22 +2425,16 @@ impl NestWeaverDaemon for DaemonService {
             }
 
             // ── Notes ───────────────────────────────────────────────
-            if do_notes
-                && let Ok(notes) = store.list_notes(None)
-            {
+            if do_notes && let Ok(notes) = store.list_notes(None) {
                 let to_embed: Vec<_> = if force {
                     notes.iter().collect()
                 } else {
-                    notes
-                        .iter()
-                        .filter(|n| n.embedding.is_none())
-                        .collect()
+                    notes.iter().filter(|n| n.embedding.is_none()).collect()
                 };
 
                 for chunk in to_embed.chunks(batch_size) {
                     for note in chunk {
-                        let text =
-                            nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                        let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                         match model.embed_query(&text) {
                             Ok(emb) => {
                                 store.add_embedding(&note.uid, emb);
@@ -2461,24 +2450,17 @@ impl NestWeaverDaemon for DaemonService {
             }
 
             // ── Headings ────────────────────────────────────────────
-            if do_headings
-                && let Ok(headings) = store.list_all_headings()
-            {
+            if do_headings && let Ok(headings) = store.list_all_headings() {
                 let to_embed: Vec<_> = if force {
                     headings.iter().collect()
                 } else {
-                    headings
-                        .iter()
-                        .filter(|h| h.embedding.is_none())
-                        .collect()
+                    headings.iter().filter(|h| h.embedding.is_none()).collect()
                 };
 
                 for chunk in to_embed.chunks(batch_size) {
                     for heading in chunk {
-                        let text = nestweaver_embed::preprocess::heading_embed_text(
-                            "",
-                            &heading.text,
-                        );
+                        let text =
+                            nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                         match model.embed_query(&text) {
                             Ok(emb) => {
                                 store.add_embedding(&heading.uid, emb);

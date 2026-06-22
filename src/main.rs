@@ -7597,9 +7597,13 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({});
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_lint", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_memory_lint",
+                    args,
+                ) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -7655,9 +7659,13 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "apply": apply });
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_consolidate", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_memory_consolidate",
+                    args,
+                ) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -7707,9 +7715,13 @@ fn run_memory(
                     "edge_types": edge_types,
                     "depth": depth,
                 });
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_memory_related", args)
-                {
+                if let Some(value) = try_daemon_json_rpc(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_memory_related",
+                    args,
+                ) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -10748,9 +10760,7 @@ fn run_embed(
                         };
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Daemon embed failed ({e:#}), falling back to direct DB path…"
-                        );
+                        eprintln!("Daemon embed failed ({e:#}), falling back to direct DB path…");
                     }
                 }
             }
@@ -11134,7 +11144,10 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
-fn run_contracts(command: ContractCommands, use_daemon: bool) -> anyhow::Result<(i32, Option<String>)> {
+fn run_contracts(
+    command: ContractCommands,
+    use_daemon: bool,
+) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         ContractCommands::List { repo, json, db } => {
             // ── daemon guard ──────────────────────────────────────
