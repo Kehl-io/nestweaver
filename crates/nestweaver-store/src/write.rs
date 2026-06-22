@@ -79,7 +79,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
         let end_line = s.end_line.to_string();
         let summary = s.summary.clone().unwrap_or_default();
         let pagerank = s.pagerank_score.unwrap_or(0.0).to_string();
-        let is_ep = if s.is_entry_point { "true" } else { "false" }.to_string();
+        let is_ep = if s.is_entry_point { "true" } else { "false" };
         let epk = s.entry_point_kind.map(|k| k.to_string()).unwrap_or_default();
         let fh = encode_framework_hint(s);
         wtr.write_record(&[
@@ -94,7 +94,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             &summary,
             &s.content_hash,
             &pagerank,
-            &is_ep,
+            is_ep,
             &epk,
             &fh,
         ])
@@ -2860,8 +2860,6 @@ mod copy_from_tests {
             ))
         };
 
-        println!("COPY Symbol FROM ... (HEADER=true) result: {:?}", result_with_header);
-
         let count_after = {
             let conn = store.conn().unwrap();
             let rows = conn
@@ -2877,10 +2875,8 @@ mod copy_from_tests {
             .unwrap_or(0)
         };
 
-        println!("Symbol count after COPY FROM (HEADER=true): {count_after}");
-
         if result_with_header.is_ok() && count_after == 100 {
-            println!("PASS: COPY FROM CSV with HEADER=true inserted 100 symbols correctly.");
+            // success
         } else {
             // Try without HEADER option — lbug may treat the first row as data.
             // First clear any partial inserts.
@@ -2909,8 +2905,6 @@ mod copy_from_tests {
                 conn.query(&format!("COPY Symbol FROM '{csv_no_hdr_str}'"))
             };
 
-            println!("COPY Symbol FROM ... (no HEADER option) result: {:?}", result_no_header);
-
             let count_no_hdr = {
                 let conn = store.conn().unwrap();
                 let rows = conn
@@ -2926,10 +2920,8 @@ mod copy_from_tests {
                 .unwrap_or(0)
             };
 
-            println!("Symbol count after COPY FROM (no header): {count_no_hdr}");
-
             if result_no_header.is_ok() && count_no_hdr == 100 {
-                println!("PASS: COPY FROM CSV without HEADER option inserted 100 symbols.");
+                // success
             } else {
                 panic!(
                     "FAIL: COPY FROM CSV did not insert 100 symbols. \
@@ -2989,8 +2981,6 @@ mod copy_from_tests {
             conn.query(&format!("COPY REPO_HAS_FILE FROM '{csv_str}'"))
         };
 
-        println!("COPY REPO_HAS_FILE FROM CSV result: {:?}", result);
-
         match result {
             Ok(_) => {
                 // Verify the edges landed.
@@ -3010,12 +3000,10 @@ mod copy_from_tests {
                     .next()
                     .unwrap_or(0);
 
-                println!("REPO_HAS_FILE edge count after COPY FROM: {edge_count}");
                 assert_eq!(
                     edge_count, 10,
                     "expected 10 REPO_HAS_FILE edges after COPY FROM CSV"
                 );
-                println!("PASS: COPY FROM CSV for REL table works in lbug 0.16.");
             }
             Err(e) => {
                 // Document the failure — do not panic. The optimization path

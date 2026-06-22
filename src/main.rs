@@ -4929,6 +4929,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let wiki_stop = stop.clone();
                 let wiki_instance = instance_id.clone();
                 std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("wiki refresh: failed to create runtime: {e}");
+                            return;
+                        }
+                    };
                     let interval = std::time::Duration::from_secs(hours * 3600);
                     loop {
                         let deadline = std::time::Instant::now() + interval;
@@ -4942,13 +4949,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             return;
                         }
                         tracing::info!("periodic wiki refresh triggered");
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::warn!("wiki refresh: failed to create runtime: {e}");
-                                continue;
-                            }
-                        };
                         match rt.block_on(async {
                             let mut client = nestweaver_client::DaemonClient::connect(
                                 &wiki_db,
@@ -8773,6 +8773,13 @@ fn run_brain(
                 let wiki_stop = stop.clone();
                 let wiki_instance = wiki_instance_id;
                 std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("wiki refresh: failed to create runtime: {e}");
+                            return;
+                        }
+                    };
                     let interval = std::time::Duration::from_secs(hours * 3600);
                     loop {
                         // Sleep in small increments so we notice shutdown quickly.
@@ -8787,13 +8794,6 @@ fn run_brain(
                             return;
                         }
                         tracing::info!("periodic wiki refresh triggered");
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::warn!("wiki refresh: failed to create runtime: {e}");
-                                continue;
-                            }
-                        };
                         match rt.block_on(async {
                             let mut client = nestweaver_client::DaemonClient::connect(
                                 &wiki_db,

@@ -423,7 +423,7 @@ fn index_into_store(
         .follow_links(false)
         .hidden(false)
         .git_ignore(true)
-        .git_global(false)
+        .git_global(true)
         .git_exclude(true)
         .filter_entry(|e| {
             if e.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -837,6 +837,10 @@ fn index_into_store(
     // can retrieve their symbols without re-parsing.
     if let Some(ref mut pc) = parsed_cache {
         for (rel_path, raw_symbols, raw_references, _source) in &parsed_files_for_resolver {
+            // Only insert newly-parsed files, not ones loaded from cache.
+            if !actually_changed_files.contains(rel_path.as_str()) {
+                continue;
+            }
             // Look up the content hash from the new filemeta cache.
             let content_hash = new_filemeta
                 .as_deref()

@@ -1,3 +1,9 @@
+//! Hashing utilities for the engine crate.
+//!
+//! The engine uses BLAKE3 for file-level content hashing (change detection,
+//! filemeta sidecar). The parser crate uses SHA-256 separately for symbol-level
+//! content hashing — these are independent and not compared across levels.
+
 /// Shared BLAKE3 hashing utilities for content change detection.
 ///
 /// BLAKE3 is used throughout the engine for content hashing (not security).
