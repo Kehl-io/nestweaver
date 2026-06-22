@@ -63,6 +63,7 @@ tempfile = "3"
 rayon = "1"
 dirs = "6"
 rmp-serde = "1"
+bumpalo = "3"
 
 [package]
 name = "nestweaver"
