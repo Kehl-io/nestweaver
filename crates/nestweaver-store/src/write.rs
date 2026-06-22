@@ -141,6 +141,31 @@ fn write_services_csv(services: &[Service], path: &Path) -> Result<(), StoreErro
     Ok(())
 }
 
+/// Write Contract rows to a CSV file (no header row).
+/// Column order: uid, kind, verb, path, operation_id, repo_uid, source_path, confidence
+fn write_contracts_csv(contracts: &[Contract], path: &Path) -> Result<(), StoreError> {
+    let f = std::fs::File::create(path)
+        .map_err(|e| StoreError::Query(format!("create contracts csv: {e}")))?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(f);
+    for c in contracts {
+        let conf = c.confidence.to_string();
+        wtr.write_record(&[
+            &c.uid,
+            &c.kind,
+            c.verb.as_deref().unwrap_or(""),
+            c.path.as_deref().unwrap_or(""),
+            c.operation_id.as_deref().unwrap_or(""),
+            &c.repo_uid,
+            &c.source_path,
+            &conf,
+        ])
+        .map_err(|e| StoreError::Query(format!("write contract row: {e}")))?;
+    }
+    wtr.flush()
+        .map_err(|e| StoreError::Query(format!("flush contracts csv: {e}")))?;
+    Ok(())
+}
+
 /// Write edge (from_pk, to_pk) pairs to a CSV file (no header row).
 fn write_edge_pair_csv(edges: &[(&str, &str)], path: &Path) -> Result<(), StoreError> {
     let f = std::fs::File::create(path)
@@ -1338,6 +1363,34 @@ impl GraphStore {
                 ("conf", lbug::Value::Float(contract.confidence)),
             ],
         )
+    }
+
+    /// Delete all Contract nodes for a given repo in one query, so re-indexing
+    /// starts clean without per-contract DELETE round-trips.
+    pub fn clear_repo_contracts(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let safe = repo_uid.replace('\'', "''");
+        conn.query(&format!(
+            "MATCH (c:Contract) WHERE c.repo_uid = '{safe}' DETACH DELETE c"
+        ))
+        .map_err(|e| StoreError::Query(format!("clear contracts: {e}")))?;
+        Ok(())
+    }
+
+    /// Bulk-insert Contract nodes via COPY FROM CSV (one connection, one query).
+    pub fn batch_insert_contracts(&self, contracts: &[Contract]) -> Result<(), StoreError> {
+        if contracts.is_empty() {
+            return Ok(());
+        }
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
+        let csv_path = tmp_dir.path().join("contracts.csv");
+        write_contracts_csv(contracts, &csv_path)?;
+        let csv_str = csv_path.display().to_string().replace('\\', "/");
+        let conn = self.conn()?;
+        conn.query(&format!("COPY Contract FROM '{csv_str}' (PARALLEL=FALSE)"))
+            .map_err(|e| StoreError::Query(format!("COPY Contract: {e}")))?;
+        Ok(())
     }
 
     pub fn batch_insert_wikilink_to_note_edges(

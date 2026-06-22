@@ -1283,7 +1283,11 @@ fn derive_contracts(
     use nestweaver_schema::{EdgeType, ResolvedEdge};
     use std::collections::HashSet;
 
+    // Bulk delete existing contracts for this repo in one query.
+    store.clear_repo_contracts(r_uid)?;
+
     // 1. Declared contracts from specs.
+    let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
     let mut declared_uids: HashSet<String> = HashSet::new();
     for spec_path in spec_files {
         let rel = spec_path
@@ -1301,7 +1305,7 @@ fn derive_contracts(
         for sc in crate::contracts::parse_spec_file(&rel, &source) {
             let contract = sc.into_contract(r_uid, &rel, 1.0);
             declared_uids.insert(contract.uid.clone());
-            store.insert_contract(&contract)?;
+            all_contracts.push(contract);
         }
     }
 
@@ -1325,7 +1329,7 @@ fn derive_contracts(
                     .contract
                     .clone()
                     .into_contract(r_uid, &hf.rel_path, m.confidence);
-                store.insert_contract(&contract)?;
+                all_contracts.push(contract);
             }
             if let Some((sym_uid, _)) = hf.symbols.get(m.symbol_index) {
                 edges.push(ResolvedEdge {
@@ -1339,6 +1343,10 @@ fn derive_contracts(
             }
         }
     }
+
+    // Batch insert all contracts at once via COPY FROM CSV.
+    store.batch_insert_contracts(&all_contracts)?;
+
     if !edges.is_empty() {
         store.batch_insert_edges(&edges)?;
     }
