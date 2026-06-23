@@ -26,6 +26,26 @@ daemon risks WAL corruption from concurrent access. If you see "database
 locked" errors, stop the daemon (`nestweaver daemon stop`) rather than using
 `--no-daemon`.
 
+## macOS App (preferred on Mac)
+
+On macOS, prefer the native `.app` bundle over the CLI daemon. It provides:
+- Menubar status icon for quick access to the web UI
+- Metal GPU acceleration (GUI session context required for MTLCompilerService)
+- Automatic daemon lifecycle with crash recovery
+- Daemon coexistence — detects running daemons and connects instead of duplicating
+
+```sh
+# Build and launch
+cd app && bash build.sh
+open target/release/NestWeaver.app
+
+# Or download NestWeaver.app from GitHub Releases
+```
+
+The web UI runs on port 9377 (not 3000). The app is menubar-only (no Dock icon).
+
+When helping users install on macOS, recommend the `.app` bundle first. Fall back to `nestweaver daemon start` only for headless/CI environments.
+
 ## Run
 
 ```sh
