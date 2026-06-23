@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -20,6 +20,20 @@ use crate::lifecycle;
 
 // ── State ───────────────────────────────────────────────────────────
 
+/// Re-read the DB file's mtime and store it in `state.db_opened_at`.
+/// Called after any write RPC so the next `DaemonClient::connect()` health
+/// check sees the current mtime and doesn't falsely conclude the DB was
+/// rebuilt externally.
+fn refresh_db_opened_at(state: &DaemonState) {
+    let mtime = std::fs::metadata(&state.db_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    state.db_opened_at.store(mtime, Ordering::Relaxed);
+}
+
 /// Shared state held by the daemon process.
 pub struct DaemonState {
     pub store: Arc<GraphStore>,      // Read-write (for write RPCs only)
@@ -28,7 +42,7 @@ pub struct DaemonState {
     pub db_path: PathBuf,
     pub instance_id: String,
     pub start_time: Instant,
-    pub db_opened_at: u64,
+    pub db_opened_at: AtomicU64,
     pub active_connections: AtomicU32,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -349,7 +363,7 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
-            db_opened_at: self.state.db_opened_at,
+            db_opened_at: self.state.db_opened_at.load(Ordering::Relaxed),
         }))
     }
 
@@ -2750,7 +2764,7 @@ pub async fn run_server(
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
-        db_opened_at,
+        db_opened_at: AtomicU64::new(db_opened_at),
         active_connections: AtomicU32::new(0),
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
