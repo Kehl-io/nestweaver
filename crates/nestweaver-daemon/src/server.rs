@@ -30,7 +30,10 @@ fn refresh_db_opened_at(state: &DaemonState) {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            tracing::warn!(path = %state.db_path.display(), "failed to stat DB — stale-detection disabled until next write");
+            0
+        });
     state.db_opened_at.store(mtime, Ordering::Relaxed);
 }
 
