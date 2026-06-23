@@ -248,11 +248,11 @@ done
 # ---------------------------------------------------------------------------
 info "Measuring token savings…"
 "$BENCH_PYTHON" "$SCRIPT_DIR/token_savings.py" \
-    --results-dir "$RESULTS_DIR" \
     --queries "$QUERIES" \
     --index-dir "$INDEX_DIR" \
     --repos-dir "$REPOS_DIR" \
     --output "$RESULTS_DIR/token-savings.json" \
+    --nestweaver-bin "$BENCH_NESTWEAVER" \
     || warn "Token savings measurement failed (non-fatal)"
 
 # ---------------------------------------------------------------------------
