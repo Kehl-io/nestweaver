@@ -92,6 +92,61 @@ def load_token_savings(results_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Quality metrics extraction
+# ---------------------------------------------------------------------------
+def compute_quality_stats(data: dict) -> dict:
+    """Extract per-repo quality stats from query-level results.
+
+    Returns a dict keyed by repo, each containing per-tool averages for
+    context queries (seeds, connected, unique_files) and search queries
+    (results, noise_nodes).
+    """
+    repos = [r for r in REPO_ORDER if r in data]
+    stats: dict[str, dict] = {}
+
+    for repo in repos:
+        repo_stats: dict[str, dict] = {}
+
+        for tool in TOOL_ORDER:
+            result = data.get(repo, {}).get(tool, {})
+            queries = result.get("queries", [])
+            if not queries:
+                continue
+
+            t: dict = {}
+
+            if tool == "nestweaver":
+                ctx_qs = [q for q in queries if q.get("kind") == "context"]
+                search_qs = [q for q in queries if q.get("kind") == "search"]
+
+                if ctx_qs:
+                    t["avg_seeds"] = sum(q.get("seeds", 0) for q in ctx_qs) / len(ctx_qs)
+                    t["avg_connected"] = sum(q.get("connected", 0) for q in ctx_qs) / len(ctx_qs)
+                    t["avg_unique_files"] = sum(q.get("unique_files", 0) for q in ctx_qs) / len(ctx_qs)
+                if search_qs:
+                    t["avg_search_results"] = sum(q.get("results", 0) for q in search_qs) / len(search_qs)
+
+            elif tool == "graphify":
+                # Graphify queries are structural (no kind field)
+                t["avg_nodes"] = sum(q.get("results", 0) for q in queries) / len(queries)
+                t["avg_noise"] = sum(q.get("noise_nodes", 0) for q in queries) / len(queries)
+                total_nodes = sum(q.get("results", 0) for q in queries)
+                total_noise = sum(q.get("noise_nodes", 0) for q in queries)
+                t["noise_pct"] = (total_noise / total_nodes * 100) if total_nodes > 0 else 0.0
+
+            elif tool == "gitnexus":
+                t["avg_results"] = sum(q.get("results", 0) for q in queries) / len(queries)
+
+            if t:
+                repo_stats[tool] = t
+
+        if repo_stats:
+            stats[repo] = repo_stats
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
 def chart_indexing_speed(data: dict, output_dir: Path) -> str:
@@ -436,6 +491,26 @@ def generate_report(
             if parts:
                 comp_label = TOOL_LABELS.get(comp, comp)
                 lines.append(f"- NestWeaver {' and '.join(parts)} than {comp_label}")
+
+        # Quality stat: NestWeaver connected nodes vs Graphify nodes
+        quality_stats = compute_quality_stats(data)
+        nw_connected_all = []
+        gf_nodes_all = []
+        for repo in repos:
+            rs = quality_stats.get(repo, {})
+            nw_c = rs.get("nestweaver", {}).get("avg_connected")
+            gf_n = rs.get("graphify", {}).get("avg_nodes")
+            if nw_c is not None:
+                nw_connected_all.append(nw_c)
+            if gf_n is not None:
+                gf_nodes_all.append(gf_n)
+        if nw_connected_all and gf_nodes_all:
+            avg_nw = sum(nw_connected_all) / len(nw_connected_all)
+            avg_gf = sum(gf_nodes_all) / len(gf_nodes_all)
+            if avg_gf > 0:
+                depth_x = avg_nw / avg_gf
+                lines.append(f"- NestWeaver returns **{depth_x:.1f}x deeper code context** "
+                             f"than Graphify ({avg_nw:.0f} connected symbols vs {avg_gf:.0f} nodes per query)")
         lines.append("")
 
     # --- Environment ---
