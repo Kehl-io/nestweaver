@@ -478,6 +478,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("watcher thread panicked"),
             }
 
+            refresh_db_opened_at(&state);
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
             if let Ok(mut guard) = state.watcher_stop.lock() {
                 *guard = None;
@@ -558,6 +559,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("code watcher thread panicked"),
             }
 
+            refresh_db_opened_at(&state);
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
             if let Ok(mut guard) = state.watcher_stop.lock() {
                 *guard = None;
@@ -929,6 +931,8 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
+
+            refresh_db_opened_at(&state);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1028,6 +1032,8 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
+
+            refresh_db_opened_at(&state);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1121,6 +1127,7 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
+            refresh_db_opened_at(&state);
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
@@ -1166,6 +1173,7 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
+        refresh_db_opened_at(&self.state);
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
@@ -1222,6 +1230,7 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
+        refresh_db_opened_at(&self.state);
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
@@ -1268,6 +1277,7 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
+        refresh_db_opened_at(&self.state);
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
@@ -1358,6 +1368,7 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
+        refresh_db_opened_at(&self.state);
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
@@ -1399,6 +1410,7 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
+        refresh_db_opened_at(&self.state);
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
@@ -1475,6 +1487,7 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
+            refresh_db_opened_at(&state);
             state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
