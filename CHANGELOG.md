@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.0.0](https://github.com/Kehl-io/nestweaver/compare/v1.1.3...v2.0.0) (2026-06-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **app:** The macOS app bundle is now the recommended install method on Mac. The app provides a menubar status icon, Metal GPU acceleration for embeddings (~5x faster), automatic daemon lifecycle with crash recovery, daemon coexistence detection, and a managed web UI on port 9377. Favicon and app icon switched from dark to light variant (transparent background).
+
+### Features
+
+* **app:** add daemon coexistence, web UI lifecycle, and icon polish ([#98](https://github.com/Kehl-io/nestweaver/issues/98)) ([ffc95f1](https://github.com/Kehl-io/nestweaver/commit/ffc95f18a1446f4fc9b9d5ea89a8d11c2f3af561))
+* **app:** native macOS app with menubar, Metal GPU, and managed daemon ([#100](https://github.com/Kehl-io/nestweaver/issues/100)) ([38cbbef](https://github.com/Kehl-io/nestweaver/commit/38cbbef666558262842846e3cd2cc76d2ca6f4e5))
+
+
+### Bug Fixes
+
+* **app:** use template image for menubar icon with transparent background ([7e30ce7](https://github.com/Kehl-io/nestweaver/commit/7e30ce7540a5088045d9c70525043494214bc990))
+
 ## [1.1.3](https://github.com/Kehl-io/nestweaver/compare/v1.1.2...v1.1.3) (2026-06-22)
 
 
