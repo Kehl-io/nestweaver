@@ -988,8 +988,8 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
         .success();
 
     // Parse stamp.json and verify
-    let stamp_json = std::fs::read_to_string(snapshot_dir.join("stamp.json"))
-        .expect("stamp.json should exist");
+    let stamp_json =
+        std::fs::read_to_string(snapshot_dir.join("stamp.json")).expect("stamp.json should exist");
     let stamp: serde_json::Value =
         serde_json::from_str(&stamp_json).expect("stamp.json should be valid JSON");
 
