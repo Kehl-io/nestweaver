@@ -158,10 +158,8 @@ def measure_savings(
             print(f"  [{repo_name}] skipping — no index at {db}")
             continue
 
-        for kind, queries in [("nl", repo_entry.get("nl_queries", [])),
-                               ("exact", repo_entry.get("exact_queries", []))]:
-            # NL queries → search, exact queries → context (matches measure.sh)
-            nw_kind = "search" if kind == "nl" else "context"
+        for nw_kind, queries in [("search", repo_entry.get("search_queries", [])),
+                                  ("context", repo_entry.get("context_queries", []))]:
 
             for query in queries:
                 t0 = time.monotonic()
@@ -189,8 +187,7 @@ def measure_savings(
                 record = {
                     "repo": repo_name,
                     "query": query,
-                    "kind": kind,
-                    "nw_kind": nw_kind,
+                    "kind": nw_kind,
                     "referenced_files": len(ref_files),
                     "fallback": fallback,
                     "raw_tokens": raw_tokens,
