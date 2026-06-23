@@ -59,27 +59,16 @@ python3 -m pip --version &>/dev/null || die "Missing dependency: pip (python3 -m
 # ---------------------------------------------------------------------------
 # 2. Clone repos (shallow, skip if present)
 # ---------------------------------------------------------------------------
-declare -A REPO_URLS=(
-    [linux]="https://github.com/torvalds/linux.git"
-    [kubernetes]="https://github.com/kubernetes/kubernetes.git"
-    [react]="https://github.com/facebook/react.git"
-    [rust]="https://github.com/rust-lang/rust.git"
-    [nextjs]="https://github.com/vercel/next.js.git"
-)
-
-REPO_NAMES=$(python3 -c "
+REPO_DATA=$(python3 -c "
 import json
 data = json.load(open('$QUERIES'))
 for r in data['repos']:
-    print(r['name'])
+    print(r['name'], r['url'])
 ")
+REPO_NAMES=$(echo "$REPO_DATA" | awk '{print $1}')
 
 info "Cloning repos (shallow, --depth 1)…"
-for name in $REPO_NAMES; do
-    url="${REPO_URLS[$name]:-}"
-    if [[ -z "$url" ]]; then
-        die "No clone URL for repo '$name' — add it to REPO_URLS in run.sh"
-    fi
+echo "$REPO_DATA" | while read -r name url; do
     dest="$REPOS_DIR/$name"
     if [[ -d "$dest/.git" ]]; then
         info "  $name — already cloned, skipping"
@@ -120,36 +109,27 @@ fi
 BENCH_PYTHON="$BENCH_VENV/bin/python3"
 export BENCH_PYTHON
 
-# Graphify — Python venv
+# Graphify — Python venv (PyPI package is "graphifyy" with double-y, binary is "graphify")
 GRAPHIFY_VENV="$VENVS_DIR/graphify"
-if [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
-    python3 -m venv "$GRAPHIFY_VENV"
+if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]]; then
+    if [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
+        python3 -m venv "$GRAPHIFY_VENV"
+    fi
+    "$GRAPHIFY_VENV/bin/pip" install --quiet graphifyy 2>/dev/null \
+        || warn "  graphifyy pip install failed"
 fi
-"$GRAPHIFY_VENV/bin/pip" install --quiet graphify 2>/dev/null \
-    || warn "  graphify pip install failed (may not exist yet)"
 GRAPHIFY_BIN="$GRAPHIFY_VENV/bin/graphify"
 
 # GitNexus — local npm install
 GITNEXUS_DIR="$NODE_DIR/gitnexus"
-if [[ ! -d "$GITNEXUS_DIR/node_modules/@anthropic/gitnexus" ]] && \
-   [[ ! -d "$GITNEXUS_DIR/node_modules/gitnexus" ]]; then
+if [[ ! -f "$GITNEXUS_DIR/node_modules/.bin/gitnexus" ]]; then
     mkdir -p "$GITNEXUS_DIR"
     npm install --prefix "$GITNEXUS_DIR" gitnexus 2>/dev/null \
-        || warn "  gitnexus npm install failed (may not exist yet)"
+        || warn "  gitnexus npm install failed"
 fi
 GITNEXUS_BIN="$GITNEXUS_DIR/node_modules/.bin/gitnexus"
 
-# Codebase-Memory-MCP — download binary
-CBMCP_BIN="$BIN_DIR/codebase-memory-mcp"
-if [[ ! -x "$CBMCP_BIN" ]]; then
-    ARCH=$(uname -m)
-    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    CBMCP_URL="https://github.com/nicobailon/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-${OS}-${ARCH}"
-    curl -fsSL -o "$CBMCP_BIN" "$CBMCP_URL" 2>/dev/null && chmod +x "$CBMCP_BIN" \
-        || warn "  codebase-memory-mcp download failed (may not exist yet)"
-fi
-
-export GRAPHIFY_BIN GITNEXUS_BIN CBMCP_BIN
+export GRAPHIFY_BIN GITNEXUS_BIN
 
 # ---------------------------------------------------------------------------
 # 5. Record metadata
@@ -236,11 +216,7 @@ for name in $REPO_NAMES; do
         warn "  Skipping gitnexus (not installed)"
     fi
 
-    if [[ -x "$CBMCP_BIN" ]]; then
-        benchmark_cbmcp "$name" "$repo_path"
-    else
-        warn "  Skipping codebase-memory-mcp (not installed)"
-    fi
+    # codebase-memory-mcp removed — unreliable install, dead upstream URL
 done
 
 # ---------------------------------------------------------------------------

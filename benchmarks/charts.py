@@ -37,26 +37,23 @@ TOOL_COLORS = {
     "nestweaver": "#4F46E5",
     "graphify": "#10B981",
     "gitnexus": "#F59E0B",
-    "cbmcp": "#EF4444",
 }
 
 TOOL_LABELS = {
     "nestweaver": "NestWeaver",
     "graphify": "Graphify",
     "gitnexus": "GitNexus",
-    "cbmcp": "Codebase-Memory-MCP",
 }
 
-TOOL_ORDER = ["nestweaver", "graphify", "gitnexus", "cbmcp"]
+TOOL_ORDER = ["nestweaver", "graphify", "gitnexus"]
 
-REPO_ORDER = ["linux", "kubernetes", "react", "rust", "nextjs"]
+REPO_ORDER = ["tailwindcss", "deno", "next.js", "elasticsearch"]
 
 REPO_LABELS = {
-    "linux": "Linux kernel",
-    "kubernetes": "Kubernetes",
-    "react": "React",
-    "rust": "Rust compiler",
-    "nextjs": "Next.js",
+    "tailwindcss": "Tailwind CSS",
+    "deno": "Deno",
+    "next.js": "Next.js",
+    "elasticsearch": "Elasticsearch",
 }
 
 

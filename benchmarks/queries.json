@@ -1,93 +1,79 @@
 {
   "repos": [
     {
-      "name": "linux",
-      "description": "Linux kernel",
+      "name": "tailwindcss",
+      "url": "https://github.com/tailwindlabs/tailwindcss.git",
+      "description": "Tailwind CSS",
       "nl_queries": [
-        "process scheduler",
-        "system call entry point",
-        "file system mounting",
-        "memory allocation",
-        "network stack packet processing"
+        "How does Tailwind compile CSS with @tailwind directives into final output?",
+        "Where does Tailwind parse candidate class strings like hover:bg-red-500 into structured objects?",
+        "How are variants like hover and responsive breakpoints registered and applied?",
+        "What optimization passes does the AST go through before serialization?",
+        "How does the design system resolve theme values from configuration?"
       ],
       "exact_queries": [
-        "schedule",
-        "do_sys_open",
-        "vfs_read",
-        "kmalloc",
-        "netif_receive_skb"
+        "compile",
+        "DesignSystem",
+        "compileCandidates",
+        "parseCandidate",
+        "optimizeAst"
       ]
     },
     {
-      "name": "kubernetes",
-      "description": "Kubernetes",
+      "name": "deno",
+      "url": "https://github.com/denoland/deno.git",
+      "description": "Deno",
       "nl_queries": [
-        "pod scheduling",
-        "API server entry point",
-        "deployment rollout",
-        "authentication",
-        "kubelet container management"
+        "How does Deno dispatch CLI subcommands to their handlers?",
+        "How does the permission system enforce security sandboxing for filesystem and network access?",
+        "What is the lifecycle of a MainWorker from creation through event loop execution?",
+        "How does Deno prepare and load TypeScript modules including type-checking?",
+        "How do Web Workers communicate with the main thread?"
       ],
       "exact_queries": [
-        "Schedule",
-        "GenericAPIServer",
-        "syncDeployment",
-        "AuthenticateRequest",
-        "syncPod"
+        "CliFactory",
+        "MainWorker",
+        "DenoSubcommand",
+        "ModuleLoadPreparer",
+        "BootstrapOptions"
       ]
     },
     {
-      "name": "react",
-      "description": "React",
-      "nl_queries": [
-        "reconciler",
-        "main entry point",
-        "hooks implementation",
-        "error boundaries",
-        "scheduler priority"
-      ],
-      "exact_queries": [
-        "createElement",
-        "useState",
-        "reconcileChildren",
-        "commitRoot",
-        "scheduleUpdateOnFiber"
-      ]
-    },
-    {
-      "name": "rust",
-      "description": "Rust compiler",
-      "nl_queries": [
-        "borrow checker",
-        "main compiler entry point",
-        "trait resolution",
-        "type inference",
-        "MIR optimizer"
-      ],
-      "exact_queries": [
-        "check_loans",
-        "rustc_driver_impl",
-        "resolve_trait_ref",
-        "infer_type",
-        "run_optimization_passes"
-      ]
-    },
-    {
-      "name": "nextjs",
+      "name": "next.js",
+      "url": "https://github.com/vercel/next.js.git",
       "description": "Next.js",
       "nl_queries": [
-        "server-side rendering",
-        "build entry point",
-        "API routes",
-        "image optimization",
-        "router"
+        "How does the Next.js build process compile pages and generate production output?",
+        "How does the App Router handle client-side navigation and layout state?",
+        "How does configuration validation and defaulting work for NextConfig?",
+        "How does the base server handle incoming requests and route them to page handlers?",
+        "How do useRouter and usePathname hooks access routing state from React context?"
       ],
       "exact_queries": [
-        "renderToHTML",
+        "NextConfig",
+        "AppRouter",
+        "OuterLayoutRouter",
         "build",
-        "apiResolver",
-        "imageOptimizer",
         "useRouter"
+      ]
+    },
+    {
+      "name": "elasticsearch",
+      "url": "https://github.com/elastic/elasticsearch.git",
+      "description": "Elasticsearch",
+      "nl_queries": [
+        "How does Elasticsearch execute a search query across shards and merge results?",
+        "How does ClusterState propagate changes to metadata and routing tables?",
+        "What is the lifecycle of a document write from bulk API through Engine to Lucene?",
+        "How does shard allocation and rebalancing work when nodes join or leave?",
+        "How does the Transport layer handle inter-node communication?"
+      ],
+      "exact_queries": [
+        "SearchService",
+        "ClusterState",
+        "IndexService",
+        "Engine",
+        "ShardRouting"
       ]
     }
   ]
