@@ -140,6 +140,15 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
+    # --- Graph depth stats ---
+    local nw_stats
+    nw_stats=$("$nw" --no-daemon index --db "$db" --repo "$repo_path" --force 2>&1 | grep -oE 'Indexed [0-9]+ file.*' || true)
+    local symbol_count edge_count file_count
+    file_count=$(echo "$nw_stats" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)
+    symbol_count=$(echo "$nw_stats" | grep -oE '[0-9]+ symbol' | grep -oE '[0-9]+' || echo 0)
+    edge_count=$(echo "$nw_stats" | grep -oE '[0-9]+ edge' | grep -oE '[0-9]+' || echo 0)
+    info "    graph: ${file_count} files, ${symbol_count} symbols, ${edge_count} edges"
+
     # --- Index size on disk ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
@@ -260,6 +269,9 @@ result = {
     'incremental_median_ms': $incremental_median,
     'incremental_runs': $incremental_runs_json,
     'index_size_bytes': $index_size_bytes,
+    'file_count': $file_count,
+    'symbol_count': $symbol_count,
+    'edge_count': $edge_count,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
@@ -293,6 +305,12 @@ benchmark_graphify() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # --- Graph depth stats (parse graph.json) ---
+    local symbol_count edge_count
+    symbol_count=$(python3 -c "import json; d=json.load(open('$graph_file')); print(len(d.get('nodes',[])))" 2>/dev/null || echo 0)
+    edge_count=$(python3 -c "import json; d=json.load(open('$graph_file')); print(len(d.get('links',d.get('edges',[]))))" 2>/dev/null || echo 0)
+    info "    graph: ${symbol_count} nodes, ${edge_count} edges"
 
     # --- Index size on disk ---
     local index_size_bytes
@@ -352,6 +370,8 @@ result = {
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
     'index_size_bytes': $index_size_bytes,
+    'symbol_count': $symbol_count,
+    'edge_count': $edge_count,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
@@ -383,6 +403,14 @@ benchmark_gitnexus() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # --- Graph depth stats (re-run analyze to capture output) ---
+    local gn_stats
+    gn_stats=$("$GITNEXUS_BIN" analyze "$repo_path" --force 2>&1 || true)
+    local symbol_count edge_count
+    symbol_count=$(echo "$gn_stats" | grep -oE '[0-9,]+ nodes' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
+    edge_count=$(echo "$gn_stats" | grep -oE '[0-9,]+ edges' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
+    info "    graph: ${symbol_count} nodes, ${edge_count} edges"
 
     # --- Index size on disk ---
     local index_size_bytes
@@ -448,6 +476,8 @@ result = {
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
     'index_size_bytes': $index_size_bytes,
+    'symbol_count': $symbol_count,
+    'edge_count': $edge_count,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
