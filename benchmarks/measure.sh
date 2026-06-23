@@ -104,6 +104,10 @@ benchmark_nestweaver() {
     local result_file="$RESULTS_DIR/${name}-nestweaver.json"
     local nw="$BENCH_NESTWEAVER"
 
+    # Bypass daemon for benchmarks — avoids launchd lifecycle issues
+    # when creating/destroying DBs repeatedly
+    export NESTWEAVER_NO_DAEMON=1
+
     info "  [nestweaver] benchmarking $name..."
 
     local db="$db_dir/bench.lbug"
@@ -111,11 +115,10 @@ benchmark_nestweaver() {
     # --- Indexing (NUM_RUNS, fresh each time) ---
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
-        "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
         rm -rf "$db_dir"
         mkdir -p "$db_dir"
         local ms
-        ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
+        ms=$(time_ms "$nw" --no-daemon index --db "$db" --repo "$repo_path")
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
@@ -129,7 +132,7 @@ benchmark_nestweaver() {
     for ((i = 1; i <= NUM_RUNS; i++)); do
         touch "$repo_path/$touch_file"
         local ms
-        ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
+        ms=$(time_ms "$nw" --no-daemon index --db "$db" --repo "$repo_path")
         incremental_times+=("$ms")
         info "    incremental run $i: ${ms}ms"
     done
@@ -137,21 +140,14 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
-    # Clean up stale WAL checkpoint files before daemon start
-    rm -f "$db_dir"/*.wal.checkpoint 2>/dev/null
-
     # --- Index size on disk ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
-    # Start a daemon for this DB (isolated from user's daemon)
-    "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
-    "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
-    sleep 3  # give launchd daemon time to bind socket
-    # Warm-up: 3 throwaway queries so daemon caches are hot
+    # Warm-up: 3 throwaway queries
     for ((w = 0; w < 3; w++)); do
-        "$nw" search --db "$db" --json "warmup" >/dev/null 2>&1 || true
-        "$nw" context --db "$db" --json "warmup" >/dev/null 2>&1 || true
+        "$nw" --no-daemon search --db "$db" --json "warmup" >/dev/null 2>&1 || true
+        "$nw" --no-daemon context --db "$db" --json "warmup" >/dev/null 2>&1 || true
     done
 
     # --- Queries ---
@@ -165,7 +161,7 @@ benchmark_nestweaver() {
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture "$nw" search --db "$db" --json "$query")
+            ms=$(time_ms_capture "$nw" --no-daemon search --db "$db" --json "$query")
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
@@ -201,7 +197,7 @@ except: print(0)
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture "$nw" context --db "$db" --json "$query")
+            ms=$(time_ms_capture "$nw" --no-daemon context --db "$db" --json "$query")
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
@@ -238,8 +234,6 @@ except: print(0)
     done < <(load_queries "$name" "context")
 
     # Stop the per-repo daemon
-    "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
-
     # Compute p50/p95 across all query latencies
     local p50 p95
     p50=$(percentile 50 "${all_latencies[@]}")
