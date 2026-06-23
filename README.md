@@ -114,6 +114,19 @@ Run `nestweaver --help` for the full command list. All commands support `--json`
 
 ## Install
 
+### macOS (recommended: native app)
+
+Download **NestWeaver.app** from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases) — or build from source:
+
+```sh
+cd app && bash build.sh
+open target/release/NestWeaver.app
+```
+
+The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings), automatic daemon lifecycle, web UI on port 9377, and crash recovery. See [macOS App](#macos-app) below.
+
+### All platforms (CLI)
+
 ```sh
 # npm (recommended — no Rust needed)
 npm install -g @kehl-io/nestweaver
@@ -302,17 +315,28 @@ weight_semantic = 0.35
 <details>
 <summary>macOS App</summary>
 
-NestWeaver includes a native macOS app with a menubar status icon. Double-click to start the daemon and open the web UI.
+NestWeaver includes a native macOS `.app` bundle — the recommended way to run on Mac. It provides:
+
+- **Menubar status icon** with quick access to the web UI and daemon status
+- **Metal GPU acceleration** — the app provides GUI session context so the daemon gets full Metal access (~5x faster embeddings: 7ms vs 37ms)
+- **Automatic daemon lifecycle** — starts the daemon on launch, terminates on quit, no orphaned processes
+- **Crash recovery** — auto-restarts the daemon up to 3 times on unexpected crashes
+- **Daemon coexistence** — detects if a daemon is already running (via CLI or launchd) and connects to it instead of starting a second instance
+- **Web UI** at `http://127.0.0.1:9377` — opens automatically on launch
 
 ```sh
-# Build the app bundle
-app/build.sh
-
-# Launch
+# Build from source (requires Xcode Command Line Tools)
+cd app && bash build.sh
 open target/release/NestWeaver.app
+
+# Or download NestWeaver.app from GitHub Releases
 ```
 
-The app auto-detects your database, spawns the daemon with Metal GPU acceleration, opens the web UI at `http://127.0.0.1:9377`, and provides crash recovery. On macOS, the daemon runs via launchd for proper GPU access.
+The app is menubar-only (no Dock icon). Click the NestWeaver icon in the menubar to open the web UI or quit. Database is auto-detected from `NESTWEAVER_DB`, `~/.nestweaver/instance.toml`, or `~/.local/share/nestweaver/*/brain.lbug`.
+
+**When to use the app vs CLI:**
+- Use the **app** for always-on daemon with Metal GPU, menubar access, and the web UI
+- Use the **CLI** (`nestweaver daemon start`) for headless/server environments, CI, or if you prefer terminal-only workflows
 
 </details>
 
