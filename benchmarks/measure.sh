@@ -72,10 +72,10 @@ else:
 load_queries() {
     local repo_name="$1" kind="$2"
     local field
-    if [[ "$kind" == "nl" ]]; then
-        field="nl_queries"
+    if [[ "$kind" == "search" ]]; then
+        field="search_queries"
     else
-        field="exact_queries"
+        field="context_queries"
     fi
     python3 -c "
 import json, os
@@ -137,7 +137,11 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
-    # --- Index size on disk ---
+    # --- Embed symbols (local model + Metal GPU) ---
+    info "    embedding symbols…"
+    "$nw" embed --db "$db" --quiet 2>/dev/null || warn "    embedding failed (non-fatal)"
+
+    # --- Index size on disk (after embedding) ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
@@ -154,7 +158,7 @@ benchmark_nestweaver() {
     local all_latencies=()
     local query_results=()
 
-    # NL queries → nestweaver search (text/semantic matching)
+    # Search queries → nestweaver search (keyword/semantic matching)
     while IFS= read -r query; do
         local latencies=()
         local result_count=0
@@ -186,11 +190,11 @@ except: print(0)
         runs_json=$(printf '%s,' "${latencies[@]}")
         runs_json="[${runs_json%,}]"
 
-        query_results+=("{\"query\": $q_json, \"kind\": \"nl\", \"latency_median_ms\": $lat_median, \"results\": $result_count, \"runs\": $runs_json}")
+        query_results+=("{\"query\": $q_json, \"kind\": \"search\", \"latency_median_ms\": $lat_median, \"results\": $result_count, \"runs\": $runs_json}")
         info "    search '$query': ${lat_median}ms (results=$result_count)"
-    done < <(load_queries "$name" "nl")
+    done < <(load_queries "$name" "search")
 
-    # Exact queries → nestweaver context (structural graph traversal)
+    # Context queries → nestweaver context (structural graph traversal)
     while IFS= read -r query; do
         local latencies=()
         local seeds=0 connected=0
@@ -229,9 +233,9 @@ except: print(0)
         runs_json=$(printf '%s,' "${latencies[@]}")
         runs_json="[${runs_json%,}]"
 
-        query_results+=("{\"query\": $q_json, \"kind\": \"exact\", \"latency_median_ms\": $lat_median, \"seeds\": $seeds, \"connected\": $connected, \"runs\": $runs_json}")
+        query_results+=("{\"query\": $q_json, \"kind\": \"context\", \"latency_median_ms\": $lat_median, \"seeds\": $seeds, \"connected\": $connected, \"runs\": $runs_json}")
         info "    context '$query': ${lat_median}ms (seeds=$seeds, connected=$connected)"
-    done < <(load_queries "$name" "exact")
+    done < <(load_queries "$name" "context")
 
     # Stop the per-repo daemon
     "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
@@ -334,7 +338,7 @@ benchmark_graphify() {
 
         query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
         info "    query '$query': ${lat_median}ms"
-    done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
+    done < <(load_queries "$name" "search"; load_queries "$name" "context")
 
     local p50 p95
     p50=$(percentile 50 "${all_latencies[@]}")
@@ -430,7 +434,7 @@ except: print(0)
 
         query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
         info "    query '$query': ${lat_median}ms"
-    done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
+    done < <(load_queries "$name" "search"; load_queries "$name" "context")
 
     local p50 p95
     p50=$(percentile 50 "${all_latencies[@]}")
