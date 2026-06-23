@@ -137,11 +137,7 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
-    # --- Embed symbols (local model + Metal GPU) ---
-    info "    embedding symbols..."
-    "$nw" embed --db "$db" --quiet 2>/dev/null || warn "    embedding failed (non-fatal)"
-
-    # --- Index size on disk (after embedding) ---
+    # --- Index size on disk ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
