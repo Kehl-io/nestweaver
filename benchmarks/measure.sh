@@ -106,12 +106,14 @@ benchmark_nestweaver() {
 
     info "  [nestweaver] benchmarking $name..."
 
+    local db="$db_dir/bench.lbug"
+
     # --- Indexing (NUM_RUNS, fresh each time) ---
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
+        "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
         rm -rf "$db_dir"
         mkdir -p "$db_dir"
-        local db="$db_dir/bench.lbug"
         local ms
         ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
         index_times+=("$ms")
@@ -119,8 +121,6 @@ benchmark_nestweaver() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
-
-    local db="$db_dir/bench.lbug"
 
     # --- Incremental indexing (modify one file, re-index) ---
     local incremental_times=()
@@ -137,13 +137,17 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
+    # Clean up stale WAL checkpoint files before daemon start
+    rm -f "$db_dir"/*.wal.checkpoint 2>/dev/null
+
     # --- Index size on disk ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
     # Start a daemon for this DB (isolated from user's daemon)
+    "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
     "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
-    sleep 2  # give launchd daemon time to bind socket
+    sleep 3  # give launchd daemon time to bind socket
     # Warm-up: 3 throwaway queries so daemon caches are hot
     for ((w = 0; w < 3; w++)); do
         "$nw" search --db "$db" --json "warmup" >/dev/null 2>&1 || true
