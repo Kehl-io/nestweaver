@@ -8,7 +8,7 @@ APP_DIR="$REPO_ROOT/target/release/NestWeaver.app"
 echo "=== Building NestWeaver.app ==="
 
 # Step 1: Build Rust binary
-echo "[1/4] Building Rust binary..."
+echo "[1/5] Building Rust binary..."
 cd "$REPO_ROOT"
 cargo build --release --features embed,metal
 
@@ -25,7 +25,7 @@ fi
 # Generate menubar template icon (18x18, transparent bg)
 if [ ! -f "$MENU_ICON" ] && command -v rsvg-convert &>/dev/null; then
     echo "[2b/5] Generating menubar icon..."
-    rsvg-convert -w 36 -h 36 "$REPO_ROOT/assets/logo-icon-dark.svg" -o "$MENU_ICON"
+    rsvg-convert -w 36 -h 36 "$REPO_ROOT/assets/logo-icon-light.svg" -o "$MENU_ICON"
 elif [ ! -f "$MENU_ICON" ] && command -v sips &>/dev/null; then
     echo "[2b/5] Generating menubar icon (sips)..."
     # Convert SVG to PNG via temporary — sips can't read SVG directly
@@ -36,14 +36,14 @@ else
 fi
 
 # Step 3: Compile Swift launcher
-echo "[3/4] Compiling Swift launcher..."
+echo "[3/5] Compiling Swift launcher..."
 swiftc "$SCRIPT_DIR/Sources/main.swift" \
     -o "$REPO_ROOT/target/release/NestWeaverLauncher" \
     -framework AppKit \
     -O
 
 # Step 4: Assemble .app bundle
-echo "[4/4] Assembling app bundle..."
+echo "[4/5] Assembling app bundle..."
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
