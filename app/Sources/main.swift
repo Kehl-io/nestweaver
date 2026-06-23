@@ -4,12 +4,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var statusMenuItem: NSMenuItem?
     var daemonProcess: Process?
+    var uiProcess: Process?
+    var sigTermSource: DispatchSourceSignal?
+    var childPids: [pid_t] = []
+    var isQuitting = false
     var restartCount = 0
     let maxRestarts = 3
     let port = 9377
     var dbPath: String?
 
+    private static let socketDir = NSHomeDirectory() + "/.local/state/nestweaver"
+
+    private func isDaemonSocketPresent() -> Bool {
+        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: Self.socketDir) else { return false }
+        return dirs.contains { FileManager.default.fileExists(atPath: Self.socketDir + "/" + $0 + "/daemon.sock") }
+    }
+
+    private func waitForDaemonSocket(timeout: Int = 100, then handler: @escaping () -> Void) {
+        DispatchQueue.global().async { [weak self] in
+            guard let self = self else { return }
+            var found = false
+            for _ in 0..<timeout {
+                if self.isDaemonSocketPresent() { found = true; break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            DispatchQueue.main.async {
+                if found {
+                    handler()
+                } else {
+                    self.updateStatus("Failed to start")
+                }
+            }
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.quitApp()
+        }
+        source.resume()
+        sigTermSource = source
+
         dbPath = detectDatabase()
         guard let db = dbPath else {
             let alert = NSAlert()
@@ -23,34 +60,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupMenuBar()
-        startDaemon(dbPath: db)
 
-        DispatchQueue.global().async { [weak self] in
-            guard let self = self else { return }
-            let socketDir = NSHomeDirectory() + "/.local/state/nestweaver"
-            var found = false
-            for _ in 0..<100 {
-                if let dirs = try? FileManager.default.contentsOfDirectory(atPath: socketDir) {
-                    for dir in dirs {
-                        let sock = socketDir + "/" + dir + "/daemon.sock"
-                        if FileManager.default.fileExists(atPath: sock) {
-                            found = true
-                            break
-                        }
-                    }
-                }
-                if found { break }
-                Thread.sleep(forTimeInterval: 0.1)
+        if isDaemonSocketPresent() {
+            startWebUI(dbPath: db)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.openWebUI()
+                self.updateStatus("Running (external daemon)")
             }
-            if found {
-                // Verify the daemon is actually healthy by checking the port
-                DispatchQueue.main.async {
+        } else {
+            startDaemon(dbPath: db)
+            waitForDaemonSocket { [weak self] in
+                guard let self = self else { return }
+                self.startWebUI(dbPath: db)
+                self.restartCount = 0
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self.openWebUI()
                     self.updateStatus("Running")
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.updateStatus("Failed to start")
                 }
             }
         }
@@ -82,7 +107,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: "o"))
-        menu.addItem(NSMenuItem.separator())
         let si = NSMenuItem(title: "Status: Starting…", action: nil, keyEquivalent: "")
         si.isEnabled = false
         statusMenuItem = si
@@ -106,13 +130,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         process.environment = ProcessInfo.processInfo.environment
 
         process.terminationHandler = { [weak self] proc in
-            guard let self = self else { return }
             DispatchQueue.main.async {
-                if proc.terminationReason == .uncaughtSignal && self.restartCount < self.maxRestarts {
+                guard let self = self, !self.isQuitting else { return }
+
+                // Only check for external daemon on normal error exits —
+                // signal-killed daemons leave stale sockets.
+                if proc.terminationReason == .exit && proc.terminationStatus != 0 && self.isDaemonSocketPresent() {
+                    self.daemonProcess = nil
+                    self.updateStatus("Running (external daemon)")
+                    self.startWebUI(dbPath: dbPath)
+                } else if (proc.terminationReason == .uncaughtSignal || proc.terminationStatus != 0) && self.restartCount < self.maxRestarts {
                     self.restartCount += 1
                     self.updateStatus("Restarting (\(self.restartCount)/\(self.maxRestarts))…")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         self.startDaemon(dbPath: dbPath)
+                        self.waitForDaemonSocket { [weak self] in
+                            guard let self = self else { return }
+                            self.startWebUI(dbPath: dbPath)
+                            self.restartCount = 0
+                            self.updateStatus("Running")
+                        }
                     }
                 } else if proc.terminationStatus != 0 && self.restartCount >= self.maxRestarts {
                     self.updateStatus("Stopped (too many crashes)")
@@ -123,12 +160,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try process.run()
             daemonProcess = process
+            childPids.append(process.processIdentifier)
         } catch {
             let alert = NSAlert()
             alert.messageText = "Failed to Start Daemon"
             alert.informativeText = error.localizedDescription
             alert.runModal()
             NSApp.terminate(nil)
+        }
+    }
+
+    func startWebUI(dbPath: String) {
+        if let old = uiProcess, old.isRunning {
+            kill(old.processIdentifier, SIGTERM)
+        }
+        let binaryPath = Bundle.main.bundlePath + "/Contents/MacOS/nestweaver-cli"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.arguments = ["ui", "--port", String(port), "--no-open", "--db", dbPath]
+        process.environment = ProcessInfo.processInfo.environment
+        do {
+            try process.run()
+            uiProcess = process
+            childPids.append(process.processIdentifier)
+        } catch {
+            updateStatus("Web UI failed to start")
         }
     }
 
@@ -139,17 +195,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func quitApp() {
-        if let process = daemonProcess, process.isRunning {
-            process.interrupt()
-            process.waitUntilExit()
-        }
+        isQuitting = true
+        terminateAllChildren()
         NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let process = daemonProcess, process.isRunning {
-            process.interrupt()
+        guard !isQuitting else { return }
+        isQuitting = true
+        terminateAllChildren()
+    }
+
+    private func terminateAllChildren() {
+        let live = childPids.filter { kill($0, 0) == 0 }
+        for pid in live { kill(pid, SIGTERM) }
+        for _ in 0..<20 {
+            if live.allSatisfy({ kill($0, 0) != 0 }) { return }
+            usleep(50_000)
         }
+        for pid in live { kill(pid, SIGKILL) }
     }
 
     func detectDatabase() -> String? {
@@ -223,4 +287,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 let delegate = AppDelegate()
 NSApplication.shared.delegate = delegate
 NSApplication.shared.setActivationPolicy(.accessory)
+
 NSApplication.shared.run()

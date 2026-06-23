@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SVG="$REPO_ROOT/assets/logo-icon-dark.svg"
+SVG="$REPO_ROOT/assets/logo-icon-light.svg"
 ICONSET_DIR="$SCRIPT_DIR/NestWeaver.iconset"
 ICNS_OUT="$SCRIPT_DIR/AppIcon.icns"
 
