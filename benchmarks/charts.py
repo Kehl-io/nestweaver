@@ -207,6 +207,115 @@ def chart_query_latency(data: dict, output_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# New charts
+# ---------------------------------------------------------------------------
+def chart_token_savings(token_savings: dict, output_dir: Path) -> str:
+    """Grouped bar chart: raw file tokens vs NestWeaver response tokens per repo."""
+    summary = token_savings.get("summary", {})
+    by_repo = summary.get("by_repo", {})
+    if not by_repo:
+        return ""
+
+    repos = [r for r in REPO_ORDER if r in by_repo]
+    if not repos:
+        return ""
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bar_width = 0.35
+    x_pos = list(range(len(repos)))
+
+    raw_values = [by_repo[r].get("raw_tokens", 0) for r in repos]
+    nw_values = [by_repo[r].get("response_tokens", 0) for r in repos]
+    savings_pcts = [by_repo[r].get("token_savings_pct", 0) for r in repos]
+
+    bars_raw = ax.bar(
+        [x - bar_width / 2 for x in x_pos], raw_values, bar_width,
+        label="Raw File Tokens", color="#9CA3AF", zorder=3,
+    )
+    bars_nw = ax.bar(
+        [x + bar_width / 2 for x in x_pos], nw_values, bar_width,
+        label="NestWeaver Tokens", color=TOOL_COLORS["nestweaver"], zorder=3,
+    )
+
+    for bar, val in zip(bars_raw, raw_values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height(),
+            f"{val:,}", ha="center", va="bottom", fontsize=8,
+        )
+    for bar, val in zip(bars_nw, nw_values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height(),
+            f"{val:,}", ha="center", va="bottom", fontsize=8,
+        )
+
+    # Savings percentage annotation above each pair
+    for i, pct in enumerate(savings_pcts):
+        max_h = max(raw_values[i], nw_values[i])
+        ax.text(
+            x_pos[i], max_h * 1.12,
+            f"{pct}% saved", ha="center", va="bottom",
+            fontsize=10, fontweight="bold", color=TOOL_COLORS["nestweaver"],
+        )
+
+    ax.set_xlabel("Repository")
+    ax.set_ylabel("Token Count")
+    ax.set_title("Token Savings: Raw Files vs NestWeaver")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([REPO_LABELS.get(r, r) for r in repos])
+    ax.legend(loc="upper left")
+    ax.grid(axis="y", alpha=0.3, zorder=0)
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+
+    plt.tight_layout()
+    out_path = output_dir / "token-savings.svg"
+    fig.savefig(out_path, format="svg")
+    plt.close(fig)
+    return str(out_path)
+
+
+def chart_incremental_indexing(data: dict, output_dir: Path) -> str:
+    """Bar chart: incremental re-index time for NestWeaver only."""
+    repos = [r for r in REPO_ORDER if r in data]
+    values = []
+    valid_repos = []
+    for r in repos:
+        nw = data.get(r, {}).get("nestweaver", {})
+        inc_ms = nw.get("incremental_median_ms")
+        if inc_ms is not None:
+            values.append(inc_ms)
+            valid_repos.append(r)
+
+    if not valid_repos:
+        return ""
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x_pos = list(range(len(valid_repos)))
+
+    bars = ax.bar(
+        x_pos, values, 0.5,
+        color=TOOL_COLORS["nestweaver"], zorder=3,
+    )
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height(),
+            f"{val:.0f}ms", ha="center", va="bottom", fontsize=10,
+        )
+
+    ax.set_xlabel("Repository")
+    ax.set_ylabel("Time (ms)")
+    ax.set_title("Incremental Re-indexing (single file change)")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([REPO_LABELS.get(r, r) for r in valid_repos])
+    ax.grid(axis="y", alpha=0.3, zorder=0)
+
+    plt.tight_layout()
+    out_path = output_dir / "incremental-indexing.svg"
+    fig.savefig(out_path, format="svg")
+    plt.close(fig)
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
 def generate_report(
@@ -216,6 +325,8 @@ def generate_report(
     output_dir: Path,
     indexing_chart: str,
     latency_chart: str,
+    token_savings_chart: str = "",
+    incremental_chart: str = "",
 ) -> str:
     """Generate the markdown benchmark report."""
     lines: list[str] = []
@@ -237,6 +348,38 @@ def generate_report(
     lines.append("")
     lines.append(f"> **Linux kernel**: indexed in **{hero_index_str}**, queries answered in **{hero_query_str}** (p50)")
     lines.append("")
+
+    # --- Key Findings (speedup factors) ---
+    competitors = [t for t in tools if t != "nestweaver"]
+    if competitors and "nestweaver" in tools:
+        lines.append("## Key Findings")
+        lines.append("")
+        for comp in competitors:
+            # Compute average indexing speedup
+            idx_ratios = []
+            query_ratios = []
+            for repo in repos:
+                nw = data.get(repo, {}).get("nestweaver", {})
+                cr = data.get(repo, {}).get(comp, {})
+                nw_idx = nw.get("index_median_ms")
+                cr_idx = cr.get("index_median_ms")
+                if nw_idx and cr_idx and nw_idx > 0:
+                    idx_ratios.append(cr_idx / nw_idx)
+                nw_p50 = nw.get("p50_ms")
+                cr_p50 = cr.get("p50_ms")
+                if nw_p50 and cr_p50 and nw_p50 > 0:
+                    query_ratios.append(cr_p50 / nw_p50)
+            parts = []
+            if idx_ratios:
+                avg_idx = sum(idx_ratios) / len(idx_ratios)
+                parts.append(f"indexes **{avg_idx:.1f}x faster**")
+            if query_ratios:
+                avg_q = sum(query_ratios) / len(query_ratios)
+                parts.append(f"answers queries **{avg_q:.1f}x faster**")
+            if parts:
+                comp_label = TOOL_LABELS.get(comp, comp)
+                lines.append(f"- NestWeaver {' and '.join(parts)} than {comp_label}")
+        lines.append("")
 
     # --- Environment ---
     lines.append("## Environment")
@@ -294,6 +437,29 @@ def generate_report(
                 row += " - |"
         lines.append(row)
     lines.append("")
+
+    # --- Incremental indexing ---
+    inc_repos = []
+    for repo in repos:
+        nw = data.get(repo, {}).get("nestweaver", {})
+        inc_ms = nw.get("incremental_median_ms")
+        if inc_ms is not None:
+            inc_repos.append((repo, inc_ms))
+
+    if inc_repos:
+        lines.append("## Incremental Indexing")
+        lines.append("")
+        lines.append("After a single file change, NestWeaver can re-index without "
+                      "rebuilding the entire graph. Competitors require a full re-index.")
+        lines.append("")
+        if incremental_chart:
+            lines.append("![Incremental Indexing](incremental-indexing.svg)")
+            lines.append("")
+        lines.append("| Repository | Incremental Re-index |")
+        lines.append("|---|---:|")
+        for repo, ms in inc_repos:
+            lines.append(f"| {REPO_LABELS.get(repo, repo)} | {ms:.0f}ms |")
+        lines.append("")
 
     # --- Query latency ---
     lines.append("## Query Latency")
@@ -355,6 +521,9 @@ def generate_report(
     if token_savings:
         lines.append("## Token Savings (NestWeaver)")
         lines.append("")
+        if token_savings_chart:
+            lines.append("![Token Savings](token-savings.svg)")
+            lines.append("")
         summary = token_savings.get("summary", {})
         overall = summary.get("overall", {})
         if overall:
@@ -440,17 +609,20 @@ def main() -> None:
 
     indexing_chart = chart_indexing_speed(data, args.output_dir)
     latency_chart = chart_query_latency(data, args.output_dir)
+    ts_chart = chart_token_savings(token_savings, args.output_dir)
+    inc_chart = chart_incremental_indexing(data, args.output_dir)
 
     report_path = generate_report(
         data, metadata, token_savings, args.output_dir,
         indexing_chart, latency_chart,
+        token_savings_chart=ts_chart,
+        incremental_chart=inc_chart,
     )
 
     print(f"Report:  {report_path}")
-    if indexing_chart:
-        print(f"Chart:   {indexing_chart}")
-    if latency_chart:
-        print(f"Chart:   {latency_chart}")
+    for chart in [indexing_chart, latency_chart, ts_chart, inc_chart]:
+        if chart:
+            print(f"Chart:   {chart}")
 
 
 if __name__ == "__main__":

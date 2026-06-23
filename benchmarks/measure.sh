@@ -122,6 +122,25 @@ benchmark_nestweaver() {
 
     local db="$db_dir/bench.lbug"
 
+    # --- Incremental indexing (modify one file, re-index) ---
+    local incremental_times=()
+    local touch_file
+    touch_file=$(cd "$repo_path" && git ls-files | head -20 | tail -1)
+    for ((i = 1; i <= NUM_RUNS; i++)); do
+        touch "$repo_path/$touch_file"
+        local ms
+        ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
+        incremental_times+=("$ms")
+        info "    incremental run $i: ${ms}ms"
+    done
+    local incremental_median
+    incremental_median=$(median "${incremental_times[@]}")
+    info "    incremental median: ${incremental_median}ms"
+
+    # --- Index size on disk ---
+    local index_size_bytes
+    index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+
     # Start a daemon for this DB (isolated from user's daemon)
     "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
     # Warm-up: 3 throwaway queries so daemon caches are hot
@@ -227,6 +246,9 @@ except: print(0)
     local index_runs_json
     index_runs_json=$(printf '%s,' "${index_times[@]}")
     index_runs_json="[${index_runs_json%,}]"
+    local incremental_runs_json
+    incremental_runs_json=$(printf '%s,' "${incremental_times[@]}")
+    incremental_runs_json="[${incremental_runs_json%,}]"
 
     python3 -c "
 import json
@@ -235,6 +257,9 @@ result = {
     'repo': '$name',
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
+    'incremental_median_ms': $incremental_median,
+    'incremental_runs': $incremental_runs_json,
+    'index_size_bytes': $index_size_bytes,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
@@ -242,7 +267,7 @@ result = {
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
-    info "  [nestweaver] done — index=${index_median}ms p50=${p50}ms p95=${p95}ms"
+    info "  [nestweaver] done — index=${index_median}ms incremental=${incremental_median}ms p50=${p50}ms p95=${p95}ms"
 }
 
 # ---------------------------------------------------------------------------
@@ -266,6 +291,15 @@ benchmark_graphify() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # --- Index size on disk ---
+    local index_size_bytes
+    index_size_bytes=$(find "$index_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+
+    # Warm-up queries
+    for ((w = 0; w < 3; w++)); do
+        "$GRAPHIFY_BIN" query --index "$index_dir" "warmup" >/dev/null 2>&1 || true
+    done
 
     local all_latencies=()
     local query_results=()
@@ -321,6 +355,7 @@ result = {
     'repo': '$name',
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
+    'index_size_bytes': $index_size_bytes,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
@@ -352,6 +387,15 @@ benchmark_gitnexus() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # --- Index size on disk ---
+    local index_size_bytes
+    index_size_bytes=$(find "$repo_path/.gitnexus" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+
+    # Warm-up queries
+    for ((w = 0; w < 3; w++)); do
+        "$GITNEXUS_BIN" query "warmup" -r "$repo_path" >/dev/null 2>&1 || true
+    done
 
     local all_latencies=()
     local query_results=()
@@ -407,6 +451,7 @@ result = {
     'repo': '$name',
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
+    'index_size_bytes': $index_size_bytes,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
@@ -438,6 +483,15 @@ benchmark_cbmcp() {
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # --- Index size on disk ---
+    local index_size_bytes
+    index_size_bytes=$(find "$index_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+
+    # Warm-up queries
+    for ((w = 0; w < 3; w++)); do
+        "$CBMCP_BIN" query --db "$index_dir/db" "warmup" >/dev/null 2>&1 || true
+    done
 
     local all_latencies=()
     local query_results=()
@@ -493,6 +547,7 @@ result = {
     'repo': '$name',
     'index_median_ms': $index_median,
     'index_runs': $index_runs_json,
+    'index_size_bytes': $index_size_bytes,
     'p50_ms': $p50,
     'p95_ms': $p95,
     'queries': $queries_json
