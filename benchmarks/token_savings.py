@@ -34,13 +34,13 @@ def count_tokens(text: str, encoder) -> int:
     return len(encoder.encode(text))
 
 
-def nestweaver_query(query: str, repo: str, kind: str = "context") -> str:
+def nestweaver_query(query: str, db: str, kind: str = "context") -> str:
     """
     Run a nestweaver CLI query and return the raw stdout.
 
-    kind: "context" for NL queries, "search" for exact-symbol queries.
+    kind: "context" for seed-symbol queries, "search" for name-substring queries.
     """
-    cmd = ["nestweaver", kind, query, "--repo", repo, "--json"]
+    cmd = ["nestweaver", kind, query, "--db", db, "--json"]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=60
@@ -55,54 +55,81 @@ def nestweaver_query(query: str, repo: str, kind: str = "context") -> str:
         )
 
 
+def get_raw_file_tokens(repo_path: str, encoder) -> int:
+    """Count tokens across all tracked files in a repo (git ls-files)."""
+    try:
+        files = subprocess.check_output(
+            ["git", "-C", repo_path, "ls-files"], text=True, timeout=30
+        ).strip().splitlines()
+    except Exception:
+        return 0
+
+    total = 0
+    for f in files[:500]:  # sample up to 500 files
+        fpath = Path(repo_path) / f
+        try:
+            content = fpath.read_text(errors="replace")
+            total += count_tokens(content, encoder)
+        except Exception:
+            continue
+    return total
+
+
 def measure_savings(
-    results_path: Path,
+    results_dir: Path,
+    queries_path: Path,
+    index_dir: Path,
+    repos_dir: Path,
     output_path: Path,
     encoder,
 ) -> list[dict]:
-    with results_path.open() as f:
-        results = json.load(f)
+    with queries_path.open() as f:
+        queries_data = json.load(f)
 
     savings = []
 
-    for entry in results:
-        repo = entry.get("repo", "")
-        query = entry.get("query", "")
-        query_kind = entry.get("kind", "nl")  # "nl" or "exact"
-        raw_files: list[str] = entry.get("raw_file_contents", [])
+    for repo_entry in queries_data["repos"]:
+        repo_name = repo_entry["name"]
+        repo_path = str(repos_dir / repo_name)
+        db = str(index_dir / f"nestweaver-{repo_name}" / "bench.lbug")
 
-        # Count tokens in raw files.
-        raw_tokens = sum(count_tokens(content, encoder) for content in raw_files)
+        if not Path(db).exists():
+            print(f"  [{repo_name}] skipping — no index at {db}")
+            continue
 
-        # Run nestweaver and count response tokens.
-        nw_kind = "context" if query_kind == "nl" else "search"
-        t0 = time.monotonic()
-        nw_response = nestweaver_query(query, repo, kind=nw_kind)
-        latency_ms = (time.monotonic() - t0) * 1000
+        raw_tokens = get_raw_file_tokens(repo_path, encoder)
 
-        response_tokens = count_tokens(nw_response, encoder)
+        for kind, queries in [("nl", repo_entry.get("nl_queries", [])),
+                               ("exact", repo_entry.get("exact_queries", []))]:
+            nw_kind = "context" if kind == "nl" else "search"
+            for query in queries:
+                t0 = time.monotonic()
+                nw_response = nestweaver_query(query, db, kind=nw_kind)
+                latency_ms = (time.monotonic() - t0) * 1000
 
-        if raw_tokens > 0:
-            savings_pct = (1 - response_tokens / raw_tokens) * 100
-        else:
-            savings_pct = 0.0
+                response_tokens = count_tokens(nw_response, encoder)
 
-        record = {
-            "repo": repo,
-            "query": query,
-            "kind": query_kind,
-            "raw_tokens": raw_tokens,
-            "response_tokens": response_tokens,
-            "token_savings_pct": round(savings_pct, 2),
-            "latency_ms": round(latency_ms, 1),
-        }
-        savings.append(record)
+                if raw_tokens > 0:
+                    savings_pct = (1 - response_tokens / raw_tokens) * 100
+                else:
+                    savings_pct = 0.0
 
-        print(
-            f"  [{repo}] {query!r:40s} "
-            f"raw={raw_tokens:>7,}  nw={response_tokens:>6,}  "
-            f"savings={savings_pct:5.1f}%  latency={latency_ms:.0f}ms"
-        )
+                record = {
+                    "repo": repo_name,
+                    "query": query,
+                    "kind": kind,
+                    "raw_tokens": raw_tokens,
+                    "response_tokens": response_tokens,
+                    "token_savings_pct": round(savings_pct, 2),
+                    "latency_ms": round(latency_ms, 1),
+                }
+                savings.append(record)
+
+                print(
+                    f"  [{repo_name}] {query!r:40s} "
+                    f"raw={raw_tokens:>7,}  nw={response_tokens:>6,}  "
+                    f"savings={savings_pct:5.1f}%  latency={latency_ms:.0f}ms"
+                )
 
     return savings
 
@@ -149,10 +176,28 @@ def summarise(savings: list[dict]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--results",
+        "--results-dir",
         required=True,
         type=Path,
-        help="Path to benchmark results JSON (produced by run_benchmarks.py).",
+        help="Directory containing benchmark result JSON files.",
+    )
+    parser.add_argument(
+        "--queries",
+        required=True,
+        type=Path,
+        help="Path to queries.json.",
+    )
+    parser.add_argument(
+        "--index-dir",
+        required=True,
+        type=Path,
+        help="Directory containing NestWeaver index databases.",
+    )
+    parser.add_argument(
+        "--repos-dir",
+        required=True,
+        type=Path,
+        help="Directory containing cloned repos.",
     )
     parser.add_argument(
         "--output",
@@ -162,17 +207,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.results.exists():
-        sys.exit(f"Results file not found: {args.results}")
-
     ensure_tiktoken()
 
     import tiktoken  # noqa: PLC0415 — imported after ensure_tiktoken()
 
     encoder = tiktoken.get_encoding("cl100k_base")
 
-    print(f"Measuring token savings from {args.results} …")
-    savings = measure_savings(args.results, args.output, encoder)
+    print(f"Measuring token savings …")
+    savings = measure_savings(
+        args.results_dir, args.queries, args.index_dir,
+        args.repos_dir, args.output, encoder,
+    )
     summary = summarise(savings)
 
     output = {"summary": summary, "per_query": savings}

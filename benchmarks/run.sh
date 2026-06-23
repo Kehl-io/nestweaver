@@ -231,7 +231,10 @@ done
 # ---------------------------------------------------------------------------
 info "Measuring token savings…"
 python3 "$SCRIPT_DIR/token_savings.py" \
-    --results "$RESULTS_DIR/metadata.json" \
+    --results-dir "$RESULTS_DIR" \
+    --queries "$QUERIES" \
+    --index-dir "$INDEX_DIR" \
+    --repos-dir "$REPOS_DIR" \
     --output "$RESULTS_DIR/token-savings.json" \
     || warn "Token savings measurement failed (non-fatal)"
 
