@@ -104,26 +104,33 @@ benchmark_nestweaver() {
     local result_file="$RESULTS_DIR/${name}-nestweaver.json"
     local nw="$BENCH_NESTWEAVER"
 
-    # Bypass daemon for benchmarks — avoids launchd lifecycle issues
-    # when creating/destroying DBs repeatedly
-    export NESTWEAVER_NO_DAEMON=1
-
     info "  [nestweaver] benchmarking $name..."
 
     local db="$db_dir/bench.lbug"
 
     # --- Indexing (NUM_RUNS, fresh each time) ---
+    # Each run uses a separate temp directory so we never destroy a DB
+    # that a daemon might reference. The final run becomes the keeper.
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
-        rm -rf "$db_dir"
-        mkdir -p "$db_dir"
+        local run_dir="$INDEX_DIR/nestweaver-$name-run$i"
+        rm -rf "$run_dir"
+        mkdir -p "$run_dir"
         local ms
-        ms=$(time_ms "$nw" --no-daemon index --db "$db" --repo "$repo_path")
+        ms=$(time_ms "$nw" index --db "$run_dir/bench.lbug" --repo "$repo_path")
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
     local index_median
     index_median=$(median "${index_times[@]}")
+
+    # Keep the last run as the canonical DB for queries
+    rm -rf "$db_dir"
+    mv "$INDEX_DIR/nestweaver-$name-run$NUM_RUNS" "$db_dir"
+    # Clean up other run dirs
+    for ((i = 1; i < NUM_RUNS; i++)); do
+        rm -rf "$INDEX_DIR/nestweaver-$name-run$i"
+    done
 
     # --- Incremental indexing (modify one file, re-index) ---
     local incremental_times=()
@@ -132,7 +139,7 @@ benchmark_nestweaver() {
     for ((i = 1; i <= NUM_RUNS; i++)); do
         touch "$repo_path/$touch_file"
         local ms
-        ms=$(time_ms "$nw" --no-daemon index --db "$db" --repo "$repo_path")
+        ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
         incremental_times+=("$ms")
         info "    incremental run $i: ${ms}ms"
     done
@@ -142,7 +149,7 @@ benchmark_nestweaver() {
 
     # --- Graph depth stats ---
     local nw_stats
-    nw_stats=$("$nw" --no-daemon index --db "$db" --repo "$repo_path" --force 2>&1 | grep -oE 'Indexed [0-9]+ file.*' || true)
+    nw_stats=$("$nw" index --db "$db" --repo "$repo_path" --force 2>&1 | grep -oE 'Indexed [0-9]+ file.*' || true)
     local symbol_count edge_count file_count
     file_count=$(echo "$nw_stats" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)
     symbol_count=$(echo "$nw_stats" | grep -oE '[0-9]+ symbol' | grep -oE '[0-9]+' || echo 0)
@@ -153,24 +160,27 @@ benchmark_nestweaver() {
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
-    # Warm-up: 3 throwaway queries
+    # Start daemon for queries (production mode — Metal GPU, in-memory graph)
+    "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
+    sleep 3
+    # Warm-up: 3 throwaway queries so daemon caches are hot
     for ((w = 0; w < 3; w++)); do
-        "$nw" --no-daemon search --db "$db" --json "warmup" >/dev/null 2>&1 || true
-        "$nw" --no-daemon context --db "$db" --json "warmup" >/dev/null 2>&1 || true
+        "$nw" search --db "$db" --json "warmup" >/dev/null 2>&1 || true
+        "$nw" context --db "$db" --json "warmup" >/dev/null 2>&1 || true
     done
 
-    # --- Queries ---
+    # --- Queries (through daemon — representative of real usage) ---
     local all_latencies=()
     local query_results=()
 
-    # Search queries → nestweaver search (keyword/semantic matching)
+    # Search queries
     while IFS= read -r query; do
         local latencies=()
         local result_count=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture "$nw" --no-daemon search --db "$db" --json "$query")
+            ms=$(time_ms_capture "$nw" search --db "$db" --json "$query")
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
@@ -201,14 +211,14 @@ except: print(0)
         info "    search '$query': ${lat_median}ms (results=$result_count)"
     done < <(load_queries "$name" "search")
 
-    # Context queries → nestweaver context (structural graph traversal)
+    # Context queries
     while IFS= read -r query; do
         local latencies=()
         local seeds=0 connected=0 unique_files=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture "$nw" --no-daemon context --db "$db" --json "$query")
+            ms=$(time_ms_capture "$nw" context --db "$db" --json "$query")
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
@@ -255,6 +265,8 @@ except: print(0)
     done < <(load_queries "$name" "context")
 
     # Stop the per-repo daemon
+    "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
+
     # Compute p50/p95 across all query latencies
     local p50 p95
     p50=$(percentile 50 "${all_latencies[@]}")
@@ -454,8 +466,8 @@ benchmark_gitnexus() {
 import json, sys
 try:
     d = json.load(sys.stdin)
-    r = d.get('results', d.get('nodes', []))
-    print(len(r))
+    procs = d.get('processes', [])
+    print(len(procs))
 except: print(0)
 " 2>/dev/null || echo 0)
             fi
@@ -471,7 +483,7 @@ except: print(0)
         runs_json="[${runs_json%,}]"
 
         query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
-        info "    query '$query': ${lat_median}ms"
+        info "    query '$query': ${lat_median}ms (results=$results)"
     done < <(load_queries "$name" "search"; load_queries "$name" "context")
 
     local p50 p95
