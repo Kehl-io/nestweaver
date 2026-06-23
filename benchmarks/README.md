@@ -1,6 +1,6 @@
 # NestWeaver Benchmark Suite
 
-Competitive benchmark comparing NestWeaver against GitNexus, Graphify, and Codebase-Memory-MCP on indexing speed, query latency, and token savings.
+Competitive benchmark comparing NestWeaver against Graphify and GitNexus on indexing speed, query latency, and token savings.
 
 ## Quick Start
 
@@ -35,13 +35,12 @@ To clean up everything: `rm -rf /private/tmp/nestweaver-bench/`
 
 ## Repositories
 
-| Repo | Language | Notes |
-|------|----------|-------|
-| linux | C | Kernel — extremely large, C macros everywhere |
-| kubernetes | Go | Cloud orchestration, heavy interface use |
-| react | JavaScript/TypeScript | UI framework, well-structured packages |
-| rust | Rust | Self-hosting compiler, complex type system |
-| nextjs | TypeScript | Full-stack framework, mixed SSR/client code |
+| Repo | Language | Size | Notes |
+|------|----------|------|-------|
+| Tailwind CSS | TS/JS | Small | Utility CSS framework |
+| Deno | Rust | Medium (~5.7K files) | JavaScript/TypeScript runtime |
+| Next.js | TypeScript | Large (~29K files) | Full-stack React framework |
+| Elasticsearch | Java | Huge (~25K+ files) | Distributed search engine |
 
 ## Output
 
