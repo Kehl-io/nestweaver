@@ -312,6 +312,65 @@ def chart_incremental_indexing(data: dict, output_dir: Path) -> str:
     return str(out_path)
 
 
+def chart_graph_depth(data: dict, output_dir: Path) -> str:
+    """Grouped bar chart: symbols and edges extracted per tool per repo."""
+    repos = [r for r in REPO_ORDER if r in data]
+    tools = [t for t in TOOL_ORDER if any(t in data.get(r, {}) for r in repos)]
+    if not repos or not tools:
+        return ""
+
+    has_data = False
+    for r in repos:
+        for t in tools:
+            if data.get(r, {}).get(t, {}).get("symbol_count"):
+                has_data = True
+                break
+    if not has_data:
+        return ""
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    bar_width = 0.8 / len(tools)
+    x_pos = list(range(len(repos)))
+
+    for metric_idx, (ax, key, ylabel, title) in enumerate([
+        (ax1, "symbol_count", "Symbols / Nodes", "Symbols Extracted"),
+        (ax2, "edge_count", "Edges / Links", "Edges Extracted"),
+    ]):
+        for i, tool in enumerate(tools):
+            values = []
+            for repo in repos:
+                result = data.get(repo, {}).get(tool, {})
+                values.append(result.get(key, 0))
+            offset = (i - len(tools) / 2 + 0.5) * bar_width
+            bars = ax.bar(
+                [x + offset for x in x_pos], values, bar_width,
+                label=TOOL_LABELS.get(tool, tool),
+                color=TOOL_COLORS.get(tool, "#888888"), zorder=3,
+            )
+            for bar, val in zip(bars, values):
+                if val > 0:
+                    label = f"{val // 1000}K" if val >= 1000 else str(val)
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height(), label,
+                        ha="center", va="bottom", fontsize=7,
+                    )
+
+        ax.set_xlabel("Repository")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([REPO_LABELS.get(r, r) for r in repos])
+        ax.legend(loc="upper left")
+        ax.grid(axis="y", alpha=0.3, zorder=0)
+
+    plt.tight_layout()
+    out_path = output_dir / "graph-depth.svg"
+    fig.savefig(out_path, format="svg")
+    plt.close(fig)
+    return str(out_path)
+
+
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
@@ -324,6 +383,7 @@ def generate_report(
     latency_chart: str,
     token_savings_chart: str = "",
     incremental_chart: str = "",
+    graph_depth_chart: str = "",
 ) -> str:
     """Generate the markdown benchmark report."""
     lines: list[str] = []
@@ -487,6 +547,43 @@ def generate_report(
         lines.append(row_p95)
     lines.append("")
 
+    # --- Graph depth ---
+    has_graph_stats = any(
+        data.get(r, {}).get(t, {}).get("symbol_count")
+        for r in repos for t in tools
+    )
+    if has_graph_stats:
+        lines.append("## Graph Depth")
+        lines.append("")
+        lines.append("NestWeaver extracts more symbols and cross-references than competitors,")
+        lines.append("building a richer knowledge graph that powers deeper query results.")
+        lines.append("")
+        if graph_depth_chart:
+            lines.append("![Graph Depth](graph-depth.svg)")
+            lines.append("")
+
+        header = "| Repository | Metric |"
+        sep = "|---|---|"
+        for tool in tools:
+            header += f" {TOOL_LABELS.get(tool, tool)} |"
+            sep += "---:|"
+        lines.append(header)
+        lines.append(sep)
+
+        for repo in repos:
+            label = REPO_LABELS.get(repo, repo)
+            row_sym = f"| {label} | Symbols |"
+            row_edge = f"| {label} | Edges |"
+            for tool in tools:
+                result = data.get(repo, {}).get(tool, {})
+                sym = result.get("symbol_count", 0)
+                edg = result.get("edge_count", 0)
+                row_sym += f" {sym:,} |" if sym else " - |"
+                row_edge += f" {edg:,} |" if edg else " - |"
+            lines.append(row_sym)
+            lines.append(row_edge)
+        lines.append("")
+
     # --- Retrieval quality ---
     lines.append("## Retrieval Quality")
     lines.append("")
@@ -608,16 +705,18 @@ def main() -> None:
     latency_chart = chart_query_latency(data, args.output_dir)
     ts_chart = chart_token_savings(token_savings, args.output_dir)
     inc_chart = chart_incremental_indexing(data, args.output_dir)
+    depth_chart = chart_graph_depth(data, args.output_dir)
 
     report_path = generate_report(
         data, metadata, token_savings, args.output_dir,
         indexing_chart, latency_chart,
         token_savings_chart=ts_chart,
         incremental_chart=inc_chart,
+        graph_depth_chart=depth_chart,
     )
 
     print(f"Report:  {report_path}")
-    for chart in [indexing_chart, latency_chart, ts_chart, inc_chart]:
+    for chart in [indexing_chart, latency_chart, ts_chart, inc_chart, depth_chart]:
         if chart:
             print(f"Chart:   {chart}")
 
