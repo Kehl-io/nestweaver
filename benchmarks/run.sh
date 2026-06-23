@@ -220,6 +220,22 @@ for name in $REPO_NAMES; do
 done
 
 # ---------------------------------------------------------------------------
+# 6b. Run Graphify's own benchmark (for comparison with their claims)
+# ---------------------------------------------------------------------------
+info "Running Graphify's self-benchmark..."
+for name in $REPO_NAMES; do
+    graph_file="$RESULTS_DIR/${name}-graphify-graph.json"
+    if [[ -f "$graph_file" ]]; then
+        info "  [graphify benchmark] $name"
+        "$GRAPHIFY_BIN" benchmark "$graph_file" > "$RESULTS_DIR/${name}-graphify-benchmark.txt" 2>&1 || true
+        # Show the key stat
+        grep -i "reduction\|fewer\|ratio\|savings" "$RESULTS_DIR/${name}-graphify-benchmark.txt" 2>/dev/null || true
+    else
+        warn "  Skipping graphify benchmark for $name (no graph.json)"
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # 7. Token savings
 # ---------------------------------------------------------------------------
 info "Measuring token savings..."

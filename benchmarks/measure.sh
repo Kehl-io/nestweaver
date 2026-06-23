@@ -178,8 +178,10 @@ benchmark_nestweaver() {
 import json, sys
 try:
     d = json.load(sys.stdin)
-    r = d if isinstance(d, list) else d.get('results', d.get('matches', []))
-    print(len(r) if isinstance(r, list) else 0)
+    if isinstance(d, list):
+        print(len(d))
+    else:
+        print(len(d.get('results', d.get('matches', []))))
 except: print(0)
 " 2>/dev/null || echo 0)
             fi
@@ -202,7 +204,7 @@ except: print(0)
     # Context queries → nestweaver context (structural graph traversal)
     while IFS= read -r query; do
         local latencies=()
-        local seeds=0 connected=0
+        local seeds=0 connected=0 unique_files=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
@@ -214,15 +216,25 @@ except: print(0)
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print(d.get('seeds', d.get('seed_count', len(d.get('results', [])))))
+    print(len(d.get('seeds', [])))
 except: print(0)
 " 2>/dev/null || echo 0)
                 connected=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
-    r = d.get('results', d.get('nodes', []))
-    print(len(r) if isinstance(r, list) else 0)
+    print(len(d.get('connected', [])))
+except: print(0)
+" 2>/dev/null || echo 0)
+                unique_files=$(echo "$CAPTURED_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    files = set()
+    for n in d.get('connected', []) + d.get('seeds', []):
+        fp = n.get('file_path', '')
+        if fp: files.add(fp)
+    print(len(files))
 except: print(0)
 " 2>/dev/null || echo 0)
             fi
@@ -238,8 +250,8 @@ except: print(0)
         runs_json=$(printf '%s,' "${latencies[@]}")
         runs_json="[${runs_json%,}]"
 
-        query_results+=("{\"query\": $q_json, \"kind\": \"context\", \"latency_median_ms\": $lat_median, \"seeds\": $seeds, \"connected\": $connected, \"runs\": $runs_json}")
-        info "    context '$query': ${lat_median}ms (seeds=$seeds, connected=$connected)"
+        query_results+=("{\"query\": $q_json, \"kind\": \"context\", \"latency_median_ms\": $lat_median, \"seeds\": $seeds, \"connected\": $connected, \"unique_files\": $unique_files, \"runs\": $runs_json}")
+        info "    context '$query': ${lat_median}ms (seeds=$seeds, connected=$connected, unique_files=$unique_files)"
     done < <(load_queries "$name" "context")
 
     # Stop the per-repo daemon
@@ -306,6 +318,9 @@ benchmark_graphify() {
     local index_median
     index_median=$(median "${index_times[@]}")
 
+    # Preserve graph.json for later graphify benchmark
+    cp "$graph_file" "$RESULTS_DIR/${name}-graphify-graph.json" 2>/dev/null || true
+
     # --- Graph depth stats (parse graph.json) ---
     local symbol_count edge_count
     symbol_count=$(python3 -c "import json; d=json.load(open('$graph_file')); print(len(d.get('nodes',[])))" 2>/dev/null || echo 0)
@@ -326,7 +341,7 @@ benchmark_graphify() {
 
     while IFS= read -r query; do
         local latencies=()
-        local results=0
+        local results=0 noise=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
@@ -334,8 +349,9 @@ benchmark_graphify() {
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                # Graphify outputs text, not JSON — count non-empty lines as results
-                results=$(echo "$CAPTURED_OUTPUT" | grep -c '[^[:space:]]' || echo 0)
+                # Graphify outputs text — NODE lines are actual results
+                results=$(echo "$CAPTURED_OUTPUT" | grep -c '^NODE ' || echo 0)
+                noise=$(echo "$CAPTURED_OUTPUT" | grep '^NODE' | grep 'src= ' | wc -l | tr -d ' ')
             fi
         done
 
@@ -348,8 +364,8 @@ benchmark_graphify() {
         runs_json=$(printf '%s,' "${latencies[@]}")
         runs_json="[${runs_json%,}]"
 
-        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
-        info "    query '$query': ${lat_median}ms"
+        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"noise_nodes\": $noise, \"runs\": $runs_json}")
+        info "    query '$query': ${lat_median}ms (results=$results, noise=$noise)"
     done < <(load_queries "$name" "search"; load_queries "$name" "context")
 
     local p50 p95
