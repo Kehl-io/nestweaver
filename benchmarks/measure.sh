@@ -143,8 +143,10 @@ benchmark_nestweaver() {
 
     # Start a daemon for this DB (isolated from user's daemon)
     "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
+    sleep 2  # give launchd daemon time to bind socket
     # Warm-up: 3 throwaway queries so daemon caches are hot
     for ((w = 0; w < 3; w++)); do
+        "$nw" search --db "$db" --json "warmup" >/dev/null 2>&1 || true
         "$nw" context --db "$db" --json "warmup" >/dev/null 2>&1 || true
     done
 
@@ -287,7 +289,7 @@ benchmark_graphify() {
     for ((i = 1; i <= NUM_RUNS; i++)); do
         rm -rf "$repo_path/graphify-out"
         local ms
-        ms=$(time_ms "$GRAPHIFY_BIN" update "$repo_path" --force --no-cluster --no-viz)
+        ms=$(time_ms "$GRAPHIFY_BIN" update "$repo_path" --force --no-cluster)
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
