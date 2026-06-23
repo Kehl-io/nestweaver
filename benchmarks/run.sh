@@ -40,7 +40,7 @@ check_dep() {
 }
 
 cleanup() {
-    info "Cleaning up benchmark daemon…"
+    info "Cleaning up benchmark daemon..."
     if [[ -n "${BENCH_NESTWEAVER:-}" ]] && [[ -x "$BENCH_NESTWEAVER" ]]; then
         "$BENCH_NESTWEAVER" daemon stop --quiet 2>/dev/null || true
     fi
@@ -50,7 +50,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 1. Check dependencies
 # ---------------------------------------------------------------------------
-info "Checking dependencies…"
+info "Checking dependencies..."
 for dep in python3 git cargo jq curl; do
     check_dep "$dep"
 done
@@ -67,7 +67,7 @@ for r in data['repos']:
 ")
 REPO_NAMES=$(echo "$REPO_DATA" | awk '{print $1}')
 
-info "Cloning repos (shallow, --depth 1)…"
+info "Cloning repos (shallow, --depth 1)..."
 echo "$REPO_DATA" | while read -r name url; do
     dest="$REPOS_DIR/$name"
     if [[ -d "$dest/.git" ]]; then
@@ -81,7 +81,7 @@ done
 # ---------------------------------------------------------------------------
 # 3. Build NestWeaver to local prefix (isolated from global install)
 # ---------------------------------------------------------------------------
-info "Building NestWeaver from source (isolated to $LOCAL_PREFIX)…"
+info "Building NestWeaver from source (isolated to $LOCAL_PREFIX)..."
 FEATURES="embed"
 if [[ "$(uname -s)" == "Darwin" ]] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q Apple; then
     FEATURES="embed,metal"
@@ -97,7 +97,7 @@ export BENCH_NESTWEAVER
 # ---------------------------------------------------------------------------
 # 4. Install competitors (all isolated under BENCH_ROOT)
 # ---------------------------------------------------------------------------
-info "Installing competitors…"
+info "Installing competitors..."
 
 # Python venv for benchmark scripts (charts, token_savings)
 BENCH_VENV="$VENVS_DIR/bench"
@@ -134,7 +134,7 @@ export GRAPHIFY_BIN GITNEXUS_BIN
 # ---------------------------------------------------------------------------
 # 5. Record metadata
 # ---------------------------------------------------------------------------
-info "Recording metadata…"
+info "Recording metadata..."
 METADATA="$RESULTS_DIR/metadata.json"
 
 REPO_META=$(python3 -c "
@@ -194,10 +194,10 @@ print('  Wrote', '$METADATA')
 # ---------------------------------------------------------------------------
 # 6. Source measure.sh and run benchmarks
 # ---------------------------------------------------------------------------
-info "Loading measurement functions…"
+info "Loading measurement functions..."
 source "$SCRIPT_DIR/measure.sh"
 
-info "Running benchmarks ($NUM_RUNS runs per measurement)…"
+info "Running benchmarks ($NUM_RUNS runs per measurement)..."
 for name in $REPO_NAMES; do
     repo_path="$REPOS_DIR/$name"
     info "━━━ $name ━━━"
@@ -222,7 +222,7 @@ done
 # ---------------------------------------------------------------------------
 # 7. Token savings
 # ---------------------------------------------------------------------------
-info "Measuring token savings…"
+info "Measuring token savings..."
 "$BENCH_PYTHON" "$SCRIPT_DIR/token_savings.py" \
     --queries "$QUERIES" \
     --index-dir "$INDEX_DIR" \
@@ -234,7 +234,7 @@ info "Measuring token savings…"
 # ---------------------------------------------------------------------------
 # 8. Generate report
 # ---------------------------------------------------------------------------
-info "Generating report and charts…"
+info "Generating report and charts..."
 "$BENCH_PYTHON" "$SCRIPT_DIR/charts.py" \
     --results-dir "$RESULTS_DIR" \
     --output-dir "$REPORT_DIR"
