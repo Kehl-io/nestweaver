@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# run.sh — NestWeaver benchmark orchestrator
+# Fully re-runnable; everything lives under /tmp/nestweaver-bench/.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+QUERIES="$SCRIPT_DIR/queries.json"
+
+# ---------------------------------------------------------------------------
+# Directories
+# ---------------------------------------------------------------------------
+BENCH_ROOT="/tmp/nestweaver-bench"
+REPOS_DIR="$BENCH_ROOT/repos"
+INDEX_DIR="$BENCH_ROOT/indexes"
+RESULTS_DIR="$BENCH_ROOT/results"
+REPORT_DIR="$BENCH_ROOT/report"
+VENVS_DIR="$BENCH_ROOT/venvs"
+NODE_DIR="$BENCH_ROOT/node"
+BIN_DIR="$BENCH_ROOT/bin"
+
+mkdir -p "$REPOS_DIR" "$INDEX_DIR" "$RESULTS_DIR" "$REPORT_DIR" \
+         "$VENVS_DIR" "$NODE_DIR" "$BIN_DIR"
+
+NUM_RUNS="${NUM_RUNS:-3}"
+export NUM_RUNS REPOS_DIR INDEX_DIR RESULTS_DIR REPORT_DIR BIN_DIR BENCH_ROOT QUERIES REPO_ROOT
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+info()  { printf '\033[1;34m[bench]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[bench]\033[0m %s\n' "$*"; }
+die()   { printf '\033[1;31m[bench]\033[0m %s\n' "$*" >&2; exit 1; }
+
+check_dep() {
+    command -v "$1" &>/dev/null || die "Missing dependency: $1"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Check dependencies
+# ---------------------------------------------------------------------------
+info "Checking dependencies…"
+for dep in python3 pip3 npm git cargo jq; do
+    check_dep "$dep"
+done
+
+# ---------------------------------------------------------------------------
+# 2. Clone repos (shallow, skip if present)
+# ---------------------------------------------------------------------------
+declare -A REPO_URLS=(
+    [linux]="https://github.com/torvalds/linux.git"
+    [kubernetes]="https://github.com/kubernetes/kubernetes.git"
+    [react]="https://github.com/facebook/react.git"
+    [rust]="https://github.com/rust-lang/rust.git"
+    [nextjs]="https://github.com/vercel/next.js.git"
+)
+
+REPO_NAMES=$(python3 -c "
+import json, sys
+data = json.load(open('$QUERIES'))
+for r in data['repos']:
+    print(r['name'])
+")
+
+info "Cloning repos (shallow, --depth 1)…"
+for name in $REPO_NAMES; do
+    url="${REPO_URLS[$name]}"
+    dest="$REPOS_DIR/$name"
+    if [[ -d "$dest/.git" ]]; then
+        info "  $name — already cloned, skipping"
+    else
+        info "  $name — cloning from $url"
+        git clone --depth 1 "$url" "$dest"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 3. Install NestWeaver
+# ---------------------------------------------------------------------------
+info "Installing NestWeaver from source…"
+cargo install --path "$REPO_ROOT" --features embed,metal 2>&1 | tail -1
+NESTWEAVER_BIN="$(command -v nestweaver)"
+info "  nestweaver at $NESTWEAVER_BIN"
+
+# ---------------------------------------------------------------------------
+# 4. Install competitors (isolated)
+# ---------------------------------------------------------------------------
+info "Installing competitors…"
+
+# Graphify — Python venv
+GRAPHIFY_VENV="$VENVS_DIR/graphify"
+if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]] && [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
+    python3 -m venv "$GRAPHIFY_VENV"
+fi
+"$GRAPHIFY_VENV/bin/pip" install --quiet graphify 2>/dev/null || warn "  graphify pip install failed (may not exist yet)"
+GRAPHIFY_BIN="$GRAPHIFY_VENV/bin/graphify"
+
+# GitNexus — npm
+GITNEXUS_DIR="$NODE_DIR/gitnexus"
+if [[ ! -d "$GITNEXUS_DIR/node_modules/gitnexus" ]]; then
+    npm install --prefix "$GITNEXUS_DIR" gitnexus 2>/dev/null || warn "  gitnexus npm install failed (may not exist yet)"
+fi
+GITNEXUS_BIN="$GITNEXUS_DIR/node_modules/.bin/gitnexus"
+
+# Codebase-Memory-MCP — download binary
+CBMCP_BIN="$BIN_DIR/codebase-memory-mcp"
+if [[ ! -x "$CBMCP_BIN" ]]; then
+    ARCH=$(uname -m)
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    CBMCP_URL="https://github.com/nicobailon/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-${OS}-${ARCH}"
+    curl -fsSL -o "$CBMCP_BIN" "$CBMCP_URL" 2>/dev/null && chmod +x "$CBMCP_BIN" \
+        || warn "  codebase-memory-mcp download failed (may not exist yet)"
+fi
+
+export GRAPHIFY_BIN GITNEXUS_BIN CBMCP_BIN
+
+# ---------------------------------------------------------------------------
+# 5. Record metadata
+# ---------------------------------------------------------------------------
+info "Recording metadata…"
+METADATA="$RESULTS_DIR/metadata.json"
+
+# Collect repo SHAs and file counts
+REPO_META=$(python3 -c "
+import json, subprocess, os
+repos_dir = '$REPOS_DIR'
+data = json.load(open('$QUERIES'))
+meta = []
+for r in data['repos']:
+    name = r['name']
+    repo_path = os.path.join(repos_dir, name)
+    sha = subprocess.check_output(
+        ['git', '-C', repo_path, 'rev-parse', 'HEAD'],
+        text=True
+    ).strip()
+    file_count = int(subprocess.check_output(
+        ['git', '-C', repo_path, 'ls-files'],
+        text=True
+    ).count('\n'))
+    line_count_raw = subprocess.run(
+        ['git', '-C', repo_path, 'ls-files', '-z'],
+        capture_output=True
+    ).stdout
+    # Count lines across all tracked files (best effort)
+    try:
+        line_count = int(subprocess.check_output(
+            'git -C \"{}\" ls-files | head -1000 | xargs -I{{}} wc -l \"{}}/{{}}\" 2>/dev/null | tail -1'.format(repo_path, repo_path),
+            shell=True, text=True, timeout=120
+        ).strip().split()[0])
+    except Exception:
+        line_count = 0
+    meta.append({
+        'name': name,
+        'description': r['description'],
+        'sha': sha,
+        'file_count': file_count,
+        'line_count_sample': line_count
+    })
+print(json.dumps(meta))
+")
+
+# Hardware info
+HW_CORES=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "unknown")
+HW_MEM=$(python3 -c "
+import os
+try:
+    import subprocess
+    mem = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], text=True).strip()
+    print(f'{int(mem) // (1024**3)} GB')
+except Exception:
+    print('unknown')
+")
+HW_ARCH=$(uname -m)
+OS_INFO=$(uname -rs)
+
+NW_VERSION=$(nestweaver --version 2>/dev/null || echo "dev")
+
+python3 -c "
+import json
+metadata = {
+    'date': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'hardware': {
+        'cores': '$HW_CORES',
+        'memory': '$HW_MEM',
+        'arch': '$HW_ARCH'
+    },
+    'os': '$OS_INFO',
+    'nestweaver_version': '$NW_VERSION',
+    'num_runs': $NUM_RUNS,
+    'repos': $REPO_META
+}
+with open('$METADATA', 'w') as f:
+    json.dump(metadata, f, indent=2)
+print('  Wrote', '$METADATA')
+"
+
+# ---------------------------------------------------------------------------
+# 6. Source measure.sh and run benchmarks
+# ---------------------------------------------------------------------------
+info "Loading measurement functions…"
+source "$SCRIPT_DIR/measure.sh"
+
+info "Running benchmarks ($NUM_RUNS runs per measurement)…"
+for name in $REPO_NAMES; do
+    repo_path="$REPOS_DIR/$name"
+    info "━━━ $name ━━━"
+
+    benchmark_nestweaver "$name" "$repo_path"
+
+    if [[ -x "$GRAPHIFY_BIN" ]]; then
+        benchmark_graphify "$name" "$repo_path"
+    else
+        warn "  Skipping graphify (not installed)"
+    fi
+
+    if [[ -x "$GITNEXUS_BIN" ]]; then
+        benchmark_gitnexus "$name" "$repo_path"
+    else
+        warn "  Skipping gitnexus (not installed)"
+    fi
+
+    if [[ -x "$CBMCP_BIN" ]]; then
+        benchmark_cbmcp "$name" "$repo_path"
+    else
+        warn "  Skipping codebase-memory-mcp (not installed)"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 7. Token savings
+# ---------------------------------------------------------------------------
+info "Measuring token savings…"
+python3 "$SCRIPT_DIR/token_savings.py" \
+    --results "$RESULTS_DIR/metadata.json" \
+    --output "$RESULTS_DIR/token-savings.json" \
+    || warn "Token savings measurement failed (non-fatal)"
+
+# ---------------------------------------------------------------------------
+# 8. Generate report
+# ---------------------------------------------------------------------------
+info "Generating report and charts…"
+python3 "$SCRIPT_DIR/charts.py" \
+    --results-dir "$RESULTS_DIR" \
+    --output-dir "$REPORT_DIR"
+
+# ---------------------------------------------------------------------------
+# 9. Summary
+# ---------------------------------------------------------------------------
+echo ""
+info "━━━ Benchmark complete ━━━"
+info "Results:  $RESULTS_DIR/"
+info "Report:   $REPORT_DIR/benchmark-report.md"
+info "Charts:   $REPORT_DIR/*.svg"
+echo ""
+if [[ -f "$REPORT_DIR/benchmark-report.md" ]]; then
+    head -30 "$REPORT_DIR/benchmark-report.md"
+fi
