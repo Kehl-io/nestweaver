@@ -128,7 +128,7 @@ benchmark_nestweaver() {
     # --- Incremental indexing (modify one file, re-index) ---
     local incremental_times=()
     local touch_file
-    touch_file=$(cd "$repo_path" && git ls-files | head -20 | tail -1)
+    touch_file=$(cd "$repo_path" && git ls-files 2>/dev/null | head -20 | tail -1 || true)
     for ((i = 1; i <= NUM_RUNS; i++)); do
         touch "$repo_path/$touch_file"
         local ms
