@@ -7,7 +7,7 @@
 # Helpers
 # ---------------------------------------------------------------------------
 
-# time_ms CMD [ARGS…] — run a command and print elapsed wall-clock milliseconds
+# time_ms CMD [ARGS...] — run a command and print elapsed wall-clock milliseconds
 time_ms() {
     local start end
     start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
@@ -16,7 +16,7 @@ time_ms() {
     echo $(( (end - start) / 1000000 ))
 }
 
-# time_ms_capture CMD [ARGS…] — like time_ms but captures stdout into $CAPTURED_OUTPUT
+# time_ms_capture CMD [ARGS...] — like time_ms but captures stdout into $CAPTURED_OUTPUT
 CAPTURED_OUTPUT=""
 time_ms_capture() {
     local start end tmpfile
@@ -29,7 +29,7 @@ time_ms_capture() {
     echo $(( (end - start) / 1000000 ))
 }
 
-# median VAL1 VAL2 VAL3 … — print the median of integer arguments
+# median VAL1 VAL2 VAL3 ... — print the median of integer arguments
 median() {
     python3 -c "
 import sys
@@ -44,7 +44,7 @@ else:
 " "$@"
 }
 
-# percentile P VAL1 VAL2 … — print the Pth percentile
+# percentile P VAL1 VAL2 ... — print the Pth percentile
 percentile() {
     local p="$1"; shift
     python3 -c "
@@ -104,7 +104,7 @@ benchmark_nestweaver() {
     local result_file="$RESULTS_DIR/${name}-nestweaver.json"
     local nw="$BENCH_NESTWEAVER"
 
-    info "  [nestweaver] benchmarking $name…"
+    info "  [nestweaver] benchmarking $name..."
 
     # --- Indexing (NUM_RUNS, fresh each time) ---
     local index_times=()
@@ -138,7 +138,7 @@ benchmark_nestweaver() {
     info "    incremental median: ${incremental_median}ms"
 
     # --- Embed symbols (local model + Metal GPU) ---
-    info "    embedding symbols…"
+    info "    embedding symbols..."
     "$nw" embed --db "$db" --quiet 2>/dev/null || warn "    embedding failed (non-fatal)"
 
     # --- Index size on disk (after embedding) ---
@@ -287,7 +287,7 @@ benchmark_graphify() {
     local graph_file="$repo_path/graphify-out/graph.json"
     local result_file="$RESULTS_DIR/${name}-graphify.json"
 
-    info "  [graphify] benchmarking $name…"
+    info "  [graphify] benchmarking $name..."
 
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
@@ -377,7 +377,7 @@ benchmark_gitnexus() {
     local name="$1" repo_path="$2"
     local result_file="$RESULTS_DIR/${name}-gitnexus.json"
 
-    info "  [gitnexus] benchmarking $name…"
+    info "  [gitnexus] benchmarking $name..."
 
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
