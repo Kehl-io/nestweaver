@@ -11512,10 +11512,11 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
-            // Resolve instance ID
-            let instance_id = instance
-                .or_else(|| cfg.as_ref().map(|c| c.instance_id.clone()))
-                .unwrap_or_else(|| "standalone".to_string());
+            // Resolve instance ID using the same hash-based algorithm the daemon uses,
+            // so the filter matches how repos are actually stored.
+            let instance_id = instance.unwrap_or_else(|| {
+                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
+            });
 
             // Fetch repos via daemon RPC (preferred) or direct store open (fallback).
             let repos: Vec<nestweaver_schema::Repo> = {
@@ -11524,7 +11525,8 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 if let Some(value) =
                     try_daemon_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
                 {
-                    serde_json::from_value(value).unwrap_or_default()
+                    serde_json::from_value(value)
+                        .context("failed to deserialize repos from daemon response")?
                 } else {
                     let store = GraphStore::open_read_only(&db_path)
                         .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
