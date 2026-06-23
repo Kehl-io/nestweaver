@@ -11579,10 +11579,11 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             };
             let effective_hash = nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
 
-            // Embedding info
+            // Embedding info — use [embedding].model_id (local sentence-transformer),
+            // not [inference].embedding_model (remote Ollama model name).
             let embedding_model_id = cfg
                 .as_ref()
-                .map(|c| c.inference.embedding_model.clone())
+                .map(|c| c.embedding.model_id.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
             // Timestamp (RFC3339 UTC)
