@@ -883,3 +883,140 @@ fn daemon_status_accepts_db_after_subcommand() {
         "daemon status should accept --db after subcommand, got: {stderr}"
     );
 }
+
+#[test]
+fn cli_snapshot_stamp_has_repos_and_correct_embedding_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    let snapshot_dir = dir.path().join("snapshot-out");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Create a minimal git repo
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // Index
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Write a config file with a known embedding model_id
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "test-instance"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[embedding]
+model_id = "sentence-transformers/all-MiniLM-L6-v2"
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    // Build snapshot with --config so embedding_model_id is populated
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "build",
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_path.display().to_string(),
+            "--output",
+            &snapshot_dir.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Parse stamp.json and verify
+    let stamp_json = std::fs::read_to_string(snapshot_dir.join("stamp.json"))
+        .expect("stamp.json should exist");
+    let stamp: serde_json::Value =
+        serde_json::from_str(&stamp_json).expect("stamp.json should be valid JSON");
+
+    // Bug 1a: repos should NOT be empty — we indexed one repo
+    let repos = stamp["repos"].as_array().expect("repos should be an array");
+    assert!(
+        !repos.is_empty(),
+        "stamp.json repos should not be empty after indexing a repo"
+    );
+
+    // The repo URL should match the repo we indexed
+    let repo_url = repos[0]["url"].as_str().unwrap();
+    assert!(
+        repo_url.contains("repo"),
+        "repo URL '{repo_url}' should reference the indexed repo"
+    );
+
+    // Bug 1b: embedding_model_id should come from [embedding], not [inference]
+    let model_id = stamp["embedding_model_id"]
+        .as_str()
+        .expect("embedding_model_id should be a string");
+    assert_eq!(
+        model_id, "sentence-transformers/all-MiniLM-L6-v2",
+        "embedding_model_id should come from [embedding].model_id, not [inference].embedding_model"
+    );
+    assert_ne!(
+        model_id, "nomic-embed-text",
+        "embedding_model_id should NOT be the inference model"
+    );
+}

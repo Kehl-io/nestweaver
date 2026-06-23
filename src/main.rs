@@ -11528,9 +11528,12 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                     serde_json::from_value(value)
                         .context("failed to deserialize repos from daemon response")?
                 } else {
+                    // No daemon: read directly from the store. The CLI `index` command
+                    // stores repos with instance_id = "default", not the hash-based id
+                    // used by the daemon, so pass None to return all repos.
                     let store = GraphStore::open_read_only(&db_path)
                         .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
-                    nestweaver_engine::list_repos(&store, Some(&instance_id))?
+                    nestweaver_engine::list_repos(&store, None)?
                 }
             };
 
