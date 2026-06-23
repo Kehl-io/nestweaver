@@ -105,7 +105,7 @@ benchmark_nestweaver() {
         mkdir -p "$db_dir"
         local db="$db_dir/bench.lbug"
         local ms
-        ms=$(time_ms env NESTWEAVER_NO_DAEMON=1 nestweaver index --db "$db" "$repo_path")
+        ms=$(time_ms nestweaver index --db "$db" --repo "$repo_path")
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
@@ -125,7 +125,7 @@ benchmark_nestweaver() {
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture env NESTWEAVER_NO_DAEMON=1 nestweaver --no-daemon context --db "$db" --json "$query")
+            ms=$(time_ms_capture nestweaver context --db "$db" --json "$query")
             latencies+=("$ms")
 
             # Parse seeds/connected from first run
