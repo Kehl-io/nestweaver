@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # measure.sh — benchmark measurement functions, sourced by run.sh
-# Requires: REPOS_DIR, INDEX_DIR, RESULTS_DIR, QUERIES, NUM_RUNS,
-#           GRAPHIFY_BIN, GITNEXUS_BIN, CBMCP_BIN
+# Requires: BENCH_NESTWEAVER, REPOS_DIR, INDEX_DIR, RESULTS_DIR, QUERIES,
+#           NUM_RUNS, GRAPHIFY_BIN, GITNEXUS_BIN, CBMCP_BIN
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,7 +20,7 @@ time_ms() {
 CAPTURED_OUTPUT=""
 time_ms_capture() {
     local start end tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(mktemp "$BENCH_ROOT/tmp.XXXXXX")
     start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
     "$@" >"$tmpfile" 2>/dev/null || true
     end=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
@@ -78,8 +78,8 @@ load_queries() {
         field="exact_queries"
     fi
     python3 -c "
-import json
-data = json.load(open('$QUERIES'))
+import json, os
+data = json.load(open(os.environ['QUERIES']))
 for r in data['repos']:
     if r['name'] == '$repo_name':
         for q in r['$field']:
@@ -88,13 +88,21 @@ for r in data['repos']:
 "
 }
 
+# json_quote STRING — safely JSON-encode a string
+json_quote() {
+    python3 -c "import json,os,sys; print(json.dumps(sys.argv[1]))" "$1"
+}
+
 # ---------------------------------------------------------------------------
 # benchmark_nestweaver REPO_NAME REPO_PATH
+# Uses daemon mode with Metal GPU acceleration via the isolated build.
+# Each repo gets its own DB, so the benchmark daemon is per-repo.
 # ---------------------------------------------------------------------------
 benchmark_nestweaver() {
     local name="$1" repo_path="$2"
     local db_dir="$INDEX_DIR/nestweaver-$name"
     local result_file="$RESULTS_DIR/${name}-nestweaver.json"
+    local nw="$BENCH_NESTWEAVER"
 
     info "  [nestweaver] benchmarking $name…"
 
@@ -105,30 +113,72 @@ benchmark_nestweaver() {
         mkdir -p "$db_dir"
         local db="$db_dir/bench.lbug"
         local ms
-        ms=$(time_ms nestweaver index --db "$db" --repo "$repo_path")
+        ms=$(time_ms "$nw" index --db "$db" --repo "$repo_path")
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
     local index_median
     index_median=$(median "${index_times[@]}")
 
-    # Ensure a DB exists for queries
     local db="$db_dir/bench.lbug"
+
+    # Start a daemon for this DB (isolated from user's daemon)
+    "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
+    # Warm-up: 3 throwaway queries so daemon caches are hot
+    for ((w = 0; w < 3; w++)); do
+        "$nw" context --db "$db" --json "warmup" >/dev/null 2>&1 || true
+    done
 
     # --- Queries ---
     local all_latencies=()
     local query_results=()
 
+    # NL queries → nestweaver search (text/semantic matching)
+    while IFS= read -r query; do
+        local latencies=()
+        local result_count=0
+
+        for ((i = 1; i <= NUM_RUNS; i++)); do
+            local ms
+            ms=$(time_ms_capture "$nw" search --db "$db" --json "$query")
+            latencies+=("$ms")
+
+            if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
+                result_count=$(echo "$CAPTURED_OUTPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    r = d if isinstance(d, list) else d.get('results', d.get('matches', []))
+    print(len(r) if isinstance(r, list) else 0)
+except: print(0)
+" 2>/dev/null || echo 0)
+            fi
+        done
+
+        local lat_median
+        lat_median=$(median "${latencies[@]}")
+        all_latencies+=("${latencies[@]}")
+
+        local q_json
+        q_json=$(json_quote "$query")
+        local runs_json
+        runs_json=$(printf '%s,' "${latencies[@]}")
+        runs_json="[${runs_json%,}]"
+
+        query_results+=("{\"query\": $q_json, \"kind\": \"nl\", \"latency_median_ms\": $lat_median, \"results\": $result_count, \"runs\": $runs_json}")
+        info "    search '$query': ${lat_median}ms (results=$result_count)"
+    done < <(load_queries "$name" "nl")
+
+    # Exact queries → nestweaver context (structural graph traversal)
     while IFS= read -r query; do
         local latencies=()
         local seeds=0 connected=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture nestweaver context --db "$db" --json "$query")
+            ms=$(time_ms_capture "$nw" context --db "$db" --json "$query")
             latencies+=("$ms")
 
-            # Parse seeds/connected from first run
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 seeds=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
@@ -152,18 +202,18 @@ except: print(0)
         lat_median=$(median "${latencies[@]}")
         all_latencies+=("${latencies[@]}")
 
-        query_results+=("$(python3 -c "
-import json
-print(json.dumps({
-    'query': $(python3 -c "import json; print(json.dumps('$query'))"),
-    'latency_median_ms': $lat_median,
-    'seeds': $seeds,
-    'connected': $connected,
-    'runs': [${latencies[*]// /,}]
-}))
-")")
-        info "    query '$query': ${lat_median}ms (seeds=$seeds, connected=$connected)"
-    done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
+        local q_json
+        q_json=$(json_quote "$query")
+        local runs_json
+        runs_json=$(printf '%s,' "${latencies[@]}")
+        runs_json="[${runs_json%,}]"
+
+        query_results+=("{\"query\": $q_json, \"kind\": \"exact\", \"latency_median_ms\": $lat_median, \"seeds\": $seeds, \"connected\": $connected, \"runs\": $runs_json}")
+        info "    context '$query': ${lat_median}ms (seeds=$seeds, connected=$connected)"
+    done < <(load_queries "$name" "exact")
+
+    # Stop the per-repo daemon
+    "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
 
     # Compute p50/p95 across all query latencies
     local p50 p95
@@ -171,16 +221,23 @@ print(json.dumps({
     p95=$(percentile 95 "${all_latencies[@]}")
 
     # Write result
+    local queries_json
+    queries_json=$(printf '%s,' "${query_results[@]}")
+    queries_json="[${queries_json%,}]"
+    local index_runs_json
+    index_runs_json=$(printf '%s,' "${index_times[@]}")
+    index_runs_json="[${index_runs_json%,}]"
+
     python3 -c "
 import json
 result = {
     'tool': 'nestweaver',
     'repo': '$name',
     'index_median_ms': $index_median,
-    'index_runs': [${index_times[*]// /,}],
+    'index_runs': $index_runs_json,
     'p50_ms': $p50,
     'p95_ms': $p95,
-    'queries': [$(IFS=,; echo "${query_results[*]}")]
+    'queries': $queries_json
 }
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
@@ -198,7 +255,6 @@ benchmark_graphify() {
 
     info "  [graphify] benchmarking $name…"
 
-    # --- Indexing ---
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
         rm -rf "$index_dir"
@@ -211,13 +267,12 @@ benchmark_graphify() {
     local index_median
     index_median=$(median "${index_times[@]}")
 
-    # --- Queries ---
     local all_latencies=()
     local query_results=()
 
     while IFS= read -r query; do
         local latencies=()
-        local seeds=0 connected=0
+        local results=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
@@ -225,7 +280,7 @@ benchmark_graphify() {
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                seeds=$(echo "$CAPTURED_OUTPUT" | python3 -c "
+                results=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -233,7 +288,6 @@ try:
     print(len(r))
 except: print(0)
 " 2>/dev/null || echo 0)
-                connected=$seeds
             fi
         done
 
@@ -241,16 +295,12 @@ except: print(0)
         lat_median=$(median "${latencies[@]}")
         all_latencies+=("${latencies[@]}")
 
-        query_results+=("$(python3 -c "
-import json
-print(json.dumps({
-    'query': $(python3 -c "import json; print(json.dumps('$query'))"),
-    'latency_median_ms': $lat_median,
-    'seeds': $seeds,
-    'connected': $connected,
-    'runs': [${latencies[*]// /,}]
-}))
-")")
+        local q_json runs_json
+        q_json=$(json_quote "$query")
+        runs_json=$(printf '%s,' "${latencies[@]}")
+        runs_json="[${runs_json%,}]"
+
+        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
         info "    query '$query': ${lat_median}ms"
     done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
 
@@ -258,16 +308,22 @@ print(json.dumps({
     p50=$(percentile 50 "${all_latencies[@]}")
     p95=$(percentile 95 "${all_latencies[@]}")
 
+    local queries_json index_runs_json
+    queries_json=$(printf '%s,' "${query_results[@]}")
+    queries_json="[${queries_json%,}]"
+    index_runs_json=$(printf '%s,' "${index_times[@]}")
+    index_runs_json="[${index_runs_json%,}]"
+
     python3 -c "
 import json
 result = {
     'tool': 'graphify',
     'repo': '$name',
     'index_median_ms': $index_median,
-    'index_runs': [${index_times[*]// /,}],
+    'index_runs': $index_runs_json,
     'p50_ms': $p50,
     'p95_ms': $p95,
-    'queries': [$(IFS=,; echo "${query_results[*]}")]
+    'queries': $queries_json
 }
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
@@ -277,42 +333,40 @@ with open('$result_file', 'w') as f:
 
 # ---------------------------------------------------------------------------
 # benchmark_gitnexus REPO_NAME REPO_PATH
+# GitNexus stores its index inside the repo (.gitnexus/), so we operate
+# from within the repo directory.
 # ---------------------------------------------------------------------------
 benchmark_gitnexus() {
     local name="$1" repo_path="$2"
-    local index_dir="$INDEX_DIR/gitnexus-$name"
     local result_file="$RESULTS_DIR/${name}-gitnexus.json"
 
     info "  [gitnexus] benchmarking $name…"
 
-    # --- Indexing ---
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
-        rm -rf "$index_dir"
-        mkdir -p "$index_dir"
+        rm -rf "$repo_path/.gitnexus"
         local ms
-        ms=$(time_ms "$GITNEXUS_BIN" index --output "$index_dir" "$repo_path")
+        ms=$(time_ms "$GITNEXUS_BIN" analyze "$repo_path")
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
     local index_median
     index_median=$(median "${index_times[@]}")
 
-    # --- Queries ---
     local all_latencies=()
     local query_results=()
 
     while IFS= read -r query; do
         local latencies=()
-        local seeds=0 connected=0
+        local results=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
-            ms=$(time_ms_capture "$GITNEXUS_BIN" query --index "$index_dir" --json "$query")
+            ms=$(time_ms_capture "$GITNEXUS_BIN" query "$query" -r "$repo_path")
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                seeds=$(echo "$CAPTURED_OUTPUT" | python3 -c "
+                results=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -320,7 +374,6 @@ try:
     print(len(r))
 except: print(0)
 " 2>/dev/null || echo 0)
-                connected=$seeds
             fi
         done
 
@@ -328,16 +381,12 @@ except: print(0)
         lat_median=$(median "${latencies[@]}")
         all_latencies+=("${latencies[@]}")
 
-        query_results+=("$(python3 -c "
-import json
-print(json.dumps({
-    'query': $(python3 -c "import json; print(json.dumps('$query'))"),
-    'latency_median_ms': $lat_median,
-    'seeds': $seeds,
-    'connected': $connected,
-    'runs': [${latencies[*]// /,}]
-}))
-")")
+        local q_json runs_json
+        q_json=$(json_quote "$query")
+        runs_json=$(printf '%s,' "${latencies[@]}")
+        runs_json="[${runs_json%,}]"
+
+        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
         info "    query '$query': ${lat_median}ms"
     done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
 
@@ -345,16 +394,22 @@ print(json.dumps({
     p50=$(percentile 50 "${all_latencies[@]}")
     p95=$(percentile 95 "${all_latencies[@]}")
 
+    local queries_json index_runs_json
+    queries_json=$(printf '%s,' "${query_results[@]}")
+    queries_json="[${queries_json%,}]"
+    index_runs_json=$(printf '%s,' "${index_times[@]}")
+    index_runs_json="[${index_runs_json%,}]"
+
     python3 -c "
 import json
 result = {
     'tool': 'gitnexus',
     'repo': '$name',
     'index_median_ms': $index_median,
-    'index_runs': [${index_times[*]// /,}],
+    'index_runs': $index_runs_json,
     'p50_ms': $p50,
     'p95_ms': $p95,
-    'queries': [$(IFS=,; echo "${query_results[*]}")]
+    'queries': $queries_json
 }
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
@@ -372,7 +427,6 @@ benchmark_cbmcp() {
 
     info "  [cbmcp] benchmarking $name…"
 
-    # --- Indexing ---
     local index_times=()
     for ((i = 1; i <= NUM_RUNS; i++)); do
         rm -rf "$index_dir"
@@ -385,13 +439,12 @@ benchmark_cbmcp() {
     local index_median
     index_median=$(median "${index_times[@]}")
 
-    # --- Queries ---
     local all_latencies=()
     local query_results=()
 
     while IFS= read -r query; do
         local latencies=()
-        local seeds=0 connected=0
+        local results=0
 
         for ((i = 1; i <= NUM_RUNS; i++)); do
             local ms
@@ -399,7 +452,7 @@ benchmark_cbmcp() {
             latencies+=("$ms")
 
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                seeds=$(echo "$CAPTURED_OUTPUT" | python3 -c "
+                results=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -407,7 +460,6 @@ try:
     print(len(r))
 except: print(0)
 " 2>/dev/null || echo 0)
-                connected=$seeds
             fi
         done
 
@@ -415,16 +467,12 @@ except: print(0)
         lat_median=$(median "${latencies[@]}")
         all_latencies+=("${latencies[@]}")
 
-        query_results+=("$(python3 -c "
-import json
-print(json.dumps({
-    'query': $(python3 -c "import json; print(json.dumps('$query'))"),
-    'latency_median_ms': $lat_median,
-    'seeds': $seeds,
-    'connected': $connected,
-    'runs': [${latencies[*]// /,}]
-}))
-")")
+        local q_json runs_json
+        q_json=$(json_quote "$query")
+        runs_json=$(printf '%s,' "${latencies[@]}")
+        runs_json="[${runs_json%,}]"
+
+        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
         info "    query '$query': ${lat_median}ms"
     done < <(load_queries "$name" "nl"; load_queries "$name" "exact")
 
@@ -432,16 +480,22 @@ print(json.dumps({
     p50=$(percentile 50 "${all_latencies[@]}")
     p95=$(percentile 95 "${all_latencies[@]}")
 
+    local queries_json index_runs_json
+    queries_json=$(printf '%s,' "${query_results[@]}")
+    queries_json="[${queries_json%,}]"
+    index_runs_json=$(printf '%s,' "${index_times[@]}")
+    index_runs_json="[${index_runs_json%,}]"
+
     python3 -c "
 import json
 result = {
     'tool': 'cbmcp',
     'repo': '$name',
     'index_median_ms': $index_median,
-    'index_runs': [${index_times[*]// /,}],
+    'index_runs': $index_runs_json,
     'p50_ms': $p50,
     'p95_ms': $p95,
-    'queries': [$(IFS=,; echo "${query_results[*]}")]
+    'queries': $queries_json
 }
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # run.sh — NestWeaver benchmark orchestrator
-# Fully re-runnable; everything lives under /tmp/nestweaver-bench/.
+# Fully isolated: builds NestWeaver to a local prefix, installs competitors
+# locally, uses a dedicated daemon instance. Nothing touches your global
+# NestWeaver installation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,9 +10,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUERIES="$SCRIPT_DIR/queries.json"
 
 # ---------------------------------------------------------------------------
-# Directories
+# Directories — everything under BENCH_ROOT
 # ---------------------------------------------------------------------------
-BENCH_ROOT="/tmp/nestweaver-bench"
+BENCH_ROOT="${BENCH_ROOT:-/private/tmp/nestweaver-bench}"
 REPOS_DIR="$BENCH_ROOT/repos"
 INDEX_DIR="$BENCH_ROOT/indexes"
 RESULTS_DIR="$BENCH_ROOT/results"
@@ -18,9 +20,10 @@ REPORT_DIR="$BENCH_ROOT/report"
 VENVS_DIR="$BENCH_ROOT/venvs"
 NODE_DIR="$BENCH_ROOT/node"
 BIN_DIR="$BENCH_ROOT/bin"
+LOCAL_PREFIX="$BENCH_ROOT/local"
 
 mkdir -p "$REPOS_DIR" "$INDEX_DIR" "$RESULTS_DIR" "$REPORT_DIR" \
-         "$VENVS_DIR" "$NODE_DIR" "$BIN_DIR"
+         "$VENVS_DIR" "$NODE_DIR" "$BIN_DIR" "$LOCAL_PREFIX"
 
 NUM_RUNS="${NUM_RUNS:-3}"
 export NUM_RUNS REPOS_DIR INDEX_DIR RESULTS_DIR REPORT_DIR BIN_DIR BENCH_ROOT QUERIES REPO_ROOT
@@ -36,13 +39,22 @@ check_dep() {
     command -v "$1" &>/dev/null || die "Missing dependency: $1"
 }
 
+cleanup() {
+    info "Cleaning up benchmark daemon…"
+    if [[ -n "${BENCH_NESTWEAVER:-}" ]] && [[ -x "$BENCH_NESTWEAVER" ]]; then
+        "$BENCH_NESTWEAVER" daemon stop --quiet 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
 # 1. Check dependencies
 # ---------------------------------------------------------------------------
 info "Checking dependencies…"
-for dep in python3 pip3 npm git cargo jq; do
+for dep in python3 git cargo jq curl; do
     check_dep "$dep"
 done
+python3 -m pip --version &>/dev/null || die "Missing dependency: pip (python3 -m pip)"
 
 # ---------------------------------------------------------------------------
 # 2. Clone repos (shallow, skip if present)
@@ -56,7 +68,7 @@ declare -A REPO_URLS=(
 )
 
 REPO_NAMES=$(python3 -c "
-import json, sys
+import json
 data = json.load(open('$QUERIES'))
 for r in data['repos']:
     print(r['name'])
@@ -64,7 +76,10 @@ for r in data['repos']:
 
 info "Cloning repos (shallow, --depth 1)…"
 for name in $REPO_NAMES; do
-    url="${REPO_URLS[$name]}"
+    url="${REPO_URLS[$name]:-}"
+    if [[ -z "$url" ]]; then
+        die "No clone URL for repo '$name' — add it to REPO_URLS in run.sh"
+    fi
     dest="$REPOS_DIR/$name"
     if [[ -d "$dest/.git" ]]; then
         info "  $name — already cloned, skipping"
@@ -75,30 +90,52 @@ for name in $REPO_NAMES; do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Install NestWeaver
+# 3. Build NestWeaver to local prefix (isolated from global install)
 # ---------------------------------------------------------------------------
-info "Installing NestWeaver from source…"
-cargo install --path "$REPO_ROOT" --features embed,metal 2>&1 | tail -1
-NESTWEAVER_BIN="$(command -v nestweaver)"
-info "  nestweaver at $NESTWEAVER_BIN"
+info "Building NestWeaver from source (isolated to $LOCAL_PREFIX)…"
+FEATURES="embed"
+if [[ "$(uname -s)" == "Darwin" ]] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q Apple; then
+    FEATURES="embed,metal"
+    info "  Detected Apple Silicon — enabling Metal GPU acceleration"
+fi
+cargo install --path "$REPO_ROOT" --root "$LOCAL_PREFIX" --features "$FEATURES" 2>&1 | tail -3
+BENCH_NESTWEAVER="$LOCAL_PREFIX/bin/nestweaver"
+[[ -x "$BENCH_NESTWEAVER" ]] || die "Build failed — $BENCH_NESTWEAVER not found"
+NW_VERSION=$("$BENCH_NESTWEAVER" --version 2>/dev/null || echo "dev")
+info "  nestweaver $NW_VERSION at $BENCH_NESTWEAVER"
+export BENCH_NESTWEAVER
 
 # ---------------------------------------------------------------------------
-# 4. Install competitors (isolated)
+# 4. Install competitors (all isolated under BENCH_ROOT)
 # ---------------------------------------------------------------------------
 info "Installing competitors…"
 
+# Python venv for benchmark scripts (charts, token_savings)
+BENCH_VENV="$VENVS_DIR/bench"
+if [[ ! -f "$BENCH_VENV/bin/activate" ]]; then
+    python3 -m venv "$BENCH_VENV"
+fi
+"$BENCH_VENV/bin/pip" install --quiet matplotlib tiktoken 2>/dev/null \
+    || warn "  matplotlib/tiktoken install failed (charts/token-savings may not work)"
+BENCH_PYTHON="$BENCH_VENV/bin/python3"
+export BENCH_PYTHON
+
 # Graphify — Python venv
 GRAPHIFY_VENV="$VENVS_DIR/graphify"
-if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]] && [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
+if [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
     python3 -m venv "$GRAPHIFY_VENV"
 fi
-"$GRAPHIFY_VENV/bin/pip" install --quiet graphify 2>/dev/null || warn "  graphify pip install failed (may not exist yet)"
+"$GRAPHIFY_VENV/bin/pip" install --quiet graphify 2>/dev/null \
+    || warn "  graphify pip install failed (may not exist yet)"
 GRAPHIFY_BIN="$GRAPHIFY_VENV/bin/graphify"
 
-# GitNexus — npm
+# GitNexus — local npm install
 GITNEXUS_DIR="$NODE_DIR/gitnexus"
-if [[ ! -d "$GITNEXUS_DIR/node_modules/gitnexus" ]]; then
-    npm install --prefix "$GITNEXUS_DIR" gitnexus 2>/dev/null || warn "  gitnexus npm install failed (may not exist yet)"
+if [[ ! -d "$GITNEXUS_DIR/node_modules/@anthropic/gitnexus" ]] && \
+   [[ ! -d "$GITNEXUS_DIR/node_modules/gitnexus" ]]; then
+    mkdir -p "$GITNEXUS_DIR"
+    npm install --prefix "$GITNEXUS_DIR" gitnexus 2>/dev/null \
+        || warn "  gitnexus npm install failed (may not exist yet)"
 fi
 GITNEXUS_BIN="$GITNEXUS_DIR/node_modules/.bin/gitnexus"
 
@@ -120,7 +157,6 @@ export GRAPHIFY_BIN GITNEXUS_BIN CBMCP_BIN
 info "Recording metadata…"
 METADATA="$RESULTS_DIR/metadata.json"
 
-# Collect repo SHAs and file counts
 REPO_META=$(python3 -c "
 import json, subprocess, os
 repos_dir = '$REPOS_DIR'
@@ -130,39 +166,22 @@ for r in data['repos']:
     name = r['name']
     repo_path = os.path.join(repos_dir, name)
     sha = subprocess.check_output(
-        ['git', '-C', repo_path, 'rev-parse', 'HEAD'],
-        text=True
+        ['git', '-C', repo_path, 'rev-parse', 'HEAD'], text=True
     ).strip()
-    file_count = int(subprocess.check_output(
-        ['git', '-C', repo_path, 'ls-files'],
-        text=True
-    ).count('\n'))
-    line_count_raw = subprocess.run(
-        ['git', '-C', repo_path, 'ls-files', '-z'],
-        capture_output=True
-    ).stdout
-    # Count lines across all tracked files (best effort)
-    try:
-        line_count = int(subprocess.check_output(
-            'git -C \"{}\" ls-files | head -1000 | xargs -I{{}} wc -l \"{}}/{{}}\" 2>/dev/null | tail -1'.format(repo_path, repo_path),
-            shell=True, text=True, timeout=120
-        ).strip().split()[0])
-    except Exception:
-        line_count = 0
+    file_count = subprocess.check_output(
+        ['git', '-C', repo_path, 'ls-files'], text=True
+    ).count('\n')
     meta.append({
         'name': name,
         'description': r['description'],
         'sha': sha,
         'file_count': file_count,
-        'line_count_sample': line_count
     })
 print(json.dumps(meta))
 ")
 
-# Hardware info
 HW_CORES=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "unknown")
 HW_MEM=$(python3 -c "
-import os
 try:
     import subprocess
     mem = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], text=True).strip()
@@ -172,8 +191,6 @@ except Exception:
 ")
 HW_ARCH=$(uname -m)
 OS_INFO=$(uname -rs)
-
-NW_VERSION=$(nestweaver --version 2>/dev/null || echo "dev")
 
 python3 -c "
 import json
@@ -230,7 +247,7 @@ done
 # 7. Token savings
 # ---------------------------------------------------------------------------
 info "Measuring token savings…"
-python3 "$SCRIPT_DIR/token_savings.py" \
+"$BENCH_PYTHON" "$SCRIPT_DIR/token_savings.py" \
     --results-dir "$RESULTS_DIR" \
     --queries "$QUERIES" \
     --index-dir "$INDEX_DIR" \
@@ -242,7 +259,7 @@ python3 "$SCRIPT_DIR/token_savings.py" \
 # 8. Generate report
 # ---------------------------------------------------------------------------
 info "Generating report and charts…"
-python3 "$SCRIPT_DIR/charts.py" \
+"$BENCH_PYTHON" "$SCRIPT_DIR/charts.py" \
     --results-dir "$RESULTS_DIR" \
     --output-dir "$REPORT_DIR"
 

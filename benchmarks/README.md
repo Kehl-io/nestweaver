@@ -1,54 +1,79 @@
 # NestWeaver Benchmark Suite
 
-Measures query latency, answer quality, and token savings across large, real-world repositories.
+Competitive benchmark comparing NestWeaver against GitNexus, Graphify, and Codebase-Memory-MCP on indexing speed, query latency, and token savings.
 
 ## Quick Start
 
 ```bash
-# Run the full benchmark
-python3 benchmarks/run_benchmarks.py --queries benchmarks/queries.json --output results.json
+# Full run (3 iterations per measurement, ~30-60 min depending on repos)
+benchmarks/run.sh
 
-# Measure token savings
-python3 benchmarks/token_savings.py --results results.json --output benchmarks/token-savings.json
+# Quick single-iteration run
+NUM_RUNS=1 benchmarks/run.sh
 ```
-
-## Metrics
-
-| Metric | Description | Unit |
-|--------|-------------|------|
-| `latency_ms` | Wall-clock time from query submission to first byte of response | milliseconds |
-| `total_latency_ms` | Wall-clock time from query submission to last byte of response | milliseconds |
-| `tokens_in_response` | Tokens in the NestWeaver response (cl100k_base encoding) | tokens |
-| `tokens_in_raw_files` | Tokens across all raw source files that would answer the query | tokens |
-| `token_savings_pct` | `(1 - tokens_in_response / tokens_in_raw_files) * 100` | percent |
-| `recall_at_1` | Whether the top-1 result matches the ground-truth symbol | 0 or 1 |
-| `recall_at_5` | Whether any of the top-5 results match the ground-truth symbol | 0 or 1 |
-
-## Repositories
-
-| Repo | Language | LOC (approx) | Notes |
-|------|----------|---------------|-------|
-| linux | C | ~28 M | Kernel — extremely large, C macros everywhere |
-| kubernetes | Go | ~3 M | Cloud orchestration, heavy interface use |
-| react | JavaScript/TypeScript | ~200 K | UI framework, well-structured packages |
-| rust | Rust | ~1 M | Self-hosting compiler, complex type system |
-| nextjs | TypeScript | ~300 K | Full-stack framework, mixed SSR/client code |
-
-## Requirements
-
-- Python 3.9+
-- `tiktoken` (auto-installed by `token_savings.py` if missing)
-- NestWeaver CLI (`nestweaver`) on `$PATH`
-- Each repo indexed: `nestweaver brain add-source <path> --db $NESTWEAVER_DB`
 
 ## Isolation
 
-Each benchmark run is isolated:
+The suite is fully self-contained — nothing touches your global NestWeaver install:
 
-- Queries are executed sequentially to avoid cache interference between runs.
-- The NestWeaver DB is not modified during a run (read-only queries).
-- OS file-system cache is **not** flushed between queries — results reflect warm-cache performance, which matches typical developer workflows.
-- To measure cold-cache performance, run `sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'` (Linux) before each query.
+- **NestWeaver** is built from source into `/private/tmp/nestweaver-bench/local/` with Metal + embed features
+- **A dedicated daemon** starts per-repo with its own DB socket (your production daemon is untouched)
+- **GitNexus** is installed via npm into a local prefix under the bench root
+- **Python deps** (matplotlib, tiktoken) go into a venv at `venvs/bench/`
+- **All indexes, results, and reports** live under `/private/tmp/nestweaver-bench/`
+
+To clean up everything: `rm -rf /private/tmp/nestweaver-bench/`
+
+## What It Measures
+
+| Metric | NestWeaver command | Description |
+|--------|-------------------|-------------|
+| Fresh indexing | `nestweaver index` | Time to parse + build knowledge graph from scratch |
+| NL query latency | `nestweaver search` | Text/semantic search response time |
+| Exact query latency | `nestweaver context` | Structural graph traversal from seed symbols |
+| Token savings | `token_savings.py` | NestWeaver response tokens vs raw source file tokens |
+
+## Repositories
+
+| Repo | Language | Notes |
+|------|----------|-------|
+| linux | C | Kernel — extremely large, C macros everywhere |
+| kubernetes | Go | Cloud orchestration, heavy interface use |
+| react | JavaScript/TypeScript | UI framework, well-structured packages |
+| rust | Rust | Self-hosting compiler, complex type system |
+| nextjs | TypeScript | Full-stack framework, mixed SSR/client code |
+
+## Output
+
+Results land in `/private/tmp/nestweaver-bench/`:
+
+```
+results/
+  metadata.json               # Hardware, versions, repo SHAs
+  <repo>-nestweaver.json      # Per-repo NestWeaver results
+  <repo>-gitnexus.json        # Per-repo competitor results
+  token-savings.json           # Token comparison data
+report/
+  benchmark-report.md          # Markdown report with tables
+  indexing-speed.svg           # Bar charts
+  query-latency.svg
+```
+
+## Configuration
+
+- **`queries.json`** — repos to benchmark and queries to run (NL + exact per repo)
+- **`NUM_RUNS`** env var — iterations per measurement (default: 3)
+- **`BENCH_ROOT`** env var — override the working directory (default: `/private/tmp/nestweaver-bench`)
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `run.sh` | Orchestrator: clone repos, build tools, run benchmarks, generate report |
+| `measure.sh` | Measurement functions sourced by run.sh |
+| `charts.py` | SVG chart generation + markdown report |
+| `token_savings.py` | Token count comparison (NestWeaver vs raw files) |
+| `queries.json` | Query definitions per repo |
 
 ## Methodology
 
@@ -56,13 +81,12 @@ Each benchmark run is isolated:
 
 For each query we compare:
 
-1. **Raw file tokens** — the total token count of every source file that a developer would need to read to answer the query manually. We identify these files by asking a grader LLM which files are ground-truth relevant, then count all their tokens with tiktoken (`cl100k_base`).
-2. **NestWeaver response tokens** — the token count of the actual response returned by `nestweaver context` or `nestweaver search`.
+1. **Raw file tokens** — total token count of source files in the repo (sampled, cl100k_base encoding)
+2. **NestWeaver response tokens** — token count of the response from `nestweaver context` or `nestweaver search`
 
-Token savings percentage: `(1 - response_tokens / raw_tokens) * 100`.
+Token savings: `(1 - response_tokens / raw_tokens) * 100`
 
-### Recall
+### Query types
 
-Ground-truth symbols for the exact-symbol queries are hand-labelled in `queries.json` (the `exact_queries` lists). Recall is computed by checking whether the labelled symbol appears in the top-k results returned by NestWeaver.
-
-NL query recall is evaluated separately using an LLM judge that scores relevance of each returned result on a 0–2 scale (0 = irrelevant, 1 = partially relevant, 2 = fully relevant). Mean relevance score is reported as `nl_relevance_mean`.
+- **NL queries** ("process scheduler", "hooks implementation") → routed to `nestweaver search` for text/semantic matching
+- **Exact queries** ("createElement", "Schedule") → routed to `nestweaver context` for structural graph traversal from seed symbols
