@@ -175,7 +175,7 @@ benchmark_nestweaver() {
 
     # --- Index size on disk ---
     local index_size_bytes
-    index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+    index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}' || echo 0)
 
     # Warm up daemon for queries. The index and incremental steps
     # auto-start a daemon. Wait until it responds to queries.
@@ -345,6 +345,9 @@ with open('$result_file', 'w') as f:
 # Output goes to <repo>/graphify-out/ by default.
 # ---------------------------------------------------------------------------
 benchmark_graphify() {
+    # Disable errexit inside this function -- graphify commands can return
+    # non-zero on benign conditions (no matches, empty graph, etc.)
+    set +e
     local name="$1" repo_path="$2"
     local graph_file="$repo_path/graphify-out/graph.json"
     local result_file="$RESULTS_DIR/${name}-graphify.json"
@@ -373,7 +376,7 @@ benchmark_graphify() {
 
     # --- Index size on disk ---
     local index_size_bytes
-    index_size_bytes=$(find "$repo_path/graphify-out" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+    index_size_bytes=$(find "$repo_path/graphify-out" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}' || echo 0)
 
     # Warm-up queries
     for ((w = 0; w < 3; w++)); do
@@ -441,6 +444,7 @@ with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
     info "  [graphify] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
+    set -e
 }
 
 # ---------------------------------------------------------------------------
@@ -449,6 +453,7 @@ with open('$result_file', 'w') as f:
 # from within the repo directory.
 # ---------------------------------------------------------------------------
 benchmark_gitnexus() {
+    set +e
     local name="$1" repo_path="$2"
     local result_file="$RESULTS_DIR/${name}-gitnexus.json"
 
@@ -475,7 +480,7 @@ benchmark_gitnexus() {
 
     # --- Index size on disk ---
     local index_size_bytes
-    index_size_bytes=$(find "$repo_path/.gitnexus" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
+    index_size_bytes=$(find "$repo_path/.gitnexus" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}' || echo 0)
 
     # Warm-up queries
     for ((w = 0; w < 3; w++)); do
@@ -548,5 +553,6 @@ with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
     info "  [gitnexus] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
+    set -e
 }
 
