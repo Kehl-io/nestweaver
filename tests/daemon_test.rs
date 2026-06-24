@@ -442,3 +442,89 @@ fn daemon_mcp_brain_add_source() {
         "brain_status should show indexed notes after brain_add_source; got: {result_str}"
     );
 }
+
+#[test]
+fn daemon_materialize_twice_no_broken_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&repo_dir);
+    write_test_vault(&vault_dir);
+
+    // Index repo to create the DB (no-daemon path).
+    create_db(&repo_dir, &db_path);
+
+    // Write a minimal instance config with a project.
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+url = "file://{repo}"
+name = "repo"
+
+[[projects]]
+name = "test-project"
+description = "A test project"
+repos = ["repo"]
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+            repo = repo_dir.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // First materialize — should succeed and start the daemon.
+    daemon_cmd()
+        .args([
+            "materialize-projects",
+            "--config",
+            &config_path.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Brief pause to let the file mtime settle (filesystem resolution).
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Second materialize — previously triggered h2 broken-pipe because
+    // the daemon's db_opened_at was stale after the first write.
+    daemon_cmd()
+        .args([
+            "materialize-projects",
+            "--config",
+            &config_path.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+}
