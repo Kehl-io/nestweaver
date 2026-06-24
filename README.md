@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <a href="https://nestweaver.kehl.io">Website</a> · <a href="https://docs.nestweaver.kehl.io">Docs</a> · <a href="https://github.com/Kehl-io/nestweaver/releases">Releases</a>
+</p>
+
+<p align="center">
   NestWeaver parses 32 languages, resolves cross-file references with confidence scoring,<br>
   and gives agents precomputed answers about symbols, dependencies, call graphs,<br>
   type usage, and field access — no source reading required.
@@ -494,6 +498,66 @@ proto               (generated gRPC types)
             <- mcp    <- (client, proto)  [daemon proxy mode]
             <- web
 ```
+
+</details>
+
+## Performance
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**71ms** query p50<br>
+Next.js — 29,402 files
+
+</td>
+<td width="50%" valign="top">
+
+**632ms** incremental re-index<br>
+Tailwind CSS — no full rebuild needed
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+**14.8M** edges extracted<br>
+Elasticsearch — 511K symbols, 43K files
+
+</td>
+<td width="50%" valign="top">
+</td>
+</tr>
+</table>
+
+<details>
+<summary>Benchmark results (NestWeaver vs Graphify vs GitNexus)</summary>
+
+**Query Speed (p50)**
+
+| Repository | Files | NestWeaver | Graphify | GitNexus |
+|---|---:|---:|---:|---:|
+| Tailwind CSS | 542 | **157ms** | 185ms | 700ms |
+| Deno | 14,136 | **82ms** | 1,355ms | 908ms |
+| Next.js | 29,402 | **71ms** | 2,440ms | 1,116ms |
+| Elasticsearch | 43,806 | **617ms** | crashed | 1,573ms |
+
+**Indexing Speed**
+
+| Repository | NestWeaver | Graphify | GitNexus |
+|---|---:|---:|---:|
+| Tailwind CSS | 3.6s | 2.5s | 9.2s |
+| Deno | 51s | 33s | 84s |
+| Next.js | **33s** | 111s | 176s |
+| Elasticsearch | **3,462s** | crashed | 5,434s |
+
+**Incremental re-indexing** (NestWeaver only — competitors require full re-index): 632ms (Tailwind), 4.0s (Next.js), 73s (Elasticsearch).
+
+**Graph depth**: NestWeaver extracts 142K symbols / 280K edges on Deno (vs Graphify's 76K / 177K). On Elasticsearch: 511K symbols, 14.8M edges.
+
+**Result quality**: NestWeaver returns ~30 connected symbols per query ranked by PageRank with full signatures. Graphify returns file-level nodes with 9-15% garbage stubs. GitNexus finds definitions but returns 0 callers and 0 callees.
+
+*Benchmarked in daemon mode on M3 Pro (36 GB). See [benchmarks/](benchmarks/) to reproduce.*
 
 </details>
 
