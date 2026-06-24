@@ -294,8 +294,9 @@ except: print(0)
         info "    context '$query': ${lat_median}ms (seeds=$seeds, connected=$connected, unique_files=$unique_files)"
     done < <(load_queries "$name" "context")
 
-    # Stop the per-repo daemon
+    # Stop all benchmark daemons (clean slate for next tool/repo)
     "$nw" daemon stop --db "$db" --quiet 2>/dev/null || true
+    "$nw" daemon stop --quiet 2>/dev/null || true
 
     # Compute p50/p95 across all query latencies
     local p50 p95
