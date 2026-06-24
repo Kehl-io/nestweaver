@@ -2622,6 +2622,7 @@ impl NestWeaverDaemon for DaemonService {
             .await
             .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;
 
+            refresh_db_opened_at(&self.state);
             self.state
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
