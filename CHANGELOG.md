@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.1](https://github.com/Kehl-io/nestweaver/compare/v2.0.0...v2.0.1) (2026-06-24)
+
+
+### Bug Fixes
+
+* **daemon:** add refresh_db_opened_at to embed RPC ([c750f66](https://github.com/Kehl-io/nestweaver/commit/c750f66bbfa1bc0900c304b02f402f5d6ee58e57))
+* **daemon:** change db_opened_at to AtomicU64 ([fd6f70d](https://github.com/Kehl-io/nestweaver/commit/fd6f70d007090bb9f12e13e68c1125492d706e04))
+* **daemon:** refresh db_opened_at after write RPCs ([7f72dcf](https://github.com/Kehl-io/nestweaver/commit/7f72dcf756af9f5835ea747946104152b0c37e81))
+* snapshot stamp.json bugs + materialize broken-pipe + release checksums ([dcd8ed2](https://github.com/Kehl-io/nestweaver/commit/dcd8ed2aefa86f724078558c283195be5200af75))
+* **snapshot:** read embedding_model_id from [embedding] config ([0e88b1c](https://github.com/Kehl-io/nestweaver/commit/0e88b1c52a9d4cec92b14d57ae3e2ed3d117bb20))
+* **snapshot:** use daemon-style instance_id for repo filtering ([9bd1123](https://github.com/Kehl-io/nestweaver/commit/9bd1123dec85338978cf60ca1eaa63347bc2b9a6))
+
 ## [2.0.0](https://github.com/Kehl-io/nestweaver/compare/v1.1.3...v2.0.0) (2026-06-23)
 
 
