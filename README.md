@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <a href="https://nestweaver.kehl.io">Website</a> · <a href="https://docs.nestweaver.kehl.io">Docs</a> · <a href="https://github.com/Kehl-io/nestweaver/releases">Releases</a>
+</p>
+
+<p align="center">
   NestWeaver parses 32 languages, resolves cross-file references with confidence scoring,<br>
   and gives agents precomputed answers about symbols, dependencies, call graphs,<br>
   type usage, and field access — no source reading required.
