@@ -16,17 +16,21 @@ time_ms() {
     echo $(( (end - start) / 1000000 ))
 }
 
-# time_ms_capture CMD [ARGS...] — like time_ms but captures stdout into $CAPTURED_OUTPUT
+# time_ms_capture CMD [ARGS...] — run a command, print elapsed ms, save output
+# to $BENCH_ROOT/.captured_output (file-based to survive subshells).
+# Read the output with: CAPTURED_OUTPUT=$(cat "$BENCH_ROOT/.captured_output")
 CAPTURED_OUTPUT=""
 time_ms_capture() {
-    local start end tmpfile
-    tmpfile=$(mktemp "$BENCH_ROOT/tmp.XXXXXX")
+    local start end
     start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
-    "$@" >"$tmpfile" 2>/dev/null || true
+    "$@" >"$BENCH_ROOT/.captured_output" 2>&1 || true
     end=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
-    CAPTURED_OUTPUT=$(cat "$tmpfile")
-    rm -f "$tmpfile"
     echo $(( (end - start) / 1000000 ))
+}
+
+# read_captured — read the last captured output into CAPTURED_OUTPUT
+read_captured() {
+    CAPTURED_OUTPUT=$(cat "$BENCH_ROOT/.captured_output" 2>/dev/null)
 }
 
 # median VAL1 VAL2 VAL3 ... — print the median of integer arguments
@@ -111,13 +115,24 @@ benchmark_nestweaver() {
     # --- Indexing (NUM_RUNS, fresh each time) ---
     # Each run uses a separate temp directory so we never destroy a DB
     # that a daemon might reference. The final run becomes the keeper.
+    # We capture stdout from the last run to extract graph stats.
     local index_times=()
+    local last_index_output=""
     for ((i = 1; i <= NUM_RUNS; i++)); do
         local run_dir="$INDEX_DIR/nestweaver-$name-run$i"
         rm -rf "$run_dir"
         mkdir -p "$run_dir"
-        local ms
-        ms=$(time_ms "$nw" index --db "$run_dir/bench.lbug" --repo "$repo_path")
+        local tmpout
+        tmpout=$(mktemp "$BENCH_ROOT/idx.XXXXXX")
+        local start end
+        start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
+        "$nw" index --db "$run_dir/bench.lbug" --repo "$repo_path" >"$tmpout" 2>&1 || true
+        end=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
+        local ms=$(( (end - start) / 1000000 ))
+        last_index_output=$(cat "$tmpout")
+        rm -f "$tmpout"
+        # Stop the auto-started daemon so next run's fresh DB doesn't conflict
+        "$nw" daemon stop --db "$run_dir/bench.lbug" --quiet 2>/dev/null || true
         index_times+=("$ms")
         info "    index run $i: ${ms}ms"
     done
@@ -131,6 +146,16 @@ benchmark_nestweaver() {
     for ((i = 1; i < NUM_RUNS; i++)); do
         rm -rf "$INDEX_DIR/nestweaver-$name-run$i"
     done
+
+    # --- Graph depth stats (from last index output) ---
+    # The [Done] line has: "Done — N files, N symbols, N edges"
+    local done_line
+    done_line=$(echo "$last_index_output" | grep 'Done' | tail -1)
+    local symbol_count edge_count file_count
+    file_count=$(echo "$done_line" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)
+    symbol_count=$(echo "$done_line" | grep -oE '[0-9]+ symbol' | grep -oE '[0-9]+' || echo 0)
+    edge_count=$(echo "$done_line" | grep -oE '[0-9]+ edge' | grep -oE '[0-9]+' || echo 0)
+    info "    graph: ${file_count} files, ${symbol_count} symbols, ${edge_count} edges"
 
     # --- Incremental indexing (modify one file, re-index) ---
     local incremental_times=()
@@ -147,27 +172,30 @@ benchmark_nestweaver() {
     incremental_median=$(median "${incremental_times[@]}")
     info "    incremental median: ${incremental_median}ms"
 
-    # --- Graph depth stats ---
-    local nw_stats
-    nw_stats=$("$nw" index --db "$db" --repo "$repo_path" --force 2>&1 | grep -oE 'Indexed [0-9]+ file.*' || true)
-    local symbol_count edge_count file_count
-    file_count=$(echo "$nw_stats" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)
-    symbol_count=$(echo "$nw_stats" | grep -oE '[0-9]+ symbol' | grep -oE '[0-9]+' || echo 0)
-    edge_count=$(echo "$nw_stats" | grep -oE '[0-9]+ edge' | grep -oE '[0-9]+' || echo 0)
-    info "    graph: ${file_count} files, ${symbol_count} symbols, ${edge_count} edges"
-
     # --- Index size on disk ---
     local index_size_bytes
     index_size_bytes=$(find "$db_dir" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
-    # Start daemon for queries (production mode — Metal GPU, in-memory graph)
-    "$nw" daemon start --db "$db" --quiet 2>/dev/null || true
-    sleep 3
-    # Warm-up: 3 throwaway queries so daemon caches are hot
+    # Warm up daemon for queries. The index and incremental steps
+    # auto-start a daemon. Wait until it responds to queries.
+    info "    warming up daemon..."
+    local warmup_ok=0
+    for ((w = 0; w < 15; w++)); do
+        if "$nw" search --db "$db" --json "test" 2>/dev/null | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+            warmup_ok=1
+            break
+        fi
+        sleep 2
+    done
+    if [[ $warmup_ok -eq 0 ]]; then
+        warn "    daemon warm-up failed — queries may be slow"
+    fi
+    # Additional warm-up passes
     for ((w = 0; w < 3; w++)); do
         "$nw" search --db "$db" --json "warmup" >/dev/null 2>&1 || true
         "$nw" context --db "$db" --json "warmup" >/dev/null 2>&1 || true
     done
+    info "    daemon ready"
 
     # --- Queries (through daemon — representative of real usage) ---
     local all_latencies=()
@@ -183,6 +211,7 @@ benchmark_nestweaver() {
             ms=$(time_ms_capture "$nw" search --db "$db" --json "$query")
             latencies+=("$ms")
 
+            read_captured
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 result_count=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
@@ -221,6 +250,7 @@ except: print(0)
             ms=$(time_ms_capture "$nw" context --db "$db" --json "$query")
             latencies+=("$ms")
 
+            read_captured
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 seeds=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
@@ -360,6 +390,7 @@ benchmark_graphify() {
             ms=$(time_ms_capture "$GRAPHIFY_BIN" query "$query" --graph "$graph_file")
             latencies+=("$ms")
 
+            read_captured
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 # Graphify outputs text — NODE lines are actual results
                 results=$(echo "$CAPTURED_OUTPUT" | grep -c '^NODE ' || echo 0)
@@ -461,6 +492,7 @@ benchmark_gitnexus() {
             ms=$(time_ms_capture "$GITNEXUS_BIN" query "$query" -r "$repo_path")
             latencies+=("$ms")
 
+            read_captured
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 results=$(echo "$CAPTURED_OUTPUT" | python3 -c "
 import json, sys
