@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# measure.sh — benchmark measurement functions, sourced by run.sh
+# measure.sh -- benchmark measurement functions, sourced by run.sh
 # Requires: BENCH_NESTWEAVER, REPOS_DIR, INDEX_DIR, RESULTS_DIR, QUERIES,
 #           NUM_RUNS, GRAPHIFY_BIN, GITNEXUS_BIN, CBMCP_BIN
 
@@ -7,7 +7,7 @@
 # Helpers
 # ---------------------------------------------------------------------------
 
-# time_ms CMD [ARGS...] — run a command and print elapsed wall-clock milliseconds
+# time_ms CMD [ARGS...] -- run a command and print elapsed wall-clock milliseconds
 time_ms() {
     local start end
     start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
@@ -16,24 +16,25 @@ time_ms() {
     echo $(( (end - start) / 1000000 ))
 }
 
-# time_ms_capture CMD [ARGS...] — run a command, print elapsed ms, save output
+# time_ms_capture CMD [ARGS...] -- run a command, print elapsed ms, save output
 # to $BENCH_ROOT/.captured_output (file-based to survive subshells).
 # Read the output with: CAPTURED_OUTPUT=$(cat "$BENCH_ROOT/.captured_output")
 CAPTURED_OUTPUT=""
 time_ms_capture() {
-    local start end
+    local start end capfile
+    capfile="${BENCH_ROOT:?BENCH_ROOT not set}/.captured_output"
     start=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
-    "$@" >"$BENCH_ROOT/.captured_output" 2>&1 || true
+    "$@" >"$capfile" 2>&1 || true
     end=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
     echo $(( (end - start) / 1000000 ))
 }
 
-# read_captured — read the last captured output into CAPTURED_OUTPUT
+# read_captured -- read the last captured output into CAPTURED_OUTPUT
 read_captured() {
-    CAPTURED_OUTPUT=$(cat "$BENCH_ROOT/.captured_output" 2>/dev/null)
+    CAPTURED_OUTPUT=$(cat "${BENCH_ROOT:?}/.captured_output" 2>/dev/null)
 }
 
-# median VAL1 VAL2 VAL3 ... — print the median of integer arguments
+# median VAL1 VAL2 VAL3 ... -- print the median of integer arguments
 median() {
     python3 -c "
 import sys
@@ -48,7 +49,7 @@ else:
 " "$@"
 }
 
-# percentile P VAL1 VAL2 ... — print the Pth percentile
+# percentile P VAL1 VAL2 ... -- print the Pth percentile
 percentile() {
     local p="$1"; shift
     python3 -c "
@@ -92,7 +93,7 @@ for r in data['repos']:
 "
 }
 
-# json_quote STRING — safely JSON-encode a string
+# json_quote STRING -- safely JSON-encode a string
 json_quote() {
     python3 -c "import json,os,sys; print(json.dumps(sys.argv[1]))" "$1"
 }
@@ -148,7 +149,7 @@ benchmark_nestweaver() {
     done
 
     # --- Graph depth stats (from last index output) ---
-    # The [Done] line has: "Done — N files, N symbols, N edges"
+    # The [Done] line has: "Done -- N files, N symbols, N edges"
     local done_line
     done_line=$(echo "$last_index_output" | grep 'Done' | tail -1)
     local symbol_count edge_count file_count
@@ -188,7 +189,7 @@ benchmark_nestweaver() {
         sleep 2
     done
     if [[ $warmup_ok -eq 0 ]]; then
-        warn "    daemon warm-up failed — queries may be slow"
+        warn "    daemon warm-up failed -- queries may be slow"
     fi
     # Additional warm-up passes
     for ((w = 0; w < 3; w++)); do
@@ -197,7 +198,7 @@ benchmark_nestweaver() {
     done
     info "    daemon ready"
 
-    # --- Queries (through daemon — representative of real usage) ---
+    # --- Queries (through daemon -- representative of real usage) ---
     local all_latencies=()
     local query_results=()
 
@@ -334,7 +335,7 @@ result = {
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
-    info "  [nestweaver] done — index=${index_median}ms incremental=${incremental_median}ms p50=${p50}ms p95=${p95}ms"
+    info "  [nestweaver] done -- index=${index_median}ms incremental=${incremental_median}ms p50=${p50}ms p95=${p95}ms"
 }
 
 # ---------------------------------------------------------------------------
@@ -393,7 +394,7 @@ benchmark_graphify() {
 
             read_captured
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                # Graphify outputs text — NODE lines are actual results
+                # Graphify outputs text -- NODE lines are actual results
                 results=$(echo "$CAPTURED_OUTPUT" | grep -c '^NODE ' || echo 0)
                 noise=$(echo "$CAPTURED_OUTPUT" | grep '^NODE' | grep 'src= ' | wc -l | tr -d ' ')
             fi
@@ -439,7 +440,7 @@ result = {
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
-    info "  [graphify] done — index=${index_median}ms p50=${p50}ms p95=${p95}ms"
+    info "  [graphify] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
 }
 
 # ---------------------------------------------------------------------------
@@ -546,6 +547,6 @@ result = {
 with open('$result_file', 'w') as f:
     json.dump(result, f, indent=2)
 "
-    info "  [gitnexus] done — index=${index_median}ms p50=${p50}ms p95=${p95}ms"
+    info "  [gitnexus] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
 }
 
