@@ -1,0 +1,80 @@
+{
+  "repos": [
+    {
+      "name": "tailwindcss",
+      "url": "https://github.com/tailwindlabs/tailwindcss.git",
+      "description": "Tailwind CSS",
+      "search_queries": [
+        "compile",
+        "parse",
+        "variant",
+        "optimize",
+        "theme"
+      ],
+      "context_queries": [
+        "compile",
+        "DesignSystem",
+        "compileCandidates",
+        "parseCandidate",
+        "optimizeAst"
+      ]
+    },
+    {
+      "name": "deno",
+      "url": "https://github.com/denoland/deno.git",
+      "description": "Deno",
+      "search_queries": [
+        "worker",
+        "permission",
+        "module",
+        "runtime",
+        "compile"
+      ],
+      "context_queries": [
+        "CliFactory",
+        "MainWorker",
+        "DenoSubcommand",
+        "ModuleLoadPreparer",
+        "BootstrapOptions"
+      ]
+    },
+    {
+      "name": "next.js",
+      "url": "https://github.com/vercel/next.js.git",
+      "description": "Next.js",
+      "search_queries": [
+        "router",
+        "render",
+        "build",
+        "config",
+        "middleware"
+      ],
+      "context_queries": [
+        "NextConfig",
+        "AppRouter",
+        "OuterLayoutRouter",
+        "build",
+        "useRouter"
+      ]
+    },
+    {
+      "name": "elasticsearch",
+      "url": "https://github.com/elastic/elasticsearch.git",
+      "description": "Elasticsearch",
+      "search_queries": [
+        "search",
+        "index",
+        "shard",
+        "cluster",
+        "transport"
+      ],
+      "context_queries": [
+        "SearchService",
+        "ClusterState",
+        "IndexService",
+        "Engine",
+        "ShardRouting"
+      ]
+    }
+  ]
+}
