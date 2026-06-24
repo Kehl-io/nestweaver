@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — NestWeaver benchmark orchestrator
+# run.sh -- NestWeaver benchmark orchestrator
 # Fully isolated: builds NestWeaver to a local prefix, installs competitors
 # locally, uses a dedicated daemon instance. Nothing touches your global
 # NestWeaver installation.
@@ -10,7 +10,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUERIES="$SCRIPT_DIR/queries.json"
 
 # ---------------------------------------------------------------------------
-# Directories — everything under BENCH_ROOT
+# Directories -- everything under BENCH_ROOT
 # ---------------------------------------------------------------------------
 BENCH_ROOT="${BENCH_ROOT:-/private/tmp/nestweaver-bench}"
 REPOS_DIR="$BENCH_ROOT/repos"
@@ -71,9 +71,9 @@ info "Cloning repos (shallow, --depth 1)..."
 echo "$REPO_DATA" | while read -r name url; do
     dest="$REPOS_DIR/$name"
     if [[ -d "$dest/.git" ]]; then
-        info "  $name — already cloned, skipping"
+        info "  $name -- already cloned, skipping"
     else
-        info "  $name — cloning from $url"
+        info "  $name -- cloning from $url"
         git clone --depth 1 "$url" "$dest"
     fi
 done
@@ -85,11 +85,11 @@ info "Building NestWeaver from source (isolated to $LOCAL_PREFIX)..."
 FEATURES="embed"
 if [[ "$(uname -s)" == "Darwin" ]] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q Apple; then
     FEATURES="embed,metal"
-    info "  Detected Apple Silicon — enabling Metal GPU acceleration"
+    info "  Detected Apple Silicon -- enabling Metal GPU acceleration"
 fi
 cargo install --path "$REPO_ROOT" --root "$LOCAL_PREFIX" --features "$FEATURES" 2>&1 | tail -3
 BENCH_NESTWEAVER="$LOCAL_PREFIX/bin/nestweaver"
-[[ -x "$BENCH_NESTWEAVER" ]] || die "Build failed — $BENCH_NESTWEAVER not found"
+[[ -x "$BENCH_NESTWEAVER" ]] || die "Build failed -- $BENCH_NESTWEAVER not found"
 NW_VERSION=$("$BENCH_NESTWEAVER" --version 2>/dev/null || echo "dev")
 info "  nestweaver $NW_VERSION at $BENCH_NESTWEAVER"
 export BENCH_NESTWEAVER
@@ -109,7 +109,7 @@ fi
 BENCH_PYTHON="$BENCH_VENV/bin/python3"
 export BENCH_PYTHON
 
-# Graphify — Python venv (PyPI package is "graphifyy" with double-y, binary is "graphify")
+# Graphify -- Python venv (PyPI package is "graphifyy" with double-y, binary is "graphify")
 GRAPHIFY_VENV="$VENVS_DIR/graphify"
 if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]]; then
     if [[ ! -f "$GRAPHIFY_VENV/bin/activate" ]]; then
@@ -120,7 +120,7 @@ if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]]; then
 fi
 GRAPHIFY_BIN="$GRAPHIFY_VENV/bin/graphify"
 
-# GitNexus — local npm install
+# GitNexus -- local npm install
 GITNEXUS_DIR="$NODE_DIR/gitnexus"
 if [[ ! -f "$GITNEXUS_DIR/node_modules/.bin/gitnexus" ]]; then
     mkdir -p "$GITNEXUS_DIR"
@@ -216,7 +216,7 @@ for name in $REPO_NAMES; do
         warn "  Skipping gitnexus (not installed)"
     fi
 
-    # codebase-memory-mcp removed — unreliable install, dead upstream URL
+    # codebase-memory-mcp removed -- unreliable install, dead upstream URL
 done
 
 # ---------------------------------------------------------------------------
