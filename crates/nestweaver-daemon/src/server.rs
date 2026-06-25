@@ -53,8 +53,7 @@ impl Drop for ConnectionGuard {
 
 /// Shared state held by the daemon process.
 pub struct DaemonState {
-    pub store: Arc<GraphStore>,      // Read-write (for write RPCs only)
-    pub store_read: Arc<GraphStore>, // Read-only (for all read RPCs)
+    pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_id: String,
@@ -131,7 +130,7 @@ impl DaemonService {
 
             let t_dispatch = std::time::Instant::now();
             let value = nestweaver_mcp::tools::dispatch(
-                &state.store_read,
+                &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
@@ -200,7 +199,7 @@ impl DaemonService {
 
             let t_dispatch = std::time::Instant::now();
             let value = nestweaver_mcp::tools::dispatch(
-                &state.store_read,
+                &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
@@ -651,10 +650,10 @@ impl NestWeaverDaemon for DaemonService {
                 "cypher" | "graphml" | "mermaid" => {
                     let mut buf = Vec::new();
                     match format {
-                        "cypher" => nestweaver_engine::export_cypher(&state.store_read, &mut buf),
-                        "graphml" => nestweaver_engine::export_graphml(&state.store_read, &mut buf),
+                        "cypher" => nestweaver_engine::export_cypher(&state.store, &mut buf),
+                        "graphml" => nestweaver_engine::export_graphml(&state.store, &mut buf),
                         "mermaid" => {
-                            nestweaver_engine::export_mermaid(&state.store_read, top, &mut buf)
+                            nestweaver_engine::export_mermaid(&state.store, top, &mut buf)
                         }
                         _ => unreachable!(),
                     }
@@ -678,7 +677,7 @@ impl NestWeaverDaemon for DaemonService {
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
                 "msgpack" => {
-                    let graph = nestweaver_engine::export_in_memory_graph(&state.store_read)
+                    let graph = nestweaver_engine::export_in_memory_graph(&state.store)
                         .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
                     let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
                         Status::internal(format!("msgpack serialize failed: {e:#}"))
@@ -738,7 +737,7 @@ impl NestWeaverDaemon for DaemonService {
         let state = self.state.clone();
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
-            state.store_read.clone(),
+            state.store.clone(),
             state.tantivy.clone(),
             state.db_path.clone(),
         );
@@ -2034,7 +2033,7 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
             let repos = state
-                .store_read
+                .store
                 .list_repos(instance)
                 .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
             serde_json::to_string(&repos)
@@ -2059,7 +2058,7 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
             let vaults = state
-                .store_read
+                .store
                 .list_vaults(instance)
                 .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
             serde_json::to_string(&vaults)
@@ -2083,7 +2082,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let result = tokio::task::spawn_blocking(move || {
             let dim = state
-                .store_read
+                .store
                 .embedding_dimension()
                 .map_err(|e| Status::internal(format!("embedding_dimension failed: {e:#}")))?;
             serde_json::to_string(&dim)
@@ -2108,7 +2107,7 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
             let services = state
-                .store_read
+                .store
                 .list_services(instance)
                 .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
             serde_json::to_string(&services)
@@ -2134,7 +2133,7 @@ impl NestWeaverDaemon for DaemonService {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let instance = args.get("instance").and_then(|v| v.as_str());
             let services = state
-                .store_read
+                .store
                 .list_services(instance)
                 .map_err(|e| Status::internal(format!("list_services failed: {e:#}")))?;
             let service = services.iter().find(|s| s.name == name || s.uid == name);
@@ -2162,7 +2161,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let result = tokio::task::spawn_blocking(move || {
             let projects = state
-                .store_read
+                .store
                 .list_projects()
                 .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
             serde_json::to_string(&projects)
@@ -2187,7 +2186,7 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let candidates = nestweaver_engine::search_symbols(&state.store_read, query, limit)
+            let candidates = nestweaver_engine::search_symbols(&state.store, query, limit)
                 .map_err(|e| Status::internal(format!("search_symbols failed: {e:#}")))?;
             serde_json::to_string(&candidates)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
@@ -2213,7 +2212,7 @@ impl NestWeaverDaemon for DaemonService {
                 .get("name_or_uid")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let lookup = nestweaver_engine::lookup_symbol(&state.store_read, name_or_uid)
+            let lookup = nestweaver_engine::lookup_symbol(&state.store, name_or_uid)
                 .map_err(|e| Status::internal(format!("lookup_symbol failed: {e:#}")))?;
             // Serialize the LookupResult as a tagged JSON value.
             let value = match lookup {
@@ -2253,7 +2252,7 @@ impl NestWeaverDaemon for DaemonService {
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4096) as usize;
-            let map = nestweaver_engine::generate_repo_map(&state.store_read, token_budget)
+            let map = nestweaver_engine::generate_repo_map(&state.store, token_budget)
                 .map_err(|e| Status::internal(format!("generate_repo_map failed: {e:#}")))?;
             let token_count = map.len().div_ceil(4);
             serde_json::to_string(&serde_json::json!({
@@ -2281,7 +2280,7 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let cache_path = state.db_path.with_extension("manifests.json");
             let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
-            let suggestions = nestweaver_engine::suggest_links(&state.store_read, &manifests)
+            let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
             serde_json::to_string(&suggestions)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
@@ -2312,7 +2311,7 @@ impl NestWeaverDaemon for DaemonService {
             let instance_id = "default";
             let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
             let detected = nestweaver_engine::detect_implicit_projects(
-                &state.store_read,
+                &state.store,
                 &vault,
                 &vault_uid,
                 instance_id,
@@ -2354,7 +2353,7 @@ impl NestWeaverDaemon for DaemonService {
                 ));
             }
             let result = nestweaver_engine::analyze_blast_radius(
-                &state.store_read,
+                &state.store,
                 &changed_files,
                 depth,
                 Some(&state.db_path),
@@ -2578,11 +2577,6 @@ pub async fn run_server(
         }
     };
 
-    // Open a second read-only connection for read RPCs. This avoids any
-    // risk of read handlers accidentally mutating the write connection.
-    let store_read =
-        GraphStore::open_read_only(&db_path).context("failed to open read-only store")?;
-
     // Load sidecars (PageRank, interaction scores).
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
     let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
@@ -2654,7 +2648,7 @@ pub async fn run_server(
 
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
-        store_read: Arc::new(store_read),
+
         tantivy,
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
@@ -2671,7 +2665,7 @@ pub async fn run_server(
     // Pre-warm PPR adjacency cache so the first PPR query after startup
     // hits the cache instead of spending ~350ms rebuilding from the DB.
     {
-        let store = state.store_read.clone();
+        let store = state.store.clone();
         tokio::task::spawn_blocking(move || match store.warm_ppr_cache() {
             Ok(()) => tracing::info!("PPR adjacency cache warmed"),
             Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
@@ -2684,7 +2678,7 @@ pub async fn run_server(
     {
         let embed_state = state.embed_model.clone();
         let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
-        let store_for_dim_check = state.store_read.clone();
+        let store_for_dim_check = state.store.clone();
         tokio::spawn(async move {
             let cfg = embedding_cfg.unwrap_or_default();
             // Expand tilde in cache_dir using the home directory.
