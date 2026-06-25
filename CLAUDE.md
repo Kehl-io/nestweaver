@@ -17,10 +17,11 @@ cargo fmt --all                                             # format in place
 All CLI commands and MCP tool calls route through a background daemon process
 that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
 invocation and self-terminates after an idle timeout. The client auto-restarts
-the daemon on version mismatch or when it detects the database has been rebuilt
-(DB mtime check).
+the daemon on version mismatch. Shutdown is graceful: the daemon drains active
+write RPCs before exiting (up to `NESTWEAVER_DRAIN_TIMEOUT_SECS`, default 660s).
 
-**Never bypass the daemon in normal use.** The `--no-daemon` flag and
+**The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
+tools against the DB while the daemon is running. The `--no-daemon` flag and
 `NESTWEAVER_NO_DAEMON=1` env var exist only for CI/testing. Bypassing the
 daemon risks WAL corruption from concurrent access. If you see "database
 locked" errors, stop the daemon (`nestweaver daemon stop`) rather than using
