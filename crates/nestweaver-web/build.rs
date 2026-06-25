@@ -16,23 +16,31 @@ fn main() {
 
         match status {
             Ok(s) if s.success() => {}
-            _ => {
+            Ok(s) => {
                 println!(
-                    "cargo:warning=Frontend build failed or npm not found, using existing dist"
+                    "cargo:warning=Frontend build exited with status {s}, using existing dist"
                 );
-                ensure_dist_exists(&dist_dir, frontend_dir);
+            }
+            Err(e) => {
+                println!("cargo:warning=Frontend build failed ({e}), using existing dist");
             }
         }
-    } else {
-        ensure_dist_exists(&dist_dir, frontend_dir);
     }
-}
 
-fn ensure_dist_exists(dist_dir: &std::path::Path, frontend_dir: &std::path::Path) {
-    std::fs::create_dir_all(dist_dir).ok();
-    if !dist_dir.join("index.html").exists()
-        && let Ok(html) = std::fs::read_to_string(frontend_dir.join("index.html"))
-    {
+    if !dist_dir.join("assets").exists() || !dist_dir.join("index.html").exists() {
+        println!("cargo:warning=frontend/dist/assets/ is missing — the UI will not work.");
+        println!(
+            "cargo:warning=Run: cd crates/nestweaver-web/frontend && npm install && npm run build"
+        );
+
+        // Create a minimal dist so rust-embed doesn't fail compilation,
+        // but the UI will show a clear error instead of a blank screen.
+        std::fs::create_dir_all(dist_dir.join("assets")).ok();
+        let html = r#"<!DOCTYPE html>
+<html><head><title>NestWeaver</title></head>
+<body><h1>Frontend not built</h1>
+<p>Run <code>cd crates/nestweaver-web/frontend &amp;&amp; npm install &amp;&amp; npm run build</code> then rebuild.</p>
+</body></html>"#;
         std::fs::write(dist_dir.join("index.html"), html).ok();
     }
 }

@@ -68,6 +68,14 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
           EOF
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
+      - name: Build frontend
+        run: npm ci && npm run build
+        working-directory: crates/nestweaver-web/frontend
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
