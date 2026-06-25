@@ -89,10 +89,7 @@ impl DaemonService {
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -157,10 +154,6 @@ impl DaemonService {
         .await
         .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
-
         tracing::debug!(
             tool = %tool_name_for_log,
             elapsed_ms = t0.elapsed().as_millis(),
@@ -179,10 +172,7 @@ impl DaemonService {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -228,10 +218,6 @@ impl DaemonService {
             elapsed_ms = t0.elapsed().as_millis(),
             "dispatch_tool_json total completed"
         );
-
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
 
         result
     }
@@ -408,8 +394,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchVaultRequest>,
     ) -> Result<Response<WatchVaultResponse>, Status> {
-        self.state.idle_notify.notify_one();
-
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -469,16 +453,14 @@ impl NestWeaverDaemon for DaemonService {
             *guard = Some(shutdown_handle);
         }
 
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-
+        let guard = ConnectionGuard::write(&self.state);
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change =
             Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -491,8 +473,6 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("watcher thread panicked"),
             }
 
-            refresh_db_opened_at(&state);
-            state.active_connections.fetch_sub(1, Ordering::Relaxed);
             if let Ok(mut guard) = state.watcher_stop.lock() {
                 *guard = None;
             }
@@ -511,8 +491,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchCodeRequest>,
     ) -> Result<Response<WatchCodeResponse>, Status> {
-        self.state.idle_notify.notify_one();
-
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -550,16 +528,14 @@ impl NestWeaverDaemon for DaemonService {
             *guard = Some(shutdown_handle);
         }
 
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-
+        let guard = ConnectionGuard::write(&self.state);
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change =
             Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -572,8 +548,6 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("code watcher thread panicked"),
             }
 
-            refresh_db_opened_at(&state);
-            state.active_connections.fetch_sub(1, Ordering::Relaxed);
             if let Ok(mut guard) = state.watcher_stop.lock() {
                 *guard = None;
             }
@@ -611,10 +585,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -705,9 +676,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -717,8 +685,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<ServeUiRequest>,
     ) -> Result<Response<ServeUiResponse>, Status> {
-        self.state.idle_notify.notify_one();
-
         let req = request.into_inner();
         let state = self.state.clone();
 
@@ -772,8 +738,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
-        self.state.idle_notify.notify_one();
-
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let state = self.state.clone();
@@ -788,7 +752,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
+        let guard = ConnectionGuard::write(&self.state);
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let repo_url = format!("file://{}", repo_path.display());
 
             let indexed_sha = std::process::Command::new("git")
@@ -945,7 +911,6 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
-            refresh_db_opened_at(&state);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -959,8 +924,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
-        self.state.idle_notify.notify_one();
-
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -974,7 +937,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
+        let guard = ConnectionGuard::write(&self.state);
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning vault {}", vault_path.display()),
@@ -1046,7 +1011,6 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
-            refresh_db_opened_at(&state);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1060,11 +1024,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MaterializeProjectsRequest>,
     ) -> Result<Response<Self::MaterializeProjectsStream>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -1076,7 +1035,9 @@ impl NestWeaverDaemon for DaemonService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
+        let guard = ConnectionGuard::write(&self.state);
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Loading instance config from {}", config_path.display()),
@@ -1095,7 +1056,6 @@ impl NestWeaverDaemon for DaemonService {
                         files_total: 0,
                         symbols_found: 0,
                     }));
-                    state.active_connections.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             };
@@ -1139,9 +1099,6 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
-
-            refresh_db_opened_at(&state);
-            state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1153,10 +1110,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveVaultRequest>,
     ) -> Result<Response<RemoveVaultResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -1186,10 +1140,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
-        refresh_db_opened_at(&self.state);
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(Response::new)
     }
 
@@ -1197,10 +1147,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -1243,10 +1190,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
-        refresh_db_opened_at(&self.state);
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(Response::new)
     }
 
@@ -1254,10 +1197,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveProjectRequest>,
     ) -> Result<Response<RemoveProjectResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -1290,10 +1230,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
-        refresh_db_opened_at(&self.state);
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(Response::new)
     }
 
@@ -1301,10 +1237,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PruneStaleRequest>,
     ) -> Result<Response<PruneStaleResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         let _req = request.into_inner();
         let state = self.state.clone();
@@ -1381,10 +1314,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
-        refresh_db_opened_at(&self.state);
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(Response::new)
     }
 
@@ -1392,10 +1321,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
         let state = self.state.clone();
@@ -1423,10 +1349,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
 
-        refresh_db_opened_at(&self.state);
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(Response::new)
     }
 
@@ -1436,18 +1358,15 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PurgeInstanceRequest>,
     ) -> Result<Response<Self::PurgeInstanceStream>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-
         let req = request.into_inner();
         let instance_id = req.instance_id.clone();
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
+        let guard = ConnectionGuard::write(&self.state);
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Writing as i32,
                 message: format!("Purging instance {instance_id}"),
@@ -1500,8 +1419,6 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
-            refresh_db_opened_at(&state);
-            state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -2063,10 +1980,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2083,9 +1997,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2094,10 +2005,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2114,9 +2022,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2125,10 +2030,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2144,9 +2046,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2155,10 +2054,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2175,9 +2071,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2186,10 +2079,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2211,9 +2101,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2222,10 +2109,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2241,9 +2125,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2252,10 +2133,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2271,9 +2149,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2282,10 +2157,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2315,9 +2187,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2328,10 +2197,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2353,9 +2219,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2364,10 +2227,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2383,9 +2243,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2394,10 +2251,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2424,9 +2278,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2435,10 +2286,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
             serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
@@ -2472,9 +2320,6 @@ impl NestWeaverDaemon for DaemonService {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
 
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         result.map(|j| Response::new(JsonResponse { result_json: j }))
     }
 
@@ -2485,16 +2330,10 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
-        self.state.idle_notify.notify_one();
-        self.state
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        let _guard = ConnectionGuard::write(&self.state);
 
         #[cfg(not(feature = "embed"))]
         {
-            self.state
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
             let _ = request;
             return Err(Status::unavailable(
                 "embedding is not available — the daemon was built without the `embed` feature",
@@ -2517,9 +2356,6 @@ impl NestWeaverDaemon for DaemonService {
             let do_headings = scope == "all" || scope == "headings";
 
             if !do_symbols && !do_notes && !do_headings {
-                self.state
-                    .active_connections
-                    .fetch_sub(1, Ordering::Relaxed);
                 return Err(Status::invalid_argument(format!(
                     "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
                 )));
@@ -2531,9 +2367,6 @@ impl NestWeaverDaemon for DaemonService {
             };
 
             let Some(model) = model else {
-                self.state
-                    .active_connections
-                    .fetch_sub(1, Ordering::Relaxed);
                 return Err(Status::unavailable(
                     "embedding model is not loaded — it may still be initializing",
                 ));
@@ -2632,10 +2465,6 @@ impl NestWeaverDaemon for DaemonService {
             .await
             .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;
 
-            refresh_db_opened_at(&self.state);
-            self.state
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
             result.map(Response::new)
         }
     }
