@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -20,21 +20,31 @@ use crate::lifecycle;
 
 // ── State ───────────────────────────────────────────────────────────
 
-/// Re-read the DB file's mtime and store it in `state.db_opened_at`.
-/// Called after any write RPC so the next `DaemonClient::connect()` health
-/// check sees the current mtime and doesn't falsely conclude the DB was
-/// rebuilt externally.
-fn refresh_db_opened_at(state: &DaemonState) {
-    let mtime = std::fs::metadata(&state.db_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or_else(|| {
-            tracing::warn!(path = %state.db_path.display(), "failed to stat DB — stale-detection disabled until next write");
-            0
-        });
-    state.db_opened_at.store(mtime, Ordering::Relaxed);
+/// RAII guard that decrements a connection counter on drop.
+/// Fixes cancellation-safety: if a client disconnects mid-RPC or
+/// the async task is cancelled, the counter is still decremented.
+struct ConnectionGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl ConnectionGuard {
+    fn read(state: &DaemonState) -> Self {
+        state.active_reads.fetch_add(1, Ordering::Relaxed);
+        state.idle_notify.notify_one();
+        Self { counter: Arc::clone(&state.active_reads) }
+    }
+
+    fn write(state: &DaemonState) -> Self {
+        state.active_writes.fetch_add(1, Ordering::Relaxed);
+        state.idle_notify.notify_one();
+        Self { counter: Arc::clone(&state.active_writes) }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Shared state held by the daemon process.
@@ -45,8 +55,8 @@ pub struct DaemonState {
     pub db_path: PathBuf,
     pub instance_id: String,
     pub start_time: Instant,
-    pub db_opened_at: AtomicU64,
-    pub active_connections: AtomicU32,
+    pub active_reads: Arc<AtomicU32>,
+    pub active_writes: Arc<AtomicU32>,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
@@ -359,14 +369,14 @@ impl NestWeaverDaemon for DaemonService {
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
         let uptime = self.state.start_time.elapsed().as_secs();
-        let active = self.state.active_connections.load(Ordering::Relaxed);
+        let active = self.state.active_reads.load(Ordering::Relaxed)
+            + self.state.active_writes.load(Ordering::Relaxed);
         Ok(Response::new(HealthCheckResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: self.state.instance_id.clone(),
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
-            db_opened_at: self.state.db_opened_at.load(Ordering::Relaxed),
         }))
     }
 
@@ -2767,13 +2777,6 @@ pub async fn run_server(
             }
         });
 
-    let db_opened_at = std::fs::metadata(&db_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
         store_read: Arc::new(store_read),
@@ -2781,8 +2784,8 @@ pub async fn run_server(
         db_path: db_path.clone(),
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
-        db_opened_at: AtomicU64::new(db_opened_at),
-        active_connections: AtomicU32::new(0),
+        active_reads: Arc::new(AtomicU32::new(0)),
+        active_writes: Arc::new(AtomicU32::new(0)),
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
@@ -2918,7 +2921,7 @@ pub async fn run_server(
                 tokio::select! {
                     _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
-                        if active.active_connections.load(Ordering::Relaxed) == 0 {
+                        if active.active_reads.load(Ordering::Relaxed) + active.active_writes.load(Ordering::Relaxed) == 0 {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
