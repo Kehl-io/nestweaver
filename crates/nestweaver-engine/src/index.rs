@@ -385,15 +385,12 @@ fn index_into_store(
 ) -> Result<IndexResult, anyhow::Error> {
     let started = Instant::now();
 
-    // 1. Insert (or update) the Repo node.
+    // 1. Insert the Repo node if it doesn't exist yet.
+    //    SHA update is deferred until after bulk_index_write succeeds so that
+    //    a write failure doesn't leave a stale SHA that skips future re-indexes.
     let r_uid = repo_uid(instance_id, repo_url);
     let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
-    if existing_repo.is_some() {
-        // Repo already exists — update its SHA rather than creating a duplicate.
-        store
-            .update_repo_sha(&r_uid, indexed_sha)
-            .context("update_repo_sha")?;
-    } else {
+    if existing_repo.is_none() {
         let repo = Repo {
             uid: r_uid.clone(),
             url: repo_url.trim_end_matches('/').to_string(),
@@ -942,6 +939,14 @@ fn index_into_store(
         "phase write complete"
     );
     drop(_phase_write_span);
+
+    // Update the Repo SHA now that file/symbol data is committed.
+    // For new repos, insert_repo already set the SHA; only update for existing repos.
+    if existing_repo.is_some() {
+        store
+            .update_repo_sha(&r_uid, indexed_sha)
+            .context("update_repo_sha")?;
+    }
 
     // ── Phase 3: Resolve cross-file references ────────────────────────────
     let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
