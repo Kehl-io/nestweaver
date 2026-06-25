@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    extract::Request,
+    http::{self, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use axum_embed::{FallbackBehavior, ServeEmbed};
 use rust_embed::RustEmbed;
 use tower_http::cors::CorsLayer;
 
@@ -18,13 +20,61 @@ use crate::state::AppState;
 #[folder = "frontend/dist/"]
 struct FrontendAssets;
 
-pub fn create_router(state: Arc<AppState>) -> Router {
-    let static_handler = ServeEmbed::<FrontendAssets>::with_parameters(
-        Some("index.html".to_string()),
-        FallbackBehavior::Ok,
-        Some("index.html".to_string()),
-    );
+fn mime_for_path(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("js") | Some("mjs") => "application/javascript",
+        Some("css") => "text/css",
+        Some("wasm") => "application/wasm",
+        Some("html") => "text/html; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("json") => "application/json",
+        Some("map") => "application/json",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
 
+fn has_file_extension(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|seg| seg.contains('.'))
+}
+
+async fn spa_fallback(request: Request) -> Response {
+    let path = request.uri().path();
+    let trimmed = path.trim_start_matches('/');
+
+    if !trimmed.is_empty()
+        && let Some(file) = FrontendAssets::get(trimmed)
+    {
+        return (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, mime_for_path(trimmed))],
+            file.data,
+        )
+            .into_response();
+    }
+
+    // Paths with file extensions that weren't found should 404
+    if has_file_extension(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // SPA fallback: serve index.html for navigation routes
+    match FrontendAssets::get("index.html") {
+        Some(file) => (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            file.data,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
         .route("/api/v1/version", get(routes::version::version))
@@ -131,7 +181,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
-        .fallback_service(static_handler)
+        .fallback(get(spa_fallback))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
