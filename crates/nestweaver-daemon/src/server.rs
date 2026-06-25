@@ -70,6 +70,9 @@ pub struct DaemonState {
     /// Lazily-loaded embedding model for semantic search. Populated by a
     /// background task when the `embed` feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+    /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
+    /// single write transaction).
+    pub write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -502,12 +505,14 @@ impl NestWeaverDaemon for DaemonService {
         }
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change =
             Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             tracing::info!(vault = %vault_path.display(), "watcher thread started");
 
@@ -577,12 +582,14 @@ impl NestWeaverDaemon for DaemonService {
         }
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change =
             Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
 
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             tracing::info!(repo = %repo_path.display(), "code watcher thread started");
 
@@ -801,7 +808,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             let repo_url = format!("file://{}", repo_path.display());
 
@@ -985,7 +994,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
@@ -1082,7 +1093,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
@@ -1156,6 +1169,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveVaultRequest>,
     ) -> Result<Response<RemoveVaultResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1193,6 +1207,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1243,6 +1258,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveProjectRequest>,
     ) -> Result<Response<RemoveProjectResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1283,6 +1299,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PruneStaleRequest>,
     ) -> Result<Response<PruneStaleResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let _req = request.into_inner();
@@ -1367,6 +1384,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1411,7 +1429,9 @@ impl NestWeaverDaemon for DaemonService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
         let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
         tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Writing as i32,
@@ -2375,6 +2395,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         #[cfg(not(feature = "embed"))]
@@ -2660,6 +2681,7 @@ pub async fn run_server(
         watcher_stop: std::sync::Mutex::new(None),
         instance_cfg,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+        write_mutex: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
