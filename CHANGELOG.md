@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.1.0](https://github.com/Kehl-io/nestweaver/compare/v2.0.1...v2.1.0) (2026-06-25)
+
+
+### Features
+
+* add competitive benchmark suite ([4953491](https://github.com/Kehl-io/nestweaver/commit/49534913825f10948a8d8d4ecd45d59d503b2476))
+* **client:** graceful restart via Shutdown RPC ([c6f4b71](https://github.com/Kehl-io/nestweaver/commit/c6f4b712143e6dfd4120ec7c8e1d871b6d3ff349))
+* **daemon:** graceful drain shutdown with configurable ceiling ([e51da65](https://github.com/Kehl-io/nestweaver/commit/e51da65184af0355cf290a9dac400c06305da3f5))
+
+
+### Bug Fixes
+
+* **benchmarks:** disable errexit in competitor functions to prevent silent crashes ([dbfa7d7](https://github.com/Kehl-io/nestweaver/commit/dbfa7d7ad499dc633b4be295d18d32d92d5db32b))
+* **cli:** close sole-writer enforcement gaps ([b64da32](https://github.com/Kehl-io/nestweaver/commit/b64da32dae7de88daaed305fcc998a37de810a4d))
+* remove leftover db_opened_at reference, fix clippy and fmt ([e7c55a1](https://github.com/Kehl-io/nestweaver/commit/e7c55a1b7fc44f871eeea958d7b167d35c0a724a))
+
 ## [2.0.1](https://github.com/Kehl-io/nestweaver/compare/v2.0.0...v2.0.1) (2026-06-24)
 
 
