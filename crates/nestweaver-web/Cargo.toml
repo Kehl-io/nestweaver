@@ -10,7 +10,6 @@ nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
 rmp-serde = "1"
 axum = { workspace = true }
-axum-embed = { workspace = true }
 rust-embed = { workspace = true }
 tower-http = { workspace = true }
 tokio = { version = "1", features = ["full"] }

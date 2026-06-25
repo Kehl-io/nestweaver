@@ -56,15 +56,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "android_system_properties"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -685,7 +676,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
- "axum-core 0.5.6",
+ "axum-core",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -714,26 +705,6 @@ dependencies = [
 
 [[package]]
 name = "axum-core"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "http 1.4.2",
- "http-body 1.0.1",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "rustversion",
- "sync_wrapper",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
-name = "axum-core"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
@@ -749,20 +720,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-embed"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "077959a7f8cf438676af90b483304528eb7e16eadadb7f44e9ada4f9dceb9e62"
-dependencies = [
- "axum-core 0.4.5",
- "chrono",
- "http 1.4.2",
- "mime_guess",
- "rust-embed",
- "tower-service",
 ]
 
 [[package]]
@@ -1155,19 +1112,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
-dependencies = [
- "iana-time-zone",
- "js-sys",
- "num-traits",
- "wasm-bindgen",
- "windows-link",
 ]
 
 [[package]]
@@ -2974,30 +2918,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iana-time-zone"
-version = "0.1.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
-dependencies = [
- "android_system_properties",
- "core-foundation-sys",
- "iana-time-zone-haiku",
- "js-sys",
- "log",
- "wasm-bindgen",
- "windows-core",
-]
-
-[[package]]
-name = "iana-time-zone-haiku"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3699,16 +3619,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3772,7 +3682,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3812,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3820,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -3836,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3862,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-embed"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3881,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -3921,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3944,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bumpalo",
  "comrak",
@@ -3992,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-proto"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "prost",
  "tonic",
@@ -4003,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "glob",
  "insta",
@@ -4020,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "hex",
  "serde",
@@ -4031,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4046,7 +3956,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -4070,7 +3980,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
@@ -4087,7 +3997,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "axum-embed",
  "futures",
  "nestweaver-algorithms",
  "nestweaver-engine",
@@ -7579,41 +7488,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link",
- "windows-result",
- "windows-strings",
-]
-
-[[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "windows-link"
