@@ -113,12 +113,15 @@ impl DaemonClient {
         }
 
         // If still alive after ceiling + buffer, force kill.
-        if let Some(pid) = autostart::read_pid(&pidfile) {
-            if autostart::is_process_alive(pid) {
-                warn!(pid, ceiling, "daemon did not exit after drain timeout — sending SIGKILL");
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+        if let Some(pid) = autostart::read_pid(&pidfile)
+            && autostart::is_process_alive(pid)
+        {
+            warn!(
+                pid,
+                ceiling, "daemon did not exit after drain timeout — sending SIGKILL"
+            );
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         // Clean up socket.

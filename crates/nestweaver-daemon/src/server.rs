@@ -31,13 +31,17 @@ impl ConnectionGuard {
     fn read(state: &DaemonState) -> Self {
         state.active_reads.fetch_add(1, Ordering::Relaxed);
         state.idle_notify.notify_one();
-        Self { counter: Arc::clone(&state.active_reads) }
+        Self {
+            counter: Arc::clone(&state.active_reads),
+        }
     }
 
     fn write(state: &DaemonState) -> Self {
         state.active_writes.fetch_add(1, Ordering::Relaxed);
         state.idle_notify.notify_one();
-        Self { counter: Arc::clone(&state.active_writes) }
+        Self {
+            counter: Arc::clone(&state.active_writes),
+        }
     }
 }
 
@@ -363,7 +367,6 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
-            db_opened_at: 0,
         }))
     }
 
@@ -411,11 +414,17 @@ impl NestWeaverDaemon for DaemonService {
                 }
 
                 if !warned_half && elapsed >= half {
-                    tracing::warn!(active_writes = writes, "drain at 50% of timeout ({ceiling}s)");
+                    tracing::warn!(
+                        active_writes = writes,
+                        "drain at 50% of timeout ({ceiling}s)"
+                    );
                     warned_half = true;
                 }
                 if !warned_ninety && elapsed >= ninety {
-                    tracing::warn!(active_writes = writes, "drain at 90% of timeout ({ceiling}s)");
+                    tracing::warn!(
+                        active_writes = writes,
+                        "drain at 90% of timeout ({ceiling}s)"
+                    );
                     warned_ninety = true;
                 }
 
@@ -950,7 +959,6 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
-
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1050,7 +1058,6 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
-
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
@@ -1458,7 +1465,6 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
             }
-
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
