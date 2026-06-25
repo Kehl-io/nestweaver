@@ -4311,6 +4311,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             &scope,
             force,
             stats,
+            use_daemon,
         )
         .map(|c| (c, None)),
 
@@ -5110,39 +5111,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let tantivy_path = tantivy_sidecar_path_for(&db_path);
                 let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-                let state = if watch {
-                    let store =
-                        std::sync::Arc::new(GraphStore::open_or_create(&db_path).with_context(
-                            || format!("failed to open database at {}", db_path.display()),
-                        )?);
-                    nestweaver_web::state::AppState::new_with_store(store, tantivy, db_path.clone())
-                } else {
+                if watch {
+                    tracing::warn!(
+                        "daemon unavailable — serving UI without live-watch (read-only)"
+                    );
+                }
+                let state = {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_web::state::AppState::new(store, tantivy, db_path.clone())
                 };
-
-                if watch {
-                    let repo_root = detect_repo_root();
-                    let code_store = state.store.clone();
-                    let code_tx = state.event_tx.clone();
-                    let code_db = db_path.clone();
-                    let code_instance = "default".to_string();
-
-                    std::thread::spawn(move || {
-                        let watcher = CodeWatcher::new(&code_db, &repo_root, &code_instance);
-                        let store_for_cb = code_store.clone();
-                        let on_change = Box::new(move || {
-                            let generation = store_for_cb.graph_generation();
-                            let _ = code_tx.send(nestweaver_web::state::GraphEvent {
-                                event_type: "graph:updated".to_string(),
-                                payload: serde_json::json!({"source": "code_watcher", "generation": generation}),
-                            });
-                        });
-                        if let Err(e) = watcher.run_with_store(code_store, Some(on_change)) {
-                            tracing::error!("CodeWatcher failed: {e}");
-                        }
-                    });
-                }
 
                 let rt =
                     tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
@@ -10829,6 +10806,7 @@ fn run_embed(
     scope: &str,
     force: bool,
     stats: bool,
+    use_daemon: bool,
 ) -> anyhow::Result<i32> {
     // Validate flags
     if local && endpoint.is_some() {
@@ -10880,6 +10858,15 @@ fn run_embed(
     }
 
     // ── Fallback: direct DB access ──────────────────────────────
+    // Only allowed when the daemon path was not attempted (--local or --endpoint)
+    // or when the daemon is explicitly disabled (--no-daemon / NESTWEAVER_NO_DAEMON=1).
+    if use_daemon && endpoint.is_none() && !local {
+        anyhow::bail!(
+            "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
+             or use --no-daemon (requires NESTWEAVER_NO_DAEMON=1)",
+            path.display()
+        );
+    }
 
     let store = nestweaver_store::GraphStore::open(path).map_err(|e| {
         anyhow::anyhow!(
