@@ -363,6 +363,7 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
+            db_opened_at: 0,
         }))
     }
 
@@ -370,9 +371,8 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
-        tracing::info!("shutdown requested via gRPC");
+        tracing::info!("shutdown requested via gRPC — draining active writes");
 
-        // Stop the file watcher if one is running.
         if let Ok(mut guard) = self.state.watcher_stop.lock()
             && let Some(handle) = guard.take()
         {
@@ -380,11 +380,51 @@ impl NestWeaverDaemon for DaemonService {
             handle.stop();
         }
 
-        let tx = self.state.shutdown_tx.clone();
+        let state = self.state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = tx.send(true);
+            let ceiling = std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(660);
+
+            let timeout = std::time::Duration::from_secs(ceiling);
+            let half = std::time::Duration::from_secs(ceiling / 2);
+            let ninety = std::time::Duration::from_secs(ceiling * 9 / 10);
+            let start = tokio::time::Instant::now();
+            let mut warned_half = false;
+            let mut warned_ninety = false;
+
+            loop {
+                let writes = state.active_writes.load(Ordering::Relaxed);
+                if writes == 0 {
+                    tracing::info!("no active writes — shutting down");
+                    break;
+                }
+
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    tracing::warn!(
+                        active_writes = writes,
+                        "drain timeout ({ceiling}s) reached — forcing shutdown"
+                    );
+                    break;
+                }
+
+                if !warned_half && elapsed >= half {
+                    tracing::warn!(active_writes = writes, "drain at 50% of timeout ({ceiling}s)");
+                    warned_half = true;
+                }
+                if !warned_ninety && elapsed >= ninety {
+                    tracing::warn!(active_writes = writes, "drain at 90% of timeout ({ceiling}s)");
+                    warned_ninety = true;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+
+            let _ = state.shutdown_tx.send(true);
         });
+
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
 
