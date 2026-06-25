@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.1](https://github.com/Kehl-io/nestweaver/compare/v2.1.0...v2.1.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* **daemon:** remove dual-Database pattern — use single store for reads and writes ([3fbc4f9](https://github.com/Kehl-io/nestweaver/commit/3fbc4f9c7f8e7657d94d4acd1bf12d8f0190841b))
+* **daemon:** serialize write RPCs with tokio Mutex ([4320814](https://github.com/Kehl-io/nestweaver/commit/4320814b1fdc840641c867a905319ad2802dd395))
+* **engine:** move SHA update to after bulk_index_write in full-index path ([7fe88e4](https://github.com/Kehl-io/nestweaver/commit/7fe88e4acfec26ca5bd27828ba95cacb5664fd0e))
+* ensure frontend assets are embedded in release binaries ([2b5e371](https://github.com/Kehl-io/nestweaver/commit/2b5e371f4bbb342e929d703a397c7dfcc91cc81f))
+* ensure frontend assets are embedded in release binaries ([2e46a09](https://github.com/Kehl-io/nestweaver/commit/2e46a091858888446acf07faa85f557ac48a96ad))
+* repo SHA stale reads — single store, write serialization, atomic SHA update ([1a110af](https://github.com/Kehl-io/nestweaver/commit/1a110af466f48cfde45026a22530137ba0e75e0d))
+* **store:** wrap update_repo_sha DELETE+CREATE in explicit transaction ([735cc98](https://github.com/Kehl-io/nestweaver/commit/735cc9857bf00a993298536426b7bcdb4e97e637))
+
 ## [2.1.0](https://github.com/Kehl-io/nestweaver/compare/v2.0.1...v2.1.0) (2026-06-25)
 
 
