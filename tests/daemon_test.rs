@@ -528,3 +528,123 @@ repos = ["repo"]
         .assert()
         .success();
 }
+
+#[test]
+fn daemon_concurrent_client_during_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&repo_dir);
+    write_test_vault(&vault_dir);
+    create_db(&repo_dir, &db_path);
+
+    let config_path = dir.path().join("instance.toml");
+    let repo_url = format!("file://{}", repo_dir.display());
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+url = "{repo_url}"
+name = "repo"
+
+[[projects]]
+name = "test-project"
+description = "A test project"
+repos = ["repo"]
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+            repo_url = repo_url,
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Start materialize in background thread.
+    let db_str = db_path.display().to_string();
+    let config_str = config_path.display().to_string();
+    let materialize_handle = std::thread::spawn(move || {
+        daemon_cmd()
+            .args([
+                "materialize-projects",
+                "--config", &config_str,
+                "--db", &db_str,
+            ])
+            .assert()
+            .success();
+    });
+
+    // Brief pause to let materialize start.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Concurrent read — should NOT trigger a daemon restart.
+    daemon_cmd()
+        .args([
+            "list-repos",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    materialize_handle.join().expect("materialize thread panicked");
+}
+
+#[test]
+fn daemon_shutdown_rpc_exits_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    // Start the daemon.
+    daemon_action_cmd(&db_path, "start")
+        .assert()
+        .success();
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Verify daemon is running.
+    daemon_action_cmd(&db_path, "status")
+        .assert()
+        .success();
+
+    // Stop via the CLI (which uses the Shutdown RPC).
+    daemon_action_cmd(&db_path, "stop")
+        .assert()
+        .success();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify daemon is no longer running.
+    daemon_action_cmd(&db_path, "status")
+        .assert()
+        .success()
+        .stdout(contains("not running"));
+}
