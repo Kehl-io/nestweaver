@@ -2080,14 +2080,16 @@ impl GraphStore {
             _ => String::new(),
         };
 
+        let txn = self.begin_transaction()?;
+
         exec_params(
-            &conn,
+            &txn,
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(uid.clone()))],
         )?;
 
         exec_params(
-            &conn,
+            &txn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
              staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
             vec![
@@ -2100,6 +2102,7 @@ impl GraphStore {
             ],
         )?;
 
+        self.commit_transaction(&txn)?;
         Ok(())
     }
 
@@ -3019,5 +3022,56 @@ mod copy_from_tests {
                 eprintln!("Edge COPY FROM will need a batch Cypher workaround.");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_repo_sha_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_sha.lbug");
+        let store = GraphStore::create(&db_path).unwrap();
+
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:test".to_string(),
+            url: "file:///tmp/test".to_string(),
+            indexed_sha: "aaa".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: Some("test-repo".to_string()),
+        };
+        store.insert_repo(&repo).unwrap();
+
+        {
+            let conn = store.conn().unwrap();
+            conn.query(
+                "CREATE (:File {uid: 'file:1', path: 'src/main.rs', \
+                 repo_uid: 'repo:test', content_hash: 'hash1'})",
+            )
+            .unwrap();
+            conn.query(
+                "MATCH (r:Repo {uid: 'repo:test'}), (f:File {uid: 'file:1'}) \
+                 CREATE (r)-[:REPO_HAS_FILE]->(f)",
+            )
+            .unwrap();
+        }
+
+        store.update_repo_sha("repo:test", "bbb").unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        let found = repos.iter().find(|r| r.uid == "repo:test").unwrap();
+        assert_eq!(found.indexed_sha, "bbb");
+        assert_eq!(found.url, "file:///tmp/test");
+        assert_eq!(found.name, Some("test-repo".to_string()));
+
+        let conn = store.conn().unwrap();
+        let rows: Vec<_> = conn
+            .query("MATCH (f:File {uid: 'file:1'}) RETURN f.uid")
+            .unwrap()
+            .collect();
+        assert_eq!(rows.len(), 1);
     }
 }
