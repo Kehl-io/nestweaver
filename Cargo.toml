@@ -53,7 +53,6 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 axum = "0.8"
-axum-embed = "0.1"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 tower-http = { version = "0.7", features = ["cors"] }
 tokio-stream = "0.1"
