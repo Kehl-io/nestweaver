@@ -591,8 +591,10 @@ repos = ["repo"]
         daemon_cmd()
             .args([
                 "materialize-projects",
-                "--config", &config_str,
-                "--db", &db_str,
+                "--config",
+                &config_str,
+                "--db",
+                &db_str,
             ])
             .assert()
             .success();
@@ -603,15 +605,13 @@ repos = ["repo"]
 
     // Concurrent read — should NOT trigger a daemon restart.
     daemon_cmd()
-        .args([
-            "list-repos",
-            "--db",
-            &db_path.display().to_string(),
-        ])
+        .args(["list-repos", "--db", &db_path.display().to_string()])
         .assert()
         .success();
 
-    materialize_handle.join().expect("materialize thread panicked");
+    materialize_handle
+        .join()
+        .expect("materialize thread panicked");
 }
 
 #[test]
@@ -624,21 +624,15 @@ fn daemon_shutdown_rpc_exits_cleanly() {
     create_db(&repo_dir, &db_path);
 
     // Start the daemon.
-    daemon_action_cmd(&db_path, "start")
-        .assert()
-        .success();
+    daemon_action_cmd(&db_path, "start").assert().success();
 
     std::thread::sleep(Duration::from_secs(1));
 
     // Verify daemon is running.
-    daemon_action_cmd(&db_path, "status")
-        .assert()
-        .success();
+    daemon_action_cmd(&db_path, "status").assert().success();
 
     // Stop via the CLI (which uses the Shutdown RPC).
-    daemon_action_cmd(&db_path, "stop")
-        .assert()
-        .success();
+    daemon_action_cmd(&db_path, "stop").assert().success();
 
     std::thread::sleep(Duration::from_secs(2));
 
