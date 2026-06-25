@@ -12,9 +12,8 @@ message HealthCheckResponse {
   string db_path = 3;
   uint64 uptime_seconds = 4;
   uint32 active_connections = 5;
-  // Unix timestamp (seconds) of the DB file when the daemon opened it.
-  // Clients compare against the current file mtime to detect stale daemons.
-  uint64 db_opened_at = 6;
+  reserved 6;
+  reserved "db_opened_at";
 }
 
 message ShutdownRequest {}

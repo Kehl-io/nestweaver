@@ -25,8 +25,8 @@ impl DaemonClient {
     /// Connect to the daemon for the given database, auto-starting if needed.
     ///
     /// After connecting, performs a version check. If the running daemon's
-    /// version doesn't match this binary's version, it stops the old daemon
-    /// and restarts with the current binary.
+    /// version doesn't match this binary's version, it asks the daemon to
+    /// gracefully drain active writes and shut down, then restarts.
     pub async fn connect(db_path: &Path, config_path: Option<&Path>) -> Result<Self> {
         let sock_path = autostart::ensure_daemon(db_path, config_path)?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
@@ -40,38 +40,21 @@ impl DaemonClient {
             .into_inner();
 
         let our_version = env!("CARGO_PKG_VERSION");
-        let needs_restart = if resp.version != our_version {
+        if resp.version != our_version {
             warn!(
                 daemon_version = %resp.version,
                 client_version = %our_version,
-                "version mismatch — restarting daemon"
+                "version mismatch — requesting graceful daemon restart"
             );
-            true
-        } else if resp.db_opened_at > 0 {
-            // Check if the DB file has been replaced since the daemon opened it.
-            let current_mtime = std::fs::metadata(db_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if current_mtime > resp.db_opened_at {
-                warn!(
-                    daemon_db_mtime = resp.db_opened_at,
-                    current_db_mtime = current_mtime,
-                    "database rebuilt since daemon started — restarting daemon"
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
 
-        if needs_restart {
-            // Stop the old daemon.
-            Self::stop_old_daemon(db_path)?;
+            // Ask the daemon to drain active writes and shut down.
+            let _ = client
+                .inner
+                .shutdown(nestweaver_proto::ShutdownRequest {})
+                .await;
+
+            // Wait for the daemon process to exit.
+            Self::wait_for_exit(db_path)?;
 
             // Re-start and reconnect.
             let sock_path = autostart::ensure_daemon(db_path, config_path)?;
@@ -106,34 +89,42 @@ impl DaemonClient {
         })
     }
 
-    /// Stop an old daemon by sending SIGTERM to its PID.
-    fn stop_old_daemon(db_path: &Path) -> Result<()> {
+    /// Wait for the daemon to exit after a Shutdown RPC was sent.
+    /// Falls back to SIGKILL after the drain ceiling + buffer.
+    fn wait_for_exit(db_path: &Path) -> Result<()> {
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
-        if let Some(pid) = autostart::read_pid(&pidfile)
-            && autostart::is_process_alive(pid)
-        {
-            info!(pid, "sending SIGTERM to old daemon");
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+        let ceiling = std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(660);
 
-            // Poll for exit with 5s timeout, then SIGKILL.
-            let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_secs(5) {
-                if !autostart::is_process_alive(pid) {
-                    break;
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(ceiling + 5);
+
+        while start.elapsed() < timeout {
+            match autostart::read_pid(&pidfile) {
+                Some(pid) if autostart::is_process_alive(pid) => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            if autostart::is_process_alive(pid) {
-                warn!(pid, "daemon did not exit after SIGTERM, sending SIGKILL");
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                _ => break,
             }
         }
 
-        // Clean up stale socket.
+        // If still alive after ceiling + buffer, force kill.
+        if let Some(pid) = autostart::read_pid(&pidfile)
+            && autostart::is_process_alive(pid)
+        {
+            warn!(
+                pid,
+                ceiling, "daemon did not exit after drain timeout — sending SIGKILL"
+            );
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        // Clean up socket.
         let sock = nestweaver_daemon::lifecycle::socket_path(&instance_id);
         if sock.exists() {
             let _ = std::fs::remove_file(&sock);
