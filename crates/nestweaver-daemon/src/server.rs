@@ -659,9 +659,7 @@ impl NestWeaverDaemon for DaemonService {
                     match format {
                         "cypher" => nestweaver_engine::export_cypher(&state.store, &mut buf),
                         "graphml" => nestweaver_engine::export_graphml(&state.store, &mut buf),
-                        "mermaid" => {
-                            nestweaver_engine::export_mermaid(&state.store, top, &mut buf)
-                        }
+                        "mermaid" => nestweaver_engine::export_mermaid(&state.store, top, &mut buf),
                         _ => unreachable!(),
                     }
                     .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
