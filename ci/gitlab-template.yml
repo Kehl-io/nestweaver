@@ -35,7 +35,7 @@
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
     - |
       set +e
-      nestweaver impact \
+      nestweaver pre-push-impact \
         --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD" \
         --server "$NESTWEAVER_URL" \
         --token "$NESTWEAVER_TOKEN" \
@@ -62,7 +62,7 @@
         --marker "nestweaver-impact" || true
     - |
       if [ "$NESTWEAVER_FAIL_ON_BREAKING" = "true" ]; then
-        if jq -e '.impacts[] | select(.severity == "BREAKING")' impact.json > /dev/null 2>&1; then
+        if jq -e '.impacts[] | select(.severity == "Breaking")' impact.json > /dev/null 2>&1; then
           echo "ERROR: Breaking changes detected across downstream repos — see MR comment for details"
           exit 1
         fi

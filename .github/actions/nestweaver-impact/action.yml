@@ -80,7 +80,7 @@ runs:
         fi
 
         # Set outputs
-        BREAKING=$(jq '[.impacts[] | select(.severity == "BREAKING")] | length' "$RUNNER_TEMP/impact.json" 2>/dev/null || echo 0)
+        BREAKING=$(jq '[.impacts[] | select(.severity == "Breaking")] | length' "$RUNNER_TEMP/impact.json" 2>/dev/null || echo 0)
         TOTAL=$(jq '.impacts | length' "$RUNNER_TEMP/impact.json" 2>/dev/null || echo 0)
         echo "has-breaking=$([ "$BREAKING" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
         echo "impact-count=$TOTAL" >> "$GITHUB_OUTPUT"
@@ -119,7 +119,7 @@ runs:
       if: inputs.fail-on-breaking == 'true'
       shell: bash
       run: |
-        if jq -e '.impacts[] | select(.severity == "BREAKING")' "$RUNNER_TEMP/impact.json" > /dev/null 2>&1; then
+        if jq -e '.impacts[] | select(.severity == "Breaking")' "$RUNNER_TEMP/impact.json" > /dev/null 2>&1; then
           echo "::error::Breaking changes detected across downstream repos — see PR comment for details"
           exit 1
         fi
