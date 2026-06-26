@@ -183,12 +183,20 @@ fn jittered(interval: Duration) -> Duration {
 pub struct ReindexTracker {
     /// Map repo_id -> incremental update count since last full index.
     counts: HashMap<String, u32>,
+    /// Map repo_id -> timestamp of last full re-index.
+    last_full_reindex: HashMap<String, Instant>,
 }
+
+/// Maximum interval between full re-indexes (7 days). Even when the
+/// count-based threshold hasn't been hit, a full re-index ensures the
+/// graph doesn't silently drift from source over long periods.
+const FULL_REINDEX_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 impl ReindexTracker {
     pub fn new() -> Self {
         Self {
             counts: HashMap::new(),
+            last_full_reindex: HashMap::new(),
         }
     }
 
@@ -198,15 +206,29 @@ impl ReindexTracker {
     }
 
     /// Check if a repo needs a full re-index based on the proportional
-    /// threshold: `max(150, file_count * 0.5%)`.
+    /// threshold: `max(150, file_count * 0.5%)`, OR if more than 7 days
+    /// have elapsed since the last full re-index.
     pub fn needs_full_reindex(&self, repo_id: &str, file_count: u64) -> bool {
+        // Count-based threshold.
         let threshold = std::cmp::max(150, (file_count as f64 * 0.005) as u32);
-        self.counts.get(repo_id).copied().unwrap_or(0) >= threshold
+        if self.counts.get(repo_id).copied().unwrap_or(0) >= threshold {
+            return true;
+        }
+        // Time-based backstop: trigger a full re-index if the last one was
+        // more than 7 days ago. Repos that have never been reset (no entry)
+        // are not triggered by time — the count threshold handles their first
+        // full index, and `reset()` records the timestamp for future checks.
+        match self.last_full_reindex.get(repo_id) {
+            Some(last) => last.elapsed() > FULL_REINDEX_INTERVAL,
+            None => false,
+        }
     }
 
     /// Reset the incremental count for a repo (after a full re-index).
     pub fn reset(&mut self, repo_id: &str) {
         self.counts.remove(repo_id);
+        self.last_full_reindex
+            .insert(repo_id.to_string(), Instant::now());
     }
 
     /// Current incremental count for a repo.
