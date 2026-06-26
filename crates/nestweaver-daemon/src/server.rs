@@ -3219,7 +3219,10 @@ pub async fn run_server(
                 eprintln!("[daemon] TLS enabled for TCP server");
                 Some(tls)
             }
-            _ => None,
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
+            }
+            (None, None) => None,
         };
 
         tokio::spawn(async move {
