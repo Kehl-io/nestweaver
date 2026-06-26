@@ -1555,6 +1555,10 @@ enum DaemonAction {
         /// Previous webhook secret (fallback during rotation)
         #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD")]
         webhook_secret_old: Option<String>,
+
+        /// Path to instance.toml for server config (repos, polling, etc.)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Stop and restart the daemon
     Restart {
@@ -7649,6 +7653,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     port_file,
                     webhook_secret,
                     webhook_secret_old,
+                    config,
                 } => {
                     let server_opts = if server {
                         Some(nestweaver_daemon::ServerOpts {
@@ -7667,7 +7672,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
-                        nestweaver_daemon::run_server(&db_path, None, None, server_opts).await
+                        nestweaver_daemon::run_server(&db_path, None, config.as_deref(), server_opts).await
                     })?;
                     Ok((EXIT_SUCCESS, None))
                 }
