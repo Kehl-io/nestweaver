@@ -499,7 +499,8 @@ enum Commands {
     /// symbols in other repos would break.
     #[command(
         name = "pre-push-impact",
-        after_help = "Examples:\n  nestweaver pre-push-impact --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project\n  nestweaver pre-push-impact --diff origin/main..HEAD --server http://localhost:50051 --fail-on-breaking\n  nestweaver pre-push-impact --diff origin/main..HEAD --fail-on-error --format json"
+        visible_alias = "ppi",
+        after_help = "Alias: nestweaver ppi\n\nNote: 'nestweaver impact' is a separate single-symbol impact command.\nUse 'pre-push-impact' (or 'ppi') for multi-file change analysis.\n\nExamples:\n  nestweaver ppi --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project\n  nestweaver pre-push-impact --diff origin/main..HEAD --server http://localhost:50051 --fail-on-breaking\n  nestweaver pre-push-impact --diff origin/main..HEAD --fail-on-error --format json"
     )]
     PrePushImpact {
         /// Analyze uncommitted changes in the working tree
