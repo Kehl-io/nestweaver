@@ -73,4 +73,6 @@ pub struct AdminState {
     pub active_writes: Arc<AtomicU32>,
     pub drained: Arc<AtomicBool>,
     pub indexing_queue_depth: Arc<AtomicU32>,
+    /// Path to the brain database, used to derive the jobs database path.
+    pub db_path: std::path::PathBuf,
 }

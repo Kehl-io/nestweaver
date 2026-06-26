@@ -3143,6 +3143,7 @@ pub async fn run_server(
                 active_writes: state.active_writes.clone(),
                 drained: state.drained.clone(),
                 indexing_queue_depth: state.indexing_queue_depth.clone(),
+                db_path: db_path.clone(),
             });
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);

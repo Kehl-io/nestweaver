@@ -147,9 +147,25 @@ pub async fn add_repo(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<AddRepoRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
-    let _ = state;
-    // Adding a repo requires writing to the instance config and triggering
-    // an index. For now, return a stub that acknowledges the request.
+    // Derive the jobs database path from the brain database path.
+    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let repo_url = req.url.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        queue
+            .upsert(
+                &repo_url,
+                &repo_url,
+                nestweaver_engine::jobs::JobTrigger::Unindexed,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue job: {e}")))?;
+        Ok::<_, (StatusCode, String)>(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
     Ok(Json(MessageResponse {
         message: format!("repo {} queued for indexing", req.url),
     }))
@@ -198,11 +214,30 @@ pub async fn remove_repo(
 /// POST /admin/api/repos/:id/reindex — trigger an immediate re-index.
 pub async fn trigger_reindex(
     _auth: AdminAuth,
-    State(_state): State<Arc<AdminState>>,
+    State(state): State<Arc<AdminState>>,
     Path(repo_uid): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
-    // Triggering a re-index requires the job queue from the daemon.
-    // For now, acknowledge the request.
+    let store = state.daemon_store.clone();
+    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let uid = repo_uid.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Look up the repo URL from the store.
+        let repo = store
+            .lookup_repo(&uid)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lookup repo: {e}")))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("repo {} not found", uid)))?;
+
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        queue
+            .upsert(&uid, &repo.url, nestweaver_engine::jobs::JobTrigger::Webhook)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue job: {e}")))?;
+        Ok::<_, (StatusCode, String)>(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
     Ok(Json(MessageResponse {
         message: format!("reindex queued for repo {}", repo_uid),
     }))
@@ -263,22 +298,61 @@ pub async fn drain_status(
 /// GET /admin/api/dead-letter — list dead-letter entries.
 pub async fn list_dead_letter(
     _auth: AdminAuth,
-    State(_state): State<Arc<AdminState>>,
-) -> Json<Vec<serde_json::Value>> {
-    // Dead letter data comes from the jobs SQLite DB which is owned by
-    // the daemon's worker pool. Return empty list until wired to job queue.
-    Json(vec![])
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+
+    let entries = tokio::task::spawn_blocking(move || {
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        let dead = queue
+            .dead_letters()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dead_letters: {e}")))?;
+        let values: Vec<serde_json::Value> = dead
+            .into_iter()
+            .map(|j| {
+                serde_json::json!({
+                    "id": j.id,
+                    "repo_id": j.repo_id,
+                    "repo_url": j.repo_url,
+                    "error": j.error_msg,
+                    "attempt": j.attempt,
+                    "max_attempts": j.max_attempts,
+                    "updated_at": j.updated_at,
+                })
+            })
+            .collect();
+        Ok::<_, (StatusCode, String)>(values)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
+    Ok(Json(entries))
 }
 
 /// POST /admin/api/dead-letter/:id/retry — retry a dead-letter entry.
 pub async fn retry_dead_letter(
     _auth: AdminAuth,
-    State(_state): State<Arc<AdminState>>,
-    Path(_id): Path<String>,
-) -> Json<MessageResponse> {
-    Json(MessageResponse {
-        message: "dead-letter entry queued for retry".to_string(),
+    State(state): State<Arc<AdminState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let id_clone = id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        queue
+            .reset_dead_letter(&id_clone)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reset_dead_letter: {e}")))?;
+        Ok::<_, (StatusCode, String)>(())
     })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
+    Ok(Json(MessageResponse {
+        message: format!("dead-letter entry {} queued for retry", id),
+    }))
 }
 
 /// DELETE /admin/api/dead-letter/:id — dismiss a dead-letter entry.
@@ -347,6 +421,7 @@ mod tests {
         let db_path = dir.path().join("test.lbug");
         let store =
             nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
+        let db_path_clone = db_path.clone();
         // Leak the tempdir so it lives as long as the store.
         std::mem::forget(dir);
         Arc::new(AdminState {
@@ -358,6 +433,7 @@ mod tests {
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            db_path: db_path_clone,
         })
     }
 
