@@ -10,6 +10,7 @@ use std::process::Command as StdCommand;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{BrainStatusRequest, RepoStatesRequest};
 use tonic::transport::{Certificate, ClientTlsConfig};
+use serde_json::json;
 
 /// Create a minimal git repo with a JS file for indexing.
 fn write_test_repo(dir: &std::path::Path) {
@@ -319,37 +320,71 @@ async fn server_auth_passes_valid_token() {
     );
 }
 
-/// Generate a self-signed certificate for localhost using openssl.
-fn generate_test_certs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let cert_path = dir.join("test-cert.pem");
-    let key_path = dir.join("test-key.pem");
+/// Test cert bundle: CA cert (for client trust), server cert + key (for server identity).
+struct TestCerts {
+    ca_cert: std::path::PathBuf,
+    server_cert: std::path::PathBuf,
+    server_key: std::path::PathBuf,
+}
 
+/// Generate a CA certificate and a server certificate signed by it.
+/// Returns (ca_cert, server_cert, server_key) paths.
+fn generate_test_certs(dir: &std::path::Path) -> TestCerts {
+    let ca_key = dir.join("ca-key.pem");
+    let ca_cert = dir.join("ca-cert.pem");
+    let server_key = dir.join("server-key.pem");
+    let server_csr = dir.join("server.csr");
+    let server_cert = dir.join("server-cert.pem");
+
+    // 1. Generate CA key + self-signed CA cert
     let output = StdCommand::new("openssl")
         .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            &key_path.display().to_string(),
-            "-out",
-            &cert_path.display().to_string(),
-            "-days",
-            "1",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
+            "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", &ca_key.display().to_string(),
+            "-out", &ca_cert.display().to_string(),
+            "-days", "1", "-nodes",
+            "-subj", "/CN=Test CA",
         ])
         .stderr(std::process::Stdio::null())
         .output()
         .expect("openssl must be installed for TLS tests");
-    assert!(
-        output.status.success(),
-        "openssl cert generation failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "CA cert generation failed");
 
-    (cert_path, key_path)
+    // 2. Generate server key + CSR
+    let output = StdCommand::new("openssl")
+        .args([
+            "req", "-newkey", "rsa:2048",
+            "-keyout", &server_key.display().to_string(),
+            "-out", &server_csr.display().to_string(),
+            "-nodes",
+            "-subj", "/CN=localhost",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("openssl CSR generation failed");
+    assert!(output.status.success(), "server CSR generation failed");
+
+    // 3. Sign server cert with CA
+    let ext_file = dir.join("ext.cnf");
+    std::fs::write(&ext_file, "subjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
+
+    let output = StdCommand::new("openssl")
+        .args([
+            "x509", "-req",
+            "-in", &server_csr.display().to_string(),
+            "-CA", &ca_cert.display().to_string(),
+            "-CAkey", &ca_key.display().to_string(),
+            "-CAcreateserial",
+            "-out", &server_cert.display().to_string(),
+            "-days", "1",
+            "-extfile", &ext_file.display().to_string(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("openssl cert signing failed");
+    assert!(output.status.success(), "server cert signing failed");
+
+    TestCerts { ca_cert, server_cert, server_key }
 }
 
 #[tokio::test]
@@ -377,16 +412,19 @@ async fn server_tls_connection() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let (cert_path, key_path) = generate_test_certs(dir.path());
+    let certs = generate_test_certs(dir.path());
 
-    let guard =
-        helpers::server_guard::ServerGuard::start_with_tls(&db_path, &cert_path, &key_path);
+    let guard = helpers::server_guard::ServerGuard::start_with_tls(
+        &db_path,
+        &certs.server_cert,
+        &certs.server_key,
+    );
     let port = guard.grpc_port();
 
-    // Read the CA cert for the client to trust the self-signed certificate.
-    let ca_cert = std::fs::read(&cert_path).expect("read test cert");
+    // Client trusts the CA that signed the server cert.
+    let ca_pem = std::fs::read(&certs.ca_cert).expect("read CA cert");
     let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca_cert))
+        .ca_certificate(Certificate::from_pem(ca_pem))
         .domain_name("localhost");
 
     let channel = tonic::transport::Channel::from_shared(format!("https://127.0.0.1:{port}"))
@@ -436,10 +474,13 @@ async fn server_tls_rejects_plain_tcp() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let (cert_path, key_path) = generate_test_certs(dir.path());
+    let certs = generate_test_certs(dir.path());
 
-    let guard =
-        helpers::server_guard::ServerGuard::start_with_tls(&db_path, &cert_path, &key_path);
+    let guard = helpers::server_guard::ServerGuard::start_with_tls(
+        &db_path,
+        &certs.server_cert,
+        &certs.server_key,
+    );
 
     // Try to connect without TLS — should fail.
     let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
@@ -522,5 +563,104 @@ async fn server_repo_states_rpc() {
     assert!(
         !repo.repo_name.is_empty(),
         "expected non-empty repo_name"
+    );
+}
+
+#[tokio::test]
+async fn server_mcp_http_initialize() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(body["result"]["protocolVersion"].is_string());
+    assert_eq!(body["result"]["serverInfo"]["name"], "nestweaver-brain");
+}
+
+#[tokio::test]
+async fn server_mcp_http_tools_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 2);
+    let tools = body["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(
+        tools.len() >= 30,
+        "expected 30+ tools, got {}",
+        tools.len()
     );
 }

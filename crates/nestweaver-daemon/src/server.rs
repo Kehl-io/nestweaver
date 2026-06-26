@@ -2908,8 +2908,48 @@ pub async fn run_server(
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
-    // TCP listener for server mode — spawned before the blocking UDS serve.
+    // MCP-over-HTTP server — spawned alongside the gRPC servers.
+    // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
+    // port when grpc_port is 0.
     if let Some(ref opts) = server_opts {
+        let mcp_state = std::sync::Arc::new(nestweaver_mcp::http::McpHttpState { lite: false });
+        let mcp_router = nestweaver_mcp::http::router(mcp_state);
+
+        // Parse the bind address to determine the MCP port.  When the gRPC
+        // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
+        // and records the actual port in the port file (second line).
+        let mcp_bind_addr: std::net::SocketAddr = opts
+            .bind_addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        let mcp_bind = if mcp_bind_addr.port() == 0 {
+            std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
+        } else {
+            std::net::SocketAddr::from((mcp_bind_addr.ip(), mcp_bind_addr.port() + 1))
+        };
+
+        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
+            .await
+            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
+        let mcp_actual_addr = mcp_listener.local_addr()?;
+        tracing::info!(%mcp_actual_addr, "MCP HTTP server listening");
+        eprintln!("[daemon] MCP HTTP server listening on {}", mcp_actual_addr);
+
+        // Store the MCP port — written alongside the gRPC port below.
+        let mcp_port_for_file = mcp_actual_addr.port();
+
+        let mut mcp_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            axum::serve(mcp_listener, mcp_router)
+                .with_graceful_shutdown(async move {
+                    let _ = mcp_shutdown_rx.changed().await;
+                })
+                .await
+                .ok();
+        });
+
+    // TCP listener for server mode — spawned before the blocking UDS serve.
+    {
         let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
             .await
             .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
@@ -2918,7 +2958,9 @@ pub async fn run_server(
         eprintln!("[daemon] TCP server listening on {}", actual_addr);
 
         if let Some(ref pf) = opts.port_file {
-            std::fs::write(pf, actual_addr.port().to_string())?;
+            // Write gRPC port on line 1, MCP HTTP port on line 2.
+            let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
+            std::fs::write(pf, contents)?;
         }
 
         let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
@@ -2936,6 +2978,11 @@ pub async fn run_server(
         // Build the TLS config when both cert and key are provided.
         let tls_config = match (&opts.tls_cert, &opts.tls_key) {
             (Some(cert_path), Some(key_path)) => {
+                // Install the ring crypto provider for rustls. This is
+                // required by rustls 0.23+ and must happen before any TLS
+                // config is created.
+                let _ = rustls::crypto::ring::default_provider().install_default();
+
                 let cert_pem = std::fs::read(cert_path)
                     .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
                 let key_pem = std::fs::read(key_path)
@@ -2964,6 +3011,7 @@ pub async fn run_server(
                 .await;
         });
     }
+    } // end if server_opts
 
     // Set process title for easier identification via pgrep.
     set_process_title(&format!("nestweaver-daemon-{instance_id}"));

@@ -13,6 +13,7 @@ use anyhow::Context;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 
+pub mod http;
 pub mod protocol;
 pub mod tools;
 

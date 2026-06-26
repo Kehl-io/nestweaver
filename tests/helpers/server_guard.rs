@@ -35,19 +35,40 @@ impl ServerGuard {
         Self::spawn_inner(db_path, None, Some(cert), Some(key))
     }
 
-    /// Return the TCP port the server bound to (read from the port file).
+    /// Return the TCP port the server bound to (read from the port file, line 1).
     pub fn grpc_port(&self) -> u16 {
         let contents = std::fs::read_to_string(&self.port_file)
             .expect("port file should be readable");
         contents
+            .lines()
+            .next()
+            .unwrap_or("")
             .trim()
             .parse::<u16>()
-            .expect("port file should contain a valid u16 port number")
+            .expect("port file line 1 should contain a valid u16 port number")
+    }
+
+    /// Return the MCP HTTP port (read from the port file, line 2).
+    pub fn mcp_port(&self) -> u16 {
+        let contents = std::fs::read_to_string(&self.port_file)
+            .expect("port file should be readable");
+        contents
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .parse::<u16>()
+            .expect("port file line 2 should contain a valid u16 MCP port number")
     }
 
     /// Return the full gRPC address, e.g. `http://127.0.0.1:12345`.
     pub fn grpc_addr(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port())
+    }
+
+    /// Return the full MCP HTTP address, e.g. `http://127.0.0.1:12346`.
+    pub fn mcp_addr(&self) -> String {
+        format!("http://127.0.0.1:{}", self.mcp_port())
     }
 
     // ── internal ──────────────────────────────────────────────────────
