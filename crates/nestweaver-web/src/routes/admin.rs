@@ -397,28 +397,33 @@ pub async fn list_dead_letter(
 }
 
 /// POST /admin/api/dead-letter/:id/retry — retry a dead-letter entry.
+///
+/// The `:id` parameter is the integer primary key from the dead-letter listing,
+/// not the `repo_id` string. This matches the `id` field in the JSON returned
+/// by `GET /admin/api/dead-letter`.
 pub async fn retry_dead_letter(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
-    let id_clone = id.clone();
+    let job_id: i64 = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid job id: {id}")))?;
 
-    tokio::task::spawn_blocking(move || {
+    let retried = tokio::task::spawn_blocking(move || {
         let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
             )
         })?;
-        queue.reset_dead_letter(&id_clone).map_err(|e| {
+        queue.reset_dead_letter_by_id(job_id).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("reset_dead_letter: {e}"),
             )
-        })?;
-        Ok::<_, (StatusCode, String)>(())
+        })
     })
     .await
     .map_err(|e| {
@@ -428,9 +433,16 @@ pub async fn retry_dead_letter(
         )
     })??;
 
-    Ok(Json(MessageResponse {
-        message: format!("dead-letter entry {} queued for retry", id),
-    }))
+    if retried {
+        Ok(Json(MessageResponse {
+            message: format!("dead-letter entry {} queued for retry", id),
+        }))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("no dead-letter entry with id {id}"),
+        ))
+    }
 }
 
 /// DELETE /admin/api/dead-letter/:id — dismiss a dead-letter entry.

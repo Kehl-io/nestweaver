@@ -399,6 +399,26 @@ impl JobQueue {
         Ok(())
     }
 
+    /// Reset a dead-lettered job back to pending by its primary key (id).
+    ///
+    /// Unlike `reset_dead_letter` which matches by `repo_id`, this method
+    /// uses the integer primary key — matching the `id` field returned by
+    /// `dead_letters()` and surfaced through the admin API listing.
+    pub fn reset_dead_letter_by_id(&self, job_id: i64) -> Result<bool, rusqlite::Error> {
+        let updated = self.conn.execute(
+            "UPDATE index_jobs
+             SET status     = 'pending',
+                 attempt    = 0,
+                 error_msg  = NULL,
+                 started_at = NULL,
+                 completed_at = NULL,
+                 updated_at = strftime('%s','now')
+             WHERE id = ?1 AND status = 'dead_letter'",
+            params![job_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Permanently delete a dead-lettered job by its primary key.
     pub fn dismiss_dead_letter(&self, job_id: i64) -> Result<bool, rusqlite::Error> {
         let deleted = self.conn.execute(
