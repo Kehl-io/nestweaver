@@ -6,6 +6,7 @@
 //! When webhooks are healthy, the floor extends to 5 minutes.
 //! Jitter prevents thundering herd on multi-repo instances.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Minimum default poll interval (45 seconds).
@@ -172,6 +173,59 @@ fn jittered(interval: Duration) -> Duration {
     Duration::from_millis(half + jitter)
 }
 
+/// Tracks incremental update counts per repo to decide when a full re-index
+/// is needed.
+///
+/// Three triggers for full re-index:
+/// 1. Proportional delta threshold: `max(150, file_count * 0.5%)`
+/// 2. 0.25% random spot-check per poll cycle
+/// 3. Time backstop (7 days) - handled externally by the scheduler loop
+pub struct ReindexTracker {
+    /// Map repo_id -> incremental update count since last full index.
+    counts: HashMap<String, u32>,
+}
+
+impl ReindexTracker {
+    pub fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+
+    /// Record an incremental update for a repo.
+    pub fn record_incremental(&mut self, repo_id: &str) {
+        *self.counts.entry(repo_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Check if a repo needs a full re-index based on the proportional
+    /// threshold: `max(150, file_count * 0.5%)`.
+    pub fn needs_full_reindex(&self, repo_id: &str, file_count: u64) -> bool {
+        let threshold = std::cmp::max(150, (file_count as f64 * 0.005) as u32);
+        self.counts.get(repo_id).copied().unwrap_or(0) >= threshold
+    }
+
+    /// Reset the incremental count for a repo (after a full re-index).
+    pub fn reset(&mut self, repo_id: &str) {
+        self.counts.remove(repo_id);
+    }
+
+    /// Current incremental count for a repo.
+    pub fn count(&self, repo_id: &str) -> u32 {
+        self.counts.get(repo_id).copied().unwrap_or(0)
+    }
+
+    /// 0.25% random spot-check: returns true with probability 1/400.
+    pub fn random_spot_check() -> bool {
+        rand::random_ratio(1, 400)
+    }
+}
+
+impl Default for ReindexTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +356,77 @@ mod tests {
         assert_eq!(sched.repo_count(), 2);
         sched.remove_repo("repo-a");
         assert_eq!(sched.repo_count(), 1);
+    }
+
+    // --- ReindexTracker tests ---
+
+    #[test]
+    fn threshold_small_repo() {
+        // 100 files -> 100 * 0.005 = 0.5 -> max(150, 0) = 150
+        let tracker = ReindexTracker::new();
+        assert!(!tracker.needs_full_reindex("repo", 100));
+    }
+
+    #[test]
+    fn threshold_large_repo() {
+        // 50000 files -> 50000 * 0.005 = 250 -> max(150, 250) = 250
+        let mut tracker = ReindexTracker::new();
+        for _ in 0..249 {
+            tracker.record_incremental("repo");
+        }
+        assert!(!tracker.needs_full_reindex("repo", 50_000));
+        tracker.record_incremental("repo");
+        assert!(tracker.needs_full_reindex("repo", 50_000));
+    }
+
+    #[test]
+    fn threshold_floor_at_150() {
+        // Even with 1000 files (1000 * 0.005 = 5), floor is 150
+        let mut tracker = ReindexTracker::new();
+        for _ in 0..149 {
+            tracker.record_incremental("repo");
+        }
+        assert!(!tracker.needs_full_reindex("repo", 1000));
+        tracker.record_incremental("repo");
+        assert!(tracker.needs_full_reindex("repo", 1000));
+    }
+
+    #[test]
+    fn record_and_check() {
+        let mut tracker = ReindexTracker::new();
+        assert_eq!(tracker.count("repo"), 0);
+
+        tracker.record_incremental("repo");
+        tracker.record_incremental("repo");
+        assert_eq!(tracker.count("repo"), 2);
+
+        tracker.reset("repo");
+        assert_eq!(tracker.count("repo"), 0);
+    }
+
+    #[test]
+    fn spot_check_probability() {
+        // Run 100_000 trials, expect ~250 hits (0.25%).
+        let mut hits = 0;
+        for _ in 0..100_000 {
+            if ReindexTracker::random_spot_check() {
+                hits += 1;
+            }
+        }
+        // Expected: 250. Allow wide tolerance for statistical safety.
+        assert!(
+            hits > 50 && hits < 600,
+            "spot check hits {hits} outside expected range"
+        );
+    }
+
+    #[test]
+    fn multiple_repos_independent() {
+        let mut tracker = ReindexTracker::new();
+        for _ in 0..150 {
+            tracker.record_incremental("repo-a");
+        }
+        assert!(tracker.needs_full_reindex("repo-a", 100));
+        assert!(!tracker.needs_full_reindex("repo-b", 100));
     }
 }
