@@ -23,6 +23,7 @@ use nestweaver_proto::{JsonRequest, JsonResponse};
 use crate::DaemonClient;
 use crate::discovery::{RoutingMode, discover_upstreams};
 use crate::merge::rrf_merge;
+use crate::routing::{ToolRouting, tool_routing};
 use crate::upstream::UpstreamHandle;
 
 /// Provenance metadata injected into every hybrid response.
@@ -155,47 +156,75 @@ impl HybridClient {
 
     // ── Query routing ─────────────────────────────────────────────────
 
-    /// Execute a query with routing based on the upstream's mode.
+    /// Execute a query with per-tool routing from the routing matrix.
     ///
-    /// - No upstreams: passes through to local.
-    /// - Fallback: query local first, query server only if local results
-    ///   are sparse (< threshold).
-    /// - Merge: query both in parallel, merge via weighted RRF + dedup.
-    /// - Primary: query server directly.
+    /// The routing matrix (`crate::routing::tool_routing`) maps each tool
+    /// name to a routing strategy (Merge, LocalFirst, ServerPreferred,
+    /// TwoTier, FanOut, LocalOnly, Combined, Continuation). When no
+    /// upstreams are configured, all queries go to the local daemon.
     pub async fn query(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        let mode = self
-            .upstreams
-            .iter()
-            .find(|u| u.is_healthy())
-            .map(|u| u.mode)
-            .unwrap_or(RoutingMode::Fallback);
-
         if !self.has_upstreams() {
             let mut result = self.query_local(tool_name, params).await?;
             inject_provenance(&mut result, &["local"], &[]);
             return Ok(result);
         }
 
-        match mode {
-            RoutingMode::Fallback => self.query_fallback(tool_name, params).await,
-            RoutingMode::Merge => self.query_merge(tool_name, params).await,
-            RoutingMode::Primary => {
-                match self
-                    .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
-                    .await
-                {
-                    Ok(mut result) => {
-                        inject_provenance(&mut result, &["server"], &[]);
-                        Ok(result)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "primary upstream failed, falling back to local");
-                        let mut result = self.query_local(tool_name, params).await?;
-                        inject_provenance(&mut result, &["local"], &[]);
-                        Ok(result)
-                    }
-                }
+        let routing = tool_routing(tool_name);
+        match routing {
+            ToolRouting::LocalOnly => {
+                let mut result = self.query_local(tool_name, params).await?;
+                inject_provenance(&mut result, &["local"], &[]);
+                Ok(result)
             }
+            ToolRouting::ServerPreferred => self.query_server_preferred(tool_name, params).await,
+            ToolRouting::TwoTier => self.query_two_tier(tool_name, params).await,
+            ToolRouting::Continuation => self.query_with_continuation(tool_name, params).await,
+            ToolRouting::Combined | ToolRouting::Merge | ToolRouting::FanOut => {
+                self.query_merge(tool_name, params).await
+            }
+            ToolRouting::LocalFirst => self.query_fallback(tool_name, params).await,
+        }
+    }
+
+    /// Server-preferred routing: query upstream first, fall back to local.
+    async fn query_server_preferred(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        match self
+            .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
+            .await
+        {
+            Ok(mut r) => {
+                inject_provenance(&mut r, &["server"], &[]);
+                Ok(r)
+            }
+            Err(e) => {
+                debug!(error = %e, tool = tool_name, "server-preferred: upstream failed, falling back to local");
+                let mut r = self.query_local(tool_name, params).await?;
+                inject_provenance(&mut r, &["local"], &[]);
+                Ok(r)
+            }
+        }
+    }
+
+    /// Two-tier routing: local impact + org-wide impact from server.
+    /// Delegates to `blast_radius_two_tier` for blast_radius/brain_impact/
+    /// affected_tests tools.
+    async fn query_two_tier(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        blast_radius_two_tier(self, params).await.or_else(|e| {
+            debug!(error = %e, tool = tool_name, "two-tier query failed, trying merge fallback");
+            // Can't await in or_else, so we just propagate.
+            Err(e)
+        })
+    }
+
+    /// Continuation routing: run locally, then stitch server spans at
+    /// cross-repo boundaries. Used for flow_trace and investigate_expand.
+    async fn query_with_continuation(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        if tool_name == "flow_trace" {
+            flow_trace_with_stitching(self, params, &[]).await
+        } else {
+            // For investigate_expand and other continuation tools, fall back
+            // to merge routing (continuation stitching is flow_trace-specific).
+            self.query_merge(tool_name, params).await
         }
     }
 
