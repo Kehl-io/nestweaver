@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: IGreeter
   kind: Interface
   start_line: 6
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: MyApp.Models
 - name: Greet
   kind: Method
   start_line: 8
@@ -38,6 +40,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
     parameter_types: []
     return_type: string
   parent_name: IGreeter
+  scope_chain: "MyApp.Models::IGreeter"
 - name: Priority
   kind: Enum
   start_line: 11
@@ -49,6 +52,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: MyApp.Models
 - name: Low
   kind: Constant
   start_line: 13
@@ -60,6 +64,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: "MyApp.Models::Priority"
 - name: Medium
   kind: Constant
   start_line: 14
@@ -71,6 +76,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: "MyApp.Models::Priority"
 - name: High
   kind: Constant
   start_line: 15
@@ -82,6 +88,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: "MyApp.Models::Priority"
 - name: SimpleGreeter
   kind: Class
   start_line: 18
@@ -93,6 +100,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: MyApp.Models
 - name: Greet
   kind: Method
   start_line: 20
@@ -107,6 +115,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
     parameter_types: []
     return_type: string
   parent_name: SimpleGreeter
+  scope_chain: "MyApp.Models::SimpleGreeter"
 - name: LogGreeting
   kind: Method
   start_line: 25
@@ -121,6 +130,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
     parameter_types: []
     return_type: void
   parent_name: SimpleGreeter
+  scope_chain: "MyApp.Models::SimpleGreeter"
 - name: Program
   kind: Class
   start_line: 31
@@ -132,6 +142,7 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: MyApp.Models
 - name: Main
   kind: Method
   start_line: 33
@@ -146,3 +157,4 @@ expression: "parsed_symbols(\"Simple.cs\", &source)"
     parameter_types: []
     return_type: void
   parent_name: Program
+  scope_chain: "MyApp.Models::Program"

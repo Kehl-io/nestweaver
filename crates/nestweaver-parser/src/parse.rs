@@ -1,5 +1,6 @@
 use crate::entry_points::detect_entry_point;
 use crate::language::detect_language;
+use crate::scope_chain::extract_scope_chain;
 use bumpalo::Bump;
 use nestweaver_schema::{EntryPointKind, Language, SymbolKind, TypeInfo, Visibility};
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,10 @@ pub struct RawSymbol {
     /// The name of the enclosing class/struct/impl/trait for method symbols.
     /// `None` for top-level functions and non-method symbols.
     pub parent_name: Option<String>,
+    /// The `::` separated scope chain for this symbol, built by walking the
+    /// tree-sitter AST parent chain (e.g. `"mymod::MyClass"`).
+    /// `None` for top-level symbols or languages without scope constructs.
+    pub scope_chain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -863,6 +868,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 } else {
                     None
                 };
+                let scope_chain = extract_scope_chain(node, source, lang_str);
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -875,6 +881,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     visibility,
                     type_info,
                     parent_name,
+                    scope_chain,
                 });
             } else if let Some(kind_str) = capture_name.strip_prefix("reference.") {
                 let kind = match kind_str {

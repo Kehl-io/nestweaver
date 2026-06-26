@@ -182,6 +182,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         }
     }
 

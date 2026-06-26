@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4158
 expression: "parsed_symbols(\"simple.py\", &source)"
 ---
 - name: standalone_function
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: decorator_factory
   kind: Function
   start_line: 7
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: decorator
   kind: Function
   start_line: 8
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: decorator_factory
 - name: wrapper
   kind: Function
   start_line: 9
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: "decorator_factory::decorator"
 - name: decorated_greet
   kind: Function
   start_line: 15
@@ -58,6 +61,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Animal
   kind: Class
   start_line: 18
@@ -69,6 +73,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: name
   kind: Property
   start_line: 18
@@ -80,6 +85,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: __init__
   kind: Method
   start_line: 19
@@ -91,6 +97,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Private
   type_info: ~
   parent_name: Animal
+  scope_chain: Animal
 - name: speak
   kind: Method
   start_line: 22
@@ -102,6 +109,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: Animal
+  scope_chain: Animal
 - name: Dog
   kind: Class
   start_line: 25
@@ -113,6 +121,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: speak
   kind: Method
   start_line: 26
@@ -124,6 +133,7 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: Dog
+  scope_chain: Dog
 - name: main
   kind: Function
   start_line: 29
@@ -135,3 +145,4 @@ expression: "parsed_symbols(\"simple.py\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

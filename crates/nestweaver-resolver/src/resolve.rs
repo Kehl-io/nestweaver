@@ -602,6 +602,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         }
     }
 
@@ -1204,6 +1205,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // File B: class Baz with method bar (different parent)
@@ -1222,6 +1224,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // File C: caller that does foo_instance.bar()
@@ -1323,6 +1326,7 @@ mod tests {
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 },
                 helper,
                 do_work,
@@ -1392,6 +1396,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // ChildClass extends BaseClass (no "save" method of its own)
@@ -1407,6 +1412,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         let extends_ref = RawReference {
@@ -1548,6 +1554,7 @@ mod tests {
                 visibility: Visibility::Public,
                 type_info: None,
                 parent_name: None,
+                scope_chain: None,
             }
         }
 
@@ -1564,6 +1571,7 @@ mod tests {
                 visibility: Visibility::Inferred,
                 type_info: None,
                 parent_name: Some(parent.to_string()),
+                scope_chain: None,
             }
         }
 
@@ -1692,6 +1700,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
         let mut store_query = make_symbol("query", 5);
         store_query.parent_name = Some("Store".to_string());
@@ -1709,6 +1718,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
         let mut handle_method = make_symbol("handle", 10);
         handle_method.parent_name = Some("MyService".to_string());

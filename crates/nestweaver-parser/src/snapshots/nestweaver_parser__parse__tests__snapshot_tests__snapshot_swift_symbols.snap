@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 4
@@ -27,6 +28,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
     parameter_types: []
     return_type: String
   parent_name: ~
+  scope_chain: Greeter
 - name: SimpleGreeter
   kind: Class
   start_line: 7
@@ -38,6 +40,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 8
@@ -52,6 +55,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
     parameter_types: []
     return_type: String
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: formatName
   kind: Method
   start_line: 12
@@ -66,6 +70,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
     parameter_types: []
     return_type: String
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: AppConfig
   kind: Class
   start_line: 17
@@ -77,6 +82,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: defaultName
   kind: Property
   start_line: 18
@@ -88,6 +94,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: AppConfig
+  scope_chain: AppConfig
 - name: Priority
   kind: Class
   start_line: 21
@@ -99,6 +106,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: low
   kind: Constant
   start_line: 22
@@ -110,6 +118,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: medium
   kind: Constant
   start_line: 23
@@ -121,6 +130,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: high
   kind: Constant
   start_line: 24
@@ -132,6 +142,7 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: main
   kind: Function
   start_line: 27
@@ -143,3 +154,4 @@ expression: "parsed_symbols(\"simple.swift\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

@@ -86,6 +86,7 @@ fn arb_symbol() -> impl Strategy<Value = RawSymbol> {
             visibility,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         })
 }
 

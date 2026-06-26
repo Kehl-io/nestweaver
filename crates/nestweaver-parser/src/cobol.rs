@@ -133,6 +133,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Inferred,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 });
                 continue; // sections can't also be paragraphs
             }
@@ -160,6 +161,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Inferred,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 });
             }
         }

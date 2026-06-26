@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: simple
   kind: Class
   start_line: 16
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: handleClick
   kind: Function
   start_line: 25
@@ -35,3 +37,4 @@ expression: "parsed_symbols(\"simple.vue\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~

@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 4
@@ -27,6 +28,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: string
   parent_name: Greeter
+  scope_chain: ~
 - name: farewell
   kind: Method
   start_line: 5
@@ -41,6 +43,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: string
   parent_name: Greeter
+  scope_chain: ~
 - name: Logger
   kind: Interface
   start_line: 8
@@ -52,6 +55,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: log
   kind: Method
   start_line: 9
@@ -66,6 +70,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: void
   parent_name: Logger
+  scope_chain: ~
 - name: ConsoleGreeter
   kind: Class
   start_line: 12
@@ -77,6 +82,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 13
@@ -91,6 +97,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ConsoleGreeter
+  scope_chain: ConsoleGreeter
 - name: farewell
   kind: Method
   start_line: 17
@@ -105,6 +112,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ConsoleGreeter
+  scope_chain: ConsoleGreeter
 - name: log
   kind: Method
   start_line: 21
@@ -119,6 +127,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: void
   parent_name: ConsoleGreeter
+  scope_chain: ConsoleGreeter
 - name: VerboseGreeter
   kind: Class
   start_line: 26
@@ -130,6 +139,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 27
@@ -144,6 +154,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: string
   parent_name: VerboseGreeter
+  scope_chain: VerboseGreeter
 - name: createGreeter
   kind: Function
   start_line: 33
@@ -158,6 +169,7 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
     parameter_types: []
     return_type: Greeter
   parent_name: ~
+  scope_chain: ~
 - name: greeter
   kind: Constant
   start_line: 37
@@ -169,3 +181,4 @@ expression: "parsed_symbols(\"simple.ts\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~

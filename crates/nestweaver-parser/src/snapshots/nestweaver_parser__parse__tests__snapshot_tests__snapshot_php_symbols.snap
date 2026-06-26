@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 10
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Public
   type_info: ~
   parent_name: GreeterInterface
+  scope_chain: GreeterInterface
 - name: Loggable
   kind: Trait
   start_line: 13
@@ -35,6 +37,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: log
   kind: Method
   start_line: 15
@@ -46,6 +49,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: Loggable
 - name: SimpleGreeter
   kind: Class
   start_line: 21
@@ -57,6 +61,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 25
@@ -68,6 +73,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Public
   type_info: ~
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: formatName
   kind: Method
   start_line: 31
@@ -79,6 +85,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Private
   type_info: ~
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: Priority
   kind: Enum
   start_line: 37
@@ -90,6 +97,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Low
   kind: Constant
   start_line: 39
@@ -101,6 +109,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: Medium
   kind: Constant
   start_line: 40
@@ -112,6 +121,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: High
   kind: Constant
   start_line: 41
@@ -123,6 +133,7 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: Priority
 - name: standalone
   kind: Function
   start_line: 44
@@ -134,3 +145,4 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

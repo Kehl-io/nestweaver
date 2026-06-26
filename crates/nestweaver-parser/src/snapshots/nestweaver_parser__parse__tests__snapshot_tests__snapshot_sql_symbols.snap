@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: orders
   kind: Class
   start_line: 8
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: active_users
   kind: Class
   start_line: 15
@@ -35,6 +37,7 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: calculate_total
   kind: Function
   start_line: 20
@@ -46,3 +49,4 @@ expression: "parsed_symbols(\"simple.sql\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

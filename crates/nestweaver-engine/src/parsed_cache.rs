@@ -101,6 +101,7 @@ mod tests {
                 visibility: Visibility::Public,
                 type_info: None,
                 parent_name: None,
+                scope_chain: None,
             }],
             references: vec![RawReference {
                 name: "world".into(),

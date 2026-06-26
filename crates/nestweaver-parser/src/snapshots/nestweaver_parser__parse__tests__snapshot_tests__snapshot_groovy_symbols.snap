@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4337
 expression: "parsed_symbols(\"simple.groovy\", &source)"
 ---
 - name: Greeter
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 5
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: Greeter
+  scope_chain: Greeter
 - name: SimpleGreeter
   kind: Class
   start_line: 14
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: SimpleGreeter
   kind: Method
   start_line: 15
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: greet
   kind: Method
   start_line: 21
@@ -58,6 +61,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: formatName
   kind: Method
   start_line: 26
@@ -69,6 +73,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Private
   type_info: ~
   parent_name: SimpleGreeter
+  scope_chain: SimpleGreeter
 - name: FormalGreeter
   kind: Class
   start_line: 31
@@ -80,6 +85,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: FormalGreeter
   kind: Method
   start_line: 32
@@ -91,6 +97,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: FormalGreeter
+  scope_chain: FormalGreeter
 - name: Priority
   kind: Enum
   start_line: 37
@@ -102,6 +109,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: HIGH
   kind: Constant
   start_line: 38
@@ -113,6 +121,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: LOW
   kind: Constant
   start_line: 38
@@ -124,6 +133,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: MEDIUM
   kind: Constant
   start_line: 38
@@ -135,6 +145,7 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Function
   start_line: 41
@@ -146,3 +157,4 @@ expression: "parsed_symbols(\"simple.groovy\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

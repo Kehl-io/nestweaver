@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4498
 expression: "parsed_symbols(\"simple.f90\", &source)"
 ---
 - name: math_utils
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Vector3D
   kind: Class
   start_line: 4
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: add_vectors
   kind: Function
   start_line: 10
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: normalize
   kind: Function
   start_line: 18
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Module
   start_line: 31
@@ -58,3 +61,4 @@ expression: "parsed_symbols(\"simple.f90\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

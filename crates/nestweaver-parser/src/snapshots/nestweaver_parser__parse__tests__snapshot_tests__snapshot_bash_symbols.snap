@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.sh\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: format_name
   kind: Function
   start_line: 12
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.sh\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Function
   start_line: 17
@@ -35,3 +37,4 @@ expression: "parsed_symbols(\"simple.sh\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
