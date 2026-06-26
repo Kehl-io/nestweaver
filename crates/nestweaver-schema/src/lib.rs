@@ -13,8 +13,8 @@ pub use nodes::{
     ResolvedType, Section, Service, Symbol, SymbolKind, Tag, TypeInfo, Vault, Visibility,
 };
 pub use uid::{
-    PATH_PLACEHOLDER, contract_uid, file_uid, heading_uid, normalize_http_path, note_uid,
-    project_uid, repo_uid, section_uid, service_uid, symbol_uid, tag_uid, truncated_hash,
-    vault_uid,
+    PATH_PLACEHOLDER, canonical_symbol_id, contract_uid, file_uid, heading_uid,
+    normalize_http_path, note_uid, project_uid, repo_uid, scope_hash, section_uid, service_uid,
+    symbol_uid, tag_uid, truncated_hash, vault_uid,
 };
 pub use version::{core_schema_hash, effective_schema_hash};

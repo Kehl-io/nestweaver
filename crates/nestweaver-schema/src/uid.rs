@@ -72,6 +72,33 @@ pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
 }
 
+/// Compute a canonical symbol ID that is instance-independent.
+///
+/// Format: `<repo_url_hash>:<file_path>#<name>:<scope_hash>`
+///
+/// The scope_hash is derived from the scope chain (module::class::method),
+/// NOT from the line number. This makes the ID stable across edits that
+/// shift line numbers without changing the symbol's logical position.
+pub fn canonical_symbol_id(repo_url: &str, file_path: &str, name: &str, scope_chain: &str) -> String {
+    let repo_hash = truncated_hash(repo_url.trim_end_matches('/'));
+    let scope_hash = if scope_chain.is_empty() {
+        truncated_hash(name)
+    } else {
+        truncated_hash(scope_chain)
+    };
+    format!("{}:{}#{}:{}", repo_hash, file_path, name, scope_hash)
+}
+
+/// Hash the scope chain for a symbol, falling back to the name when no
+/// scope chain is available.
+pub fn scope_hash(scope_chain: &str, name: &str) -> String {
+    if scope_chain.is_empty() {
+        truncated_hash(name)
+    } else {
+        truncated_hash(scope_chain)
+    }
+}
+
 /// Canonical placeholder substituted for every path parameter slot when
 /// normalizing an HTTP route. The *name* of the slot is intentionally
 /// discarded so that `/v1/users/{id}` and `/v1/users/:userId` and
@@ -273,5 +300,102 @@ mod tests {
     fn contract_uid_graphql_scheme() {
         let uid = contract_uid("graphql", None, None, Some("Mutation.createApproval"));
         assert_eq!(uid, "contract:graphql:Mutation.createApproval");
+    }
+
+    #[test]
+    fn canonical_id_deterministic() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_id_same_across_trailing_slash() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api/",
+            "src/lib.rs",
+            "foo",
+            "foo",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "foo",
+            "foo",
+        );
+        assert_eq!(a, b, "trailing slash should not change canonical_id");
+    }
+
+    #[test]
+    fn canonical_id_different_for_different_scopes() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "process",
+            "ModA::ClassA::process",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "process",
+            "ModB::ClassB::process",
+        );
+        assert_ne!(a, b, "different scopes should produce different IDs");
+    }
+
+    #[test]
+    fn canonical_id_format() {
+        let id = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        assert!(id.contains("src/billing/webhook.rs"));
+        assert!(id.contains("#processPayment:"));
+        let repo_hash = id.split(':').next().unwrap();
+        assert_eq!(repo_hash.len(), 12);
+    }
+
+    #[test]
+    fn canonical_id_empty_scope_falls_back_to_name() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "main",
+            "",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "main",
+            "",
+        );
+        assert_eq!(a, b, "empty scope chain should still be deterministic");
+        // The scope hash should be the hash of the name
+        assert!(a.ends_with(&format!(":{}", truncated_hash("main"))));
+    }
+
+    #[test]
+    fn scope_hash_empty_falls_back_to_name() {
+        let h = scope_hash("", "main");
+        assert_eq!(h, truncated_hash("main"));
+    }
+
+    #[test]
+    fn scope_hash_non_empty_uses_chain() {
+        let h = scope_hash("Foo::bar", "bar");
+        assert_eq!(h, truncated_hash("Foo::bar"));
+        assert_ne!(h, truncated_hash("bar"));
     }
 }
