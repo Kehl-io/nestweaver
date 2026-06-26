@@ -2331,6 +2331,8 @@ enum BackupCommands {
         config: Option<PathBuf>,
         #[arg(long, help = "Include git bare clones in the backup (full tier)")]
         include_clones: bool,
+        #[arg(long, help = "Proceed even if the daemon is running (backup may be inconsistent)")]
+        force: bool,
     },
     /// Inspect a .nwsnap.zst archive and show its manifest
     Inspect {
@@ -12367,6 +12369,7 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             db,
             config,
             include_clones,
+            force,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !db_path.exists() {
@@ -12378,6 +12381,21 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
 
             let instance_id =
                 nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
+
+            // Warn if the daemon is running — concurrent writes can produce
+            // an inconsistent snapshot.
+            if nestweaver_daemon::launchd::is_running(&instance_id) && !force {
+                eprintln!(
+                    "Error: daemon is running for this database. The backup may be inconsistent."
+                );
+                eprintln!("Stop the daemon first (`nestweaver daemon stop`), or use --force to proceed.");
+                return Ok(EXIT_ERROR);
+            }
+            if nestweaver_daemon::launchd::is_running(&instance_id) && force {
+                eprintln!(
+                    "Warning: daemon is running — backup may be inconsistent (--force specified)."
+                );
+            }
 
             let workspace_path = if include_clones {
                 db_path.parent().map(|p| p.join("workspace"))
