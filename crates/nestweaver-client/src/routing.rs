@@ -56,7 +56,23 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         "detect_changes" => ToolRouting::LocalOnly,
 
         // Metadata — combined
-        "brain_status" | "stale_check" | "brain_doc_stats" => ToolRouting::Combined,
+        "brain_status" | "stale_check" | "brain_doc_stats"
+        | "brain_tag_graph" | "brain_topic_clusters" => ToolRouting::Combined,
+
+        // Vault/note tools — merge (notes may be on server vault)
+        "note_get" | "backlinks" | "get_summary"
+        | "brain_guide" | "brain_diff" => ToolRouting::Merge,
+
+        // Vault analysis — server-preferred (need full vault)
+        "brain_broken_links" | "brain_orphan_documents" => ToolRouting::ServerPreferred,
+
+        // Memory tools — local-only (personal vault)
+        "brain_memory_lint" | "brain_memory_consolidate"
+        | "brain_memory_related" => ToolRouting::LocalOnly,
+
+        // Admin/mutation tools — local-only
+        "brain_add_source" | "brain_remove_source"
+        | "prune_stale" | "set_extension" | "query_extensions" => ToolRouting::LocalOnly,
 
         // Everything else — local-first (safe default)
         _ => ToolRouting::LocalFirst,
