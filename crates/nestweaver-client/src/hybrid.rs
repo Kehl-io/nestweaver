@@ -206,12 +206,11 @@ impl HybridClient {
     }
 
     /// Two-tier routing: local impact + org-wide impact from server.
-    /// Delegates to `blast_radius_two_tier` for blast_radius/brain_impact/
+    /// Delegates to `two_tier_query` for blast_radius/brain_impact/
     /// affected_tests tools.
     async fn query_two_tier(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        blast_radius_two_tier(self, params).await.or_else(|e| {
-            debug!(error = %e, tool = tool_name, "two-tier query failed, trying merge fallback");
-            // Can't await in or_else, so we just propagate.
+        two_tier_query(self, tool_name, params).await.or_else(|e| {
+            debug!(error = %e, tool = tool_name, "two-tier query failed");
             Err(e)
         })
     }
@@ -1428,18 +1427,17 @@ fn uuid_v4_simple() -> String {
 
 // ── Two-tier blast_radius ───────────────────────────────────────────────
 
-/// Execute blast_radius with two-tier output: local + org-wide.
+/// Execute a two-tier impact query: local impact + org-wide impact.
 ///
 /// When an upstream server is available:
-/// 1. Run blast_radius locally (existing logic)
-/// 2. Query the server's blast_radius for the same files
+/// 1. Run the tool locally (existing logic)
+/// 2. Query the server for the same tool
 /// 3. Combine into a response with `local_impact` and `org_impact` sections
 ///
-/// The org-wide section shows impacts in repos only the server has indexed,
-/// giving visibility into cross-repo breakage before pushing.
-pub async fn blast_radius_two_tier(client: &mut HybridClient, params: &Value) -> Result<Value> {
-    // 1. Always run local blast_radius.
-    let mut local_result = client.query_local("blast_radius", params).await?;
+/// Used for blast_radius, brain_impact, and affected_tests.
+pub async fn two_tier_query(client: &mut HybridClient, tool_name: &str, params: &Value) -> Result<Value> {
+    // 1. Always run the tool locally.
+    let mut local_result = client.query_local(tool_name, params).await?;
 
     // 2. If no upstream, return local-only with clear annotation.
     if !client.has_upstreams() {
@@ -1470,13 +1468,14 @@ pub async fn blast_radius_two_tier(client: &mut HybridClient, params: &Value) ->
     let mut up_client = upstream.client();
     let token = upstream.auth_token().map(|t| t.to_string());
     let timeout = upstream.timeout;
+    let tool = tool_name.to_string();
 
     let server_params = params.clone();
     let server_result = match tokio::time::timeout(
         timeout,
         dispatch_json_rpc_authed(
             &mut up_client,
-            "blast_radius",
+            &tool,
             &server_params,
             token.as_deref(),
         ),
@@ -1485,11 +1484,11 @@ pub async fn blast_radius_two_tier(client: &mut HybridClient, params: &Value) ->
     {
         Ok(Ok(result)) => Some(result),
         Ok(Err(e)) => {
-            debug!(error = %e, "org-wide blast_radius query failed");
+            debug!(error = %e, tool = %tool, "org-wide two-tier query failed");
             None
         }
         Err(_) => {
-            debug!("org-wide blast_radius query timed out");
+            debug!(tool = %tool, "org-wide two-tier query timed out");
             None
         }
     };

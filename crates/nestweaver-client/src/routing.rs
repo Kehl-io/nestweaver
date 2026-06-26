@@ -161,4 +161,12 @@ mod tests {
         assert_eq!(tool_routing("some_new_tool"), ToolRouting::LocalFirst);
         assert_eq!(tool_routing("future_feature"), ToolRouting::LocalFirst);
     }
+
+    #[test]
+    fn two_tier_tools_are_distinct() {
+        let tools = ["blast_radius", "brain_impact", "affected_tests"];
+        for tool in &tools {
+            assert_eq!(tool_routing(tool), ToolRouting::TwoTier, "{tool} should be TwoTier");
+        }
+    }
 }
