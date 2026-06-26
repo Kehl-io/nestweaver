@@ -214,6 +214,9 @@ pub struct InstanceConfig {
     /// Default pagination limits for tool responses (`[limits]`).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Server-mode configuration (`[server]`).
+    #[serde(default)]
+    pub server: ServerConfig,
     /// Local embedding model and hybrid-search blend configuration (`[embedding]`).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
@@ -457,6 +460,10 @@ pub struct RepoConfig {
     /// `Some(false)` → this repo never has its CodeRank dampened by git
     /// activity (e.g. a vendored/generated repo where commit recency is noise).
     pub use_git_activity: Option<bool>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub poll: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -517,6 +524,51 @@ pub struct McpServerConfig {
     /// Timeout in seconds for tool calls to this server (default 30).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub indexing: IndexingConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IndexingConfig {
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+    #[serde(default = "default_min_poll")]
+    pub min_poll: String,
+    #[serde(default = "default_max_poll")]
+    pub max_poll: String,
+}
+
+fn default_workers() -> usize { 2 }
+fn default_min_poll() -> String { "45s".to_string() }
+fn default_max_poll() -> String { "8h".to_string() }
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self { workers: default_workers(), min_poll: default_min_poll(), max_poll: default_max_poll() }
+    }
+}
+
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let (num_str, unit) = if s.ends_with("ms") {
+        (&s[..s.len()-2], "ms")
+    } else {
+        let last = s.chars().last()?;
+        (&s[..s.len()-1], if last == 's' { "s" } else if last == 'm' { "m" } else if last == 'h' { "h" } else { return None })
+    };
+    let num: u64 = num_str.parse().ok()?;
+    match unit {
+        "ms" => Some(std::time::Duration::from_millis(num)),
+        "s" => Some(std::time::Duration::from_secs(num)),
+        "m" => Some(std::time::Duration::from_secs(num * 60)),
+        "h" => Some(std::time::Duration::from_secs(num * 3600)),
+        _ => None,
+    }
 }
 
 impl InstanceConfig {
@@ -1161,5 +1213,43 @@ path_deboost = []
         // Shim translates with factor 0.3 each.
         assert!((cfg.seed_resolution.path_deboost[0].factor - 0.3).abs() < 1e-9);
         assert!((cfg.seed_resolution.path_deboost[1].factor - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_duration_variants() {
+        assert_eq!(parse_duration("45s"), Some(std::time::Duration::from_secs(45)));
+        assert_eq!(parse_duration("5m"), Some(std::time::Duration::from_secs(300)));
+        assert_eq!(parse_duration("8h"), Some(std::time::Duration::from_secs(28800)));
+        assert_eq!(parse_duration("500ms"), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("bogus"), None);
+    }
+
+    #[test]
+    fn repo_config_poll_deserializes() {
+        let toml_str = r#"
+            url = "https://github.com/org/repo"
+            branch = "develop"
+            poll = "never"
+        "#;
+        let cfg: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.branch.as_deref(), Some("develop"));
+        assert_eq!(cfg.poll.as_deref(), Some("never"));
+    }
+
+    #[test]
+    fn repo_config_defaults_without_new_fields() {
+        let toml_str = r#"url = "https://github.com/org/repo""#;
+        let cfg: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.branch.is_none());
+        assert!(cfg.poll.is_none());
+    }
+
+    #[test]
+    fn server_indexing_config_defaults() {
+        let cfg = IndexingConfig::default();
+        assert_eq!(cfg.workers, 2);
+        assert_eq!(cfg.min_poll, "45s");
+        assert_eq!(cfg.max_poll, "8h");
     }
 }

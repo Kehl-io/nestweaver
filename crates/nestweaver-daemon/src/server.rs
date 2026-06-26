@@ -3280,6 +3280,9 @@ pub async fn run_server(
             let worker_instance = instance_id.clone();
             let worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
+            let worker_count = state.instance_cfg.as_ref()
+                .map(|c| c.server.indexing.workers)
+                .unwrap_or(2);
             let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
                 Arc::clone(&state.indexing_active),
                 state.indexing_repo.clone(),
@@ -3312,7 +3315,7 @@ pub async fn run_server(
                             return;
                         }
                     };
-                let pool = nestweaver_engine::worker::WorkerPool::new(2);
+                let pool = nestweaver_engine::worker::WorkerPool::new(worker_count);
                 pool.run_with_drain(
                     std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
                     std::sync::Arc::new(workspace),
@@ -3338,8 +3341,14 @@ pub async fn run_server(
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
-            let mut scheduler =
-                PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
+            let indexing_cfg = poll_cfg.as_ref().map(|c| &c.server.indexing);
+            let min_poll = indexing_cfg
+                .and_then(|c| nestweaver_engine::config::parse_duration(&c.min_poll))
+                .unwrap_or(Duration::from_secs(45));
+            let max_poll = indexing_cfg
+                .and_then(|c| nestweaver_engine::config::parse_duration(&c.max_poll))
+                .unwrap_or(Duration::from_secs(8 * 3600));
+            let mut scheduler = PollScheduler::new(min_poll, max_poll);
 
             // Seed from config repos first (includes unindexed repos).
             let mut seeded_urls = std::collections::HashSet::new();
@@ -3348,7 +3357,15 @@ pub async fn run_server(
                     let repo_name = repo_cfg.name.clone().unwrap_or_else(|| {
                         nestweaver_engine::pull::repo_name_from_url(&repo_cfg.url)
                     });
-                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), None);
+                    let poll_override = repo_cfg.poll.as_deref().and_then(|p| {
+                        match p {
+                            "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                            "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                            other => nestweaver_engine::config::parse_duration(other)
+                                .map(nestweaver_engine::scheduler::PollOverride::Fixed),
+                        }
+                    });
+                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), poll_override);
                     seeded_urls.insert(repo_cfg.url.clone());
                 }
             }
