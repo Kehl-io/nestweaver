@@ -284,7 +284,8 @@ impl HybridClient {
 
         // Prepare the server future before borrowing self.local mutably.
         // Pick the first healthy upstream and clone its client (cheap channel clone).
-        let server_task = self.upstreams.iter().find(|u| u.is_healthy()).map(|u| {
+        let repo_hint = extract_repo_hint(params);
+        let server_task = find_upstream_for_repo(&self.upstreams, repo_hint).map(|u| {
             let timeout = u.timeout;
             let mut client = u.client();
             let token = u.auth_token().map(|t| t.to_string());
@@ -440,10 +441,8 @@ impl HybridClient {
         params: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let upstream = self
-            .upstreams
-            .iter()
-            .find(|u| u.is_healthy())
+        let repo_hint = extract_repo_hint(params);
+        let upstream = find_upstream_for_repo(&self.upstreams, repo_hint)
             .context("no healthy upstream servers")?;
 
         let mut client = upstream.client();
@@ -953,6 +952,33 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ── Upstream selection helpers ────────────────────────────────────────
+
+/// Pick an upstream whose repo globs match `repo_hint`, falling back to the
+/// first healthy upstream when no glob matches (or no hint is provided).
+fn find_upstream_for_repo<'a>(
+    upstreams: &'a [UpstreamHandle],
+    repo_hint: Option<&str>,
+) -> Option<&'a UpstreamHandle> {
+    if let Some(repo) = repo_hint {
+        let matched = upstreams.iter().find(|u| u.is_healthy() && u.matches_repo(repo));
+        if matched.is_some() {
+            return matched;
+        }
+    }
+    upstreams.iter().find(|u| u.is_healthy())
+}
+
+/// Extract a repo hint from query params — checks `repos[0]`, `repo`, `repo_url`.
+fn extract_repo_hint(params: &Value) -> Option<&str> {
+    params.get("repos")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("repo").and_then(|v| v.as_str()))
+        .or_else(|| params.get("repo_url").and_then(|v| v.as_str()))
 }
 
 // ── Result helpers ────────────────────────────────────────────────────
@@ -2075,5 +2101,60 @@ mod tests {
 
         let merged = merge_structured_results(&local, &server);
         assert!(merged.get("results").is_some());
+    }
+
+    // ── Upstream repo-glob routing tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn find_upstream_for_repo_uses_globs() {
+        use crate::discovery::{RoutingMode, UpstreamConfig};
+
+        let cfg_acme = UpstreamConfig {
+            name: Some("acme".to_string()),
+            url: "http://127.0.0.1:19990".to_string(),
+            token: None,
+            repos: vec!["acme/*".to_string()],
+            mode: RoutingMode::Fallback,
+            timeout: "1s".to_string(),
+        };
+        let cfg_partner = UpstreamConfig {
+            name: Some("partner".to_string()),
+            url: "http://127.0.0.1:19991".to_string(),
+            token: None,
+            repos: vec!["partner/*".to_string()],
+            mode: RoutingMode::Merge,
+            timeout: "1s".to_string(),
+        };
+
+        let h1 = UpstreamHandle::from_config(&cfg_acme).unwrap();
+        let h2 = UpstreamHandle::from_config(&cfg_partner).unwrap();
+        let upstreams = vec![h1, h2];
+
+        let matched = find_upstream_for_repo(&upstreams, Some("acme/billing"));
+        assert_eq!(matched.unwrap().name.as_str(), "acme");
+
+        let matched = find_upstream_for_repo(&upstreams, Some("partner/api"));
+        assert_eq!(matched.unwrap().name.as_str(), "partner");
+
+        let matched = find_upstream_for_repo(&upstreams, Some("unknown/thing"));
+        assert!(matched.is_some(), "should fall back to first healthy");
+
+        let matched = find_upstream_for_repo(&upstreams, None);
+        assert!(matched.is_some());
+    }
+
+    #[test]
+    fn extract_repo_hint_from_params() {
+        let params = json!({"repos": ["acme/billing", "acme/api"]});
+        assert_eq!(extract_repo_hint(&params), Some("acme/billing"));
+
+        let params = json!({"repo": "partner/api"});
+        assert_eq!(extract_repo_hint(&params), Some("partner/api"));
+
+        let params = json!({"repo_url": "https://github.com/acme/api"});
+        assert_eq!(extract_repo_hint(&params), Some("https://github.com/acme/api"));
+
+        let params = json!({"query": "foo"});
+        assert_eq!(extract_repo_hint(&params), None);
     }
 }
