@@ -12521,16 +12521,24 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             if start {
                 eprintln!();
                 eprintln!("Starting daemon with restored data...");
-                // Find a .lbug file in the data dir to use as --db.
                 let lbug = find_lbug_in_dir(&data_dir);
                 if let Some(db) = lbug {
                     eprintln!("  Database: {}", db.display());
-                    // For now, just print the command the user can run.
-                    // Full daemon launch integration deferred to the daemon crate.
-                    eprintln!(
-                        "  Run: nestweaver daemon run --db {}",
-                        db.display()
-                    );
+                    let exe = std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let db_str = db.display().to_string();
+                    match std::process::Command::new(&exe)
+                        .args(["daemon", "run", "--db", &db_str])
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            eprintln!("  Daemon started (pid {})", child.id());
+                        }
+                        Err(e) => {
+                            eprintln!("  Failed to start daemon: {e}");
+                            eprintln!("  Run manually: nestweaver daemon run --db {}", db.display());
+                        }
+                    }
                 } else {
                     eprintln!(
                         "  No .lbug file found in {}; launch manually.",
