@@ -1460,11 +1460,39 @@ enum Commands {
         #[arg(long, default_value = "fallback")]
         mode: String,
     },
+    /// Server management utilities
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
         #[arg(long)]
         hardware: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServerAction {
+    /// Generate TLS certificates for secure server communication
+    #[command(
+        name = "init-tls",
+        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90"
+    )]
+    InitTls {
+        /// Directory to write certificate files
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Subject Alternative Names (hostnames and IPs)
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        /// Certificate validity in days
+        #[arg(long, default_value = "365")]
+        validity_days: u32,
+        /// Generate client certificate for mTLS
+        #[arg(long)]
+        client: bool,
     },
 }
 
@@ -7799,6 +7827,63 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
         }
+
+        Commands::Server { action } => match action {
+            ServerAction::InitTls {
+                output_dir,
+                sans,
+                validity_days,
+                client,
+            } => {
+                use nestweaver_engine::tls;
+
+                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+
+                tls::write_tls_bundle(&output_dir, &bundle)?;
+
+                let dir_display = output_dir.display();
+                println!("Generated TLS certificates in {dir_display}/");
+                println!();
+                println!("  ca.pem           CA certificate");
+                println!("  ca-key.pem       CA private key");
+                println!("  server.pem       Server certificate");
+                println!("  server-key.pem   Server private key");
+                if client {
+                    println!("  client.pem       Client certificate (mTLS)");
+                    println!("  client-key.pem   Client private key (mTLS)");
+                }
+                println!();
+                println!("Start server with:");
+                println!(
+                    "  nestweaver daemon run --server \\",
+                );
+                println!(
+                    "    --tls-cert {dir_display}/server.pem \\",
+                );
+                println!(
+                    "    --tls-key {dir_display}/server-key.pem",
+                );
+                println!();
+                println!("Clients connect with:");
+                println!("  --cacert {dir_display}/ca.pem");
+                println!();
+
+                let expiry_days = validity_days;
+                println!("Certificates valid for {expiry_days} days.");
+
+                let effective_sans = if sans.is_empty() {
+                    vec!["localhost".to_string(), "127.0.0.1".to_string()]
+                } else {
+                    sans
+                };
+                println!(
+                    "SANs: {}",
+                    effective_sans.join(", ")
+                );
+
+                Ok((EXIT_SUCCESS, None))
+            }
+        },
 
         Commands::Info { hardware } => {
             if hardware {
