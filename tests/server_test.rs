@@ -41,14 +41,31 @@ fn write_test_repo(dir: &std::path::Path) {
 }
 
 #[test]
-fn server_test_helpers_compile() {
-    // Placeholder — verifies test infrastructure compiles.
+fn server_starts_and_writes_port_file() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    write_test_repo(&repo);
-    assert!(repo.join("main.js").exists());
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
 
-    // Verify the ServerGuard type is accessible (compile-time check).
-    let _ty: fn(&std::path::Path) -> helpers::server_guard::ServerGuard =
-        helpers::server_guard::ServerGuard::start;
+    // Index first (no daemon) so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let port = guard.grpc_port();
+    assert!(port > 0, "bound port should be nonzero");
 }

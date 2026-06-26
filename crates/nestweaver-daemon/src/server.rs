@@ -2540,10 +2540,20 @@ impl NestWeaverDaemon for DaemonService {
 ///
 /// `idle_timeout` controls how long the daemon stays alive with no
 /// active requests before self-terminating. Pass `None` to disable.
+/// Options for TCP server mode (passed when `--server` is set).
+#[derive(Debug, Clone)]
+pub struct ServerOpts {
+    /// TCP bind address, e.g. `"127.0.0.1:9378"` or `"127.0.0.1:0"` for OS-assigned.
+    pub bind_addr: String,
+    /// When set, the actual bound port is written here (useful for tests with port 0).
+    pub port_file: Option<PathBuf>,
+}
+
 pub async fn run_server(
     db_path: &Path,
     idle_timeout: Option<Duration>,
     config_path: Option<&Path>,
+    server_opts: Option<ServerOpts>,
 ) -> Result<(), anyhow::Error> {
     // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
     // The DB will be created by GraphStore::open_or_create below.
@@ -2839,6 +2849,33 @@ pub async fn run_server(
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+
+    // TCP listener for server mode — spawned before the blocking UDS serve.
+    if let Some(ref opts) = server_opts {
+        let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+            .await
+            .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
+        let actual_addr = tcp_listener.local_addr()?;
+        tracing::info!(%actual_addr, "TCP server listening");
+        eprintln!("[daemon] TCP server listening on {}", actual_addr);
+
+        if let Some(ref pf) = opts.port_file {
+            std::fs::write(pf, actual_addr.port().to_string())?;
+        }
+
+        let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+        let tcp_svc = svc.clone();
+        let mut tcp_shutdown_rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(tcp_svc)
+                .serve_with_incoming_shutdown(tcp_stream, async move {
+                    let _ = tcp_shutdown_rx.changed().await;
+                })
+                .await;
+        });
+    }
 
     // Set process title for easier identification via pgrep.
     set_process_title(&format!("nestweaver-daemon-{instance_id}"));

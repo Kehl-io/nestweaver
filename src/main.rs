@@ -6959,6 +6959,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         &db_path,
                                         idle,
                                         config_path.as_deref(),
+                                        None,
                                     )
                                     .await
                                     {
@@ -6984,18 +6985,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     admin_token,
                     port_file,
                 } => {
-                    // Flags parsed but not wired up yet.
-                    let _ = server;
-                    let _ = bind;
+                    // TLS and auth flags are parsed but not wired up yet (Tasks 6-7).
                     let _ = tls_cert;
                     let _ = tls_key;
                     let _ = auth_token;
                     let _ = admin_token;
-                    let _ = port_file;
+
+                    let server_opts = if server {
+                        Some(nestweaver_daemon::ServerOpts {
+                            bind_addr: bind,
+                            port_file,
+                        })
+                    } else {
+                        None
+                    };
 
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
-                        nestweaver_daemon::run_server(&db_path, None, None).await
+                        nestweaver_daemon::run_server(&db_path, None, None, server_opts).await
                     })?;
                     Ok((EXIT_SUCCESS, None))
                 }
