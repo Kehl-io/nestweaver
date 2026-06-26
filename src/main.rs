@@ -10114,41 +10114,77 @@ fn run_brain(
             // direct-disk implementation below when `--no-daemon` is set,
             // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config.as_deref(),
+                    &cwd,
                 ));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::BrainSearchRequest {
-                        query: raw_query.clone(),
-                        limit: limit as i32,
-                        response_format: None,
-                        include_bodies: false,
-                        prf,
-                        rerank: false,
-                        root: None,
-                    };
-                    let rpc = rt.block_on(async {
-                        client.inner_mut().search(req).await.map(|r| r.into_inner())
-                    });
-                    match rpc {
-                        Ok(resp) => {
-                            render_brain_search_response(&resp, json)?;
-                            let stats = format!(
-                                "{} results in {} (via daemon)",
-                                resp.results.len(),
-                                format_elapsed(t0.elapsed())
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
+                if let Ok(mut hybrid) = connect {
+                    if hybrid.has_upstreams() {
+                        // Route through HybridClient::query for upstream routing.
+                        let params = serde_json::json!({
+                            "query": raw_query,
+                            "limit": limit,
+                            "prf": prf,
+                        });
+                        let rpc = rt.block_on(hybrid.query("brain_search", &params));
+                        match rpc {
+                            Ok(result) => {
+                                if json {
+                                    println!("{}", serde_json::to_string_pretty(&result)?);
+                                } else {
+                                    render_brain_search_json(&result)?;
+                                }
+                                let count = result
+                                    .get("results")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let stats = format!(
+                                    "{} results in {} (via daemon+hybrid)",
+                                    count,
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: hybrid search failed ({}); falling back to direct DB read",
+                                    e
+                                );
+                            }
                         }
-                        Err(status) => {
-                            // Surface a single eprintln, then fall through to
-                            // the direct-disk path so the user still gets a
-                            // result.
-                            eprintln!(
-                                "warning: daemon search RPC failed ({}); falling back to direct DB read",
-                                status.message()
-                            );
+                    } else {
+                        // No upstreams — use typed RPC for efficiency.
+                        let req = nestweaver_proto::BrainSearchRequest {
+                            query: raw_query.clone(),
+                            limit: limit as i32,
+                            response_format: None,
+                            include_bodies: false,
+                            prf,
+                            rerank: false,
+                            root: None,
+                        };
+                        let rpc = rt.block_on(async {
+                            hybrid.inner_mut().search(req).await.map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                render_brain_search_response(&resp, json)?;
+                                let stats = format!(
+                                    "{} results in {} (via daemon)",
+                                    resp.results.len(),
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(status) => {
+                                eprintln!(
+                                    "warning: daemon search RPC failed ({}); falling back to direct DB read",
+                                    status.message()
+                                );
+                            }
                         }
                     }
                 }
@@ -10425,55 +10461,43 @@ fn run_brain(
                 && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
             {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config_path.as_deref(),
+                    &cwd,
                 ));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::BrainContextRequest {
-                        seeds: seeds.clone(),
-                        token_budget: token_budget.unwrap_or(0) as i32,
-                        response_format: String::new(),
-                        repos: repos.clone(),
-                        vaults: vaults.clone(),
-                        kinds: kinds.clone(),
-                        path_prefix: path_prefix.clone().unwrap_or_default(),
-                        tags: tags.clone(),
-                        exclude_tags: exclude_tags.clone(),
-                        weight_ppr: weight_ppr.unwrap_or(0.0),
-                        weight_bm25: weight_bm25.unwrap_or(0.0),
-                        // Pass the parsed --intent through to the daemon
-                        // (empty string = auto-detect on the server).
-                        intent: intent.clone().unwrap_or_default(),
-                        include_seeds: true,
-                        include_bodies: inline_bodies,
-                        root: root
-                            .clone()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        prf,
-                        rerank,
-                        weight_semantic: if no_embed {
-                            0.0
-                        } else {
-                            weight_semantic.unwrap_or(0.0)
-                        },
-                        since: since.as_deref().unwrap_or("").to_string(),
-                        recency_weight,
-                        recency_half_life_days,
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .get_context(req)
-                            .await
-                            .map(|r| r.into_inner())
+                if let Ok(mut hybrid) = connect {
+                    // Build params JSON — used by both hybrid and typed paths.
+                    let context_params = serde_json::json!({
+                        "seeds": seeds,
+                        "token_budget": token_budget.unwrap_or(0),
+                        "repos": repos,
+                        "vaults": vaults,
+                        "kinds": kinds,
+                        "path_prefix": path_prefix.clone().unwrap_or_default(),
+                        "tags": tags,
+                        "exclude_tags": exclude_tags,
+                        "weight_ppr": weight_ppr.unwrap_or(0.0),
+                        "weight_bm25": weight_bm25.unwrap_or(0.0),
+                        "intent": intent.clone().unwrap_or_default(),
+                        "include_seeds": true,
+                        "include_bodies": inline_bodies,
+                        "root": root.clone().unwrap_or_default().to_string_lossy().to_string(),
+                        "prf": prf,
+                        "rerank": rerank,
+                        "weight_semantic": if no_embed { 0.0 } else { weight_semantic.unwrap_or(0.0) },
+                        "since": since.as_deref().unwrap_or(""),
+                        "recency_weight": recency_weight,
+                        "recency_half_life_days": recency_half_life_days,
                     });
+
+                    // Route through hybrid.query for upstream merge.
+                    let rpc = rt.block_on(hybrid.query("brain_context", &context_params));
                     match rpc {
-                        Ok(resp) => {
+                        Ok(result_json) => {
                             let result: nestweaver_engine::BrainContextResult =
-                                serde_json::from_str(&resp.result_json)?;
+                                serde_json::from_value(result_json)?;
                             let cut = match token_budget {
                                 Some(budget) => token_budgeted_truncate(&result.connected, budget),
                                 None => limit.min(result.connected.len()),
@@ -10483,18 +10507,24 @@ fn run_brain(
                             } else {
                                 print_brain_context_text(&result, cut, token_budget);
                             }
+                            let source = if hybrid.has_upstreams() {
+                                "daemon+hybrid"
+                            } else {
+                                "daemon"
+                            };
                             let node_count = result.seeds.len() + cut;
                             let stats = format!(
-                                "{} nodes in {} (via daemon)",
+                                "{} nodes in {} (via {})",
                                 node_count,
-                                format_elapsed(t0.elapsed())
+                                format_elapsed(t0.elapsed()),
+                                source,
                             );
                             return Ok((EXIT_SUCCESS, Some(stats)));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             eprintln!(
                                 "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                status.message()
+                                e
                             );
                         }
                     }
@@ -11563,6 +11593,86 @@ fn render_brain_search_response(
                 );
             } else {
                 println!("  [{:.2}] {} [{}]", item.score, item.title, kind_short);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render a brain search response from a JSON `Value` (hybrid path).
+///
+/// The JSON shape matches the proto `BrainSearchResponse` serialized by
+/// `dispatch_typed_brain_search` in the hybrid client.
+fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
+    let results = result
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let query = result.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let engine = result
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bm25");
+    let expansion_terms: Vec<String> = result
+        .get("expansion_terms")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if results.is_empty() {
+        println!("No results for '{}'.", query);
+        return Ok(());
+    }
+
+    let header = if engine == "bm25" {
+        "Brain search (BM25)"
+    } else {
+        "Brain search (substring fallback)"
+    };
+    // Include provenance scope if present (hybrid/local/server).
+    let scope = result
+        .get("_meta")
+        .and_then(|m| m.get("scope"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("local");
+    println!("{}: {} result(s) [{}]", header, results.len(), scope);
+    if !expansion_terms.is_empty() {
+        println!("  PRF expansion terms: {}", expansion_terms.join(", "));
+    }
+    println!();
+    for item in &results {
+        let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let location = item.get("location").and_then(|v| v.as_str());
+        let matched_headings: Vec<&str> = item
+            .get("matched_headings")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        if kind == "note" {
+            if matched_headings.is_empty() {
+                println!("  [{:.2}] {}", score, title);
+            } else {
+                println!(
+                    "  [{:.2}] {} (matched: {})",
+                    score,
+                    title,
+                    matched_headings.join(", "),
+                );
+            }
+        } else {
+            let kind_short = kind.strip_prefix("Symbol/").unwrap_or(kind);
+            if let Some(loc) = location {
+                println!("  [{:.2}] {} [{}] @ {}", score, title, kind_short, loc);
+            } else {
+                println!("  [{:.2}] {} [{}]", score, title, kind_short);
             }
         }
     }
