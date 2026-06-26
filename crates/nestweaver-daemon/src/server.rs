@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
+use crate::safeguards::{ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard};
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -81,6 +82,14 @@ pub struct DaemonState {
     pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
     /// Number of pending + running jobs in the server-side job queue.
     pub indexing_queue_depth: Arc<AtomicU32>,
+    /// Per-tool query safeguards (timeouts, depth limits, result caps).
+    pub safeguards: QuerySafeguards,
+    /// Per-client rate limiters (token bucket via governor).
+    pub rate_limiters: Option<Arc<ClientRateLimiters>>,
+    /// Whether the server-side worker pool is drained (not picking new jobs).
+    pub drained: Arc<AtomicBool>,
+    /// Admin token for admin API authentication (separate from query token).
+    pub admin_token: Option<String>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -97,7 +106,28 @@ impl DaemonService {
     /// corresponding MCP tool via `nestweaver_mcp::tools::dispatch`.
     /// Runs the blocking dispatch on a dedicated thread to avoid
     /// starving the tokio runtime.
+    ///
+    /// In server mode, the dispatch is wrapped with a per-tool timeout
+    /// via `with_safeguard`.
     async fn dispatch_json_tool(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let safeguards = &self.state.safeguards;
+        let tool = tool_name.to_string();
+        let handler = self.dispatch_json_tool_inner(tool_name, args_json);
+
+        if self.state.server_mode {
+            with_safeguard(&tool, safeguards, None, handler).await
+        } else {
+            handler.await
+        }
+    }
+
+    /// Inner dispatch without safeguard wrapper. Extracted so
+    /// `with_safeguard` can race it against a timeout.
+    async fn dispatch_json_tool_inner(
         &self,
         tool_name: &str,
         args_json: &str,
@@ -181,7 +211,26 @@ impl DaemonService {
     /// Dispatch a tool by name with a pre-built JSON args value, returning the
     /// raw `serde_json::Value` result. Used by typed RPC handlers that convert
     /// protobuf → JSON on input and JSON → protobuf on output.
+    ///
+    /// In server mode, the dispatch is wrapped with a per-tool timeout.
     async fn dispatch_tool_json(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, Status> {
+        let safeguards = &self.state.safeguards;
+        let tool = tool_name.to_string();
+        let handler = self.dispatch_tool_json_inner(tool_name, args);
+
+        if self.state.server_mode {
+            with_safeguard(&tool, safeguards, None, handler).await
+        } else {
+            handler.await
+        }
+    }
+
+    /// Inner dispatch without safeguard wrapper.
+    async fn dispatch_tool_json_inner(
         &self,
         tool_name: &str,
         args: serde_json::Value,
@@ -2687,6 +2736,8 @@ pub struct ServerOpts {
     pub webhook_secret: Option<String>,
     /// Previous webhook secret, checked as fallback during secret rotation.
     pub webhook_secret_old: Option<String>,
+    /// Admin token for admin API endpoints (separate from query auth token).
+    pub admin_token: Option<String>,
 }
 
 pub async fn run_server(
@@ -2816,6 +2867,26 @@ pub async fn run_server(
         });
 
     let is_server_mode = server_opts.is_some();
+
+    // Build safeguards and rate limiters for server mode.
+    let safeguards = if is_server_mode {
+        QuerySafeguards::default_server()
+    } else {
+        QuerySafeguards::disabled()
+    };
+
+    let rate_limiters = if is_server_mode {
+        let config = RateLimitConfig::default();
+        Some(Arc::new(ClientRateLimiters::new(&config)))
+    } else {
+        None
+    };
+
+    // Extract admin token from server opts (if present).
+    let admin_token = server_opts
+        .as_ref()
+        .and_then(|opts| opts.admin_token.clone());
+
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -2835,6 +2906,10 @@ pub async fn run_server(
         indexing_active: Arc::new(AtomicBool::new(false)),
         indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
         indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+        safeguards,
+        rate_limiters: rate_limiters.clone(),
+        drained: Arc::new(AtomicBool::new(false)),
+        admin_token,
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
@@ -2844,6 +2919,23 @@ pub async fn run_server(
         tokio::task::spawn_blocking(move || match store.warm_ppr_cache() {
             Ok(()) => tracing::info!("PPR adjacency cache warmed"),
             Err(e) => tracing::warn!("failed to warm PPR cache: {e}"),
+        });
+    }
+
+    // Spawn periodic rate limiter cleanup (every 10 minutes).
+    if let Some(ref rl) = state.rate_limiters {
+        let rl = rl.clone();
+        let mut sweep_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(600)) => {
+                        rl.sweep_stale();
+                        tracing::debug!("rate limiter stale entries swept");
+                    }
+                    _ = sweep_shutdown.changed() => break,
+                }
+            }
         });
     }
 
@@ -3029,6 +3121,23 @@ pub async fn run_server(
             tracing::info!("webhook endpoint enabled at /webhook");
         }
 
+        // Mount admin API routes when an admin token is configured.
+        if let Some(ref admin_tok) = opts.admin_token {
+            let admin_state = std::sync::Arc::new(nestweaver_web::state::AdminState {
+                admin_token: admin_tok.clone(),
+                daemon_store: state.store.clone(),
+                instance_id: state.instance_id.clone(),
+                start_time: state.start_time,
+                active_reads: state.active_reads.clone(),
+                active_writes: state.active_writes.clone(),
+                drained: state.drained.clone(),
+                indexing_queue_depth: state.indexing_queue_depth.clone(),
+            });
+            let admin_router = nestweaver_web::create_admin_router(admin_state);
+            mcp_router = mcp_router.nest("/admin/api", admin_router);
+            tracing::info!("admin API enabled at /admin/api/*");
+        }
+
         // Parse the bind address to determine the MCP port.  When the gRPC
         // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
         // and records the actual port in the port file (second line).
@@ -3081,9 +3190,12 @@ pub async fn run_server(
         let mut tcp_shutdown_rx = shutdown_tx.subscribe();
 
         // When an auth token is configured, wrap the TCP service with a
-        // bearer-token interceptor. UDS stays unauthenticated.
-        let interceptor =
-            crate::auth::bearer_auth_interceptor(opts.auth_token.clone());
+        // bearer-token interceptor + rate limiting. UDS stays unauthenticated.
+        let interceptor = crate::auth::bearer_auth_interceptor(
+            opts.auth_token.clone(),
+            opts.admin_token.clone(),
+            rate_limiters.clone(),
+        );
         let tcp_svc = tonic::service::interceptor::InterceptedService::new(
             svc.clone(),
             interceptor,

@@ -42,6 +42,7 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 pub mod admin;
 pub mod affected_tests;
 pub mod atomic_changes;
+pub mod backup;
 pub mod bare_clone;
 pub mod agent_guide;
 pub mod blast_radius;
@@ -93,6 +94,7 @@ pub mod snapshot;
 pub mod suggest;
 pub mod summaries;
 pub mod summary;
+pub mod tls;
 pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
@@ -106,6 +108,10 @@ pub use agent_guide::{
     generate_claude_md_with_rules, generate_cursor_rule, generate_cursor_rule_with_rules,
     generate_guide, generate_guide_with_rules, generate_skill, generate_skill_with_rules,
     generate_skill_with_tools,
+};
+pub use backup::{
+    BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
+    RestoreResult, backup_inspect, backup_list, backup_restore, backup_save,
 };
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,

@@ -40,6 +40,12 @@ rayon = "1.10"
 globset = "0.4"
 url = "2"
 html2md = "0.2"
+sha2 = { workspace = true }
+tar = "0.4"
+tempfile = "3"
+zstd = "0.13"
+rcgen = "0.14"
+time = "0.3"
 nestweaver-embed = { path = "../nestweaver-embed", optional = true }
 
 [features]

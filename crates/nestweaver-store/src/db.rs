@@ -506,6 +506,14 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Merge the WAL into the main database file.
+    pub fn checkpoint(&self) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        conn.query("CHECKPOINT")
+            .map_err(|e| StoreError::Query(format!("checkpoint: {e}")))?;
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
