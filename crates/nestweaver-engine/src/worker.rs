@@ -1,12 +1,54 @@
 //! Worker pool that claims jobs from the SQLite queue, fetches repos via bare
 //! clones, and indexes them via `GitBareReader` + `index_with_reader`.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
 
 use crate::bare_clone::BareCloneWorkspace;
 use crate::jobs::{IndexJob, JobQueue};
+
+/// Shared indexing status that can be observed by other components (e.g. the
+/// daemon's `brain_status` handler) to report whether indexing is in progress.
+#[derive(Clone)]
+pub struct IndexingStatus {
+    /// Whether any worker is currently indexing.
+    pub active: Arc<AtomicBool>,
+    /// The repo currently being indexed (empty when idle).
+    pub current_repo: Arc<tokio::sync::RwLock<String>>,
+    /// Number of pending + running jobs.
+    pub queue_depth: Arc<AtomicU32>,
+}
+
+impl IndexingStatus {
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+            current_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+            queue_depth: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Create from existing Arc fields (e.g. shared with DaemonState).
+    pub fn from_arcs(
+        active: Arc<AtomicBool>,
+        current_repo: Arc<tokio::sync::RwLock<String>>,
+        queue_depth: Arc<AtomicU32>,
+    ) -> Self {
+        Self {
+            active,
+            current_repo,
+            queue_depth,
+        }
+    }
+}
+
+impl Default for IndexingStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Coordinates concurrent indexing workers. Each worker claims a job from the
 /// queue, fetches the latest commits into a bare clone, and runs full indexing
@@ -31,6 +73,9 @@ impl WorkerPool {
 
     /// Run the worker loop. Claims jobs from the queue, processes them with
     /// bounded concurrency via `tokio::spawn`. Exits when `shutdown` fires.
+    ///
+    /// The optional `status` is updated as jobs start/finish so callers (e.g.
+    /// the daemon's `brain_status` RPC) can report indexing progress.
     pub async fn run(
         &self,
         queue: Arc<Mutex<JobQueue>>,
@@ -38,6 +83,7 @@ impl WorkerPool {
         store: Arc<nestweaver_store::GraphStore>,
         instance_id: String,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
+        status: Option<IndexingStatus>,
     ) {
         loop {
             // Check shutdown signal.
@@ -49,13 +95,26 @@ impl WorkerPool {
             // rusqlite::Connection is !Sync).
             let job = {
                 let q = queue.lock().expect("job queue lock poisoned");
+                // Update queue depth while we hold the lock.
+                if let Some(ref st) = status {
+                    if let Ok(depth) = q.queue_depth() {
+                        st.queue_depth
+                            .store((depth.pending + depth.running) as u32, Ordering::Relaxed);
+                    }
+                }
                 q.claim_next(2) // 2s debounce
             };
 
             let job = match job {
                 Ok(Some(job)) => job,
                 Ok(None) => {
-                    // No jobs available. Wait briefly or until shutdown.
+                    // No jobs available — mark idle.
+                    if let Some(ref st) = status {
+                        st.active.store(false, Ordering::Relaxed);
+                        *st.current_repo.write().await = String::new();
+                        st.queue_depth.store(0, Ordering::Relaxed);
+                    }
+                    // Wait briefly or until shutdown.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                         _ = shutdown.changed() => {}
@@ -72,12 +131,19 @@ impl WorkerPool {
                 }
             };
 
+            // Signal that indexing is active.
+            if let Some(ref st) = status {
+                st.active.store(true, Ordering::Relaxed);
+                *st.current_repo.write().await = job.repo_id.clone();
+            }
+
             // Acquire a semaphore permit to bound concurrency.
             let permit = self.semaphore.clone().acquire_owned().await.unwrap();
             let queue = queue.clone();
             let workspace = workspace.clone();
             let store = store.clone();
             let instance_id = instance_id.clone();
+            let status_clone = status.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -109,6 +175,24 @@ impl WorkerPool {
                         let q = queue.lock().expect("job queue lock poisoned");
                         let _ = q.fail(job.id, &format!("task panic: {join_err}"), false);
                         tracing::error!(repo = job.repo_id, error = %join_err, "worker task panicked");
+                    }
+                }
+
+                // Update queue depth after job completion.
+                if let Some(ref st) = status_clone {
+                    let q = queue.lock().expect("job queue lock poisoned");
+                    if let Ok(depth) = q.queue_depth() {
+                        let total = (depth.pending + depth.running) as u32;
+                        st.queue_depth.store(total, Ordering::Relaxed);
+                        if total == 0 {
+                            st.active.store(false, Ordering::Relaxed);
+                            // Clear current_repo — requires async, so we
+                            // spawn a minimal task.
+                            let cr = st.current_repo.clone();
+                            tokio::spawn(async move {
+                                *cr.write().await = String::new();
+                            });
+                        }
                     }
                 }
             });
@@ -344,7 +428,7 @@ mod tests {
 
         // Run the worker loop in a background task.
         let handle = tokio::spawn(async move {
-            pool.run(q, workspace, s, "test".to_string(), shutdown_rx)
+            pool.run(q, workspace, s, "test".to_string(), shutdown_rx, None)
                 .await;
         });
 
@@ -375,5 +459,69 @@ mod tests {
         // Verify symbols were indexed.
         let count = store.count_symbols().unwrap();
         assert!(count > 0, "worker should have indexed the repo and created symbols");
+    }
+
+    #[tokio::test]
+    async fn worker_pool_updates_indexing_status() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[("lib.rs", "pub fn mul(a: i32, b: i32) -> i32 { a * b }")],
+        );
+        let url = format!("file://{}", src.display());
+
+        let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        queue
+            .upsert("status-test-repo", &url, JobTrigger::Unindexed)
+            .unwrap();
+        let queue = Arc::new(Mutex::new(queue));
+
+        let workspace =
+            Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+
+        let status = IndexingStatus::new();
+        let status_check = status.clone();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pool = WorkerPool::new(1);
+
+        let q = queue.clone();
+        let s = store.clone();
+
+        let handle = tokio::spawn(async move {
+            pool.run(q, workspace, s, "test".to_string(), shutdown_rx, Some(status))
+                .await;
+        });
+
+        // Wait for the job to complete.
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let depth = {
+                let q = queue.lock().unwrap();
+                q.queue_depth().unwrap()
+            };
+            if depth.succeeded >= 1 {
+                break;
+            }
+        }
+
+        // After completion, the status should reflect idle state.
+        // Give a moment for the status update to propagate.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            !status_check.active.load(Ordering::Relaxed),
+            "indexing should not be active after job completes"
+        );
+        assert_eq!(
+            status_check.queue_depth.load(Ordering::Relaxed),
+            0,
+            "queue depth should be 0 after job completes"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 }

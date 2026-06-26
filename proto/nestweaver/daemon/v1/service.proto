@@ -202,6 +202,9 @@ message BrainStatusResponse {
   int32 repo_count = 7;
   bool tantivy_available = 8;
   int32 tantivy_doc_count = 9;
+  bool indexing_active = 10;
+  string indexing_repo = 11;  // repo currently being indexed (empty if idle)
+  int32 queue_depth = 12;     // number of pending + running jobs
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison

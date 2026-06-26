@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -73,6 +73,14 @@ pub struct DaemonState {
     /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
     /// single write transaction).
     pub write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this daemon is running in server mode (TCP, no local source files).
+    pub server_mode: bool,
+    /// Whether the server-side worker pool is currently indexing a repo.
+    pub indexing_active: Arc<AtomicBool>,
+    /// The repo currently being indexed (empty string when idle).
+    pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
+    /// Number of pending + running jobs in the server-side job queue.
+    pub indexing_queue_depth: Arc<AtomicU32>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -124,6 +132,7 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
+            nestweaver_mcp::tools::set_server_mode(state.server_mode);
 
             let embed_ref = embed_arc.as_deref();
             tracing::debug!(
@@ -197,6 +206,7 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
+            nestweaver_mcp::tools::set_server_mode(state.server_mode);
 
             let embed_ref = embed_arc.as_deref();
 
@@ -1792,6 +1802,14 @@ impl NestWeaverDaemon for DaemonService {
         let args = serde_json::json!({});
         let value = self.dispatch_tool_json("brain_status", args).await?;
 
+        let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+        let indexing_repo = if indexing_active {
+            self.state.indexing_repo.read().await.clone()
+        } else {
+            String::new()
+        };
+        let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
+
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
                 .get("vault_count")
@@ -1814,6 +1832,9 @@ impl NestWeaverDaemon for DaemonService {
                 .get("tantivy_doc_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32,
+            indexing_active,
+            indexing_repo,
+            queue_depth,
         }))
     }
 
@@ -1841,7 +1862,28 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "brain_status")
+        let req = r.into_inner();
+        let resp = self.dispatch_json_tool("brain_status", &req.args_json).await?;
+        // Inject server-side indexing status into the JSON response so
+        // AI agents see it via the MCP tool path as well.
+        let mut json_resp = resp.into_inner();
+        if let Ok(mut value) =
+            serde_json::from_str::<serde_json::Value>(&json_resp.result_json)
+        {
+            let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+            value["indexing_active"] = serde_json::json!(indexing_active);
+            if indexing_active {
+                value["indexing_repo"] =
+                    serde_json::json!(*self.state.indexing_repo.read().await);
+            }
+            value["queue_depth"] = serde_json::json!(
+                self.state.indexing_queue_depth.load(Ordering::Relaxed)
+            );
+            if let Ok(s) = serde_json::to_string(&value) {
+                json_resp.result_json = s;
+            }
+        }
+        Ok(Response::new(json_resp))
     }
 
     async fn repo_states(
@@ -2737,6 +2779,7 @@ pub async fn run_server(
             }
         });
 
+    let is_server_mode = server_opts.is_some();
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -2752,6 +2795,10 @@ pub async fn run_server(
         instance_cfg,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        server_mode: is_server_mode,
+        indexing_active: Arc::new(AtomicBool::new(false)),
+        indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+        indexing_queue_depth: Arc::new(AtomicU32::new(0)),
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
