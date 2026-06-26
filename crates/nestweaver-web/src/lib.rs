@@ -9,12 +9,12 @@ use axum::{
     extract::Request,
     http::{self, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use rust_embed::RustEmbed;
 use tower_http::cors::CorsLayer;
 
-use crate::state::AppState;
+use crate::state::{AdminState, AppState};
 
 #[derive(RustEmbed, Clone)]
 #[folder = "frontend/dist/"]
@@ -174,6 +174,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/export/svg", post(routes::export::export_svg))
         .route("/api/v1/export/png", post(routes::export::export_png))
         .route("/api/v1/export/html", post(routes::export::export_html))
+        // Metrics (Prometheus text format, no auth)
+        .route("/metrics", get(routes::metrics::metrics_handler))
         // Snapshot
         .route(
             "/api/v1/snapshot.msgpack",
@@ -183,6 +185,27 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
         .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// Creates the admin API router for server-mode deployments.
+/// All routes require admin token authentication via the `AdminAuth` extractor.
+pub fn create_admin_router(state: Arc<AdminState>) -> Router {
+    use routes::admin;
+
+    Router::new()
+        .route("/repos", get(admin::list_repos).post(admin::add_repo))
+        .route("/repos/{id}", delete(admin::remove_repo))
+        .route("/repos/{id}/reindex", post(admin::trigger_reindex))
+        .route("/queue", get(admin::get_queue))
+        .route("/drain", post(admin::drain))
+        .route("/resume", post(admin::resume))
+        .route("/drain/status", get(admin::drain_status))
+        .route("/dead-letter", get(admin::list_dead_letter))
+        .route("/dead-letter/{id}/retry", post(admin::retry_dead_letter))
+        .route("/dead-letter/{id}", delete(admin::dismiss_dead_letter))
+        .route("/reload", post(admin::reload_config))
+        .route("/status", get(admin::get_status))
         .with_state(state)
 }
 

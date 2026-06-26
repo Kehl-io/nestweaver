@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod brain;
 pub mod canvases;
 pub mod context;
@@ -8,6 +9,7 @@ pub mod gaps;
 pub mod health;
 pub mod impact;
 pub mod llm;
+pub mod metrics;
 pub mod overview;
 pub mod paths;
 pub mod perspectives;
