@@ -1127,15 +1127,49 @@ fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
 }
 
 /// Filter org-wide results to exclude repos already covered by local impact.
+///
+/// Removes entries from the server's `affected_symbols` and `changed_symbols`
+/// whose file paths resolve to a repo already present in the local impact.
+/// Matching is done by repo-prefix extraction: the first path component of
+/// each `file_path` is treated as the repo identifier. Repos indexed locally
+/// are excluded from the org section to avoid duplicate noise.
 fn filter_org_results(
     server: &Value,
-    _local_repos: &std::collections::HashSet<String>,
+    local_repos: &std::collections::HashSet<String>,
 ) -> Value {
-    // For now, return the full server result. More sophisticated filtering
-    // (e.g., by repo URL matching) requires canonical repo identification
-    // across local and server databases, which depends on consistent repo
-    // URL normalization. Document this for future refinement.
-    server.clone()
+    if local_repos.is_empty() {
+        return server.clone();
+    }
+    let mut filtered = server.clone();
+
+    // Filter affected_symbols and changed_symbols arrays.
+    for key in &["affected_symbols", "changed_symbols"] {
+        if let Some(arr) = filtered.get_mut(key).and_then(|v| v.as_array_mut()) {
+            arr.retain(|item| {
+                let dominated = item
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(|fp| fp.split('/').next())
+                    .is_some_and(|repo| local_repos.contains(repo));
+                !dominated
+            });
+        }
+    }
+
+    // Filter affected_clusters entries whose repo matches a local repo.
+    if let Some(clusters) = filtered.get_mut("affected_clusters").and_then(|v| v.as_array_mut()) {
+        clusters.retain(|cluster| {
+            // Keep the cluster if any of its symbols are NOT in a local repo.
+            let dominated = cluster
+                .get("representative_file")
+                .and_then(|v| v.as_str())
+                .and_then(|fp| fp.split('/').next())
+                .is_some_and(|repo| local_repos.contains(repo));
+            !dominated
+        });
+    }
+
+    filtered
 }
 
 // ---------------------------------------------------------------------------
