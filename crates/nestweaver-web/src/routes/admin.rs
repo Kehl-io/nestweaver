@@ -594,6 +594,28 @@ pub async fn reload_config(
         )
     })??;
 
+    // Notify the live scheduler so it picks up added/removed repos
+    // without a daemon restart.
+    if let Some(ref tx) = state.scheduler_tx {
+        if let Some(ref config_path) = state.config_path {
+            if let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path) {
+                let repos: Vec<_> = cfg.repos.iter().map(|r| {
+                    let repo_name = r.name.clone().unwrap_or_else(|| {
+                        nestweaver_engine::pull::repo_name_from_url(&r.url)
+                    });
+                    let poll_override = r.poll.as_deref().and_then(|p| match p {
+                        "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                        "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                        other => nestweaver_engine::config::parse_duration(other)
+                            .map(nestweaver_engine::scheduler::PollOverride::Fixed),
+                    });
+                    (repo_name, r.url.clone(), poll_override)
+                }).collect();
+                let _ = tx.send(nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos }).await;
+            }
+        }
+    }
+
     Ok(Json(MessageResponse { message }))
 }
 
@@ -652,6 +674,7 @@ mod tests {
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             db_path: db_path_clone,
             config_path: None,
+            scheduler_tx: None,
         })
     }
 

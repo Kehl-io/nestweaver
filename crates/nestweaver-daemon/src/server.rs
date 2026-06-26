@@ -3111,6 +3111,11 @@ pub async fn run_server(
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
+    // Create scheduler command channel. The sender goes into AdminState
+    // so the reload endpoint can push commands; the receiver is consumed
+    // by the scheduler task below.
+    let (scheduler_tx, scheduler_rx) = tokio::sync::mpsc::channel::<nestweaver_engine::scheduler::SchedulerCommand>(64);
+
     // MCP-over-HTTP server — spawned alongside the gRPC servers.
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
@@ -3168,6 +3173,7 @@ pub async fn run_server(
                 indexing_queue_depth: state.indexing_queue_depth.clone(),
                 db_path: db_path.clone(),
                 config_path: config_path.map(|p| p.to_path_buf()),
+                scheduler_tx: Some(scheduler_tx.clone()),
             });
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);
@@ -3338,6 +3344,7 @@ pub async fn run_server(
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
+        let mut scheduler_rx = scheduler_rx;  // move into the spawned task
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
@@ -3387,6 +3394,25 @@ pub async fn run_server(
             loop {
                 tokio::select! {
                     _ = poll_shutdown.changed() => break,
+                    cmd = scheduler_rx.recv() => {
+                        if let Some(cmd) = cmd {
+                            match cmd {
+                                nestweaver_engine::scheduler::SchedulerCommand::AddRepo { repo_id, repo_url, poll_override } => {
+                                    scheduler.add_repo(repo_id, repo_url, poll_override);
+                                }
+                                nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
+                                    scheduler.remove_repo(&repo_id);
+                                }
+                                nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos } => {
+                                    scheduler = PollScheduler::new(min_poll, max_poll);
+                                    for (id, url, ovr) in repos {
+                                        scheduler.add_repo(id, url, ovr);
+                                    }
+                                    tracing::info!(count = scheduler.repo_count(), "scheduler reloaded from config");
+                                }
+                            }
+                        }
+                    }
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {
                         // Skip polling when drained.
                         if poll_drained.load(std::sync::atomic::Ordering::Relaxed) {

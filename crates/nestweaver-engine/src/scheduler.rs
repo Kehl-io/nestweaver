@@ -32,7 +32,24 @@ struct RepoSchedule {
     next_poll_at: Instant,
 }
 
+/// Command sent to the live scheduler via an mpsc channel.
+#[derive(Debug)]
+pub enum SchedulerCommand {
+    AddRepo {
+        repo_id: String,
+        repo_url: String,
+        poll_override: Option<PollOverride>,
+    },
+    RemoveRepo {
+        repo_id: String,
+    },
+    ReloadConfig {
+        repos: Vec<(String, String, Option<PollOverride>)>,
+    },
+}
+
 /// Per-repo override for poll behavior.
+#[derive(Debug)]
 pub enum PollOverride {
     /// Always poll at this fixed interval.
     Fixed(Duration),
