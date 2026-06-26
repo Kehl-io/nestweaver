@@ -41,6 +41,7 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 
 pub mod admin;
 pub mod affected_tests;
+pub mod bare_clone;
 pub mod agent_guide;
 pub mod blast_radius;
 pub mod brain_docgraph;
