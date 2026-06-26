@@ -9,7 +9,8 @@ use nestweaver_parser::{
 };
 use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
 use nestweaver_schema::{
-    File, Language, Repo, Service, Symbol, file_uid, repo_uid, service_uid, symbol_uid,
+    File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
+    symbol_uid,
 };
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
@@ -801,6 +802,9 @@ fn index_into_store(
                         ));
                     }
 
+                    let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
+                    let canonical = canonical_symbol_id(repo_url, &rel_path, &raw_sym.name, scope_str);
+
                     all_symbols.push(Symbol {
                         uid: s_uid.clone(),
                         name: raw_sym.name.clone(),
@@ -819,7 +823,7 @@ fn index_into_store(
                         visibility: raw_sym.visibility,
                         type_info: raw_sym.type_info.clone(),
                         framework_hint: hint_by_index.remove(&sym_idx),
-                        canonical_id: None,
+                        canonical_id: Some(canonical),
                     });
 
                     file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
@@ -1579,7 +1583,7 @@ pub fn incremental_index_with_name(
                     result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, &store, &txn)?;
+                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, repo_url, &store, &txn)?;
                 result.symbols_added += added;
                 result.files_added += 1;
             }
@@ -1595,7 +1599,7 @@ pub fn incremental_index_with_name(
                 result.symbols_removed += removed;
 
                 // Re-parse and insert.
-                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, &store, &txn)?;
+                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, repo_url, &store, &txn)?;
                 result.symbols_added += added;
                 result.files_modified += 1;
             }
@@ -1638,7 +1642,7 @@ pub fn incremental_index_with_name(
                         .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file_txn(&reader, to, &r_uid, &store, &txn)?;
+                    let added = process_added_or_modified_file_txn(&reader, to, &r_uid, repo_url, &store, &txn)?;
                     result.symbols_added += added;
                 }
 
@@ -1685,11 +1689,12 @@ fn process_added_or_modified_file(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
     r_uid: &str,
+    repo_url: &str,
     store: &nestweaver_store::GraphStore,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
-    use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
+    use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
@@ -1732,6 +1737,8 @@ fn process_added_or_modified_file(
 
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
+        let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
+        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -1750,7 +1757,7 @@ fn process_added_or_modified_file(
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
             framework_hint: None,
-            canonical_id: None,
+            canonical_id: Some(canonical),
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));
@@ -1814,12 +1821,13 @@ fn process_added_or_modified_file_txn(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
     r_uid: &str,
+    repo_url: &str,
     store: &nestweaver_store::GraphStore,
     conn: &nestweaver_store::DbConnection<'_>,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
-    use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
+    use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
@@ -1860,6 +1868,8 @@ fn process_added_or_modified_file_txn(
 
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
+        let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
+        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -1878,7 +1888,7 @@ fn process_added_or_modified_file_txn(
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
             framework_hint: None,
-            canonical_id: None,
+            canonical_id: Some(canonical),
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));
