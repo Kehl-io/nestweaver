@@ -1,0 +1,292 @@
+//! CI integration tests for NestWeaver impact analysis pipeline.
+//!
+//! These tests exercise the end-to-end flow of indexing a repo, computing
+//! impact from local changes, and verifying JSON/markdown output — the same
+//! steps a CI pipeline would run.
+//!
+//! Run with:
+//!   cargo test --test ci_integration_test -- --test-threads=1
+
+use std::process::Command as StdCommand;
+
+/// Create a minimal git repo with a JS function, committed.
+fn init_git_repo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+}
+
+/// Run a git command in the given directory, panicking on failure.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git command failed to spawn");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Build a nestweaver command with daemon suppressed.
+fn nestweaver() -> StdCommand {
+    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd
+}
+
+/// Index a repo into a database, asserting success.
+fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) {
+    let output = nestweaver()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── Test 1: impact diff produces valid JSON ─────────────────────────────
+
+#[test]
+fn impact_diff_produces_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+
+    // Set up a git repo with an initial commit containing a function.
+    init_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function processOrder(orderId) { return orderId; }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &[
+        "-c", "user.email=test@test.com",
+        "-c", "user.name=Test",
+        "commit", "-m", "initial: add processOrder",
+    ]);
+
+    // Index the repo at its initial state.
+    index_repo(&repo_dir, &db_path);
+
+    // Second commit: change the function signature (breaking change).
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function processOrder(orderId, options) { return orderId; }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &[
+        "-c", "user.email=test@test.com",
+        "-c", "user.name=Test",
+        "commit", "-m", "change processOrder signature",
+    ]);
+
+    // Run pre-push-impact using --diff against the previous commit.
+    let output = nestweaver()
+        .args([
+            "pre-push-impact",
+            "--diff",
+            "HEAD~1..HEAD",
+            "--format",
+            "json",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "pre-push-impact failed (exit {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The output should be valid JSON.
+    let json_start = stdout.find('{');
+    assert!(json_start.is_some(), "expected JSON output, got: {stdout}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout[json_start.unwrap()..]).expect("output should be valid JSON");
+
+    // Verify expected top-level structure.
+    assert!(
+        parsed.get("changes").is_some(),
+        "JSON should have 'changes' field, got: {parsed}"
+    );
+    assert!(
+        parsed.get("impacts").is_some(),
+        "JSON should have 'impacts' field, got: {parsed}"
+    );
+}
+
+// ── Test 2: format-comment produces markdown ────────────────────────────
+
+#[test]
+#[ignore = "depends on the format-comment subcommand being implemented"]
+fn format_comment_produces_markdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("impact.json");
+
+    // Write a sample ImpactResult JSON array matching the engine struct.
+    let impact_data = serde_json::json!([
+        {
+            "change_canonical_id": "sym:repo:lib.js:processOrder:1",
+            "change_kind": "SignatureChanged",
+            "affected_canonical_id": "sym:repo:app.js:handleCheckout:5",
+            "affected_name": "handleCheckout",
+            "affected_repo_url": "https://github.com/acme/frontend.git",
+            "affected_file": "app.js",
+            "affected_line": 5,
+            "affected_signature": "function handleCheckout(order)",
+            "severity": "Breaking",
+            "reason": "Calls processOrder which changed signature"
+        }
+    ]);
+
+    std::fs::write(&input_path, serde_json::to_string_pretty(&impact_data).unwrap()).unwrap();
+
+    let output = nestweaver()
+        .args([
+            "impact",
+            "format-comment",
+            "--input",
+            &input_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "format-comment failed (exit {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("<!-- nestweaver-impact -->"),
+        "markdown output should contain hidden marker, got: {stdout}"
+    );
+}
+
+// ── Test 3: graceful degradation when server is unreachable ─────────────
+
+#[test]
+fn impact_server_down_graceful() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+
+    // Set up a git repo with uncommitted changes so pre-push-impact has
+    // something to analyze.
+    init_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function hello() { return 1; }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &[
+        "-c", "user.email=test@test.com",
+        "-c", "user.name=Test",
+        "commit", "-m", "initial",
+    ]);
+
+    // Index the repo.
+    index_repo(&repo_dir, &db_path);
+
+    // Create a second commit so --diff has something to compare.
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function hello(name) { return name; }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &[
+        "-c", "user.email=test@test.com",
+        "-c", "user.name=Test",
+        "commit", "-m", "change hello",
+    ]);
+
+    // Point --server at localhost:1 which should be unreachable. Without
+    // --fail-on-error the command should exit 0 gracefully.
+    let output = nestweaver()
+        .args([
+            "pre-push-impact",
+            "--diff",
+            "HEAD~1..HEAD",
+            "--format",
+            "json",
+            "--server",
+            "grpc://localhost:1",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "pre-push-impact should exit 0 when server is unreachable (exit {}): stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // When server is down and format is json, output should contain empty
+    // impacts or an error indicator.
+    if let Some(json_start) = stdout.find('{') {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout[json_start..]).unwrap_or_default();
+        let impacts = parsed
+            .get("impacts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            impacts, 0,
+            "impacts should be empty when server is unreachable"
+        );
+        // Should include an error indicator
+        assert!(
+            parsed.get("error").is_some(),
+            "JSON output should include an 'error' field when server is down, got: {parsed}"
+        );
+    }
+    // If no JSON output at all, that's also acceptable (warning printed to stderr).
+}
