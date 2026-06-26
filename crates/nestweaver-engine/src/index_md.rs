@@ -12,6 +12,7 @@ use std::time::Instant;
 use anyhow::Context;
 use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
+use crate::content_reader::ContentReader;
 use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
@@ -20,7 +21,8 @@ use nestweaver_schema::{
     tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
-use walkdir::WalkDir;
+// walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
+// still use direct fs access.
 
 /// Outcome of a markdown index run.
 pub struct MarkdownIndexResult {
@@ -48,6 +50,23 @@ const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
 ];
+
+/// Returns true if any component of `rel_path` matches one of the vault
+/// `SKIP_DIRS`. Used to post-filter results from `ContentReader::list_files()`
+/// which may not know about vault-specific skip directories (e.g. `.obsidian`,
+/// `.trash`).
+fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
+    for component in rel_path.components() {
+        if let std::path::Component::Normal(name) = component {
+            if let Some(s) = name.to_str() {
+                if SKIP_DIRS.contains(&s) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
 /// pasted into a note). Files above this size are skipped with a warning.
@@ -104,10 +123,12 @@ pub fn index_markdown_directory_with_store(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
-    let result = index_into_store(vault_root, store, instance_id, vault_name, &ignore_set)?;
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
+    let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
-    let aliases = load_taxonomy_aliases(vault_root);
+    let aliases = load_taxonomy_aliases(reader.root());
     if !aliases.is_empty() {
         let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
         match serde_json::to_string(&aliases) {
@@ -150,8 +171,10 @@ pub fn index_markdown_directory_in_memory(
     vault_name: &str,
 ) -> Result<(MarkdownIndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("create in-memory GraphStore")?;
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, &[]);
-    let result = index_into_store(vault_root, &store, instance_id, vault_name, &ignore_set)?;
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
+    let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result, store))
 }
 
@@ -204,6 +227,7 @@ pub fn index_markdown_directory_since_with_ignore(
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
 
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
     let root_str = canonical.to_string_lossy().into_owned();
     let vault_root: &Path = &canonical;
     let v_uid = vault_uid(instance_id, &root_str);
@@ -218,34 +242,12 @@ pub fn index_markdown_directory_since_with_ignore(
         })
         .context("upsert_vault")?;
 
-    // Track visited directory inodes to detect symlink loops.
-    #[cfg(unix)]
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let since_secs = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
-    let walker = WalkDir::new(vault_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            {
-                return false;
-            }
-            #[cfg(unix)]
-            if e.file_type().is_dir()
-                && let Ok(meta) = std::fs::metadata(e.path())
-            {
-                use std::os::unix::fs::MetadataExt;
-                let key = (meta.dev(), meta.ino());
-                if !seen_inodes.insert(key) {
-                    tracing::debug!("skipping already-visited inode: {}", e.path().display());
-                    return false;
-                }
-            }
-            true
-        });
+    let all_files = reader.list_files()?;
 
     let mut files_checked = 0usize;
     let mut notes_updated = 0usize;
@@ -255,89 +257,57 @@ pub fn index_markdown_directory_since_with_ignore(
     let mut total_tags = 0usize;
     let mut total_wikilinks = 0usize;
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("walkdir error (since): {err}");
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
+    for rel_path in all_files {
+        if !is_markdown(&rel_path) {
             continue;
         }
-        let path = entry.path();
-        if !is_markdown(path) {
+        // Skip vault-specific directories.
+        if path_has_vault_skip_dir(&rel_path) {
             continue;
         }
-        // Reject symlinks whose target is outside the vault root.
-        if entry.path_is_symlink() {
-            match std::fs::canonicalize(path) {
-                Ok(resolved) if !resolved.starts_with(vault_root) => {
-                    tracing::warn!("skipping symlink escaping vault root: {}", path.display());
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!("cannot resolve symlink: {}", path.display());
-                    continue;
-                }
-                Ok(_) => {}
-            }
-        }
-
         // Apply .brainignore patterns.
-        let rel_for_ignore = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_for_ignore, &ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+        let rel_str = rel_path.to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_str, &ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_str);
             continue;
         }
 
         files_checked += 1;
 
-        // Filter by modification time.
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if mtime < since {
+        // Filter by modification time via ContentReader metadata.
+        let (mtime_secs, file_size) = match reader.file_meta(&rel_path) {
+            Ok(Some((m, s))) => (m, s),
+            _ => continue,
+        };
+        if mtime_secs < since_secs {
             continue;
         }
 
         // Size guard.
-        if let Ok(meta) = entry.metadata()
-            && meta.len() > MAX_FILE_SIZE_BYTES
-        {
-            tracing::warn!("skipping oversized file: {}", path.display());
+        if file_size > MAX_FILE_SIZE_BYTES {
+            tracing::warn!("skipping oversized file: {}", rel_str);
             continue;
         }
 
-        let source = match std::fs::read_to_string(path) {
+        let source = match reader.read_file(&rel_path) {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!("read error {}: {err}", path.display());
+                tracing::warn!("read error {}: {err}", rel_str);
                 continue;
             }
         };
 
-        let rel_path = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let rel_path_str = rel_str.into_owned();
 
-        let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
+        let parsed: ParsedNote = match parse_markdown(&rel_path_str, &source) {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!("parse error {rel_path}: {err}");
+                tracing::warn!("parse error {rel_path_str}: {err}");
                 continue;
             }
         };
 
-        let n_uid = note_uid(&v_uid, &rel_path);
+        let n_uid = note_uid(&v_uid, &rel_path_str);
 
         // Delete old note data (cascade). Safe when note doesn't exist.
         if let Err(e) = store.delete_note_cascade(&n_uid) {
@@ -346,9 +316,10 @@ pub fn index_markdown_directory_since_with_ignore(
             notes_deleted += 1;
         }
 
+        let abs_path = vault_root.join(&rel_path);
         let (h_count, s_count, wl_count, t_count) =
-            reinsert_single_note(&store, &v_uid, &n_uid, path, &rel_path, &parsed)
-                .with_context(|| format!("reinsert_single_note {rel_path}"))?;
+            reinsert_single_note(&store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
+                .with_context(|| format!("reinsert_single_note {rel_path_str}"))?;
 
         total_headings += h_count;
         total_sections += s_count;
@@ -650,7 +621,7 @@ fn reinsert_single_note(
 }
 
 fn index_into_store(
-    vault_root: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     store: &GraphStore,
     instance_id: &str,
     vault_name: &str,
@@ -658,11 +629,11 @@ fn index_into_store(
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let started = Instant::now();
 
-    // Canonicalize the root so vault_uid and note rel_paths agree with the
-    // watcher (which sees canonical paths from FSEvents on macOS).
-    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
-    let root_str = canonical.to_string_lossy().into_owned();
-    let vault_root: &Path = &canonical;
+    // The caller canonicalizes vault_root before constructing the reader, so
+    // reader.root() is already canonical — agreeing with the watcher (which
+    // sees canonical paths from FSEvents on macOS).
+    let vault_root = reader.root();
+    let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
 
     // 1. Insert the Vault node. If the vault was already indexed, cascade-
@@ -690,112 +661,51 @@ fn index_into_store(
 
     /// Per-file data collected during the scan phase.
     struct ScannedNote {
-        path: PathBuf,
-        metadata: Option<std::fs::Metadata>,
+        rel_path: PathBuf,
     }
 
     let mut scanned_notes: Vec<ScannedNote> = Vec::new();
     let mut skipped: Vec<SkippedFile> = Vec::new();
 
-    // Track visited directory inodes to detect symlink loops.
-    #[cfg(unix)]
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-
-    // SECURITY: do NOT follow symlinks. A vault containing a symlink to
-    // /etc/passwd (or any path outside the vault) would otherwise be
-    // indexed, and `note_get` would then exfiltrate the target file's
-    // contents through Claude. Symlinks are silently skipped.
-    let walker = WalkDir::new(vault_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            {
-                return false;
-            }
-            #[cfg(unix)]
-            if e.file_type().is_dir()
-                && let Ok(meta) = std::fs::metadata(e.path())
-            {
-                use std::os::unix::fs::MetadataExt;
-                let key = (meta.dev(), meta.ino());
-                if !seen_inodes.insert(key) {
-                    tracing::debug!("skipping already-visited inode: {}", e.path().display());
-                    return false;
-                }
-            }
-            true
-        });
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("walkdir error: {err}");
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
+    // SECURITY: FilesystemReader::list_files() uses follow_links(false)
+    // and only returns entries where file_type().is_file() == true,
+    // so symlinks (including those pointing outside the vault) are
+    // silently excluded — matching the old WalkDir + symlink-rejection
+    // behaviour.
+    let all_files = reader.list_files()?;
+    for rel_path in all_files {
+        if !is_markdown(&rel_path) {
             continue;
         }
-        let path = entry.path();
-        if !is_markdown(path) {
+        // Skip vault-specific directories (e.g. .obsidian, .trash).
+        if path_has_vault_skip_dir(&rel_path) {
             continue;
-        }
-
-        // Reject symlinks whose target is outside the vault root.
-        if entry.path_is_symlink() {
-            match std::fs::canonicalize(path) {
-                Ok(resolved) if !resolved.starts_with(vault_root) => {
-                    skipped.push(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: "symlink target outside vault root".to_string(),
-                    });
-                    continue;
-                }
-                Err(e) => {
-                    skipped.push(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: format!("cannot resolve symlink: {e}"),
-                    });
-                    continue;
-                }
-                Ok(_) => {}
-            }
         }
 
         // Apply .brainignore patterns.
-        let rel_for_ignore = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_for_ignore, ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+        let rel_str = rel_path.to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_str);
             skipped.push(SkippedFile {
-                path: path.to_string_lossy().into_owned(),
+                path: rel_str.into_owned(),
                 reason: "matched .brainignore pattern".to_string(),
             });
             continue;
         }
 
         // Size guard.
-        let metadata = entry.metadata().ok();
-        if let Some(ref meta) = metadata
-            && meta.len() > MAX_FILE_SIZE_BYTES
-        {
-            skipped.push(SkippedFile {
-                path: path.to_string_lossy().into_owned(),
-                reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
-            });
-            continue;
+        if let Ok(Some((_, size))) = reader.file_meta(&rel_path) {
+            if size > MAX_FILE_SIZE_BYTES {
+                skipped.push(SkippedFile {
+                    path: rel_str.into_owned(),
+                    reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
+                });
+                continue;
+            }
         }
 
         scanned_notes.push(ScannedNote {
-            path: path.to_path_buf(),
-            metadata,
+            rel_path,
         });
         scan_pb.set_message(format!("Scanning notes... {}", scanned_notes.len()));
         scan_pb.tick();
@@ -845,28 +755,19 @@ fn index_into_store(
     let outcomes: Vec<NoteOutcome> = scanned_notes
         .par_iter()
         .map(|scanned| {
-            let path = &scanned.path;
+            let rel_path = scanned.rel_path.to_string_lossy().into_owned();
 
-            let display_name = path
-                .strip_prefix(vault_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
-
-            // Read.
-            let source = match std::fs::read_to_string(path) {
+            // Read via ContentReader.
+            let source = match reader.read_file(&scanned.rel_path) {
                 Ok(s) => s,
                 Err(err) => {
                     parse_pb.inc(1);
                     return NoteOutcome::Skipped(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
+                        path: rel_path,
                         reason: format!("read error: {err}"),
                     });
                 }
             };
-
-            // Compute relative path from vault root for stable UIDs.
-            let rel_path = display_name;
 
             let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
                 Ok(p) => p,
@@ -894,14 +795,15 @@ fn index_into_store(
                 None
             };
 
-            // File timestamps — best-effort, never fatal.
-            let (created_at, modified_at) = match &scanned.metadata {
-                Some(meta) => {
+            // File timestamps — best-effort, never fatal. Uses direct
+            // fs::metadata for created_at (not in ContentReader trait).
+            let (created_at, modified_at) = match std::fs::metadata(vault_root.join(&scanned.rel_path)) {
+                Ok(meta) => {
                     let created = meta.created().ok().and_then(format_system_time);
                     let modified = meta.modified().ok().and_then(format_system_time);
                     (created, modified)
                 }
-                None => (None, None),
+                Err(_) => (None, None),
             };
 
             let note = Note {
