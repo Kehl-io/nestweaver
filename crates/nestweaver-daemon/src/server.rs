@@ -3279,6 +3279,7 @@ pub async fn run_server(
             let worker_db = db_path.clone();
             let worker_instance = instance_id.clone();
             let worker_shutdown = shutdown_tx.subscribe();
+            let worker_drained = Arc::clone(&state.drained);
             let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
                 Arc::clone(&state.indexing_active),
                 state.indexing_repo.clone(),
@@ -3312,13 +3313,14 @@ pub async fn run_server(
                         }
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(2);
-                pool.run(
+                pool.run_with_drain(
                     std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
                     std::sync::Arc::new(workspace),
                     worker_store,
                     worker_instance,
                     worker_shutdown,
                     Some(indexing_status),
+                    worker_drained,
                 )
                 .await;
             });
@@ -3331,6 +3333,7 @@ pub async fn run_server(
         let poll_db = db_path.clone();
         let poll_instance = instance_id.clone();
         let poll_cfg = state.instance_cfg.clone();
+        let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
@@ -3368,6 +3371,10 @@ pub async fn run_server(
                 tokio::select! {
                     _ = poll_shutdown.changed() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        // Skip polling when drained.
+                        if poll_drained.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
                         let due = scheduler.due_repos();
                         for (repo_id, repo_url) in due {
                             // Determine which branch ref to check. Default to

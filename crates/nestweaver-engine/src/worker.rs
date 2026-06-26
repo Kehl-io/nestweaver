@@ -85,10 +85,70 @@ impl WorkerPool {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
     ) {
+        self.run_inner(
+            queue,
+            workspace,
+            store,
+            instance_id,
+            &mut shutdown,
+            status,
+            None,
+        )
+        .await;
+    }
+
+    /// Run the worker loop with an optional drained flag.
+    ///
+    /// When `drained` is `Some(flag)` and the flag is `true`, the worker
+    /// sleeps instead of claiming new jobs. In-flight jobs are unaffected
+    /// (they finish naturally).
+    pub async fn run_with_drain(
+        &self,
+        queue: Arc<Mutex<JobQueue>>,
+        workspace: Arc<BareCloneWorkspace>,
+        store: Arc<nestweaver_store::GraphStore>,
+        instance_id: String,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        status: Option<IndexingStatus>,
+        drained: Arc<AtomicBool>,
+    ) {
+        self.run_inner(
+            queue,
+            workspace,
+            store,
+            instance_id,
+            &mut shutdown,
+            status,
+            Some(drained),
+        )
+        .await;
+    }
+
+    async fn run_inner(
+        &self,
+        queue: Arc<Mutex<JobQueue>>,
+        workspace: Arc<BareCloneWorkspace>,
+        store: Arc<nestweaver_store::GraphStore>,
+        instance_id: String,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        status: Option<IndexingStatus>,
+        drained: Option<Arc<AtomicBool>>,
+    ) {
         loop {
             // Check shutdown signal.
             if *shutdown.borrow() {
                 break;
+            }
+
+            // If drained, sleep instead of claiming new jobs.
+            if let Some(ref flag) = drained {
+                if flag.load(Ordering::Relaxed) {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        _ = shutdown.changed() => {}
+                    }
+                    continue;
+                }
             }
 
             // Try to claim the next job (behind a std::sync::Mutex since
