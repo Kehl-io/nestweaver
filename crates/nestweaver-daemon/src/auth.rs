@@ -40,13 +40,15 @@ pub fn bearer_auth_interceptor(
             Some(value) if value.starts_with("Bearer ") => {
                 let bearer = &value[7..];
 
-                // Check if this is the admin token — admin bypasses rate limiting.
+                // Constant-time token comparison to prevent timing side-channel attacks.
+                use subtle::ConstantTimeEq;
+                let token_match: bool = bearer.as_bytes().ct_eq(token.as_bytes()).into();
                 let is_admin = admin_token
                     .as_ref()
-                    .is_some_and(|admin| bearer == admin.as_str());
+                    .map(|admin| bool::from(bearer.as_bytes().ct_eq(admin.as_bytes())))
+                    .unwrap_or(false);
 
-                // Validate: accept if token matches auth token OR admin token.
-                if bearer != token.as_str() && !is_admin {
+                if !token_match && !is_admin {
                     return Err(Status::unauthenticated("missing or invalid bearer token"));
                 }
 

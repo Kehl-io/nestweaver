@@ -652,7 +652,7 @@ fn extract_result_items(value: &Value) -> Vec<Value> {
         results.clone()
     } else if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
         items.clone()
-    } else if value.is_object() && !value.as_object().unwrap().is_empty() {
+    } else if value.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         vec![value.clone()]
     } else {
         vec![]

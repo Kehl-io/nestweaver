@@ -27,6 +27,7 @@ keywords = ["code-graph", "tree-sitter", "code-analysis", "knowledge-graph", "mc
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
+subtle = "2"
 nestweaver-algorithms = { path = "crates/nestweaver-algorithms" }
 nestweaver-schema = { path = "crates/nestweaver-schema" }
 nestweaver-parser = { path = "crates/nestweaver-parser" }

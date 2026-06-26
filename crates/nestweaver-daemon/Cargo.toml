@@ -6,6 +6,7 @@ license.workspace = true
 description = "gRPC daemon for NestWeaver — serves read RPCs over a Unix domain socket"
 
 [dependencies]
+subtle = { workspace = true }
 nestweaver-proto = { workspace = true }
 nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
