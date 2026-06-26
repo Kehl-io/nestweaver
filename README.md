@@ -116,6 +116,40 @@ nestweaver setup --force   # regenerate skill/guide files even if customized
 
 Run `nestweaver --help` for the full command list. All commands support `--json` for machine-readable output.
 
+## Server Mode
+
+NestWeaver can run as a centralized server, indexing repos for your entire team and serving queries to AI agents via gRPC and MCP-over-HTTP.
+
+### Quick Start
+
+```bash
+# Start the server
+nestweaver daemon --db ./brain.lbug run \
+  --server \
+  --bind 0.0.0.0:9378 \
+  --auth-token "$NESTWEAVER_AUTH_TOKEN"
+
+# Connect from another machine
+nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TOKEN"
+```
+
+### Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 9377 | HTTP | Web UI + Prometheus `/metrics` |
+| 9378 | gRPC | Query API (TCP + TLS) |
+| 9379 | HTTP | MCP-over-HTTP (AI agents) |
+| 9380 | HTTP | Webhook endpoint |
+
+### Docker
+
+```bash
+docker compose up -d
+```
+
+See [Server Mode Guide](docs/server-mode.md) for full documentation.
+
 ## Install
 
 ### macOS (recommended: native app)
