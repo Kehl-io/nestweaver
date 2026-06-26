@@ -492,6 +492,38 @@ enum Commands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
+    /// Analyze the impact of local changes against the org-wide graph
+    ///
+    /// Computes atomic changes from uncommitted modifications, sends them
+    /// to the daemon for cross-repo impact analysis, and reports which
+    /// symbols in other repos would break.
+    #[command(
+        name = "pre-push-impact",
+        after_help = "Examples:\n  nestweaver pre-push-impact --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project"
+    )]
+    PrePushImpact {
+        /// Analyze uncommitted changes in the working tree
+        #[arg(long)]
+        local_changes: bool,
+        /// Maximum transitive depth for impact analysis (default: 3)
+        #[arg(long, default_value = "3")]
+        max_depth: u32,
+        /// Include test files in impact results
+        #[arg(long)]
+        include_tests: bool,
+        /// Output format: human (default), json
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Repository path (default: current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Path to the database file
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// Generate a structural skeleton ranked by symbol importance
     ///
     /// Outputs the highest-PageRank symbols organized by file, truncated
@@ -5641,6 +5673,168 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_AMBIGUOUS, None))
                 }
             }
+        }
+
+        Commands::PrePushImpact {
+            local_changes,
+            max_depth,
+            include_tests,
+            format,
+            repo,
+            db,
+        } => {
+            if !local_changes {
+                eprintln!("error: --local-changes is required");
+                return Ok((EXIT_ERROR, None));
+            }
+
+            let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            if !repo_path.join(".git").exists() {
+                eprintln!(
+                    "error: {} is not a git repository",
+                    repo_path.display()
+                );
+                return Ok((EXIT_ERROR, None));
+            }
+
+            // Detect repo URL from git remote
+            let repo_url = {
+                let output = std::process::Command::new("git")
+                    .args(["remote", "get-url", "origin"])
+                    .current_dir(&repo_path)
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    }
+                    _ => format!("file://{}", repo_path.display()),
+                }
+            };
+
+            // Compute local atomic changes
+            use nestweaver_engine::atomic_changes::{compute_local_changes, ImpactSeverity};
+            let changes = compute_local_changes(&repo_path, &repo_url)
+                .map_err(|e| anyhow::anyhow!("failed to compute local changes: {}", e))?;
+
+            if changes.is_empty() {
+                if !out.quiet {
+                    println!("No local changes detected.");
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            if !out.quiet {
+                println!(
+                    "  Analyzing {} local change(s)...",
+                    changes.len()
+                );
+            }
+
+            // Run impact analysis against the local store
+            let store = open_store(db.as_deref())?;
+            let impacts = nestweaver_engine::atomic_changes::analyze_impact(
+                &store, &changes, max_depth, include_tests,
+            )
+            .map_err(|e| anyhow::anyhow!("impact analysis failed: {}", e))?;
+
+            if format == "json" {
+                let output = serde_json::json!({
+                    "changes": changes.len(),
+                    "impacts": impacts,
+                    "total_impacted_files": impacts.iter().map(|i| &i.affected_file).collect::<std::collections::HashSet<_>>().len(),
+                    "total_impacted_repos": impacts.iter().map(|i| &i.affected_repo_url).filter(|u| !u.is_empty()).collect::<std::collections::HashSet<_>>().len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                // Human-readable output
+                if impacts.is_empty() {
+                    if !out.quiet {
+                        println!("\n  No cross-repo impact detected.");
+                    }
+                } else {
+                    // Group by severity
+                    let breaking: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Breaking)
+                        .collect();
+                    let warnings: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Warning)
+                        .collect();
+                    let info: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Info)
+                        .collect();
+
+                    println!();
+                    for impact in &breaking {
+                        println!(
+                            "  \x1b[31mBREAKING\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!(
+                            "    {}:{}",
+                            impact.affected_file, impact.affected_line
+                        );
+                    }
+                    for impact in &warnings {
+                        println!(
+                            "  \x1b[33mWARNING\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!(
+                            "    {}:{}",
+                            impact.affected_file, impact.affected_line
+                        );
+                    }
+                    for impact in &info {
+                        println!(
+                            "  \x1b[34mINFO\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!(
+                            "    {}:{}",
+                            impact.affected_file, impact.affected_line
+                        );
+                    }
+
+                    let unique_files: std::collections::HashSet<_> =
+                        impacts.iter().map(|i| &i.affected_file).collect();
+                    let unique_repos: std::collections::HashSet<_> = impacts
+                        .iter()
+                        .map(|i| &i.affected_repo_url)
+                        .filter(|u| !u.is_empty())
+                        .collect();
+
+                    println!();
+                    println!(
+                        "  {} impact(s) across {} file(s){}",
+                        impacts.len(),
+                        unique_files.len(),
+                        if unique_repos.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {} repo(s)", unique_repos.len())
+                        },
+                    );
+                    if !breaking.is_empty() {
+                        println!(
+                            "  {} BREAKING, {} WARNING, {} INFO",
+                            breaking.len(),
+                            warnings.len(),
+                            info.len()
+                        );
+                    }
+                }
+            }
+
+            let stats = format!(
+                "{} change(s), {} impact(s) in {}",
+                changes.len(),
+                impacts.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::Impact {
