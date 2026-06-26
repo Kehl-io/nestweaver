@@ -572,7 +572,32 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         neighbors,
         token_budget,
     );
-    Ok(serde_json::to_value(res)?)
+    let mut value = serde_json::to_value(res)?;
+
+    // In server mode, source files live in bare clones (no checkout tree on
+    // disk), so FilesystemReader will return empty bodies for every symbol.
+    // Add a note so AI agents know to use brain_search/brain_context instead.
+    if is_server_mode() {
+        let has_empty_bodies = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().all(|s| {
+                s.get("body")
+                    .and_then(|b| b.as_str())
+                    .is_none_or(|b| b.is_empty())
+            }));
+        if has_empty_bodies {
+            value["server_note"] = serde_json::json!(
+                "Running in server mode — source files are in bare clones without \
+                 checkout trees. Symbol metadata (name, kind, location, edges) is \
+                 available but source spans cannot be read. Use brain_search or \
+                 brain_context for content lookup, or connect a local client with \
+                 filesystem access for full source spans."
+            );
+        }
+    }
+
+    Ok(value)
 }
 
 fn tool_schema_read_symbols() -> Value {
@@ -5278,6 +5303,7 @@ thread_local! {
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SERVER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // F16 response cache: size cap (MiB) and per-session hit/miss counters.
     static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
         const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
@@ -5353,6 +5379,17 @@ pub fn set_track_interactions(track: bool) {
 
 pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
+}
+
+/// Mark this dispatch context as running in server mode (no local source files).
+/// When set, tools like `read_symbols` add a note explaining that source spans
+/// may be empty because the server indexes bare clones without checkout trees.
+pub fn set_server_mode(server: bool) {
+    SERVER_MODE.with(|c| c.set(server));
+}
+
+pub fn is_server_mode() -> bool {
+    SERVER_MODE.with(|c| c.get())
 }
 
 // ── Daemon proxy dispatch ─────────────────────────────────────────────────
