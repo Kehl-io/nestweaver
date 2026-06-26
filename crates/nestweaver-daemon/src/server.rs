@@ -3091,13 +3091,24 @@ pub async fn run_server(
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
     if let Some(ref opts) = server_opts {
-        let mcp_state = std::sync::Arc::new(nestweaver_mcp::http::McpHttpState::new(
-            false,
-            state.store.clone(),
-            state.tantivy.clone(),
-            state.db_path.clone(),
-            state.instance_cfg.clone(),
-        ));
+        let mcp_state = std::sync::Arc::new(if let Some(ref token) = opts.auth_token {
+            nestweaver_mcp::http::McpHttpState::with_auth(
+                false,
+                state.store.clone(),
+                state.tantivy.clone(),
+                state.db_path.clone(),
+                state.instance_cfg.clone(),
+                token.clone(),
+            )
+        } else {
+            nestweaver_mcp::http::McpHttpState::new(
+                false,
+                state.store.clone(),
+                state.tantivy.clone(),
+                state.db_path.clone(),
+                state.instance_cfg.clone(),
+            )
+        });
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
 

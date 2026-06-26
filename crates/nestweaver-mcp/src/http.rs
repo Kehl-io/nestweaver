@@ -48,10 +48,13 @@ pub struct McpHttpState {
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
     pub sessions: Arc<DashMap<String, McpSession>>,
+    /// Optional bearer token for MCP-over-HTTP authentication. When set,
+    /// requests must include `Authorization: Bearer <token>` or receive 401.
+    pub auth_token: Option<String>,
 }
 
 impl McpHttpState {
-    /// Create a new state with an empty session registry.
+    /// Create a new state with an empty session registry and no auth.
     pub fn new(
         lite: bool,
         store: Arc<GraphStore>,
@@ -66,6 +69,27 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            auth_token: None,
+        }
+    }
+
+    /// Create a new state with bearer token authentication enabled.
+    pub fn with_auth(
+        lite: bool,
+        store: Arc<GraphStore>,
+        tantivy: Option<Arc<TantivyIndex>>,
+        db_path: PathBuf,
+        instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+        auth_token: String,
+    ) -> Self {
+        Self {
+            lite,
+            store,
+            tantivy,
+            db_path,
+            instance_cfg,
+            sessions: Arc::new(DashMap::new()),
+            auth_token: Some(auth_token),
         }
     }
 }
@@ -107,7 +131,32 @@ async fn handle_mcp(
     State(state): State<Arc<McpHttpState>>,
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
-) -> (HeaderMap, Json<Value>) {
+) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+    // Validate bearer token when auth is configured.
+    if let Some(ref expected) = state.auth_token {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(t) if t == expected => {}
+            _ => {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": error_code::INVALID_REQUEST,
+                            "message": "unauthorized: valid Bearer token required",
+                        }
+                    })),
+                );
+            }
+        }
+    }
+
     let id = req.id.clone().unwrap_or(Value::Null);
 
     // Track the session: look up an existing one or note that we need a new one.
@@ -157,7 +206,7 @@ async fn handle_mcp(
                 }
             });
 
-            return (resp_headers, Json(body));
+            return (axum::http::StatusCode::OK, resp_headers, Json(body));
         }
 
         "notifications/initialized" | "initialized" => json!({
@@ -187,7 +236,7 @@ async fn handle_mcp(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {
-                return (HeaderMap::new(), Json(json!({
+                return (axum::http::StatusCode::OK, HeaderMap::new(), Json(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
@@ -249,7 +298,7 @@ async fn handle_mcp(
         }),
     };
 
-    (HeaderMap::new(), Json(response))
+    (axum::http::StatusCode::OK, HeaderMap::new(), Json(response))
 }
 
 #[cfg(test)]
