@@ -75,4 +75,6 @@ pub struct AdminState {
     pub indexing_queue_depth: Arc<AtomicU32>,
     /// Path to the brain database, used to derive the jobs database path.
     pub db_path: std::path::PathBuf,
+    /// Path to instance.toml for hot-reload. `None` when no config was supplied.
+    pub config_path: Option<std::path::PathBuf>,
 }

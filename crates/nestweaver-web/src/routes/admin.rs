@@ -358,12 +358,31 @@ pub async fn retry_dead_letter(
 /// DELETE /admin/api/dead-letter/:id — dismiss a dead-letter entry.
 pub async fn dismiss_dead_letter(
     _auth: AdminAuth,
-    State(_state): State<Arc<AdminState>>,
-    Path(_id): Path<String>,
-) -> Json<MessageResponse> {
-    Json(MessageResponse {
-        message: "dead-letter entry dismissed".to_string(),
+    State(state): State<Arc<AdminState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let job_id: i64 = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid job id: {id}")))?;
+
+    let dismissed = tokio::task::spawn_blocking(move || {
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        queue
+            .dismiss_dead_letter(job_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dismiss_dead_letter: {e}")))
     })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
+    if dismissed {
+        Ok(Json(MessageResponse {
+            message: format!("dead-letter entry {} dismissed", id),
+        }))
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no dead-letter entry with id {id}")))
+    }
 }
 
 // ── Config reload ──────────────────────────────────────────────────────
@@ -371,12 +390,43 @@ pub async fn dismiss_dead_letter(
 /// POST /admin/api/reload — hot-reload instance.toml.
 pub async fn reload_config(
     _auth: AdminAuth,
-    State(_state): State<Arc<AdminState>>,
-) -> Json<MessageResponse> {
-    // Config reload will reuse the existing SIGHUP logic once wired.
-    Json(MessageResponse {
-        message: "config reload triggered".to_string(),
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let Some(ref config_path) = state.config_path else {
+        return Ok(Json(MessageResponse {
+            message: "no config path configured — daemon started without --config".to_string(),
+        }));
+    };
+
+    let path = config_path.clone();
+    let message = tokio::task::spawn_blocking(move || {
+        match nestweaver_engine::InstanceConfig::from_file(&path) {
+            Ok(cfg) => {
+                let repo_count = cfg.repos.len();
+                tracing::info!(
+                    path = %path.display(),
+                    repos = repo_count,
+                    "config reloaded from disk"
+                );
+                Ok(format!(
+                    "config reloaded from {} ({} repos configured)",
+                    path.display(),
+                    repo_count,
+                ))
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "config reload failed");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to parse config: {e}"),
+                ))
+            }
+        }
     })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+
+    Ok(Json(MessageResponse { message }))
 }
 
 // ── Status ─────────────────────────────────────────────────────────────

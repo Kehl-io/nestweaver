@@ -406,6 +406,15 @@ impl JobQueue {
         )?;
         Ok(())
     }
+
+    /// Permanently delete a dead-lettered job by its primary key.
+    pub fn dismiss_dead_letter(&self, job_id: i64) -> Result<bool, rusqlite::Error> {
+        let deleted = self.conn.execute(
+            "DELETE FROM index_jobs WHERE id = ?1 AND status = 'dead_letter'",
+            params![job_id],
+        )?;
+        Ok(deleted > 0)
+    }
 }
 
 /// Map a rusqlite row to an `IndexJob`.
