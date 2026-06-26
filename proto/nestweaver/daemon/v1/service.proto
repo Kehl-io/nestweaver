@@ -204,6 +204,19 @@ message BrainStatusResponse {
   int32 tantivy_doc_count = 9;
 }
 
+// repo_states — per-repo indexed SHA and metadata for staleness comparison
+message RepoStatesRequest {}
+message RepoState {
+  string repo_uid = 1;
+  string repo_url = 2;
+  string repo_name = 3;
+  string indexed_sha = 4;
+  int64 symbol_count = 5;
+}
+message RepoStatesResponse {
+  repeated RepoState repos = 1;
+}
+
 // note_get
 message NoteGetRequest {
   optional string uid = 1;
@@ -341,6 +354,7 @@ service NestWeaverDaemon {
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
   rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
+  rpc RepoStates(RepoStatesRequest) returns (RepoStatesResponse);
   rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);
 
   // Read RPCs — JSON pass-through

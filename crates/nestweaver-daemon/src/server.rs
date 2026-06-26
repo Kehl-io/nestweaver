@@ -1844,6 +1844,55 @@ impl NestWeaverDaemon for DaemonService {
         json_rpc!(self, r, "brain_status")
     }
 
+    async fn repo_states(
+        &self,
+        _request: Request<RepoStatesRequest>,
+    ) -> Result<Response<RepoStatesResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let state = self.state.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let repos = state
+                .store
+                .list_repos(None)
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+
+            let repo_states: Vec<RepoState> = repos
+                .into_iter()
+                .map(|r| {
+                    let symbol_count = state
+                        .store
+                        .symbol_names_by_repo(&r.uid)
+                        .map(|v| v.len() as i64)
+                        .unwrap_or(0);
+                    RepoState {
+                        repo_uid: r.uid,
+                        repo_url: r.url.clone(),
+                        repo_name: r.name.unwrap_or_else(|| {
+                            r.url
+                                .strip_prefix("file://")
+                                .unwrap_or(&r.url)
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&r.url)
+                                .to_string()
+                        }),
+                        indexed_sha: r.indexed_sha,
+                        symbol_count,
+                    }
+                })
+                .collect();
+
+            Ok::<_, Status>(RepoStatesResponse {
+                repos: repo_states,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        result.map(Response::new)
+    }
+
     // ── Read RPCs — JSON pass-through ───────────────────────────────
 
     async fn get_backlinks(
@@ -2550,6 +2599,12 @@ pub struct ServerOpts {
     /// Optional bearer token for TCP authentication. When set, TCP clients
     /// must send `Authorization: Bearer <token>` or receive UNAUTHENTICATED.
     pub auth_token: Option<String>,
+    /// Path to a PEM-encoded TLS certificate. When both `tls_cert` and
+    /// `tls_key` are set, the TCP listener uses TLS via rustls and plain
+    /// TCP connections are refused.
+    pub tls_cert: Option<PathBuf>,
+    /// Path to a PEM-encoded TLS private key.
+    pub tls_key: Option<PathBuf>,
 }
 
 pub async fn run_server(
@@ -2878,8 +2933,30 @@ pub async fn run_server(
             interceptor,
         );
 
+        // Build the TLS config when both cert and key are provided.
+        let tls_config = match (&opts.tls_cert, &opts.tls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_pem = std::fs::read(cert_path)
+                    .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
+                let key_pem = std::fs::read(key_path)
+                    .with_context(|| format!("read TLS key: {}", key_path.display()))?;
+                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+                tracing::info!("TLS enabled for TCP server");
+                eprintln!("[daemon] TLS enabled for TCP server");
+                Some(tls)
+            }
+            _ => None,
+        };
+
         tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+            if let Some(tls) = tls_config {
+                builder = builder
+                    .tls_config(tls)
+                    .expect("invalid TLS configuration");
+            }
+            let _ = builder
                 .add_service(tcp_svc)
                 .serve_with_incoming_shutdown(tcp_stream, async move {
                     let _ = tcp_shutdown_rx.changed().await;

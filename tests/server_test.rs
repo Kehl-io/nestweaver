@@ -8,7 +8,8 @@ mod helpers;
 use std::process::Command as StdCommand;
 
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
-use nestweaver_proto::BrainStatusRequest;
+use nestweaver_proto::{BrainStatusRequest, RepoStatesRequest};
+use tonic::transport::{Certificate, ClientTlsConfig};
 
 /// Create a minimal git repo with a JS file for indexing.
 fn write_test_repo(dir: &std::path::Path) {
@@ -315,5 +316,211 @@ async fn server_auth_passes_valid_token() {
         status.repo_count >= 1,
         "expected at least 1 repo, got {}",
         status.repo_count
+    );
+}
+
+/// Generate a self-signed certificate for localhost using openssl.
+fn generate_test_certs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cert_path = dir.join("test-cert.pem");
+    let key_path = dir.join("test-key.pem");
+
+    let output = StdCommand::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &key_path.display().to_string(),
+            "-out",
+            &cert_path.display().to_string(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("openssl must be installed for TLS tests");
+    assert!(
+        output.status.success(),
+        "openssl cert generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (cert_path, key_path)
+}
+
+#[tokio::test]
+async fn server_tls_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index first so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (cert_path, key_path) = generate_test_certs(dir.path());
+
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_tls(&db_path, &cert_path, &key_path);
+    let port = guard.grpc_port();
+
+    // Read the CA cert for the client to trust the self-signed certificate.
+    let ca_cert = std::fs::read(&cert_path).expect("read test cert");
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_cert))
+        .domain_name("localhost");
+
+    let channel = tonic::transport::Channel::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TLS gRPC server");
+
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let response = client
+        .brain_status(BrainStatusRequest {})
+        .await
+        .expect("BrainStatus RPC should succeed over TLS");
+
+    let status = response.into_inner();
+    assert!(
+        status.repo_count >= 1,
+        "expected at least 1 repo, got {}",
+        status.repo_count
+    );
+}
+
+#[tokio::test]
+async fn server_tls_rejects_plain_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (cert_path, key_path) = generate_test_certs(dir.path());
+
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_tls(&db_path, &cert_path, &key_path);
+
+    // Try to connect without TLS — should fail.
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await;
+
+    match channel {
+        Err(_) => {
+            // Connection refused or failed — expected when TLS is required.
+        }
+        Ok(ch) => {
+            // Connection might succeed at TCP level but the RPC should fail.
+            let mut client = NestWeaverDaemonClient::new(ch);
+            let result = client.brain_status(BrainStatusRequest {}).await;
+            assert!(
+                result.is_err(),
+                "plain TCP RPC should fail when server requires TLS"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_repo_states_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index first (no daemon) so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+
+    // Connect tonic gRPC client to TCP port
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let response = client
+        .repo_states(RepoStatesRequest {})
+        .await
+        .expect("RepoStates RPC failed");
+
+    let repo_states = response.into_inner();
+    assert!(
+        !repo_states.repos.is_empty(),
+        "expected at least 1 repo in RepoStates response"
+    );
+
+    let repo = &repo_states.repos[0];
+    assert!(
+        !repo.indexed_sha.is_empty(),
+        "expected non-empty indexed_sha"
+    );
+    assert!(
+        !repo.repo_uid.is_empty(),
+        "expected non-empty repo_uid"
+    );
+    assert!(
+        !repo.repo_name.is_empty(),
+        "expected non-empty repo_name"
     );
 }

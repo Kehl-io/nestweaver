@@ -27,7 +27,12 @@ impl ServerGuard {
 
     /// Spawn the server with a bearer auth token.
     pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
-        Self::spawn(db_path, Some(token))
+        Self::spawn_inner(db_path, Some(token), None, None)
+    }
+
+    /// Spawn the server with TLS enabled.
+    pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
+        Self::spawn_inner(db_path, None, Some(cert), Some(key))
     }
 
     /// Return the TCP port the server bound to (read from the port file).
@@ -48,6 +53,15 @@ impl ServerGuard {
     // ── internal ──────────────────────────────────────────────────────
 
     fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
+        Self::spawn_inner(db_path, auth_token, None, None)
+    }
+
+    fn spawn_inner(
+        db_path: &Path,
+        auth_token: Option<&str>,
+        tls_cert: Option<&Path>,
+        tls_key: Option<&Path>,
+    ) -> Self {
         let port_file = db_path
             .parent()
             .unwrap_or(Path::new("."))
@@ -73,6 +87,13 @@ impl ServerGuard {
 
         if let Some(token) = auth_token {
             cmd.args(["--auth-token", token]);
+        }
+
+        if let Some(cert) = tls_cert {
+            cmd.args(["--tls-cert", &cert.display().to_string()]);
+        }
+        if let Some(key) = tls_key {
+            cmd.args(["--tls-key", &key.display().to_string()]);
         }
 
         // Run in foreground — launchd-style daemonisation doesn't work in tests.

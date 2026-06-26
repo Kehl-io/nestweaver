@@ -6985,9 +6985,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     admin_token,
                     port_file,
                 } => {
-                    // TLS flags are parsed but not wired up yet (Task 7).
-                    let _ = tls_cert;
-                    let _ = tls_key;
                     let _ = admin_token;
 
                     let server_opts = if server {
@@ -6995,6 +6992,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             bind_addr: bind,
                             port_file,
                             auth_token,
+                            tls_cert,
+                            tls_key,
                         })
                     } else {
                         None
