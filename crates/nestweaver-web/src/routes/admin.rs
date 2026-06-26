@@ -492,6 +492,8 @@ pub async fn reload_config(
     };
 
     let path = config_path.clone();
+    let store = state.daemon_store.clone();
+    let db_path = state.db_path.clone();
     let message = tokio::task::spawn_blocking(move || {
         match nestweaver_engine::InstanceConfig::from_file(&path) {
             Ok(cfg) => {
@@ -501,11 +503,64 @@ pub async fn reload_config(
                     repos = repo_count,
                     "config reloaded from disk"
                 );
-                Ok(format!(
+
+                // ── Reconcile declared repos vs indexed repos ─────────
+                let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+                let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
+
+                // Collect declared repo URLs from config.
+                let declared_urls: std::collections::HashSet<String> =
+                    cfg.repos.iter().map(|r| r.url.clone()).collect();
+
+                // Collect indexed repo URLs from the store.
+                let indexed_urls: std::collections::HashSet<String> = store
+                    .list_repos(None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| r.url)
+                    .collect();
+
+                let mut new_repos = 0usize;
+                let mut orphaned_repos = 0usize;
+
+                // New repos in config but not yet indexed: enqueue.
+                for url in &declared_urls {
+                    if !indexed_urls.contains(url) {
+                        tracing::info!(url = %url, "config reload: new repo — queueing for indexing");
+                        if let Some(ref q) = queue {
+                            let _ = q.upsert(
+                                url,
+                                url,
+                                nestweaver_engine::jobs::JobTrigger::Unindexed,
+                            );
+                        }
+                        new_repos += 1;
+                    }
+                }
+
+                // Indexed repos no longer in config: log warning.
+                for url in &indexed_urls {
+                    if !declared_urls.contains(url) {
+                        tracing::warn!(
+                            url = %url,
+                            "config reload: repo no longer in config (orphaned)"
+                        );
+                        orphaned_repos += 1;
+                    }
+                }
+
+                let mut msg = format!(
                     "config reloaded from {} ({} repos configured)",
                     path.display(),
                     repo_count,
-                ))
+                );
+                if new_repos > 0 {
+                    msg.push_str(&format!(", {} new repos queued", new_repos));
+                }
+                if orphaned_repos > 0 {
+                    msg.push_str(&format!(", {} orphaned repos", orphaned_repos));
+                }
+                Ok(msg)
             }
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "config reload failed");
