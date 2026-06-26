@@ -452,6 +452,9 @@ impl HybridClient {
     }
 
     /// Query an upstream server via its gRPC channel with a timeout.
+    ///
+    /// Marks the upstream unhealthy on failure or timeout so subsequent
+    /// queries skip it until the background health check recovers it.
     async fn query_upstream(
         &self,
         tool_name: &str,
@@ -465,15 +468,94 @@ impl HybridClient {
             .context("no healthy upstream servers")?;
 
         let mut client = upstream.client();
-        let result = tokio::time::timeout(
+        match tokio::time::timeout(
             timeout,
             dispatch_json_rpc(&mut client, tool_name, params),
         )
         .await
-        .context("upstream query timed out")?
-        .context("upstream query failed")?;
+        {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => {
+                warn!(
+                    upstream = %upstream.name,
+                    error = %e,
+                    "upstream query failed, marking unhealthy"
+                );
+                upstream.mark_unhealthy();
+                Err(e)
+            }
+            Err(_) => {
+                warn!(
+                    upstream = %upstream.name,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "upstream query timed out, marking unhealthy"
+                );
+                upstream.mark_unhealthy();
+                anyhow::bail!("upstream query timed out after {}ms", timeout.as_millis())
+            }
+        }
+    }
 
-        Ok(result)
+    /// Start background health checks for all upstreams.
+    ///
+    /// Every 30 seconds, unhealthy upstreams are probed with a HealthCheck
+    /// RPC (2s timeout). If the probe succeeds, the upstream is marked
+    /// healthy again. Healthy upstreams are not probed (they'll be marked
+    /// unhealthy on the next failed query).
+    ///
+    /// Returns a `JoinHandle` that runs until dropped.
+    pub fn start_health_checks(&self) -> tokio::task::JoinHandle<()> {
+        use std::sync::atomic::Ordering;
+
+        let upstream_data: Vec<_> = self
+            .upstreams
+            .iter()
+            .map(|u| {
+                (
+                    u.name.clone(),
+                    u.client(),
+                    u.token().map(String::from),
+                    u.healthy_ref(),
+                )
+            })
+            .collect();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+
+                for (name, client, token, healthy) in &upstream_data {
+                    let was_healthy = healthy.load(Ordering::Relaxed);
+                    if was_healthy {
+                        // Don't probe healthy upstreams — they'll be marked
+                        // unhealthy on the next failed query.
+                        continue;
+                    }
+
+                    let mut c = client.clone();
+                    let mut req =
+                        tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
+                    if let Some(t) = token {
+                        if let Ok(val) =
+                            format!("Bearer {}", t).parse::<tonic::metadata::MetadataValue<_>>()
+                        {
+                            req.metadata_mut().insert("authorization", val);
+                        }
+                    }
+
+                    match tokio::time::timeout(Duration::from_secs(2), c.health_check(req)).await
+                    {
+                        Ok(Ok(_)) => {
+                            info!(upstream = %name, "upstream recovered, marking healthy");
+                            healthy.store(true, Ordering::Relaxed);
+                        }
+                        _ => {
+                            debug!(upstream = %name, "upstream still unhealthy");
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -856,5 +938,52 @@ mod tests {
     #[test]
     fn upstream_timeout_is_one_second() {
         assert_eq!(UPSTREAM_TIMEOUT, Duration::from_secs(1));
+    }
+
+    // ── Offline fallback tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn unhealthy_upstream_is_skipped() {
+        use crate::discovery::UpstreamConfig;
+
+        let cfg = UpstreamConfig {
+            name: Some("dead-server".to_string()),
+            url: "http://127.0.0.1:19990".to_string(),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Fallback,
+            timeout: "1s".to_string(),
+        };
+        let handle = UpstreamHandle::from_config(&cfg).unwrap();
+        handle.mark_unhealthy();
+
+        // has_upstreams should return false when all upstreams are unhealthy.
+        let upstreams = vec![handle];
+        let has_healthy = upstreams.iter().any(|u| u.is_healthy());
+        assert!(!has_healthy);
+    }
+
+    #[tokio::test]
+    async fn health_recovery_marks_upstream_healthy() {
+        use std::sync::atomic::Ordering;
+
+        let cfg = crate::discovery::UpstreamConfig {
+            name: Some("recoverable".to_string()),
+            url: "http://127.0.0.1:19990".to_string(),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Fallback,
+            timeout: "1s".to_string(),
+        };
+        let handle = UpstreamHandle::from_config(&cfg).unwrap();
+        let healthy_ref = handle.healthy_ref();
+
+        // Simulate unhealthy state.
+        handle.mark_unhealthy();
+        assert!(!healthy_ref.load(Ordering::Relaxed));
+
+        // Simulate recovery (background task would do this).
+        healthy_ref.store(true, Ordering::Relaxed);
+        assert!(handle.is_healthy());
     }
 }
