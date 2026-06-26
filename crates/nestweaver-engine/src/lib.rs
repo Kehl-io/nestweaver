@@ -91,6 +91,7 @@ pub mod summary;
 pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
+pub mod worker;
 
 pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
