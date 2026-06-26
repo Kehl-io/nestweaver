@@ -1,0 +1,123 @@
+//! `ServerGuard` — RAII helper for server-mode integration tests.
+//!
+//! Spawns `nestweaver daemon --db <path> run --server --bind 127.0.0.1:0 --port-file <path>`
+//! as a foreground child process, waits for the port file to appear, and kills
+//! the process on drop.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+/// Guard that owns a `nestweaver daemon run --server` child process.
+///
+/// On drop the child is killed and the port file removed, ensuring cleanup even
+/// on test panics.
+pub struct ServerGuard {
+    child: Child,
+    port_file: PathBuf,
+    #[allow(dead_code)]
+    db_path: PathBuf,
+}
+
+impl ServerGuard {
+    /// Spawn the server without authentication.
+    pub fn start(db_path: &Path) -> Self {
+        Self::spawn(db_path, None)
+    }
+
+    /// Spawn the server with a bearer auth token.
+    pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
+        Self::spawn(db_path, Some(token))
+    }
+
+    /// Return the TCP port the server bound to (read from the port file).
+    pub fn grpc_port(&self) -> u16 {
+        let contents = std::fs::read_to_string(&self.port_file)
+            .expect("port file should be readable");
+        contents
+            .trim()
+            .parse::<u16>()
+            .expect("port file should contain a valid u16 port number")
+    }
+
+    /// Return the full gRPC address, e.g. `http://127.0.0.1:12345`.
+    pub fn grpc_addr(&self) -> String {
+        format!("http://127.0.0.1:{}", self.grpc_port())
+    }
+
+    // ── internal ──────────────────────────────────────────────────────
+
+    fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
+        let port_file = db_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("server.port");
+
+        // Remove any stale port file from a previous run.
+        let _ = std::fs::remove_file(&port_file);
+
+        let bin = env!("CARGO_BIN_EXE_nestweaver");
+
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "daemon",
+            "--db",
+            &db_path.display().to_string(),
+            "run",
+            "--server",
+            "--bind",
+            "127.0.0.1:0",
+            "--port-file",
+            &port_file.display().to_string(),
+        ]);
+
+        if let Some(token) = auth_token {
+            cmd.args(["--auth-token", token]);
+        }
+
+        // Run in foreground — launchd-style daemonisation doesn't work in tests.
+        cmd.env("NESTWEAVER_DAEMON_FORK", "0");
+
+        let child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn nestweaver daemon in server mode");
+
+        let guard = Self {
+            child,
+            port_file: port_file.clone(),
+            db_path: db_path.to_path_buf(),
+        };
+
+        // Wait for the port file to appear (up to 10 s).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if port_file.exists() {
+                // Give the server a moment to finish binding after writing.
+                std::thread::sleep(Duration::from_millis(100));
+                return guard;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // If we reach here in the current codebase, it means `run_server()`
+        // hasn't been implemented yet (Task 3). That's expected — tests that
+        // call `start()` will be gated behind `#[ignore]` until then.
+        //
+        // We still panic so that un-ignored tests get a clear error.
+        panic!(
+            "port file {:?} did not appear within 10 s — \
+             is `nestweaver daemon run --server` implemented?",
+            port_file
+        );
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.port_file);
+    }
+}
