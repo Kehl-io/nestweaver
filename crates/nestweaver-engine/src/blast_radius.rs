@@ -49,6 +49,34 @@ pub struct AffectedCluster {
     pub cohesion: f64,
 }
 
+/// Org-wide impact from an upstream server (if available).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgWideImpact {
+    /// Breaking impact items from the upstream.
+    pub breaking: Vec<OrgImpactItem>,
+    /// Warning impact items from the upstream.
+    pub warnings: Vec<OrgImpactItem>,
+    /// Info-level impact items from the upstream.
+    pub info: Vec<OrgImpactItem>,
+    /// Repos impacted across the org.
+    pub impacted_repos: Vec<String>,
+    /// Name of the upstream server.
+    pub source_server: String,
+}
+
+/// A single org-wide impact item (from the upstream server).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgImpactItem {
+    pub change_name: String,
+    pub change_kind: String,
+    pub affected_name: String,
+    pub affected_repo: String,
+    pub affected_file: String,
+    pub affected_line: i32,
+    pub severity: String,
+    pub reason: String,
+}
+
 /// Full result of a blast radius analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlastRadiusResult {
@@ -57,6 +85,10 @@ pub struct BlastRadiusResult {
     pub affected_clusters: Vec<AffectedCluster>,
     pub risk_level: RiskLevel,
     pub summary: String,
+    /// Org-wide impacts from the upstream server (if available).
+    /// `None` when no upstream is configured or the server is unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_wide: Option<OrgWideImpact>,
 }
 
 /// Analyze the blast radius of a set of changed files.
@@ -191,6 +223,7 @@ pub fn analyze_blast_radius(
         affected_clusters,
         risk_level,
         summary,
+        org_wide: None,
     })
 }
 
