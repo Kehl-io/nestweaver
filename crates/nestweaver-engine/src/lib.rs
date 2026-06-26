@@ -69,6 +69,7 @@ pub mod html_to_md;
 pub mod hubs;
 pub mod index;
 pub mod index_md;
+pub mod jobs;
 pub mod interactions;
 pub mod investigate;
 pub mod manifest;
