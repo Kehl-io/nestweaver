@@ -1402,6 +1402,14 @@ enum DaemonAction {
         /// Write actual bound port to this file (for test harness)
         #[arg(long)]
         port_file: Option<PathBuf>,
+
+        /// Webhook HMAC secret for verifying push event signatures
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET")]
+        webhook_secret: Option<String>,
+
+        /// Previous webhook secret (fallback during rotation)
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD")]
+        webhook_secret_old: Option<String>,
     },
     /// Stop and restart the daemon
     Restart {
@@ -6985,6 +6993,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     auth_token,
                     admin_token,
                     port_file,
+                    webhook_secret,
+                    webhook_secret_old,
                 } => {
                     let _ = admin_token;
 
@@ -6995,6 +7005,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             auth_token,
                             tls_cert,
                             tls_key,
+                            webhook_secret,
+                            webhook_secret_old,
                         })
                     } else {
                         None

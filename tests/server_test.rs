@@ -11,6 +11,8 @@ use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{BrainStatusRequest, RepoStatesRequest};
 use tonic::transport::{Certificate, ClientTlsConfig};
 use serde_json::json;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 /// Create a minimal git repo with a JS file for indexing.
 fn write_test_repo(dir: &std::path::Path) {
@@ -843,4 +845,201 @@ async fn server_mcp_sessions_tracked() {
         body4["result"]["tools"].is_array(),
         "stateless tools/list should return tools array"
     );
+}
+
+// ── Webhook integration tests ───────────────────────────────────────────
+
+/// Compute HMAC-SHA256 signature in GitHub's `sha256=<hex>` format.
+fn webhook_sign(body: &[u8], secret: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+    mac.update(body);
+    let result = mac.finalize().into_bytes();
+    format!("sha256={}", hex::encode(result))
+}
+
+#[tokio::test]
+async fn server_webhook_enqueues_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index once so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let secret = "webhook-test-secret";
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
+    let mcp_addr = guard.mcp_addr();
+
+    let payload = json!({
+        "repository": {
+            "clone_url": "https://github.com/acme/api-service.git"
+        },
+        "ref": "refs/heads/main"
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let sig = webhook_sign(&body, secret);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-hub-signature-256", &sig)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST failed");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, "accepted");
+}
+
+#[tokio::test]
+async fn server_webhook_rejects_invalid_sig() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "correct-secret");
+    let mcp_addr = guard.mcp_addr();
+
+    let payload = json!({
+        "repository": {
+            "clone_url": "https://github.com/acme/api-service.git"
+        }
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    // Sign with the wrong secret.
+    let wrong_sig = webhook_sign(&body, "wrong-secret");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-hub-signature-256", &wrong_sig)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST failed");
+
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn server_webhook_rejects_missing_sig() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "my-secret");
+    let mcp_addr = guard.mcp_addr();
+
+    let payload = json!({
+        "repository": {
+            "clone_url": "https://github.com/acme/api-service.git"
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .expect("webhook POST failed");
+
+    // No signature header at all -> 401
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn server_webhook_rejects_bad_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let secret = "my-secret";
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
+    let mcp_addr = guard.mcp_addr();
+
+    let body = b"not valid json";
+    let sig = webhook_sign(body, secret);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-hub-signature-256", &sig)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("webhook POST failed");
+
+    assert_eq!(resp.status(), 400);
 }

@@ -27,12 +27,17 @@ impl ServerGuard {
 
     /// Spawn the server with a bearer auth token.
     pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
-        Self::spawn_inner(db_path, Some(token), None, None)
+        Self::spawn_inner(db_path, Some(token), None, None, None)
     }
 
     /// Spawn the server with TLS enabled.
     pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
-        Self::spawn_inner(db_path, None, Some(cert), Some(key))
+        Self::spawn_inner(db_path, None, Some(cert), Some(key), None)
+    }
+
+    /// Spawn the server with a webhook secret configured.
+    pub fn start_with_webhook(db_path: &Path, secret: &str) -> Self {
+        Self::spawn_inner(db_path, None, None, None, Some(secret))
     }
 
     /// Return the TCP port the server bound to (read from the port file, line 1).
@@ -74,7 +79,7 @@ impl ServerGuard {
     // ── internal ──────────────────────────────────────────────────────
 
     fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
-        Self::spawn_inner(db_path, auth_token, None, None)
+        Self::spawn_inner(db_path, auth_token, None, None, None)
     }
 
     fn spawn_inner(
@@ -82,6 +87,7 @@ impl ServerGuard {
         auth_token: Option<&str>,
         tls_cert: Option<&Path>,
         tls_key: Option<&Path>,
+        webhook_secret: Option<&str>,
     ) -> Self {
         let port_file = db_path
             .parent()
@@ -115,6 +121,10 @@ impl ServerGuard {
         }
         if let Some(key) = tls_key {
             cmd.args(["--tls-key", &key.display().to_string()]);
+        }
+
+        if let Some(secret) = webhook_secret {
+            cmd.args(["--webhook-secret", secret]);
         }
 
         // Run in foreground — launchd-style daemonisation doesn't work in tests.

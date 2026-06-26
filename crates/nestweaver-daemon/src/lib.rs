@@ -3,6 +3,7 @@ pub mod auth;
 pub mod launchd;
 pub mod lifecycle;
 pub mod server;
+pub mod webhook;
 
 pub use lifecycle::*;
 pub use server::*;

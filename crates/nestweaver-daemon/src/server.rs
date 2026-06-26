@@ -2605,6 +2605,10 @@ pub struct ServerOpts {
     pub tls_cert: Option<PathBuf>,
     /// Path to a PEM-encoded TLS private key.
     pub tls_key: Option<PathBuf>,
+    /// Webhook HMAC secret for verifying push event signatures.
+    pub webhook_secret: Option<String>,
+    /// Previous webhook secret, checked as fallback during secret rotation.
+    pub webhook_secret_old: Option<String>,
 }
 
 pub async fn run_server(
@@ -2920,7 +2924,27 @@ pub async fn run_server(
             state.instance_cfg.clone(),
         ));
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
-        let mcp_router = nestweaver_mcp::http::router(mcp_state);
+        let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
+
+        // Mount webhook endpoint when a secret is configured.
+        if let Some(ref secret) = opts.webhook_secret {
+            let jobs_db_path = db_path.parent().unwrap_or(Path::new(".")).join("jobs.db");
+            let job_queue = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
+                .expect("open webhook job queue");
+            let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
+                config: crate::webhook::WebhookConfig {
+                    secret: secret.clone(),
+                    secret_old: opts.webhook_secret_old.clone(),
+                },
+                job_queue: std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+            });
+            mcp_router = mcp_router.route(
+                "/webhook",
+                axum::routing::post(crate::webhook::handle_webhook)
+                    .with_state(webhook_state),
+            );
+            tracing::info!("webhook endpoint enabled at /webhook");
+        }
 
         // Parse the bind address to determine the MCP port.  When the gRPC
         // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
