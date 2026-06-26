@@ -312,33 +312,7 @@ impl HybridClient {
 
         match server_result {
             Ok(Ok(server)) => {
-                // Extract arrays from both, run RRF merge.
-                let local_items = extract_result_items(&local);
-                let server_items = extract_result_items(&server);
-
-                let merged = rrf_merge(local_items, server_items);
-
-                // Reconstruct the response with merged results + provenance.
-                let merged_values: Vec<Value> = merged
-                    .into_iter()
-                    .map(|mr| {
-                        let mut v = mr.value;
-                        if let Value::Object(ref mut map) = v {
-                            map.insert(
-                                "_provenance".to_string(),
-                                serde_json::to_value(mr.provenance).unwrap_or(Value::Null),
-                            );
-                            map.insert(
-                                "_confidence".to_string(),
-                                serde_json::to_value(mr.confidence).unwrap_or(Value::Null),
-                            );
-                            map.insert("_rrf_score".to_string(), Value::from(mr.score));
-                        }
-                        v
-                    })
-                    .collect();
-
-                Ok(wrap_merged_response(merged_values, &["local", "server"]))
+                Ok(merge_structured_results(&local, &server))
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
@@ -1027,6 +1001,60 @@ fn merge_json_results(local: &Value, server: &Value) -> Value {
     let values: Vec<Value> = merged.into_iter().map(|mr| mr.value).collect();
 
     wrap_merged_response(values, &["local", "server"])
+}
+
+/// Merge two JSON responses, preserving structured schemas (e.g. brain_context's
+/// `{ seeds, connected, unresolved_seeds, expansion_terms }`) when detected.
+/// Falls back to flat `{ results: [...] }` envelope for non-structured responses.
+fn merge_structured_results(local: &Value, server: &Value) -> Value {
+    let local_connected = local.get("connected").and_then(|v| v.as_array());
+    let server_connected = server.get("connected").and_then(|v| v.as_array());
+
+    if let (Some(lc), Some(sc)) = (local_connected, server_connected) {
+        let merged_connected = rrf_merge(lc.clone(), sc.clone());
+        let merged_values: Vec<Value> = merged_connected
+            .into_iter()
+            .map(|mr| {
+                let mut v = mr.value;
+                if let Value::Object(ref mut map) = v {
+                    map.insert("_provenance".to_string(), serde_json::to_value(mr.provenance).unwrap_or(Value::Null));
+                    map.insert("_confidence".to_string(), serde_json::to_value(mr.confidence).unwrap_or(Value::Null));
+                    map.insert("_rrf_score".to_string(), Value::from(mr.score));
+                }
+                v
+            })
+            .collect();
+
+        let mut seeds = local.get("seeds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if let Some(server_seeds) = server.get("seeds").and_then(|v| v.as_array()) {
+            seeds.extend(server_seeds.iter().cloned());
+        }
+
+        let mut unresolved = local.get("unresolved_seeds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if let Some(su) = server.get("unresolved_seeds").and_then(|v| v.as_array()) {
+            unresolved.extend(su.iter().cloned());
+        }
+
+        let mut expansion = local.get("expansion_terms").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if let Some(se) = server.get("expansion_terms").and_then(|v| v.as_array()) {
+            expansion.extend(se.iter().cloned());
+        }
+
+        let mut result = serde_json::json!({
+            "seeds": seeds,
+            "connected": merged_values,
+        });
+        if !unresolved.is_empty() {
+            result["unresolved_seeds"] = Value::Array(unresolved);
+        }
+        if !expansion.is_empty() {
+            result["expansion_terms"] = Value::Array(expansion);
+        }
+        inject_provenance(&mut result, &["local", "server"], &[]);
+        result
+    } else {
+        merge_json_results(local, server)
+    }
 }
 
 /// Wrap merged results into a response envelope with provenance metadata.
@@ -2011,5 +2039,42 @@ mod tests {
         let local_repos = std::collections::HashSet::new();
         let filtered = filter_org_results(&server, &local_repos);
         assert_eq!(filtered, server);
+    }
+
+    #[test]
+    fn merge_structured_response_preserves_schema() {
+        let local = json!({
+            "seeds": [{"uid": "s1", "label": "foo"}],
+            "connected": [
+                {"uid": "c1", "label": "bar", "score": 0.9},
+                {"uid": "c2", "label": "baz", "score": 0.7}
+            ],
+            "unresolved_seeds": []
+        });
+        let server = json!({
+            "seeds": [{"uid": "s2", "label": "qux"}],
+            "connected": [
+                {"uid": "c3", "label": "quux", "score": 0.8},
+                {"uid": "c1", "label": "bar", "score": 0.85}
+            ],
+            "unresolved_seeds": []
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert!(merged.get("connected").is_some(), "connected field must be preserved");
+        assert!(merged.get("seeds").is_some(), "seeds field must be preserved");
+        assert!(merged.get("_meta").is_some(), "_meta must be present");
+        let connected = merged["connected"].as_array().unwrap();
+        assert!(connected.len() >= 3, "should merge connected items from both");
+    }
+
+    #[test]
+    fn merge_flat_response_uses_results_envelope() {
+        let local = json!({"results": [{"uid": "r1", "score": 0.9}]});
+        let server = json!({"results": [{"uid": "r2", "score": 0.8}]});
+
+        let merged = merge_structured_results(&local, &server);
+        assert!(merged.get("results").is_some());
     }
 }
