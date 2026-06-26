@@ -559,6 +559,30 @@ async fn dispatch_json_rpc_authed(
     params: &Value,
     auth_token: Option<&str>,
 ) -> Result<Value> {
+    // ── Typed RPCs (not JsonRequest/JsonResponse) ─────────────────────
+    //
+    // These five tools use typed proto requests. Handle them first so
+    // we don't build an unnecessary JsonRequest.
+    match tool_name {
+        "brain_search" => {
+            return dispatch_typed_brain_search(client, params, auth_token).await;
+        }
+        "brain_context" => {
+            return dispatch_typed_brain_context(client, params, auth_token).await;
+        }
+        "project_context" => {
+            return dispatch_typed_project_context(client, params, auth_token).await;
+        }
+        "note_get" => {
+            return dispatch_typed_note_get(client, params, auth_token).await;
+        }
+        "hub_nodes" => {
+            return dispatch_typed_hub_nodes(client, params, auth_token).await;
+        }
+        _ => {} // fall through to JsonRequest dispatch
+    }
+
+    // ── JsonRequest/JsonResponse pass-through RPCs ────────────────────
     let args_json = serde_json::to_string(params)?;
     let mut request = tonic::Request::new(JsonRequest { args_json });
 
@@ -600,7 +624,6 @@ async fn dispatch_json_rpc_authed(
         "investigate_hydrate" => client.investigate_hydrate(request).await,
         "set_extension" => client.set_extension(request).await,
         "query_extensions" => client.query_extensions(request).await,
-        // hub_nodes uses HubNodesRequest — dispatch separately if needed.
         "brain_status" | "brain_status_json" => client.brain_status_json(request).await,
         "export_graph" => client.export_graph(request).await,
         "search_symbols" => client.search_symbols(request).await,
@@ -615,6 +638,319 @@ async fn dispatch_json_rpc_authed(
     let parsed: Value = serde_json::from_str(&response.result_json)
         .unwrap_or_else(|_| Value::String(response.result_json));
     Ok(parsed)
+}
+
+/// Inject an optional bearer token into a tonic request.
+fn inject_bearer_token<T>(request: &mut tonic::Request<T>, auth_token: Option<&str>) {
+    if let Some(token) = auth_token {
+        if let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>() {
+            request.metadata_mut().insert("authorization", val);
+        }
+    }
+}
+
+/// Typed dispatch for `brain_search` -> `Search` RPC.
+async fn dispatch_typed_brain_search(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = nestweaver_proto::BrainSearchRequest {
+        query: params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        limit: params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20) as i32,
+        response_format: params
+            .get("response_format")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        include_bodies: params
+            .get("include_bodies")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        prf: params.get("prf").and_then(|v| v.as_bool()).unwrap_or(false),
+        rerank: params
+            .get("rerank")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        root: params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    };
+    let mut request = tonic::Request::new(req);
+    inject_bearer_token(&mut request, auth_token);
+    let resp = client
+        .search(request)
+        .await
+        .context("brain_search RPC failed")?
+        .into_inner();
+    // Serialize the typed response back to JSON.
+    let results: Vec<Value> = resp
+        .results
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::json!({
+                "uid": r.uid,
+                "kind": r.kind,
+                "title": r.title,
+                "score": r.score,
+            });
+            if let Some(ref loc) = r.location {
+                obj["location"] = Value::String(loc.clone());
+            }
+            if !r.matched_headings.is_empty() {
+                obj["matched_headings"] = serde_json::json!(r.matched_headings);
+            }
+            if let Some(ref body) = r.inline_body {
+                obj["inline_body"] = Value::String(body.clone());
+            }
+            obj
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "query": resp.query,
+        "engine": resp.engine,
+        "total_matches": resp.total_matches,
+        "results": results,
+        "expansion_terms": resp.expansion_terms,
+    }))
+}
+
+/// Typed dispatch for `brain_context` -> `GetContext` RPC.
+/// Response is `BrainContextResponse { result_json }`.
+async fn dispatch_typed_brain_context(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let seeds = params
+        .get("seeds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let req = nestweaver_proto::BrainContextRequest {
+        seeds,
+        token_budget: params
+            .get("token_budget")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+        response_format: params
+            .get("response_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        repos: json_str_array(params, "repos"),
+        vaults: json_str_array(params, "vaults"),
+        kinds: json_str_array(params, "kinds"),
+        path_prefix: params
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tags: json_str_array(params, "tags"),
+        exclude_tags: json_str_array(params, "exclude_tags"),
+        weight_ppr: params
+            .get("weight_ppr")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        weight_bm25: params
+            .get("weight_bm25")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        intent: params
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        include_seeds: params
+            .get("include_seeds")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_bodies: params
+            .get("include_bodies")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        root: params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        prf: params.get("prf").and_then(|v| v.as_bool()).unwrap_or(false),
+        rerank: params
+            .get("rerank")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        weight_semantic: params
+            .get("weight_semantic")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        since: params
+            .get("since")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        recency_weight: params
+            .get("recency_weight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        recency_half_life_days: params
+            .get("recency_half_life_days")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+    };
+    let mut request = tonic::Request::new(req);
+    inject_bearer_token(&mut request, auth_token);
+    let resp = client
+        .get_context(request)
+        .await
+        .context("brain_context RPC failed")?
+        .into_inner();
+    let parsed: Value =
+        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+    Ok(parsed)
+}
+
+/// Typed dispatch for `project_context` -> `GetProjectContext` RPC.
+/// Response is `ProjectContextResponse { result_json }`.
+async fn dispatch_typed_project_context(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = nestweaver_proto::ProjectContextRequest {
+        project: params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        token_budget: params
+            .get("token_budget")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+        kinds: json_str_array(params, "kinds"),
+        include_components: params
+            .get("include_components")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        intent: params
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        include_seeds: params
+            .get("include_seeds")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        since: params
+            .get("since")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        recency_weight: params
+            .get("recency_weight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        recency_half_life_days: params
+            .get("recency_half_life_days")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+    };
+    let mut request = tonic::Request::new(req);
+    inject_bearer_token(&mut request, auth_token);
+    let resp = client
+        .get_project_context(request)
+        .await
+        .context("project_context RPC failed")?
+        .into_inner();
+    let parsed: Value =
+        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+    Ok(parsed)
+}
+
+/// Typed dispatch for `note_get` -> `GetNote` RPC.
+async fn dispatch_typed_note_get(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = nestweaver_proto::NoteGetRequest {
+        uid: params.get("uid").and_then(|v| v.as_str()).map(String::from),
+        title: params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        include_body: params
+            .get("include_body")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        sections: json_str_array(params, "sections"),
+    };
+    let mut request = tonic::Request::new(req);
+    inject_bearer_token(&mut request, auth_token);
+    let resp = client
+        .get_note(request)
+        .await
+        .context("note_get RPC failed")?
+        .into_inner();
+    let mut result = serde_json::json!({
+        "uid": resp.uid,
+        "title": resp.title,
+        "path": resp.path,
+        "note_kind": resp.note_kind,
+        "word_count": resp.word_count,
+        "section_count": resp.section_count,
+    });
+    if let Some(body) = resp.body {
+        result["body"] = Value::String(body);
+    }
+    Ok(result)
+}
+
+/// Typed dispatch for `hub_nodes` -> `HubNodes` RPC.
+/// Response is `HubNodesResponse { result_json }`.
+async fn dispatch_typed_hub_nodes(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
+    let req = nestweaver_proto::HubNodesRequest {
+        top_n: params.get("top_n").and_then(|v| v.as_i64()).unwrap_or(10) as i32,
+        response_format: params
+            .get("response_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+    let mut request = tonic::Request::new(req);
+    inject_bearer_token(&mut request, auth_token);
+    let resp = client
+        .hub_nodes(request)
+        .await
+        .context("hub_nodes RPC failed")?
+        .into_inner();
+    let parsed: Value =
+        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+    Ok(parsed)
+}
+
+/// Helper: extract a `Vec<String>` from a JSON array field.
+fn json_str_array(params: &Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── Result helpers ────────────────────────────────────────────────────
