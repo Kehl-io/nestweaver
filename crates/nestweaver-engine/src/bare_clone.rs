@@ -149,13 +149,14 @@ impl BareCloneWorkspace {
         let output = Command::new("git")
             .args([
                 "clone",
+                "--filter=blob:none",
                 "--bare",
                 "--",
                 url,
                 &dest.display().to_string(),
             ])
             .output()
-            .with_context(|| format!("failed to run git clone --bare for {url}"))?;
+            .with_context(|| format!("failed to run git clone --filter=blob:none --bare for {url}"))?;
 
         if !output.status.success() {
             anyhow::bail!(
