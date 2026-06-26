@@ -142,3 +142,35 @@ min_symbol_name_length = 4
 # [mcp_servers.env]
 # CONFLUENCE_URL = "https://yoursite.atlassian.net"
 # CONFLUENCE_API_TOKEN = "your-token"
+
+# ── Server mode ──────────────────────────────────────────────────────────
+# Uncomment to enable server mode features.
+
+# [server]
+# bind = "0.0.0.0:9378"
+# auth_token = "${NESTWEAVER_AUTH_TOKEN}"
+# admin_token = "${NESTWEAVER_ADMIN_TOKEN}"
+
+# [server.indexing]
+# workers = 8
+# poll_min = "45s"
+# poll_max = "8h"
+
+# [server.webhook]
+# secret = "${NESTWEAVER_WEBHOOK_SECRET}"
+
+# [server.backup]
+# enabled = true
+# interval = "24h"
+# destination = "/backups"
+# tier = "standard"
+# retain = 7
+
+# ── Upstream servers (client-side) ───────────────────────────────────────
+# Connect your local daemon to a team server.
+
+# [[upstream]]
+# name = "team-server"
+# url = "grpcs://nestweaver.internal:9378"
+# token = "${NESTWEAVER_TOKEN}"
+# mode = "fallback"    # fallback | merge | primary
