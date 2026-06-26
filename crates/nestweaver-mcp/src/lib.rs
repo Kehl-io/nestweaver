@@ -43,7 +43,15 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 ## Do NOT
 - grep or find in indexed repos — use brain_search or regex_search
 - Read entire files — use read_symbols for specific symbol spans
-- Re-index manually — use stale_check to verify, the daemon handles re-indexing";
+- Re-index manually — use stale_check to verify, the daemon handles re-indexing
+
+## Server Mode
+When connected to a NestWeaver server (not a local daemon):
+- brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
+- read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
+- regex_search redirects to Tantivy FTS search on the server
+- blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available
+- Results include _meta.sources indicating which data sources contributed";
 
 /// Canonical sidecar location for the Tantivy index. Lives next to the
 /// LadybugDB file: `<db>.tantivy/`.
