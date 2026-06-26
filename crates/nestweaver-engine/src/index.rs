@@ -380,6 +380,32 @@ pub fn index_directory_in_memory(
     Ok((result, store))
 }
 
+/// Index via an arbitrary [`ContentReader`] into an in-memory GraphStore.
+///
+/// This is the primary entry point for server-mode indexing where the caller
+/// controls how files are read (e.g. via `GitBareReader` for bare clones).
+pub fn index_with_reader(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    name: Option<&str>,
+) -> Result<IndexResult, anyhow::Error> {
+    index_into_store(
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        None,
+        None,
+        None,
+        None,
+        name,
+    )
+}
+
 /// Core indexing logic shared by both public functions.
 ///
 /// When `filemeta_cache` is `Some`, tiered change detection skips files
