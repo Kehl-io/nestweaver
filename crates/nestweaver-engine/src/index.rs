@@ -94,20 +94,38 @@ enum ChangeVerdict {
 /// been modified, or `Changed` with the file content + new hash when it
 /// has (or when no cache entry exists).
 fn tiered_change_check(
-    abs_path: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     rel_path: &str,
     cache: &FileMetaCache,
 ) -> Result<ChangeVerdict, anyhow::Error> {
-    let fs_meta =
-        std::fs::metadata(abs_path).with_context(|| format!("stat {}", abs_path.display()))?;
+    let rel = Path::new(rel_path);
 
-    let mtime_secs = fs_meta
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let size_bytes = fs_meta.len();
+    // file_meta returns None for bare-repo readers (no mtime available).
+    // In that case, always fall through to read + hash.
+    let (mtime_secs, size_bytes) = match reader.file_meta(rel)? {
+        Some((m, s)) => (m, s),
+        None => {
+            // No filesystem metadata (e.g. GitBareReader) — read and hash.
+            let source = reader
+                .read_file(rel)
+                .with_context(|| format!("read {rel_path}"))?;
+            let content_hash = content_hash_hex(&source);
+            if let Some(cached) = cache.get(rel_path) {
+                if content_hash == cached.content_hash {
+                    return Ok(ChangeVerdict::Unchanged);
+                }
+            }
+            return Ok(ChangeVerdict::Changed {
+                meta: CachedFileMeta {
+                    mtime_secs: 0,
+                    size_bytes: source.len() as u64,
+                    content_hash: content_hash.clone(),
+                },
+                source,
+                content_hash,
+            });
+        }
+    };
 
     if let Some(cached) = cache.get(rel_path) {
         // Tier 1: mtime unchanged → skip.
@@ -119,8 +137,9 @@ fn tiered_change_check(
         // Same-size edits are common, so we cannot skip based on size alone.
 
         // Tier 3: mtime differs → read file, compute hash, compare.
-        let source = std::fs::read_to_string(abs_path)
-            .with_context(|| format!("read {}", abs_path.display()))?;
+        let source = reader
+            .read_file(rel)
+            .with_context(|| format!("read {rel_path}"))?;
         let content_hash = content_hash_hex(&source);
         if content_hash == cached.content_hash {
             // Content identical despite mtime/size change — unchanged for the
@@ -139,8 +158,9 @@ fn tiered_change_check(
         })
     } else {
         // No cache entry → file is new, read and hash it.
-        let source = std::fs::read_to_string(abs_path)
-            .with_context(|| format!("read {}", abs_path.display()))?;
+        let source = reader
+            .read_file(rel)
+            .with_context(|| format!("read {rel_path}"))?;
         let content_hash = content_hash_hex(&source);
         Ok(ChangeVerdict::Changed {
             meta: CachedFileMeta {
@@ -523,7 +543,7 @@ fn index_into_store(
 
             // Tiered change detection.
             let (source, content_hash, file_meta) =
-                match tiered_change_check(path, &display_name, cache) {
+                match tiered_change_check(reader, &display_name, cache) {
                     Ok(ChangeVerdict::Unchanged) => {
                         parse_pb.inc(1);
                         // Check parsed cache: if we have cached symbols for this
@@ -972,8 +992,7 @@ fn index_into_store(
                 let source: &str = if let Some(s) = source_opt.as_deref() {
                     s
                 } else {
-                    let full_path = repo_path.join(file_path);
-                    source_owned = std::fs::read_to_string(&full_path).ok()?;
+                    source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
                     &source_owned
                 };
 
@@ -1023,10 +1042,9 @@ fn index_into_store(
             let mut seeded = 0usize;
             for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
                 if let Some(env) = type_envs.get_mut(file_path) {
-                    let full_path = repo_path.join(file_path);
                     let source_str = match source_opt {
                         Some(s) => s.clone(),
-                        None => match std::fs::read_to_string(&full_path) {
+                        None => match reader.read_file(Path::new(file_path.as_str())) {
                             Ok(s) => s,
                             Err(_) => continue,
                         },
@@ -1209,7 +1227,7 @@ fn index_into_store(
     // Best-effort: a malformed spec or unexpected store error here must not
     // fail the whole index. Contracts are hypotheses layered on top of the
     // code graph.
-    if let Err(e) = derive_contracts(store, repo_path, &r_uid, &spec_files, &handler_files) {
+    if let Err(e) = derive_contracts(store, reader, &r_uid, &spec_files, &handler_files) {
         tracing::warn!("contract derivation failed (non-fatal): {e}");
     }
     tracing::info!(
@@ -1281,7 +1299,7 @@ fn is_parseable(path: &Path) -> bool {
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
 fn derive_contracts(
     store: &GraphStore,
-    repo_path: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     spec_files: &[PathBuf],
     handler_files: &[HandlerFileData],
@@ -1295,13 +1313,14 @@ fn derive_contracts(
     // 1. Declared contracts from specs.
     let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
     let mut declared_uids: HashSet<String> = HashSet::new();
+    let repo_path = reader.root();
     for spec_path in spec_files {
         let rel = spec_path
             .strip_prefix(repo_path)
             .unwrap_or(spec_path)
             .to_string_lossy()
             .into_owned();
-        let source = match std::fs::read_to_string(spec_path) {
+        let source = match reader.read_file(Path::new(&rel)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("skip unreadable spec {rel}: {e}");
@@ -1324,7 +1343,8 @@ fn derive_contracts(
         // class-level base path (@RequestMapping / @Controller) is usually
         // dropped. Read the raw source to recover it; fall back to the
         // truncated signature if the file is unreadable.
-        let base_source = std::fs::read_to_string(repo_path.join(&hf.rel_path))
+        let base_source = reader
+            .read_file(Path::new(&hf.rel_path))
             .unwrap_or_else(|_| hf.class_signature.clone());
         let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
         for m in matches {
@@ -1514,6 +1534,7 @@ pub fn incremental_index_with_name(
         "processing incremental changes"
     );
 
+    let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let mut result = IncrementalResult::default();
 
     for change in &changes {
@@ -1523,7 +1544,7 @@ pub fn incremental_index_with_name(
                     result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file(repo_path, rel_path, &r_uid, &store)?;
+                let added = process_added_or_modified_file(&reader, rel_path, &r_uid, &store)?;
                 result.symbols_added += added;
                 result.files_added += 1;
             }
@@ -1540,7 +1561,7 @@ pub fn incremental_index_with_name(
                 result.symbols_removed += removed;
 
                 // Re-parse and insert.
-                let added = process_added_or_modified_file(repo_path, rel_path, &r_uid, &store)?;
+                let added = process_added_or_modified_file(&reader, rel_path, &r_uid, &store)?;
                 result.symbols_added += added;
                 result.files_modified += 1;
             }
@@ -1589,7 +1610,7 @@ pub fn incremental_index_with_name(
                         .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file(repo_path, to, &r_uid, &store)?;
+                    let added = process_added_or_modified_file(&reader, to, &r_uid, &store)?;
                     result.symbols_added += added;
                 }
 
@@ -1623,7 +1644,7 @@ pub fn incremental_index_with_name(
 /// Parse a single file and insert its File node, Symbol nodes, and edges.
 /// Returns the number of symbols inserted.
 fn process_added_or_modified_file(
-    repo_path: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
     r_uid: &str,
     store: &nestweaver_store::GraphStore,
@@ -1632,10 +1653,10 @@ fn process_added_or_modified_file(
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
 
-    let abs_path = repo_path.join(rel_path);
+    let abs_path = reader.root().join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
-    let source = match std::fs::read_to_string(&abs_path) {
+    let source = match reader.read_file(rel_path) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %abs_path.display(), "read error: {e}; skipping");
@@ -1723,7 +1744,7 @@ fn process_added_or_modified_file(
             | nestweaver_schema::Language::Svelte
             | nestweaver_schema::Language::Astro
     ) {
-        discover_workspace_context(repo_path)
+        discover_workspace_context(reader.root())
     } else {
         Default::default()
     };
@@ -2250,8 +2271,9 @@ function hello(name) { return "Hello " + name; }
         let file_path = dir.path().join("hello.js");
         fs::write(&file_path, "function hello() {}").unwrap();
 
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
         let cache = FileMetaCache::new();
-        match tiered_change_check(&file_path, "hello.js", &cache).unwrap() {
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
             ChangeVerdict::Changed {
                 source,
                 content_hash,
@@ -2291,7 +2313,8 @@ function hello(name) { return "Hello " + name; }
             },
         );
 
-        match tiered_change_check(&file_path, "hello.js", &cache).unwrap() {
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
             ChangeVerdict::Unchanged => {} // expected
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged for same mtime"),
         }
@@ -2318,7 +2341,8 @@ function hello(name) { return "Hello " + name; }
             },
         );
 
-        match tiered_change_check(&file_path, "hello.js", &cache).unwrap() {
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
             ChangeVerdict::Unchanged => {} // expected — hash matches, so unchanged
             ChangeVerdict::Changed { .. } => panic!("expected Unchanged when hash matches"),
         }
@@ -2334,7 +2358,7 @@ function hello(name) { return "Hello " + name; }
             },
         );
 
-        match tiered_change_check(&file_path, "hello.js", &cache2).unwrap() {
+        match tiered_change_check(&reader, "hello.js", &cache2).unwrap() {
             ChangeVerdict::Changed { .. } => {} // expected — hash differs
             ChangeVerdict::Unchanged => {
                 panic!("expected Changed when hash differs despite same size")
@@ -2360,7 +2384,8 @@ function hello(name) { return "Hello " + name; }
             },
         );
 
-        match tiered_change_check(&file_path, "hello.js", &cache).unwrap() {
+        let reader = crate::content_reader::FilesystemReader::new(dir.path());
+        match tiered_change_check(&reader, "hello.js", &cache).unwrap() {
             ChangeVerdict::Changed {
                 source,
                 content_hash,
