@@ -25,6 +25,27 @@ use crate::merge::rrf_merge;
 use crate::upstream::UpstreamHandle;
 use crate::DaemonClient;
 
+/// Provenance metadata injected into every hybrid response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProvenanceMeta {
+    /// Which sources contributed to this response (e.g. ["local"], ["local", "acme"]).
+    pub sources: Vec<String>,
+    /// Repos where local index is behind the server's indexed SHA.
+    pub stale_repos: Vec<String>,
+    /// Routing scope: "local", "server", or "hybrid".
+    pub scope: String,
+}
+
+/// Status information for a single upstream server.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpstreamStatus {
+    pub name: String,
+    pub healthy: bool,
+    pub mode: String,
+    pub repo_count: usize,
+    pub stale_repos: Vec<String>,
+}
+
 /// Minimum result count before we consider querying the server in fallback mode.
 const FALLBACK_THRESHOLD: usize = 5;
 
@@ -154,7 +175,9 @@ impl HybridClient {
             .unwrap_or(RoutingMode::Fallback);
 
         if !self.has_upstreams() {
-            return self.query_local(tool_name, params).await;
+            let mut result = self.query_local(tool_name, params).await?;
+            inject_provenance(&mut result, &["local"], &[]);
+            return Ok(result);
         }
 
         match mode {
@@ -165,10 +188,15 @@ impl HybridClient {
                     .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
                     .await
                 {
-                    Ok(result) => Ok(result),
+                    Ok(mut result) => {
+                        inject_provenance(&mut result, &["server"], &[]);
+                        Ok(result)
+                    }
                     Err(e) => {
                         warn!(error = %e, "primary upstream failed, falling back to local");
-                        self.query_local(tool_name, params).await
+                        let mut result = self.query_local(tool_name, params).await?;
+                        inject_provenance(&mut result, &["local"], &[]);
+                        Ok(result)
                     }
                 }
             }
@@ -183,10 +211,11 @@ impl HybridClient {
         params: &Value,
     ) -> Result<Value> {
         // 1. Always query local first.
-        let local_result = self.query_local(tool_name, params).await?;
+        let mut local_result = self.query_local(tool_name, params).await?;
 
-        // 2. If no healthy upstreams, return local as-is.
+        // 2. If no healthy upstreams, return local as-is with provenance.
         if !self.has_upstreams() {
+            inject_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
 
@@ -198,6 +227,7 @@ impl HybridClient {
                 local_count,
                 "fallback: local results sufficient, skipping server"
             );
+            inject_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
 
@@ -218,6 +248,7 @@ impl HybridClient {
             }
             Err(e) => {
                 debug!(error = %e, "fallback: server query failed, using local only");
+                inject_provenance(&mut local_result, &["local"], &[]);
                 Ok(local_result)
             }
         }
@@ -231,7 +262,9 @@ impl HybridClient {
         params: &Value,
     ) -> Result<Value> {
         if !self.has_upstreams() {
-            return self.query_local(tool_name, params).await;
+            let mut result = self.query_local(tool_name, params).await?;
+            inject_provenance(&mut result, &["local"], &[]);
+            return Ok(result);
         }
 
         // Prepare the server future before borrowing self.local mutably.
@@ -301,13 +334,112 @@ impl HybridClient {
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
-                Ok(local)
+                let mut result = local;
+                inject_provenance(&mut result, &["local"], &[]);
+                Ok(result)
             }
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
-                Ok(local)
+                let mut result = local;
+                inject_provenance(&mut result, &["local"], &[]);
+                Ok(result)
             }
         }
+    }
+
+    /// Compare local repo SHAs against each upstream's `RepoStates`.
+    /// Returns repo URLs where the local index is behind the server.
+    pub async fn check_staleness(&mut self) -> Vec<String> {
+        let mut stale = Vec::new();
+
+        // Get local repo states.
+        let local_states: std::collections::HashMap<String, String> = {
+            let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+            match self.local.inner_mut().repo_states(req).await {
+                Ok(resp) => resp
+                    .into_inner()
+                    .repos
+                    .into_iter()
+                    .map(|r| (r.repo_url.clone(), r.indexed_sha))
+                    .collect(),
+                Err(_) => return stale,
+            }
+        };
+
+        for upstream in &self.upstreams {
+            if !upstream.is_healthy() {
+                continue;
+            }
+            let mut client = upstream.client();
+            let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+            upstream.inject_auth(&mut req);
+
+            if let Ok(resp) = client.repo_states(req).await {
+                for server_repo in resp.into_inner().repos {
+                    if let Some(local_sha) = local_states.get(&server_repo.repo_url) {
+                        if local_sha != &server_repo.indexed_sha && !server_repo.indexed_sha.is_empty() {
+                            stale.push(server_repo.repo_url.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        stale
+    }
+
+    /// Collect status information for all configured upstreams.
+    pub async fn upstream_status(&mut self) -> Vec<UpstreamStatus> {
+        let mut statuses = Vec::new();
+
+        // Get local repo states for staleness comparison.
+        let local_states: std::collections::HashMap<String, String> = {
+            let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+            match self.local.inner_mut().repo_states(req).await {
+                Ok(resp) => resp
+                    .into_inner()
+                    .repos
+                    .into_iter()
+                    .map(|r| (r.repo_url.clone(), r.indexed_sha))
+                    .collect(),
+                Err(_) => std::collections::HashMap::new(),
+            }
+        };
+
+        for upstream in &self.upstreams {
+            let mut status = UpstreamStatus {
+                name: upstream.name.clone(),
+                healthy: upstream.is_healthy(),
+                mode: format!("{:?}", upstream.mode).to_lowercase(),
+                repo_count: 0,
+                stale_repos: vec![],
+            };
+
+            if upstream.is_healthy() {
+                let mut client = upstream.client();
+                let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+                upstream.inject_auth(&mut req);
+
+                if let Ok(resp) = client.repo_states(req).await {
+                    let server_repos = resp.into_inner().repos;
+                    status.repo_count = server_repos.len();
+
+                    for server_repo in &server_repos {
+                        if let Some(local_sha) = local_states.get(&server_repo.repo_url) {
+                            if local_sha != &server_repo.indexed_sha
+                                && !server_repo.indexed_sha.is_empty()
+                            {
+                                status.stale_repos.push(server_repo.repo_url.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            statuses.push(status);
+        }
+
+        statuses
     }
 
     /// Query the local daemon via its gRPC channel.
@@ -459,11 +591,38 @@ fn merge_json_results(local: &Value, server: &Value) -> Value {
 
 /// Wrap merged results into a response envelope with provenance metadata.
 fn wrap_merged_response(results: Vec<Value>, sources: &[&str]) -> Value {
+    let scope = if sources.len() > 1 {
+        "hybrid"
+    } else {
+        sources.first().copied().unwrap_or("local")
+    };
     serde_json::json!({
         "results": results,
-        "sources": sources,
-        "merged": true,
+        "_meta": {
+            "sources": sources,
+            "stale_repos": [],
+            "scope": scope,
+        },
     })
+}
+
+/// Inject `_meta` provenance into an existing JSON response.
+fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String]) {
+    let scope = if sources.len() > 1 {
+        "hybrid"
+    } else {
+        sources.first().copied().unwrap_or("local")
+    };
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "_meta".to_string(),
+            serde_json::json!({
+                "sources": sources,
+                "stale_repos": stale_repos,
+                "scope": scope,
+            }),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -631,8 +790,10 @@ mod tests {
         let results = merged["results"].as_array().unwrap();
         // init appears once (deduplicated), handle is new => 2 results
         assert_eq!(results.len(), 2);
-        assert_eq!(merged["merged"], true);
-        assert!(merged["sources"].as_array().unwrap().len() >= 2);
+        // Has _meta provenance
+        assert!(merged["_meta"].is_object());
+        let sources = merged["_meta"]["sources"].as_array().unwrap();
+        assert!(sources.len() >= 2);
     }
 
     #[test]
@@ -648,9 +809,39 @@ mod tests {
     fn wrap_merged_response_has_metadata() {
         let results = vec![json!({"name": "a"})];
         let wrapped = wrap_merged_response(results, &["local", "server"]);
-        assert_eq!(wrapped["merged"], true);
-        assert!(wrapped["sources"].is_array());
         assert!(wrapped["results"].is_array());
+        // _meta provenance
+        assert!(wrapped["_meta"].is_object());
+        let meta = &wrapped["_meta"];
+        assert_eq!(meta["scope"], "hybrid");
+        let sources = meta["sources"].as_array().unwrap();
+        assert!(sources.len() >= 2);
+    }
+
+    #[test]
+    fn wrap_merged_response_single_source_scope() {
+        let results = vec![json!({"name": "a"})];
+        let wrapped = wrap_merged_response(results, &["local"]);
+        assert_eq!(wrapped["_meta"]["scope"], "local");
+    }
+
+    #[test]
+    fn inject_provenance_adds_meta() {
+        let mut val = json!({"results": [1, 2, 3]});
+        inject_provenance(&mut val, &["local", "acme"], &["repo-a".to_string()]);
+        assert!(val["_meta"].is_object());
+        assert_eq!(val["_meta"]["scope"], "hybrid");
+        assert_eq!(val["_meta"]["stale_repos"][0], "repo-a");
+        assert_eq!(val["_meta"]["sources"][0], "local");
+        assert_eq!(val["_meta"]["sources"][1], "acme");
+    }
+
+    #[test]
+    fn inject_provenance_local_only_scope() {
+        let mut val = json!({"results": []});
+        inject_provenance(&mut val, &["local"], &[]);
+        assert_eq!(val["_meta"]["scope"], "local");
+        assert!(val["_meta"]["stale_repos"].as_array().unwrap().is_empty());
     }
 
     // ── Routing mode selection test ───────────────────────────────
