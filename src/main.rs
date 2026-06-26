@@ -8250,6 +8250,30 @@ fn run_brain(
                 serde_json::json!({}),
             ) {
                 if json {
+                    // Inject upstream info into JSON output.
+                    let mut value = value;
+                    let upstream_configs =
+                        nestweaver_client::discovery::discover_upstreams(
+                            db_path.parent().unwrap_or(std::path::Path::new(".")),
+                        );
+                    if !upstream_configs.is_empty() {
+                        let upstreams_json: Vec<_> = upstream_configs
+                            .iter()
+                            .map(|ucfg| {
+                                serde_json::json!({
+                                    "name": ucfg.name.as_deref().unwrap_or("upstream"),
+                                    "url": ucfg.url,
+                                    "mode": format!("{:?}", ucfg.mode).to_lowercase(),
+                                })
+                            })
+                            .collect();
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert(
+                                "upstreams".to_string(),
+                                serde_json::json!(upstreams_json),
+                            );
+                        }
+                    }
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     println!("Brain status:");
@@ -8381,6 +8405,70 @@ fn run_brain(
                                         "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
                                          Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
                                          Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // ── Upstream server info ─────────────────────────────
+                    let upstream_configs =
+                        nestweaver_client::discovery::discover_upstreams(db_path.parent().unwrap_or(std::path::Path::new(".")));
+                    if !upstream_configs.is_empty() {
+                        println!();
+                        for ucfg in &upstream_configs {
+                            let name = ucfg.name.as_deref().unwrap_or("upstream");
+                            let mode = format!("{:?}", ucfg.mode).to_lowercase();
+                            match nestweaver_client::upstream::UpstreamHandle::from_config(ucfg)
+                            {
+                                Ok(handle) => {
+                                    // Try a quick HealthCheck to determine reachability.
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .unwrap();
+                                    let health_result = rt.block_on(async {
+                                        let mut client = handle.client();
+                                        let mut req = tonic::Request::new(
+                                            nestweaver_proto::HealthCheckRequest {},
+                                        );
+                                        handle.inject_auth(&mut req);
+                                        tokio::time::timeout(
+                                            std::time::Duration::from_secs(2),
+                                            client.health_check(req),
+                                        )
+                                        .await
+                                    });
+
+                                    match health_result {
+                                        Ok(Ok(resp)) => {
+                                            let version = resp.into_inner().version;
+                                            // Try to get repo count.
+                                            let repo_count = rt.block_on(async {
+                                                let mut client = handle.client();
+                                                let mut req = tonic::Request::new(
+                                                    nestweaver_proto::RepoStatesRequest {},
+                                                );
+                                                handle.inject_auth(&mut req);
+                                                client
+                                                    .repo_states(req)
+                                                    .await
+                                                    .map(|r| r.into_inner().repos.len())
+                                                    .unwrap_or(0)
+                                            });
+                                            println!(
+                                                "  Server: {name} (v{version}, {mode} mode, healthy, {repo_count} repos)"
+                                            );
+                                        }
+                                        _ => {
+                                            println!(
+                                                "  Server: {name} ({mode} mode, unreachable)"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    println!(
+                                        "  Server: {name} ({mode} mode, config error)"
                                     );
                                 }
                             }
