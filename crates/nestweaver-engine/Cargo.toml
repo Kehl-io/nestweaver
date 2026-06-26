@@ -38,6 +38,7 @@ rusqlite = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 rayon = "1.10"
 globset = "0.4"
+url = "2"
 html2md = "0.2"
 nestweaver-embed = { path = "../nestweaver-embed", optional = true }
 

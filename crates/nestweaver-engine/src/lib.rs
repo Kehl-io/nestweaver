@@ -48,6 +48,7 @@ pub mod brain_docgraph;
 pub mod brain_memory;
 pub mod brainignore;
 pub mod bridges;
+pub mod circuit_breaker;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod cochange;
