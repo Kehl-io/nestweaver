@@ -83,6 +83,7 @@ pub mod read_symbols;
 pub mod recency;
 pub mod registry;
 pub mod rerank;
+pub mod scheduler;
 pub mod resolution_cache;
 pub mod snapshot;
 pub mod suggest;
