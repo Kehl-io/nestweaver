@@ -564,20 +564,33 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
-    let res = nestweaver_engine::read_symbols::read_symbols(
-        store,
-        &targets,
-        &reader,
-        neighbors,
-        token_budget,
-    );
-    let mut value = serde_json::to_value(res)?;
 
-    // In server mode, source files live in bare clones (no checkout tree on
-    // disk), so FilesystemReader will return empty bodies for every symbol.
-    // Add a note so AI agents know to use brain_search/brain_context instead.
-    if is_server_mode() {
+    // In server mode, try to read source spans from bare clones via
+    // GitBareReader instead of the filesystem (which has no checkout tree).
+    let (value, used_bare) = if is_server_mode() {
+        let bare_result = try_read_symbols_from_bare(store, &targets, neighbors, token_budget);
+        match bare_result {
+            Some(res) => (serde_json::to_value(res)?, true),
+            None => {
+                let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+                let res = nestweaver_engine::read_symbols::read_symbols(
+                    store, &targets, &reader, neighbors, token_budget,
+                );
+                (serde_json::to_value(res)?, false)
+            }
+        }
+    } else {
+        let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+        let res = nestweaver_engine::read_symbols::read_symbols(
+            store, &targets, &reader, neighbors, token_budget,
+        );
+        (serde_json::to_value(res)?, false)
+    };
+    let mut value = value;
+
+    // If we're in server mode and couldn't use bare clones (or they returned
+    // empty bodies), add a diagnostic note for AI agents.
+    if is_server_mode() && !used_bare {
         let has_empty_bodies = value
             .get("symbols")
             .and_then(|v| v.as_array())
@@ -589,15 +602,78 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         if has_empty_bodies {
             value["server_note"] = serde_json::json!(
                 "Running in server mode — source files are in bare clones without \
-                 checkout trees. Symbol metadata (name, kind, location, edges) is \
-                 available but source spans cannot be read. Use brain_search or \
-                 brain_context for content lookup, or connect a local client with \
-                 filesystem access for full source spans."
+                 checkout trees. The bare clone workspace could not be located \
+                 (expected at <db_parent>/workspace/). Symbol metadata (name, kind, \
+                 location, edges) is available but source spans are empty. \
+                 Alternatives: use brain_search or brain_context for content lookup, \
+                 or connect a local client with filesystem access for full source spans."
             );
         }
     }
 
     Ok(value)
+}
+
+/// Attempt to read symbol source spans from bare git clones in server mode.
+///
+/// Derives the bare clone workspace root from the current DB path
+/// (convention: `<db_parent>/workspace/`). For each target, resolves the
+/// symbol's repo, finds the matching `<repo_name>.git` bare clone, and
+/// reads the source span via `GitBareReader`. Returns `None` if the
+/// workspace directory doesn't exist or if no repo can be resolved.
+fn try_read_symbols_from_bare(
+    store: &GraphStore,
+    targets: &[String],
+    neighbors: u8,
+    token_budget: Option<usize>,
+) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
+    // Derive workspace root from the thread-local db_path.
+    let db_path = current_db_path(store).ok()?;
+    let workspace_root = db_path.parent()?.join("workspace");
+    if !workspace_root.is_dir() {
+        return None;
+    }
+
+    // Resolve the first target to discover which repo we need.
+    // (All targets in a single call typically belong to the same repo.)
+    let first_spec = targets.first()?;
+    let repo_uid = resolve_repo_for_spec(store, first_spec)?;
+    let repo = store.lookup_repo(&repo_uid).ok().flatten()?;
+    let repo_name = repo
+        .name
+        .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
+    let bare_path = workspace_root.join(format!("{repo_name}.git"));
+    if !bare_path.is_dir() {
+        return None;
+    }
+
+    let reader = nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()?;
+    Some(nestweaver_engine::read_symbols::read_symbols(
+        store,
+        targets,
+        &reader,
+        neighbors,
+        token_budget,
+    ))
+}
+
+/// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
+fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
+    if spec.starts_with("sym:") {
+        return store.lookup_symbol(spec).ok().map(|s| s.repo_uid);
+    }
+    let name = spec
+        .rsplit("::")
+        .next()
+        .unwrap_or(spec)
+        .rsplit('.')
+        .next()
+        .unwrap_or(spec);
+    store
+        .lookup_symbols_by_name(name)
+        .ok()
+        .and_then(|syms| syms.into_iter().next())
+        .map(|s| s.repo_uid)
 }
 
 fn tool_schema_read_symbols() -> Value {
