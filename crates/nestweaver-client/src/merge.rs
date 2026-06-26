@@ -5,9 +5,9 @@
 //! result sets are asymmetric (spec validation finding #8).
 
 use crate::dedup::{
-    extract_identity, Confidence, MergedResult, Provenance, SymbolIdentity,
+    assign_confidence, extract_identity, Confidence, MergedResult, Provenance, SymbolIdentity,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// RRF smoothing constant. Standard value from the original RRF paper.
 const RRF_K: f64 = 60.0;
@@ -83,6 +83,88 @@ pub fn rrf_merge_weighted(
                     // Duplicate: local wins on content, accumulate score
                     existing.provenance = Provenance::Both;
                     existing.score += rrf_score;
+                } else {
+                    scored.insert(
+                        id,
+                        MergedResult {
+                            value: val,
+                            provenance: Provenance::Server,
+                            confidence,
+                            score: rrf_score,
+                        },
+                    );
+                }
+            }
+            None => {
+                unkeyed.push(MergedResult {
+                    value: val,
+                    provenance: Provenance::Server,
+                    confidence: Confidence::Heuristic,
+                    score: rrf_score,
+                });
+            }
+        }
+    }
+
+    let mut results: Vec<_> = scored.into_values().chain(unkeyed).collect();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
+/// Merge with awareness of locally modified files for staleness labeling.
+///
+/// Results from the server that touch files in `locally_modified_files`
+/// are tagged `Confidence::Stale` instead of `Precise`.
+pub fn rrf_merge_with_modified(
+    local_results: Vec<serde_json::Value>,
+    server_results: Vec<serde_json::Value>,
+    locally_modified_files: &HashSet<String>,
+) -> Vec<MergedResult> {
+    let mut scored: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
+    let mut unkeyed: Vec<MergedResult> = Vec::new();
+
+    for (rank, val) in local_results.into_iter().enumerate() {
+        let rrf_score = LOCAL_WEIGHT / (rank as f64 + RRF_K + 1.0);
+        let confidence = assign_confidence(&val, Provenance::Local, locally_modified_files);
+        match extract_identity(&val) {
+            Some(id) => {
+                scored.insert(
+                    id,
+                    MergedResult {
+                        value: val,
+                        provenance: Provenance::Local,
+                        confidence,
+                        score: rrf_score,
+                    },
+                );
+            }
+            None => {
+                unkeyed.push(MergedResult {
+                    value: val,
+                    provenance: Provenance::Local,
+                    confidence: Confidence::Heuristic,
+                    score: rrf_score,
+                });
+            }
+        }
+    }
+
+    for (rank, val) in server_results.into_iter().enumerate() {
+        let rrf_score = SERVER_WEIGHT / (rank as f64 + RRF_K + 1.0);
+        let confidence = assign_confidence(&val, Provenance::Server, locally_modified_files);
+        match extract_identity(&val) {
+            Some(id) => {
+                if let Some(existing) = scored.get_mut(&id) {
+                    existing.provenance = Provenance::Both;
+                    existing.score += rrf_score;
+                    // If server version is stale, downgrade confidence.
+                    if confidence == Confidence::Stale {
+                        existing.confidence = Confidence::Stale;
+                    }
                 } else {
                     scored.insert(
                         id,
@@ -303,5 +385,84 @@ mod tests {
         })];
         let merged = rrf_merge(local, vec![]);
         assert_eq!(merged[0].confidence, Confidence::Heuristic);
+    }
+
+    // ── rrf_merge_with_modified tests ────────────────────────────
+
+    #[test]
+    fn server_result_stale_when_file_modified() {
+        let server = vec![json!({
+            "repo_url": "repo",
+            "file_path": "src/lib.rs",
+            "symbol_name": "func",
+            "scope_chain": "mod::func",
+        })];
+        let modified = HashSet::from(["src/lib.rs".to_string()]);
+        let merged = rrf_merge_with_modified(vec![], server, &modified);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].confidence, Confidence::Stale);
+    }
+
+    #[test]
+    fn server_result_precise_when_file_not_modified() {
+        let server = vec![json!({
+            "repo_url": "repo",
+            "file_path": "src/other.rs",
+            "symbol_name": "func",
+            "scope_chain": "mod::func",
+        })];
+        let modified = HashSet::from(["src/lib.rs".to_string()]);
+        let merged = rrf_merge_with_modified(vec![], server, &modified);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].confidence, Confidence::Precise);
+    }
+
+    #[test]
+    fn local_result_precise_even_when_file_modified() {
+        let local = vec![json!({
+            "repo_url": "repo",
+            "file_path": "src/lib.rs",
+            "symbol_name": "func",
+            "scope_chain": "mod::func",
+        })];
+        let modified = HashSet::from(["src/lib.rs".to_string()]);
+        let merged = rrf_merge_with_modified(local, vec![], &modified);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].confidence, Confidence::Precise);
+    }
+
+    #[test]
+    fn duplicate_downgraded_to_stale_when_server_file_modified() {
+        let local = vec![json!({
+            "repo_url": "repo",
+            "file_path": "src/lib.rs",
+            "symbol_name": "func",
+            "scope_chain": "mod::func",
+            "body": "local version",
+        })];
+        let server = vec![json!({
+            "repo_url": "repo",
+            "file_path": "src/lib.rs",
+            "symbol_name": "func",
+            "scope_chain": "mod::func",
+            "body": "server version",
+        })];
+        let modified = HashSet::from(["src/lib.rs".to_string()]);
+        let merged = rrf_merge_with_modified(local, server, &modified);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].provenance, Provenance::Both);
+        // Should be downgraded to stale because the server's version is outdated.
+        assert_eq!(merged[0].confidence, Confidence::Stale);
+        // Local content wins.
+        assert_eq!(merged[0].value["body"], "local version");
+    }
+
+    #[test]
+    fn no_modified_files_keeps_precise() {
+        let local = vec![make_result("repo", "a", "mod::a")];
+        let server = vec![make_result("repo", "b", "mod::b")];
+        let merged = rrf_merge_with_modified(local, server, &HashSet::new());
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|r| r.confidence == Confidence::Precise));
     }
 }

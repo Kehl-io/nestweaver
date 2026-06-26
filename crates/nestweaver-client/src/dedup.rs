@@ -172,6 +172,43 @@ pub fn deduplicate(
     results
 }
 
+/// Determine confidence for a result based on its provenance and local file state.
+///
+/// - If the result is from the server and the file has been modified locally,
+///   the result is `Stale` (server's index is out of date for that file).
+/// - If the result has structural scope information, it is `Precise`.
+/// - Otherwise it is `Heuristic`.
+pub fn assign_confidence(
+    result: &serde_json::Value,
+    provenance: Provenance,
+    locally_modified_files: &std::collections::HashSet<String>,
+) -> Confidence {
+    let file_path = result
+        .get("file_path")
+        .or_else(|| result.get("file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Server results for locally-modified files are stale.
+    if provenance == Provenance::Server && locally_modified_files.contains(file_path) {
+        return Confidence::Stale;
+    }
+
+    // Check for structural resolution markers.
+    let has_scope = result
+        .get("scope_chain")
+        .or_else(|| result.get("scope"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if has_scope {
+        Confidence::Precise
+    } else {
+        Confidence::Heuristic
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +371,46 @@ mod tests {
 
         let merged = deduplicate(local, server);
         assert_eq!(merged.len(), 2);
+    }
+
+    // ── assign_confidence tests ──────────────────────────────────
+
+    #[test]
+    fn confidence_precise_when_scope_present() {
+        let result = json!({ "scope_chain": "module::class::method" });
+        let confidence = assign_confidence(&result, Provenance::Local, &std::collections::HashSet::new());
+        assert_eq!(confidence, Confidence::Precise);
+    }
+
+    #[test]
+    fn confidence_heuristic_when_no_scope() {
+        let result = json!({ "symbol_name": "foo" });
+        let confidence = assign_confidence(&result, Provenance::Local, &std::collections::HashSet::new());
+        assert_eq!(confidence, Confidence::Heuristic);
+    }
+
+    #[test]
+    fn confidence_stale_when_server_result_for_modified_file() {
+        let result = json!({ "file_path": "src/lib.rs", "scope_chain": "mod::fn" });
+        let modified = std::collections::HashSet::from(["src/lib.rs".to_string()]);
+        let confidence = assign_confidence(&result, Provenance::Server, &modified);
+        assert_eq!(confidence, Confidence::Stale);
+    }
+
+    #[test]
+    fn confidence_not_stale_for_local_result_of_modified_file() {
+        let result = json!({ "file_path": "src/lib.rs", "scope_chain": "mod::fn" });
+        let modified = std::collections::HashSet::from(["src/lib.rs".to_string()]);
+        // Local results are fresh regardless — stale only applies to server results.
+        let confidence = assign_confidence(&result, Provenance::Local, &modified);
+        assert_eq!(confidence, Confidence::Precise);
+    }
+
+    #[test]
+    fn confidence_precise_for_server_result_of_unmodified_file() {
+        let result = json!({ "file_path": "src/other.rs", "scope_chain": "mod::fn" });
+        let modified = std::collections::HashSet::from(["src/lib.rs".to_string()]);
+        let confidence = assign_confidence(&result, Provenance::Server, &modified);
+        assert_eq!(confidence, Confidence::Precise);
     }
 }
