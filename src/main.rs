@@ -5256,18 +5256,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
-                let daemon_client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
-                    .context("connect to daemon")?;
-                let grpc_client = daemon_client.into_inner();
-                nestweaver_mcp::run_stdio_server_daemon(
-                    grpc_client,
-                    rt,
-                    lite,
-                    track_interactions,
-                    &db_path,
-                )
-                .context("mcp server (daemon mode)")?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let mut hybrid = rt
+                    .block_on(nestweaver_client::hybrid::HybridClient::connect(
+                        &db_path,
+                        config.as_deref().map(std::path::Path::new),
+                        &cwd,
+                    ))
+                    .context("connect to daemon (hybrid)")?;
+                if hybrid.has_upstreams() {
+                    tracing::info!(
+                        upstreams = ?hybrid.upstream_info(),
+                        "MCP daemon proxy with hybrid routing"
+                    );
+                    run_mcp_hybrid(hybrid, rt, lite, track_interactions, &db_path)
+                        .context("mcp server (hybrid mode)")?;
+                } else {
+                    let grpc_client = hybrid.inner().clone();
+                    nestweaver_mcp::run_stdio_server_daemon(
+                        grpc_client,
+                        rt,
+                        lite,
+                        track_interactions,
+                        &db_path,
+                    )
+                    .context("mcp server (daemon mode)")?;
+                }
             } else {
                 nestweaver_mcp::run_stdio_server(
                     &db_path,
@@ -12562,6 +12576,157 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
             None
         }
     })
+}
+
+/// Run the MCP stdio server using HybridClient for query routing.
+///
+/// Read-only queries are dispatched through `HybridClient::query()` which
+/// applies fallback/merge/primary routing across upstream servers. Write
+/// operations (brain_add_source, brain_remove_source, prune_stale) go
+/// through the standard gRPC path.
+fn run_mcp_hybrid(
+    mut hybrid: nestweaver_client::hybrid::HybridClient,
+    rt: tokio::runtime::Runtime,
+    lite: bool,
+    track_interactions: bool,
+    db_path: &Path,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    nestweaver_mcp::tools::set_lite_mode(lite);
+
+    // Interaction tracking uses the MCP crate's private record_interaction
+    // helper. In hybrid mode, the HybridClient dispatches queries itself so
+    // we skip interaction tracking here. Standard MCP tools/call still tracks
+    // via the daemon proxy path.
+    let _ = track_interactions;
+
+    tracing::info!("brain MCP server ready on stdio (hybrid routing mode)");
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    let mut line = String::new();
+    let mut reader = stdin.lock();
+
+    // Write tools that must bypass hybrid routing.
+    let write_tools: std::collections::HashSet<&str> =
+        ["brain_add_source", "brain_remove_source", "prune_stale"]
+            .into_iter()
+            .collect();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            tracing::info!("client closed stdin; shutting down (hybrid)");
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("invalid JSON: {e}") }
+                });
+                serde_json::to_writer(&mut stdout, &resp)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = parsed
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "nestweaver-brain",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }
+            }),
+            "notifications/initialized" | "initialized" => continue,
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": nestweaver_mcp::tools::tool_list(lite),
+            }),
+            "tools/call" => {
+                let params = parsed.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                if name.is_empty() {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": "tools/call: 'name' is required" }
+                    })
+                } else if write_tools.contains(name) {
+                    // Write operations go through standard gRPC dispatch.
+                    let grpc = hybrid.inner_mut();
+                    match nestweaver_mcp::tools::dispatch_via_daemon(grpc, &rt, name, arguments.clone()) {
+                        Ok(result) => {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
+                        }),
+                    }
+                } else {
+                    // Read queries go through HybridClient for routing.
+                    match rt.block_on(hybrid.query(name, &arguments)) {
+                        Ok(result) => {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
+                        }),
+                    }
+                }
+            }
+            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("method not implemented: {method}") }
+            }),
+        };
+
+        serde_json::to_writer(&mut stdout, &response)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
 }
 
 /// Format a byte count as a human-readable string.
