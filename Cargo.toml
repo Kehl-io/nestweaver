@@ -117,6 +117,9 @@ tempfile = "3"
 serde_json = { workspace = true }
 criterion = { version = "0.8", default-features = false }
 nestweaver-daemon = { workspace = true }
+nestweaver-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 blake3 = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
