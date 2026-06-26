@@ -184,8 +184,10 @@ impl JobQueue {
     /// upgraded (lower = higher priority) and trigger is updated only when the
     /// new priority is strictly higher.
     ///
-    /// Running or succeeded jobs are not disturbed — the upsert is a no-op in
-    /// those cases because the `ON CONFLICT ... WHERE` clause won't match.
+    /// Running jobs are not disturbed — the upsert is a no-op for running
+    /// jobs so we don't interrupt an in-progress index. Succeeded and
+    /// dead_letter jobs are reset to pending so new webhooks can re-trigger
+    /// indexing.
     pub fn upsert(
         &self,
         repo_id: &str,
@@ -194,25 +196,32 @@ impl JobQueue {
     ) -> Result<(), rusqlite::Error> {
         let priority = trigger.priority();
         let trigger_str = trigger.as_str();
-        // Two-clause upsert:
-        // 1. If a pending/failed job exists, upgrade priority and reset to pending.
-        // 2. If a running/succeeded/dead_letter job exists, silently ignore
-        //    (the caller should use reset_dead_letter for dead_letter cases).
+        // Single ON CONFLICT clause that fires on repo_id conflict and
+        // conditionally updates based on current status:
         //
-        // SQLite only supports one ON CONFLICT per INSERT, so we use a single
-        // clause that always fires on repo_id conflict and conditionally updates.
+        // - pending/failed: upgrade priority if new one is higher, reset to pending.
+        // - succeeded/dead_letter: reset to pending with new trigger, clear attempt
+        //   counter so the job gets a fresh run.
+        // - running: no-op — don't interrupt in-progress work.
         self.conn.execute(
             "INSERT INTO index_jobs (repo_id, repo_url, trigger, priority, status)
              VALUES (?1, ?2, ?3, ?4, 'pending')
              ON CONFLICT (repo_id) DO UPDATE SET
                priority   = CASE WHEN status IN ('pending', 'failed')
                                  THEN MIN(excluded.priority, priority)
+                                 WHEN status IN ('succeeded', 'dead_letter')
+                                 THEN excluded.priority
                                  ELSE priority END,
                trigger    = CASE WHEN status IN ('pending', 'failed') AND excluded.priority < priority
-                                 THEN excluded.trigger ELSE trigger END,
-               status     = CASE WHEN status IN ('pending', 'failed')
+                                 THEN excluded.trigger
+                                 WHEN status IN ('succeeded', 'dead_letter')
+                                 THEN excluded.trigger
+                                 ELSE trigger END,
+               status     = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter')
                                  THEN 'pending' ELSE status END,
-               updated_at = CASE WHEN status IN ('pending', 'failed')
+               attempt    = CASE WHEN status IN ('succeeded', 'dead_letter')
+                                 THEN 0 ELSE attempt END,
+               updated_at = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter')
                                  THEN strftime('%s','now') ELSE updated_at END",
             params![repo_id, repo_url, trigger_str, priority],
         )?;
