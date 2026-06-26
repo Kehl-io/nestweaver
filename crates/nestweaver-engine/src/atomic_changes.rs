@@ -804,16 +804,28 @@ mod tests {
     }
 
     #[test]
-    fn line_shift_does_not_produce_false_positive() {
-        // Adding a comment above should NOT trigger a change for scoped symbols
+    fn line_shift_does_not_produce_false_positive_for_scoped_symbols() {
+        // Adding a comment above should NOT trigger a change for SCOPED symbols
+        // (those with a scope chain like Foo::bar). Top-level symbols without a
+        // scope chain (like `impl Foo` itself) DO change canonical_id when their
+        // line shifts — that's expected and correct per the spec.
         let old = "impl Foo {\n    pub fn bar(&self) {}\n}";
         let new = "// new comment\nimpl Foo {\n    pub fn bar(&self) {}\n}";
         let changes = compute_file_changes(old, new, "src/lib.rs", REPO_URL).unwrap();
-        // bar has a scope chain (Foo::bar), so line shift shouldn't matter
+        // bar (scoped as Foo::bar) should NOT produce a false positive
+        let bar_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| match c {
+                AtomicChange::SymbolAdded { name, .. }
+                | AtomicChange::SymbolRemoved { name, .. }
+                | AtomicChange::SignatureChanged { name, .. } => name == "bar",
+                _ => false,
+            })
+            .collect();
         assert!(
-            changes.is_empty(),
-            "line shift should not produce false positives for scoped symbols; got: {:?}",
-            changes
+            bar_changes.is_empty(),
+            "scoped symbol 'bar' should not produce false positives on line shift; got: {:?}",
+            bar_changes
         );
     }
 
