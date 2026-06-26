@@ -546,6 +546,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         store.insert_symbol(&sym).unwrap();
 
@@ -578,6 +579,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         let sym2 = nestweaver_schema::Symbol {
             uid: "sym:test:abc:20".to_string(),
@@ -597,6 +599,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         store.insert_symbol(&sym1).unwrap();
         store.insert_symbol(&sym2).unwrap();

@@ -562,6 +562,7 @@ impl GraphStore {
                 is_entry_point STRING, \
                 entry_point_kind STRING, \
                 framework_hint STRING, \
+                canonical_id STRING, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -573,6 +574,10 @@ impl GraphStore {
         // Migration (F2.0): add `framework_hint` to pre-existing Symbol tables.
         // Stored as "framework:role" (e.g. "spring:controller"); empty for none.
         let _ = conn.query("ALTER TABLE Symbol ADD framework_hint STRING DEFAULT ''");
+
+        // Migration (Phase 4): add `canonical_id` for cross-boundary symbol matching.
+        // Existing symbols get empty string until re-indexed with scope-chain extraction.
+        let _ = conn.query("ALTER TABLE Symbol ADD canonical_id STRING DEFAULT ''");
 
         // --- Relationship tables ---
         conn.query("CREATE REL TABLE IF NOT EXISTS REPO_HAS_FILE(FROM Repo TO File)")

@@ -323,6 +323,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         let helper_sym = Symbol {
             uid: "sym:helper".to_string(),
@@ -342,6 +343,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
 
         store.insert_symbol(&main_sym).expect("insert main");
@@ -391,6 +393,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         let helper_sym = Symbol {
             uid: "sym:helper".to_string(),
@@ -410,6 +413,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
 
         store.insert_symbol(&main_sym).expect("insert main");

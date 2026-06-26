@@ -85,6 +85,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             .map(|k| k.to_string())
             .unwrap_or_default();
         let fh = encode_framework_hint(s);
+        let canonical = s.canonical_id.clone().unwrap_or_default();
         wtr.write_record([
             &s.uid,
             &s.name,
@@ -100,6 +101,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             is_ep,
             &epk,
             &fh,
+            &canonical,
         ])
         .map_err(|e| StoreError::Query(format!("write symbol row: {e}")))?;
     }
@@ -285,7 +287,7 @@ impl GraphStore {
              repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
              pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
-             framework_hint: $fh})",
+             framework_hint: $fh, canonical_id: $cid})",
             vec![
                 ("uid", lbug::Value::String(symbol.uid.clone())),
                 ("name", lbug::Value::String(symbol.name.clone())),
@@ -325,6 +327,10 @@ impl GraphStore {
                     ),
                 ),
                 ("fh", lbug::Value::String(encode_framework_hint(symbol))),
+                (
+                    "cid",
+                    lbug::Value::String(symbol.canonical_id.clone().unwrap_or_default()),
+                ),
             ],
         )
     }
@@ -2903,14 +2909,14 @@ mod copy_from_tests {
                 f,
                 "uid,name,kind,repo_uid,file_path,start_line,end_line,\
                  signature,summary,content_hash,pagerank_score,is_entry_point,\
-                 entry_point_kind,framework_hint"
+                 entry_point_kind,framework_hint,canonical_id"
             )
             .unwrap();
             for i in 0..100 {
                 writeln!(
                     f,
                     "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
                 )
                 .unwrap();
             }
@@ -2957,7 +2963,7 @@ mod copy_from_tests {
                     writeln!(
                         f,
                         "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
                     )
                     .unwrap();
                 }

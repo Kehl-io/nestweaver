@@ -192,6 +192,11 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         .get(13)
         .and_then(|_| extract_opt_string(row, 13).ok().flatten())
         .and_then(|s| parse_framework_hint(&s));
+    // Column 14 (canonical_id) is optional: added in Phase 4 migration.
+    let canonical_id = row
+        .get(14)
+        .and_then(|_| extract_opt_string(row, 14).ok().flatten())
+        .filter(|s| !s.is_empty());
 
     Ok(Symbol {
         uid,
@@ -211,6 +216,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         visibility: Visibility::Inferred,
         type_info: None,
         framework_hint,
+        canonical_id,
     })
 }
 
@@ -229,7 +235,7 @@ fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
 
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
-     s.framework_hint";
+     s.framework_hint, s.canonical_id";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
      n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";

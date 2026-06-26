@@ -124,6 +124,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }];
 
         let summary = generate_summary(&mock_server.uri(), "test-model", &symbols)

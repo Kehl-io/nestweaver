@@ -111,6 +111,7 @@ fn setup_test_store() -> GraphStore {
         visibility: Visibility::Inferred,
         type_info: None,
         framework_hint: None,
+        canonical_id: None,
     };
     store.insert_symbol(&symbol).unwrap();
 

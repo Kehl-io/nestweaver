@@ -5997,6 +5997,7 @@ mod project_context_bug12_tests {
             visibility: Visibility::Public,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 

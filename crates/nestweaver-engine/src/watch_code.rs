@@ -393,6 +393,7 @@ fn reindex_file(
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
             framework_hint: hint_by_index.remove(&sym_idx),
+            canonical_id: None,
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));

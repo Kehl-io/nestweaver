@@ -472,6 +472,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 

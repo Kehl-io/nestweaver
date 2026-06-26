@@ -406,6 +406,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         let sym_b = Symbol {
             uid: "sym:b".to_string(),
@@ -425,6 +426,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
 
         store.insert_symbol(&sym_a).expect("insert sym_a");
@@ -487,6 +489,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
 
         for (uid, name, file) in [
@@ -558,6 +561,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
 
         for (uid, name, file) in [

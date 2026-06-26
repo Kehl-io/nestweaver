@@ -161,6 +161,11 @@ pub struct Symbol {
     pub visibility: Visibility,
     pub type_info: Option<TypeInfo>,
     pub framework_hint: Option<FrameworkHint>,
+    /// Instance-independent canonical identifier for cross-boundary matching.
+    /// Format: `<repo_url_hash>:<file_path>#<name>:<scope_hash>`.
+    /// `None` for symbols that haven't been re-indexed with scope-chain extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
 }
 
 // ── Brain extension: markdown nodes ────────────────────────────────────────
