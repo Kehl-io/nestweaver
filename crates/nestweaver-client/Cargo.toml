@@ -16,3 +16,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 hyper-util = "0.1"
 libc = "0.2"
+serde = { workspace = true }
+toml = "0.8"
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
