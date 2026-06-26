@@ -726,3 +726,121 @@ async fn server_mcp_http_brain_status_tool() {
         structured["repo_count"]
     );
 }
+
+#[tokio::test]
+async fn server_mcp_sessions_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+    let client = reqwest::Client::new();
+
+    // 1. Initialize — should get Mcp-Session-Id header back.
+    let resp1 = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+        }))
+        .send()
+        .await
+        .expect("first initialize failed");
+
+    assert_eq!(resp1.status(), 200);
+    let session_id_1 = resp1
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize response should contain Mcp-Session-Id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !session_id_1.is_empty(),
+        "session ID should not be empty"
+    );
+
+    // 2. Second initialize — should get a *different* session ID.
+    let resp2 = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+        }))
+        .send()
+        .await
+        .expect("second initialize failed");
+
+    assert_eq!(resp2.status(), 200);
+    let session_id_2 = resp2
+        .headers()
+        .get("mcp-session-id")
+        .expect("second initialize should also return Mcp-Session-Id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        session_id_1, session_id_2,
+        "two initialize calls should produce different session IDs"
+    );
+
+    // 3. tools/call WITH session header — should succeed.
+    let resp3 = client
+        .post(format!("{mcp_addr}/mcp"))
+        .header("mcp-session-id", &session_id_1)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+        }))
+        .send()
+        .await
+        .expect("tools/list with session failed");
+
+    assert_eq!(resp3.status(), 200);
+    let body3: serde_json::Value = resp3.json().await.unwrap();
+    assert!(
+        body3["result"]["tools"].is_array(),
+        "tools/list should return tools array"
+    );
+
+    // 4. tools/list WITHOUT session header — should also work (stateless fallback).
+    let resp4 = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/list",
+        }))
+        .send()
+        .await
+        .expect("stateless tools/list failed");
+
+    assert_eq!(resp4.status(), 200);
+    let body4: serde_json::Value = resp4.json().await.unwrap();
+    assert!(
+        body4["result"]["tools"].is_array(),
+        "stateless tools/list should return tools array"
+    );
+}

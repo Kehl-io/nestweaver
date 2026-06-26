@@ -7,16 +7,35 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
+use axum::http::HeaderMap;
 use axum::{Json, Router, extract::State, routing::post};
+use dashmap::DashMap;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::protocol::{PROTOCOL_VERSION, error_code};
 use crate::tools;
 
 const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a session can be idle before the sweeper removes it.
+const SESSION_TTL_SECS: u64 = 3600; // 1 hour
+
+/// How often the background sweeper runs.
+const SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+/// Per-client MCP session metadata.
+#[derive(Debug)]
+pub struct McpSession {
+    pub id: String,
+    pub created_at: Instant,
+    pub last_active: Instant,
+    pub request_count: u64,
+}
 
 /// Shared state for the MCP HTTP handler.
 ///
@@ -28,6 +47,40 @@ pub struct McpHttpState {
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    pub sessions: Arc<DashMap<String, McpSession>>,
+}
+
+impl McpHttpState {
+    /// Create a new state with an empty session registry.
+    pub fn new(
+        lite: bool,
+        store: Arc<GraphStore>,
+        tantivy: Option<Arc<TantivyIndex>>,
+        db_path: PathBuf,
+        instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    ) -> Self {
+        Self {
+            lite,
+            store,
+            tantivy,
+            db_path,
+            instance_cfg,
+            sessions: Arc::new(DashMap::new()),
+        }
+    }
+}
+
+/// Spawn a background task that removes sessions idle longer than `SESSION_TTL_SECS`.
+pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
+        let ttl = std::time::Duration::from_secs(SESSION_TTL_SECS);
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = Instant::now();
+            sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
+        }
+    });
 }
 
 /// Build an axum [`Router`] that serves `POST /mcp`.
@@ -52,26 +105,60 @@ struct JsonRpcRequest {
 
 async fn handle_mcp(
     State(state): State<Arc<McpHttpState>>,
+    headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
-) -> Json<Value> {
+) -> (HeaderMap, Json<Value>) {
     let id = req.id.clone().unwrap_or(Value::Null);
 
+    // Track the session: look up an existing one or note that we need a new one.
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // Update last_active / request_count for existing sessions.
+    if let Some(ref sid) = session_id {
+        if let Some(mut entry) = state.sessions.get_mut(sid) {
+            entry.last_active = Instant::now();
+            entry.request_count += 1;
+        }
+    }
+
     let response = match req.method.as_str() {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {}
+        "initialize" => {
+            // Always create a fresh session on initialize.
+            let new_id = Uuid::new_v4().to_string();
+            state.sessions.insert(
+                new_id.clone(),
+                McpSession {
+                    id: new_id.clone(),
+                    created_at: Instant::now(),
+                    last_active: Instant::now(),
+                    request_count: 1,
                 },
-                "serverInfo": {
-                    "name": SERVER_NAME,
-                    "version": SERVER_VERSION,
-                },
-                "instructions": crate::SERVER_INSTRUCTIONS,
-            }
-        }),
+            );
+
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("mcp-session-id", new_id.parse().unwrap());
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": SERVER_NAME,
+                        "version": SERVER_VERSION,
+                    },
+                    "instructions": crate::SERVER_INSTRUCTIONS,
+                }
+            });
+
+            return (resp_headers, Json(body));
+        }
 
         "notifications/initialized" | "initialized" => json!({
             "jsonrpc": "2.0",
@@ -100,14 +187,14 @@ async fn handle_mcp(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {
-                return Json(json!({
+                return (HeaderMap::new(), Json(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
                         "code": error_code::INVALID_PARAMS,
                         "message": "tools/call: 'name' is required",
                     }
-                }));
+                })));
             };
 
             let store = state.store.clone();
@@ -162,7 +249,7 @@ async fn handle_mcp(
         }),
     };
 
-    Json(response)
+    (HeaderMap::new(), Json(response))
 }
 
 #[cfg(test)]
@@ -174,13 +261,13 @@ mod tests {
 
     fn test_app() -> Router {
         let store = Arc::new(GraphStore::in_memory().unwrap());
-        let state = Arc::new(McpHttpState {
-            lite: false,
+        let state = Arc::new(McpHttpState::new(
+            false,
             store,
-            tantivy: None,
-            db_path: PathBuf::from("/tmp/test.lbug"),
-            instance_cfg: None,
-        });
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+        ));
         router(state)
     }
 
