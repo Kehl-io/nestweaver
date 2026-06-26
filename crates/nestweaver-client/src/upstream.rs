@@ -68,6 +68,11 @@ impl UpstreamHandle {
         .max_encoding_message_size(256 * 1024 * 1024)
     }
 
+    /// Returns the bearer token for this upstream, if configured.
+    pub fn auth_token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// Inject bearer token into a tonic request.
     pub fn inject_auth<T>(&self, req: &mut tonic::Request<T>) {
         if let Some(ref token) = self.token {

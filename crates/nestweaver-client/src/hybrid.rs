@@ -276,12 +276,13 @@ impl HybridClient {
             .map(|u| {
                 let timeout = u.timeout;
                 let mut client = u.client();
+                let token = u.auth_token().map(|t| t.to_string());
                 let tool = tool_name.to_string();
                 let p = params.clone();
                 async move {
                     tokio::time::timeout(
                         timeout,
-                        dispatch_json_rpc(&mut client, &tool, &p),
+                        dispatch_json_rpc_authed(&mut client, &tool, &p, token.as_deref()),
                     )
                     .await
                 }
@@ -468,9 +469,10 @@ impl HybridClient {
             .context("no healthy upstream servers")?;
 
         let mut client = upstream.client();
+        let token = upstream.auth_token().map(|t| t.to_string());
         match tokio::time::timeout(
             timeout,
-            dispatch_json_rpc(&mut client, tool_name, params),
+            dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
         )
         .await
         {
@@ -572,8 +574,27 @@ async fn dispatch_json_rpc(
     tool_name: &str,
     params: &Value,
 ) -> Result<Value> {
+    dispatch_json_rpc_authed(client, tool_name, params, None).await
+}
+
+/// Like `dispatch_json_rpc` but optionally injects a bearer token into the
+/// request metadata (required for authenticated upstream servers).
+async fn dispatch_json_rpc_authed(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    tool_name: &str,
+    params: &Value,
+    auth_token: Option<&str>,
+) -> Result<Value> {
     let args_json = serde_json::to_string(params)?;
-    let request = tonic::Request::new(JsonRequest { args_json });
+    let mut request = tonic::Request::new(JsonRequest { args_json });
+
+    if let Some(token) = auth_token {
+        if let Ok(val) =
+            format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>()
+        {
+            request.metadata_mut().insert("authorization", val);
+        }
+    }
 
     let response: JsonResponse = match tool_name {
         "backlinks" | "get_backlinks" => client.get_backlinks(request).await,
@@ -1052,12 +1073,13 @@ pub async fn blast_radius_two_tier(
 
     let server_name = upstream.name.clone();
     let mut up_client = upstream.client();
+    let token = upstream.auth_token().map(|t| t.to_string());
     let timeout = upstream.timeout;
 
     let server_params = params.clone();
     let server_result = match tokio::time::timeout(
         timeout,
-        dispatch_json_rpc(&mut up_client, "blast_radius", &server_params),
+        dispatch_json_rpc_authed(&mut up_client, "blast_radius", &server_params, token.as_deref()),
     )
     .await
     {
