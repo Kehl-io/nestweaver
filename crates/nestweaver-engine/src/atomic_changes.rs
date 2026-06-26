@@ -90,7 +90,7 @@ impl AtomicChange {
 /// Compute a canonical ID for a `RawSymbol` within a given file and repo.
 fn raw_symbol_canonical_id(sym: &RawSymbol, file_path: &str, repo_url: &str) -> String {
     let scope = sym.scope_chain.as_deref().unwrap_or("");
-    canonical_symbol_id(repo_url, file_path, &sym.name, scope)
+    canonical_symbol_id(repo_url, file_path, &sym.name, scope, sym.start_line)
 }
 
 /// Match old and new symbols by canonical_id to detect changes.

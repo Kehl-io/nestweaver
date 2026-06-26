@@ -79,10 +79,10 @@ pub fn project_uid(instance: &str, name: &str) -> String {
 /// The scope_hash is derived from the scope chain (module::class::method),
 /// NOT from the line number. This makes the ID stable across edits that
 /// shift line numbers without changing the symbol's logical position.
-pub fn canonical_symbol_id(repo_url: &str, file_path: &str, name: &str, scope_chain: &str) -> String {
+pub fn canonical_symbol_id(repo_url: &str, file_path: &str, name: &str, scope_chain: &str, line: u32) -> String {
     let repo_hash = truncated_hash(repo_url.trim_end_matches('/'));
     let scope_hash = if scope_chain.is_empty() {
-        truncated_hash(name)
+        truncated_hash(&format!("{}@{}", name, line))
     } else {
         truncated_hash(scope_chain)
     };
@@ -309,12 +309,14 @@ mod tests {
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
+            42,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
+            42,
         );
         assert_eq!(a, b);
     }
@@ -326,12 +328,14 @@ mod tests {
             "src/lib.rs",
             "foo",
             "foo",
+            1,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/lib.rs",
             "foo",
             "foo",
+            1,
         );
         assert_eq!(a, b, "trailing slash should not change canonical_id");
     }
@@ -343,12 +347,14 @@ mod tests {
             "src/lib.rs",
             "process",
             "ModA::ClassA::process",
+            10,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/lib.rs",
             "process",
             "ModB::ClassB::process",
+            10,
         );
         assert_ne!(a, b, "different scopes should produce different IDs");
     }
@@ -360,6 +366,7 @@ mod tests {
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
+            42,
         );
         assert!(id.contains("src/billing/webhook.rs"));
         assert!(id.contains("#processPayment:"));
@@ -368,22 +375,43 @@ mod tests {
     }
 
     #[test]
-    fn canonical_id_empty_scope_falls_back_to_name() {
+    fn canonical_id_empty_scope_falls_back_to_name_and_line() {
         let a = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/lib.rs",
             "main",
             "",
+            1,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/lib.rs",
             "main",
             "",
+            1,
         );
         assert_eq!(a, b, "empty scope chain should still be deterministic");
-        // The scope hash should be the hash of the name
-        assert!(a.ends_with(&format!(":{}", truncated_hash("main"))));
+        // The scope hash should be the hash of name@line
+        assert!(a.ends_with(&format!(":{}", truncated_hash("main@1"))));
+    }
+
+    #[test]
+    fn canonical_id_empty_scope_different_lines_differ() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "helper",
+            "",
+            10,
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "helper",
+            "",
+            50,
+        );
+        assert_ne!(a, b, "same name on different lines with no scope should differ");
     }
 
     #[test]
