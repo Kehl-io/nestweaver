@@ -1035,3 +1035,14 @@ fn cli_daemon_run_server_help() {
         .stdout(contains("--admin-token"))
         .stdout(contains("--port-file"));
 }
+
+#[test]
+fn cli_connect_help() {
+    nestweaver_cmd()
+        .args(["connect", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--token"))
+        .stdout(contains("--mode"))
+        .stdout(contains("--name"));
+}

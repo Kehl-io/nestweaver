@@ -1,6 +1,7 @@
 //! NestWeaver daemon client — connect over Unix domain socket with auto-start.
 
 pub mod autostart;
+pub mod connect;
 pub mod discovery;
 
 use std::path::{Path, PathBuf};

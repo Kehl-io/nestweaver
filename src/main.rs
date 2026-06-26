@@ -1344,6 +1344,23 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Connect to an upstream NestWeaver server
+    #[command(
+        after_help = "Examples:\n  nestweaver connect localhost:9378 --token nw_abc123\n  nestweaver connect nestweaver.acme.com:9378 --token nw_abc123 --mode merge\n  nestweaver connect grpcs://nestweaver.acme.com:9378 --token nw_abc123 --name acme"
+    )]
+    Connect {
+        /// Server URL (e.g., nestweaver.acme.com:9378)
+        url: String,
+        /// Bearer token for authentication
+        #[arg(long, env = "NESTWEAVER_TOKEN")]
+        token: Option<String>,
+        /// Name for this upstream (default: "upstream")
+        #[arg(long)]
+        name: Option<String>,
+        /// Routing mode: fallback (default), merge, or primary
+        #[arg(long, default_value = "fallback")]
+        mode: String,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
@@ -7152,6 +7169,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         anyhow::bail!("daemon start failed with {status}");
                     }
                     Ok((EXIT_SUCCESS, None))
+                }
+            }
+        }
+
+        Commands::Connect {
+            url,
+            token,
+            name,
+            mode,
+        } => {
+            let mode = match mode.as_str() {
+                "fallback" => nestweaver_client::discovery::RoutingMode::Fallback,
+                "merge" => nestweaver_client::discovery::RoutingMode::Merge,
+                "primary" => nestweaver_client::discovery::RoutingMode::Primary,
+                other => {
+                    eprintln!(
+                        "Unknown routing mode: {other}. Use fallback, merge, or primary."
+                    );
+                    return Ok((EXIT_ERROR, None));
+                }
+            };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            match rt.block_on(nestweaver_client::connect::connect_upstream(
+                &url,
+                token.as_deref(),
+                name.as_deref(),
+                mode,
+            )) {
+                Ok(_) => Ok((EXIT_SUCCESS, None)),
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    Ok((EXIT_ERROR, None))
                 }
             }
         }
