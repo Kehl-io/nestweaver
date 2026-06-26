@@ -9,7 +9,7 @@ description = "Client for NestWeaver daemon — auto-start, connect, call RPCs"
 nestweaver-proto = { workspace = true }
 nestweaver-daemon = { workspace = true }
 tonic = { workspace = true }
-tokio = { version = "1", features = ["net", "time", "rt"] }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
 tower = "0.5"
 anyhow = { workspace = true }
@@ -19,6 +19,7 @@ libc = "0.2"
 serde = { workspace = true }
 toml = "0.8"
 dirs = { workspace = true }
+glob = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
