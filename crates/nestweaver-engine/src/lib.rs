@@ -51,6 +51,7 @@ pub mod cluster_dispatch;
 pub mod clustering;
 pub mod cochange;
 pub mod config;
+pub mod content_reader;
 pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
