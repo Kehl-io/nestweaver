@@ -46,13 +46,28 @@ impl ResolutionDeps {
         self.deps.insert(file_path, depends_on);
     }
 
-    /// Return changed files PLUS any file whose resolved edges depend on a changed file.
+    /// Return changed files PLUS any file whose resolved edges depend on a
+    /// changed file, expanding up to `MAX_HOPS` levels of transitive
+    /// dependents. This ensures that when file A changes and B depends on A,
+    /// files that depend on B are also re-resolved (since B's exports may
+    /// have changed shape).
+    ///
+    /// Capped at 3 iterations to prevent cascading through the entire graph.
     pub fn affected_files(&self, changed: &HashSet<String>) -> HashSet<String> {
+        const MAX_HOPS: usize = 2;
+
         let mut affected = changed.clone();
-        for (file, deps) in &self.deps {
-            if deps.iter().any(|d| changed.contains(d)) {
-                affected.insert(file.clone());
+        for _ in 0..MAX_HOPS {
+            let mut newly_added = Vec::new();
+            for (file, deps) in &self.deps {
+                if !affected.contains(file) && deps.iter().any(|d| affected.contains(d)) {
+                    newly_added.push(file.clone());
+                }
             }
+            if newly_added.is_empty() {
+                break; // fixed point — no more transitive dependents
+            }
+            affected.extend(newly_added);
         }
         affected
     }
@@ -97,15 +112,55 @@ mod tests {
             affected.contains("a.ts"),
             "file depending on changed file must be affected"
         );
-        // d.ts depends on a.ts which isn't in `changed` — NOT affected
+        // d.ts depends on a.ts — now included via 2-hop transitive expansion
         assert!(
-            !affected.contains("d.ts"),
-            "transitive dependents should not be included"
+            affected.contains("d.ts"),
+            "2-hop transitive dependents should be included"
         );
         assert!(
             !affected.contains("e.ts"),
             "unrelated file should not be affected"
         );
+    }
+
+    #[test]
+    fn affected_files_two_hop_chain() {
+        let mut deps = ResolutionDeps {
+            deps: HashMap::new(),
+        };
+        // Chain: a.ts -> b.ts -> c.ts -> d.ts
+        deps.set_deps("b.ts".to_string(), HashSet::from(["a.ts".to_string()]));
+        deps.set_deps("c.ts".to_string(), HashSet::from(["b.ts".to_string()]));
+        deps.set_deps("d.ts".to_string(), HashSet::from(["c.ts".to_string()]));
+
+        let changed = HashSet::from(["a.ts".to_string()]);
+        let affected = deps.affected_files(&changed);
+
+        // a.ts changed, b.ts is 1 hop, c.ts is 2 hops
+        assert!(affected.contains("a.ts"));
+        assert!(affected.contains("b.ts"), "1-hop dependent");
+        assert!(affected.contains("c.ts"), "2-hop dependent");
+        // d.ts is 3 hops — beyond the MAX_HOPS=2 cap
+        assert!(
+            !affected.contains("d.ts"),
+            "3-hop dependent should be excluded by cap"
+        );
+    }
+
+    #[test]
+    fn affected_files_stops_at_fixed_point() {
+        let mut deps = ResolutionDeps {
+            deps: HashMap::new(),
+        };
+        // a.ts depends on b.ts, nothing else
+        deps.set_deps("a.ts".to_string(), HashSet::from(["b.ts".to_string()]));
+
+        let changed = HashSet::from(["b.ts".to_string()]);
+        let affected = deps.affected_files(&changed);
+
+        assert_eq!(affected.len(), 2); // b.ts + a.ts
+        assert!(affected.contains("b.ts"));
+        assert!(affected.contains("a.ts"));
     }
 
     #[test]
