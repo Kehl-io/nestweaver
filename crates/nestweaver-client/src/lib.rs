@@ -3,6 +3,7 @@
 pub mod autostart;
 pub mod connect;
 pub mod discovery;
+pub mod hybrid;
 pub mod upstream;
 
 use std::path::{Path, PathBuf};
