@@ -173,9 +173,10 @@ pub async fn add_repo(
                 format!("open job queue: {e}"),
             )
         })?;
+        let repo_id = nestweaver_engine::jobs::canonical_repo_id(&repo_url);
         queue
             .upsert(
-                &repo_url,
+                &repo_id,
                 &repo_url,
                 nestweaver_engine::jobs::JobTrigger::Unindexed,
             )
@@ -273,9 +274,10 @@ pub async fn trigger_reindex(
                 format!("open job queue: {e}"),
             )
         })?;
+        let repo_id = nestweaver_engine::jobs::canonical_repo_id(&repo.url);
         queue
             .upsert(
-                &uid,
+                &repo_id,
                 &repo.url,
                 nestweaver_engine::jobs::JobTrigger::Webhook,
             )
@@ -540,8 +542,9 @@ pub async fn reload_config(
                     if !indexed_urls.contains(url) {
                         tracing::info!(url = %url, "config reload: new repo — queueing for indexing");
                         if let Some(ref q) = queue {
+                            let repo_id = nestweaver_engine::jobs::canonical_repo_id(url);
                             let _ = q.upsert(
-                                url,
+                                &repo_id,
                                 url,
                                 nestweaver_engine::jobs::JobTrigger::Unindexed,
                             );

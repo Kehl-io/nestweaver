@@ -3411,7 +3411,8 @@ pub async fn run_server(
                                 if !remote_sha.is_empty() && remote_sha != indexed_sha {
                                     let jobs_path = nestweaver_engine::sidecar_path(&poll_db, ".jobs.sqlite");
                                     if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
-                                        let _ = queue.upsert(&repo_id, &url, nestweaver_engine::jobs::JobTrigger::Poll);
+                                        let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+                                        let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll);
                                     }
                                 }
                             }

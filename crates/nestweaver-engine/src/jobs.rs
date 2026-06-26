@@ -429,6 +429,22 @@ impl JobQueue {
     }
 }
 
+/// Normalize a repo identifier for job-queue keying.
+///
+/// Strips a trailing `.git` suffix and any trailing slashes so that
+/// `https://github.com/org/repo.git`, `https://github.com/org/repo/`,
+/// and `https://github.com/org/repo` all map to the same key.
+pub fn canonical_repo_id(url: &str) -> String {
+    let mut s = url.to_string();
+    if s.ends_with(".git") {
+        s.truncate(s.len() - 4);
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
 /// Map a rusqlite row to an `IndexJob`.
 fn row_to_job(row: &rusqlite::Row) -> Result<IndexJob, rusqlite::Error> {
     Ok(IndexJob {
@@ -788,6 +804,36 @@ mod tests {
 
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 1, "first claim should set attempt to 1");
+    }
+
+    #[test]
+    fn canonical_repo_id_normalizes() {
+        assert_eq!(
+            canonical_repo_id("https://github.com/org/repo.git"),
+            "https://github.com/org/repo"
+        );
+        assert_eq!(
+            canonical_repo_id("https://github.com/org/repo/"),
+            "https://github.com/org/repo"
+        );
+        assert_eq!(
+            canonical_repo_id("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+    }
+
+    #[test]
+    fn canonical_id_coalesces_same_repo() {
+        let q = queue();
+        let url = "https://github.com/org/repo";
+        let id1 = canonical_repo_id(url);
+        let id2 = canonical_repo_id(&format!("{}.git", url));
+
+        q.upsert(&id1, url, JobTrigger::Webhook).unwrap();
+        q.upsert(&id2, url, JobTrigger::Poll).unwrap();
+
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(depth.pending, 1, "same repo should coalesce");
     }
 
     #[test]

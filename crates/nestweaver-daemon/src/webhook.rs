@@ -16,7 +16,6 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use nestweaver_engine::jobs::{JobQueue, JobTrigger};
-use nestweaver_engine::pull::repo_name_from_url;
 
 /// Configuration for webhook signature verification.
 #[derive(Debug, Clone)]
@@ -64,7 +63,7 @@ pub async fn handle_webhook(
     };
 
     // 3. Enqueue job — the worker discovers HEAD itself.
-    let repo_id = repo_name_from_url(&url);
+    let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
     let enqueue_result = {
         let queue = state.job_queue.lock().expect("job queue lock poisoned");
         queue.upsert(&repo_id, &url, JobTrigger::Webhook)
