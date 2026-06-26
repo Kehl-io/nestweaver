@@ -1,0 +1,125 @@
+name: 'NestWeaver Impact Analysis'
+description: 'Cross-repo blast radius analysis for pull requests'
+inputs:
+  server:
+    description: 'NestWeaver server gRPC URL (e.g., https://nestweaver.internal:9378)'
+    required: true
+  token:
+    description: 'NestWeaver API bearer token'
+    required: true
+  severity:
+    description: 'Minimum severity to report: breaking, warning, info'
+    default: 'info'
+  comment:
+    description: 'Post a PR comment with results (true/false)'
+    default: 'true'
+  fail-on-breaking:
+    description: 'Fail the workflow if breaking changes detected (true/false)'
+    default: 'false'
+  fail-on-error:
+    description: 'Fail the workflow if NestWeaver server is unavailable (true/false)'
+    default: 'false'
+  version:
+    description: 'NestWeaver CLI version to install (default: latest)'
+    default: 'latest'
+outputs:
+  has-breaking:
+    description: 'Whether breaking changes were detected (true/false)'
+    value: ${{ steps.impact.outputs.has-breaking }}
+  impact-count:
+    description: 'Total number of impacted symbols'
+    value: ${{ steps.impact.outputs.impact-count }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Cache NestWeaver CLI
+      uses: actions/cache@v4
+      id: cache-cli
+      with:
+        path: /usr/local/bin/nestweaver
+        key: nestweaver-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+
+    - name: Install NestWeaver CLI
+      if: steps.cache-cli.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          URL="https://github.com/nestweaver/nestweaver/releases/latest/download/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+        else
+          URL="https://github.com/nestweaver/nestweaver/releases/download/v${VERSION}/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+        fi
+        curl -sSL "$URL" -o /usr/local/bin/nestweaver
+        chmod +x /usr/local/bin/nestweaver
+
+    - name: Run impact analysis
+      id: impact
+      shell: bash
+      env:
+        NESTWEAVER_TOKEN: ${{ inputs.token }}
+      run: |
+        set +e
+        nestweaver pre-push-impact \
+          --diff "origin/${{ github.base_ref }}..HEAD" \
+          --server "${{ inputs.server }}" \
+          --token "$NESTWEAVER_TOKEN" \
+          --min-severity "${{ inputs.severity }}" \
+          --format json \
+          > "$RUNNER_TEMP/impact.json" 2> "$RUNNER_TEMP/impact-stderr.txt"
+        EXIT_CODE=$?
+        set -e
+
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "::warning::NestWeaver impact analysis failed: $(cat "$RUNNER_TEMP/impact-stderr.txt")"
+          if [ "${{ inputs.fail-on-error }}" = "true" ]; then
+            echo "::error::NestWeaver server error (fail-on-error is enabled)"
+            exit 1
+          fi
+          echo '{"impacts":[],"error":"server_unavailable"}' > "$RUNNER_TEMP/impact.json"
+          exit 0
+        fi
+
+        # Set outputs
+        BREAKING=$(jq '[.impacts[] | select(.severity == "BREAKING")] | length' "$RUNNER_TEMP/impact.json" 2>/dev/null || echo 0)
+        TOTAL=$(jq '.impacts | length' "$RUNNER_TEMP/impact.json" 2>/dev/null || echo 0)
+        echo "has-breaking=$([ "$BREAKING" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        echo "impact-count=$TOTAL" >> "$GITHUB_OUTPUT"
+
+    - name: Format and post comment
+      if: inputs.comment == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        # Skip if server was unavailable (no useful data to comment)
+        if jq -e '.error == "server_unavailable"' "$RUNNER_TEMP/impact.json" > /dev/null 2>&1; then
+          echo "::notice::Skipping PR comment — NestWeaver server was unavailable"
+          exit 0
+        fi
+
+        ARTIFACT_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        nestweaver format-comment \
+          --input "$RUNNER_TEMP/impact.json" \
+          --repo "${{ github.repository }}" \
+          --pr "${{ github.event.pull_request.number }}" \
+          --marker "nestweaver-impact" \
+          --artifact-url "$ARTIFACT_URL"
+
+    - name: Upload full report artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nestweaver-impact-report
+        path: ${{ runner.temp }}/impact.json
+        retention-days: 30
+
+    - name: Check for breaking changes
+      if: inputs.fail-on-breaking == 'true'
+      shell: bash
+      run: |
+        if jq -e '.impacts[] | select(.severity == "BREAKING")' "$RUNNER_TEMP/impact.json" > /dev/null 2>&1; then
+          echo "::error::Breaking changes detected across downstream repos — see PR comment for details"
+          exit 1
+        fi

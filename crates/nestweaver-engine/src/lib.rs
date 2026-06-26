@@ -58,6 +58,8 @@ pub mod content_reader;
 pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
+pub mod diff_impact;
+pub mod format_comment;
 pub mod embedding;
 pub mod eval;
 pub mod export;

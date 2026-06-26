@@ -499,7 +499,7 @@ enum Commands {
     /// symbols in other repos would break.
     #[command(
         name = "pre-push-impact",
-        after_help = "Examples:\n  nestweaver pre-push-impact --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project"
+        after_help = "Examples:\n  nestweaver pre-push-impact --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project\n  nestweaver pre-push-impact --diff origin/main..HEAD --server http://localhost:50051 --fail-on-breaking\n  nestweaver pre-push-impact --diff origin/main..HEAD --fail-on-error --format json"
     )]
     PrePushImpact {
         /// Analyze uncommitted changes in the working tree
@@ -523,6 +523,68 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        /// Exit with code 1 if any impact has BREAKING severity
+        #[arg(long)]
+        fail_on_breaking: bool,
+        /// Exit with code 1 if server/store is unreachable or analysis fails
+        /// (default: exit 0 with warning)
+        #[arg(long)]
+        fail_on_error: bool,
+        /// gRPC URL to a remote NestWeaver server (uses local store if omitted)
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for server authentication
+        #[arg(long)]
+        token: Option<String>,
+        /// Git revision range for diff-based changes (e.g., origin/main..HEAD)
+        #[arg(long)]
+        diff: Option<String>,
+        /// Minimum severity to include: breaking, warning, info
+        #[arg(long, default_value = "info")]
+        min_severity: String,
+        /// Override auto-detected repo URL for canonical ID computation
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Show what would be sent without running impact analysis
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Format impact analysis results as a PR/MR comment
+    ///
+    /// Reads impact JSON (from pre-push-impact --format json) and renders
+    /// it as Markdown. Optionally posts to GitHub PR or GitLab MR.
+    #[command(
+        name = "format-comment",
+        after_help = "Examples:\n  nestweaver format-comment --input impact.json\n  nestweaver format-comment --input impact.json --repo owner/repo --pr 123\n  nestweaver format-comment --input - --gitlab-project 456 --mr 78 --gitlab-token TOKEN"
+    )]
+    FormatComment {
+        /// Input JSON file from impact analysis (use - for stdin)
+        #[arg(long)]
+        input: PathBuf,
+        /// GitHub repo (owner/repo) for posting PR comment
+        #[arg(long)]
+        repo: Option<String>,
+        /// GitHub PR number
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Hidden HTML marker for comment dedup
+        #[arg(long, default_value = "nestweaver-impact")]
+        marker: String,
+        /// GitLab project ID
+        #[arg(long)]
+        gitlab_project: Option<String>,
+        /// GitLab MR IID
+        #[arg(long)]
+        mr: Option<u64>,
+        /// GitLab API token (Project Access Token with api scope)
+        #[arg(long)]
+        gitlab_token: Option<String>,
+        /// Write Markdown to file instead of posting
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// URL to link in truncation notice (e.g., CI artifact URL)
+        #[arg(long)]
+        artifact_url: Option<String>,
     },
     /// Generate a structural skeleton ranked by symbol importance
     ///
@@ -5682,9 +5744,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             format,
             repo,
             db,
+            fail_on_breaking,
+            fail_on_error,
+            server,
+            token,
+            diff,
+            min_severity,
+            repo_url: repo_url_override,
+            dry_run,
         } => {
-            if !local_changes {
-                eprintln!("error: --local-changes is required");
+            if !local_changes && diff.is_none() {
+                eprintln!("error: --local-changes or --diff is required");
                 return Ok((EXIT_ERROR, None));
             }
 
@@ -5697,8 +5767,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_ERROR, None));
             }
 
-            // Detect repo URL from git remote
-            let repo_url = {
+            // Detect repo URL from git remote (or use override)
+            let repo_url = if let Some(url) = repo_url_override {
+                url
+            } else {
                 let output = std::process::Command::new("git")
                     .args(["remote", "get-url", "origin"])
                     .current_dir(&repo_path)
@@ -5711,31 +5783,208 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
-            // Compute local atomic changes
+            // Compute atomic changes — either from local working tree or from a diff range
             use nestweaver_engine::atomic_changes::{compute_local_changes, ImpactSeverity};
-            let changes = compute_local_changes(&repo_path, &repo_url)
-                .map_err(|e| anyhow::anyhow!("failed to compute local changes: {}", e))?;
+
+            let changes = if let Some(ref diff_range) = diff {
+                // Diff-based: compute changes between two revisions (CI mode)
+                nestweaver_engine::diff_impact::compute_diff_changes(
+                    &repo_path, diff_range, &repo_url,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to compute diff changes: {}", e))?
+            } else {
+                // Local changes mode (existing behavior)
+                compute_local_changes(&repo_path, &repo_url)
+                    .map_err(|e| anyhow::anyhow!("failed to compute local changes: {}", e))?
+            };
 
             if changes.is_empty() {
                 if !out.quiet {
                     println!("No local changes detected.");
                 }
+                if format == "json" {
+                    let output = serde_json::json!({
+                        "changes": 0,
+                        "impacts": [],
+                        "total_impacted_files": 0,
+                        "total_impacted_repos": 0,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
                 return Ok((EXIT_SUCCESS, None));
+            }
+
+            // Dry-run mode: show the atomic changes without running impact analysis
+            if dry_run {
+                if format == "json" {
+                    let output = serde_json::json!({
+                        "dry_run": true,
+                        "changes": changes,
+                        "change_count": changes.len(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    println!("  Dry run: {} atomic change(s) detected\n", changes.len());
+                    for change in &changes {
+                        println!("  {:?}", change);
+                    }
+                }
+                let stats = format!(
+                    "{} change(s) (dry run) in {}",
+                    changes.len(),
+                    format_elapsed(t0.elapsed())
+                );
+                return Ok((EXIT_SUCCESS, Some(stats)));
             }
 
             if !out.quiet {
                 println!(
-                    "  Analyzing {} local change(s)...",
+                    "  Analyzing {} change(s)...",
                     changes.len()
                 );
             }
 
-            // Run impact analysis against the local store
-            let store = open_store(db.as_deref())?;
-            let impacts = nestweaver_engine::atomic_changes::analyze_impact(
-                &store, &changes, max_depth, include_tests,
-            )
-            .map_err(|e| anyhow::anyhow!("impact analysis failed: {}", e))?;
+            // Parse min_severity
+            let min_sev = match min_severity.to_lowercase().as_str() {
+                "breaking" => ImpactSeverity::Breaking,
+                "warning" => ImpactSeverity::Warning,
+                _ => ImpactSeverity::Info,
+            };
+
+            // Run impact analysis — either against a remote server or the local store
+            let impacts = if let Some(ref server_url) = server {
+                // Remote server mode: connect via gRPC
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+
+                match rt.block_on(async {
+                    let endpoint = tonic::transport::Channel::from_shared(server_url.clone())
+                        .map_err(|e| anyhow::anyhow!("invalid server URL: {}", e))?
+                        .timeout(std::time::Duration::from_secs(30));
+
+                    let channel = endpoint
+                        .connect()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("server unavailable: {}", e))?;
+
+                    let mut client =
+                        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(
+                            channel,
+                        );
+
+                    // Convert engine AtomicChange -> proto AtomicChangeProto
+                    let proto_changes: Vec<nestweaver_proto::AtomicChangeProto> = changes
+                        .iter()
+                        .map(|c| atomic_change_to_proto(c))
+                        .collect();
+
+                    let mut req = tonic::Request::new(nestweaver_proto::ImpactAnalysisRequest {
+                        changes: proto_changes,
+                        source_repo_url: repo_url.clone(),
+                        max_depth: max_depth as i32,
+                        include_tests,
+                    });
+
+                    // Attach bearer token if provided
+                    if let Some(ref tok) = token {
+                        req.metadata_mut().insert(
+                            "authorization",
+                            format!("Bearer {}", tok)
+                                .parse()
+                                .map_err(|_| anyhow::anyhow!("invalid token"))?,
+                        );
+                    }
+
+                    let resp = client
+                        .impact_analysis(req)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("impact analysis RPC failed: {}", e))?;
+
+                    // Convert proto ImpactItem -> engine ImpactResult
+                    let response = resp.into_inner();
+                    let impacts: Vec<nestweaver_engine::atomic_changes::ImpactResult> = response
+                        .impacts
+                        .into_iter()
+                        .map(|item| impact_item_to_result(item))
+                        .collect();
+
+                    Ok::<_, anyhow::Error>(impacts)
+                }) {
+                    Ok(impacts) => impacts,
+                    Err(e) => {
+                        // Server unreachable / RPC failed — apply fallback
+                        if fail_on_error {
+                            eprintln!("error: {}", e);
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        eprintln!(
+                            "warning: Server unavailable — skipping impact analysis ({})",
+                            e
+                        );
+                        if format == "json" {
+                            let output = serde_json::json!({
+                                "impacts": [],
+                                "error": "server_unavailable",
+                            });
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        }
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                }
+            } else {
+                // Local store mode (existing behavior)
+                let store = match open_store(db.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if fail_on_error {
+                            return Err(anyhow::anyhow!("failed to open store: {}", e));
+                        }
+                        eprintln!(
+                            "warning: failed to open store, skipping impact analysis ({})",
+                            e
+                        );
+                        if format == "json" {
+                            let output = serde_json::json!({
+                                "impacts": [],
+                                "error": "store_unavailable",
+                            });
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        }
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                };
+
+                match nestweaver_engine::atomic_changes::analyze_impact(
+                    &store, &changes, max_depth, include_tests,
+                ) {
+                    Ok(impacts) => impacts,
+                    Err(e) => {
+                        if fail_on_error {
+                            return Err(anyhow::anyhow!("impact analysis failed: {}", e));
+                        }
+                        eprintln!(
+                            "warning: impact analysis failed, skipping ({})",
+                            e
+                        );
+                        if format == "json" {
+                            let output = serde_json::json!({
+                                "impacts": [],
+                                "error": "analysis_failed",
+                            });
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        }
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                }
+            };
+
+            // Determine if there are breaking impacts (before severity filter)
+            let has_breaking = impacts
+                .iter()
+                .any(|i| i.severity == ImpactSeverity::Breaking);
+
+            // Filter by minimum severity
+            let impacts = nestweaver_engine::diff_impact::filter_by_severity(impacts, min_sev);
 
             if format == "json" {
                 let output = serde_json::json!({
@@ -5828,10 +6077,118 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            // Exit with error if --fail-on-breaking and there are breaking impacts
+            if fail_on_breaking && has_breaking {
+                let stats = format!(
+                    "{} change(s), {} impact(s) in {} — BREAKING changes detected",
+                    changes.len(),
+                    impacts.len(),
+                    format_elapsed(t0.elapsed())
+                );
+                return Ok((EXIT_ERROR, Some(stats)));
+            }
+
             let stats = format!(
                 "{} change(s), {} impact(s) in {}",
                 changes.len(),
                 impacts.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::FormatComment {
+            input,
+            repo,
+            pr,
+            marker,
+            gitlab_project,
+            mr,
+            gitlab_token,
+            output,
+            artifact_url,
+        } => {
+            use nestweaver_engine::format_comment::{
+                FormatConfig, GitHubCommentConfig, GitLabCommentConfig,
+                read_impact_report, render_impact_markdown,
+            };
+
+            let report = read_impact_report(&input)
+                .map_err(|e| anyhow::anyhow!("failed to read impact report: {}", e))?;
+
+            let config = FormatConfig {
+                marker: marker.clone(),
+                artifact_url,
+            };
+            let markdown = render_impact_markdown(&report.impacts, &config);
+
+            // Determine output destination
+            if let Some(output_path) = output {
+                // Write to file
+                std::fs::write(&output_path, &markdown)
+                    .map_err(|e| anyhow::anyhow!("failed to write output: {}", e))?;
+                if !out.quiet {
+                    println!("  Wrote {} bytes to {}", markdown.len(), output_path.display());
+                }
+            } else if let (Some(owner_repo), Some(pr_number)) = (repo.as_ref(), pr) {
+                // Post to GitHub PR
+                let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    eprintln!("error: --repo must be in owner/repo format");
+                    return Ok((EXIT_ERROR, None));
+                }
+
+                let gh_config = GitHubCommentConfig {
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                    pr_number,
+                    marker: marker.clone(),
+                };
+
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+                rt.block_on(nestweaver_engine::format_comment::post_github_comment(
+                    &gh_config, &markdown,
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to post GitHub comment: {}", e))?;
+
+                if !out.quiet {
+                    println!("  Posted impact comment to {}/pull/{}", owner_repo, pr_number);
+                }
+            } else if let (Some(project_id), Some(mr_iid), Some(gl_token)) =
+                (gitlab_project.as_ref(), mr, gitlab_token.as_ref())
+            {
+                // Post to GitLab MR
+                let api_url = std::env::var("CI_API_V4_URL")
+                    .unwrap_or_else(|_| "https://gitlab.com/api/v4".to_string());
+
+                let gl_config = GitLabCommentConfig {
+                    project_id: project_id.clone(),
+                    mr_iid,
+                    token: gl_token.clone(),
+                    api_url,
+                    marker: marker.clone(),
+                };
+
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+                rt.block_on(nestweaver_engine::format_comment::post_gitlab_comment(
+                    &gl_config, &markdown,
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to post GitLab comment: {}", e))?;
+
+                if !out.quiet {
+                    println!("  Posted impact comment to GitLab project {} MR !{}", project_id, mr_iid);
+                }
+            } else {
+                // Default: print to stdout
+                println!("{}", markdown);
+            }
+
+            let stats = format!(
+                "{} impact(s), {} chars in {}",
+                report.impacts.len(),
+                markdown.len(),
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -12133,5 +12490,180 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             );
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+/// Convert an engine `AtomicChange` to a proto `AtomicChangeProto` for the gRPC client.
+fn atomic_change_to_proto(
+    change: &nestweaver_engine::atomic_changes::AtomicChange,
+) -> nestweaver_proto::AtomicChangeProto {
+    use nestweaver_engine::atomic_changes::AtomicChange;
+    use nestweaver_proto::{AtomicChangeProto, ChangeKind};
+
+    match change {
+        AtomicChange::SymbolAdded {
+            name,
+            kind,
+            signature,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolAdded.into(),
+            canonical_id: String::new(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: Some(signature.clone()),
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: format!("{:?}", kind),
+        },
+        AtomicChange::SymbolRemoved {
+            canonical_id,
+            name,
+            kind,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolRemoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: format!("{:?}", kind),
+        },
+        AtomicChange::SignatureChanged {
+            canonical_id,
+            name,
+            old_signature,
+            new_signature,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SignatureChanged.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: Some(old_signature.clone()),
+            new_signature: Some(new_signature.clone()),
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::SymbolRenamed {
+            old_canonical_id,
+            old_name,
+            new_name,
+            new_canonical_id,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolRenamed.into(),
+            canonical_id: old_canonical_id.clone(),
+            name: new_name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: Some(old_name.clone()),
+            new_name: Some(new_name.clone()),
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::SymbolMoved {
+            canonical_id,
+            name,
+            old_file,
+            new_file,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolMoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: Some(old_file.clone()),
+            new_file: Some(new_file.clone()),
+            file_path: new_file.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::ExportAdded {
+            canonical_id,
+            name,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::ExportAdded.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::ExportRemoved {
+            canonical_id,
+            name,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::ExportRemoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+    }
+}
+
+/// Convert a proto `ImpactItem` to an engine `ImpactResult` for the CLI output path.
+fn impact_item_to_result(
+    item: nestweaver_proto::ImpactItem,
+) -> nestweaver_engine::atomic_changes::ImpactResult {
+    use nestweaver_engine::atomic_changes::{ImpactResult, ImpactSeverity};
+    use nestweaver_proto::{ChangeKind, Severity};
+
+    let severity = match Severity::try_from(item.severity).unwrap_or(Severity::Info) {
+        Severity::Breaking => ImpactSeverity::Breaking,
+        Severity::Warning => ImpactSeverity::Warning,
+        Severity::Info => ImpactSeverity::Info,
+    };
+
+    let change_kind = match ChangeKind::try_from(item.change_kind).unwrap_or(ChangeKind::Unspecified) {
+        ChangeKind::SymbolAdded => "SYMBOL_ADDED",
+        ChangeKind::SymbolRemoved => "SYMBOL_REMOVED",
+        ChangeKind::SignatureChanged => "SIGNATURE_CHANGED",
+        ChangeKind::SymbolRenamed => "SYMBOL_RENAMED",
+        ChangeKind::SymbolMoved => "SYMBOL_MOVED",
+        ChangeKind::ExportAdded => "EXPORT_ADDED",
+        ChangeKind::ExportRemoved => "EXPORT_REMOVED",
+        ChangeKind::Unspecified => "UNSPECIFIED",
+    };
+
+    ImpactResult {
+        change_canonical_id: item.change_canonical_id,
+        change_kind: change_kind.to_string(),
+        affected_canonical_id: item.affected_canonical_id,
+        affected_name: item.affected_name,
+        affected_repo_url: item.affected_repo_url,
+        affected_file: item.affected_file,
+        affected_line: item.affected_line as u32,
+        affected_signature: item.affected_signature,
+        severity,
+        reason: item.reason,
     }
 }
