@@ -664,3 +664,65 @@ async fn server_mcp_http_tools_list() {
         tools.len()
     );
 }
+
+#[tokio::test]
+async fn server_mcp_http_brain_status_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "brain_status",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP tools/call request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 10);
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["result"]["isError"], false);
+
+    // brain_status returns repo_count in structuredContent
+    let structured = &body["result"]["structuredContent"];
+    assert!(
+        structured["repo_count"].is_number(),
+        "expected repo_count in structuredContent, got: {structured}"
+    );
+    assert!(
+        structured["repo_count"].as_i64().unwrap() >= 1,
+        "expected at least 1 repo, got {}",
+        structured["repo_count"]
+    );
+}

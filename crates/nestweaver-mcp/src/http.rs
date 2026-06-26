@@ -1,12 +1,15 @@
 //! MCP-over-HTTP endpoint.
 //!
 //! Provides a minimal axum HTTP server that accepts `POST /mcp` with
-//! JSON-RPC 2.0 bodies.  Currently handles `initialize` and `tools/list`;
-//! full tool dispatch (`tools/call`) is wired up separately.
+//! JSON-RPC 2.0 bodies.  Handles `initialize`, `tools/list`, and
+//! `tools/call` — the latter delegates to the same `tools::dispatch`
+//! function used by the stdio server.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, routing::post};
+use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 
 use crate::protocol::{PROTOCOL_VERSION, error_code};
@@ -17,11 +20,14 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Shared state for the MCP HTTP handler.
 ///
-/// For now only `lite` mode matters (controls which tools `tools/list`
-/// returns).  Task 10 will add `DaemonState` fields needed for
-/// `tools/call` dispatch.
+/// Holds references to the graph store and search index so `tools/call`
+/// can dispatch through the same path as the stdio server.
 pub struct McpHttpState {
     pub lite: bool,
+    pub store: Arc<GraphStore>,
+    pub tantivy: Option<Arc<TantivyIndex>>,
+    pub db_path: PathBuf,
+    pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
 }
 
 /// Build an axum [`Router`] that serves `POST /mcp`.
@@ -82,6 +88,64 @@ async fn handle_mcp(
             })
         }
 
+        "tools/call" => {
+            let params = req.params.clone().unwrap_or(Value::Null);
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+
+            let Some(name) = name else {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": error_code::INVALID_PARAMS,
+                        "message": "tools/call: 'name' is required",
+                    }
+                }));
+            };
+
+            let store = state.store.clone();
+            let tantivy = state.tantivy.clone();
+            let db_path = state.db_path.clone();
+            let instance_cfg = state.instance_cfg.clone();
+            let lite = state.lite;
+
+            // Run tool dispatch on a blocking thread — graph queries are
+            // CPU-bound and must not starve the tokio runtime.
+            let result = tokio::task::spawn_blocking(move || {
+                tools::set_current_db_path(db_path);
+                tools::set_lite_mode(lite);
+                tools::set_current_instance_config(instance_cfg);
+
+                tools::dispatch(&store, tantivy.as_deref(), &name, arguments, None)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(value)) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": tools::wrap_tool_result(value),
+                }),
+                Ok(Err(e)) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": tools::wrap_tool_error(&e.to_string()),
+                }),
+                Err(e) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": tools::wrap_tool_error(&format!("dispatch panicked: {e}")),
+                }),
+            }
+        }
+
         "ping" => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -109,7 +173,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app() -> Router {
-        let state = Arc::new(McpHttpState { lite: false });
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let state = Arc::new(McpHttpState {
+            lite: false,
+            store,
+            tantivy: None,
+            db_path: PathBuf::from("/tmp/test.lbug"),
+            instance_cfg: None,
+        });
         router(state)
     }
 

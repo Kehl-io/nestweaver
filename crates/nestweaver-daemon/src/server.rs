@@ -2912,7 +2912,13 @@ pub async fn run_server(
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
     if let Some(ref opts) = server_opts {
-        let mcp_state = std::sync::Arc::new(nestweaver_mcp::http::McpHttpState { lite: false });
+        let mcp_state = std::sync::Arc::new(nestweaver_mcp::http::McpHttpState {
+            lite: false,
+            store: state.store.clone(),
+            tantivy: state.tantivy.clone(),
+            db_path: state.db_path.clone(),
+            instance_cfg: state.instance_cfg.clone(),
+        });
         let mcp_router = nestweaver_mcp::http::router(mcp_state);
 
         // Parse the bind address to determine the MCP port.  When the gRPC
