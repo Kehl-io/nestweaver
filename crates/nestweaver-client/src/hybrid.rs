@@ -707,6 +707,437 @@ fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String
     }
 }
 
+// ── Flow trace stitching ────────────────────────────────────────────────
+
+/// A boundary symbol detected in a local flow_trace result.
+///
+/// The local trace knows the symbol name and canonical_id but cannot
+/// follow the call graph past it because the target repo is not indexed
+/// locally.
+#[derive(Debug, Clone)]
+pub struct TraceBoundary {
+    /// The canonical_id of the boundary symbol.
+    pub canonical_id: String,
+    /// The symbol name (for display/logging).
+    pub name: String,
+    /// The span_id (or JSON path) of the parent node in the local trace,
+    /// used for stitching the server continuation back into the tree.
+    pub parent_path: Vec<String>,
+}
+
+/// Detect boundary symbols in a flow_trace JSON result tree.
+///
+/// A boundary is a leaf node whose `uid` refers to a symbol in a repo
+/// that is not locally indexed. We detect this by checking if the node's
+/// result came back as a leaf (no children) but the original call graph
+/// edge exists — meaning we couldn't follow it locally.
+///
+/// In the current MCP implementation, boundary detection requires
+/// comparing the local repos against the repo_uid of each symbol. For
+/// the initial implementation, we return an empty list (no boundaries
+/// detected in the JSON output), and provide the `stitch_flow_trace`
+/// function for callers who can provide boundary info from the store.
+pub fn detect_boundaries_in_trace(_result: &Value) -> Vec<TraceBoundary> {
+    // The current flow_trace JSON output doesn't include canonical_id or
+    // repo information in tree nodes, so we can't detect boundaries from
+    // the JSON alone. Boundary detection requires store-level knowledge.
+    //
+    // Integration path: modify tool_flow_trace to annotate boundary nodes
+    // with `"boundary": true` and `"canonical_id": "..."` when a callee's
+    // repo_uid doesn't match any locally indexed repo.
+    vec![]
+}
+
+/// Stitch server-side trace spans into a local flow_trace result tree.
+///
+/// Given a local trace result (JSON tree) and server continuation
+/// response (spans from FlowTraceContinue RPC), merge the server spans
+/// into the tree at the correct boundary point.
+///
+/// The merge strategy:
+/// 1. Find the node in the local tree matching `parent_span_id`
+/// 2. Convert server spans into the same JSON tree format
+/// 3. Append server subtrees as children of the boundary node
+/// 4. Annotate server-sourced nodes with `"source": "server"`
+pub fn stitch_server_spans(
+    local_result: &mut Value,
+    server_spans: &[nestweaver_proto::TraceSpanProto],
+    boundary_canonical_id: &str,
+    server_name: &str,
+) {
+    if server_spans.is_empty() {
+        return;
+    }
+
+    // Build a lookup from span_id -> span for parent linkage.
+    let span_map: std::collections::HashMap<&str, &nestweaver_proto::TraceSpanProto> =
+        server_spans
+            .iter()
+            .map(|s| (s.span_id.as_str(), s))
+            .collect();
+
+    // Find the root span(s) — those whose canonical_id matches the boundary.
+    let root_spans: Vec<&nestweaver_proto::TraceSpanProto> = server_spans
+        .iter()
+        .filter(|s| s.canonical_id == boundary_canonical_id)
+        .collect();
+
+    if root_spans.is_empty() {
+        return;
+    }
+
+    // Build JSON subtree(s) from server spans.
+    fn build_subtree(
+        span: &nestweaver_proto::TraceSpanProto,
+        span_map: &std::collections::HashMap<&str, &nestweaver_proto::TraceSpanProto>,
+        server_name: &str,
+    ) -> Value {
+        let children: Vec<Value> = span
+            .callee_span_ids
+            .iter()
+            .filter_map(|cid| span_map.get(cid.as_str()))
+            .map(|child| build_subtree(child, span_map, server_name))
+            .collect();
+
+        serde_json::json!({
+            "name": span.name,
+            "file_path": span.file_path,
+            "canonical_id": span.canonical_id,
+            "source": format!("server:{}", server_name),
+            "children": children,
+        })
+    }
+
+    let subtrees: Vec<Value> = root_spans
+        .iter()
+        .map(|s| build_subtree(s, &span_map, server_name))
+        .collect();
+
+    // Find the boundary node in the local tree and inject server subtrees.
+    // The boundary node is a leaf with matching canonical_id.
+    fn inject_at_boundary(
+        node: &mut Value,
+        boundary_cid: &str,
+        subtrees: &[Value],
+        server_name: &str,
+    ) -> bool {
+        // Check if this node is the boundary (leaf with matching canonical_id).
+        if let Some(cid) = node.get("canonical_id").and_then(|v| v.as_str()) {
+            if cid == boundary_cid {
+                // Inject children.
+                if let Some(children) = node.get_mut("children") {
+                    if let Some(arr) = children.as_array_mut() {
+                        arr.extend_from_slice(subtrees);
+                    }
+                } else if let Some(obj) = node.as_object_mut() {
+                    obj.insert(
+                        "children".to_string(),
+                        Value::Array(subtrees.to_vec()),
+                    );
+                    obj.insert(
+                        "boundary_crossed".to_string(),
+                        Value::String(format!("-> {}", server_name)),
+                    );
+                }
+                return true;
+            }
+        }
+
+        // Recurse into children.
+        if let Some(children) = node.get_mut("children") {
+            if let Some(arr) = children.as_array_mut() {
+                for child in arr.iter_mut() {
+                    if inject_at_boundary(child, boundary_cid, subtrees, server_name) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    // Try to inject into the "tree" field of the response.
+    if let Some(tree) = local_result.get_mut("tree") {
+        inject_at_boundary(tree, boundary_canonical_id, &subtrees, server_name);
+    }
+
+    // Also try "methods" array for class-expanded traces.
+    if let Some(methods) = local_result.get_mut("methods") {
+        if let Some(arr) = methods.as_array_mut() {
+            for method in arr.iter_mut() {
+                inject_at_boundary(
+                    method,
+                    boundary_canonical_id,
+                    &subtrees,
+                    server_name,
+                );
+            }
+        }
+    }
+}
+
+/// Execute a flow_trace with cross-boundary stitching.
+///
+/// This is the high-level function that:
+/// 1. Runs flow_trace locally via the daemon
+/// 2. If boundaries are detected and an upstream is available, sends
+///    FlowTraceContinue RPCs
+/// 3. Stitches server spans into the local result
+///
+/// Currently, boundary detection from JSON is limited (see
+/// `detect_boundaries_in_trace`). Full integration requires the MCP
+/// tool to annotate boundary nodes with canonical_ids. When boundaries
+/// are provided explicitly (e.g., from a store-aware caller), they
+/// are used directly.
+pub async fn flow_trace_with_stitching(
+    client: &mut HybridClient,
+    params: &Value,
+    explicit_boundaries: &[TraceBoundary],
+) -> Result<Value> {
+    // 1. Run flow_trace locally.
+    let mut local_result = client.query_local("flow_trace", params).await?;
+
+    // 2. Detect boundaries (from JSON or explicit).
+    let boundaries = if explicit_boundaries.is_empty() {
+        detect_boundaries_in_trace(&local_result)
+    } else {
+        explicit_boundaries.to_vec()
+    };
+
+    if boundaries.is_empty() || !client.has_upstreams() {
+        inject_provenance(&mut local_result, &["local"], &[]);
+        return Ok(local_result);
+    }
+
+    // 3. For each boundary, send FlowTraceContinue to the upstream.
+    let max_depth = params
+        .get("max_depth")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10) as i32;
+    let trace_id = format!("trace-{}", uuid_v4_simple());
+
+    let upstream = match client.upstreams.iter().find(|u| u.is_healthy()) {
+        Some(u) => u,
+        None => {
+            // Mark boundaries as stubs.
+            if let Some(obj) = local_result.as_object_mut() {
+                obj.insert(
+                    "_boundary_stubs".to_string(),
+                    serde_json::json!(boundaries
+                        .iter()
+                        .map(|b| serde_json::json!({
+                            "canonical_id": b.canonical_id,
+                            "name": b.name,
+                            "reason": "server unavailable"
+                        }))
+                        .collect::<Vec<_>>()),
+                );
+            }
+            inject_provenance(&mut local_result, &["local"], &[]);
+            return Ok(local_result);
+        }
+    };
+
+    let mut all_visited: Vec<String> = Vec::new();
+    let server_name = upstream.name.clone();
+
+    for boundary in &boundaries {
+        let mut up_client = upstream.client();
+        let mut req = tonic::Request::new(
+            nestweaver_proto::FlowTraceContinueRequest {
+                trace_id: trace_id.clone(),
+                entry_canonical_id: boundary.canonical_id.clone(),
+                parent_span_id: String::new(), // No span linkage in JSON mode.
+                remaining_depth: max_depth.saturating_sub(
+                    boundary.parent_path.len() as i32
+                ).max(1),
+                visited_canonical_ids: all_visited.clone(),
+            },
+        );
+        upstream.inject_auth(&mut req);
+
+        match tokio::time::timeout(
+            upstream.timeout,
+            up_client.flow_trace_continue(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let resp = resp.into_inner();
+                // Collect visited canonical_ids from server spans.
+                for span in &resp.spans {
+                    all_visited.push(span.canonical_id.clone());
+                }
+                // Stitch server spans into local result.
+                stitch_server_spans(
+                    &mut local_result,
+                    &resp.spans,
+                    &boundary.canonical_id,
+                    &server_name,
+                );
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    boundary = %boundary.canonical_id,
+                    error = %e,
+                    "FlowTraceContinue failed"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    boundary = %boundary.canonical_id,
+                    "FlowTraceContinue timed out"
+                );
+            }
+        }
+    }
+
+    inject_provenance(&mut local_result, &["local", &server_name], &[]);
+    Ok(local_result)
+}
+
+/// Generate a simple pseudo-UUID for trace IDs.
+fn uuid_v4_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:032x}", t)
+}
+
+// ── Two-tier blast_radius ───────────────────────────────────────────────
+
+/// Execute blast_radius with two-tier output: local + org-wide.
+///
+/// When an upstream server is available:
+/// 1. Run blast_radius locally (existing logic)
+/// 2. Query the server's blast_radius for the same files
+/// 3. Combine into a response with `local_impact` and `org_impact` sections
+///
+/// The org-wide section shows impacts in repos only the server has indexed,
+/// giving visibility into cross-repo breakage before pushing.
+pub async fn blast_radius_two_tier(
+    client: &mut HybridClient,
+    params: &Value,
+) -> Result<Value> {
+    // 1. Always run local blast_radius.
+    let mut local_result = client.query_local("blast_radius", params).await?;
+
+    // 2. If no upstream, return local-only with clear annotation.
+    if !client.has_upstreams() {
+        inject_provenance(&mut local_result, &["local"], &[]);
+        if let Some(obj) = local_result.as_object_mut() {
+            obj.insert("tier".to_string(), Value::String("local_only".into()));
+        }
+        return Ok(local_result);
+    }
+
+    // 3. Query upstream for org-wide impact.
+    let upstream = match client.upstreams.iter().find(|u| u.is_healthy()) {
+        Some(u) => u,
+        None => {
+            inject_provenance(&mut local_result, &["local"], &[]);
+            if let Some(obj) = local_result.as_object_mut() {
+                obj.insert("tier".to_string(), Value::String("local_only".into()));
+                obj.insert(
+                    "org_note".to_string(),
+                    Value::String("upstream unavailable — showing local impact only".into()),
+                );
+            }
+            return Ok(local_result);
+        }
+    };
+
+    let server_name = upstream.name.clone();
+    let mut up_client = upstream.client();
+    let timeout = upstream.timeout;
+
+    let server_params = params.clone();
+    let server_result = match tokio::time::timeout(
+        timeout,
+        dispatch_json_rpc(&mut up_client, "blast_radius", &server_params),
+    )
+    .await
+    {
+        Ok(Ok(result)) => Some(result),
+        Ok(Err(e)) => {
+            debug!(error = %e, "org-wide blast_radius query failed");
+            None
+        }
+        Err(_) => {
+            debug!("org-wide blast_radius query timed out");
+            None
+        }
+    };
+
+    // 4. Build two-tier response.
+    let mut response = serde_json::json!({
+        "tier": "two_tier",
+        "local_impact": local_result,
+    });
+
+    if let Some(server) = server_result {
+        // Filter out results that are already in the local impact to avoid
+        // duplicating repos the user has indexed locally.
+        let local_repos = extract_local_repos(&local_result);
+        let filtered_server = filter_org_results(&server, &local_repos);
+
+        response["org_impact"] = serde_json::json!({
+            "source_server": server_name,
+            "results": filtered_server,
+        });
+    } else {
+        response["org_impact"] = serde_json::json!({
+            "source_server": server_name,
+            "status": "unavailable",
+            "note": "upstream server query failed — showing local impact only",
+        });
+    }
+
+    inject_provenance(
+        &mut response,
+        &["local", &server_name],
+        &[],
+    );
+
+    Ok(response)
+}
+
+/// Extract repo URLs/paths mentioned in local blast_radius results.
+fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
+    let mut repos = std::collections::HashSet::new();
+
+    // Look for repo info in changed_symbols and affected_symbols.
+    for key in &["changed_symbols", "affected_symbols"] {
+        if let Some(arr) = local.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(fp) = item.get("file_path").and_then(|v| v.as_str()) {
+                    // Extract repo-level prefix (first path component).
+                    if let Some(repo) = fp.split('/').next() {
+                        repos.insert(repo.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    repos
+}
+
+/// Filter org-wide results to exclude repos already covered by local impact.
+fn filter_org_results(
+    server: &Value,
+    _local_repos: &std::collections::HashSet<String>,
+) -> Value {
+    // For now, return the full server result. More sophisticated filtering
+    // (e.g., by repo URL matching) requires canonical repo identification
+    // across local and server databases, which depends on consistent repo
+    // URL normalization. Document this for future refinement.
+    server.clone()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -985,5 +1416,153 @@ mod tests {
         // Simulate recovery (background task would do this).
         healthy_ref.store(true, Ordering::Relaxed);
         assert!(handle.is_healthy());
+    }
+
+    // ── Trace stitching tests ────────────────────────────────────
+
+    #[test]
+    fn stitch_server_spans_into_local_tree() {
+        use nestweaver_proto::TraceSpanProto;
+
+        // Local tree: A -> B (boundary)
+        let mut local_result = json!({
+            "root_uid": "uid-a",
+            "root_name": "funcA",
+            "max_depth": 5,
+            "tree": {
+                "uid": "uid-a",
+                "name": "funcA",
+                "file_path": "src/a.rs",
+                "depth": 0,
+                "children": [{
+                    "uid": "uid-b",
+                    "name": "funcB",
+                    "canonical_id": "abc123:src/b.rs#funcB:def456",
+                    "file_path": "src/b.rs",
+                    "depth": 1,
+                    "children": []
+                }]
+            }
+        });
+
+        // Server spans: B -> C -> D
+        let spans = vec![
+            TraceSpanProto {
+                trace_id: "t1".into(),
+                span_id: "span-b".into(),
+                parent_span_id: None,
+                canonical_id: "abc123:src/b.rs#funcB:def456".into(),
+                name: "funcB".into(),
+                repo_url: "https://github.com/acme/api".into(),
+                file_path: "src/b.rs".into(),
+                start_line: 10,
+                callee_span_ids: vec!["span-c".into()],
+                source: "server".into(),
+            },
+            TraceSpanProto {
+                trace_id: "t1".into(),
+                span_id: "span-c".into(),
+                parent_span_id: Some("span-b".into()),
+                canonical_id: "abc123:src/c.rs#funcC:ghi789".into(),
+                name: "funcC".into(),
+                repo_url: "https://github.com/acme/api".into(),
+                file_path: "src/c.rs".into(),
+                start_line: 20,
+                callee_span_ids: vec![],
+                source: "server".into(),
+            },
+        ];
+
+        stitch_server_spans(
+            &mut local_result,
+            &spans,
+            "abc123:src/b.rs#funcB:def456",
+            "acme-server",
+        );
+
+        // Verify the boundary node now has server children.
+        let tree = &local_result["tree"];
+        let boundary_node = &tree["children"][0];
+        assert_eq!(boundary_node["name"], "funcB");
+
+        let stitched_children = boundary_node["children"].as_array().unwrap();
+        assert!(
+            !stitched_children.is_empty(),
+            "boundary node should have server-sourced children"
+        );
+
+        // The stitched root should be funcB with child funcC.
+        let server_root = &stitched_children[0];
+        assert_eq!(server_root["name"], "funcB");
+        assert!(
+            server_root["source"]
+                .as_str()
+                .unwrap()
+                .contains("acme-server")
+        );
+
+        let server_children = server_root["children"].as_array().unwrap();
+        assert_eq!(server_children.len(), 1);
+        assert_eq!(server_children[0]["name"], "funcC");
+    }
+
+    #[test]
+    fn stitch_empty_spans_is_noop() {
+        let mut local_result = json!({
+            "tree": {
+                "name": "funcA",
+                "children": []
+            }
+        });
+        let original = local_result.clone();
+
+        stitch_server_spans(&mut local_result, &[], "some-cid", "server");
+
+        assert_eq!(local_result, original);
+    }
+
+    #[test]
+    fn detect_boundaries_returns_empty_for_now() {
+        let result = json!({
+            "tree": {
+                "name": "funcA",
+                "children": [{"name": "funcB", "children": []}]
+            }
+        });
+        let boundaries = detect_boundaries_in_trace(&result);
+        assert!(boundaries.is_empty(), "boundary detection from JSON is not yet implemented");
+    }
+
+    #[test]
+    fn uuid_simple_generates_hex() {
+        let id = uuid_v4_simple();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── Two-tier blast_radius tests ──────────────────────────────
+
+    #[test]
+    fn extract_local_repos_from_changed_symbols() {
+        let local = json!({
+            "changed_symbols": [
+                {"uid": "1", "name": "foo", "file_path": "src/lib.rs"},
+                {"uid": "2", "name": "bar", "file_path": "api/handler.rs"},
+            ],
+            "affected_symbols": [
+                {"uid": "3", "name": "baz", "file_path": "src/util.rs"},
+            ]
+        });
+        let repos = extract_local_repos(&local);
+        assert!(repos.contains("src"));
+        assert!(repos.contains("api"));
+    }
+
+    #[test]
+    fn filter_org_results_returns_full_for_now() {
+        let server = json!({"affected_symbols": [{"name": "x"}]});
+        let local_repos = std::collections::HashSet::new();
+        let filtered = filter_org_results(&server, &local_repos);
+        assert_eq!(filtered, server);
     }
 }
