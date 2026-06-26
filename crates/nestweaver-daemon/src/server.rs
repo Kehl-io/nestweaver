@@ -3252,6 +3252,58 @@ pub async fn run_server(
                 .await;
         });
     }
+
+    // Spawn the worker pool to consume index jobs from the SQLite queue.
+    {
+        let worker_store = Arc::clone(&state.store);
+        let worker_db = db_path.clone();
+        let worker_instance = instance_id.clone();
+        let worker_shutdown = shutdown_tx.subscribe();
+        let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
+            Arc::clone(&state.indexing_active),
+            state.indexing_repo.clone(),
+            Arc::clone(&state.indexing_queue_depth),
+        );
+        tokio::spawn(async move {
+            let jobs_path = nestweaver_engine::sidecar_path(&worker_db, ".jobs.sqlite");
+            let workspace_dir = worker_db
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("workspace");
+            let job_queue = match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+                Ok(q) => q,
+                Err(e) => {
+                    tracing::error!("failed to open job queue for worker pool: {e}");
+                    return;
+                }
+            };
+            // Recover any stale running jobs from a previous crash.
+            if let Ok(recovered) = job_queue.recover_stale(1800) {
+                if recovered > 0 {
+                    tracing::info!(recovered, "recovered stale running jobs");
+                }
+            }
+            let workspace = match nestweaver_engine::bare_clone::BareCloneWorkspace::new(
+                &workspace_dir,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("failed to create bare clone workspace: {e}");
+                    return;
+                }
+            };
+            let pool = nestweaver_engine::worker::WorkerPool::new(2);
+            pool.run(
+                std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+                std::sync::Arc::new(workspace),
+                worker_store,
+                worker_instance,
+                worker_shutdown,
+                Some(indexing_status),
+            )
+            .await;
+        });
+    }
     } // end if server_opts
 
     // Spawn adaptive poll scheduler in server mode.
