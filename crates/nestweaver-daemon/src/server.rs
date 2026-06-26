@@ -2547,6 +2547,9 @@ pub struct ServerOpts {
     pub bind_addr: String,
     /// When set, the actual bound port is written here (useful for tests with port 0).
     pub port_file: Option<PathBuf>,
+    /// Optional bearer token for TCP authentication. When set, TCP clients
+    /// must send `Authorization: Bearer <token>` or receive UNAUTHENTICATED.
+    pub auth_token: Option<String>,
 }
 
 pub async fn run_server(
@@ -2864,8 +2867,16 @@ pub async fn run_server(
         }
 
         let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
-        let tcp_svc = svc.clone();
         let mut tcp_shutdown_rx = shutdown_tx.subscribe();
+
+        // When an auth token is configured, wrap the TCP service with a
+        // bearer-token interceptor. UDS stays unauthenticated.
+        let interceptor =
+            crate::auth::bearer_auth_interceptor(opts.auth_token.clone());
+        let tcp_svc = tonic::service::interceptor::InterceptedService::new(
+            svc.clone(),
+            interceptor,
+        );
 
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()

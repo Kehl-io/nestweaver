@@ -122,3 +122,103 @@ async fn server_tcp_brain_status() {
         status.repo_count
     );
 }
+
+#[tokio::test]
+async fn server_auth_rejects_unauthenticated() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start_with_auth(&db_path, "test-secret");
+
+    // Connect without a bearer token — should be rejected.
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let result = client.brain_status(BrainStatusRequest {}).await;
+    assert!(result.is_err(), "expected UNAUTHENTICATED error");
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "expected UNAUTHENTICATED, got {:?}",
+        status.code()
+    );
+}
+
+#[tokio::test]
+async fn server_auth_passes_valid_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start_with_auth(&db_path, "test-secret");
+
+    // Connect WITH a valid bearer token — should succeed.
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+
+    let mut client = NestWeaverDaemonClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            "Bearer test-secret".parse().unwrap(),
+        );
+        Ok(req)
+    });
+
+    let response = client
+        .brain_status(BrainStatusRequest {})
+        .await
+        .expect("BrainStatus RPC should succeed with valid token");
+
+    let status = response.into_inner();
+    assert!(
+        status.repo_count >= 1,
+        "expected at least 1 repo, got {}",
+        status.repo_count
+    );
+}

@@ -6985,16 +6985,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     admin_token,
                     port_file,
                 } => {
-                    // TLS and auth flags are parsed but not wired up yet (Tasks 6-7).
+                    // TLS flags are parsed but not wired up yet (Task 7).
                     let _ = tls_cert;
                     let _ = tls_key;
-                    let _ = auth_token;
                     let _ = admin_token;
 
                     let server_opts = if server {
                         Some(nestweaver_daemon::ServerOpts {
                             bind_addr: bind,
                             port_file,
+                            auth_token,
                         })
                     } else {
                         None
