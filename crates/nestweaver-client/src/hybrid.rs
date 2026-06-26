@@ -629,6 +629,18 @@ async fn dispatch_json_rpc_authed(
         "export_graph" => client.export_graph(request).await,
         "search_symbols" => client.search_symbols(request).await,
         "symbol_lookup" => client.symbol_lookup(request).await,
+        // Admin / listing RPCs (local-only in routing matrix, but must be
+        // dispatchable so HybridClient::query can route them).
+        "list_repos" => client.list_repos_json(request).await,
+        "list_vaults" => client.list_vaults_json(request).await,
+        "embedding_dimension" => client.embedding_dimension(request).await,
+        "list_services" => client.list_services_json(request).await,
+        "service_summary" => client.service_summary_json(request).await,
+        "list_projects" => client.list_projects_json(request).await,
+        "repo_map" => client.repo_map_json(request).await,
+        "suggest_links" => client.suggest_links_json(request).await,
+        "detect_implicit_projects" => client.detect_implicit_projects_json(request).await,
+        "pr_impact" => client.pr_impact_json(request).await,
         _ => {
             anyhow::bail!("unsupported tool for JSON dispatch: {tool_name}");
         }

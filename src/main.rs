@@ -2771,7 +2771,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "list_repos", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "list_repos", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -2987,7 +2987,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "list_services", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "list_services", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3047,7 +3047,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "service_summary", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3101,7 +3101,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "repo_map", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3149,7 +3149,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["repo"] = serde_json::json!(rf);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, db_path, None, "cross_repo_contracts", args)
+                    try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3652,7 +3652,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "suggest_links", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "suggest_links", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3831,7 +3831,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["config"] = serde_json::json!(c.to_string_lossy());
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
                 {
                     // brain_guide returns the guide text as a JSON string.
                     let text = if let Some(s) = value.as_str() {
@@ -3968,29 +3968,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             top,
             json,
             db,
-            config: _,
+            config,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // ── daemon guard (typed RPC) ──────────────────────────
+            // ── hybrid guard (routes through local + upstream) ────
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::HubNodesRequest {
-                        top_n: top as i32,
-                        response_format: String::new(),
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .hub_nodes(req)
-                            .await
-                            .map(|r| r.into_inner())
-                    });
+                let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                    &start_dir,
+                ));
+                if let Ok(mut hybrid) = connect {
+                    let rpc = rt.block_on(hybrid.query(
+                        "hub_nodes",
+                        &serde_json::json!({
+                            "top_n": top,
+                        }),
+                    ));
                     match rpc {
-                        Ok(resp) => {
-                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)
-                                .unwrap_or(serde_json::json!({}));
+                        Ok(value) => {
                             if json {
                                 println!("{}", serde_json::to_string_pretty(&value)?);
                             } else {
@@ -4020,16 +4018,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                             }
                             let stats = format!(
-                                "{} hubs in {} (via daemon)",
+                                "{} hubs in {} (via hybrid)",
                                 value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
                                 format_elapsed(t0.elapsed())
                             );
                             return Ok((EXIT_SUCCESS, Some(stats)));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             eprintln!(
-                                "warning: daemon hub_nodes RPC failed ({}); falling back to direct DB read",
-                                status.message()
+                                "warning: hybrid hub_nodes query failed ({}); falling back to direct DB read",
+                                e
                             );
                         }
                     }
@@ -4082,7 +4080,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "top": top });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "bridge_nodes", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "bridge_nodes", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4155,7 +4153,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4225,7 +4223,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "clusters", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4298,7 +4296,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "id_or_name": id_or_name });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "clusters", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if let Some(c) = value.as_object() {
@@ -4554,7 +4552,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "min_confidence": min_confidence });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "dead_code", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4838,7 +4836,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "files": file_strs,
                     "depth": depth,
                 });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "pr_impact", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -4991,7 +4989,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["base_ref"] = serde_json::json!(br);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "affected_tests", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5388,7 +5386,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "query": query, "limit": limit });
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "search_symbols", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "search_symbols", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5452,7 +5450,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ms) = max_millis {
                     args["max_millis"] = serde_json::json!(ms);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "regex_search", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "regex_search", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5538,7 +5536,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["kinds"] = serde_json::json!(k);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "count_patterns", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "count_patterns", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5584,7 +5582,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "read_symbols", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5649,7 +5647,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "name_or_uid": name_or_uid });
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "symbol_lookup", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "symbol_lookup", args)
                 {
                     let status = value
                         .get("status")
@@ -6297,7 +6295,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     None,
@@ -6468,7 +6466,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
-                try_daemon_json_rpc(true, &db_path, None, "list_projects", args)
+                try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_else(|| {
                         let store = open_store(db.as_deref()).expect("open_store");
@@ -6545,7 +6543,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             include_components,
             json,
             db,
-            config: _,
+            config,
             since,
             recency_weight,
             recency_half_life_days,
@@ -6553,36 +6551,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::ProjectContextRequest {
-                        project: name.clone(),
-                        token_budget: token_budget as i32,
-                        kinds: vec![],
-                        include_components,
-                        intent: String::new(),
-                        include_seeds: false,
-                        since: since.clone().unwrap_or_default(),
-                        recency_weight,
-                        recency_half_life_days,
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .get_project_context(req)
-                            .await
-                            .map(|r| r.into_inner())
-                    });
+                let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                    &start_dir,
+                ));
+                if let Ok(mut hybrid) = connect {
+                    let rpc = rt.block_on(hybrid.query(
+                        "project_context",
+                        &serde_json::json!({
+                            "project": name,
+                            "token_budget": token_budget,
+                            "include_components": include_components,
+                            "since": since.clone().unwrap_or_default(),
+                            "recency_weight": recency_weight,
+                            "recency_half_life_days": recency_half_life_days,
+                        }),
+                    ));
                     match rpc {
-                        Ok(resp) => {
-                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)?;
+                        Ok(value) => {
                             render_project_context_daemon_response(&value, json, token_budget);
                             return Ok((EXIT_SUCCESS, None));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             tracing::info!(
-                                "daemon GetProjectContext failed ({}); falling back to direct mode",
-                                status.message()
+                                "hybrid project_context query failed ({}); falling back to direct mode",
+                                e
                             );
                         }
                     }
@@ -6897,7 +6892,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "investigate", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -6996,7 +6991,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "investigate_expand", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -7054,7 +7049,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "investigate_hydrate", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -7150,7 +7145,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "vault": vault.to_string_lossy(),
                 });
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
                 {
                     let detected: Vec<String> = serde_json::from_value(value).unwrap_or_default();
                     if detected.is_empty() {
@@ -8466,7 +8461,7 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({});
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -8528,7 +8523,7 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "apply": apply });
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -8584,7 +8579,7 @@ fn run_memory(
                     "edge_types": edge_types,
                     "depth": depth,
                 });
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -8621,11 +8616,12 @@ fn run_memory(
     }
 }
 
-/// Try to dispatch a read-only brain command through the daemon's JSON
-/// pass-through RPC. Returns `Some(json_value)` on success, `None` if the
-/// daemon is unavailable or the RPC fails (caller should fall through to
+/// Dispatch a read-only brain command through the `HybridClient`, which
+/// queries the local daemon **and** any configured upstream servers.
+/// Returns `Some(json_value)` on success, `None` if the daemon is
+/// unavailable or the RPC fails (caller should fall through to
 /// direct-disk mode).
-fn try_daemon_json_rpc(
+fn try_hybrid_json_rpc(
     use_daemon: bool,
     db_path: &std::path::Path,
     config: Option<&std::path::Path>,
@@ -8636,62 +8632,16 @@ fn try_daemon_json_rpc(
         return None;
     }
     let rt = tokio::runtime::Runtime::new().ok()?;
-    let mut client = rt
-        .block_on(nestweaver_client::DaemonClient::connect(db_path, config))
+    let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut hybrid = rt
+        .block_on(nestweaver_client::hybrid::HybridClient::connect(
+            db_path,
+            config,
+            &start_dir,
+        ))
         .ok()?;
-    let args_json = serde_json::to_string(&args).ok()?;
-    let req = tonic::Request::new(nestweaver_proto::JsonRequest { args_json });
-    let rpc_name_owned = rpc_name.to_string();
-    let result = rt.block_on(async {
-        // Route to the correct RPC method by name.
-        let resp = match rpc_name_owned.as_str() {
-            "brain_broken_links" => client.inner_mut().brain_broken_links(req).await,
-            "brain_orphan_documents" => client.inner_mut().brain_orphan_documents(req).await,
-            "brain_topic_clusters" => client.inner_mut().brain_topic_clusters(req).await,
-            "brain_tag_graph" => client.inner_mut().brain_tag_graph(req).await,
-            "brain_doc_stats" => client.inner_mut().brain_doc_stats(req).await,
-            "brain_impact" => client.inner_mut().impact(req).await,
-            "regex_search" => client.inner_mut().regex_search(req).await,
-            "stale_check" => client.inner_mut().stale_check(req).await,
-            "brain_status" => client.inner_mut().brain_status_json(req).await,
-            "read_symbols" => client.inner_mut().read_symbols(req).await,
-            "dead_code" => client.inner_mut().dead_code(req).await,
-            "clusters" => client.inner_mut().clusters(req).await,
-            "bridge_nodes" => client.inner_mut().bridge_nodes(req).await,
-            "blast_radius" => client.inner_mut().blast_radius(req).await,
-            "get_summary" => client.inner_mut().get_summary(req).await,
-            "count_patterns" => client.inner_mut().count_patterns(req).await,
-            "affected_tests" => client.inner_mut().affected_tests(req).await,
-            "investigate" => client.inner_mut().investigate(req).await,
-            "investigate_expand" => client.inner_mut().investigate_expand(req).await,
-            "investigate_hydrate" => client.inner_mut().investigate_hydrate(req).await,
-            "flow_trace" => client.inner_mut().flow_trace(req).await,
-            "contract_drift" => client.inner_mut().contract_drift(req).await,
-            "cross_repo_contracts" => client.inner_mut().cross_repo_contracts(req).await,
-            "brain_memory_lint" => client.inner_mut().brain_memory_lint(req).await,
-            "brain_memory_consolidate" => client.inner_mut().brain_memory_consolidate(req).await,
-            "brain_memory_related" => client.inner_mut().brain_memory_related(req).await,
-            "detect_changes" => client.inner_mut().detect_changes(req).await,
-            "brain_guide" => client.inner_mut().brain_guide(req).await,
-            "list_repos" => client.inner_mut().list_repos_json(req).await,
-            "list_vaults" => client.inner_mut().list_vaults_json(req).await,
-            "embedding_dimension" => client.inner_mut().embedding_dimension(req).await,
-            "list_services" => client.inner_mut().list_services_json(req).await,
-            "service_summary" => client.inner_mut().service_summary_json(req).await,
-            "list_projects" => client.inner_mut().list_projects_json(req).await,
-            "search_symbols" => client.inner_mut().search_symbols(req).await,
-            "symbol_lookup" => client.inner_mut().symbol_lookup(req).await,
-            "repo_map" => client.inner_mut().repo_map_json(req).await,
-            "suggest_links" => client.inner_mut().suggest_links_json(req).await,
-            "detect_implicit_projects" => {
-                client.inner_mut().detect_implicit_projects_json(req).await
-            }
-            "pr_impact" => client.inner_mut().pr_impact_json(req).await,
-            _ => return None,
-        };
-        resp.ok().map(|r| r.into_inner().result_json)
-    })?;
-    serde_json::from_str(&result).ok()
+    let result = rt.block_on(hybrid.query(rpc_name, &args)).ok()?;
+    Some(result)
 }
 
 fn run_brain(
@@ -8866,7 +8816,7 @@ fn run_brain(
 
             if use_daemon
                 && let Some(value) =
-                    try_daemon_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
+                    try_hybrid_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
             {
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok((EXIT_SUCCESS, None));
@@ -8929,7 +8879,7 @@ fn run_brain(
             let db_path = db_resolved.as_path();
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 db_path,
                 config.as_deref(),
@@ -9361,7 +9311,7 @@ fn run_brain(
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 None,
@@ -9924,7 +9874,7 @@ fn run_brain(
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
+                    try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
                 {
                     serde_json::from_value(value).unwrap_or_default()
                 } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
@@ -10850,7 +10800,7 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -10940,7 +10890,7 @@ fn run_brain(
                     args["allowlist"] = serde_json::json!(allow);
                 }
                 args["limit"] = serde_json::json!(limit);
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
@@ -11010,7 +10960,7 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -11089,7 +11039,7 @@ fn run_brain(
                 if let Some(ref t) = tag {
                     args["tag"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
@@ -11195,7 +11145,7 @@ fn run_brain(
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -12244,7 +12194,7 @@ fn run_contracts(
                     args["repo"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -12298,7 +12248,7 @@ fn run_contracts(
                     args["repo"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "contract_drift", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -12878,7 +12828,7 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 let mut args = serde_json::json!({});
                 args["instance"] = serde_json::json!(&instance_id);
                 if let Some(value) =
-                    try_daemon_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
+                    try_hybrid_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
                 {
                     serde_json::from_value(value)
                         .context("failed to deserialize repos from daemon response")?
@@ -12895,7 +12845,7 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             // Fetch embedding dimension via daemon RPC (preferred) or direct store (fallback).
             let embedding_dim: u32 = {
                 let args = serde_json::json!({});
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
