@@ -269,9 +269,10 @@ pub fn index_directory_with_store(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
+    let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let result = if force {
         index_into_store(
-            repo_path,
+            &reader,
             store,
             instance_id,
             repo_url,
@@ -285,7 +286,7 @@ pub fn index_directory_with_store(
     } else {
         let filemeta_cache = load_filemeta_cache(&filemeta_path);
         index_into_store(
-            repo_path,
+            &reader,
             store,
             instance_id,
             repo_url,
@@ -343,8 +344,9 @@ pub fn index_directory_in_memory(
     indexed_sha: &str,
 ) -> Result<(IndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("failed to create in-memory GraphStore")?;
+    let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let result = index_into_store(
-        repo_path,
+        &reader,
         &store,
         instance_id,
         repo_url,
@@ -372,7 +374,7 @@ pub fn index_directory_in_memory(
 /// the cache so callers can persist it after indexing.
 #[allow(clippy::too_many_arguments)]
 fn index_into_store(
-    repo_path: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     store: &GraphStore,
     instance_id: &str,
     repo_url: &str,
@@ -416,56 +418,30 @@ fn index_into_store(
     // most have no detected source language so they fall outside `file_entries`.
     let mut spec_files: Vec<PathBuf> = Vec::new();
 
-    // SECURITY: do NOT follow symlinks (see index_md.rs for rationale).
-    let walker = ignore::WalkBuilder::new(repo_path)
-        .follow_links(false)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|e| {
-            if e.file_type().is_some_and(|ft| ft.is_dir())
-                && let Some(name) = e.file_name().to_str()
-                && SKIP_DIRS.contains(&name)
-            {
-                return false;
-            }
-            true
-        })
-        .build();
+    let repo_path = reader.root();
+    let discovered_files = reader.list_files()
+        .context("ContentReader::list_files failed")?;
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("walk error: {err}");
-                continue;
-            }
-        };
-
-        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
-            continue;
-        }
-
-        let path = entry.path();
+    for rel_path in &discovered_files {
+        let path = repo_path.join(rel_path);
 
         // F2.1: collect API spec files regardless of source language.
         if crate::contracts::is_spec_file(&path.to_string_lossy()) {
-            spec_files.push(path.to_path_buf());
+            spec_files.push(path.clone());
         }
 
         // Only process files with a supported language extension.
-        let lang = match detect_language(path) {
+        let lang = match detect_language(&path) {
             Some(l) => l,
             None => continue,
         };
 
         // Skip minified/bundled files — they produce noise in the graph.
-        if is_minified_or_bundled(path) {
+        if is_minified_or_bundled(&path) {
             continue;
         }
 
-        file_entries.push((path.to_path_buf(), lang));
+        file_entries.push((path, lang));
         scan_pb.set_message(format!("Scanning files... {}", file_entries.len()));
         scan_pb.tick();
     }
@@ -1825,8 +1801,9 @@ fn full_index_fallback(
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
+    let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let result = index_into_store(
-        repo_path,
+        &reader,
         store,
         instance_id,
         repo_url,
