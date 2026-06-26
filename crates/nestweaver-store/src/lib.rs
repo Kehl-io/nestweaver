@@ -12,6 +12,11 @@ pub mod write;
 
 pub use db::GraphStore;
 pub use error::StoreError;
+
+/// Re-export the LadybugDB connection type so callers can use transactional
+/// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants
+/// without depending on `lbug` directly.
+pub use lbug::Connection as DbConnection;
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
     PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery,

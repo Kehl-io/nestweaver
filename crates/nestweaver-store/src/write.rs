@@ -222,8 +222,13 @@ impl GraphStore {
 
     pub fn insert_file(&self, file: &File) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_file_on(&conn, file)
+    }
+
+    /// Insert a File node using an externally-provided connection (for transaction batching).
+    pub fn insert_file_on(conn: &lbug::Connection<'_>, file: &File) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "CREATE (:File {uid: $uid, path: $path, repo_uid: $repo, content_hash: $hash})",
             vec![
                 ("uid", lbug::Value::String(file.uid.clone())),
@@ -263,6 +268,14 @@ impl GraphStore {
 
     pub(crate) fn insert_symbol_with_conn(
         &self,
+        conn: &lbug::Connection<'_>,
+        symbol: &Symbol,
+    ) -> Result<(), StoreError> {
+        Self::insert_symbol_with_conn_static(conn, symbol)
+    }
+
+    /// Static version of `insert_symbol_with_conn` for use without `&self`.
+    pub(crate) fn insert_symbol_with_conn_static(
         conn: &lbug::Connection<'_>,
         symbol: &Symbol,
     ) -> Result<(), StoreError> {
@@ -418,8 +431,17 @@ impl GraphStore {
 
     pub fn insert_repo_file_edge(&self, repo_uid: &str, file_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_repo_file_edge_on(&conn, repo_uid, file_uid)
+    }
+
+    /// Insert a single repo-file edge using an externally-provided connection.
+    pub fn insert_repo_file_edge_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        file_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (r:Repo {uid: $repo}), (f:File {uid: $file}) \
              CREATE (r)-[:REPO_HAS_FILE]->(f)",
             vec![
@@ -1909,6 +1931,15 @@ impl GraphStore {
         file_path: &str,
     ) -> Result<usize, StoreError> {
         let conn = self.conn()?;
+        Self::delete_symbols_in_file_on(&conn, repo_uid, file_path)
+    }
+
+    /// Delete symbols in a file using an externally-provided connection (for transaction batching).
+    pub fn delete_symbols_in_file_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<usize, StoreError> {
         // LadybugDB does not support parameterized compound WHERE clauses.
         // Sanitize user-derived values by escaping single quotes.
         let safe_repo_uid = repo_uid.replace('\'', "\\'");
@@ -1993,8 +2024,16 @@ impl GraphStore {
     /// incident edges (REPO_HAS_FILE, FILE_HAS_SYMBOL) automatically.
     pub fn delete_file_node(&self, file_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_file_node_on(&conn, file_uid)
+    }
+
+    /// Delete a File node using an externally-provided connection (for transaction batching).
+    pub fn delete_file_node_on(
+        conn: &lbug::Connection<'_>,
+        file_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (f:File {uid: $uid}) DETACH DELETE f",
             vec![("uid", lbug::Value::String(file_uid.to_string()))],
         )
@@ -2010,9 +2049,18 @@ impl GraphStore {
         old_path: &str,
         new_path: &str,
     ) -> Result<(), StoreError> {
-        use crate::read::row_to_symbol;
-
         let conn = self.conn()?;
+        Self::update_symbol_file_paths_on(&conn, repo_uid, old_path, new_path)
+    }
+
+    /// Update symbol file paths using an externally-provided connection (for transaction batching).
+    pub fn update_symbol_file_paths_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), StoreError> {
+        use crate::read::row_to_symbol;
 
         let rows: Vec<_> = {
             let r = conn
@@ -2033,12 +2081,12 @@ impl GraphStore {
             sym.file_path = new_path.to_string();
 
             exec_params(
-                &conn,
+                conn,
                 "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
                 vec![("uid", lbug::Value::String(old_uid))],
             )?;
 
-            self.insert_symbol_with_conn(&conn, &sym)?;
+            Self::insert_symbol_with_conn_static(conn, &sym)?;
         }
 
         Ok(())
@@ -2046,8 +2094,19 @@ impl GraphStore {
 
     /// Update the `indexed_sha` field of a Repo node.
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
+        let txn = self.begin_transaction()?;
+        Self::update_repo_sha_on(&txn, repo_uid, new_sha)?;
+        self.commit_transaction(&txn)?;
+        Ok(())
+    }
 
+    /// Update the `indexed_sha` field using an externally-provided connection
+    /// (for transaction batching). Does NOT begin/commit its own transaction.
+    pub fn update_repo_sha_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        new_sha: &str,
+    ) -> Result<(), StoreError> {
         let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
         let rows: Vec<_> = conn
             .query(&format!(
@@ -2080,16 +2139,14 @@ impl GraphStore {
             _ => String::new(),
         };
 
-        let txn = self.begin_transaction()?;
-
         exec_params(
-            &txn,
+            conn,
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(uid.clone()))],
         )?;
 
         exec_params(
-            &txn,
+            conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
              staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
             vec![
@@ -2102,7 +2159,6 @@ impl GraphStore {
             ],
         )?;
 
-        self.commit_transaction(&txn)?;
         Ok(())
     }
 

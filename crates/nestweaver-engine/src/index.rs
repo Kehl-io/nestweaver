@@ -1563,6 +1563,14 @@ pub fn incremental_index_with_name(
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let mut result = IncrementalResult::default();
 
+    // Wrap the entire incremental update in a single transaction so that a
+    // crash mid-index doesn't leave partial data in the store. The indexed
+    // SHA is updated inside the transaction — if we crash before commit, the
+    // next run replays from the old SHA.
+    let txn = store
+        .begin_transaction()
+        .with_context(|| "begin incremental transaction")?;
+
     for change in &changes {
         match change {
             crate::git_diff::FileChange::Added(rel_path) => {
@@ -1570,7 +1578,7 @@ pub fn incremental_index_with_name(
                     result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file(&reader, rel_path, &r_uid, &store)?;
+                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, &store, &txn)?;
                 result.symbols_added += added;
                 result.files_added += 1;
             }
@@ -1581,26 +1589,23 @@ pub fn incremental_index_with_name(
                 }
                 // Remove old symbols first.
                 let rel_str = rel_path.to_string_lossy();
-                let removed = store
-                    .delete_symbols_in_file(&r_uid, &rel_str)
+                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                     .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
 
                 // Re-parse and insert.
-                let added = process_added_or_modified_file(&reader, rel_path, &r_uid, &store)?;
+                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, &store, &txn)?;
                 result.symbols_added += added;
                 result.files_modified += 1;
             }
             crate::git_diff::FileChange::Deleted(rel_path) => {
                 let rel_str = rel_path.to_string_lossy();
-                let removed = store
-                    .delete_symbols_in_file(&r_uid, &rel_str)
+                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
                     .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
 
                 let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
-                store
-                    .delete_file_node(&f_uid)
+                nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
                     .with_context(|| format!("delete_file_node {}", rel_str))?;
                 result.files_deleted += 1;
             }
@@ -1610,33 +1615,29 @@ pub fn incremental_index_with_name(
 
                 if is_parseable(to) && !path_in_skip_dir(to) {
                     // Update symbol file_path references.
-                    store
-                        .update_symbol_file_paths(&r_uid, &from_str, &to_str)
+                    nestweaver_store::GraphStore::update_symbol_file_paths_on(&txn, &r_uid, &from_str, &to_str)
                         .with_context(|| {
                             format!("update_symbol_file_paths {} -> {}", from_str, to_str)
                         })?;
                 } else {
                     // Destination is not parseable — just delete the old symbols.
-                    let removed = store
-                        .delete_symbols_in_file(&r_uid, &from_str)
+                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &from_str)
                         .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
                     result.symbols_removed += removed;
                 }
 
                 // Re-key the File node: delete old, insert new.
                 let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
-                store
-                    .delete_file_node(&old_f_uid)
+                nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
                     .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
 
                 if is_parseable(to) && !path_in_skip_dir(to) {
                     // Re-read from disk and re-insert the file + symbols under the new path.
-                    let removed2 = store
-                        .delete_symbols_in_file(&r_uid, &to_str)
+                    let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &to_str)
                         .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file(&reader, to, &r_uid, &store)?;
+                    let added = process_added_or_modified_file_txn(&reader, to, &r_uid, &store, &txn)?;
                     result.symbols_added += added;
                 }
 
@@ -1645,12 +1646,18 @@ pub fn incremental_index_with_name(
         }
     }
 
-    // 6. Update the stored SHA.
-    store
-        .update_repo_sha(&r_uid, &new_sha)
+    // 6. Update the stored SHA inside the transaction, then commit.
+    // If we crash before commit, the next run replays from the old SHA.
+    nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
         .with_context(|| "update_repo_sha")?;
 
-    // 7. Recompute PageRank.
+    store
+        .commit_transaction(&txn)
+        .with_context(|| "commit incremental transaction")?;
+    drop(txn);
+
+    // 7. Recompute PageRank (outside the transaction — it's read-heavy and
+    // idempotent, so partial completion is fine).
     store
         .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
         .with_context(|| "compute_pagerank after incremental index")?;
@@ -1669,6 +1676,10 @@ pub fn incremental_index_with_name(
 
 /// Parse a single file and insert its File node, Symbol nodes, and edges.
 /// Returns the number of symbols inserted.
+///
+/// Retained as a non-transactional fallback; the incremental path now uses
+/// `process_added_or_modified_file_txn` instead.
+#[allow(dead_code)]
 fn process_added_or_modified_file(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &std::path::Path,
@@ -1789,6 +1800,129 @@ fn process_added_or_modified_file(
     if !insertable_edges.is_empty() {
         store
             .batch_insert_edges(&insertable_edges)
+            .with_context(|| format!("batch_insert_edges {}", rel_str))?;
+    }
+
+    Ok(sym_count)
+}
+
+/// Like [`process_added_or_modified_file`] but uses an externally-provided
+/// transaction connection for all store writes, ensuring atomicity.
+fn process_added_or_modified_file_txn(
+    reader: &dyn crate::content_reader::ContentReader,
+    rel_path: &std::path::Path,
+    r_uid: &str,
+    store: &nestweaver_store::GraphStore,
+    conn: &nestweaver_store::DbConnection<'_>,
+) -> Result<usize, anyhow::Error> {
+    use nestweaver_parser::{RawReference, RawSymbol};
+    use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
+    use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
+
+    let abs_path = reader.root().join(rel_path);
+    let rel_str = rel_path.to_string_lossy().into_owned();
+
+    let source = match reader.read_file(rel_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), "read error: {e}; skipping");
+            return Ok(0);
+        }
+    };
+
+    let parsed = match nestweaver_parser::parse_source(&abs_path, &source) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), "parse error: {e}; skipping");
+            return Ok(0);
+        }
+    };
+
+    let content_hash = content_hash_hex(&source);
+    let f_uid = file_uid(r_uid, &rel_str);
+
+    // Insert the File node via the transaction connection.
+    let file = File {
+        uid: f_uid.clone(),
+        path: rel_str.clone(),
+        repo_uid: r_uid.to_string(),
+        content_hash,
+    };
+    nestweaver_store::GraphStore::insert_file_on(conn, &file)
+        .with_context(|| format!("insert_file {}", rel_str))?;
+    nestweaver_store::GraphStore::insert_repo_file_edge_on(conn, r_uid, &f_uid)
+        .with_context(|| format!("insert_repo_file_edge {}", rel_str))?;
+
+    let mut symbols: Vec<nestweaver_schema::Symbol> = Vec::new();
+    let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
+
+    for raw_sym in &parsed.symbols {
+        let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
+        let sym = Symbol {
+            uid: s_uid.clone(),
+            name: raw_sym.name.clone(),
+            kind: raw_sym.kind,
+            repo_uid: r_uid.to_string(),
+            file_path: rel_str.clone(),
+            start_line: raw_sym.start_line,
+            end_line: raw_sym.end_line,
+            signature: raw_sym.signature.clone(),
+            summary: None,
+            content_hash: raw_sym.content_hash.clone(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: raw_sym.is_entry_point,
+            entry_point_kind: raw_sym.entry_point_kind,
+            visibility: raw_sym.visibility,
+            type_info: raw_sym.type_info.clone(),
+            framework_hint: None,
+        };
+        symbols.push(sym);
+        file_sym_pairs.push((f_uid.clone(), s_uid));
+    }
+
+    let sym_count = symbols.len();
+
+    nestweaver_store::GraphStore::batch_insert_symbols_on(conn, &symbols)
+        .with_context(|| format!("batch_insert_symbols {}", rel_str))?;
+
+    let file_sym_refs: Vec<(&str, &str)> = file_sym_pairs
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
+    nestweaver_store::GraphStore::batch_insert_file_symbol_edges_on(conn, &file_sym_refs)
+        .with_context(|| format!("batch_insert_file_symbol_edges {}", rel_str))?;
+
+    // Resolve cross-file edges within this file only (single-file scope).
+    let lang = nestweaver_parser::detect_language(&abs_path)
+        .unwrap_or(nestweaver_schema::Language::JavaScript);
+
+    let workspace_ctx = if matches!(
+        lang,
+        nestweaver_schema::Language::JavaScript
+            | nestweaver_schema::Language::TypeScript
+            | nestweaver_schema::Language::Vue
+            | nestweaver_schema::Language::Svelte
+            | nestweaver_schema::Language::Astro
+    ) {
+        discover_workspace_context(reader.root())
+    } else {
+        Default::default()
+    };
+
+    let file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = vec![(
+        rel_str.clone(),
+        parsed.symbols.clone(),
+        parsed.references.clone(),
+    )];
+    let resolved_edges =
+        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
+    let insertable_edges: Vec<_> = resolved_edges
+        .into_iter()
+        .filter(|e| !e.target_uid.starts_with("unresolved:"))
+        .collect();
+    if !insertable_edges.is_empty() {
+        nestweaver_store::GraphStore::batch_insert_edges_on(conn, &insertable_edges)
             .with_context(|| format!("batch_insert_edges {}", rel_str))?;
     }
 
