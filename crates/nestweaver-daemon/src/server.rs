@@ -1919,6 +1919,7 @@ impl NestWeaverDaemon for DaemonService {
         if let Ok(mut value) =
             serde_json::from_str::<serde_json::Value>(&json_resp.result_json)
         {
+            value["server_mode"] = serde_json::json!(self.state.server_mode);
             let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
             value["indexing_active"] = serde_json::json!(indexing_active);
             if indexing_active {

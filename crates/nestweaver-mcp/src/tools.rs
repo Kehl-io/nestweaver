@@ -2958,6 +2958,7 @@ fn tool_brain_status(
         "wikilinks": wikilinks,
         "repos": repos_json,
         "repo_count": repos.len(),
+        "server_mode": false,
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,
         "watcher_pid": watcher_pid,
