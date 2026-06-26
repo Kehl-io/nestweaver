@@ -3115,7 +3115,7 @@ pub async fn run_server(
 
         // Mount webhook endpoint when a secret is configured.
         if let Some(ref secret) = opts.webhook_secret {
-            let jobs_db_path = db_path.parent().unwrap_or(Path::new(".")).join("jobs.db");
+            let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
             let job_queue = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
                 .expect("open webhook job queue");
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
