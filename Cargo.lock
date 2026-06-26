@@ -3979,6 +3979,7 @@ dependencies = [
  "rustls 0.23.40",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tokio",
  "tokio-stream",
  "tonic",
