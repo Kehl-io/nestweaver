@@ -748,28 +748,69 @@ pub struct TraceBoundary {
 
 /// Detect cross-repo boundary symbols in a flow_trace JSON result tree.
 ///
-/// A boundary is a leaf node whose `uid` refers to a symbol in a repo
-/// that is not locally indexed. We detect this by checking if the node's
-/// result came back as a leaf (no children) but the original call graph
-/// edge exists -- meaning we couldn't follow it locally.
+/// A boundary is a leaf node whose `repo_uid` differs from the root
+/// node's `repo_uid` (the locally-initiated trace). These represent
+/// cross-repo call edges where the upstream server should continue
+/// the trace.
 ///
-/// NOTE: Currently returns empty -- cross-boundary stitching requires
-/// `canonical_id` and repo metadata in the flow_trace JSON output,
-/// which is not yet available from the local daemon's response format.
-/// The flow_trace RPC returns a tree of symbol names and spans, but does
-/// not annotate nodes with their owning repo or canonical identifiers.
-///
-/// Integration path: modify `tool_flow_trace` to annotate boundary nodes
-/// with `"boundary": true` and `"canonical_id": "..."` when a callee's
-/// `repo_uid` doesn't match any locally indexed repo. Once that metadata
-/// is present, this function can walk the tree, identify boundaries, and
-/// return them for `stitch_server_spans` to continue the trace across
-/// upstream servers.
+/// Requires flow_trace output to include `repo_uid` and `canonical_id`
+/// fields on each node (added in the detailed output format).
 ///
 /// See architecture spec: cross-boundary-flow-trace.md
-pub fn detect_boundaries_in_trace(_result: &Value) -> Vec<TraceBoundary> {
-    debug!("detect_boundaries_in_trace: returning empty — flow_trace JSON lacks canonical_id/repo metadata for boundary detection");
-    vec![]
+pub fn detect_boundaries_in_trace(result: &Value) -> Vec<TraceBoundary> {
+    let tree = result.get("tree").or(Some(result));
+    let Some(tree) = tree else {
+        return vec![];
+    };
+
+    // Extract root repo_uid — the "local" repo for this trace.
+    let root_repo = tree.get("repo_uid").and_then(|v| v.as_str()).unwrap_or("");
+    if root_repo.is_empty() {
+        debug!("detect_boundaries_in_trace: root node lacks repo_uid, cannot detect boundaries");
+        return vec![];
+    }
+
+    let mut boundaries = Vec::new();
+    let mut path = Vec::new();
+    collect_boundaries(tree, root_repo, &mut path, &mut boundaries);
+
+    debug!(
+        count = boundaries.len(),
+        "detect_boundaries_in_trace: found boundary nodes"
+    );
+    boundaries
+}
+
+/// Recursively walk the flow_trace tree collecting boundary nodes.
+fn collect_boundaries(
+    node: &Value,
+    root_repo: &str,
+    path: &mut Vec<String>,
+    out: &mut Vec<TraceBoundary>,
+) {
+    let children = node.get("children").and_then(|v| v.as_array());
+    let is_leaf = children.is_none_or(|c| c.is_empty());
+    let repo_uid = node.get("repo_uid").and_then(|v| v.as_str()).unwrap_or("");
+    let canonical_id = node.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    // A boundary: different repo than the root, is a leaf (trace couldn't follow),
+    // and has a canonical_id for cross-boundary matching.
+    if is_leaf && !repo_uid.is_empty() && repo_uid != root_repo && !canonical_id.is_empty() {
+        out.push(TraceBoundary {
+            canonical_id: canonical_id.to_string(),
+            name: name.to_string(),
+            parent_path: path.clone(),
+        });
+    }
+
+    if let Some(children) = children {
+        path.push(name.to_string());
+        for child in children {
+            collect_boundaries(child, root_repo, path, out);
+        }
+        path.pop();
+    }
 }
 
 /// Stitch server-side trace spans into a local flow_trace result tree.
@@ -1582,6 +1623,7 @@ mod tests {
 
     #[test]
     fn detect_boundaries_returns_empty_for_now() {
+        // No repo_uid on root -> no boundaries detected.
         let result = json!({
             "tree": {
                 "name": "funcA",
@@ -1589,7 +1631,26 @@ mod tests {
             }
         });
         let boundaries = detect_boundaries_in_trace(&result);
-        assert!(boundaries.is_empty(), "boundary detection from JSON is not yet implemented");
+        assert!(boundaries.is_empty(), "no repo_uid on root means no boundaries");
+
+        // Cross-repo leaf with canonical_id -> detected as boundary.
+        let result = json!({
+            "tree": {
+                "name": "funcA",
+                "repo_uid": "local-repo",
+                "canonical_id": "abc:src/lib.rs#funcA:xyz",
+                "children": [{
+                    "name": "funcB",
+                    "repo_uid": "remote-repo",
+                    "canonical_id": "def:src/api.rs#funcB:uvw",
+                    "children": []
+                }]
+            }
+        });
+        let boundaries = detect_boundaries_in_trace(&result);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].name, "funcB");
+        assert_eq!(boundaries[0].canonical_id, "def:src/api.rs#funcB:uvw");
     }
 
     #[test]

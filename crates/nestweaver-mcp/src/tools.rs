@@ -3844,11 +3844,19 @@ fn build_flow_tree(
             "children": children,
         })
     } else {
+        // Look up repo_uid and canonical_id for boundary detection.
+        let (repo_uid, canonical_id) = store
+            .lookup_symbol(uid)
+            .ok()
+            .map(|s| (s.repo_uid.clone(), s.canonical_id.clone().unwrap_or_default()))
+            .unwrap_or_default();
         json!({
             "uid": uid,
             "name": name,
             "file_path": file_path,
             "depth": depth,
+            "repo_uid": repo_uid,
+            "canonical_id": canonical_id,
             "children": children,
         })
     }
