@@ -1030,6 +1030,8 @@ fn cli_daemon_run_server_help() {
         .stdout(contains("--server"))
         .stdout(contains("--bind"))
         .stdout(contains("--tls-cert"))
+        .stdout(contains("--tls-key"))
         .stdout(contains("--auth-token"))
+        .stdout(contains("--admin-token"))
         .stdout(contains("--port-file"));
 }
