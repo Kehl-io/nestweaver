@@ -2,8 +2,9 @@
 // `FilesystemReader` for local repos, `GitBareReader` for server-side bare clones (Task 6).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Abstracts how the indexer reads file contents and discovers files.
 /// `FilesystemReader` preserves local behavior; `GitBareReader` (added in Task 6)
@@ -108,6 +109,129 @@ impl ContentReader for FilesystemReader {
     }
 }
 
+/// Reads file contents from a bare git clone without a working tree.
+///
+/// Uses `git show <sha>:<path>` for individual file reads and
+/// `git ls-tree -r --name-only <sha>` for file listing. This avoids
+/// needing a checkout — the server only needs transient access to blobs.
+pub struct GitBareReader {
+    bare_path: PathBuf,
+    sha: String,
+}
+
+impl GitBareReader {
+    pub fn new(bare_path: &Path, sha: &str) -> Self {
+        Self {
+            bare_path: bare_path.to_path_buf(),
+            sha: sha.to_string(),
+        }
+    }
+
+    /// Resolve HEAD of the bare repo to a full SHA.
+    pub fn from_head(bare_path: &Path) -> Result<Self> {
+        let output = Command::new("git")
+            .args(["-C", &bare_path.display().to_string(), "rev-parse", "HEAD"])
+            .output()
+            .context("failed to run git rev-parse HEAD")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git rev-parse HEAD failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let sha = String::from_utf8(output.stdout)
+            .context("non-utf8 SHA")?
+            .trim()
+            .to_string();
+        Ok(Self::new(bare_path, &sha))
+    }
+}
+
+impl ContentReader for GitBareReader {
+    fn read_file(&self, rel_path: &Path) -> Result<String> {
+        let spec = format!("{}:{}", self.sha, rel_path.display());
+        let output = Command::new("git")
+            .args(["-C", &self.bare_path.display().to_string(), "show", &spec])
+            .output()
+            .with_context(|| format!("failed to run git show {spec}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git show {} failed: {}",
+                spec,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("non-utf8 content in {}", rel_path.display()))
+    }
+
+    fn list_files(&self) -> Result<Vec<PathBuf>> {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &self.bare_path.display().to_string(),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                &self.sha,
+            ])
+            .output()
+            .context("failed to run git ls-tree")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git ls-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("non-utf8 ls-tree output")?;
+        let files: Vec<PathBuf> = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| !crate::index::path_in_skip_dir(p))
+            .collect();
+        Ok(files)
+    }
+
+    fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>> {
+        // Bare repos have no filesystem mtime. Return size only (mtime = 0).
+        let spec = format!("{}:{}", self.sha, rel_path.display());
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &self.bare_path.display().to_string(),
+                "cat-file",
+                "-s",
+                &spec,
+            ])
+            .output()
+            .with_context(|| format!("failed to run git cat-file -s {spec}"))?;
+        if !output.status.success() {
+            // File doesn't exist at this SHA — treat as missing.
+            anyhow::bail!(
+                "git cat-file -s {} failed: {}",
+                spec,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let size: u64 = String::from_utf8(output.stdout)
+            .context("non-utf8 cat-file output")?
+            .trim()
+            .parse()
+            .context("invalid size from cat-file -s")?;
+        // No mtime available in bare repos — return 0 for mtime.
+        Ok(Some((0, size)))
+    }
+
+    fn root(&self) -> &Path {
+        &self.bare_path
+    }
+
+    fn version_id(&self) -> &str {
+        &self.sha
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +307,170 @@ mod tests {
         let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
         assert!(names.contains(&"real.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    // ---------- GitBareReader tests ----------
+
+    use std::process::Command;
+
+    /// Helper: create a source repo with files, commit, and clone as bare.
+    /// Returns (TempDir, bare_path, sha).
+    fn setup_bare_repo(files: &[(&str, &str)]) -> (TempDir, PathBuf, String) {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src_repo");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Init repo.
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        // Configure committer identity for CI environments.
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        // Write files.
+        for (path, content) in files {
+            let full = src.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, content).unwrap();
+        }
+
+        // Stage and commit.
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        // Clone as bare.
+        let bare = tmp.path().join("repo.git");
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+
+        // Get HEAD sha.
+        let sha_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        (tmp, bare, sha)
+    }
+
+    #[test]
+    fn git_bare_reader_read_file() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("main.js", "function greet() {}"),
+            ("lib/util.js", "export const x = 1;"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+        assert_eq!(
+            reader.read_file(Path::new("main.js")).unwrap(),
+            "function greet() {}"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("lib/util.js")).unwrap(),
+            "export const x = 1;"
+        );
+    }
+
+    #[test]
+    fn git_bare_reader_missing_file() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "hi")]);
+        let reader = GitBareReader::new(&bare, &sha);
+        assert!(reader.read_file(Path::new("nope.txt")).is_err());
+    }
+
+    #[test]
+    fn git_bare_reader_list_files() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("src/lib.rs", ""),
+            ("src/main.rs", "fn main() {}"),
+            ("README.md", "# Hello"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"src/lib.rs".to_string()));
+        assert!(names.contains(&"src/main.rs".to_string()));
+        assert!(names.contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn git_bare_reader_list_files_skips_skip_dirs() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("src/lib.rs", ""),
+            ("node_modules/foo/bar.js", "junk"),
+            ("target/debug/x.rs", "junk"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"src/lib.rs".to_string()));
+        assert!(!names.iter().any(|n| n.contains("node_modules")));
+        assert!(!names.iter().any(|n| n.contains("target")));
+    }
+
+    #[test]
+    fn git_bare_reader_file_meta() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("hello.txt", "world")]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let meta = reader.file_meta(Path::new("hello.txt")).unwrap();
+        assert!(meta.is_some());
+        let (mtime, size) = meta.unwrap();
+        // Bare repos return mtime=0.
+        assert_eq!(mtime, 0);
+        assert_eq!(size, 5); // "world" is 5 bytes
+    }
+
+    #[test]
+    fn git_bare_reader_file_meta_missing() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
+        let reader = GitBareReader::new(&bare, &sha);
+        assert!(reader.file_meta(Path::new("missing.txt")).is_err());
+    }
+
+    #[test]
+    fn git_bare_reader_root_and_version() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
+        let reader = GitBareReader::new(&bare, &sha);
+        assert_eq!(reader.root(), bare.as_path());
+        assert_eq!(reader.version_id(), sha);
+    }
+
+    #[test]
+    fn git_bare_reader_from_head() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
+        let reader = GitBareReader::from_head(&bare).unwrap();
+        assert_eq!(reader.version_id(), sha);
+        assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "x");
     }
 }
