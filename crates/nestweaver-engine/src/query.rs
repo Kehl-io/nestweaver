@@ -1777,7 +1777,8 @@ pub fn populate_inline_bodies(
 /// for kinds without a meaningful body (Heading, Tag) or on lookup failure.
 fn fetch_node_body(store: &GraphStore, uid: &str, root: &std::path::Path) -> Option<String> {
     if uid.starts_with("sym:") {
-        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        let reader = crate::content_reader::FilesystemReader::new(root);
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
         return res.symbols.into_iter().next().map(|w| w.body);
     }
     if uid.starts_with("sec:") {

@@ -5377,10 +5377,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(db.as_deref())?;
             let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
             let res = nestweaver_engine::read_symbols::read_symbols(
                 &store,
                 &targets,
-                &root,
+                &reader,
                 neighbors,
                 token_budget,
             );

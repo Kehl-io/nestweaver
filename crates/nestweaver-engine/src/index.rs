@@ -341,7 +341,7 @@ pub fn index_directory_with_store(
         tracing::warn!("failed to save resolution deps: {e}");
     }
 
-    let manifest = crate::manifest::parse_manifest(repo_path);
+    let manifest = crate::manifest::parse_manifest(&reader);
     crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
     let cache_path = crate::sidecar_path(db_path, ".manifests.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
@@ -1860,7 +1860,7 @@ fn full_index_fallback(
     }
 
     // Update the manifest cache sidecar (same as index_directory does).
-    let manifest = crate::manifest::parse_manifest(repo_path);
+    let manifest = crate::manifest::parse_manifest(&reader);
     crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
     let cache_path = crate::sidecar_path(db_path, ".manifests.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);

@@ -564,10 +564,11 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
     let res = nestweaver_engine::read_symbols::read_symbols(
         store,
         &targets,
-        &root,
+        &reader,
         neighbors,
         token_budget,
     );

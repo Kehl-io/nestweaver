@@ -415,7 +415,9 @@ impl BrainWatcher {
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf();
-                let manifest = crate::manifest::parse_manifest(&repo_path);
+                let manifest = crate::manifest::parse_manifest(
+                    &crate::content_reader::FilesystemReader::new(&repo_path),
+                );
                 // Load the existing cache, update this repo's entry, and save.
                 let repo_key = repo_path.to_string_lossy().into_owned();
                 match crate::manifest::load_manifest_cache(manifests_path) {

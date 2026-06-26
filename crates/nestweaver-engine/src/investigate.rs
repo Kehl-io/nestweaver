@@ -642,7 +642,8 @@ fn domain_label(e: &BundleEntry) -> String {
 /// section text; notes → concatenated section text.
 fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Option<String> {
     if uid.starts_with("sym:") {
-        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        let reader = crate::content_reader::FilesystemReader::new(root);
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
         return res.symbols.into_iter().next().map(|w| w.body);
     }
     if uid.starts_with("sec:") {
