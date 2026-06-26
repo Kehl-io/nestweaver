@@ -124,6 +124,101 @@ async fn server_tcp_brain_status() {
 }
 
 #[tokio::test]
+async fn server_transport_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index (no daemon) so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+
+    // ── TCP query via tonic ──────────────────────────────────────────
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+    let mut tcp_client = NestWeaverDaemonClient::new(channel);
+    let tcp_status = tcp_client
+        .brain_status(BrainStatusRequest {})
+        .await
+        .expect("BrainStatus RPC failed over TCP")
+        .into_inner();
+
+    // ── UDS query via CLI (daemon is running, CLI routes through UDS) ─
+    let cli_output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli_output.status.success(),
+        "CLI status --json failed: {}",
+        String::from_utf8_lossy(&cli_output.stderr)
+    );
+
+    // Parse CLI JSON output. The pretty-printed JSON may span multiple lines,
+    // so we find the first '{' and parse from there.
+    let stdout = String::from_utf8_lossy(&cli_output.stdout);
+    let json_start = stdout
+        .find('{')
+        .expect("no JSON object in CLI output");
+    let cli_json: serde_json::Value =
+        serde_json::from_str(&stdout[json_start..]).expect("CLI output is not valid JSON");
+
+    // ── Assert parity ────────────────────────────────────────────────
+    let cli_repo_count = cli_json["repo_count"]
+        .as_i64()
+        .expect("CLI JSON missing repo_count");
+    assert_eq!(
+        tcp_status.repo_count as i64, cli_repo_count,
+        "repo_count mismatch between TCP ({}) and UDS ({})",
+        tcp_status.repo_count, cli_repo_count
+    );
+
+    let cli_vault_count = cli_json["vault_count"]
+        .as_i64()
+        .expect("CLI JSON missing vault_count");
+    assert_eq!(
+        tcp_status.vault_count as i64, cli_vault_count,
+        "vault_count mismatch between TCP ({}) and UDS ({})",
+        tcp_status.vault_count, cli_vault_count
+    );
+
+    let cli_notes = cli_json["notes"]
+        .as_i64()
+        .expect("CLI JSON missing notes");
+    assert_eq!(
+        tcp_status.notes as i64, cli_notes,
+        "notes mismatch between TCP ({}) and UDS ({})",
+        tcp_status.notes, cli_notes
+    );
+}
+
+#[tokio::test]
 async fn server_auth_rejects_unauthenticated() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");
