@@ -595,26 +595,30 @@ pub fn analyze_impact(
                 file_path: _,
             } => {
                 if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
-                    let impact_nodes = store.impact(&symbol.uid, max_depth, 0.0)?;
-                    for node in impact_nodes {
-                        if !include_tests && is_test_file(&node.file_path) {
+                    let refs = store.references_to(&symbol.uid)?;
+                    for ref_sym in refs {
+                        if !include_tests && is_test_file(&ref_sym.file_path) {
                             continue;
                         }
                         let severity = classify_signature_change(
                             old_signature,
                             new_signature,
-                            &node.file_path,
+                            &ref_sym.file_path,
                         );
+                        let repo_url = resolve_repo_url(&ref_sym.repo_uid);
                         let reason = format_impact_reason(change, &severity);
                         impacts.push(ImpactResult {
                             change_canonical_id: canonical_id.clone(),
                             change_kind: "SIGNATURE_CHANGED".to_string(),
-                            affected_canonical_id: String::new(),
-                            affected_name: node.name.clone(),
-                            affected_repo_url: String::new(),
-                            affected_file: node.file_path.clone(),
-                            affected_line: node.start_line,
-                            affected_signature: String::new(),
+                            affected_canonical_id: ref_sym
+                                .canonical_id
+                                .clone()
+                                .unwrap_or_default(),
+                            affected_name: ref_sym.name.clone(),
+                            affected_repo_url: repo_url,
+                            affected_file: ref_sym.file_path.clone(),
+                            affected_line: ref_sym.start_line,
+                            affected_signature: ref_sym.signature.clone(),
                             severity,
                             reason,
                         });
