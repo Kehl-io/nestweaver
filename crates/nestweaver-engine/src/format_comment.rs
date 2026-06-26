@@ -100,7 +100,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         .filter(|i| i.severity == ImpactSeverity::Info)
         .count();
 
-    let repos: std::collections::HashSet<&str> = impacts
+    let _repos: std::collections::HashSet<&str> = impacts
         .iter()
         .filter(|i| !i.affected_repo_url.is_empty())
         .map(|i| extract_repo_name(&i.affected_repo_url))
@@ -155,7 +155,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
     md.push('\n');
 
     // Per-symbol collapsible details
-    for (i, group) in sorted_groups.iter().enumerate() {
+    for group in sorted_groups.iter() {
         let severity_label = match group.severity {
             ImpactSeverity::Breaking => "BREAKING",
             ImpactSeverity::Warning => "WARNING",
