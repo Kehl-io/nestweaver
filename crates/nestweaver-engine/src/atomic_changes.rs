@@ -355,6 +355,385 @@ pub fn compute_local_changes(
     Ok(all_changes)
 }
 
+// ── Compatibility classification (Task 8) ────────────────────────────
+
+/// Severity classification for impact analysis results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImpactSeverity {
+    Breaking,
+    Warning,
+    Info,
+}
+
+impl std::fmt::Display for ImpactSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImpactSeverity::Breaking => write!(f, "BREAKING"),
+            ImpactSeverity::Warning => write!(f, "WARNING"),
+            ImpactSeverity::Info => write!(f, "INFO"),
+        }
+    }
+}
+
+/// A single impact result from server-side analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactResult {
+    pub change_canonical_id: String,
+    pub change_kind: String,
+    pub affected_canonical_id: String,
+    pub affected_name: String,
+    pub affected_repo_url: String,
+    pub affected_file: String,
+    pub affected_line: u32,
+    pub affected_signature: String,
+    pub severity: ImpactSeverity,
+    pub reason: String,
+}
+
+/// Classify the base severity of an atomic change (before considering callers).
+pub fn classify_change(change: &AtomicChange) -> ImpactSeverity {
+    match change {
+        AtomicChange::SymbolRemoved { .. } => ImpactSeverity::Breaking,
+        AtomicChange::ExportRemoved { .. } => ImpactSeverity::Breaking,
+        AtomicChange::SignatureChanged { .. } => ImpactSeverity::Breaking,
+        AtomicChange::SymbolRenamed { .. } => ImpactSeverity::Breaking,
+        AtomicChange::SymbolMoved { .. } => ImpactSeverity::Warning,
+        AtomicChange::SymbolAdded { .. } => ImpactSeverity::Info,
+        AtomicChange::ExportAdded { .. } => ImpactSeverity::Info,
+    }
+}
+
+/// Classify a signature change by comparing old and new signatures.
+/// Takes the affected file path to determine static vs dynamic language.
+pub fn classify_signature_change(
+    old_sig: &str,
+    new_sig: &str,
+    affected_file_path: &str,
+) -> ImpactSeverity {
+    let old_params = count_params(old_sig);
+    let new_params = count_params(new_sig);
+    let is_dynamic = is_dynamic_language_file(affected_file_path);
+
+    if new_params > old_params {
+        if has_default_params(new_sig, old_params) {
+            ImpactSeverity::Info
+        } else if is_dynamic {
+            ImpactSeverity::Warning
+        } else {
+            ImpactSeverity::Breaking
+        }
+    } else if new_params < old_params {
+        if is_dynamic {
+            ImpactSeverity::Warning
+        } else {
+            ImpactSeverity::Breaking
+        }
+    } else {
+        // Same param count — could be type change or return type change
+        ImpactSeverity::Warning
+    }
+}
+
+fn is_dynamic_language_file(path: &str) -> bool {
+    path.ends_with(".py")
+        || path.ends_with(".js")
+        || path.ends_with(".rb")
+        || path.ends_with(".lua")
+        || path.ends_with(".php")
+}
+
+fn has_default_params(sig: &str, old_count: usize) -> bool {
+    if let Some(start) = sig.find('(') {
+        if let Some(end) = sig[start..].find(')') {
+            let params_str = &sig[start + 1..start + end];
+            let params: Vec<&str> = params_str
+                .split(',')
+                .filter(|p| {
+                    let p = p.trim();
+                    !p.starts_with("self")
+                        && !p.starts_with("&self")
+                        && !p.starts_with("&mut self")
+                        && !p.starts_with("cls")
+                })
+                .collect();
+            if params.len() > old_count {
+                let new_params = &params[old_count..];
+                return new_params
+                    .iter()
+                    .all(|p| p.contains('=') || p.contains("Option<"));
+            }
+        }
+    }
+    false
+}
+
+/// Format a human-readable reason string for an impact result.
+pub fn format_impact_reason(change: &AtomicChange, severity: &ImpactSeverity) -> String {
+    match change {
+        AtomicChange::SignatureChanged {
+            name,
+            old_signature,
+            new_signature,
+            ..
+        } => {
+            let old_count = count_params(old_signature);
+            let new_count = count_params(new_signature);
+            match severity {
+                ImpactSeverity::Breaking => {
+                    if new_count > old_count {
+                        format!(
+                            "{}(): parameter count changed ({} -> {}) — call site passes {} args",
+                            name, old_count, new_count, old_count
+                        )
+                    } else if new_count < old_count {
+                        format!(
+                            "{}(): parameter removed — call site passes {} args but function now takes {}",
+                            name, old_count, new_count
+                        )
+                    } else {
+                        format!(
+                            "{}(): signature changed — {} -> {}",
+                            name, old_signature, new_signature
+                        )
+                    }
+                }
+                ImpactSeverity::Warning => {
+                    format!(
+                        "{}(): signature changed (dynamic language) — {} -> {}",
+                        name, old_signature, new_signature
+                    )
+                }
+                ImpactSeverity::Info => {
+                    format!(
+                        "{}(): new parameters have defaults — existing call sites likely unaffected",
+                        name
+                    )
+                }
+            }
+        }
+        AtomicChange::SymbolRemoved { name, .. } => {
+            format!("'{}' was removed — reference will break", name)
+        }
+        AtomicChange::ExportRemoved { name, .. } => {
+            format!("'{}' export was removed — import will fail", name)
+        }
+        AtomicChange::SymbolRenamed {
+            old_name, new_name, ..
+        } => {
+            format!(
+                "renamed from '{}' to '{}' — import will fail",
+                old_name, new_name
+            )
+        }
+        AtomicChange::SymbolMoved {
+            name,
+            old_file,
+            new_file,
+            ..
+        } => {
+            format!(
+                "'{}' moved from {} to {} — import path will break",
+                name, old_file, new_file
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// Check if a file path looks like a test file.
+pub fn is_test_file(path: &str) -> bool {
+    path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains("_test.")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+        || path.ends_with("_test.rs")
+        || path.ends_with("_test.go")
+        || path.ends_with("_test.py")
+}
+
+// ── Server-side impact analysis (Task 7) ─────────────────────────────
+
+/// Server-side impact analysis: given atomic changes, query the graph store
+/// for affected symbols and classify severity.
+///
+/// For each change:
+/// - SignatureChanged -> find all callers via depth-bounded traversal, classify
+/// - SymbolRemoved / ExportRemoved -> find all references, mark as BREAKING
+/// - SymbolRenamed -> find all importers, mark as BREAKING
+/// - SymbolMoved -> find all importers, mark as WARNING
+/// - SymbolAdded / ExportAdded -> no impact (no existing dependents)
+pub fn analyze_impact(
+    store: &nestweaver_store::GraphStore,
+    changes: &[AtomicChange],
+    max_depth: u32,
+    include_tests: bool,
+) -> Result<Vec<ImpactResult>, anyhow::Error> {
+    let mut impacts = Vec::new();
+
+    // Cache repo_uid -> repo_url mappings
+    let repos = store.list_repos(None)?;
+    let repo_url_map: HashMap<String, String> = repos
+        .into_iter()
+        .map(|r| (r.uid.clone(), r.url.clone()))
+        .collect();
+
+    let resolve_repo_url = |repo_uid: &str| -> String {
+        repo_url_map
+            .get(repo_uid)
+            .cloned()
+            .unwrap_or_else(|| repo_uid.to_string())
+    };
+
+    for change in changes {
+        match change {
+            AtomicChange::SignatureChanged {
+                canonical_id,
+                name: _,
+                old_signature,
+                new_signature,
+                file_path: _,
+            } => {
+                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                    let impact_nodes = store.impact(&symbol.uid, max_depth, 0.0)?;
+                    for node in impact_nodes {
+                        if !include_tests && is_test_file(&node.file_path) {
+                            continue;
+                        }
+                        let severity = classify_signature_change(
+                            old_signature,
+                            new_signature,
+                            &node.file_path,
+                        );
+                        let reason = format_impact_reason(change, &severity);
+                        impacts.push(ImpactResult {
+                            change_canonical_id: canonical_id.clone(),
+                            change_kind: "SIGNATURE_CHANGED".to_string(),
+                            affected_canonical_id: String::new(),
+                            affected_name: node.name.clone(),
+                            affected_repo_url: String::new(),
+                            affected_file: node.file_path.clone(),
+                            affected_line: node.start_line,
+                            affected_signature: String::new(),
+                            severity,
+                            reason,
+                        });
+                    }
+                }
+            }
+            AtomicChange::SymbolRemoved {
+                canonical_id, name, ..
+            }
+            | AtomicChange::ExportRemoved {
+                canonical_id, name, ..
+            } => {
+                let change_kind = if matches!(change, AtomicChange::ExportRemoved { .. }) {
+                    "EXPORT_REMOVED"
+                } else {
+                    "SYMBOL_REMOVED"
+                };
+                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                    let refs = store.references_to(&symbol.uid)?;
+                    for ref_sym in refs {
+                        if !include_tests && is_test_file(&ref_sym.file_path) {
+                            continue;
+                        }
+                        let repo_url = resolve_repo_url(&ref_sym.repo_uid);
+                        impacts.push(ImpactResult {
+                            change_canonical_id: canonical_id.clone(),
+                            change_kind: change_kind.to_string(),
+                            affected_canonical_id: ref_sym
+                                .canonical_id
+                                .clone()
+                                .unwrap_or_default(),
+                            affected_name: ref_sym.name.clone(),
+                            affected_repo_url: repo_url,
+                            affected_file: ref_sym.file_path.clone(),
+                            affected_line: ref_sym.start_line,
+                            affected_signature: ref_sym.signature.clone(),
+                            severity: ImpactSeverity::Breaking,
+                            reason: format!("'{}' was removed — reference will break", name),
+                        });
+                    }
+                }
+            }
+            AtomicChange::SymbolRenamed {
+                old_canonical_id,
+                old_name,
+                new_name,
+                ..
+            } => {
+                if let Some(symbol) = store.symbol_by_canonical_id(old_canonical_id)? {
+                    let importers = store.importers_of(&symbol.uid)?;
+                    for importer in importers {
+                        if !include_tests && is_test_file(&importer.file_path) {
+                            continue;
+                        }
+                        let repo_url = resolve_repo_url(&importer.repo_uid);
+                        impacts.push(ImpactResult {
+                            change_canonical_id: old_canonical_id.clone(),
+                            change_kind: "SYMBOL_RENAMED".to_string(),
+                            affected_canonical_id: importer
+                                .canonical_id
+                                .clone()
+                                .unwrap_or_default(),
+                            affected_name: importer.name.clone(),
+                            affected_repo_url: repo_url,
+                            affected_file: importer.file_path.clone(),
+                            affected_line: importer.start_line,
+                            affected_signature: importer.signature.clone(),
+                            severity: ImpactSeverity::Breaking,
+                            reason: format!(
+                                "renamed from '{}' to '{}' — import will fail",
+                                old_name, new_name
+                            ),
+                        });
+                    }
+                }
+            }
+            AtomicChange::SymbolAdded { .. } | AtomicChange::ExportAdded { .. } => {
+                // No impact — new symbols have no existing dependents
+            }
+            AtomicChange::SymbolMoved {
+                canonical_id,
+                name,
+                old_file,
+                new_file,
+            } => {
+                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                    let importers = store.importers_of(&symbol.uid)?;
+                    for importer in importers {
+                        if !include_tests && is_test_file(&importer.file_path) {
+                            continue;
+                        }
+                        let repo_url = resolve_repo_url(&importer.repo_uid);
+                        impacts.push(ImpactResult {
+                            change_canonical_id: canonical_id.clone(),
+                            change_kind: "SYMBOL_MOVED".to_string(),
+                            affected_canonical_id: importer
+                                .canonical_id
+                                .clone()
+                                .unwrap_or_default(),
+                            affected_name: importer.name.clone(),
+                            affected_repo_url: repo_url,
+                            affected_file: importer.file_path.clone(),
+                            affected_line: importer.start_line,
+                            affected_signature: String::new(),
+                            severity: ImpactSeverity::Warning,
+                            reason: format!(
+                                "'{}' moved from {} to {} — import path may break",
+                                name, old_file, new_file
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(impacts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +925,133 @@ mod tests {
             "should detect no changes; got: {:?}",
             changes
         );
+    }
+
+    // ── Compatibility classification tests ──
+
+    #[test]
+    fn classify_removed_is_breaking() {
+        let change = AtomicChange::SymbolRemoved {
+            canonical_id: "test:src/lib.rs#foo:abc".into(),
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_export_removed_is_breaking() {
+        let change = AtomicChange::ExportRemoved {
+            canonical_id: "test:src/lib.rs#foo:abc".into(),
+            name: "foo".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_added_is_info() {
+        let change = AtomicChange::SymbolAdded {
+            name: "bar".into(),
+            kind: SymbolKind::Function,
+            signature: "fn bar()".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Info);
+    }
+
+    #[test]
+    fn classify_export_added_is_info() {
+        let change = AtomicChange::ExportAdded {
+            canonical_id: "test:src/lib.rs#foo:abc".into(),
+            name: "foo".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Info);
+    }
+
+    #[test]
+    fn classify_renamed_is_breaking() {
+        let change = AtomicChange::SymbolRenamed {
+            old_canonical_id: "test:src/lib.rs#foo:abc".into(),
+            old_name: "foo".into(),
+            new_name: "bar".into(),
+            new_canonical_id: "test:src/lib.rs#bar:def".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_moved_is_warning() {
+        let change = AtomicChange::SymbolMoved {
+            canonical_id: "test:src/old.rs#foo:abc".into(),
+            name: "foo".into(),
+            old_file: "src/old.rs".into(),
+            new_file: "src/new.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Warning);
+    }
+
+    #[test]
+    fn classify_sig_add_required_param_static_is_breaking() {
+        let severity = classify_signature_change(
+            "fn foo(a: i32) -> bool",
+            "fn foo(a: i32, b: String) -> bool",
+            "src/caller.rs",
+        );
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_sig_add_optional_param_is_info() {
+        let severity = classify_signature_change(
+            "def foo(a)",
+            "def foo(a, b=None)",
+            "src/caller.py",
+        );
+        assert_eq!(severity, ImpactSeverity::Info);
+    }
+
+    #[test]
+    fn classify_sig_add_param_dynamic_is_warning() {
+        let severity = classify_signature_change(
+            "def foo(a)",
+            "def foo(a, b)",
+            "src/caller.py",
+        );
+        assert_eq!(severity, ImpactSeverity::Warning);
+    }
+
+    #[test]
+    fn classify_sig_remove_param_static_is_breaking() {
+        let severity = classify_signature_change(
+            "fn foo(a: i32, b: String) -> bool",
+            "fn foo(a: i32) -> bool",
+            "src/caller.rs",
+        );
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_sig_same_count_is_warning() {
+        let severity = classify_signature_change(
+            "fn foo(a: i32) -> bool",
+            "fn foo(a: String) -> bool",
+            "src/caller.rs",
+        );
+        assert_eq!(severity, ImpactSeverity::Warning);
+    }
+
+    #[test]
+    fn test_is_test_file() {
+        assert!(is_test_file("src/tests/foo.rs"));
+        assert!(is_test_file("src/foo_test.rs"));
+        assert!(is_test_file("src/foo.test.ts"));
+        assert!(is_test_file("src/foo.spec.js"));
+        assert!(!is_test_file("src/foo.rs"));
+        assert!(!is_test_file("src/main.ts"));
     }
 
     // --- Test helpers ---
