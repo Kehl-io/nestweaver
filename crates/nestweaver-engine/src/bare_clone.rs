@@ -156,7 +156,9 @@ impl BareCloneWorkspace {
                 &dest.display().to_string(),
             ])
             .output()
-            .with_context(|| format!("failed to run git clone --filter=blob:none --bare for {url}"))?;
+            .with_context(|| {
+                format!("failed to run git clone --filter=blob:none --bare for {url}")
+            })?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -313,7 +315,15 @@ mod tests {
 
         assert!(clone.is_valid());
         assert!(clone.path.exists());
-        assert!(clone.path.file_name().unwrap().to_str().unwrap().ends_with(".git"));
+        assert!(
+            clone
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(".git")
+        );
     }
 
     #[test]
@@ -418,7 +428,10 @@ mod tests {
             .output()
             .unwrap();
         let src_sha = String::from_utf8_lossy(&src_sha.stdout).trim().to_string();
-        assert_ne!(sha_before, src_sha, "source should have a new SHA after the second commit");
+        assert_ne!(
+            sha_before, src_sha,
+            "source should have a new SHA after the second commit"
+        );
     }
 
     #[test]

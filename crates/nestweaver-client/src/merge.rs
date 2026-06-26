@@ -5,7 +5,7 @@
 //! result sets are asymmetric (spec validation finding #8).
 
 use crate::dedup::{
-    assign_confidence, extract_identity, Confidence, MergedResult, Provenance, SymbolIdentity,
+    Confidence, MergedResult, Provenance, SymbolIdentity, assign_confidence, extract_identity,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -293,7 +293,10 @@ mod tests {
             .iter()
             .filter(|r| r.provenance == Provenance::Local)
             .count();
-        assert!(local_in_top5 >= 2, "expected both local results in top 5, got {local_in_top5}");
+        assert!(
+            local_in_top5 >= 2,
+            "expected both local results in top 5, got {local_in_top5}"
+        );
     }
 
     #[test]

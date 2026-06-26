@@ -3,8 +3,8 @@
 //! Wraps a `tonic::Channel` with bearer token injection, health state,
 //! timeout, routing mode, and repo glob matching.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -47,7 +47,10 @@ impl UpstreamHandle {
         let timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
 
         Ok(Self {
-            name: config.name.clone().unwrap_or_else(|| "upstream".to_string()),
+            name: config
+                .name
+                .clone()
+                .unwrap_or_else(|| "upstream".to_string()),
             channel,
             token: config.token.clone(),
             repo_globs: patterns,

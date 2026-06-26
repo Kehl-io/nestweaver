@@ -43,8 +43,12 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         "flow_trace" | "investigate_expand" => ToolRouting::Continuation,
 
         // Structural analysis — server-preferred
-        "hub_nodes" | "bridge_nodes" | "clusters" | "dead_code"
-        | "cross_repo_contracts" | "contract_drift" => ToolRouting::ServerPreferred,
+        "hub_nodes"
+        | "bridge_nodes"
+        | "clusters"
+        | "dead_code"
+        | "cross_repo_contracts"
+        | "contract_drift" => ToolRouting::ServerPreferred,
 
         // Impact analysis — two-tier
         "blast_radius" | "brain_impact" | "affected_tests" => ToolRouting::TwoTier,
@@ -56,23 +60,31 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         "detect_changes" => ToolRouting::LocalOnly,
 
         // Metadata — combined
-        "brain_status" | "stale_check" | "brain_doc_stats"
-        | "brain_tag_graph" | "brain_topic_clusters" => ToolRouting::Combined,
+        "brain_status"
+        | "stale_check"
+        | "brain_doc_stats"
+        | "brain_tag_graph"
+        | "brain_topic_clusters" => ToolRouting::Combined,
 
         // Vault/note tools — merge (notes may be on server vault)
-        "note_get" | "backlinks" | "get_summary"
-        | "brain_guide" | "brain_diff" => ToolRouting::Merge,
+        "note_get" | "backlinks" | "get_summary" | "brain_guide" | "brain_diff" => {
+            ToolRouting::Merge
+        }
 
         // Vault analysis — server-preferred (need full vault)
         "brain_broken_links" | "brain_orphan_documents" => ToolRouting::ServerPreferred,
 
         // Memory tools — local-only (personal vault)
-        "brain_memory_lint" | "brain_memory_consolidate"
-        | "brain_memory_related" => ToolRouting::LocalOnly,
+        "brain_memory_lint" | "brain_memory_consolidate" | "brain_memory_related" => {
+            ToolRouting::LocalOnly
+        }
 
         // Admin/mutation tools — local-only
-        "brain_add_source" | "brain_remove_source"
-        | "prune_stale" | "set_extension" | "query_extensions" => ToolRouting::LocalOnly,
+        "brain_add_source"
+        | "brain_remove_source"
+        | "prune_stale"
+        | "set_extension"
+        | "query_extensions" => ToolRouting::LocalOnly,
 
         // Everything else — local-first (safe default)
         _ => ToolRouting::LocalFirst,
@@ -100,7 +112,10 @@ mod tests {
     #[test]
     fn continuation_tools() {
         assert_eq!(tool_routing("flow_trace"), ToolRouting::Continuation);
-        assert_eq!(tool_routing("investigate_expand"), ToolRouting::Continuation);
+        assert_eq!(
+            tool_routing("investigate_expand"),
+            ToolRouting::Continuation
+        );
     }
 
     #[test]
@@ -109,7 +124,10 @@ mod tests {
         assert_eq!(tool_routing("bridge_nodes"), ToolRouting::ServerPreferred);
         assert_eq!(tool_routing("clusters"), ToolRouting::ServerPreferred);
         assert_eq!(tool_routing("dead_code"), ToolRouting::ServerPreferred);
-        assert_eq!(tool_routing("cross_repo_contracts"), ToolRouting::ServerPreferred);
+        assert_eq!(
+            tool_routing("cross_repo_contracts"),
+            ToolRouting::ServerPreferred
+        );
         assert_eq!(tool_routing("contract_drift"), ToolRouting::ServerPreferred);
     }
 

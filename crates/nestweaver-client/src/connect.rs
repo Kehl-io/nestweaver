@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use tonic::transport::Channel;
 
-use crate::discovery::{save_upstream, RoutingMode, UpstreamConfig};
+use crate::discovery::{RoutingMode, UpstreamConfig, save_upstream};
 
 /// Connect to an upstream server, validate with HealthCheck, save config.
 ///

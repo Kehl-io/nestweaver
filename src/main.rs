@@ -2331,7 +2331,10 @@ enum BackupCommands {
         config: Option<PathBuf>,
         #[arg(long, help = "Include git bare clones in the backup (full tier)")]
         include_clones: bool,
-        #[arg(long, help = "Proceed even if the daemon is running (backup may be inconsistent)")]
+        #[arg(
+            long,
+            help = "Proceed even if the daemon is running (backup may be inconsistent)"
+        )]
         force: bool,
     },
     /// Inspect a .nwsnap.zst archive and show its manifest
@@ -5850,10 +5853,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             if !repo_path.join(".git").exists() {
-                eprintln!(
-                    "error: {} is not a git repository",
-                    repo_path.display()
-                );
+                eprintln!("error: {} is not a git repository", repo_path.display());
                 return Ok((EXIT_ERROR, None));
             }
 
@@ -5874,7 +5874,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             // Compute atomic changes — either from local working tree or from a diff range
-            use nestweaver_engine::atomic_changes::{compute_local_changes, ImpactSeverity};
+            use nestweaver_engine::atomic_changes::{ImpactSeverity, compute_local_changes};
 
             let changes = if let Some(ref diff_range) = diff {
                 // Diff-based: compute changes between two revisions (CI mode)
@@ -5928,10 +5928,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             if !out.quiet {
-                println!(
-                    "  Analyzing {} change(s)...",
-                    changes.len()
-                );
+                println!("  Analyzing {} change(s)...", changes.len());
             }
 
             // Parse min_severity
@@ -5963,10 +5960,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
 
                     // Convert engine AtomicChange -> proto AtomicChangeProto
-                    let proto_changes: Vec<nestweaver_proto::AtomicChangeProto> = changes
-                        .iter()
-                        .map(|c| atomic_change_to_proto(c))
-                        .collect();
+                    let proto_changes: Vec<nestweaver_proto::AtomicChangeProto> =
+                        changes.iter().map(|c| atomic_change_to_proto(c)).collect();
 
                     let mut req = tonic::Request::new(nestweaver_proto::ImpactAnalysisRequest {
                         changes: proto_changes,
@@ -6045,17 +6040,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 };
 
                 match nestweaver_engine::atomic_changes::analyze_impact(
-                    &store, &changes, max_depth, include_tests,
+                    &store,
+                    &changes,
+                    max_depth,
+                    include_tests,
                 ) {
                     Ok(impacts) => impacts,
                     Err(e) => {
                         if fail_on_error {
                             return Err(anyhow::anyhow!("impact analysis failed: {}", e));
                         }
-                        eprintln!(
-                            "warning: impact analysis failed, skipping ({})",
-                            e
-                        );
+                        eprintln!("warning: impact analysis failed, skipping ({})", e);
                         if format == "json" {
                             let output = serde_json::json!({
                                 "impacts": [],
@@ -6111,30 +6106,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "  \x1b[31mBREAKING\x1b[0m: {} — {}",
                             impact.affected_name, impact.reason
                         );
-                        println!(
-                            "    {}:{}",
-                            impact.affected_file, impact.affected_line
-                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &warnings {
                         println!(
                             "  \x1b[33mWARNING\x1b[0m: {} — {}",
                             impact.affected_name, impact.reason
                         );
-                        println!(
-                            "    {}:{}",
-                            impact.affected_file, impact.affected_line
-                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &info {
                         println!(
                             "  \x1b[34mINFO\x1b[0m: {} — {}",
                             impact.affected_name, impact.reason
                         );
-                        println!(
-                            "    {}:{}",
-                            impact.affected_file, impact.affected_line
-                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
 
                     let unique_files: std::collections::HashSet<_> =
@@ -6199,8 +6185,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             artifact_url,
         } => {
             use nestweaver_engine::format_comment::{
-                FormatConfig, GitHubCommentConfig, GitLabCommentConfig,
-                read_impact_report, render_impact_markdown,
+                FormatConfig, GitHubCommentConfig, GitLabCommentConfig, read_impact_report,
+                render_impact_markdown,
             };
 
             let report = read_impact_report(&input)
@@ -6218,7 +6204,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 std::fs::write(&output_path, &markdown)
                     .map_err(|e| anyhow::anyhow!("failed to write output: {}", e))?;
                 if !out.quiet {
-                    println!("  Wrote {} bytes to {}", markdown.len(), output_path.display());
+                    println!(
+                        "  Wrote {} bytes to {}",
+                        markdown.len(),
+                        output_path.display()
+                    );
                 }
             } else if let (Some(owner_repo), Some(pr_number)) = (repo.as_ref(), pr) {
                 // Post to GitHub PR
@@ -6243,7 +6233,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .map_err(|e| anyhow::anyhow!("failed to post GitHub comment: {}", e))?;
 
                 if !out.quiet {
-                    println!("  Posted impact comment to {}/pull/{}", owner_repo, pr_number);
+                    println!(
+                        "  Posted impact comment to {}/pull/{}",
+                        owner_repo, pr_number
+                    );
                 }
             } else if let (Some(project_id), Some(mr_iid), Some(gl_token)) =
                 (gitlab_project.as_ref(), mr, gitlab_token.as_ref())
@@ -6268,7 +6261,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .map_err(|e| anyhow::anyhow!("failed to post GitLab comment: {}", e))?;
 
                 if !out.quiet {
-                    println!("  Posted impact comment to GitLab project {} MR !{}", project_id, mr_iid);
+                    println!(
+                        "  Posted impact comment to GitLab project {} MR !{}",
+                        project_id, mr_iid
+                    );
                 }
             } else {
                 // Default: print to stdout
@@ -7824,9 +7820,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "merge" => nestweaver_client::discovery::RoutingMode::Merge,
                 "primary" => nestweaver_client::discovery::RoutingMode::Primary,
                 other => {
-                    eprintln!(
-                        "Unknown routing mode: {other}. Use fallback, merge, or primary."
-                    );
+                    eprintln!("Unknown routing mode: {other}. Use fallback, merge, or primary.");
                     return Ok((EXIT_ERROR, None));
                 }
             };
@@ -7871,15 +7865,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 println!();
                 println!("Start server with:");
-                println!(
-                    "  nestweaver daemon run --server \\",
-                );
-                println!(
-                    "    --tls-cert {dir_display}/server.pem \\",
-                );
-                println!(
-                    "    --tls-key {dir_display}/server-key.pem",
-                );
+                println!("  nestweaver daemon run --server \\",);
+                println!("    --tls-cert {dir_display}/server.pem \\",);
+                println!("    --tls-key {dir_display}/server-key.pem",);
                 println!();
                 println!("Clients connect with:");
                 println!("  --cacert {dir_display}/ca.pem");
@@ -7893,10 +7881,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 } else {
                     sans
                 };
-                println!(
-                    "SANs: {}",
-                    effective_sans.join(", ")
-                );
+                println!("SANs: {}", effective_sans.join(", "));
 
                 Ok((EXIT_SUCCESS, None))
             }
@@ -8949,10 +8934,9 @@ fn run_brain(
                 if json {
                     // Inject upstream info into JSON output.
                     let mut value = value;
-                    let upstream_configs =
-                        nestweaver_client::discovery::discover_upstreams(
-                            db_path.parent().unwrap_or(std::path::Path::new(".")),
-                        );
+                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
+                        db_path.parent().unwrap_or(std::path::Path::new(".")),
+                    );
                     if !upstream_configs.is_empty() {
                         let upstreams_json: Vec<_> = upstream_configs
                             .iter()
@@ -8965,10 +8949,7 @@ fn run_brain(
                             })
                             .collect();
                         if let Some(obj) = value.as_object_mut() {
-                            obj.insert(
-                                "upstreams".to_string(),
-                                serde_json::json!(upstreams_json),
-                            );
+                            obj.insert("upstreams".to_string(), serde_json::json!(upstreams_json));
                         }
                     }
                     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -9108,15 +9089,15 @@ fn run_brain(
                         }
                     }
                     // ── Upstream server info ─────────────────────────────
-                    let upstream_configs =
-                        nestweaver_client::discovery::discover_upstreams(db_path.parent().unwrap_or(std::path::Path::new(".")));
+                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
+                        db_path.parent().unwrap_or(std::path::Path::new(".")),
+                    );
                     if !upstream_configs.is_empty() {
                         println!();
                         for ucfg in &upstream_configs {
                             let name = ucfg.name.as_deref().unwrap_or("upstream");
                             let mode = format!("{:?}", ucfg.mode).to_lowercase();
-                            match nestweaver_client::upstream::UpstreamHandle::from_config(ucfg)
-                            {
+                            match nestweaver_client::upstream::UpstreamHandle::from_config(ucfg) {
                                 Ok(handle) => {
                                     // Try a quick HealthCheck to determine reachability.
                                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -9157,16 +9138,12 @@ fn run_brain(
                                             );
                                         }
                                         _ => {
-                                            println!(
-                                                "  Server: {name} ({mode} mode, unreachable)"
-                                            );
+                                            println!("  Server: {name} ({mode} mode, unreachable)");
                                         }
                                     }
                                 }
                                 Err(_) => {
-                                    println!(
-                                        "  Server: {name} ({mode} mode, config error)"
-                                    );
+                                    println!("  Server: {name} ({mode} mode, config error)");
                                 }
                             }
                         }
@@ -12393,8 +12370,7 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 );
             }
 
-            let instance_id =
-                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
+            let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
 
             // Warn if the daemon is running — concurrent writes can produce
             // an inconsistent snapshot.
@@ -12402,7 +12378,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 eprintln!(
                     "Error: daemon is running for this database. The backup may be inconsistent."
                 );
-                eprintln!("Stop the daemon first (`nestweaver daemon stop`), or use --force to proceed.");
+                eprintln!(
+                    "Stop the daemon first (`nestweaver daemon stop`), or use --force to proceed."
+                );
                 return Ok(EXIT_ERROR);
             }
             if nestweaver_daemon::launchd::is_running(&instance_id) && force {
@@ -12439,7 +12417,10 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 "  Uncompressed: {}",
                 format_bytes(m.sizes.total_uncompressed)
             );
-            eprintln!("  Write pause:  {}ms", result.write_pause_duration.as_millis());
+            eprintln!(
+                "  Write pause:  {}ms",
+                result.write_pause_duration.as_millis()
+            );
             eprintln!("  Total time:   {}", format_elapsed(result.duration));
             Ok(EXIT_SUCCESS)
         }
@@ -12471,10 +12452,7 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 "  Compressed:   {}",
                 format_bytes(manifest.sizes.total_compressed)
             );
-            println!(
-                "  Checksums:    {} file(s)",
-                manifest.checksums.len()
-            );
+            println!("  Checksums:    {} file(s)", manifest.checksums.len());
             Ok(EXIT_SUCCESS)
         }
         BackupCommands::List { dir } => {
@@ -12538,8 +12516,8 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 let lbug = find_lbug_in_dir(&data_dir);
                 if let Some(db) = lbug {
                     eprintln!("  Database: {}", db.display());
-                    let exe = std::env::current_exe()
-                        .unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let exe =
+                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
                     let db_str = db.display().to_string();
                     match std::process::Command::new(&exe)
                         .args(["daemon", "run", "--db", &db_str])
@@ -12550,7 +12528,10 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                         }
                         Err(e) => {
                             eprintln!("  Failed to start daemon: {e}");
-                            eprintln!("  Run manually: nestweaver daemon run --db {}", db.display());
+                            eprintln!(
+                                "  Run manually: nestweaver daemon run --db {}",
+                                db.display()
+                            );
                         }
                     }
                 } else {
@@ -12568,14 +12549,17 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
 
 /// Find the first .lbug file in a directory (non-recursive).
 fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).find_map(|entry| {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("lbug") && p.is_file() {
-            Some(p)
-        } else {
-            None
-        }
-    })
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|entry| {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("lbug") && p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
+        })
 }
 
 /// Run the MCP stdio server using HybridClient for query routing.
@@ -12642,10 +12626,7 @@ fn run_mcp_hybrid(
         };
 
         let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let method = parsed
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
         let response = match method {
             "initialize" => serde_json::json!({
@@ -12667,7 +12648,10 @@ fn run_mcp_hybrid(
                 "result": nestweaver_mcp::tools::tool_list(lite),
             }),
             "tools/call" => {
-                let params = parsed.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = parsed
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params
                     .get("arguments")
@@ -12683,7 +12667,12 @@ fn run_mcp_hybrid(
                 } else if write_tools.contains(name) {
                     // Write operations go through standard gRPC dispatch.
                     let grpc = hybrid.inner_mut();
-                    match nestweaver_mcp::tools::dispatch_via_daemon(grpc, &rt, name, arguments.clone()) {
+                    match nestweaver_mcp::tools::dispatch_via_daemon(
+                        grpc,
+                        &rt,
+                        name,
+                        arguments.clone(),
+                    ) {
                         Ok(result) => {
                             serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -13155,16 +13144,17 @@ fn impact_item_to_result(
         Severity::Info => ImpactSeverity::Info,
     };
 
-    let change_kind = match ChangeKind::try_from(item.change_kind).unwrap_or(ChangeKind::Unspecified) {
-        ChangeKind::SymbolAdded => "SYMBOL_ADDED",
-        ChangeKind::SymbolRemoved => "SYMBOL_REMOVED",
-        ChangeKind::SignatureChanged => "SIGNATURE_CHANGED",
-        ChangeKind::SymbolRenamed => "SYMBOL_RENAMED",
-        ChangeKind::SymbolMoved => "SYMBOL_MOVED",
-        ChangeKind::ExportAdded => "EXPORT_ADDED",
-        ChangeKind::ExportRemoved => "EXPORT_REMOVED",
-        ChangeKind::Unspecified => "UNSPECIFIED",
-    };
+    let change_kind =
+        match ChangeKind::try_from(item.change_kind).unwrap_or(ChangeKind::Unspecified) {
+            ChangeKind::SymbolAdded => "SYMBOL_ADDED",
+            ChangeKind::SymbolRemoved => "SYMBOL_REMOVED",
+            ChangeKind::SignatureChanged => "SIGNATURE_CHANGED",
+            ChangeKind::SymbolRenamed => "SYMBOL_RENAMED",
+            ChangeKind::SymbolMoved => "SYMBOL_MOVED",
+            ChangeKind::ExportAdded => "EXPORT_ADDED",
+            ChangeKind::ExportRemoved => "EXPORT_REMOVED",
+            ChangeKind::Unspecified => "UNSPECIFIED",
+        };
 
     ImpactResult {
         change_canonical_id: item.change_canonical_id,

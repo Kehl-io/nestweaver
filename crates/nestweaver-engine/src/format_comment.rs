@@ -84,7 +84,10 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         sorted_groups.truncate(MAX_IMPACTS);
     }
 
-    let mut md = format!("<!-- {} -->\n## NestWeaver Impact Analysis\n\n", config.marker);
+    let mut md = format!(
+        "<!-- {} -->\n## NestWeaver Impact Analysis\n\n",
+        config.marker
+    );
 
     // Summary table
     let breaking_count = impacts

@@ -494,10 +494,7 @@ impl GraphStore {
 
     /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
     /// Returns `None` if no symbol has this canonical_id.
-    pub fn symbol_by_canonical_id(
-        &self,
-        canonical_id: &str,
-    ) -> Result<Option<Symbol>, StoreError> {
+    pub fn symbol_by_canonical_id(&self, canonical_id: &str) -> Result<Option<Symbol>, StoreError> {
         let conn = self.conn()?;
         let q = format!(
             "MATCH (s:Symbol) WHERE s.canonical_id = $cid RETURN {} LIMIT 1",
@@ -1275,10 +1272,7 @@ impl GraphStore {
     /// Returns the repo URL for a given repo UID, or an empty string if
     /// the repo is not found.
     pub fn repo_url_for_uid(&self, repo_uid: &str) -> Option<String> {
-        self.lookup_repo(repo_uid)
-            .ok()
-            .flatten()
-            .map(|r| r.url)
+        self.lookup_repo(repo_uid).ok().flatten().map(|r| r.url)
     }
 
     /// Returns all Symbol nodes and code-level edges for clustering.

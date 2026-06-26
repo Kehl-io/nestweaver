@@ -574,7 +574,11 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             None => {
                 let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
                 let res = nestweaver_engine::read_symbols::read_symbols(
-                    store, &targets, &reader, neighbors, token_budget,
+                    store,
+                    &targets,
+                    &reader,
+                    neighbors,
+                    token_budget,
                 );
                 (serde_json::to_value(res)?, false)
             }
@@ -582,7 +586,11 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     } else {
         let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
         let res = nestweaver_engine::read_symbols::read_symbols(
-            store, &targets, &reader, neighbors, token_budget,
+            store,
+            &targets,
+            &reader,
+            neighbors,
+            token_budget,
         );
         (serde_json::to_value(res)?, false)
     };
@@ -594,11 +602,13 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         let has_empty_bodies = value
             .get("symbols")
             .and_then(|v| v.as_array())
-            .is_some_and(|arr| arr.iter().all(|s| {
-                s.get("body")
-                    .and_then(|b| b.as_str())
-                    .is_none_or(|b| b.is_empty())
-            }));
+            .is_some_and(|arr| {
+                arr.iter().all(|s| {
+                    s.get("body")
+                        .and_then(|b| b.as_str())
+                        .is_none_or(|b| b.is_empty())
+                })
+            });
         if has_empty_bodies {
             value["server_note"] = serde_json::json!(
                 "Running in server mode — source files are in bare clones without \
@@ -3848,7 +3858,12 @@ fn build_flow_tree(
         let (repo_uid, canonical_id) = store
             .lookup_symbol(uid)
             .ok()
-            .map(|s| (s.repo_uid.clone(), s.canonical_id.clone().unwrap_or_default()))
+            .map(|s| {
+                (
+                    s.repo_uid.clone(),
+                    s.canonical_id.clone().unwrap_or_default(),
+                )
+            })
             .unwrap_or_default();
         json!({
             "uid": uid,

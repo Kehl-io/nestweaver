@@ -54,12 +54,10 @@ pub fn generate_tls_bundle(
         .distinguished_name
         .push(DnType::OrganizationName, "NestWeaver");
     ca_params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
-    ca_params.not_after =
-        OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days) * 3);
+    ca_params.not_after = OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days) * 3);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    let ca = CertifiedIssuer::self_signed(ca_params, ca_key)
-        .context("self-sign CA certificate")?;
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key).context("self-sign CA certificate")?;
 
     // ── Server certificate ───────────────────────────────────────────
 
@@ -70,9 +68,11 @@ pub fn generate_tls_bundle(
         if let Ok(ip) = name.parse::<IpAddr>() {
             server_sans.push(SanType::IpAddress(ip));
         } else {
-            server_sans.push(SanType::DnsName(name.clone().try_into().context(
-                format!("invalid DNS name: {name}"),
-            )?));
+            server_sans.push(SanType::DnsName(
+                name.clone()
+                    .try_into()
+                    .context(format!("invalid DNS name: {name}"))?,
+            ));
         }
     }
 
@@ -85,8 +85,7 @@ pub fn generate_tls_bundle(
         .distinguished_name
         .push(DnType::OrganizationName, "NestWeaver");
     server_params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
-    server_params.not_after =
-        OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days));
+    server_params.not_after = OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days));
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
     let server_cert = server_params

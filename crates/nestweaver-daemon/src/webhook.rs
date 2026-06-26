@@ -137,8 +137,7 @@ mod tests {
 
     /// Compute a valid HMAC-SHA256 signature for the given body and secret.
     fn sign(body: &[u8], secret: &str) -> String {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
         mac.update(body);
         let result = mac.finalize().into_bytes();
         format!("sha256={}", hex::encode(result))
@@ -210,7 +209,11 @@ mod tests {
             secret: "secret".to_string(),
             secret_old: None,
         };
-        assert!(!verify_signature(b"body", Some("sha256=not_valid_hex!!!"), &config));
+        assert!(!verify_signature(
+            b"body",
+            Some("sha256=not_valid_hex!!!"),
+            &config
+        ));
     }
 
     #[test]

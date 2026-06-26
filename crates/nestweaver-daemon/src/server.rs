@@ -169,7 +169,9 @@ impl DaemonService {
             let mut args = args;
             if state.server_mode {
                 // Clamp depth parameter.
-                let client_depth = args.get("depth").or_else(|| args.get("max_depth"))
+                let client_depth = args
+                    .get("depth")
+                    .or_else(|| args.get("max_depth"))
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
                 let effective_depth = state.safeguards.effective_depth(&tool_name, client_depth)?;
@@ -180,8 +182,13 @@ impl DaemonService {
                 }
 
                 // Clamp result limit parameter.
-                let client_limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
-                let effective_limit = state.safeguards.effective_result_limit(&tool_name, client_limit);
+                let client_limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let effective_limit = state
+                    .safeguards
+                    .effective_result_limit(&tool_name, client_limit);
                 if args.get("limit").is_some() {
                     args["limit"] = serde_json::json!(effective_limit);
                 }
@@ -1935,23 +1942,21 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let req = r.into_inner();
-        let resp = self.dispatch_json_tool("brain_status", &req.args_json).await?;
+        let resp = self
+            .dispatch_json_tool("brain_status", &req.args_json)
+            .await?;
         // Inject server-side indexing status into the JSON response so
         // AI agents see it via the MCP tool path as well.
         let mut json_resp = resp.into_inner();
-        if let Ok(mut value) =
-            serde_json::from_str::<serde_json::Value>(&json_resp.result_json)
-        {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["server_mode"] = serde_json::json!(self.state.server_mode);
             let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
             value["indexing_active"] = serde_json::json!(indexing_active);
             if indexing_active {
-                value["indexing_repo"] =
-                    serde_json::json!(*self.state.indexing_repo.read().await);
+                value["indexing_repo"] = serde_json::json!(*self.state.indexing_repo.read().await);
             }
-            value["queue_depth"] = serde_json::json!(
-                self.state.indexing_queue_depth.load(Ordering::Relaxed)
-            );
+            value["queue_depth"] =
+                serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
             if let Ok(s) = serde_json::to_string(&value) {
                 json_resp.result_json = s;
             }
@@ -1998,9 +2003,7 @@ impl NestWeaverDaemon for DaemonService {
                 })
                 .collect();
 
-            Ok::<_, Status>(RepoStatesResponse {
-                repos: repo_states,
-            })
+            Ok::<_, Status>(RepoStatesResponse { repos: repo_states })
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
@@ -2018,11 +2021,10 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let state = self.state.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            flow_trace_continue_impl(&state.store, req)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || flow_trace_continue_impl(&state.store, req))
+                .await
+                .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
 
         result.map(Response::new)
     }
@@ -2035,11 +2037,9 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let state = self.state.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            impact_analysis_impl(&state.store, req)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+        let result = tokio::task::spawn_blocking(move || impact_analysis_impl(&state.store, req))
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
 
         result.map(Response::new)
     }
@@ -3150,8 +3150,7 @@ pub async fn run_server(
             });
             mcp_router = mcp_router.route(
                 "/webhook",
-                axum::routing::post(crate::webhook::handle_webhook)
-                    .with_state(webhook_state),
+                axum::routing::post(crate::webhook::handle_webhook).with_state(webhook_state),
             );
             tracing::info!("webhook endpoint enabled at /webhook");
         }
@@ -3208,127 +3207,122 @@ pub async fn run_server(
                 .ok();
         });
 
-    // TCP listener for server mode — spawned before the blocking UDS serve.
-    {
-        let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
-            .await
-            .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
-        let actual_addr = tcp_listener.local_addr()?;
-        tracing::info!(%actual_addr, "TCP server listening");
-        eprintln!("[daemon] TCP server listening on {}", actual_addr);
+        // TCP listener for server mode — spawned before the blocking UDS serve.
+        {
+            let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+                .await
+                .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
+            let actual_addr = tcp_listener.local_addr()?;
+            tracing::info!(%actual_addr, "TCP server listening");
+            eprintln!("[daemon] TCP server listening on {}", actual_addr);
 
-        if let Some(ref pf) = opts.port_file {
-            // Write gRPC port on line 1, MCP HTTP port on line 2.
-            let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
-            std::fs::write(pf, contents)?;
+            if let Some(ref pf) = opts.port_file {
+                // Write gRPC port on line 1, MCP HTTP port on line 2.
+                let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
+                std::fs::write(pf, contents)?;
+            }
+
+            let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+            let mut tcp_shutdown_rx = shutdown_tx.subscribe();
+
+            // When an auth token is configured, wrap the TCP service with a
+            // bearer-token interceptor + rate limiting. UDS stays unauthenticated.
+            let interceptor = crate::auth::bearer_auth_interceptor(
+                opts.auth_token.clone(),
+                opts.admin_token.clone(),
+                rate_limiters.clone(),
+            );
+            let tcp_svc =
+                tonic::service::interceptor::InterceptedService::new(svc.clone(), interceptor);
+
+            // Build the TLS config when both cert and key are provided.
+            let tls_config = match (&opts.tls_cert, &opts.tls_key) {
+                (Some(cert_path), Some(key_path)) => {
+                    // Install the ring crypto provider for rustls. This is
+                    // required by rustls 0.23+ and must happen before any TLS
+                    // config is created.
+                    let _ = rustls::crypto::ring::default_provider().install_default();
+
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
+                    let key_pem = std::fs::read(key_path)
+                        .with_context(|| format!("read TLS key: {}", key_path.display()))?;
+                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+                    tracing::info!("TLS enabled for TCP server");
+                    eprintln!("[daemon] TLS enabled for TCP server");
+                    Some(tls)
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
+                }
+                (None, None) => None,
+            };
+
+            tokio::spawn(async move {
+                let mut builder = tonic::transport::Server::builder();
+                if let Some(tls) = tls_config {
+                    builder = builder.tls_config(tls).expect("invalid TLS configuration");
+                }
+                let _ = builder
+                    .add_service(tcp_svc)
+                    .serve_with_incoming_shutdown(tcp_stream, async move {
+                        let _ = tcp_shutdown_rx.changed().await;
+                    })
+                    .await;
+            });
         }
 
-        let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
-        let mut tcp_shutdown_rx = shutdown_tx.subscribe();
-
-        // When an auth token is configured, wrap the TCP service with a
-        // bearer-token interceptor + rate limiting. UDS stays unauthenticated.
-        let interceptor = crate::auth::bearer_auth_interceptor(
-            opts.auth_token.clone(),
-            opts.admin_token.clone(),
-            rate_limiters.clone(),
-        );
-        let tcp_svc = tonic::service::interceptor::InterceptedService::new(
-            svc.clone(),
-            interceptor,
-        );
-
-        // Build the TLS config when both cert and key are provided.
-        let tls_config = match (&opts.tls_cert, &opts.tls_key) {
-            (Some(cert_path), Some(key_path)) => {
-                // Install the ring crypto provider for rustls. This is
-                // required by rustls 0.23+ and must happen before any TLS
-                // config is created.
-                let _ = rustls::crypto::ring::default_provider().install_default();
-
-                let cert_pem = std::fs::read(cert_path)
-                    .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
-                let key_pem = std::fs::read(key_path)
-                    .with_context(|| format!("read TLS key: {}", key_path.display()))?;
-                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                tracing::info!("TLS enabled for TCP server");
-                eprintln!("[daemon] TLS enabled for TCP server");
-                Some(tls)
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
-            }
-            (None, None) => None,
-        };
-
-        tokio::spawn(async move {
-            let mut builder = tonic::transport::Server::builder();
-            if let Some(tls) = tls_config {
-                builder = builder
-                    .tls_config(tls)
-                    .expect("invalid TLS configuration");
-            }
-            let _ = builder
-                .add_service(tcp_svc)
-                .serve_with_incoming_shutdown(tcp_stream, async move {
-                    let _ = tcp_shutdown_rx.changed().await;
-                })
+        // Spawn the worker pool to consume index jobs from the SQLite queue.
+        {
+            let worker_store = Arc::clone(&state.store);
+            let worker_db = db_path.clone();
+            let worker_instance = instance_id.clone();
+            let worker_shutdown = shutdown_tx.subscribe();
+            let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
+                Arc::clone(&state.indexing_active),
+                state.indexing_repo.clone(),
+                Arc::clone(&state.indexing_queue_depth),
+            );
+            tokio::spawn(async move {
+                let jobs_path = nestweaver_engine::sidecar_path(&worker_db, ".jobs.sqlite");
+                let workspace_dir = worker_db
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("workspace");
+                let job_queue = match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        tracing::error!("failed to open job queue for worker pool: {e}");
+                        return;
+                    }
+                };
+                // Recover any stale running jobs from a previous crash.
+                if let Ok(recovered) = job_queue.recover_stale(1800) {
+                    if recovered > 0 {
+                        tracing::info!(recovered, "recovered stale running jobs");
+                    }
+                }
+                let workspace =
+                    match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::error!("failed to create bare clone workspace: {e}");
+                            return;
+                        }
+                    };
+                let pool = nestweaver_engine::worker::WorkerPool::new(2);
+                pool.run(
+                    std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+                    std::sync::Arc::new(workspace),
+                    worker_store,
+                    worker_instance,
+                    worker_shutdown,
+                    Some(indexing_status),
+                )
                 .await;
-        });
-    }
-
-    // Spawn the worker pool to consume index jobs from the SQLite queue.
-    {
-        let worker_store = Arc::clone(&state.store);
-        let worker_db = db_path.clone();
-        let worker_instance = instance_id.clone();
-        let worker_shutdown = shutdown_tx.subscribe();
-        let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
-            Arc::clone(&state.indexing_active),
-            state.indexing_repo.clone(),
-            Arc::clone(&state.indexing_queue_depth),
-        );
-        tokio::spawn(async move {
-            let jobs_path = nestweaver_engine::sidecar_path(&worker_db, ".jobs.sqlite");
-            let workspace_dir = worker_db
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("workspace");
-            let job_queue = match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
-                Ok(q) => q,
-                Err(e) => {
-                    tracing::error!("failed to open job queue for worker pool: {e}");
-                    return;
-                }
-            };
-            // Recover any stale running jobs from a previous crash.
-            if let Ok(recovered) = job_queue.recover_stale(1800) {
-                if recovered > 0 {
-                    tracing::info!(recovered, "recovered stale running jobs");
-                }
-            }
-            let workspace = match nestweaver_engine::bare_clone::BareCloneWorkspace::new(
-                &workspace_dir,
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("failed to create bare clone workspace: {e}");
-                    return;
-                }
-            };
-            let pool = nestweaver_engine::worker::WorkerPool::new(2);
-            pool.run(
-                std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
-                std::sync::Arc::new(workspace),
-                worker_store,
-                worker_instance,
-                worker_shutdown,
-                Some(indexing_status),
-            )
-            .await;
-        });
-    }
+            });
+        }
     } // end if server_opts
 
     // Spawn adaptive poll scheduler in server mode.
@@ -3340,16 +3334,15 @@ pub async fn run_server(
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
-            let mut scheduler = PollScheduler::new(
-                Duration::from_secs(45),
-                Duration::from_secs(8 * 3600),
-            );
+            let mut scheduler =
+                PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
             // Populate repos from store
             if let Ok(repos) = poll_store.list_repos(Some(&poll_instance)) {
                 for repo in repos {
-                    let repo_name = repo.name.clone().unwrap_or_else(|| {
-                        nestweaver_engine::pull::repo_name_from_url(&repo.url)
-                    });
+                    let repo_name = repo
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
                     scheduler.add_repo(repo_name, repo.url.clone(), None);
                 }
             }
@@ -3450,9 +3443,7 @@ fn flow_trace_continue_impl(
     };
 
     // Get the repo URL for source annotation.
-    let repo_url = store
-        .repo_url_for_uid(&entry.repo_uid)
-        .unwrap_or_default();
+    let repo_url = store.repo_url_for_uid(&entry.repo_uid).unwrap_or_default();
 
     let mut spans: Vec<TraceSpanProto> = Vec::new();
     let mut boundaries: Vec<BoundarySymbolProto> = Vec::new();
@@ -3491,10 +3482,7 @@ fn flow_trace_continue_impl(
         if depth < max_depth {
             let callees = ctx.store.callees_of(uid).unwrap_or_default();
             for callee in &callees {
-                let callee_cid = callee
-                    .canonical_id
-                    .as_deref()
-                    .unwrap_or("");
+                let callee_cid = callee.canonical_id.as_deref().unwrap_or("");
 
                 // Skip visited symbols (cycle prevention).
                 if !callee_cid.is_empty() && ctx.visited.contains(callee_cid) {
@@ -3654,9 +3642,7 @@ fn impact_analysis_impl(
     store: &nestweaver_store::GraphStore,
     req: ImpactAnalysisRequest,
 ) -> Result<ImpactAnalysisResponse, Status> {
-    use nestweaver_engine::atomic_changes::{
-        analyze_impact, AtomicChange, ImpactSeverity,
-    };
+    use nestweaver_engine::atomic_changes::{AtomicChange, ImpactSeverity, analyze_impact};
 
     // Convert proto AtomicChangeProto -> engine AtomicChange
     let changes: Vec<AtomicChange> = req

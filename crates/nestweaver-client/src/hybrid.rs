@@ -20,10 +20,10 @@ use tracing::{debug, info, warn};
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{JsonRequest, JsonResponse};
 
-use crate::discovery::{discover_upstreams, RoutingMode};
+use crate::DaemonClient;
+use crate::discovery::{RoutingMode, discover_upstreams};
 use crate::merge::rrf_merge;
 use crate::upstream::UpstreamHandle;
-use crate::DaemonClient;
 
 /// Provenance metadata injected into every hybrid response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -162,11 +162,7 @@ impl HybridClient {
     ///   are sparse (< threshold).
     /// - Merge: query both in parallel, merge via weighted RRF + dedup.
     /// - Primary: query server directly.
-    pub async fn query(
-        &mut self,
-        tool_name: &str,
-        params: &Value,
-    ) -> Result<Value> {
+    pub async fn query(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         let mode = self
             .upstreams
             .iter()
@@ -205,11 +201,7 @@ impl HybridClient {
 
     /// Fallback routing: query local first, query server only if local
     /// results are sparse (fewer than [`FALLBACK_THRESHOLD`]).
-    pub async fn query_fallback(
-        &mut self,
-        tool_name: &str,
-        params: &Value,
-    ) -> Result<Value> {
+    pub async fn query_fallback(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         // 1. Always query local first.
         let mut local_result = self.query_local(tool_name, params).await?;
 
@@ -224,8 +216,7 @@ impl HybridClient {
         if local_count >= FALLBACK_THRESHOLD {
             debug!(
                 tool = tool_name,
-                local_count,
-                "fallback: local results sufficient, skipping server"
+                local_count, "fallback: local results sufficient, skipping server"
             );
             inject_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
@@ -256,11 +247,7 @@ impl HybridClient {
 
     /// Merge routing: query both local and server in parallel, merge via
     /// weighted RRF + scope-hash dedup.
-    pub async fn query_merge(
-        &mut self,
-        tool_name: &str,
-        params: &Value,
-    ) -> Result<Value> {
+    pub async fn query_merge(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         if !self.has_upstreams() {
             let mut result = self.query_local(tool_name, params).await?;
             inject_provenance(&mut result, &["local"], &[]);
@@ -269,24 +256,20 @@ impl HybridClient {
 
         // Prepare the server future before borrowing self.local mutably.
         // Pick the first healthy upstream and clone its client (cheap channel clone).
-        let server_task = self
-            .upstreams
-            .iter()
-            .find(|u| u.is_healthy())
-            .map(|u| {
-                let timeout = u.timeout;
-                let mut client = u.client();
-                let token = u.auth_token().map(|t| t.to_string());
-                let tool = tool_name.to_string();
-                let p = params.clone();
-                async move {
-                    tokio::time::timeout(
-                        timeout,
-                        dispatch_json_rpc_authed(&mut client, &tool, &p, token.as_deref()),
-                    )
-                    .await
-                }
-            });
+        let server_task = self.upstreams.iter().find(|u| u.is_healthy()).map(|u| {
+            let timeout = u.timeout;
+            let mut client = u.client();
+            let token = u.auth_token().map(|t| t.to_string());
+            let tool = tool_name.to_string();
+            let p = params.clone();
+            async move {
+                tokio::time::timeout(
+                    timeout,
+                    dispatch_json_rpc_authed(&mut client, &tool, &p, token.as_deref()),
+                )
+                .await
+            }
+        });
 
         let Some(server_fut) = server_task else {
             return self.query_local(tool_name, params).await;
@@ -314,18 +297,13 @@ impl HybridClient {
                         if let Value::Object(ref mut map) = v {
                             map.insert(
                                 "_provenance".to_string(),
-                                serde_json::to_value(mr.provenance)
-                                    .unwrap_or(Value::Null),
+                                serde_json::to_value(mr.provenance).unwrap_or(Value::Null),
                             );
                             map.insert(
                                 "_confidence".to_string(),
-                                serde_json::to_value(mr.confidence)
-                                    .unwrap_or(Value::Null),
+                                serde_json::to_value(mr.confidence).unwrap_or(Value::Null),
                             );
-                            map.insert(
-                                "_rrf_score".to_string(),
-                                Value::from(mr.score),
-                            );
+                            map.insert("_rrf_score".to_string(), Value::from(mr.score));
                         }
                         v
                     })
@@ -378,7 +356,9 @@ impl HybridClient {
             if let Ok(resp) = client.repo_states(req).await {
                 for server_repo in resp.into_inner().repos {
                     if let Some(local_sha) = local_states.get(&server_repo.repo_url) {
-                        if local_sha != &server_repo.indexed_sha && !server_repo.indexed_sha.is_empty() {
+                        if local_sha != &server_repo.indexed_sha
+                            && !server_repo.indexed_sha.is_empty()
+                        {
                             stale.push(server_repo.repo_url.clone());
                         }
                     }
@@ -444,11 +424,7 @@ impl HybridClient {
     }
 
     /// Query the local daemon via its gRPC channel.
-    async fn query_local(
-        &mut self,
-        tool_name: &str,
-        params: &Value,
-    ) -> Result<Value> {
+    async fn query_local(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         dispatch_json_rpc(self.local.inner_mut(), tool_name, params).await
     }
 
@@ -535,8 +511,7 @@ impl HybridClient {
                     }
 
                     let mut c = client.clone();
-                    let mut req =
-                        tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
+                    let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
                     if let Some(t) = token {
                         if let Ok(val) =
                             format!("Bearer {}", t).parse::<tonic::metadata::MetadataValue<_>>()
@@ -545,8 +520,7 @@ impl HybridClient {
                         }
                     }
 
-                    match tokio::time::timeout(Duration::from_secs(2), c.health_check(req)).await
-                    {
+                    match tokio::time::timeout(Duration::from_secs(2), c.health_check(req)).await {
                         Ok(Ok(_)) => {
                             info!(upstream = %name, "upstream recovered, marking healthy");
                             healthy.store(true, Ordering::Relaxed);
@@ -589,9 +563,7 @@ async fn dispatch_json_rpc_authed(
     let mut request = tonic::Request::new(JsonRequest { args_json });
 
     if let Some(token) = auth_token {
-        if let Ok(val) =
-            format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>()
-        {
+        if let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>() {
             request.metadata_mut().insert("authorization", val);
         }
     }
@@ -791,7 +763,10 @@ fn collect_boundaries(
     let children = node.get("children").and_then(|v| v.as_array());
     let is_leaf = children.is_none_or(|c| c.is_empty());
     let repo_uid = node.get("repo_uid").and_then(|v| v.as_str()).unwrap_or("");
-    let canonical_id = node.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("");
+    let canonical_id = node
+        .get("canonical_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
     // A boundary: different repo than the root, is a leaf (trace couldn't follow),
@@ -835,11 +810,10 @@ pub fn stitch_server_spans(
     }
 
     // Build a lookup from span_id -> span for parent linkage.
-    let span_map: std::collections::HashMap<&str, &nestweaver_proto::TraceSpanProto> =
-        server_spans
-            .iter()
-            .map(|s| (s.span_id.as_str(), s))
-            .collect();
+    let span_map: std::collections::HashMap<&str, &nestweaver_proto::TraceSpanProto> = server_spans
+        .iter()
+        .map(|s| (s.span_id.as_str(), s))
+        .collect();
 
     // Find the root span(s) — those whose canonical_id matches the boundary.
     let root_spans: Vec<&nestweaver_proto::TraceSpanProto> = server_spans
@@ -895,10 +869,7 @@ pub fn stitch_server_spans(
                         arr.extend_from_slice(subtrees);
                     }
                 } else if let Some(obj) = node.as_object_mut() {
-                    obj.insert(
-                        "children".to_string(),
-                        Value::Array(subtrees.to_vec()),
-                    );
+                    obj.insert("children".to_string(), Value::Array(subtrees.to_vec()));
                     obj.insert(
                         "boundary_crossed".to_string(),
                         Value::String(format!("-> {}", server_name)),
@@ -931,12 +902,7 @@ pub fn stitch_server_spans(
     if let Some(methods) = local_result.get_mut("methods") {
         if let Some(arr) = methods.as_array_mut() {
             for method in arr.iter_mut() {
-                inject_at_boundary(
-                    method,
-                    boundary_canonical_id,
-                    &subtrees,
-                    server_name,
-                );
+                inject_at_boundary(method, boundary_canonical_id, &subtrees, server_name);
             }
         }
     }
@@ -989,14 +955,16 @@ pub async fn flow_trace_with_stitching(
             if let Some(obj) = local_result.as_object_mut() {
                 obj.insert(
                     "_boundary_stubs".to_string(),
-                    serde_json::json!(boundaries
-                        .iter()
-                        .map(|b| serde_json::json!({
-                            "canonical_id": b.canonical_id,
-                            "name": b.name,
-                            "reason": "server unavailable"
-                        }))
-                        .collect::<Vec<_>>()),
+                    serde_json::json!(
+                        boundaries
+                            .iter()
+                            .map(|b| serde_json::json!({
+                                "canonical_id": b.canonical_id,
+                                "name": b.name,
+                                "reason": "server unavailable"
+                            }))
+                            .collect::<Vec<_>>()
+                    ),
                 );
             }
             inject_provenance(&mut local_result, &["local"], &[]);
@@ -1009,25 +977,18 @@ pub async fn flow_trace_with_stitching(
 
     for boundary in &boundaries {
         let mut up_client = upstream.client();
-        let mut req = tonic::Request::new(
-            nestweaver_proto::FlowTraceContinueRequest {
-                trace_id: trace_id.clone(),
-                entry_canonical_id: boundary.canonical_id.clone(),
-                parent_span_id: String::new(), // No span linkage in JSON mode.
-                remaining_depth: max_depth.saturating_sub(
-                    boundary.parent_path.len() as i32
-                ).max(1),
-                visited_canonical_ids: all_visited.clone(),
-            },
-        );
+        let mut req = tonic::Request::new(nestweaver_proto::FlowTraceContinueRequest {
+            trace_id: trace_id.clone(),
+            entry_canonical_id: boundary.canonical_id.clone(),
+            parent_span_id: String::new(), // No span linkage in JSON mode.
+            remaining_depth: max_depth
+                .saturating_sub(boundary.parent_path.len() as i32)
+                .max(1),
+            visited_canonical_ids: all_visited.clone(),
+        });
         upstream.inject_auth(&mut req);
 
-        match tokio::time::timeout(
-            upstream.timeout,
-            up_client.flow_trace_continue(req),
-        )
-        .await
-        {
+        match tokio::time::timeout(upstream.timeout, up_client.flow_trace_continue(req)).await {
             Ok(Ok(resp)) => {
                 let resp = resp.into_inner();
                 // Collect visited canonical_ids from server spans.
@@ -1083,10 +1044,7 @@ fn uuid_v4_simple() -> String {
 ///
 /// The org-wide section shows impacts in repos only the server has indexed,
 /// giving visibility into cross-repo breakage before pushing.
-pub async fn blast_radius_two_tier(
-    client: &mut HybridClient,
-    params: &Value,
-) -> Result<Value> {
+pub async fn blast_radius_two_tier(client: &mut HybridClient, params: &Value) -> Result<Value> {
     // 1. Always run local blast_radius.
     let mut local_result = client.query_local("blast_radius", params).await?;
 
@@ -1123,7 +1081,12 @@ pub async fn blast_radius_two_tier(
     let server_params = params.clone();
     let server_result = match tokio::time::timeout(
         timeout,
-        dispatch_json_rpc_authed(&mut up_client, "blast_radius", &server_params, token.as_deref()),
+        dispatch_json_rpc_authed(
+            &mut up_client,
+            "blast_radius",
+            &server_params,
+            token.as_deref(),
+        ),
     )
     .await
     {
@@ -1162,11 +1125,7 @@ pub async fn blast_radius_two_tier(
         });
     }
 
-    inject_provenance(
-        &mut response,
-        &["local", &server_name],
-        &[],
-    );
+    inject_provenance(&mut response, &["local", &server_name], &[]);
 
     Ok(response)
 }
@@ -1199,10 +1158,7 @@ fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
 /// Matching is done by repo-prefix extraction: the first path component of
 /// each `file_path` is treated as the repo identifier. Repos indexed locally
 /// are excluded from the org section to avoid duplicate noise.
-fn filter_org_results(
-    server: &Value,
-    local_repos: &std::collections::HashSet<String>,
-) -> Value {
+fn filter_org_results(server: &Value, local_repos: &std::collections::HashSet<String>) -> Value {
     if local_repos.is_empty() {
         return server.clone();
     }
@@ -1223,7 +1179,10 @@ fn filter_org_results(
     }
 
     // Filter affected_clusters entries whose repo matches a local repo.
-    if let Some(clusters) = filtered.get_mut("affected_clusters").and_then(|v| v.as_array_mut()) {
+    if let Some(clusters) = filtered
+        .get_mut("affected_clusters")
+        .and_then(|v| v.as_array_mut())
+    {
         clusters.retain(|cluster| {
             // Keep the cluster if any of its symbols are NOT in a local repo.
             let dominated = cluster
@@ -1631,7 +1590,10 @@ mod tests {
             }
         });
         let boundaries = detect_boundaries_in_trace(&result);
-        assert!(boundaries.is_empty(), "no repo_uid on root means no boundaries");
+        assert!(
+            boundaries.is_empty(),
+            "no repo_uid on root means no boundaries"
+        );
 
         // Cross-repo leaf with canonical_id -> detected as boundary.
         let result = json!({

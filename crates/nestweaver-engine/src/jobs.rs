@@ -232,10 +232,7 @@ impl JobQueue {
     ///
     /// Uses `BEGIN IMMEDIATE` so busy_timeout applies on contention.
     /// Only jobs whose `updated_at + debounce_secs <= now` are eligible.
-    pub fn claim_next(
-        &self,
-        debounce_secs: i64,
-    ) -> Result<Option<IndexJob>, rusqlite::Error> {
+    pub fn claim_next(&self, debounce_secs: i64) -> Result<Option<IndexJob>, rusqlite::Error> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
         let result = self.conn.query_row(
@@ -292,12 +289,7 @@ impl JobQueue {
     /// If `is_poison` is true or `attempt >= max_attempts`, the job moves
     /// directly to dead_letter. Otherwise it goes back to pending for retry
     /// with the `retry` trigger.
-    pub fn fail(
-        &self,
-        job_id: i64,
-        error: &str,
-        is_poison: bool,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn fail(&self, job_id: i64, error: &str, is_poison: bool) -> Result<(), rusqlite::Error> {
         // Read current attempt/max_attempts to decide the outcome.
         let (attempt, max_attempts): (i32, i32) = self.conn.query_row(
             "SELECT attempt, max_attempts FROM index_jobs WHERE id = ?1",
@@ -351,9 +343,9 @@ impl JobQueue {
     /// Return current queue depth by status.
     pub fn queue_depth(&self) -> Result<QueueDepth, rusqlite::Error> {
         let mut depth = QueueDepth::default();
-        let mut stmt = self.conn.prepare(
-            "SELECT status, COUNT(*) FROM index_jobs GROUP BY status",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM index_jobs GROUP BY status")?;
         let rows = stmt.query_map([], |row| {
             let status: String = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -447,8 +439,12 @@ mod tests {
     #[test]
     fn upsert_creates_job() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.pending, 1);
@@ -457,8 +453,12 @@ mod tests {
     #[test]
     fn upsert_coalesces_same_repo() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll)
             .unwrap();
 
@@ -473,13 +473,14 @@ mod tests {
         q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll)
             .unwrap();
         // Upsert with higher priority (webhook = 1)
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
-        let job = q
-            .claim_next(0)
-            .unwrap()
-            .expect("should have a job");
+        let job = q.claim_next(0).unwrap().expect("should have a job");
         assert_eq!(job.priority, 1, "priority should be upgraded to webhook(1)");
         assert_eq!(job.trigger, JobTrigger::Webhook);
     }
@@ -488,11 +489,19 @@ mod tests {
     fn upsert_does_not_downgrade_priority() {
         let q = queue();
         // Insert with high priority (webhook = 1)
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         // Upsert with lower priority (scheduled = 3)
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Scheduled)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Scheduled,
+        )
+        .unwrap();
 
         let job = q.claim_next(0).unwrap().expect("should have a job");
         assert_eq!(job.priority, 1, "priority should stay at webhook(1)");
@@ -502,12 +511,24 @@ mod tests {
     #[test]
     fn claim_next_returns_highest_priority() {
         let q = queue();
-        q.upsert("repo-low", "https://github.com/org/low", JobTrigger::Scheduled)
-            .unwrap();
-        q.upsert("repo-high", "https://github.com/org/high", JobTrigger::Unindexed)
-            .unwrap();
-        q.upsert("repo-mid", "https://github.com/org/mid", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-low",
+            "https://github.com/org/low",
+            JobTrigger::Scheduled,
+        )
+        .unwrap();
+        q.upsert(
+            "repo-high",
+            "https://github.com/org/high",
+            JobTrigger::Unindexed,
+        )
+        .unwrap();
+        q.upsert(
+            "repo-mid",
+            "https://github.com/org/mid",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         let job = q.claim_next(0).unwrap().expect("should have a job");
         assert_eq!(job.repo_id, "repo-high");
@@ -524,8 +545,12 @@ mod tests {
     #[test]
     fn claim_next_respects_debounce() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         // With a very large debounce, the just-inserted job shouldn't be claimable
         let job = q.claim_next(999_999).unwrap();
@@ -539,8 +564,12 @@ mod tests {
     #[test]
     fn complete_sets_succeeded() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
 
         q.complete(job.id).unwrap();
@@ -553,8 +582,12 @@ mod tests {
     #[test]
     fn fail_retries_up_to_max() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         // Claim and fail — attempt becomes 1, max_attempts is 4, so it should retry
         let job = q.claim_next(0).unwrap().unwrap();
@@ -582,29 +615,43 @@ mod tests {
         q.fail(job.id, "final failure", false).unwrap();
 
         let depth = q.queue_depth().unwrap();
-        assert_eq!(depth.dead_letter, 1, "should be dead-lettered after max attempts");
+        assert_eq!(
+            depth.dead_letter, 1,
+            "should be dead-lettered after max attempts"
+        );
         assert_eq!(depth.pending, 0);
     }
 
     #[test]
     fn fail_poison_goes_to_dead_letter() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
 
         q.fail(job.id, "auth failure 401", true).unwrap();
 
         let depth = q.queue_depth().unwrap();
-        assert_eq!(depth.dead_letter, 1, "poison should dead-letter immediately");
+        assert_eq!(
+            depth.dead_letter, 1,
+            "poison should dead-letter immediately"
+        );
         assert_eq!(depth.pending, 0);
     }
 
     #[test]
     fn recover_stale_resets_old_running() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Running);
 
@@ -625,14 +672,21 @@ mod tests {
 
         // The attempt count should be preserved
         let reclaimed = q.claim_next(0).unwrap().unwrap();
-        assert_eq!(reclaimed.attempt, 2, "attempt preserved from prior run + new claim");
+        assert_eq!(
+            reclaimed.attempt, 2,
+            "attempt preserved from prior run + new claim"
+        );
     }
 
     #[test]
     fn new_event_resets_dead_letter() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
         q.fail(job.id, "poison", true).unwrap();
 
@@ -642,8 +696,12 @@ mod tests {
         // New event for the same repo — reset from dead_letter
         q.reset_dead_letter("repo-1").unwrap();
         // Now upsert should work since the status is pending
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.pending, 1, "should be pending again after reset");
@@ -653,8 +711,12 @@ mod tests {
     #[test]
     fn dead_letters_returns_only_dead_lettered() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
         q.upsert("repo-2", "https://github.com/org/repo-2", JobTrigger::Poll)
             .unwrap();
 
@@ -697,8 +759,12 @@ mod tests {
     #[test]
     fn claim_increments_attempt() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 1, "first claim should set attempt to 1");
@@ -707,15 +773,23 @@ mod tests {
     #[test]
     fn upsert_ignores_running_job() {
         let q = queue();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Scheduled)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Scheduled,
+        )
+        .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Running);
 
         // The job is now running. Upsert for the same repo should succeed
         // silently without changing the running job's state.
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Webhook)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+        )
+        .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.running, 1, "job should still be running");

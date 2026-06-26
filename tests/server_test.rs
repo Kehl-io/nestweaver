@@ -7,12 +7,12 @@ mod helpers;
 
 use std::process::Command as StdCommand;
 
+use hmac::{Hmac, KeyInit, Mac};
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{BrainStatusRequest, RepoStatesRequest};
-use tonic::transport::{Certificate, ClientTlsConfig};
 use serde_json::json;
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use tonic::transport::{Certificate, ClientTlsConfig};
 
 /// Create a minimal git repo with a JS file for indexing.
 fn write_test_repo(dir: &std::path::Path) {
@@ -22,11 +22,7 @@ fn write_test_repo(dir: &std::path::Path) {
         .current_dir(dir)
         .output()
         .unwrap();
-    std::fs::write(
-        dir.join("main.js"),
-        "function greet(name) { return name; }",
-    )
-    .unwrap();
+    std::fs::write(dir.join("main.js"), "function greet(name) { return name; }").unwrap();
     StdCommand::new("git")
         .args(["add", "."])
         .current_dir(dir)
@@ -187,9 +183,7 @@ async fn server_transport_parity() {
     // Parse CLI JSON output. The pretty-printed JSON may span multiple lines,
     // so we find the first '{' and parse from there.
     let stdout = String::from_utf8_lossy(&cli_output.stdout);
-    let json_start = stdout
-        .find('{')
-        .expect("no JSON object in CLI output");
+    let json_start = stdout.find('{').expect("no JSON object in CLI output");
     let cli_json: serde_json::Value =
         serde_json::from_str(&stdout[json_start..]).expect("CLI output is not valid JSON");
 
@@ -212,9 +206,7 @@ async fn server_transport_parity() {
         tcp_status.vault_count, cli_vault_count
     );
 
-    let cli_notes = cli_json["notes"]
-        .as_i64()
-        .expect("CLI JSON missing notes");
+    let cli_notes = cli_json["notes"].as_i64().expect("CLI JSON missing notes");
     assert_eq!(
         tcp_status.notes as i64, cli_notes,
         "notes mismatch between TCP ({}) and UDS ({})",
@@ -301,13 +293,12 @@ async fn server_auth_passes_valid_token() {
         .await
         .expect("failed to connect to TCP gRPC server");
 
-    let mut client = NestWeaverDaemonClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
-        req.metadata_mut().insert(
-            "authorization",
-            "Bearer test-secret".parse().unwrap(),
-        );
-        Ok(req)
-    });
+    let mut client =
+        NestWeaverDaemonClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
+            req.metadata_mut()
+                .insert("authorization", "Bearer test-secret".parse().unwrap());
+            Ok(req)
+        });
 
     let response = client
         .brain_status(BrainStatusRequest {})
@@ -341,11 +332,19 @@ fn generate_test_certs(dir: &std::path::Path) -> TestCerts {
     // 1. Generate CA key + self-signed CA cert
     let output = StdCommand::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", &ca_key.display().to_string(),
-            "-out", &ca_cert.display().to_string(),
-            "-days", "1", "-nodes",
-            "-subj", "/CN=Test CA",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &ca_key.display().to_string(),
+            "-out",
+            &ca_cert.display().to_string(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=Test CA",
         ])
         .stderr(std::process::Stdio::null())
         .output()
@@ -355,11 +354,16 @@ fn generate_test_certs(dir: &std::path::Path) -> TestCerts {
     // 2. Generate server key + CSR
     let output = StdCommand::new("openssl")
         .args([
-            "req", "-newkey", "rsa:2048",
-            "-keyout", &server_key.display().to_string(),
-            "-out", &server_csr.display().to_string(),
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &server_key.display().to_string(),
+            "-out",
+            &server_csr.display().to_string(),
             "-nodes",
-            "-subj", "/CN=localhost",
+            "-subj",
+            "/CN=localhost",
         ])
         .stderr(std::process::Stdio::null())
         .output()
@@ -372,21 +376,32 @@ fn generate_test_certs(dir: &std::path::Path) -> TestCerts {
 
     let output = StdCommand::new("openssl")
         .args([
-            "x509", "-req",
-            "-in", &server_csr.display().to_string(),
-            "-CA", &ca_cert.display().to_string(),
-            "-CAkey", &ca_key.display().to_string(),
+            "x509",
+            "-req",
+            "-in",
+            &server_csr.display().to_string(),
+            "-CA",
+            &ca_cert.display().to_string(),
+            "-CAkey",
+            &ca_key.display().to_string(),
             "-CAcreateserial",
-            "-out", &server_cert.display().to_string(),
-            "-days", "1",
-            "-extfile", &ext_file.display().to_string(),
+            "-out",
+            &server_cert.display().to_string(),
+            "-days",
+            "1",
+            "-extfile",
+            &ext_file.display().to_string(),
         ])
         .stderr(std::process::Stdio::null())
         .output()
         .expect("openssl cert signing failed");
     assert!(output.status.success(), "server cert signing failed");
 
-    TestCerts { ca_cert, server_cert, server_key }
+    TestCerts {
+        ca_cert,
+        server_cert,
+        server_key,
+    }
 }
 
 #[tokio::test]
@@ -558,14 +573,8 @@ async fn server_repo_states_rpc() {
         !repo.indexed_sha.is_empty(),
         "expected non-empty indexed_sha"
     );
-    assert!(
-        !repo.repo_uid.is_empty(),
-        "expected non-empty repo_uid"
-    );
-    assert!(
-        !repo.repo_name.is_empty(),
-        "expected non-empty repo_name"
-    );
+    assert!(!repo.repo_uid.is_empty(), "expected non-empty repo_uid");
+    assert!(!repo.repo_name.is_empty(), "expected non-empty repo_name");
 }
 
 #[tokio::test]
@@ -660,11 +669,7 @@ async fn server_mcp_http_tools_list() {
     let tools = body["result"]["tools"]
         .as_array()
         .expect("tools should be an array");
-    assert!(
-        tools.len() >= 30,
-        "expected 30+ tools, got {}",
-        tools.len()
-    );
+    assert!(tools.len() >= 30, "expected 30+ tools, got {}", tools.len());
 }
 
 #[tokio::test]
@@ -777,10 +782,7 @@ async fn server_mcp_sessions_tracked() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(
-        !session_id_1.is_empty(),
-        "session ID should not be empty"
-    );
+    assert!(!session_id_1.is_empty(), "session ID should not be empty");
 
     // 2. Second initialize — should get a *different* session ID.
     let resp2 = client
@@ -934,8 +936,7 @@ async fn server_webhook_rejects_invalid_sig() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let guard =
-        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "correct-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "correct-secret");
     let mcp_addr = guard.mcp_addr();
 
     let payload = json!({
@@ -980,8 +981,7 @@ async fn server_webhook_rejects_missing_sig() {
         .unwrap();
     assert!(output.status.success());
 
-    let guard =
-        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "my-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "my-secret");
     let mcp_addr = guard.mcp_addr();
 
     let payload = json!({
@@ -1024,8 +1024,7 @@ async fn server_webhook_rejects_bad_json() {
     assert!(output.status.success());
 
     let secret = "my-secret";
-    let guard =
-        helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
     let mcp_addr = guard.mcp_addr();
 
     let body = b"not valid json";

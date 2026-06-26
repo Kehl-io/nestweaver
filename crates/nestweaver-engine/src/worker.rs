@@ -236,7 +236,14 @@ fn process_job(
     // 6. Full index via index_with_reader.
     //    Incremental indexing through ContentReader is a follow-up optimization;
     //    for v1 we always do a full index.
-    crate::index_with_reader(&reader, store, instance_id, &job.repo_url, &remote_sha, None)?;
+    crate::index_with_reader(
+        &reader,
+        store,
+        instance_id,
+        &job.repo_url,
+        &remote_sha,
+        None,
+    )?;
 
     Ok(())
 }
@@ -416,8 +423,7 @@ mod tests {
             .unwrap();
         let queue = Arc::new(Mutex::new(queue));
 
-        let workspace =
-            Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let workspace = Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
         let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -458,7 +464,10 @@ mod tests {
 
         // Verify symbols were indexed.
         let count = store.count_symbols().unwrap();
-        assert!(count > 0, "worker should have indexed the repo and created symbols");
+        assert!(
+            count > 0,
+            "worker should have indexed the repo and created symbols"
+        );
     }
 
     #[tokio::test]
@@ -477,8 +486,7 @@ mod tests {
             .unwrap();
         let queue = Arc::new(Mutex::new(queue));
 
-        let workspace =
-            Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let workspace = Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
         let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
 
         let status = IndexingStatus::new();
@@ -491,8 +499,15 @@ mod tests {
         let s = store.clone();
 
         let handle = tokio::spawn(async move {
-            pool.run(q, workspace, s, "test".to_string(), shutdown_rx, Some(status))
-                .await;
+            pool.run(
+                q,
+                workspace,
+                s,
+                "test".to_string(),
+                shutdown_rx,
+                Some(status),
+            )
+            .await;
         });
 
         // Wait for the job to complete.

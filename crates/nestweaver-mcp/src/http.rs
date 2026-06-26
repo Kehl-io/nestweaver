@@ -236,14 +236,18 @@ async fn handle_mcp(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {
-                return (axum::http::StatusCode::OK, HeaderMap::new(), Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": error_code::INVALID_PARAMS,
-                        "message": "tools/call: 'name' is required",
-                    }
-                })));
+                return (
+                    axum::http::StatusCode::OK,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": error_code::INVALID_PARAMS,
+                            "message": "tools/call: 'name' is required",
+                        }
+                    })),
+                );
             };
 
             let store = state.store.clone();

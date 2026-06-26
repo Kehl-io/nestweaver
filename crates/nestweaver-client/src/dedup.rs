@@ -378,14 +378,22 @@ mod tests {
     #[test]
     fn confidence_precise_when_scope_present() {
         let result = json!({ "scope_chain": "module::class::method" });
-        let confidence = assign_confidence(&result, Provenance::Local, &std::collections::HashSet::new());
+        let confidence = assign_confidence(
+            &result,
+            Provenance::Local,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(confidence, Confidence::Precise);
     }
 
     #[test]
     fn confidence_heuristic_when_no_scope() {
         let result = json!({ "symbol_name": "foo" });
-        let confidence = assign_confidence(&result, Provenance::Local, &std::collections::HashSet::new());
+        let confidence = assign_confidence(
+            &result,
+            Provenance::Local,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(confidence, Confidence::Heuristic);
     }
 

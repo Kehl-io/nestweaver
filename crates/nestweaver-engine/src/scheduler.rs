@@ -253,11 +253,12 @@ mod tests {
     use super::*;
 
     fn scheduler_with_repo(last_commit_ago: Option<Duration>) -> PollScheduler {
-        let mut sched = PollScheduler::new(
-            Duration::from_secs(45),
-            Duration::from_secs(8 * 3600),
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
+        sched.add_repo(
+            "test-repo".into(),
+            "https://github.com/org/test".into(),
+            None,
         );
-        sched.add_repo("test-repo".into(), "https://github.com/org/test".into(), None);
 
         if let Some(ago) = last_commit_ago {
             let commit_time = Instant::now() - ago;
@@ -291,18 +292,12 @@ mod tests {
         let interval = sched.next_interval(&sched.repos[0]);
         // Allow small timing slop from elapsed() measurement
         let secs = interval.as_secs();
-        assert!(
-            secs >= 1799 && secs <= 1801,
-            "expected ~1800s, got {secs}s"
-        );
+        assert!(secs >= 1799 && secs <= 1801, "expected ~1800s, got {secs}s");
     }
 
     #[test]
     fn poll_override_fixed() {
-        let mut sched = PollScheduler::new(
-            Duration::from_secs(45),
-            Duration::from_secs(8 * 3600),
-        );
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
         sched.add_repo(
             "fixed-repo".into(),
             "https://github.com/org/fixed".into(),
@@ -314,10 +309,7 @@ mod tests {
 
     #[test]
     fn poll_override_never() {
-        let mut sched = PollScheduler::new(
-            Duration::from_secs(45),
-            Duration::from_secs(8 * 3600),
-        );
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
         sched.add_repo(
             "never-repo".into(),
             "https://github.com/org/never".into(),
@@ -333,7 +325,11 @@ mod tests {
         // time is near zero, so half is near zero, clamped to min_poll.
         let sched = scheduler_with_repo(Some(Duration::ZERO));
         let interval = sched.next_interval(&sched.repos[0]);
-        assert_eq!(interval, Duration::from_secs(45), "zero elapsed clamps to floor");
+        assert_eq!(
+            interval,
+            Duration::from_secs(45),
+            "zero elapsed clamps to floor"
+        );
     }
 
     #[test]
@@ -357,17 +353,21 @@ mod tests {
 
     #[test]
     fn due_repos_skips_never() {
-        let mut sched = PollScheduler::new(
-            Duration::from_secs(45),
-            Duration::from_secs(8 * 3600),
-        );
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
         sched.add_repo("repo-a".into(), "https://a.com".into(), None);
-        sched.add_repo("repo-b".into(), "https://b.com".into(), Some(PollOverride::Never));
+        sched.add_repo(
+            "repo-b".into(),
+            "https://b.com".into(),
+            Some(PollOverride::Never),
+        );
 
         let due = sched.due_repos();
         let ids: Vec<&str> = due.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"repo-a"), "active repo should be due");
-        assert!(!ids.contains(&"repo-b"), "never-poll repo should be skipped");
+        assert!(
+            !ids.contains(&"repo-b"),
+            "never-poll repo should be skipped"
+        );
     }
 
     #[test]

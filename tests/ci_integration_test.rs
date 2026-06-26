@@ -86,11 +86,18 @@ fn impact_diff_produces_json() {
     )
     .unwrap();
     git(&repo_dir, &["add", "."]);
-    git(&repo_dir, &[
-        "-c", "user.email=test@test.com",
-        "-c", "user.name=Test",
-        "commit", "-m", "initial: add processOrder",
-    ]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "initial: add processOrder",
+        ],
+    );
 
     // Index the repo at its initial state.
     index_repo(&repo_dir, &db_path);
@@ -102,11 +109,18 @@ fn impact_diff_produces_json() {
     )
     .unwrap();
     git(&repo_dir, &["add", "."]);
-    git(&repo_dir, &[
-        "-c", "user.email=test@test.com",
-        "-c", "user.name=Test",
-        "commit", "-m", "change processOrder signature",
-    ]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "change processOrder signature",
+        ],
+    );
 
     // Run pre-push-impact using --diff against the previous commit.
     let output = nestweaver()
@@ -175,7 +189,11 @@ fn format_comment_produces_markdown() {
         }
     ]);
 
-    std::fs::write(&input_path, serde_json::to_string_pretty(&impact_data).unwrap()).unwrap();
+    std::fs::write(
+        &input_path,
+        serde_json::to_string_pretty(&impact_data).unwrap(),
+    )
+    .unwrap();
 
     let output = nestweaver()
         .args([
@@ -212,17 +230,20 @@ fn impact_server_down_graceful() {
     // Set up a git repo with uncommitted changes so pre-push-impact has
     // something to analyze.
     init_git_repo(&repo_dir);
-    std::fs::write(
-        repo_dir.join("lib.js"),
-        "function hello() { return 1; }\n",
-    )
-    .unwrap();
+    std::fs::write(repo_dir.join("lib.js"), "function hello() { return 1; }\n").unwrap();
     git(&repo_dir, &["add", "."]);
-    git(&repo_dir, &[
-        "-c", "user.email=test@test.com",
-        "-c", "user.name=Test",
-        "commit", "-m", "initial",
-    ]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
 
     // Index the repo.
     index_repo(&repo_dir, &db_path);
@@ -234,11 +255,18 @@ fn impact_server_down_graceful() {
     )
     .unwrap();
     git(&repo_dir, &["add", "."]);
-    git(&repo_dir, &[
-        "-c", "user.email=test@test.com",
-        "-c", "user.name=Test",
-        "commit", "-m", "change hello",
-    ]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "change hello",
+        ],
+    );
 
     // Point --server at localhost:1 which should be unreachable. Without
     // --fail-on-error the command should exit 0 gracefully.

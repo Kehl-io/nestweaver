@@ -9,10 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::content_reader::ContentReader;
 use anyhow::Context;
 use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
-use crate::content_reader::ContentReader;
 use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
@@ -704,9 +704,7 @@ fn index_into_store(
             }
         }
 
-        scanned_notes.push(ScannedNote {
-            rel_path,
-        });
+        scanned_notes.push(ScannedNote { rel_path });
         scan_pb.set_message(format!("Scanning notes... {}", scanned_notes.len()));
         scan_pb.tick();
     }
@@ -797,14 +795,15 @@ fn index_into_store(
 
             // File timestamps — best-effort, never fatal. Uses direct
             // fs::metadata for created_at (not in ContentReader trait).
-            let (created_at, modified_at) = match std::fs::metadata(vault_root.join(&scanned.rel_path)) {
-                Ok(meta) => {
-                    let created = meta.created().ok().and_then(format_system_time);
-                    let modified = meta.modified().ok().and_then(format_system_time);
-                    (created, modified)
-                }
-                Err(_) => (None, None),
-            };
+            let (created_at, modified_at) =
+                match std::fs::metadata(vault_root.join(&scanned.rel_path)) {
+                    Ok(meta) => {
+                        let created = meta.created().ok().and_then(format_system_time);
+                        let modified = meta.modified().ok().and_then(format_system_time);
+                        (created, modified)
+                    }
+                    Err(_) => (None, None),
+                };
 
             let note = Note {
                 uid: n_uid.clone(),

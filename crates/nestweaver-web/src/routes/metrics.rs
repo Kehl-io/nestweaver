@@ -120,11 +120,7 @@ pub static GRPC_CONNECTIONS: LazyLock<IntGauge> = LazyLock::new(|| {
 });
 
 pub static MCP_SESSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
-    let g = IntGauge::new(
-        "nestweaver_mcp_sessions_active",
-        "Active MCP sessions",
-    )
-    .unwrap();
+    let g = IntGauge::new("nestweaver_mcp_sessions_active", "Active MCP sessions").unwrap();
     REGISTRY.register(Box::new(g.clone())).unwrap();
     g
 });

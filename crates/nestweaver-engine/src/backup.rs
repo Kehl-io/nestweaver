@@ -272,10 +272,7 @@ fn copy_db_files(
 }
 
 /// Build the backup manifest by inspecting staged files.
-fn build_backup_manifest(
-    config: &BackupConfig,
-    staging: &Path,
-) -> anyhow::Result<BackupManifest> {
+fn build_backup_manifest(config: &BackupConfig, staging: &Path) -> anyhow::Result<BackupManifest> {
     let db_filename = config
         .db_path
         .file_name()
@@ -451,11 +448,13 @@ fn unix_to_utc(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 
 /// Encode bytes as lowercase hex string.
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 fn is_leap(y: u64) -> bool {
@@ -576,8 +575,7 @@ mod tests {
         // Corrupt the db file.
         std::fs::write(restore_dir.join("test.lbug"), b"corrupted").unwrap();
 
-        let manifest_str =
-            std::fs::read_to_string(restore_dir.join("manifest.json")).unwrap();
+        let manifest_str = std::fs::read_to_string(restore_dir.join("manifest.json")).unwrap();
         let manifest: BackupManifest = serde_json::from_str(&manifest_str).unwrap();
         let err = verify_backup_checksums(&restore_dir, &manifest).unwrap_err();
         assert!(err.to_string().contains("integrity check failed"));

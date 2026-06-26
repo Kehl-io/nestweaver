@@ -140,7 +140,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
-        scope_chain: None,
+                    scope_chain: None,
                 });
             }
 
@@ -161,7 +161,7 @@ pub fn parse_svelte(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Private,
                     type_info: None,
                     parent_name: None,
-        scope_chain: None,
+                    scope_chain: None,
                 });
             }
 

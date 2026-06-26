@@ -610,10 +610,7 @@ pub fn analyze_impact(
                         impacts.push(ImpactResult {
                             change_canonical_id: canonical_id.clone(),
                             change_kind: "SIGNATURE_CHANGED".to_string(),
-                            affected_canonical_id: ref_sym
-                                .canonical_id
-                                .clone()
-                                .unwrap_or_default(),
+                            affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
                             affected_name: ref_sym.name.clone(),
                             affected_repo_url: repo_url,
                             affected_file: ref_sym.file_path.clone(),
@@ -646,10 +643,7 @@ pub fn analyze_impact(
                         impacts.push(ImpactResult {
                             change_canonical_id: canonical_id.clone(),
                             change_kind: change_kind.to_string(),
-                            affected_canonical_id: ref_sym
-                                .canonical_id
-                                .clone()
-                                .unwrap_or_default(),
+                            affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
                             affected_name: ref_sym.name.clone(),
                             affected_repo_url: repo_url,
                             affected_file: ref_sym.file_path.clone(),
@@ -760,9 +754,9 @@ mod tests {
         let old = "pub fn foo() {}\npub fn bar() {}";
         let new = "pub fn foo() {}";
         let changes = compute_file_changes(old, new, "src/lib.rs", REPO_URL).unwrap();
-        let removed = changes.iter().find(
-            |c| matches!(c, AtomicChange::SymbolRemoved { name, .. } if name == "bar"),
-        );
+        let removed = changes
+            .iter()
+            .find(|c| matches!(c, AtomicChange::SymbolRemoved { name, .. } if name == "bar"));
         assert!(removed.is_some(), "should detect bar was removed");
     }
 
@@ -771,9 +765,9 @@ mod tests {
         let old = "pub fn foo() {}";
         let new = "pub fn foo() {}\npub fn bar() {}";
         let changes = compute_file_changes(old, new, "src/lib.rs", REPO_URL).unwrap();
-        let added = changes.iter().find(
-            |c| matches!(c, AtomicChange::SymbolAdded { name, .. } if name == "bar"),
-        );
+        let added = changes
+            .iter()
+            .find(|c| matches!(c, AtomicChange::SymbolAdded { name, .. } if name == "bar"));
         assert!(added.is_some(), "should detect bar was added");
     }
 
@@ -785,10 +779,7 @@ mod tests {
         let export_removed = changes
             .iter()
             .find(|c| matches!(c, AtomicChange::ExportRemoved { .. }));
-        assert!(
-            export_removed.is_some(),
-            "should detect export was removed"
-        );
+        assert!(export_removed.is_some(), "should detect export was removed");
     }
 
     #[test]
@@ -834,7 +825,11 @@ mod tests {
         let renamed = changes
             .iter()
             .find(|c| matches!(c, AtomicChange::SymbolRenamed { .. }));
-        assert!(renamed.is_some(), "should detect rename; got: {:?}", changes);
+        assert!(
+            renamed.is_some(),
+            "should detect rename; got: {:?}",
+            changes
+        );
     }
 
     #[test]
@@ -902,9 +897,9 @@ mod tests {
             .unwrap();
 
         let changes = compute_local_changes(&repo, REPO_URL).unwrap();
-        let added = changes.iter().find(
-            |c| matches!(c, AtomicChange::SymbolAdded { name, .. } if name == "bar"),
-        );
+        let added = changes
+            .iter()
+            .find(|c| matches!(c, AtomicChange::SymbolAdded { name, .. } if name == "bar"));
         assert!(
             added.is_some(),
             "should detect new file symbols as added; got: {:?}",
@@ -1010,21 +1005,14 @@ mod tests {
 
     #[test]
     fn classify_sig_add_optional_param_is_info() {
-        let severity = classify_signature_change(
-            "def foo(a)",
-            "def foo(a, b=None)",
-            "src/caller.py",
-        );
+        let severity =
+            classify_signature_change("def foo(a)", "def foo(a, b=None)", "src/caller.py");
         assert_eq!(severity, ImpactSeverity::Info);
     }
 
     #[test]
     fn classify_sig_add_param_dynamic_is_warning() {
-        let severity = classify_signature_change(
-            "def foo(a)",
-            "def foo(a, b)",
-            "src/caller.py",
-        );
+        let severity = classify_signature_change("def foo(a)", "def foo(a, b)", "src/caller.py");
         assert_eq!(severity, ImpactSeverity::Warning);
     }
 

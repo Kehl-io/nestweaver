@@ -99,11 +99,7 @@ impl QuerySafeguards {
             hard_caps.insert(tool.to_string(), Duration::from_secs(60));
         }
         hard_caps.insert("regex_search".to_string(), Duration::from_secs(30));
-        for tool in &[
-            "blast_radius",
-            "flow_trace",
-            "cross_repo_contracts",
-        ] {
+        for tool in &["blast_radius", "flow_trace", "cross_repo_contracts"] {
             hard_caps.insert(tool.to_string(), Duration::from_secs(60));
         }
 

@@ -45,8 +45,7 @@ impl FilesystemReader {
 impl ContentReader for FilesystemReader {
     fn read_file(&self, rel_path: &Path) -> Result<String> {
         let abs = self.repo_path.join(rel_path);
-        std::fs::read_to_string(&abs)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))
+        std::fs::read_to_string(&abs).map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))
     }
 
     fn list_files(&self) -> Result<Vec<PathBuf>> {
@@ -263,7 +262,10 @@ mod tests {
         let files = reader.list_files().unwrap();
         assert!(files.len() >= 2);
         // Verify both files are present (order-independent).
-        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         assert!(names.contains(&"src/lib.rs".to_string()));
         assert!(names.contains(&"src/main.rs".to_string()));
     }
@@ -304,7 +306,10 @@ mod tests {
         std::fs::write(dir.path().join("real.rs"), "").unwrap();
         let reader = FilesystemReader::new(dir.path());
         let files = reader.list_files().unwrap();
-        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         assert!(names.contains(&"real.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
     }
@@ -418,7 +423,10 @@ mod tests {
         ]);
         let reader = GitBareReader::new(&bare, &sha);
         let files = reader.list_files().unwrap();
-        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         assert!(names.contains(&"src/lib.rs".to_string()));
         assert!(names.contains(&"src/main.rs".to_string()));
         assert!(names.contains(&"README.md".to_string()));
@@ -433,7 +441,10 @@ mod tests {
         ]);
         let reader = GitBareReader::new(&bare, &sha);
         let files = reader.list_files().unwrap();
-        let names: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         assert!(names.contains(&"src/lib.rs".to_string()));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
         assert!(!names.iter().any(|n| n.contains("target")));

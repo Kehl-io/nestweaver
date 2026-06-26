@@ -103,8 +103,18 @@ pub async fn list_repos(
 
     let repos = tokio::task::spawn_blocking(move || store.list_repos(None))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list_repos failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task panicked: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list_repos failed: {e}"),
+            )
+        })?;
 
     let store = state.daemon_store.clone();
     let repo_infos = tokio::task::spawn_blocking(move || {
@@ -136,7 +146,12 @@ pub async fn list_repos(
             .collect::<Vec<_>>()
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })?;
 
     Ok(Json(repo_infos))
 }
@@ -152,19 +167,33 @@ pub async fn add_repo(
     let repo_url = req.url.clone();
 
     tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open job queue: {e}"),
+            )
+        })?;
         queue
             .upsert(
                 &repo_url,
                 &repo_url,
                 nestweaver_engine::jobs::JobTrigger::Unindexed,
             )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue job: {e}")))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("enqueue job: {e}"),
+                )
+            })?;
         Ok::<_, (StatusCode, String)>(())
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(MessageResponse {
         message: format!("repo {} queued for indexing", req.url),
@@ -204,7 +233,12 @@ pub async fn remove_repo(
         Ok::<_, (StatusCode, String)>(())
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(MessageResponse {
         message: format!("repo {} removed", repo_uid),
@@ -225,18 +259,41 @@ pub async fn trigger_reindex(
         // Look up the repo URL from the store.
         let repo = store
             .lookup_repo(&uid)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lookup repo: {e}")))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("lookup repo: {e}"),
+                )
+            })?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("repo {} not found", uid)))?;
 
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open job queue: {e}"),
+            )
+        })?;
         queue
-            .upsert(&uid, &repo.url, nestweaver_engine::jobs::JobTrigger::Webhook)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue job: {e}")))?;
+            .upsert(
+                &uid,
+                &repo.url,
+                nestweaver_engine::jobs::JobTrigger::Webhook,
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("enqueue job: {e}"),
+                )
+            })?;
         Ok::<_, (StatusCode, String)>(())
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(MessageResponse {
         message: format!("reindex queued for repo {}", repo_uid),
@@ -246,10 +303,7 @@ pub async fn trigger_reindex(
 // ── Queue management ───────────────────────────────────────────────────
 
 /// GET /admin/api/queue — queue state.
-pub async fn get_queue(
-    _auth: AdminAuth,
-    State(state): State<Arc<AdminState>>,
-) -> Json<QueueInfo> {
+pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -> Json<QueueInfo> {
     let depth = state.indexing_queue_depth.load(Ordering::Relaxed);
     let drained = state.drained.load(Ordering::Relaxed);
     Json(QueueInfo { depth, drained })
@@ -303,11 +357,18 @@ pub async fn list_dead_letter(
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
 
     let entries = tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
-        let dead = queue
-            .dead_letters()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dead_letters: {e}")))?;
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open job queue: {e}"),
+            )
+        })?;
+        let dead = queue.dead_letters().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dead_letters: {e}"),
+            )
+        })?;
         let values: Vec<serde_json::Value> = dead
             .into_iter()
             .map(|j| {
@@ -325,7 +386,12 @@ pub async fn list_dead_letter(
         Ok::<_, (StatusCode, String)>(values)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(entries))
 }
@@ -340,15 +406,27 @@ pub async fn retry_dead_letter(
     let id_clone = id.clone();
 
     tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
-        queue
-            .reset_dead_letter(&id_clone)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reset_dead_letter: {e}")))?;
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open job queue: {e}"),
+            )
+        })?;
+        queue.reset_dead_letter(&id_clone).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reset_dead_letter: {e}"),
+            )
+        })?;
         Ok::<_, (StatusCode, String)>(())
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(MessageResponse {
         message: format!("dead-letter entry {} queued for retry", id),
@@ -367,21 +445,36 @@ pub async fn dismiss_dead_letter(
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid job id: {id}")))?;
 
     let dismissed = tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("open job queue: {e}")))?;
-        queue
-            .dismiss_dead_letter(job_id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dismiss_dead_letter: {e}")))
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open job queue: {e}"),
+            )
+        })?;
+        queue.dismiss_dead_letter(job_id).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dismiss_dead_letter: {e}"),
+            )
+        })
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     if dismissed {
         Ok(Json(MessageResponse {
             message: format!("dead-letter entry {} dismissed", id),
         }))
     } else {
-        Err((StatusCode::NOT_FOUND, format!("no dead-letter entry with id {id}")))
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("no dead-letter entry with id {id}"),
+        ))
     }
 }
 
@@ -424,7 +517,12 @@ pub async fn reload_config(
         }
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+    })??;
 
     Ok(Json(MessageResponse { message }))
 }
@@ -437,11 +535,10 @@ pub async fn get_status(
     State(state): State<Arc<AdminState>>,
 ) -> Json<AdminStatus> {
     let store = state.daemon_store.clone();
-    let repo_count = tokio::task::spawn_blocking(move || {
-        store.list_repos(None).map(|r| r.len()).unwrap_or(0)
-    })
-    .await
-    .unwrap_or(0);
+    let repo_count =
+        tokio::task::spawn_blocking(move || store.list_repos(None).map(|r| r.len()).unwrap_or(0))
+            .await
+            .unwrap_or(0);
 
     Json(AdminStatus {
         instance_id: state.instance_id.clone(),
@@ -461,9 +558,9 @@ pub async fn get_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::get};
     use axum::body::Body;
     use axum::http::Request;
+    use axum::{Router, routing::get};
     use tower::ServiceExt;
 
     fn test_admin_state() -> Arc<AdminState> {
@@ -484,6 +581,7 @@ mod tests {
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             db_path: db_path_clone,
+            config_path: None,
         })
     }
 

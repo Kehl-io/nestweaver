@@ -146,7 +146,9 @@ pub fn save_upstream(config: &UpstreamConfig) -> Result<PathBuf> {
         upstreams.push(config.clone());
     }
 
-    let toml_str = toml::to_string_pretty(&UpstreamsToml { upstream: upstreams })?;
+    let toml_str = toml::to_string_pretty(&UpstreamsToml {
+        upstream: upstreams,
+    })?;
     std::fs::write(&path, toml_str)?;
     Ok(path)
 }

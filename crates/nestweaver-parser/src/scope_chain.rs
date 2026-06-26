@@ -103,7 +103,8 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
             if child.kind() == "identifier"
                 || child.kind() == "type_identifier"
                 || child.kind() == "name"
-                || child.kind() == "constant"  // Ruby module/class names are constants
+                || child.kind() == "constant"
+            // Ruby module/class names are constants
             {
                 return Some(child.utf8_text(source_bytes).ok()?.to_string());
             }

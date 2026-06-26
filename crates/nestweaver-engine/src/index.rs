@@ -466,7 +466,8 @@ fn index_into_store(
     let mut spec_files: Vec<PathBuf> = Vec::new();
 
     let repo_path = reader.root();
-    let discovered_files = reader.list_files()
+    let discovered_files = reader
+        .list_files()
         .context("ContentReader::list_files failed")?;
 
     for rel_path in &discovered_files {
@@ -803,7 +804,13 @@ fn index_into_store(
                     }
 
                     let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-                    let canonical = canonical_symbol_id(repo_url, &rel_path, &raw_sym.name, scope_str, raw_sym.start_line);
+                    let canonical = canonical_symbol_id(
+                        repo_url,
+                        &rel_path,
+                        &raw_sym.name,
+                        scope_str,
+                        raw_sym.start_line,
+                    );
 
                     all_symbols.push(Symbol {
                         uid: s_uid.clone(),
@@ -1583,7 +1590,9 @@ pub fn incremental_index_with_name(
                     result.files_skipped += 1;
                     continue;
                 }
-                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, repo_url, &store, &txn)?;
+                let added = process_added_or_modified_file_txn(
+                    &reader, rel_path, &r_uid, repo_url, &store, &txn,
+                )?;
                 result.symbols_added += added;
                 result.files_added += 1;
             }
@@ -1594,19 +1603,23 @@ pub fn incremental_index_with_name(
                 }
                 // Remove old symbols first.
                 let rel_str = rel_path.to_string_lossy();
-                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
-                    .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
+                let removed =
+                    nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
+                        .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
 
                 // Re-parse and insert.
-                let added = process_added_or_modified_file_txn(&reader, rel_path, &r_uid, repo_url, &store, &txn)?;
+                let added = process_added_or_modified_file_txn(
+                    &reader, rel_path, &r_uid, repo_url, &store, &txn,
+                )?;
                 result.symbols_added += added;
                 result.files_modified += 1;
             }
             crate::git_diff::FileChange::Deleted(rel_path) => {
                 let rel_str = rel_path.to_string_lossy();
-                let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
-                    .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
+                let removed =
+                    nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
+                        .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
                 result.symbols_removed += removed;
 
                 let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
@@ -1620,14 +1633,18 @@ pub fn incremental_index_with_name(
 
                 if is_parseable(to) && !path_in_skip_dir(to) {
                     // Update symbol file_path references.
-                    nestweaver_store::GraphStore::update_symbol_file_paths_on(&txn, &r_uid, &from_str, &to_str)
-                        .with_context(|| {
-                            format!("update_symbol_file_paths {} -> {}", from_str, to_str)
-                        })?;
+                    nestweaver_store::GraphStore::update_symbol_file_paths_on(
+                        &txn, &r_uid, &from_str, &to_str,
+                    )
+                    .with_context(|| {
+                        format!("update_symbol_file_paths {} -> {}", from_str, to_str)
+                    })?;
                 } else {
                     // Destination is not parseable — just delete the old symbols.
-                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &from_str)
-                        .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
+                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                        &txn, &r_uid, &from_str,
+                    )
+                    .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
                     result.symbols_removed += removed;
                 }
 
@@ -1638,11 +1655,15 @@ pub fn incremental_index_with_name(
 
                 if is_parseable(to) && !path_in_skip_dir(to) {
                     // Re-read from disk and re-insert the file + symbols under the new path.
-                    let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &to_str)
-                        .with_context(|| "delete_symbols_in_file (rename to)")?;
+                    let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                        &txn, &r_uid, &to_str,
+                    )
+                    .with_context(|| "delete_symbols_in_file (rename to)")?;
                     result.symbols_removed += removed2;
 
-                    let added = process_added_or_modified_file_txn(&reader, to, &r_uid, repo_url, &store, &txn)?;
+                    let added = process_added_or_modified_file_txn(
+                        &reader, to, &r_uid, repo_url, &store, &txn,
+                    )?;
                     result.symbols_added += added;
                 }
 
@@ -1738,7 +1759,13 @@ fn process_added_or_modified_file(
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str, raw_sym.start_line);
+        let canonical = canonical_symbol_id(
+            repo_url,
+            &rel_str,
+            &raw_sym.name,
+            scope_str,
+            raw_sym.start_line,
+        );
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -1869,7 +1896,13 @@ fn process_added_or_modified_file_txn(
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str, raw_sym.start_line);
+        let canonical = canonical_symbol_id(
+            repo_url,
+            &rel_str,
+            &raw_sym.name,
+            scope_str,
+            raw_sym.start_line,
+        );
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
