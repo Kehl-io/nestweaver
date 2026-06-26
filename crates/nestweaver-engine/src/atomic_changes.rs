@@ -270,6 +270,91 @@ pub fn compute_file_changes(
     ))
 }
 
+/// Compute all atomic changes in the working tree vs the last indexed state.
+///
+/// 1. Run `git diff --name-only HEAD` to find changed files
+/// 2. For each changed file that's a supported language:
+///    a. Read the old content from `git show HEAD:<file>`
+///    b. Read the new content from the working tree
+///    c. Diff symbols
+/// 3. Return the combined list of atomic changes
+pub fn compute_local_changes(
+    repo_path: &Path,
+    repo_url: &str,
+) -> Result<Vec<AtomicChange>, anyhow::Error> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    // Unstaged changes
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .context("git diff --name-only HEAD")?;
+
+    let changed_files: Vec<&str> = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Staged but not yet committed changes
+    let staged = Command::new("git")
+        .args(["diff", "--name-only", "--cached"])
+        .current_dir(repo_path)
+        .output()
+        .context("git diff --name-only --cached")?;
+
+    let staged_files: Vec<&str> = std::str::from_utf8(&staged.stdout)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut all_files: HashSet<String> = HashSet::new();
+    for f in changed_files.iter().chain(staged_files.iter()) {
+        all_files.insert(f.to_string());
+    }
+
+    let mut all_changes = Vec::new();
+
+    for file in &all_files {
+        let path = Path::new(file.as_str());
+        // Skip non-code files
+        if nestweaver_parser::detect_language(path).is_none() {
+            continue;
+        }
+
+        // Get old content from HEAD
+        let old_output = Command::new("git")
+            .args(["show", &format!("HEAD:{}", file)])
+            .current_dir(repo_path)
+            .output();
+
+        let old_content = match old_output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => String::new(), // New file -- no old content
+        };
+
+        // Get new content from working tree
+        let new_content = match std::fs::read_to_string(repo_path.join(file)) {
+            Ok(c) => c,
+            Err(_) => String::new(), // Deleted file -- no new content
+        };
+
+        if old_content.is_empty() && new_content.is_empty() {
+            continue;
+        }
+
+        match compute_file_changes(&old_content, &new_content, file, repo_url) {
+            Ok(changes) => all_changes.extend(changes),
+            Err(e) => {
+                tracing::warn!(file, error = %e, "failed to diff file, skipping");
+            }
+        }
+    }
+
+    Ok(all_changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,4 +464,122 @@ mod tests {
         assert_eq!(count_params("def foo(cls, a)"), 1);
     }
 
+    #[test]
+    fn compute_local_changes_detects_working_tree_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        // Initial commit
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn process(amount: f64) -> bool { true }",
+        )
+        .unwrap();
+        init_git_repo(&repo);
+        git_add_commit(&repo, "initial");
+
+        // Modify file (not committed)
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn process(amount: f64, currency: &str) -> bool { true }",
+        )
+        .unwrap();
+
+        let changes = compute_local_changes(&repo, REPO_URL).unwrap();
+        assert!(!changes.is_empty(), "should detect local changes");
+        let sig_change = changes
+            .iter()
+            .find(|c| matches!(c, AtomicChange::SignatureChanged { .. }));
+        assert!(
+            sig_change.is_some(),
+            "should detect signature change; got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn compute_local_changes_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        // Initial commit with one file
+        std::fs::write(repo.join("src/lib.rs"), "pub fn foo() {}").unwrap();
+        init_git_repo(&repo);
+        git_add_commit(&repo, "initial");
+
+        // Add new file (not committed)
+        std::fs::write(repo.join("src/bar.rs"), "pub fn bar() {}").unwrap();
+        // Stage it so git diff --cached picks it up
+        std::process::Command::new("git")
+            .args(["add", "src/bar.rs"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        let changes = compute_local_changes(&repo, REPO_URL).unwrap();
+        let added = changes.iter().find(
+            |c| matches!(c, AtomicChange::SymbolAdded { name, .. } if name == "bar"),
+        );
+        assert!(
+            added.is_some(),
+            "should detect new file symbols as added; got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn compute_local_changes_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        std::fs::write(repo.join("src/lib.rs"), "pub fn foo() {}").unwrap();
+        init_git_repo(&repo);
+        git_add_commit(&repo, "initial");
+
+        // No modifications
+        let changes = compute_local_changes(&repo, REPO_URL).unwrap();
+        assert!(
+            changes.is_empty(),
+            "should detect no changes; got: {:?}",
+            changes
+        );
+    }
+
+    // --- Test helpers ---
+
+    fn init_git_repo(path: &Path) {
+        use std::process::Command;
+        Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
+
+    fn git_add_commit(path: &Path, msg: &str) {
+        use std::process::Command;
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
 }
