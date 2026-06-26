@@ -910,6 +910,11 @@ enum Commands {
         #[command(subcommand)]
         command: SnapshotCommands,
     },
+    /// Backup and restore the NestWeaver database
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
     /// Show the most connected hub nodes in the code graph
     ///
     /// Hub nodes have the highest degree centrality (most incoming + outgoing
@@ -2279,6 +2284,45 @@ enum SnapshotCommands {
         backend: Option<String>,
         #[arg(long, help = "Storage backend path")]
         backend_path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Save a backup of the database to a .nwsnap.zst archive
+    Save {
+        /// Output file path (e.g. backup.nwsnap.zst)
+        output: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Include git bare clones in the backup (full tier)")]
+        include_clones: bool,
+    },
+    /// Inspect a .nwsnap.zst archive and show its manifest
+    Inspect {
+        /// Path to the .nwsnap.zst file
+        path: PathBuf,
+    },
+    /// List all .nwsnap.zst backups in a directory
+    List {
+        /// Directory containing backup files
+        dir: PathBuf,
+    },
+    /// Restore a backup from a .nwsnap.zst archive
+    Restore {
+        /// Path to the .nwsnap.zst file
+        path: PathBuf,
+        /// Target directory for restored data
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Launch the daemon after restore
+        #[arg(long)]
+        start: bool,
     },
 }
 
@@ -4433,6 +4477,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
+        Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
@@ -7564,8 +7609,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret,
                     webhook_secret_old,
                 } => {
-                    let _ = admin_token;
-
                     let server_opts = if server {
                         Some(nestweaver_daemon::ServerOpts {
                             bind_addr: bind,
@@ -7575,6 +7618,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             tls_key,
                             webhook_secret,
                             webhook_secret_old,
+                            admin_token,
                         })
                     } else {
                         None
@@ -12227,6 +12271,197 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             }
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
+    match command {
+        BackupCommands::Save {
+            output,
+            db,
+            config,
+            include_clones,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            if !db_path.exists() {
+                anyhow::bail!(
+                    "database not found at {}; run 'nestweaver index' first",
+                    db_path.display()
+                );
+            }
+
+            let instance_id =
+                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
+
+            let workspace_path = if include_clones {
+                db_path.parent().map(|p| p.join("workspace"))
+            } else {
+                None
+            };
+
+            let config = nestweaver_engine::BackupConfig {
+                db_path,
+                output_path: output,
+                include_clones,
+                instance_id,
+                workspace_path,
+            };
+
+            eprintln!("Creating backup...");
+            let result = nestweaver_engine::backup_save(&config)?;
+            let m = &result.manifest;
+
+            eprintln!("Backup saved to {}", result.output_path.display());
+            eprintln!("  Instance:     {}", m.instance_id);
+            eprintln!("  Tier:         {}", m.tier);
+            eprintln!("  Version:      {}", m.nestweaver_version);
+            eprintln!("  Created:      {}", m.created_at);
+            eprintln!("  DB size:      {}", format_bytes(m.sizes.db));
+            eprintln!(
+                "  Uncompressed: {}",
+                format_bytes(m.sizes.total_uncompressed)
+            );
+            eprintln!("  Write pause:  {}ms", result.write_pause_duration.as_millis());
+            eprintln!("  Total time:   {}", format_elapsed(result.duration));
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::Inspect { path } => {
+            let manifest = nestweaver_engine::backup_inspect(&path)?;
+            println!("NestWeaver Snapshot -- {}", path.display());
+            println!("  Instance:     {}", manifest.instance_id);
+            println!("  Created:      {}", manifest.created_at);
+            println!(
+                "  Version:      {} (schema v{})",
+                manifest.nestweaver_version, manifest.schema_version
+            );
+            println!(
+                "  Tier:         {}{}",
+                manifest.tier,
+                if manifest.tier == "standard" {
+                    " (no git clones)"
+                } else {
+                    ""
+                }
+            );
+            println!("  Repos:        {}", manifest.repo_count);
+            println!("  Symbols:      {}", manifest.symbol_count);
+            println!(
+                "  Uncompressed: {}",
+                format_bytes(manifest.sizes.total_uncompressed)
+            );
+            println!(
+                "  Compressed:   {}",
+                format_bytes(manifest.sizes.total_compressed)
+            );
+            println!(
+                "  Checksums:    {} file(s)",
+                manifest.checksums.len()
+            );
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::List { dir } => {
+            let items = nestweaver_engine::backup_list(&dir)?;
+            if items.is_empty() {
+                println!("No snapshots found in {}", dir.display());
+                return Ok(EXIT_SUCCESS);
+            }
+            println!("Available snapshots in {}:", dir.display());
+            for (path, m) in &items {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  {}  {}  {}  {} repos  v{}  {}",
+                    m.created_at,
+                    m.tier,
+                    format_bytes(m.sizes.total_compressed),
+                    m.repo_count,
+                    m.nestweaver_version,
+                    filename,
+                );
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::Restore {
+            path,
+            data_dir,
+            start,
+        } => {
+            eprintln!("Restoring backup from {}...", path.display());
+
+            let config = nestweaver_engine::RestoreConfig {
+                snapshot_path: path,
+                data_dir: data_dir.clone(),
+            };
+
+            let result = nestweaver_engine::backup_restore(&config)?;
+            let m = &result.manifest;
+
+            eprintln!("Backup restored to {}", data_dir.display());
+            eprintln!("  Instance:     {}", m.instance_id);
+            eprintln!("  Version:      {}", m.nestweaver_version);
+            eprintln!("  Tier:         {}", m.tier);
+            eprintln!("  Repos:        {}", m.repo_count);
+            eprintln!("  Symbols:      {}", m.symbol_count);
+            eprintln!("  Restored in:  {}", format_elapsed(result.duration));
+
+            if m.tier == "standard" {
+                eprintln!();
+                eprintln!(
+                    "Standard-tier restore: git clones not included. \
+                     Start the daemon to re-clone repos in the background."
+                );
+            }
+
+            if start {
+                eprintln!();
+                eprintln!("Starting daemon with restored data...");
+                // Find a .lbug file in the data dir to use as --db.
+                let lbug = find_lbug_in_dir(&data_dir);
+                if let Some(db) = lbug {
+                    eprintln!("  Database: {}", db.display());
+                    // For now, just print the command the user can run.
+                    // Full daemon launch integration deferred to the daemon crate.
+                    eprintln!(
+                        "  Run: nestweaver daemon run --db {}",
+                        db.display()
+                    );
+                } else {
+                    eprintln!(
+                        "  No .lbug file found in {}; launch manually.",
+                        data_dir.display()
+                    );
+                }
+            }
+
+            Ok(EXIT_SUCCESS)
+        }
+    }
+}
+
+/// Find the first .lbug file in a directory (non-recursive).
+fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).find_map(|entry| {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("lbug") && p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    })
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 

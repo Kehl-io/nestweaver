@@ -67,7 +67,7 @@ pub struct QueueInfo {
     pub drained: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DrainStatus {
     pub drained: bool,
     pub active_reads: u32,
