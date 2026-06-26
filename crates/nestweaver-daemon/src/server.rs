@@ -164,6 +164,29 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
             nestweaver_mcp::tools::set_server_mode(state.server_mode);
 
+            // In server mode, clamp depth and result limits per safeguard config
+            // before passing to the tool handler.
+            let mut args = args;
+            if state.server_mode {
+                // Clamp depth parameter.
+                let client_depth = args.get("depth").or_else(|| args.get("max_depth"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let effective_depth = state.safeguards.effective_depth(&tool_name, client_depth)?;
+                if args.get("depth").is_some() {
+                    args["depth"] = serde_json::json!(effective_depth);
+                } else if args.get("max_depth").is_some() {
+                    args["max_depth"] = serde_json::json!(effective_depth);
+                }
+
+                // Clamp result limit parameter.
+                let client_limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let effective_limit = state.safeguards.effective_result_limit(&tool_name, client_limit);
+                if args.get("limit").is_some() {
+                    args["limit"] = serde_json::json!(effective_limit);
+                }
+            }
+
             let embed_ref = embed_arc.as_deref();
             tracing::debug!(
                 has_model = embed_ref.is_some(),
