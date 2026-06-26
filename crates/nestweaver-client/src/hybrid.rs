@@ -746,26 +746,29 @@ pub struct TraceBoundary {
     pub parent_path: Vec<String>,
 }
 
-/// Detect boundary symbols in a flow_trace JSON result tree.
+/// Detect cross-repo boundary symbols in a flow_trace JSON result tree.
 ///
 /// A boundary is a leaf node whose `uid` refers to a symbol in a repo
 /// that is not locally indexed. We detect this by checking if the node's
 /// result came back as a leaf (no children) but the original call graph
-/// edge exists — meaning we couldn't follow it locally.
+/// edge exists -- meaning we couldn't follow it locally.
 ///
-/// In the current MCP implementation, boundary detection requires
-/// comparing the local repos against the repo_uid of each symbol. For
-/// the initial implementation, we return an empty list (no boundaries
-/// detected in the JSON output), and provide the `stitch_flow_trace`
-/// function for callers who can provide boundary info from the store.
+/// NOTE: Currently returns empty -- cross-boundary stitching requires
+/// `canonical_id` and repo metadata in the flow_trace JSON output,
+/// which is not yet available from the local daemon's response format.
+/// The flow_trace RPC returns a tree of symbol names and spans, but does
+/// not annotate nodes with their owning repo or canonical identifiers.
+///
+/// Integration path: modify `tool_flow_trace` to annotate boundary nodes
+/// with `"boundary": true` and `"canonical_id": "..."` when a callee's
+/// `repo_uid` doesn't match any locally indexed repo. Once that metadata
+/// is present, this function can walk the tree, identify boundaries, and
+/// return them for `stitch_server_spans` to continue the trace across
+/// upstream servers.
+///
+/// See architecture spec: cross-boundary-flow-trace.md
 pub fn detect_boundaries_in_trace(_result: &Value) -> Vec<TraceBoundary> {
-    // The current flow_trace JSON output doesn't include canonical_id or
-    // repo information in tree nodes, so we can't detect boundaries from
-    // the JSON alone. Boundary detection requires store-level knowledge.
-    //
-    // Integration path: modify tool_flow_trace to annotate boundary nodes
-    // with `"boundary": true` and `"canonical_id": "..."` when a callee's
-    // repo_uid doesn't match any locally indexed repo.
+    debug!("detect_boundaries_in_trace: returning empty — flow_trace JSON lacks canonical_id/repo metadata for boundary detection");
     vec![]
 }
 
