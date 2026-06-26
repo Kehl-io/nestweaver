@@ -2,8 +2,11 @@
 
 pub mod autostart;
 pub mod connect;
+pub mod dedup;
 pub mod discovery;
 pub mod hybrid;
+pub mod merge;
+pub mod routing;
 pub mod upstream;
 
 use std::path::{Path, PathBuf};
