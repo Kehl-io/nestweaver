@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{JsonRequest, JsonResponse};
 
-use crate::discovery::discover_upstreams;
+use crate::discovery::{discover_upstreams, RoutingMode};
 use crate::merge::rrf_merge;
 use crate::upstream::UpstreamHandle;
 use crate::DaemonClient;
@@ -134,6 +134,47 @@ impl HybridClient {
 
     // ── Query routing ─────────────────────────────────────────────────
 
+    /// Execute a query with routing based on the upstream's mode.
+    ///
+    /// - No upstreams: passes through to local.
+    /// - Fallback: query local first, query server only if local results
+    ///   are sparse (< threshold).
+    /// - Merge: query both in parallel, merge via weighted RRF + dedup.
+    /// - Primary: query server directly.
+    pub async fn query(
+        &mut self,
+        tool_name: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        let mode = self
+            .upstreams
+            .iter()
+            .find(|u| u.is_healthy())
+            .map(|u| u.mode)
+            .unwrap_or(RoutingMode::Fallback);
+
+        if !self.has_upstreams() {
+            return self.query_local(tool_name, params).await;
+        }
+
+        match mode {
+            RoutingMode::Fallback => self.query_fallback(tool_name, params).await,
+            RoutingMode::Merge => self.query_merge(tool_name, params).await,
+            RoutingMode::Primary => {
+                match self
+                    .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        warn!(error = %e, "primary upstream failed, falling back to local");
+                        self.query_local(tool_name, params).await
+                    }
+                }
+            }
+        }
+    }
+
     /// Fallback routing: query local first, query server only if local
     /// results are sparse (fewer than [`FALLBACK_THRESHOLD`]).
     pub async fn query_fallback(
@@ -178,6 +219,93 @@ impl HybridClient {
             Err(e) => {
                 debug!(error = %e, "fallback: server query failed, using local only");
                 Ok(local_result)
+            }
+        }
+    }
+
+    /// Merge routing: query both local and server in parallel, merge via
+    /// weighted RRF + scope-hash dedup.
+    pub async fn query_merge(
+        &mut self,
+        tool_name: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        if !self.has_upstreams() {
+            return self.query_local(tool_name, params).await;
+        }
+
+        // Prepare the server future before borrowing self.local mutably.
+        // Pick the first healthy upstream and clone its client (cheap channel clone).
+        let server_task = self
+            .upstreams
+            .iter()
+            .find(|u| u.is_healthy())
+            .map(|u| {
+                let timeout = u.timeout;
+                let mut client = u.client();
+                let tool = tool_name.to_string();
+                let p = params.clone();
+                async move {
+                    tokio::time::timeout(
+                        timeout,
+                        dispatch_json_rpc(&mut client, &tool, &p),
+                    )
+                    .await
+                }
+            });
+
+        let Some(server_fut) = server_task else {
+            return self.query_local(tool_name, params).await;
+        };
+
+        // Now borrow self.local mutably for the local query.
+        let local_fut = dispatch_json_rpc(self.local.inner_mut(), tool_name, params);
+
+        let (local_result, server_result) = tokio::join!(local_fut, server_fut);
+        let local = local_result?;
+
+        match server_result {
+            Ok(Ok(server)) => {
+                // Extract arrays from both, run RRF merge.
+                let local_items = extract_result_items(&local);
+                let server_items = extract_result_items(&server);
+
+                let merged = rrf_merge(local_items, server_items);
+
+                // Reconstruct the response with merged results + provenance.
+                let merged_values: Vec<Value> = merged
+                    .into_iter()
+                    .map(|mr| {
+                        let mut v = mr.value;
+                        if let Value::Object(ref mut map) = v {
+                            map.insert(
+                                "_provenance".to_string(),
+                                serde_json::to_value(mr.provenance)
+                                    .unwrap_or(Value::Null),
+                            );
+                            map.insert(
+                                "_confidence".to_string(),
+                                serde_json::to_value(mr.confidence)
+                                    .unwrap_or(Value::Null),
+                            );
+                            map.insert(
+                                "_rrf_score".to_string(),
+                                Value::from(mr.score),
+                            );
+                        }
+                        v
+                    })
+                    .collect();
+
+                Ok(wrap_merged_response(merged_values, &["local", "server"]))
+            }
+            Ok(Err(e)) => {
+                debug!(error = %e, "merge: server query failed, using local only");
+                Ok(local)
+            }
+            Err(_) => {
+                debug!("merge: server query timed out, using local only");
+                Ok(local)
             }
         }
     }
@@ -474,7 +602,7 @@ mod tests {
         assert!(count_results(&local) < FALLBACK_THRESHOLD);
     }
 
-    // ── Fallback merge helpers test ──────────────────────────────
+    // ── Merge helpers test ────────────────────────────────────────
 
     #[test]
     fn merge_json_results_deduplicates() {
@@ -523,6 +651,15 @@ mod tests {
         assert_eq!(wrapped["merged"], true);
         assert!(wrapped["sources"].is_array());
         assert!(wrapped["results"].is_array());
+    }
+
+    // ── Routing mode selection test ───────────────────────────────
+
+    #[test]
+    fn routing_mode_defaults_to_fallback() {
+        // When no upstreams, default mode should be Fallback.
+        let mode = RoutingMode::default();
+        assert_eq!(mode, RoutingMode::Fallback);
     }
 
     #[test]
