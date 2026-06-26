@@ -82,7 +82,7 @@ nestweaver-schema = { workspace = true }
 nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
 rmp-serde = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 miette = { version = "7", features = ["fancy"] }
 thiserror = { workspace = true }

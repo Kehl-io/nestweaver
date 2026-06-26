@@ -1020,3 +1020,16 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
         "embedding_model_id should NOT be the inference model"
     );
 }
+
+#[test]
+fn cli_daemon_run_server_help() {
+    nestweaver_cmd()
+        .args(["daemon", "run", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--server"))
+        .stdout(contains("--bind"))
+        .stdout(contains("--tls-cert"))
+        .stdout(contains("--auth-token"))
+        .stdout(contains("--port-file"));
+}

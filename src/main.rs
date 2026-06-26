@@ -1374,7 +1374,35 @@ enum DaemonAction {
     /// Show daemon status
     Status,
     /// Run daemon in foreground (used by launchd)
-    Run,
+    Run {
+        /// Enable server mode (TCP listener alongside UDS)
+        #[arg(long)]
+        server: bool,
+
+        /// TCP bind address for server mode
+        #[arg(long, default_value = "127.0.0.1:9378")]
+        bind: String,
+
+        /// Path to TLS certificate PEM file. Enables TLS when set.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+
+        /// Path to TLS private key PEM file
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+
+        /// Bearer token for query auth
+        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// Separate admin bearer token
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+
+        /// Write actual bound port to this file (for test harness)
+        #[arg(long)]
+        port_file: Option<PathBuf>,
+    },
     /// Stop and restart the daemon
     Restart {
         /// Idle timeout in seconds
@@ -6947,7 +6975,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
 
-                DaemonAction::Run => {
+                DaemonAction::Run {
+                    server,
+                    bind,
+                    tls_cert,
+                    tls_key,
+                    auth_token,
+                    admin_token,
+                    port_file,
+                } => {
+                    // Flags parsed but not wired up yet.
+                    let _ = server;
+                    let _ = bind;
+                    let _ = tls_cert;
+                    let _ = tls_key;
+                    let _ = auth_token;
+                    let _ = admin_token;
+                    let _ = port_file;
+
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
                         nestweaver_daemon::run_server(&db_path, None, None).await
