@@ -1,0 +1,29 @@
+services:
+  nestweaver:
+    build: .
+    # image: ghcr.io/kehl-io/nestweaver:latest  # when published
+    ports:
+      - "9377:9377"   # Web UI + Prometheus metrics
+      - "9378:9378"   # gRPC
+      - "9379:9379"   # MCP-over-HTTP
+      - "9380:9380"   # Webhook
+    volumes:
+      - ./instance.toml:/etc/nestweaver/instance.toml:ro
+      - nestweaver-data:/data/nestweaver
+    environment:
+      - NESTWEAVER_AUTH_TOKEN=${NESTWEAVER_AUTH_TOKEN}
+      - NESTWEAVER_ADMIN_TOKEN=${NESTWEAVER_ADMIN_TOKEN}
+      - NESTWEAVER_WEBHOOK_SECRET=${WEBHOOK_SECRET}
+    command:
+      [
+        "daemon", "run",
+        "--server",
+        "--bind", "0.0.0.0:9378",
+        "--db", "/data/nestweaver/brain.lbug",
+        "--config", "/etc/nestweaver/instance.toml"
+      ]
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  nestweaver-data:

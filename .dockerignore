@@ -1,0 +1,8 @@
+target/
+.git/
+node_modules/
+*.lbug
+*.lbug.*
+test-results/
+.claude/
+.nestweaver/
