@@ -313,7 +313,7 @@ fn dispatch_uncached(
         "blast_radius" => tool_blast_radius(store, args),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
-        "regex_search" => tool_regex_search(store, args),
+        "regex_search" => tool_regex_search(store, tantivy, args),
         "count_patterns" => tool_count_patterns(store, args),
         "brain_broken_links" => tool_brain_broken_links(store, args),
         "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
@@ -709,12 +709,59 @@ fn tool_schema_read_symbols() -> Value {
 /// F3: trigram-accelerated regex search over indexed text. Lets agents run a
 /// real regex against Section bodies, Note titles, and Symbol signatures
 /// without shelling out to rg/grep.
-fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_regex_search(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
     let pattern = args
         .get("pattern")
         .or_else(|| args.get("query"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
+
+    // In server mode there are no source files to grep — redirect to
+    // Tantivy FTS which searches the indexed text (note bodies, symbol
+    // signatures, section content).
+    if is_server_mode() {
+        if let Some(idx) = tantivy {
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(20);
+            let hits = idx
+                .search(pattern, limit)
+                .map_err(|e| anyhow!("tantivy search (regex_search redirect): {e}"))?;
+            let results: Vec<Value> = hits
+                .iter()
+                .map(|hit| {
+                    json!({
+                        "uid": hit.uid,
+                        "kind": hit.kind,
+                        "title": hit.title,
+                        "score": hit.score,
+                    })
+                })
+                .collect();
+            let total = results.len();
+            return Ok(json!({
+                "results": results,
+                "total_matches": total,
+                "truncated": false,
+                "server_note": format!(
+                    "Running in server mode — no source files to scan. \
+                     regex_search redirected to Tantivy FTS with pattern '{}'. \
+                     Results are BM25-ranked text matches, not regex matches. \
+                     For precise regex matching, use a local client with filesystem access.",
+                    pattern
+                ),
+            }));
+        }
+        // No Tantivy available — fall through to the graph-based regex_search
+        // which searches indexed text in the graph store.
+    }
+
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
     let limit = args
