@@ -54,7 +54,7 @@
         exit 0
       fi
     - |
-      nestweaver impact format-comment \
+      nestweaver format-comment \
         --input impact.json \
         --gitlab-project "$CI_PROJECT_ID" \
         --mr "$CI_MERGE_REQUEST_IID" \
