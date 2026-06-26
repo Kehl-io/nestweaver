@@ -3330,15 +3330,32 @@ pub async fn run_server(
         let poll_store = Arc::clone(&state.store);
         let poll_db = db_path.clone();
         let poll_instance = instance_id.clone();
+        let poll_cfg = state.instance_cfg.clone();
         let mut poll_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
             let mut scheduler =
                 PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
-            // Populate repos from store
+
+            // Seed from config repos first (includes unindexed repos).
+            let mut seeded_urls = std::collections::HashSet::new();
+            if let Some(ref cfg) = poll_cfg {
+                for repo_cfg in &cfg.repos {
+                    let repo_name = repo_cfg.name.clone().unwrap_or_else(|| {
+                        nestweaver_engine::pull::repo_name_from_url(&repo_cfg.url)
+                    });
+                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), None);
+                    seeded_urls.insert(repo_cfg.url.clone());
+                }
+            }
+
+            // Also seed any already-indexed repos not in the config (legacy).
             if let Ok(repos) = poll_store.list_repos(Some(&poll_instance)) {
                 for repo in repos {
+                    if seeded_urls.contains(&repo.url) {
+                        continue;
+                    }
                     let repo_name = repo
                         .name
                         .clone()
@@ -3346,16 +3363,20 @@ pub async fn run_server(
                     scheduler.add_repo(repo_name, repo.url.clone(), None);
                 }
             }
+
             loop {
                 tokio::select! {
                     _ = poll_shutdown.changed() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {
                         let due = scheduler.due_repos();
                         for (repo_id, repo_url) in due {
-                            // Check if repo has new commits via ls-remote
+                            // Determine which branch ref to check. Default to
+                            // HEAD (symref of the remote's default branch) for
+                            // the ls-remote so we aren't hardcoded to "main".
                             let url = repo_url.clone();
+                            let ref_spec = "HEAD".to_string();
                             if let Ok(output) = std::process::Command::new("git")
-                                .args(["ls-remote", "--heads", &url, "refs/heads/main"])
+                                .args(["ls-remote", &url, &ref_spec])
                                 .output()
                             {
                                 let remote_sha = String::from_utf8_lossy(&output.stdout)
@@ -3364,7 +3385,6 @@ pub async fn run_server(
                                 let indexed_sha = poll_store.lookup_repo(&r_uid)
                                     .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
                                 if !remote_sha.is_empty() && remote_sha != indexed_sha {
-                                    // Enqueue re-index job if job queue is available
                                     let jobs_path = nestweaver_engine::sidecar_path(&poll_db, ".jobs.sqlite");
                                     if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
                                         let _ = queue.upsert(&repo_id, &url, nestweaver_engine::jobs::JobTrigger::Poll);
