@@ -3833,11 +3833,13 @@ version = "2.1.1"
 dependencies = [
  "anyhow",
  "dirs",
+ "glob",
  "hyper-util",
  "libc",
  "nestweaver-daemon",
  "nestweaver-proto",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
