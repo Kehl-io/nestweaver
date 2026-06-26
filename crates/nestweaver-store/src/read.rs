@@ -492,6 +492,84 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
+    /// Returns `None` if no symbol has this canonical_id.
+    pub fn symbol_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Option<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.canonical_id = $cid RETURN {} LIMIT 1",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("cid", Value::String(canonical_id.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Some(row_to_symbol(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns all Symbol nodes that have any incoming edge (CALLS, IMPORTS,
+    /// EXTENDS_SYM, IMPLEMENTS_SYM, INCLUDES_SYM) pointing TO `uid`.
+    /// Used by impact analysis for SymbolRemoved/ExportRemoved changes.
+    pub fn references_to(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let edge_types = [
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+        ];
+        let mut all: Vec<Symbol> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!(
+                "MATCH (s:Symbol)-[:{}]->(t:Symbol {{uid: $uid}}) RETURN {}",
+                et, SYMBOL_COLUMNS
+            );
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let sym = row_to_symbol(&row)?;
+                if seen.insert(sym.uid.clone()) {
+                    all.push(sym);
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    /// Returns all Symbol nodes that have an IMPORTS edge pointing TO `uid`.
+    /// Used by impact analysis for SymbolRenamed changes.
+    pub fn importers_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol)-[:IMPORTS]->(t:Symbol {{uid: $uid}}) RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
     /// Returns all CROSS_REPO_LINK edges in the graph, up to `limit` rows.
     ///
     /// Each row includes the source and target symbol names plus their repo UIDs
@@ -1192,6 +1270,15 @@ impl GraphStore {
     ) -> Result<Option<nestweaver_schema::Repo>, StoreError> {
         let repos = self.list_repos(None)?;
         Ok(repos.into_iter().find(|r| r.uid == repo_uid))
+    }
+
+    /// Returns the repo URL for a given repo UID, or an empty string if
+    /// the repo is not found.
+    pub fn repo_url_for_uid(&self, repo_uid: &str) -> Option<String> {
+        self.lookup_repo(repo_uid)
+            .ok()
+            .flatten()
+            .map(|r| r.url)
     }
 
     /// Returns all Symbol nodes and code-level edges for clustering.

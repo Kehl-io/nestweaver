@@ -314,6 +314,101 @@ message EmbedResponse {
   uint32 failed = 2;
 }
 
+// ─── Impact Analysis (Phase 4) ──────────────────────────────────────
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  SYMBOL_ADDED = 1;
+  SYMBOL_REMOVED = 2;
+  SIGNATURE_CHANGED = 3;
+  SYMBOL_RENAMED = 4;
+  SYMBOL_MOVED = 5;
+  EXPORT_ADDED = 6;
+  EXPORT_REMOVED = 7;
+}
+
+message AtomicChangeProto {
+  ChangeKind kind = 1;
+  string canonical_id = 2;
+  string name = 3;
+  optional string old_signature = 4;
+  optional string new_signature = 5;
+  optional string old_name = 6;
+  optional string new_name = 7;
+  optional string old_file = 8;
+  optional string new_file = 9;
+  string file_path = 10;
+  string symbol_kind = 11;
+}
+
+message ImpactAnalysisRequest {
+  repeated AtomicChangeProto changes = 1;
+  string source_repo_url = 2;
+  int32 max_depth = 3;
+  bool include_tests = 4;
+}
+
+enum Severity {
+  SEVERITY_BREAKING = 0;
+  SEVERITY_WARNING = 1;
+  SEVERITY_INFO = 2;
+}
+
+message ImpactItem {
+  string change_canonical_id = 1;
+  ChangeKind change_kind = 2;
+  string affected_canonical_id = 3;
+  string affected_name = 4;
+  string affected_repo_url = 5;
+  string affected_file = 6;
+  int32 affected_line = 7;
+  string affected_signature = 8;
+  Severity severity = 9;
+  string reason = 10;
+}
+
+message ImpactAnalysisResponse {
+  repeated ImpactItem impacts = 1;
+  int32 total_impacted_files = 2;
+  int32 total_impacted_repos = 3;
+  repeated string impacted_repo_urls = 4;
+}
+
+// ─── Flow Trace Continuation (Phase 4) ────────────────────────────
+
+message TraceSpanProto {
+  string trace_id = 1;
+  string span_id = 2;
+  optional string parent_span_id = 3;
+  string canonical_id = 4;
+  string name = 5;
+  string repo_url = 6;
+  string file_path = 7;
+  int32 start_line = 8;
+  repeated string callee_span_ids = 9;
+  string source = 10;  // "local" or server name
+}
+
+message BoundarySymbolProto {
+  string canonical_id = 1;
+  string name = 2;
+  string parent_span_id = 3;
+}
+
+message FlowTraceContinueRequest {
+  string trace_id = 1;
+  string entry_canonical_id = 2;
+  string parent_span_id = 3;
+  int32 remaining_depth = 4;
+  repeated string visited_canonical_ids = 5;
+}
+
+message FlowTraceContinueResponse {
+  repeated TraceSpanProto spans = 1;
+  repeated BoundarySymbolProto boundaries = 2;
+  bool truncated = 3;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -350,6 +445,9 @@ service NestWeaverDaemon {
   // UI
   rpc ServeUi(ServeUiRequest) returns (ServeUiResponse);
 
+  // Phase 4 — typed RPCs
+  rpc FlowTraceContinue(FlowTraceContinueRequest) returns (FlowTraceContinueResponse);
+
   // Read RPCs — typed hot-path
   rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
   rpc GetContext(BrainContextRequest) returns (BrainContextResponse);
@@ -365,6 +463,9 @@ service NestWeaverDaemon {
   rpc FlowTrace(JsonRequest) returns (JsonResponse);
   rpc BlastRadius(JsonRequest) returns (JsonResponse);
   rpc Impact(JsonRequest) returns (JsonResponse);
+
+  // Phase 4: typed impact analysis with Chianti-style atomic changes
+  rpc ImpactAnalysis(ImpactAnalysisRequest) returns (ImpactAnalysisResponse);
   rpc BrainGuide(JsonRequest) returns (JsonResponse);
   rpc BrainDiff(JsonRequest) returns (JsonResponse);
   rpc ReadSymbols(JsonRequest) returns (JsonResponse);

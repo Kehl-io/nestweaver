@@ -1935,6 +1935,42 @@ impl NestWeaverDaemon for DaemonService {
         result.map(Response::new)
     }
 
+    // ── Phase 4 — typed RPCs ───────────────────────────────────────
+
+    async fn flow_trace_continue(
+        &self,
+        request: Request<FlowTraceContinueRequest>,
+    ) -> Result<Response<FlowTraceContinueResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            flow_trace_continue_impl(&state.store, req)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+
+        result.map(Response::new)
+    }
+
+    async fn impact_analysis(
+        &self,
+        request: Request<ImpactAnalysisRequest>,
+    ) -> Result<Response<ImpactAnalysisResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            impact_analysis_impl(&state.store, req)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+
+        result.map(Response::new)
+    }
+
     // ── Read RPCs — JSON pass-through ───────────────────────────────
 
     async fn get_backlinks(
@@ -3110,6 +3146,186 @@ pub async fn run_server(
     Ok(())
 }
 
+// ── FlowTraceContinue implementation ────────────────────────────────────
+
+/// Server-side flow trace continuation: given an entry symbol's canonical_id,
+/// walk the call graph forward up to `remaining_depth`, skipping visited
+/// symbols. Returns trace spans + boundary symbols (call targets not in
+/// this database).
+fn flow_trace_continue_impl(
+    store: &nestweaver_store::GraphStore,
+    req: FlowTraceContinueRequest,
+) -> Result<FlowTraceContinueResponse, Status> {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+
+    // Counter for generating unique span IDs within this request.
+    static SPAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let make_span_id = || {
+        let n = SPAN_COUNTER.fetch_add(1, AtomOrd::Relaxed);
+        format!("srv-{:016x}", n)
+    };
+
+    let max_depth = req.remaining_depth.max(0) as usize;
+    let trace_id = req.trace_id.clone();
+
+    // Build the visited set from the request.
+    let mut visited: HashSet<String> = req.visited_canonical_ids.into_iter().collect();
+
+    // Look up the entry symbol by canonical_id.
+    let entry = store
+        .symbol_by_canonical_id(&req.entry_canonical_id)
+        .map_err(|e| Status::internal(format!("canonical_id lookup failed: {e}")))?;
+
+    let Some(entry) = entry else {
+        // Entry symbol not found in this database — it's a boundary from
+        // this server's perspective. Return empty response.
+        return Ok(FlowTraceContinueResponse {
+            spans: vec![],
+            boundaries: vec![BoundarySymbolProto {
+                canonical_id: req.entry_canonical_id.clone(),
+                name: String::new(),
+                parent_span_id: req.parent_span_id.clone(),
+            }],
+            truncated: false,
+        });
+    };
+
+    // Get the repo URL for source annotation.
+    let repo_url = store
+        .repo_url_for_uid(&entry.repo_uid)
+        .unwrap_or_default();
+
+    let mut spans: Vec<TraceSpanProto> = Vec::new();
+    let mut boundaries: Vec<BoundarySymbolProto> = Vec::new();
+    let mut truncated = false;
+
+    // Recursive trace builder.
+    struct TraceCtx<'a> {
+        store: &'a nestweaver_store::GraphStore,
+        trace_id: String,
+        repo_url: String,
+        visited: HashSet<String>,
+        spans: Vec<TraceSpanProto>,
+        boundaries: Vec<BoundarySymbolProto>,
+        truncated: bool,
+        make_span_id: Box<dyn Fn() -> String>,
+    }
+
+    fn walk_trace(
+        ctx: &mut TraceCtx<'_>,
+        uid: &str,
+        canonical_id: &str,
+        name: &str,
+        file_path: &str,
+        start_line: u32,
+        parent_span_id: Option<&str>,
+        depth: usize,
+        max_depth: usize,
+    ) -> String {
+        let span_id = (ctx.make_span_id)();
+
+        // Mark this canonical_id as visited.
+        ctx.visited.insert(canonical_id.to_string());
+
+        let mut callee_span_ids = Vec::new();
+
+        if depth < max_depth {
+            let callees = ctx.store.callees_of(uid).unwrap_or_default();
+            for callee in &callees {
+                let callee_cid = callee
+                    .canonical_id
+                    .as_deref()
+                    .unwrap_or("");
+
+                // Skip visited symbols (cycle prevention).
+                if !callee_cid.is_empty() && ctx.visited.contains(callee_cid) {
+                    continue;
+                }
+
+                if callee_cid.is_empty() {
+                    // Symbol without canonical_id — skip as boundary.
+                    continue;
+                }
+
+                // Check if this callee is in the same repo (we have it locally).
+                // If callees_of returned it, it's in our database.
+                let child_span_id = walk_trace(
+                    ctx,
+                    &callee.uid,
+                    callee_cid,
+                    &callee.name,
+                    &callee.file_path,
+                    callee.start_line,
+                    Some(&span_id),
+                    depth + 1,
+                    max_depth,
+                );
+                callee_span_ids.push(child_span_id);
+            }
+        } else if depth >= max_depth {
+            // Check if there are callees we didn't follow due to depth limit.
+            let callees = ctx.store.callees_of(uid).unwrap_or_default();
+            if !callees.is_empty() {
+                ctx.truncated = true;
+            }
+        }
+
+        ctx.spans.push(TraceSpanProto {
+            trace_id: ctx.trace_id.clone(),
+            span_id: span_id.clone(),
+            parent_span_id: parent_span_id.map(String::from),
+            canonical_id: canonical_id.to_string(),
+            name: name.to_string(),
+            repo_url: ctx.repo_url.clone(),
+            file_path: file_path.to_string(),
+            start_line: start_line as i32,
+            callee_span_ids,
+            source: "server".to_string(),
+        });
+
+        span_id
+    }
+
+    let entry_cid = entry
+        .canonical_id
+        .as_deref()
+        .unwrap_or(&req.entry_canonical_id);
+
+    let mut ctx = TraceCtx {
+        store,
+        trace_id: trace_id.clone(),
+        repo_url: repo_url.clone(),
+        visited,
+        spans: Vec::new(),
+        boundaries: Vec::new(),
+        truncated: false,
+        make_span_id: Box::new(make_span_id),
+    };
+
+    walk_trace(
+        &mut ctx,
+        &entry.uid,
+        entry_cid,
+        &entry.name,
+        &entry.file_path,
+        entry.start_line,
+        if req.parent_span_id.is_empty() {
+            None
+        } else {
+            Some(&req.parent_span_id)
+        },
+        0,
+        max_depth,
+    );
+
+    Ok(FlowTraceContinueResponse {
+        spans: ctx.spans,
+        boundaries: ctx.boundaries,
+        truncated: ctx.truncated,
+    })
+}
+
 // ── Process title helper ────────────────────────────────────────────────
 
 #[cfg(all(
@@ -3169,5 +3385,164 @@ fn set_process_title(title: &str) {
         // Note: macOS doesn't provide setproctitle in the C library, so the daemon
         // process title cannot be modified on macOS. Users can identify the daemon
         // via pgrep using the socket path instead.
+    }
+}
+
+// ── ImpactAnalysis implementation ───────────────────────────────────────
+
+/// Server-side impact analysis: converts proto atomic changes to engine types,
+/// runs graph queries for affected symbols, and returns classified impacts.
+fn impact_analysis_impl(
+    store: &nestweaver_store::GraphStore,
+    req: ImpactAnalysisRequest,
+) -> Result<ImpactAnalysisResponse, Status> {
+    use nestweaver_engine::atomic_changes::{
+        analyze_impact, AtomicChange, ImpactSeverity,
+    };
+
+    // Convert proto AtomicChangeProto -> engine AtomicChange
+    let changes: Vec<AtomicChange> = req
+        .changes
+        .iter()
+        .filter_map(|proto| proto_to_atomic_change(proto))
+        .collect();
+
+    if changes.is_empty() {
+        return Ok(ImpactAnalysisResponse {
+            impacts: vec![],
+            total_impacted_files: 0,
+            total_impacted_repos: 0,
+            impacted_repo_urls: vec![],
+        });
+    }
+
+    let max_depth = if req.max_depth > 0 {
+        req.max_depth as u32
+    } else {
+        3 // default
+    };
+
+    let results = analyze_impact(store, &changes, max_depth, req.include_tests)
+        .map_err(|e| Status::internal(format!("impact analysis failed: {e}")))?;
+
+    // Collect unique impacted files and repos
+    let mut impacted_files = std::collections::HashSet::new();
+    let mut impacted_repos = std::collections::HashSet::new();
+
+    let impacts: Vec<ImpactItem> = results
+        .iter()
+        .map(|r| {
+            impacted_files.insert(r.affected_file.clone());
+            if !r.affected_repo_url.is_empty() {
+                impacted_repos.insert(r.affected_repo_url.clone());
+            }
+
+            let severity = match r.severity {
+                ImpactSeverity::Breaking => Severity::Breaking,
+                ImpactSeverity::Warning => Severity::Warning,
+                ImpactSeverity::Info => Severity::Info,
+            };
+
+            let change_kind = match r.change_kind.as_str() {
+                "SYMBOL_REMOVED" => ChangeKind::SymbolRemoved,
+                "SIGNATURE_CHANGED" => ChangeKind::SignatureChanged,
+                "SYMBOL_RENAMED" => ChangeKind::SymbolRenamed,
+                "SYMBOL_MOVED" => ChangeKind::SymbolMoved,
+                "EXPORT_REMOVED" => ChangeKind::ExportRemoved,
+                "EXPORT_ADDED" => ChangeKind::ExportAdded,
+                "SYMBOL_ADDED" => ChangeKind::SymbolAdded,
+                _ => ChangeKind::Unspecified,
+            };
+
+            ImpactItem {
+                change_canonical_id: r.change_canonical_id.clone(),
+                change_kind: change_kind.into(),
+                affected_canonical_id: r.affected_canonical_id.clone(),
+                affected_name: r.affected_name.clone(),
+                affected_repo_url: r.affected_repo_url.clone(),
+                affected_file: r.affected_file.clone(),
+                affected_line: r.affected_line as i32,
+                affected_signature: r.affected_signature.clone(),
+                severity: severity.into(),
+                reason: r.reason.clone(),
+            }
+        })
+        .collect();
+
+    let impacted_repo_urls: Vec<String> = impacted_repos.into_iter().collect();
+
+    Ok(ImpactAnalysisResponse {
+        impacts,
+        total_impacted_files: impacted_files.len() as i32,
+        total_impacted_repos: impacted_repo_urls.len() as i32,
+        impacted_repo_urls,
+    })
+}
+
+/// Convert a proto AtomicChangeProto to an engine AtomicChange.
+fn proto_to_atomic_change(
+    proto: &AtomicChangeProto,
+) -> Option<nestweaver_engine::atomic_changes::AtomicChange> {
+    use nestweaver_engine::atomic_changes::AtomicChange;
+    use nestweaver_schema::SymbolKind;
+
+    let kind = ChangeKind::try_from(proto.kind).unwrap_or(ChangeKind::Unspecified);
+    let parse_kind = |s: &str| -> SymbolKind {
+        match s {
+            "Function" => SymbolKind::Function,
+            "Class" => SymbolKind::Class,
+            "Method" => SymbolKind::Method,
+            "Interface" => SymbolKind::Interface,
+            "Trait" => SymbolKind::Trait,
+            "Enum" => SymbolKind::Enum,
+            "Module" => SymbolKind::Module,
+            _ => SymbolKind::Function,
+        }
+    };
+
+    match kind {
+        ChangeKind::SymbolAdded => Some(AtomicChange::SymbolAdded {
+            name: proto.name.clone(),
+            kind: parse_kind(&proto.symbol_kind),
+            signature: proto.new_signature.clone().unwrap_or_default(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolRemoved => Some(AtomicChange::SymbolRemoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            kind: parse_kind(&proto.symbol_kind),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SignatureChanged => Some(AtomicChange::SignatureChanged {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            old_signature: proto.old_signature.clone().unwrap_or_default(),
+            new_signature: proto.new_signature.clone().unwrap_or_default(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolRenamed => Some(AtomicChange::SymbolRenamed {
+            old_canonical_id: proto.canonical_id.clone(),
+            old_name: proto.old_name.clone().unwrap_or_default(),
+            new_name: proto.new_name.clone().unwrap_or_default(),
+            new_canonical_id: String::new(), // Computed client-side
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolMoved => Some(AtomicChange::SymbolMoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            old_file: proto.old_file.clone().unwrap_or_default(),
+            new_file: proto.new_file.clone().unwrap_or_default(),
+        }),
+        ChangeKind::ExportAdded => Some(AtomicChange::ExportAdded {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::ExportRemoved => Some(AtomicChange::ExportRemoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::Unspecified => None,
     }
 }
