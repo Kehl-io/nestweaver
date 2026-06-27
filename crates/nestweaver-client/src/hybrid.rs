@@ -1087,6 +1087,14 @@ fn merge_structured_results(local: &Value, server: &Value) -> Value {
         if !expansion.is_empty() {
             result["expansion_terms"] = Value::Array(expansion);
         }
+        // Carry over scalar metadata from the local response (project header,
+        // budget accounting, etc.) that the merge would otherwise drop.
+        for key in ["project", "project_uid", "seeds_expanded", "tokens_used",
+                     "token_budget", "external_refs"] {
+            if let Some(val) = local.get(key) {
+                result[key] = val.clone();
+            }
+        }
         inject_provenance(&mut result, &["local", "server"], &[]);
         result
     } else {
@@ -2113,6 +2121,35 @@ mod tests {
 
         let merged = merge_structured_results(&local, &server);
         assert!(merged.get("results").is_some());
+    }
+
+    #[test]
+    fn merge_structured_preserves_project_metadata() {
+        let local = json!({
+            "project": "billing",
+            "project_uid": "uid-123",
+            "seeds_expanded": 5,
+            "tokens_used": 1200,
+            "token_budget": 5000,
+            "external_refs": [{"url": "https://example.com"}],
+            "seeds": [{"uid": "s1"}],
+            "connected": [{"uid": "c1", "score": 0.9}],
+        });
+        let server = json!({
+            "project": "billing",
+            "project_uid": "uid-456",
+            "seeds": [],
+            "connected": [{"uid": "c2", "score": 0.8}],
+        });
+
+        let merged = merge_structured_results(&local, &server);
+
+        assert_eq!(merged["project"], "billing");
+        assert_eq!(merged["project_uid"], "uid-123");
+        assert_eq!(merged["seeds_expanded"], 5);
+        assert_eq!(merged["tokens_used"], 1200);
+        assert_eq!(merged["token_budget"], 5000);
+        assert!(merged.get("external_refs").is_some());
     }
 
     // ── Upstream repo-glob routing tests ─────────────────────────────
