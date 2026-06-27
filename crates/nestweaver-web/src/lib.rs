@@ -215,6 +215,18 @@ pub async fn start_server(
     open_browser: bool,
 ) -> anyhow::Result<()> {
     let app = create_router(state);
+    start_server_with_router(app, port, open_browser).await
+}
+
+/// Start the web UI server with a pre-built router.
+///
+/// This allows callers (e.g. the daemon's `serve_ui` RPC) to customise the
+/// router — for instance by nesting the admin API — before starting.
+pub async fn start_server_with_router(
+    app: Router,
+    port: u16,
+    open_browser: bool,
+) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("nestweaver-web listening on http://{addr}");

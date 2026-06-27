@@ -90,6 +90,9 @@ pub struct DaemonState {
     pub drained: Arc<AtomicBool>,
     /// Admin token for admin API authentication (separate from query token).
     pub admin_token: Option<String>,
+    /// Shared admin state, set once after construction. Used by `serve_ui`
+    /// to mount the admin API on the web UI server as well.
+    pub admin_state: std::sync::OnceLock<Arc<nestweaver_web::state::AdminState>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -839,9 +842,20 @@ impl NestWeaverDaemon for DaemonService {
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
 
+        // Build web UI router, mounting the admin API when available so the
+        // admin dashboard SPA can reach its backend on the same origin.
+        let mut web_router = nestweaver_web::create_router(app_state);
+        if let Some(admin_state) = state.admin_state.get() {
+            let admin_router = nestweaver_web::create_admin_router(admin_state.clone());
+            web_router = web_router.nest("/admin/api", admin_router);
+            tracing::info!("admin API also mounted on web UI server");
+        }
+
         // Spawn web server as a background task inside the daemon.
         tokio::spawn(async move {
-            if let Err(e) = nestweaver_web::start_server(app_state, port, open_browser).await {
+            if let Err(e) =
+                nestweaver_web::start_server_with_router(web_router, port, open_browser).await
+            {
                 tracing::error!("UI server error: {e}");
             }
         });
@@ -2934,6 +2948,7 @@ pub async fn run_server(
         rate_limiters: rate_limiters.clone(),
         drained: Arc::new(AtomicBool::new(false)),
         admin_token,
+        admin_state: std::sync::OnceLock::new(),
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
@@ -3218,6 +3233,10 @@ pub async fn run_server(
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
             });
+            // Store the admin state so serve_ui can mount the admin API on
+            // the web UI server as well (shared Arc = same state).
+            let _ = state.admin_state.set(admin_state.clone());
+
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);
             tracing::info!("admin API enabled at /admin/api/*");
