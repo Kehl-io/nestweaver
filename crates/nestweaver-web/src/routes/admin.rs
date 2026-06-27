@@ -198,6 +198,38 @@ pub async fn add_repo(
         )
     })??;
 
+    // Update live scheduler so the new repo is polled without restart.
+    if let Some(ref tx) = state.scheduler_tx {
+        let repo_name = nestweaver_engine::pull::repo_name_from_url(&req.url);
+        let _ = tx
+            .send(nestweaver_engine::scheduler::SchedulerCommand::AddRepo {
+                repo_id: repo_name,
+                repo_url: req.url.clone(),
+                poll_override: None,
+                branch: req.branch.clone(),
+            })
+            .await;
+    }
+
+    // Update webhook allowed repos so pushes are accepted immediately.
+    let canonical = nestweaver_engine::jobs::canonical_repo_id(&req.url);
+    if let Some(ref lock) = state.webhook_allowed_repos {
+        if let Ok(mut guard) = lock.write() {
+            if let Some(ref mut set) = *guard {
+                set.insert(canonical.clone());
+            }
+        }
+    }
+
+    // Update webhook branch map if a branch was specified.
+    if let Some(ref branch) = req.branch {
+        if let Some(ref lock) = state.webhook_repo_branches {
+            if let Ok(mut guard) = lock.write() {
+                guard.insert(canonical, branch.clone());
+            }
+        }
+    }
+
     Ok(Json(MessageResponse {
         message: format!("repo {} queued for indexing", req.url),
     }))
@@ -211,6 +243,21 @@ pub async fn remove_repo(
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let store = state.daemon_store.clone();
     let uid = repo_uid.clone();
+
+    // Look up the repo URL before deletion so we can clean up scheduler
+    // and webhook state afterwards.
+    let store_for_lookup = state.daemon_store.clone();
+    let uid_for_lookup = repo_uid.clone();
+    let repo_url: Option<String> = tokio::task::spawn_blocking(move || {
+        store_for_lookup
+            .lookup_repo(&uid_for_lookup)
+            .ok()
+            .flatten()
+            .map(|r| r.url)
+    })
+    .await
+    .ok()
+    .flatten();
 
     tokio::task::spawn_blocking(move || {
         store
@@ -242,6 +289,36 @@ pub async fn remove_repo(
             format!("task panicked: {e}"),
         )
     })??;
+
+    // Remove from live scheduler.
+    if let Some(ref tx) = state.scheduler_tx {
+        // The scheduler uses the repo name as its ID. Derive it from the
+        // URL (same logic as scheduler seeding), or fall back to the UID.
+        let sched_id = repo_url
+            .as_deref()
+            .map(nestweaver_engine::pull::repo_name_from_url)
+            .unwrap_or_else(|| repo_uid.clone());
+        let _ = tx
+            .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id: sched_id })
+            .await;
+    }
+
+    // Remove from webhook allowed repos.
+    if let Some(ref url) = repo_url {
+        let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
+        if let Some(ref lock) = state.webhook_allowed_repos {
+            if let Ok(mut guard) = lock.write() {
+                if let Some(ref mut set) = *guard {
+                    set.remove(&canonical);
+                }
+            }
+        }
+        if let Some(ref lock) = state.webhook_repo_branches {
+            if let Ok(mut guard) = lock.write() {
+                guard.remove(&canonical);
+            }
+        }
+    }
 
     Ok(Json(MessageResponse {
         message: format!("repo {} removed", repo_uid),
