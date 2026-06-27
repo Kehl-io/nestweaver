@@ -181,7 +181,7 @@ impl HybridClient {
                 match upstream.mode {
                     RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
                     RoutingMode::Merge => routing = ToolRouting::Merge,
-                    RoutingMode::Fallback => {} // keep per-tool default
+                    RoutingMode::Fallback => routing = ToolRouting::LocalFirst,
                 }
             }
         }
