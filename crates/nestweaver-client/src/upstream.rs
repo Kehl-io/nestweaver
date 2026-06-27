@@ -32,10 +32,11 @@ impl UpstreamHandle {
         // Normalize URL for tonic (needs http/https scheme).
         let url = normalize_url(&config.url);
 
+        let per_rpc_timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
         let channel = Channel::from_shared(url)
             .context("invalid upstream URL")?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
+            .timeout(per_rpc_timeout)
             .connect_lazy();
 
         let patterns: Vec<_> = config

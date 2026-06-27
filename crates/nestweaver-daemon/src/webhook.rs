@@ -6,7 +6,7 @@
 //! The handler never does indexing work — it returns 200 immediately and lets
 //! the worker pool handle the actual index update.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -35,6 +35,10 @@ pub struct WebhookState {
     /// Repos with `poll = "manual"` or not in the instance config are excluded.
     /// When `None`, all validly-signed webhooks are accepted (backwards-compat).
     pub allowed_repos: Option<HashSet<String>>,
+    /// Configured branch per repo (canonical_id → branch). When a webhook
+    /// fires for a repo with a configured branch, the job carries that branch
+    /// so the worker indexes the correct ref instead of defaulting to HEAD.
+    pub repo_branches: HashMap<String, String>,
 }
 
 /// POST /webhook — receives push events from GitHub/GitLab.
@@ -76,11 +80,12 @@ pub async fn handle_webhook(
         }
     }
 
-    // 3. Enqueue job — the worker discovers HEAD itself.
+    // 3. Enqueue job with the configured branch (if any).
     let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+    let branch = state.repo_branches.get(&repo_id).map(|s| s.as_str());
     let enqueue_result = {
         let queue = state.job_queue.lock().expect("job queue lock poisoned");
-        queue.upsert(&repo_id, &url, JobTrigger::Webhook, None)
+        queue.upsert(&repo_id, &url, JobTrigger::Webhook, branch)
     };
 
     if let Err(e) = enqueue_result {

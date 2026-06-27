@@ -275,7 +275,7 @@ fn process_job(
 
     // 3. Discover remote SHA — use the configured branch if set.
     let remote_sha = match &job.branch {
-        Some(branch) => bare.sha_for_ref(&format!("origin/{}", branch))?,
+        Some(branch) => bare.sha_for_ref(&format!("refs/heads/{}", branch))?,
         None => bare.head_sha()?,
     };
 

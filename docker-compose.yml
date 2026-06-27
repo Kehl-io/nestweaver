@@ -5,8 +5,7 @@ services:
     ports:
       - "9377:9377"   # Web UI + Prometheus metrics
       - "9378:9378"   # gRPC
-      - "9379:9379"   # MCP-over-HTTP
-      - "9380:9380"   # Webhook
+      - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:
       - ./instance.toml:/etc/nestweaver/instance.toml:ro
       - nestweaver-data:/data/nestweaver

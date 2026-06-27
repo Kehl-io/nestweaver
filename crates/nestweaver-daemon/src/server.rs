@@ -3155,6 +3155,23 @@ pub async fn run_server(
                         .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
                         .collect()
                 });
+            let repo_branches: std::collections::HashMap<String, String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .filter_map(|r| {
+                            r.branch.as_ref().map(|b| {
+                                (
+                                    nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                                    b.clone(),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
                 config: crate::webhook::WebhookConfig {
                     secret: secret.clone(),
@@ -3162,6 +3179,7 @@ pub async fn run_server(
                 },
                 job_queue: std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
                 allowed_repos,
+                repo_branches,
             });
             mcp_router = mcp_router.route(
                 "/webhook",

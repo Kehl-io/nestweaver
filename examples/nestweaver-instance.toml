@@ -146,25 +146,14 @@ min_symbol_name_length = 4
 # ── Server mode ──────────────────────────────────────────────────────────
 # Uncomment to enable server mode features.
 
-# [server]
-# bind = "0.0.0.0:9378"
-# auth_token = "${NESTWEAVER_AUTH_TOKEN}"
-# admin_token = "${NESTWEAVER_ADMIN_TOKEN}"
+# Server-mode settings. Note: bind, auth_token, admin_token, and webhook_secret
+# come from CLI flags (--bind, --auth-token, --admin-token, --webhook-secret)
+# or their corresponding environment variables, not the config file.
 
 # [server.indexing]
 # workers = 8
 # min_poll = "45s"
 # max_poll = "8h"
-
-# [server.webhook]
-# secret = "${NESTWEAVER_WEBHOOK_SECRET}"
-
-# [server.backup]
-# enabled = true
-# interval = "24h"
-# destination = "/backups"
-# tier = "standard"
-# retain = 7
 
 # ── Upstream servers (client-side) ───────────────────────────────────────
 # Connect your local daemon to a team server.

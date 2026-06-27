@@ -31,11 +31,16 @@ impl BareClone {
     }
 
     /// Fetch a specific branch from origin, or all refs if `branch` is `None`.
+    ///
+    /// For branch-specific fetches, uses an explicit refspec
+    /// (`<branch>:refs/heads/<branch>`) so the local ref is updated in the
+    /// bare repo. Without this, `git fetch origin <branch>` in a bare clone
+    /// only updates FETCH_HEAD, and `rev-parse origin/<branch>` fails.
     pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.path).args(["fetch", "origin"]);
         if let Some(b) = branch {
-            cmd.arg(b);
+            cmd.arg(format!("{b}:refs/heads/{b}"));
         }
         let output = cmd.output().context("failed to run git fetch")?;
         if !output.status.success() {

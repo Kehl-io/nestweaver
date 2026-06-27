@@ -401,6 +401,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Regex search over indexed text (section bodies, note titles, symbol signatures)
     ///
@@ -432,6 +434,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Count regex matches per pattern across indexed text (counts only)
     ///
@@ -459,6 +463,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Analyze blast radius: what depends on this symbol
     ///
@@ -5443,6 +5449,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             max_millis,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5460,7 +5467,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ms) = max_millis {
                     args["max_millis"] = serde_json::json!(ms);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "regex_search", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "regex_search", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5534,6 +5542,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             kinds,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5546,7 +5555,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["kinds"] = serde_json::json!(k);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "count_patterns", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "count_patterns", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5580,6 +5589,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             root,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5592,7 +5602,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "read_symbols", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "read_symbols", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));

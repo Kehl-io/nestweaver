@@ -55,13 +55,6 @@ environment variables (see table above).
 workers = 8
 min_poll = "45s"
 max_poll = "8h"
-
-[server.backup]
-enabled = true
-interval = "24h"
-destination = "/backups"
-tier = "standard"
-retain = 7
 ```
 
 ---
@@ -447,14 +440,7 @@ nestweaver server backup inspect /backups/brain-2026-06-25T10-30-00.nwsnap.zst
 
 ### Automatic backups
 
-```toml
-[server.backup]
-enabled = true
-interval = "24h"         # backup every 24 hours
-destination = "/backups"
-tier = "standard"        # standard | compressed
-retain = 7               # keep 7 most recent backups
-```
+Backup configuration is planned for a future release. Use `nestweaver server backup save` (CLI) for manual backups.
 
 ---
 
@@ -470,11 +456,12 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/repos/{id}/reindex` | POST | Force reindex of a specific repo |
 | `/admin/api/reload` | POST | Reload server configuration |
 | `/admin/api/queue` | GET | View the indexing job queue |
-| `/admin/api/queue/drain` | POST | Pause job processing |
-| `/admin/api/queue/resume` | POST | Resume job processing |
-| `/admin/api/queue/dead-letter` | GET | View failed jobs |
-| `/admin/api/queue/dead-letter` | DELETE | Clear failed jobs |
-| `/admin/api/backup/save` | POST | Trigger a backup |
+| `/admin/api/drain` | POST | Pause job processing |
+| `/admin/api/resume` | POST | Resume job processing |
+| `/admin/api/drain/status` | GET | Check drain state |
+| `/admin/api/dead-letter` | GET | View failed jobs |
+| `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
+| `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
 | `/metrics` | GET | Prometheus metrics on `:9377` (no auth required) |
 
 ```bash
@@ -488,7 +475,7 @@ curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
 
 # Drain the queue (pause indexing)
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://localhost:9379/admin/api/queue/drain
+  http://localhost:9379/admin/api/drain
 ```
 
 ---
@@ -586,7 +573,7 @@ curl -v http://nestweaver.internal:9379/webhook
 
 # Check the admin queue for failed jobs
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9379/admin/api/queue/dead-letter
+  http://localhost:9379/admin/api/dead-letter
 ```
 
 ### High query latency
