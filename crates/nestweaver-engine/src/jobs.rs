@@ -922,4 +922,90 @@ mod tests {
         assert_eq!(depth.running, 1, "job should still be running");
         assert_eq!(depth.pending, 0, "should not create a new pending job");
     }
+
+    #[test]
+    fn upsert_stores_branch() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            Some("develop"),
+        )
+        .unwrap();
+
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(job.branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn upsert_updates_branch_on_conflict() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+
+        // Second upsert with a branch should update the stored branch.
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Poll,
+            Some("release/v2"),
+        )
+        .unwrap();
+
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(
+            job.branch.as_deref(),
+            Some("release/v2"),
+            "branch should be updated on upsert"
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_branch_when_new_is_none() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            Some("develop"),
+        )
+        .unwrap();
+
+        // Upsert with None branch should keep the existing branch.
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Poll,
+            None,
+        )
+        .unwrap();
+
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(
+            job.branch.as_deref(),
+            Some("develop"),
+            "branch should be preserved when new upsert has None"
+        );
+    }
+
+    #[test]
+    fn claimed_job_without_branch_has_none() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert!(job.branch.is_none(), "branch should be None when not set");
+    }
 }

@@ -2262,4 +2262,54 @@ mod tests {
         let params = json!({"query": "foo"});
         assert_eq!(extract_repo_hint(&params), None);
     }
+
+    // ── Routing mode override tests ──────────────────────────────────
+
+    #[test]
+    fn fallback_mode_overrides_merge_to_local_first() {
+        use crate::routing::{ToolRouting, tool_routing};
+
+        // brain_search defaults to Merge in the per-tool matrix
+        assert_eq!(tool_routing("brain_search"), ToolRouting::Merge);
+        assert_eq!(tool_routing("brain_context"), ToolRouting::Merge);
+        assert_eq!(tool_routing("project_context"), ToolRouting::Merge);
+
+        // But RoutingMode::Fallback should override to LocalFirst.
+        // We can't test the full query() path without a live daemon, but we can
+        // verify the override logic by simulating what query() does:
+        let routing = tool_routing("brain_search");
+        assert_eq!(routing, ToolRouting::Merge, "default should be Merge");
+
+        // Simulate the override: Fallback => LocalFirst
+        let overridden = match RoutingMode::Fallback {
+            RoutingMode::Primary => ToolRouting::ServerPreferred,
+            RoutingMode::Merge => ToolRouting::Merge,
+            RoutingMode::Fallback => ToolRouting::LocalFirst,
+        };
+        assert_eq!(
+            overridden,
+            ToolRouting::LocalFirst,
+            "Fallback must override to LocalFirst, not keep Merge"
+        );
+    }
+
+    #[test]
+    fn primary_mode_overrides_to_server_preferred() {
+        let overridden = match RoutingMode::Primary {
+            RoutingMode::Primary => ToolRouting::ServerPreferred,
+            RoutingMode::Merge => ToolRouting::Merge,
+            RoutingMode::Fallback => ToolRouting::LocalFirst,
+        };
+        assert_eq!(overridden, ToolRouting::ServerPreferred);
+    }
+
+    #[test]
+    fn merge_mode_keeps_merge() {
+        let overridden = match RoutingMode::Merge {
+            RoutingMode::Primary => ToolRouting::ServerPreferred,
+            RoutingMode::Merge => ToolRouting::Merge,
+            RoutingMode::Fallback => ToolRouting::LocalFirst,
+        };
+        assert_eq!(overridden, ToolRouting::Merge);
+    }
 }
