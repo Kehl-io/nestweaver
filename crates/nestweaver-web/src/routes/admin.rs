@@ -65,6 +65,10 @@ pub struct AddRepoRequest {
 pub struct QueueInfo {
     pub depth: u32,
     pub drained: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by_priority: Option<std::collections::HashMap<String, u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +76,26 @@ pub struct DrainStatus {
     pub drained: bool,
     pub active_reads: u32,
     pub active_writes: u32,
+}
+
+#[derive(Serialize)]
+pub struct RepoStats {
+    pub total: usize,
+    pub indexed: usize,
+    pub stale: usize,
+    pub dead_letter: usize,
+}
+
+#[derive(Serialize)]
+pub struct SymbolStats {
+    pub total: usize,
+}
+
+#[derive(Serialize)]
+pub struct QueueStats {
+    pub pending: u32,
+    pub running: u32,
+    pub dead_letter: usize,
 }
 
 #[derive(Serialize)]
@@ -85,6 +109,10 @@ pub struct AdminStatus {
     pub queue_depth: u32,
     pub drained: bool,
     pub version: String,
+    // Nested shapes expected by the React admin dashboard.
+    pub repos: RepoStats,
+    pub symbols: SymbolStats,
+    pub queue: QueueStats,
 }
 
 #[derive(Serialize)]
@@ -388,7 +416,12 @@ pub async fn trigger_reindex(
 pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -> Json<QueueInfo> {
     let depth = state.indexing_queue_depth.load(Ordering::Relaxed);
     let drained = state.drained.load(Ordering::Relaxed);
-    Json(QueueInfo { depth, drained })
+    Json(QueueInfo {
+        depth,
+        drained,
+        by_priority: None,
+        running: None,
+    })
 }
 
 // ── Drain/Resume ───────────────────────────────────────────────────────
@@ -458,7 +491,12 @@ pub async fn list_dead_letter(
                     "id": j.id,
                     "repo_id": j.repo_id,
                     "repo_url": j.repo_url,
+                    // Frontend-expected fields:
+                    "repo": j.repo_id,
                     "error": j.error_msg,
+                    "last_attempt": j.updated_at,
+                    "attempts": j.attempt,
+                    // Keep original fields for backwards compat:
                     "attempt": j.attempt,
                     "max_attempts": j.max_attempts,
                     "updated_at": j.updated_at,
@@ -759,10 +797,28 @@ pub async fn get_status(
     State(state): State<Arc<AdminState>>,
 ) -> Json<AdminStatus> {
     let store = state.daemon_store.clone();
-    let repo_count =
-        tokio::task::spawn_blocking(move || store.list_repos(None).map(|r| r.len()).unwrap_or(0))
-            .await
-            .unwrap_or(0);
+    let (repo_count, symbol_count) = tokio::task::spawn_blocking(move || {
+        let repos = store.list_repos(None).map(|r| r.len()).unwrap_or(0);
+        let symbols = store.count_symbols().unwrap_or(0);
+        (repos, symbols)
+    })
+    .await
+    .unwrap_or((0, 0));
+
+    // Count dead-letter entries for the nested stats.
+    let db_path = state.db_path.clone();
+    let dead_letter_count = tokio::task::spawn_blocking(move || {
+        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .ok()
+            .and_then(|q| q.dead_letters().ok())
+            .map(|d| d.len())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+
+    let queue_depth = state.indexing_queue_depth.load(Ordering::Relaxed);
 
     Json(AdminStatus {
         instance_id: state.instance_id.clone(),
@@ -771,9 +827,23 @@ pub async fn get_status(
         repo_count,
         active_reads: state.active_reads.load(Ordering::Relaxed),
         active_writes: state.active_writes.load(Ordering::Relaxed),
-        queue_depth: state.indexing_queue_depth.load(Ordering::Relaxed),
+        queue_depth,
         drained: state.drained.load(Ordering::Relaxed),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        repos: RepoStats {
+            total: repo_count,
+            indexed: repo_count,
+            stale: 0,
+            dead_letter: dead_letter_count,
+        },
+        symbols: SymbolStats {
+            total: symbol_count,
+        },
+        queue: QueueStats {
+            pending: queue_depth,
+            running: state.active_writes.load(Ordering::Relaxed),
+            dead_letter: dead_letter_count,
+        },
     })
 }
 
