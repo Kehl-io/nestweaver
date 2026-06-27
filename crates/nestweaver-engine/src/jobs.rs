@@ -282,12 +282,15 @@ impl JobQueue {
     }
 
     /// Mark a job as succeeded.
+    ///
+    /// Does NOT update `updated_at` — that column is only set by external
+    /// events (upsert). This ensures `requeue_if_stale` correctly detects
+    /// "an event arrived while running" without false positives.
     pub fn complete(&self, job_id: i64) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "UPDATE index_jobs
              SET status       = 'succeeded',
-                 completed_at = strftime('%s','now'),
-                 updated_at   = strftime('%s','now')
+                 completed_at = strftime('%s','now')
              WHERE id = ?1",
             params![job_id],
         )?;
@@ -872,6 +875,26 @@ mod tests {
 
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 1, "first claim should set attempt to 1");
+    }
+
+    #[test]
+    fn requeue_if_stale_does_not_trigger_on_normal_completion() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        q.complete(job.id).unwrap();
+        // No external event happened — should NOT requeue
+        assert_eq!(
+            q.requeue_if_stale("repo-1").unwrap(),
+            false,
+            "should not requeue when no external event arrived during indexing"
+        );
     }
 
     #[test]
