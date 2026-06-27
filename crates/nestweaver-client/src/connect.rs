@@ -27,8 +27,17 @@ pub async fn connect_upstream(
     };
 
     // Connect and validate via HealthCheck.
-    let channel = Channel::from_shared(grpc_url.clone())
-        .context("invalid upstream URL")?
+    let mut endpoint = Channel::from_shared(grpc_url.clone()).context("invalid upstream URL")?;
+
+    if let Some(ca_path) = ca_cert {
+        let pem = std::fs::read(ca_path)
+            .with_context(|| format!("failed to read CA cert: {}", ca_path.display()))?;
+        let ca = tonic::transport::Certificate::from_pem(pem);
+        let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
+        endpoint = endpoint.tls_config(tls).context("TLS config failed")?;
+    }
+
+    let channel = endpoint
         .connect()
         .await
         .context("failed to connect to upstream server")?;

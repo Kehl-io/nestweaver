@@ -320,6 +320,18 @@ pub async fn remove_repo(
         )
     })??;
 
+    // Purge any pending/running jobs to prevent re-indexing after removal.
+    if let Some(ref url) = repo_url {
+        let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+                let _ = queue.cancel_repo(&canonical);
+            }
+        })
+        .await;
+    }
+
     // Remove from live scheduler.
     if let Some(ref tx) = state.scheduler_tx {
         // The scheduler seeds repos with `repo_cfg.name.unwrap_or(repo_name_from_url(...))`.
@@ -346,8 +358,23 @@ pub async fn remove_repo(
             url_derived
         };
         let _ = tx
-            .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id: sched_id })
+            .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo {
+                repo_id: sched_id.clone(),
+            })
             .await;
+        // Also try the URL-derived name in case the config name didn't match
+        // (e.g., repo already removed from config, or name was customized).
+        let url_fallback = repo_url
+            .as_deref()
+            .map(nestweaver_engine::pull::repo_name_from_url)
+            .unwrap_or_default();
+        if !url_fallback.is_empty() && url_fallback != sched_id {
+            let _ = tx
+                .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo {
+                    repo_id: url_fallback,
+                })
+                .await;
+        }
     }
 
     // Remove from webhook allowed repos.
@@ -888,7 +915,7 @@ pub async fn get_status(
             total: symbol_count,
         },
         queue: QueueStats {
-            pending: queue_depth,
+            pending: queue_depth.saturating_sub(running_count),
             running: running_count,
             dead_letter: dead_letter_count,
         },

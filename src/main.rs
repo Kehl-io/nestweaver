@@ -7903,7 +7903,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 println!("    --tls-key {dir_display}/server-key.pem",);
                 println!();
                 println!("Clients connect with:");
-                println!("  --cacert {dir_display}/ca.pem");
+                println!("  nestweaver connect <url> --ca-cert {dir_display}/ca.pem");
                 println!();
 
                 let expiry_days = validity_days;

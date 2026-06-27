@@ -67,7 +67,6 @@ The server listens on three ports. Webhook and admin API endpoints are mounted a
 ┌─────────────────────────────────────────────────────────┐
 │                   NestWeaver Server                       │
 │                                                           │
-│  :9377  HTTP    Web UI + Prometheus /metrics               │
 │  :9378  gRPC    Query API (TCP + TLS)                     │
 │  :9379  HTTP    MCP-over-HTTP (AI agents)                 │
 │                  ├─ /webhook      (GitHub/GitLab push)    │
@@ -84,9 +83,10 @@ The server listens on three ports. Webhook and admin API endpoints are mounted a
   Dev A (local)   Dev B (local)   AI Agent (Claude/Cursor)
 ```
 
+`daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (:9377) is started separately via `nestweaver ui` and is not part of the server container default.
+
 | Port | Protocol | Auth | Purpose |
 |------|----------|------|---------|
-| 9377 | HTTP | None (bind to localhost in production) | Web UI graph visualization, Prometheus `/metrics` |
 | 9378 | gRPC | Bearer token (TLS recommended) | Primary query API for CLI clients and local daemons |
 | 9379 | HTTP | Bearer token / HMAC | MCP-over-HTTP for AI agents, plus `/webhook` (HMAC) and `/admin/api/*` (admin token) |
 
@@ -297,8 +297,9 @@ The client discovers upstream servers from (highest priority first):
 Check this file into your repo so every developer auto-connects:
 
 ```toml
+[upstream]
 url = "grpcs://nestweaver.internal:9378"
-token_env = "NESTWEAVER_TOKEN"    # read token from this env var
+token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
 ```
 
@@ -389,7 +390,7 @@ compatibility: BREAKING (function signature changed)
 nestweaver pre-push-impact origin/main...HEAD --format json
 
 # Post a formatted comment to the PR
-nestweaver pre-push-impact origin/main...HEAD --format json | nestweaver format-comment --input - | gh pr comment --body-file -
+nestweaver pre-push-impact --diff origin/main..HEAD --format json | nestweaver format-comment --input - | gh pr comment --body-file -
 ```
 
 ### Two-tier blast radius
@@ -452,7 +453,7 @@ Backup configuration is planned for a future release. Use `nestweaver backup sav
 
 ## Admin API
 
-The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` and requires the admin token. Prometheus metrics are served on the web UI port (`:9377`).
+The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` and requires the admin token.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -468,7 +469,7 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/dead-letter` | GET | View failed jobs |
 | `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
 | `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
-| `/metrics` | GET | Prometheus metrics on `:9377` (no auth required) |
+| `/metrics` | GET | Prometheus metrics (served on the web UI port when running `nestweaver ui`) |
 
 ```bash
 # List repos
@@ -497,7 +498,6 @@ services:
   nestweaver:
     image: ghcr.io/kehl-io/nestweaver:latest
     ports:
-      - "9377:9377"   # Web UI + metrics
       - "9378:9378"   # gRPC
       - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:
@@ -586,7 +586,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ```bash
 # Check Prometheus metrics
-curl http://localhost:9377/metrics | grep nestweaver_query
+curl http://localhost:9379/metrics | grep nestweaver_query
 
 # Expected p95 latencies (LAN):
 #   brain_search:    <50ms

@@ -147,6 +147,7 @@ impl JobQueue {
                 max_attempts INTEGER NOT NULL DEFAULT 4,
                 error_msg    TEXT,
                 branch       TEXT,
+                requeue_needed INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -154,8 +155,11 @@ impl JobQueue {
                 UNIQUE(repo_id)
             );",
         )?;
-        // Migration: add branch column to existing databases.
+        // Migrations: add columns to existing databases.
         let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN branch TEXT;");
+        let _ = conn.execute_batch(
+            "ALTER TABLE index_jobs ADD COLUMN requeue_needed INTEGER NOT NULL DEFAULT 0;",
+        );
         Ok(Self { conn })
     }
 
@@ -180,6 +184,7 @@ impl JobQueue {
                 max_attempts INTEGER NOT NULL DEFAULT 4,
                 error_msg    TEXT,
                 branch       TEXT,
+                requeue_needed INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -239,6 +244,8 @@ impl JobQueue {
                                  THEN 0 ELSE attempt END,
                branch     = CASE WHEN excluded.branch IS NOT NULL
                                  THEN excluded.branch ELSE branch END,
+               requeue_needed = CASE WHEN status = 'running' THEN 1
+                                     ELSE requeue_needed END,
                updated_at = strftime('%s','now')",
             params![repo_id, repo_url, trigger_str, priority, branch],
         )?;
@@ -257,6 +264,7 @@ impl JobQueue {
              SET status     = 'running',
                  started_at = strftime('%s','now'),
                  attempt    = attempt + 1,
+                 requeue_needed = 0,
                  updated_at = strftime('%s','now')
              WHERE id = (
                  SELECT id FROM index_jobs
@@ -307,16 +315,27 @@ impl JobQueue {
     /// Re-queue a completed repo if an upsert arrived while it was running.
     /// Call this after complete() to catch pushes that arrived mid-index.
     pub fn requeue_if_stale(&self, repo_id: &str) -> Result<bool, rusqlite::Error> {
-        // If the job was updated while running (updated_at > started_at),
-        // it means an upsert tried to queue a new event. Reset to pending.
+        // If an upsert arrived while the job was running, requeue_needed
+        // was set to 1. Reset to pending and clear the flag.
         let changed = self.conn.execute(
             "UPDATE index_jobs SET status = 'pending', attempt = 0,
+                    requeue_needed = 0,
                     updated_at = strftime('%s','now')
              WHERE repo_id = ?1 AND status = 'succeeded'
-               AND updated_at > started_at",
+               AND requeue_needed = 1",
             params![repo_id],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Delete all jobs for a repo (pending, running, succeeded, etc.).
+    /// Used by admin repo removal to prevent re-indexing after deletion.
+    pub fn cancel_repo(&self, repo_id: &str) -> Result<usize, rusqlite::Error> {
+        let deleted = self.conn.execute(
+            "DELETE FROM index_jobs WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        Ok(deleted)
     }
 
     /// Mark a job as failed.
