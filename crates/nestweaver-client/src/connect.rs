@@ -13,6 +13,7 @@ pub async fn connect_upstream(
     token: Option<&str>,
     name: Option<&str>,
     mode: RoutingMode,
+    ca_cert: Option<&std::path::Path>,
 ) -> Result<UpstreamConfig> {
     // Normalize URL — tonic needs an http(s) scheme.
     let grpc_url = if url.starts_with("http://") || url.starts_with("https://") {
@@ -74,7 +75,7 @@ pub async fn connect_upstream(
         repos: vec![],
         mode,
         timeout: "1s".to_string(),
-        ca_cert: None,
+        ca_cert: ca_cert.map(|p| p.display().to_string()),
     };
 
     let saved_path = save_upstream(&config)?;

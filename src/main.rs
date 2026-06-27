@@ -1466,6 +1466,9 @@ enum Commands {
         /// Routing mode: fallback (default), merge, or primary
         #[arg(long, default_value = "fallback")]
         mode: String,
+        /// Path to CA certificate PEM for self-signed TLS
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
     },
     /// Server management utilities
     Server {
@@ -7842,6 +7845,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             token,
             name,
             mode,
+            ca_cert,
         } => {
             let mode = match mode.as_str() {
                 "fallback" => nestweaver_client::discovery::RoutingMode::Fallback,
@@ -7858,6 +7862,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 token.as_deref(),
                 name.as_deref(),
                 mode,
+                ca_cert.as_deref(),
             )) {
                 Ok(_) => Ok((EXIT_SUCCESS, None)),
                 Err(e) => {
