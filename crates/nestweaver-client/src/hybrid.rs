@@ -170,7 +170,22 @@ impl HybridClient {
             return Ok(result);
         }
 
-        let routing = tool_routing(tool_name);
+        let mut routing = tool_routing(tool_name);
+
+        // Let the upstream's RoutingMode override the per-tool default.
+        // LocalOnly and TwoTier are never overridden (they have tool-specific
+        // semantics), but Merge/LocalFirst/ServerPreferred can be promoted.
+        if routing != ToolRouting::LocalOnly && routing != ToolRouting::TwoTier {
+            let repo_hint = extract_repo_hint(params);
+            if let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint) {
+                match upstream.mode {
+                    RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
+                    RoutingMode::Merge => routing = ToolRouting::Merge,
+                    RoutingMode::Fallback => {} // keep per-tool default
+                }
+            }
+        }
+
         match routing {
             ToolRouting::LocalOnly => {
                 let mut result = self.query_local(tool_name, params).await?;
