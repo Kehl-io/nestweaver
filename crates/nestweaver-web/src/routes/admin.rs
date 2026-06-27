@@ -599,25 +599,36 @@ pub async fn reload_config(
     if let Some(ref tx) = state.scheduler_tx {
         if let Some(ref config_path) = state.config_path {
             if let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path) {
-                let repos: Vec<_> = cfg.repos.iter().map(|r| {
-                    let repo_name = r.name.clone().unwrap_or_else(|| {
-                        nestweaver_engine::pull::repo_name_from_url(&r.url)
-                    });
-                    let poll_override = r.poll.as_deref().and_then(|p| match p {
-                        "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
-                        "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
-                        other => nestweaver_engine::config::parse_duration(other)
-                            .map(nestweaver_engine::scheduler::PollOverride::Fixed),
-                    });
-                    (repo_name, r.url.clone(), poll_override, r.branch.clone())
-                }).collect();
-                let new_min_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
-                let new_max_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
-                let _ = tx.send(nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig {
-                    repos,
-                    min_poll: new_min_poll,
-                    max_poll: new_max_poll,
-                }).await;
+                let repos: Vec<_> = cfg
+                    .repos
+                    .iter()
+                    .map(|r| {
+                        let repo_name = r
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&r.url));
+                        let poll_override = r.poll.as_deref().and_then(|p| match p {
+                            "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                            "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                            other => nestweaver_engine::config::parse_duration(other)
+                                .map(nestweaver_engine::scheduler::PollOverride::Fixed),
+                        });
+                        (repo_name, r.url.clone(), poll_override, r.branch.clone())
+                    })
+                    .collect();
+                let new_min_poll =
+                    nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
+                let new_max_poll =
+                    nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
+                let _ = tx
+                    .send(
+                        nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig {
+                            repos,
+                            min_poll: new_min_poll,
+                            max_poll: new_max_poll,
+                        },
+                    )
+                    .await;
             }
         }
     }

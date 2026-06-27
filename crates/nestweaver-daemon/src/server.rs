@@ -3114,7 +3114,8 @@ pub async fn run_server(
     // Create scheduler command channel. The sender goes into AdminState
     // so the reload endpoint can push commands; the receiver is consumed
     // by the scheduler task below.
-    let (scheduler_tx, scheduler_rx) = tokio::sync::mpsc::channel::<nestweaver_engine::scheduler::SchedulerCommand>(64);
+    let (scheduler_tx, scheduler_rx) =
+        tokio::sync::mpsc::channel::<nestweaver_engine::scheduler::SchedulerCommand>(64);
 
     // MCP-over-HTTP server — spawned alongside the gRPC servers.
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
@@ -3295,7 +3296,9 @@ pub async fn run_server(
             let worker_instance = instance_id.clone();
             let worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
-            let worker_count = state.instance_cfg.as_ref()
+            let worker_count = state
+                .instance_cfg
+                .as_ref()
                 .map(|c| c.server.indexing.workers)
                 .unwrap_or(2);
             let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
@@ -3353,7 +3356,7 @@ pub async fn run_server(
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
-        let mut scheduler_rx = scheduler_rx;  // move into the spawned task
+        let mut scheduler_rx = scheduler_rx; // move into the spawned task
         tokio::spawn(async move {
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
@@ -3373,15 +3376,18 @@ pub async fn run_server(
                     let repo_name = repo_cfg.name.clone().unwrap_or_else(|| {
                         nestweaver_engine::pull::repo_name_from_url(&repo_cfg.url)
                     });
-                    let poll_override = repo_cfg.poll.as_deref().and_then(|p| {
-                        match p {
-                            "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
-                            "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
-                            other => nestweaver_engine::config::parse_duration(other)
-                                .map(nestweaver_engine::scheduler::PollOverride::Fixed),
-                        }
+                    let poll_override = repo_cfg.poll.as_deref().and_then(|p| match p {
+                        "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                        "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                        other => nestweaver_engine::config::parse_duration(other)
+                            .map(nestweaver_engine::scheduler::PollOverride::Fixed),
                     });
-                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), poll_override, repo_cfg.branch.clone());
+                    scheduler.add_repo(
+                        repo_name,
+                        repo_cfg.url.clone(),
+                        poll_override,
+                        repo_cfg.branch.clone(),
+                    );
                     seeded_urls.insert(repo_cfg.url.clone());
                 }
             }

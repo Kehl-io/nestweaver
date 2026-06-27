@@ -327,9 +327,7 @@ impl HybridClient {
         let local = local_result?;
 
         match server_result {
-            Ok(Ok(server)) => {
-                Ok(merge_structured_results(&local, &server))
-            }
+            Ok(Ok(server)) => Ok(merge_structured_results(&local, &server)),
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
                 let mut result = local;
@@ -991,7 +989,9 @@ fn find_upstream_for_repo<'a>(
     repo_hint: Option<&str>,
 ) -> Option<&'a UpstreamHandle> {
     if let Some(repo) = repo_hint {
-        let matched = upstreams.iter().find(|u| u.is_healthy() && u.matches_repo(repo));
+        let matched = upstreams
+            .iter()
+            .find(|u| u.is_healthy() && u.matches_repo(repo));
         if matched.is_some() {
             return matched;
         }
@@ -1001,7 +1001,8 @@ fn find_upstream_for_repo<'a>(
 
 /// Extract a repo hint from query params — checks `repos[0]`, `repo`, `repo_url`.
 fn extract_repo_hint(params: &Value) -> Option<&str> {
-    params.get("repos")
+    params
+        .get("repos")
         .and_then(|v| v.as_array())
         .and_then(|a| a.first())
         .and_then(|v| v.as_str())
@@ -1070,25 +1071,43 @@ fn merge_structured_results(local: &Value, server: &Value) -> Value {
             .map(|mr| {
                 let mut v = mr.value;
                 if let Value::Object(ref mut map) = v {
-                    map.insert("_provenance".to_string(), serde_json::to_value(mr.provenance).unwrap_or(Value::Null));
-                    map.insert("_confidence".to_string(), serde_json::to_value(mr.confidence).unwrap_or(Value::Null));
+                    map.insert(
+                        "_provenance".to_string(),
+                        serde_json::to_value(mr.provenance).unwrap_or(Value::Null),
+                    );
+                    map.insert(
+                        "_confidence".to_string(),
+                        serde_json::to_value(mr.confidence).unwrap_or(Value::Null),
+                    );
                     map.insert("_rrf_score".to_string(), Value::from(mr.score));
                 }
                 v
             })
             .collect();
 
-        let mut seeds = local.get("seeds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut seeds = local
+            .get("seeds")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if let Some(server_seeds) = server.get("seeds").and_then(|v| v.as_array()) {
             seeds.extend(server_seeds.iter().cloned());
         }
 
-        let mut unresolved = local.get("unresolved_seeds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut unresolved = local
+            .get("unresolved_seeds")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if let Some(su) = server.get("unresolved_seeds").and_then(|v| v.as_array()) {
             unresolved.extend(su.iter().cloned());
         }
 
-        let mut expansion = local.get("expansion_terms").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut expansion = local
+            .get("expansion_terms")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if let Some(se) = server.get("expansion_terms").and_then(|v| v.as_array()) {
             expansion.extend(se.iter().cloned());
         }
@@ -1105,8 +1124,14 @@ fn merge_structured_results(local: &Value, server: &Value) -> Value {
         }
         // Carry over scalar metadata from the local response (project header,
         // budget accounting, etc.) that the merge would otherwise drop.
-        for key in ["project", "project_uid", "seeds_expanded", "tokens_used",
-                     "token_budget", "external_refs"] {
+        for key in [
+            "project",
+            "project_uid",
+            "seeds_expanded",
+            "tokens_used",
+            "token_budget",
+            "external_refs",
+        ] {
             if let Some(val) = local.get(key) {
                 result[key] = val.clone();
             }
@@ -1497,7 +1522,11 @@ fn uuid_v4_simple() -> String {
 /// 3. Combine into a response with `local_impact` and `org_impact` sections
 ///
 /// Used for blast_radius, brain_impact, and affected_tests.
-pub async fn two_tier_query(client: &mut HybridClient, tool_name: &str, params: &Value) -> Result<Value> {
+pub async fn two_tier_query(
+    client: &mut HybridClient,
+    tool_name: &str,
+    params: &Value,
+) -> Result<Value> {
     // 1. Always run the tool locally.
     let mut local_result = client.query_local(tool_name, params).await?;
 
@@ -1535,12 +1564,7 @@ pub async fn two_tier_query(client: &mut HybridClient, tool_name: &str, params: 
     let server_params = params.clone();
     let server_result = match tokio::time::timeout(
         timeout,
-        dispatch_json_rpc_authed(
-            &mut up_client,
-            &tool,
-            &server_params,
-            token.as_deref(),
-        ),
+        dispatch_json_rpc_authed(&mut up_client, &tool, &server_params, token.as_deref()),
     )
     .await
     {
@@ -2123,11 +2147,20 @@ mod tests {
 
         let merged = merge_structured_results(&local, &server);
 
-        assert!(merged.get("connected").is_some(), "connected field must be preserved");
-        assert!(merged.get("seeds").is_some(), "seeds field must be preserved");
+        assert!(
+            merged.get("connected").is_some(),
+            "connected field must be preserved"
+        );
+        assert!(
+            merged.get("seeds").is_some(),
+            "seeds field must be preserved"
+        );
         assert!(merged.get("_meta").is_some(), "_meta must be present");
         let connected = merged["connected"].as_array().unwrap();
-        assert!(connected.len() >= 3, "should merge connected items from both");
+        assert!(
+            connected.len() >= 3,
+            "should merge connected items from both"
+        );
     }
 
     #[test]
@@ -2217,7 +2250,10 @@ mod tests {
         assert_eq!(extract_repo_hint(&params), Some("partner/api"));
 
         let params = json!({"repo_url": "https://github.com/acme/api"});
-        assert_eq!(extract_repo_hint(&params), Some("https://github.com/acme/api"));
+        assert_eq!(
+            extract_repo_hint(&params),
+            Some("https://github.com/acme/api")
+        );
 
         let params = json!({"query": "foo"});
         assert_eq!(extract_repo_hint(&params), None);

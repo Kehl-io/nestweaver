@@ -574,24 +574,47 @@ pub struct IndexingConfig {
     pub max_poll: String,
 }
 
-fn default_workers() -> usize { 2 }
-fn default_min_poll() -> String { "45s".to_string() }
-fn default_max_poll() -> String { "8h".to_string() }
+fn default_workers() -> usize {
+    2
+}
+fn default_min_poll() -> String {
+    "45s".to_string()
+}
+fn default_max_poll() -> String {
+    "8h".to_string()
+}
 
 impl Default for IndexingConfig {
     fn default() -> Self {
-        Self { workers: default_workers(), min_poll: default_min_poll(), max_poll: default_max_poll() }
+        Self {
+            workers: default_workers(),
+            min_poll: default_min_poll(),
+            max_poll: default_max_poll(),
+        }
     }
 }
 
 pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     let (num_str, unit) = if s.ends_with("ms") {
-        (&s[..s.len()-2], "ms")
+        (&s[..s.len() - 2], "ms")
     } else {
         let last = s.chars().last()?;
-        (&s[..s.len()-1], if last == 's' { "s" } else if last == 'm' { "m" } else if last == 'h' { "h" } else { return None })
+        (
+            &s[..s.len() - 1],
+            if last == 's' {
+                "s"
+            } else if last == 'm' {
+                "m"
+            } else if last == 'h' {
+                "h"
+            } else {
+                return None;
+            },
+        )
     };
     let num: u64 = num_str.parse().ok()?;
     match unit {
@@ -1249,10 +1272,22 @@ path_deboost = []
 
     #[test]
     fn parse_duration_variants() {
-        assert_eq!(parse_duration("45s"), Some(std::time::Duration::from_secs(45)));
-        assert_eq!(parse_duration("5m"), Some(std::time::Duration::from_secs(300)));
-        assert_eq!(parse_duration("8h"), Some(std::time::Duration::from_secs(28800)));
-        assert_eq!(parse_duration("500ms"), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(
+            parse_duration("45s"),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(
+            parse_duration("5m"),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_duration("8h"),
+            Some(std::time::Duration::from_secs(28800))
+        );
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("bogus"), None);
     }

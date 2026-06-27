@@ -166,7 +166,11 @@ mod tests {
     fn two_tier_tools_are_distinct() {
         let tools = ["blast_radius", "brain_impact", "affected_tests"];
         for tool in &tools {
-            assert_eq!(tool_routing(tool), ToolRouting::TwoTier, "{tool} should be TwoTier");
+            assert_eq!(
+                tool_routing(tool),
+                ToolRouting::TwoTier,
+                "{tool} should be TwoTier"
+            );
         }
     }
 }

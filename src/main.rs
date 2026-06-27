@@ -3974,7 +3974,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── hybrid guard (routes through local + upstream) ────
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let start_dir =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config.as_deref(),
@@ -6551,7 +6552,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let start_dir =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config.as_deref(),
@@ -7667,7 +7669,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
-                        nestweaver_daemon::run_server(&db_path, None, config.as_deref(), server_opts).await
+                        nestweaver_daemon::run_server(
+                            &db_path,
+                            None,
+                            config.as_deref(),
+                            server_opts,
+                        )
+                        .await
                     })?;
                     Ok((EXIT_SUCCESS, None))
                 }
@@ -8635,9 +8643,7 @@ fn try_hybrid_json_rpc(
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut hybrid = rt
         .block_on(nestweaver_client::hybrid::HybridClient::connect(
-            db_path,
-            config,
-            &start_dir,
+            db_path, config, &start_dir,
         ))
         .ok()?;
     let result = rt.block_on(hybrid.query(rpc_name, &args)).ok()?;

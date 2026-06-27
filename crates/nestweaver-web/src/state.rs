@@ -79,5 +79,6 @@ pub struct AdminState {
     pub config_path: Option<std::path::PathBuf>,
     /// Channel to send commands to the live poll scheduler. `None` when no
     /// scheduler is running (non-server mode or no admin token).
-    pub scheduler_tx: Option<tokio::sync::mpsc::Sender<nestweaver_engine::scheduler::SchedulerCommand>>,
+    pub scheduler_tx:
+        Option<tokio::sync::mpsc::Sender<nestweaver_engine::scheduler::SchedulerCommand>>,
 }
