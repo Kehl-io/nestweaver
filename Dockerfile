@@ -11,4 +11,4 @@ COPY --from=builder /build/target/release/nestweaver /usr/local/bin/nestweaver
 VOLUME /data
 EXPOSE 9377 9378 9379
 ENTRYPOINT ["nestweaver"]
-CMD ["daemon", "run", "--server", "--config", "/etc/nestweaver/instance.toml"]
+CMD ["daemon", "--db", "/data/nestweaver/brain.lbug", "run", "--server", "--bind", "0.0.0.0:9378", "--config", "/etc/nestweaver/instance.toml"]
