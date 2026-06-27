@@ -202,10 +202,19 @@ impl HybridClient {
         }
     }
 
+    /// Resolve the configured timeout for the best-matching upstream.
+    fn upstream_timeout(&self, params: &Value) -> Duration {
+        let repo_hint = extract_repo_hint(params);
+        find_upstream_for_repo(&self.upstreams, repo_hint)
+            .map(|u| u.timeout)
+            .unwrap_or(UPSTREAM_TIMEOUT)
+    }
+
     /// Server-preferred routing: query upstream first, fall back to local.
     async fn query_server_preferred(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        let timeout = self.upstream_timeout(params);
         match self
-            .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
+            .query_upstream(tool_name, params, timeout)
             .await
         {
             Ok(mut r) => {
@@ -267,6 +276,7 @@ impl HybridClient {
         }
 
         // 4. Local results are sparse — query server with timeout.
+        let timeout = self.upstream_timeout(params);
         debug!(
             tool = tool_name,
             local_count,
@@ -274,7 +284,7 @@ impl HybridClient {
             "fallback: local results sparse, querying server"
         );
         match self
-            .query_upstream(tool_name, params, UPSTREAM_TIMEOUT)
+            .query_upstream(tool_name, params, timeout)
             .await
         {
             Ok(server_result) => {
