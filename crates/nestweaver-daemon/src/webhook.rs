@@ -6,6 +6,7 @@
 //! The handler never does indexing work — it returns 200 immediately and lets
 //! the worker pool handle the actual index update.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -30,6 +31,10 @@ pub struct WebhookConfig {
 pub struct WebhookState {
     pub config: WebhookConfig,
     pub job_queue: Arc<Mutex<JobQueue>>,
+    /// When `Some`, only repos whose canonical ID is in this set get enqueued.
+    /// Repos with `poll = "manual"` or not in the instance config are excluded.
+    /// When `None`, all validly-signed webhooks are accepted (backwards-compat).
+    pub allowed_repos: Option<HashSet<String>>,
 }
 
 /// POST /webhook — receives push events from GitHub/GitLab.
@@ -61,6 +66,15 @@ pub async fn handle_webhook(
     let Some(url) = extract_repo_url(&payload) else {
         return (StatusCode::BAD_REQUEST, "no repo URL in payload");
     };
+
+    // 2b. Check whether this repo is in the allowed set.
+    if let Some(ref allowed) = state.allowed_repos {
+        let canonical = nestweaver_engine::jobs::canonical_repo_id(&url);
+        if !allowed.contains(&canonical) {
+            tracing::info!(%url, "webhook ignored: repo not in allowed set");
+            return (StatusCode::OK, "ignored");
+        }
+    }
 
     // 3. Enqueue job — the worker discovers HEAD itself.
     let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);

@@ -3146,12 +3146,21 @@ pub async fn run_server(
             let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
             let job_queue = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
                 .expect("open webhook job queue");
+            let allowed_repos: Option<std::collections::HashSet<String>> =
+                state.instance_cfg.as_ref().map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .filter(|r| r.poll.as_deref() != Some("manual"))
+                        .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                        .collect()
+                });
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
                 config: crate::webhook::WebhookConfig {
                     secret: secret.clone(),
                     secret_old: opts.webhook_secret_old.clone(),
                 },
                 job_queue: std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+                allowed_repos,
             });
             mcp_router = mcp_router.route(
                 "/webhook",
