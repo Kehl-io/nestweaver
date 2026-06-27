@@ -3372,7 +3372,7 @@ pub async fn run_server(
                                 .map(nestweaver_engine::scheduler::PollOverride::Fixed),
                         }
                     });
-                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), poll_override);
+                    scheduler.add_repo(repo_name, repo_cfg.url.clone(), poll_override, repo_cfg.branch.clone());
                     seeded_urls.insert(repo_cfg.url.clone());
                 }
             }
@@ -3387,7 +3387,7 @@ pub async fn run_server(
                         .name
                         .clone()
                         .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
-                    scheduler.add_repo(repo_name, repo.url.clone(), None);
+                    scheduler.add_repo(repo_name, repo.url.clone(), None, None);
                 }
             }
 
@@ -3397,8 +3397,8 @@ pub async fn run_server(
                     cmd = scheduler_rx.recv() => {
                         if let Some(cmd) = cmd {
                             match cmd {
-                                nestweaver_engine::scheduler::SchedulerCommand::AddRepo { repo_id, repo_url, poll_override } => {
-                                    scheduler.add_repo(repo_id, repo_url, poll_override);
+                                nestweaver_engine::scheduler::SchedulerCommand::AddRepo { repo_id, repo_url, poll_override, branch } => {
+                                    scheduler.add_repo(repo_id, repo_url, poll_override, branch);
                                 }
                                 nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
                                     scheduler.remove_repo(&repo_id);
@@ -3407,8 +3407,8 @@ pub async fn run_server(
                                     if let Some(m) = new_min { min_poll = m; }
                                     if let Some(m) = new_max { max_poll = m; }
                                     scheduler = PollScheduler::new(min_poll, max_poll);
-                                    for (id, url, ovr) in repos {
-                                        scheduler.add_repo(id, url, ovr);
+                                    for (id, url, ovr, branch) in repos {
+                                        scheduler.add_repo(id, url, ovr, branch);
                                     }
                                     tracing::info!(count = scheduler.repo_count(), "scheduler reloaded from config");
                                 }
@@ -3421,12 +3421,13 @@ pub async fn run_server(
                             continue;
                         }
                         let due = scheduler.due_repos();
-                        for (repo_id, repo_url) in due {
-                            // Determine which branch ref to check. Default to
-                            // HEAD (symref of the remote's default branch) for
-                            // the ls-remote so we aren't hardcoded to "main".
+                        for (repo_id, repo_url, branch) in due {
+                            // Determine which branch ref to check. If the repo
+                            // config specifies a branch, use that ref; otherwise
+                            // fall back to HEAD (symref of the remote's default
+                            // branch) so we aren't hardcoded to "main".
                             let url = repo_url.clone();
-                            let ref_spec = "HEAD".to_string();
+                            let ref_spec = branch.unwrap_or_else(|| "HEAD".to_string());
                             if let Ok(output) = std::process::Command::new("git")
                                 .args(["ls-remote", &url, &ref_spec])
                                 .output()

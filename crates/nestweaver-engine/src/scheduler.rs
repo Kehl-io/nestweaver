@@ -27,6 +27,7 @@ pub struct PollScheduler {
 struct RepoSchedule {
     repo_id: String,
     repo_url: String,
+    branch: Option<String>,
     poll_override: Option<PollOverride>,
     last_commit_time: Option<Instant>,
     next_poll_at: Instant,
@@ -39,12 +40,13 @@ pub enum SchedulerCommand {
         repo_id: String,
         repo_url: String,
         poll_override: Option<PollOverride>,
+        branch: Option<String>,
     },
     RemoveRepo {
         repo_id: String,
     },
     ReloadConfig {
-        repos: Vec<(String, String, Option<PollOverride>)>,
+        repos: Vec<(String, String, Option<PollOverride>, Option<String>)>,
         min_poll: Option<std::time::Duration>,
         max_poll: Option<std::time::Duration>,
     },
@@ -88,10 +90,12 @@ impl PollScheduler {
         repo_id: String,
         repo_url: String,
         poll_override: Option<PollOverride>,
+        branch: Option<String>,
     ) {
         self.repos.push(RepoSchedule {
             repo_id,
             repo_url,
+            branch,
             poll_override,
             last_commit_time: None,
             next_poll_at: Instant::now(),
@@ -111,7 +115,7 @@ impl PollScheduler {
 
     /// Return repos that are due for polling now, advancing their
     /// `next_poll_at` to the next interval.
-    pub fn due_repos(&mut self) -> Vec<(String, String)> {
+    pub fn due_repos(&mut self) -> Vec<(String, String, Option<String>)> {
         let now = Instant::now();
         let min_poll = self.min_poll;
         let max_poll = self.max_poll;
@@ -127,7 +131,7 @@ impl PollScheduler {
                     return None;
                 }
                 r.next_poll_at = now + jittered(interval);
-                Some((r.repo_id.clone(), r.repo_url.clone()))
+                Some((r.repo_id.clone(), r.repo_url.clone(), r.branch.clone()))
             })
             .collect()
     }
@@ -277,6 +281,7 @@ mod tests {
             "test-repo".into(),
             "https://github.com/org/test".into(),
             None,
+            None,
         );
 
         if let Some(ago) = last_commit_ago {
@@ -321,6 +326,7 @@ mod tests {
             "fixed-repo".into(),
             "https://github.com/org/fixed".into(),
             Some(PollOverride::Fixed(Duration::from_secs(60))),
+            None,
         );
         let interval = sched.next_interval(&sched.repos[0]);
         assert_eq!(interval, Duration::from_secs(60));
@@ -333,6 +339,7 @@ mod tests {
             "never-repo".into(),
             "https://github.com/org/never".into(),
             Some(PollOverride::Never),
+            None,
         );
         let interval = sched.next_interval(&sched.repos[0]);
         assert_eq!(interval, Duration::MAX);
@@ -373,15 +380,16 @@ mod tests {
     #[test]
     fn due_repos_skips_never() {
         let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(8 * 3600));
-        sched.add_repo("repo-a".into(), "https://a.com".into(), None);
+        sched.add_repo("repo-a".into(), "https://a.com".into(), None, None);
         sched.add_repo(
             "repo-b".into(),
             "https://b.com".into(),
             Some(PollOverride::Never),
+            None,
         );
 
         let due = sched.due_repos();
-        let ids: Vec<&str> = due.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = due.iter().map(|(id, _, _)| id.as_str()).collect();
         assert!(ids.contains(&"repo-a"), "active repo should be due");
         assert!(
             !ids.contains(&"repo-b"),
@@ -392,8 +400,8 @@ mod tests {
     #[test]
     fn remove_repo_works() {
         let mut sched = PollScheduler::with_defaults();
-        sched.add_repo("repo-a".into(), "https://a.com".into(), None);
-        sched.add_repo("repo-b".into(), "https://b.com".into(), None);
+        sched.add_repo("repo-a".into(), "https://a.com".into(), None, None);
+        sched.add_repo("repo-b".into(), "https://b.com".into(), None, None);
         assert_eq!(sched.repo_count(), 2);
         sched.remove_repo("repo-a");
         assert_eq!(sched.repo_count(), 1);

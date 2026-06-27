@@ -609,7 +609,7 @@ pub async fn reload_config(
                         other => nestweaver_engine::config::parse_duration(other)
                             .map(nestweaver_engine::scheduler::PollOverride::Fixed),
                     });
-                    (repo_name, r.url.clone(), poll_override)
+                    (repo_name, r.url.clone(), poll_override, r.branch.clone())
                 }).collect();
                 let new_min_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
                 let new_max_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
