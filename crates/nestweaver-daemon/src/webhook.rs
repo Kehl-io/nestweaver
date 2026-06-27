@@ -54,12 +54,19 @@ pub async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // 1. Verify HMAC signature.
+    // 1. Verify webhook authentication.
+    // GitLab uses X-Gitlab-Token with a plain secret comparison (no HMAC).
+    // GitHub uses X-Hub-Signature-256 with HMAC-SHA256.
+    let gitlab_token = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok());
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok());
 
-    if !verify_signature(&body, sig_header, &state.config) {
+    if let Some(token) = gitlab_token {
+        if token != state.config.secret && state.config.secret_old.as_deref() != Some(token) {
+            return (StatusCode::UNAUTHORIZED, "invalid token");
+        }
+    } else if !verify_signature(&body, sig_header, &state.config) {
         return (StatusCode::UNAUTHORIZED, "invalid signature");
     }
 
