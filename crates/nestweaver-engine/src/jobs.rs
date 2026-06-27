@@ -118,7 +118,8 @@ pub struct QueueDepth {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunningJobInfo {
     pub repo: String,
-    pub started: Option<i64>,
+    pub started_at: Option<String>,
+    pub duration_s: f64,
 }
 
 /// SQLite-backed job queue. One instance per server process.
@@ -338,6 +339,16 @@ impl JobQueue {
         Ok(deleted)
     }
 
+    /// Check if a job row still exists (not cancelled by admin removal).
+    pub fn job_exists(&self, job_id: i64) -> Result<bool, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM index_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Mark a job as failed.
     ///
     /// If `is_poison` is true or `attempt >= max_attempts`, the job moves
@@ -421,13 +432,18 @@ impl JobQueue {
 
     /// Return info about currently running jobs.
     pub fn running_jobs(&self) -> Result<Vec<RunningJobInfo>, rusqlite::Error> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT repo_id, started_at FROM index_jobs WHERE status = 'running'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT repo_id, started_at,
+                    CAST(strftime('%s','now') AS REAL) - CAST(started_at AS REAL) AS dur
+             FROM index_jobs WHERE status = 'running'",
+        )?;
         let rows = stmt.query_map([], |row| {
+            let started_epoch: Option<i64> = row.get(1)?;
+            let duration: f64 = row.get::<_, Option<f64>>(2)?.unwrap_or(0.0);
             Ok(RunningJobInfo {
                 repo: row.get(0)?,
-                started: row.get(1)?,
+                started_at: started_epoch.map(|e| format!("{e}")),
+                duration_s: duration,
             })
         })?;
         rows.collect()

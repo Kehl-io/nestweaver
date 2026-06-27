@@ -57,6 +57,26 @@ fn default_timeout() -> String {
     "1s".to_string()
 }
 
+/// Expand `${VAR}` patterns in a string using environment variables.
+/// Returns the original string if no pattern is found or the var is unset.
+fn expand_env(s: &str) -> String {
+    if let Some(var) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+        std::env::var(var).unwrap_or_else(|_| s.to_string())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Expand env vars in the token field of an UpstreamConfig.
+fn expand_config_token(config: &mut UpstreamConfig) {
+    if let Some(ref tok) = config.token {
+        let expanded = expand_env(tok);
+        if expanded != *tok {
+            config.token = Some(expanded);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal TOML shapes
 // ---------------------------------------------------------------------------
@@ -150,6 +170,11 @@ pub fn discover_upstreams_with_config(
         }
     }
 
+    // Expand ${VAR} patterns in token fields.
+    for cfg in &mut upstreams {
+        expand_config_token(cfg);
+    }
+
     upstreams
 }
 
@@ -197,7 +222,7 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
         if candidate.is_file() {
             if let Ok(content) = std::fs::read_to_string(&candidate) {
                 if let Ok(parsed) = toml::from_str::<ServerToml>(&content) {
-                    return Some(UpstreamConfig {
+                    let mut cfg = UpstreamConfig {
                         name: None,
                         url: parsed.upstream.url,
                         token: parsed.upstream.token,
@@ -205,7 +230,9 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
                         mode: parsed.upstream.mode,
                         timeout: default_timeout(),
                         ca_cert: None,
-                    });
+                    };
+                    expand_config_token(&mut cfg);
+                    return Some(cfg);
                 }
             }
         }

@@ -387,10 +387,12 @@ compatibility: BREAKING (function signature changed)
 
 ```bash
 # In CI: analyze a PR diff against the server
-nestweaver pre-push-impact origin/main...HEAD --format json
+nestweaver pre-push-impact --diff origin/main..HEAD --format json
 
 # Post a formatted comment to the PR
-nestweaver pre-push-impact --diff origin/main..HEAD --format json | nestweaver format-comment --input - | gh pr comment --body-file -
+nestweaver pre-push-impact --diff origin/main..HEAD --format json \
+  | nestweaver format-comment --input - \
+  | gh pr comment --body-file -
 ```
 
 ### Two-tier blast radius
@@ -586,7 +588,9 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ```bash
 # Check Prometheus metrics
-curl http://localhost:9379/metrics | grep nestweaver_query
+# Metrics are served by `nestweaver ui` (not the server daemon).
+# If running the UI alongside the server:
+# curl http://localhost:9377/metrics | grep nestweaver_query
 
 # Expected p95 latencies (LAN):
 #   brain_search:    <50ms

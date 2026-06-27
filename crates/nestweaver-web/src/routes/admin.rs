@@ -287,6 +287,21 @@ pub async fn remove_repo(
     .ok()
     .flatten();
 
+    // Purge queued jobs FIRST so no new workers can claim while we delete.
+    if let Some(ref url) = repo_url {
+        let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+                let _ = queue.cancel_repo(&canonical);
+            }
+        })
+        .await;
+    }
+
+    // Delete graph data under write mutex. An already-claimed worker will
+    // also acquire this mutex before indexing; when it runs, it checks
+    // whether the repo node still exists and skips if deleted.
     let write_mutex = state.write_mutex.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
@@ -319,18 +334,6 @@ pub async fn remove_repo(
             format!("task panicked: {e}"),
         )
     })??;
-
-    // Purge any pending/running jobs to prevent re-indexing after removal.
-    if let Some(ref url) = repo_url {
-        let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
-        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
-                let _ = queue.cancel_repo(&canonical);
-            }
-        })
-        .await;
-    }
 
     // Remove from live scheduler.
     if let Some(ref tx) = state.scheduler_tx {
@@ -475,7 +478,8 @@ pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -
                     .map(|j| {
                         serde_json::json!({
                             "repo": j.repo,
-                            "started": j.started,
+                            "started_at": j.started_at,
+                            "duration_s": j.duration_s,
                         })
                     })
                     .collect()

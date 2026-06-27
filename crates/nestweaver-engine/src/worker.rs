@@ -232,10 +232,23 @@ impl WorkerPool {
                 // blocking pool so we don't starve the tokio runtime.
                 let result = {
                     let job_clone = job.clone();
+                    let queue_check = queue.clone();
                     tokio::task::spawn_blocking(move || {
                         // Acquire the daemon's write mutex to prevent concurrent
                         // writes to the graph store from RPC handlers.
                         let _write_guard = write_mutex.as_ref().map(|m| m.blocking_lock());
+                        // Check if the job was cancelled (admin repo removal)
+                        // while we waited for the mutex.
+                        {
+                            let q = queue_check.lock().expect("job queue lock");
+                            if q.job_exists(job_clone.id).unwrap_or(false) == false {
+                                tracing::info!(
+                                    repo = %job_clone.repo_id,
+                                    "job cancelled (repo removed), skipping"
+                                );
+                                return Ok(());
+                            }
+                        }
                         process_job(&job_clone, &workspace, &store, &instance_id)
                     })
                     .await
