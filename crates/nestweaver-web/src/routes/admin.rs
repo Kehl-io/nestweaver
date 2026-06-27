@@ -322,12 +322,29 @@ pub async fn remove_repo(
 
     // Remove from live scheduler.
     if let Some(ref tx) = state.scheduler_tx {
-        // The scheduler uses the repo name as its ID. Derive it from the
-        // URL (same logic as scheduler seeding), or fall back to the UID.
-        let sched_id = repo_url
+        // The scheduler seeds repos with `repo_cfg.name.unwrap_or(repo_name_from_url(...))`.
+        // To match that, look up the configured name from the instance config first.
+        let url_derived = repo_url
             .as_deref()
             .map(nestweaver_engine::pull::repo_name_from_url)
             .unwrap_or_else(|| repo_uid.clone());
+        let sched_id = if let Some(ref config_path) = state.config_path {
+            nestweaver_engine::InstanceConfig::from_file(config_path)
+                .ok()
+                .and_then(|cfg| {
+                    let canonical = repo_url
+                        .as_deref()
+                        .map(nestweaver_engine::jobs::canonical_repo_id)
+                        .unwrap_or_default();
+                    cfg.repos
+                        .iter()
+                        .find(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url) == canonical)
+                        .and_then(|r| r.name.clone())
+                })
+                .unwrap_or(url_derived)
+        } else {
+            url_derived
+        };
         let _ = tx
             .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id: sched_id })
             .await;
