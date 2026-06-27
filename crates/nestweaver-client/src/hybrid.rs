@@ -195,9 +195,14 @@ impl HybridClient {
             ToolRouting::ServerPreferred => self.query_server_preferred(tool_name, params).await,
             ToolRouting::TwoTier => self.query_two_tier(tool_name, params).await,
             ToolRouting::Continuation => self.query_with_continuation(tool_name, params).await,
-            ToolRouting::Combined | ToolRouting::Merge | ToolRouting::FanOut => {
-                self.query_merge(tool_name, params).await
+            ToolRouting::Combined => {
+                // Combined tools return status/metadata objects — preserve shape,
+                // don't flatten into { results: [...] }.
+                let mut result = self.query_local(tool_name, params).await?;
+                inject_provenance(&mut result, &["local"], &[]);
+                Ok(result)
             }
+            ToolRouting::Merge | ToolRouting::FanOut => self.query_merge(tool_name, params).await,
             ToolRouting::LocalFirst => self.query_fallback(tool_name, params).await,
         }
     }
