@@ -287,7 +287,9 @@ pub async fn remove_repo(
     .ok()
     .flatten();
 
+    let write_mutex = state.write_mutex.clone();
     tokio::task::spawn_blocking(move || {
+        let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
         store
             .bulk_delete_repo_files_and_symbols(&uid)
             .map_err(|e| {
@@ -879,6 +881,7 @@ mod tests {
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
+            write_mutex: None,
         })
     }
 

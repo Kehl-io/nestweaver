@@ -3232,6 +3232,7 @@ pub async fn run_server(
                 scheduler_tx: Some(scheduler_tx.clone()),
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
+                write_mutex: Some(Arc::clone(&state.write_mutex)),
             });
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).
