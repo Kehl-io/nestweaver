@@ -238,10 +238,14 @@ impl WorkerPool {
                         // writes to the graph store from RPC handlers.
                         let _write_guard = write_mutex.as_ref().map(|m| m.blocking_lock());
                         // Check if the job was cancelled (admin repo removal)
-                        // while we waited for the mutex.
+                        // while we waited for the mutex. Verifies both ID and
+                        // repo_id to guard against SQLite ID reuse.
                         {
                             let q = queue_check.lock().expect("job queue lock");
-                            if q.job_exists(job_clone.id).unwrap_or(false) == false {
+                            if !q
+                                .job_is_active(job_clone.id, &job_clone.repo_id)
+                                .unwrap_or(false)
+                            {
                                 tracing::info!(
                                     repo = %job_clone.repo_id,
                                     "job cancelled (repo removed), skipping"
@@ -257,7 +261,7 @@ impl WorkerPool {
                 match result {
                     Ok(Ok(())) => {
                         let q = queue.lock().expect("job queue lock poisoned");
-                        let _ = q.complete(job.id);
+                        let _ = q.complete(job.id, &job.repo_id);
                         if let Ok(true) = q.requeue_if_stale(&job.repo_id) {
                             tracing::info!(repo = %job.repo_id, "re-queued: push arrived during indexing");
                         }

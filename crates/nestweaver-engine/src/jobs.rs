@@ -60,6 +60,7 @@ pub enum JobStatus {
     Succeeded,
     Failed,
     DeadLetter,
+    Cancelled,
 }
 
 impl JobStatus {
@@ -70,6 +71,7 @@ impl JobStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::DeadLetter => "dead_letter",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -80,6 +82,7 @@ impl JobStatus {
             "succeeded" => Self::Succeeded,
             "failed" => Self::Failed,
             "dead_letter" => Self::DeadLetter,
+            "cancelled" => Self::Cancelled,
             _ => Self::Pending,
         }
     }
@@ -302,13 +305,13 @@ impl JobQueue {
     /// Does NOT update `updated_at` — that column is only set by external
     /// events (upsert). This ensures `requeue_if_stale` correctly detects
     /// "an event arrived while running" without false positives.
-    pub fn complete(&self, job_id: i64) -> Result<(), rusqlite::Error> {
+    pub fn complete(&self, job_id: i64, repo_id: &str) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "UPDATE index_jobs
              SET status       = 'succeeded',
                  completed_at = strftime('%s','now')
-             WHERE id = ?1",
-            params![job_id],
+             WHERE id = ?1 AND repo_id = ?2 AND status = 'running'",
+            params![job_id, repo_id],
         )?;
         Ok(())
     }
@@ -329,21 +332,27 @@ impl JobQueue {
         Ok(changed > 0)
     }
 
-    /// Delete all jobs for a repo (pending, running, succeeded, etc.).
-    /// Used by admin repo removal to prevent re-indexing after deletion.
+    /// Mark all jobs for a repo as cancelled. Unlike DELETE, this preserves
+    /// the row so that SQLite cannot reuse the ID for a new job — preventing
+    /// an already-claimed worker from mistaking a new job for the old one.
     pub fn cancel_repo(&self, repo_id: &str) -> Result<usize, rusqlite::Error> {
-        let deleted = self.conn.execute(
-            "DELETE FROM index_jobs WHERE repo_id = ?1",
+        let changed = self.conn.execute(
+            "UPDATE index_jobs SET status = 'cancelled',
+                    updated_at = strftime('%s','now')
+             WHERE repo_id = ?1 AND status != 'cancelled'",
             params![repo_id],
         )?;
-        Ok(deleted)
+        Ok(changed)
     }
 
-    /// Check if a job row still exists (not cancelled by admin removal).
-    pub fn job_exists(&self, job_id: i64) -> Result<bool, rusqlite::Error> {
+    /// Check if a specific job is still valid (not cancelled, and still
+    /// belongs to the expected repo). The caller must pass the repo_id from
+    /// the originally-claimed job to guard against ID reuse.
+    pub fn job_is_active(&self, job_id: i64, repo_id: &str) -> Result<bool, rusqlite::Error> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM index_jobs WHERE id = ?1",
-            params![job_id],
+            "SELECT COUNT(*) FROM index_jobs
+             WHERE id = ?1 AND repo_id = ?2 AND status = 'running'",
+            params![job_id, repo_id],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -713,7 +722,7 @@ mod tests {
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
 
-        q.complete(job.id).unwrap();
+        q.complete(job.id, &job.repo_id).unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.succeeded, 1);
@@ -905,7 +914,7 @@ mod tests {
 
         // Claim and complete repo-a
         let job_a = q.claim_next(0).unwrap().unwrap();
-        q.complete(job_a.id).unwrap();
+        q.complete(job_a.id, &job_a.repo_id).unwrap();
 
         // Claim repo-b (leave running)
         let _job_b = q.claim_next(0).unwrap().unwrap();
@@ -944,13 +953,60 @@ mod tests {
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
-        q.complete(job.id).unwrap();
+        q.complete(job.id, &job.repo_id).unwrap();
         // No external event happened — should NOT requeue
         assert_eq!(
             q.requeue_if_stale("repo-1").unwrap(),
             false,
             "should not requeue when no external event arrived during indexing"
         );
+    }
+
+    #[test]
+    fn cancel_repo_marks_cancelled_and_blocks_active_check() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert!(q.job_is_active(job.id, "repo-1").unwrap());
+
+        // Admin removes the repo — cancels the job
+        q.cancel_repo("repo-1").unwrap();
+
+        // The claimed worker should see the job as inactive
+        assert!(
+            !q.job_is_active(job.id, "repo-1").unwrap(),
+            "cancelled job should not be considered active"
+        );
+
+        // complete() on a cancelled job should be a no-op (status != 'running')
+        q.complete(job.id, "repo-1").unwrap();
+        // Job should still be cancelled, not succeeded
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(depth.succeeded, 0);
+    }
+
+    #[test]
+    fn job_is_active_rejects_wrong_repo_id() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+
+        // Correct repo_id → active
+        assert!(q.job_is_active(job.id, "repo-1").unwrap());
+        // Wrong repo_id (simulates ID reuse) → not active
+        assert!(!q.job_is_active(job.id, "repo-2").unwrap());
     }
 
     #[test]
