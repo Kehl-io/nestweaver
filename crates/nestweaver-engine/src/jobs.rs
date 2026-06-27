@@ -232,8 +232,7 @@ impl JobQueue {
                                  THEN 0 ELSE attempt END,
                branch     = CASE WHEN excluded.branch IS NOT NULL
                                  THEN excluded.branch ELSE branch END,
-               updated_at = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter')
-                                 THEN strftime('%s','now') ELSE updated_at END",
+               updated_at = strftime('%s','now')",
             params![repo_id, repo_url, trigger_str, priority, branch],
         )?;
         Ok(())
@@ -293,6 +292,21 @@ impl JobQueue {
             params![job_id],
         )?;
         Ok(())
+    }
+
+    /// Re-queue a completed repo if an upsert arrived while it was running.
+    /// Call this after complete() to catch pushes that arrived mid-index.
+    pub fn requeue_if_stale(&self, repo_id: &str) -> Result<bool, rusqlite::Error> {
+        // If the job was updated while running (updated_at > started_at),
+        // it means an upsert tried to queue a new event. Reset to pending.
+        let changed = self.conn.execute(
+            "UPDATE index_jobs SET status = 'pending', attempt = 0,
+                    updated_at = strftime('%s','now')
+             WHERE repo_id = ?1 AND status = 'succeeded'
+               AND updated_at > started_at",
+            params![repo_id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Mark a job as failed.

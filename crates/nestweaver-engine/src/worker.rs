@@ -222,6 +222,9 @@ impl WorkerPool {
                     Ok(Ok(())) => {
                         let q = queue.lock().expect("job queue lock poisoned");
                         let _ = q.complete(job.id);
+                        if let Ok(true) = q.requeue_if_stale(&job.repo_id) {
+                            tracing::info!(repo = %job.repo_id, "re-queued: push arrived during indexing");
+                        }
                         tracing::info!(repo = job.repo_id, "index complete");
                     }
                     Ok(Err(e)) => {
