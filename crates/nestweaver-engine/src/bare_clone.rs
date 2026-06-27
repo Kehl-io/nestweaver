@@ -485,4 +485,63 @@ mod tests {
         let usage = ws.disk_usage().unwrap();
         assert!(usage > 0, "disk usage should be > 0");
     }
+
+    #[test]
+    fn fetch_branch_creates_resolvable_ref() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("hello.txt", "world")]);
+
+        // Create a "develop" branch in the source repo with a new commit.
+        Command::new("git")
+            .args(["checkout", "-b", "develop"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::fs::write(src.join("dev.txt"), "develop content").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "develop commit"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        // Get the develop SHA from the source.
+        let dev_sha_output = Command::new("git")
+            .args(["rev-parse", "develop"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        let expected_sha = String::from_utf8_lossy(&dev_sha_output.stdout)
+            .trim()
+            .to_string();
+
+        // Clone as bare (like the server does).
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let bare = ws
+            .ensure_clone(&format!("file://{}", src.display()))
+            .unwrap();
+
+        // Fetch the develop branch with explicit refspec.
+        bare.fetch_branch(Some("develop")).unwrap();
+
+        // Resolve via refs/heads/develop (what the worker does).
+        let resolved = bare.sha_for_ref("refs/heads/develop").unwrap();
+        assert_eq!(
+            resolved, expected_sha,
+            "refs/heads/develop should resolve to the develop SHA"
+        );
+
+        // Verify origin/develop does NOT exist in a bare clone
+        // (this is the bug we fixed — origin/ refs aren't created).
+        let origin_result = bare.sha_for_ref("origin/develop");
+        assert!(
+            origin_result.is_err(),
+            "origin/develop should NOT resolve in a bare clone"
+        );
+    }
 }
