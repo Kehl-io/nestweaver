@@ -165,6 +165,7 @@ pub async fn add_repo(
     // Derive the jobs database path from the brain database path.
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
     let repo_url = req.url.clone();
+    let branch = req.branch.clone();
 
     tokio::task::spawn_blocking(move || {
         let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
@@ -179,6 +180,7 @@ pub async fn add_repo(
                 &repo_id,
                 &repo_url,
                 nestweaver_engine::jobs::JobTrigger::Unindexed,
+                branch.as_deref(),
             )
             .map_err(|e| {
                 (
@@ -280,6 +282,7 @@ pub async fn trigger_reindex(
                 &repo_id,
                 &repo.url,
                 nestweaver_engine::jobs::JobTrigger::Webhook,
+                None,
             )
             .map_err(|e| {
                 (
@@ -538,15 +541,16 @@ pub async fn reload_config(
                 let mut orphaned_repos = 0usize;
 
                 // New repos in config but not yet indexed: enqueue.
-                for url in &declared_urls {
-                    if !indexed_urls.contains(url) {
-                        tracing::info!(url = %url, "config reload: new repo — queueing for indexing");
+                for r in &cfg.repos {
+                    if !indexed_urls.contains(&r.url) {
+                        tracing::info!(url = %r.url, "config reload: new repo — queueing for indexing");
                         if let Some(ref q) = queue {
-                            let repo_id = nestweaver_engine::jobs::canonical_repo_id(url);
+                            let repo_id = nestweaver_engine::jobs::canonical_repo_id(&r.url);
                             let _ = q.upsert(
                                 &repo_id,
-                                url,
+                                &r.url,
                                 nestweaver_engine::jobs::JobTrigger::Unindexed,
+                                r.branch.as_deref(),
                             );
                         }
                         new_repos += 1;

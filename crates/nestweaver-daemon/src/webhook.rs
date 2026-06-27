@@ -80,7 +80,7 @@ pub async fn handle_webhook(
     let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
     let enqueue_result = {
         let queue = state.job_queue.lock().expect("job queue lock poisoned");
-        queue.upsert(&repo_id, &url, JobTrigger::Webhook)
+        queue.upsert(&repo_id, &url, JobTrigger::Webhook, None)
     };
 
     if let Err(e) = enqueue_result {

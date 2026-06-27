@@ -271,10 +271,13 @@ fn process_job(
     let bare = workspace.ensure_clone(&job.repo_url)?;
 
     // 2. Fetch latest refs from origin.
-    bare.fetch()?;
+    bare.fetch_branch(job.branch.as_deref())?;
 
-    // 3. Discover remote HEAD SHA.
-    let remote_sha = bare.head_sha()?;
+    // 3. Discover remote SHA — use the configured branch if set.
+    let remote_sha = match &job.branch {
+        Some(branch) => bare.sha_for_ref(&format!("origin/{}", branch))?,
+        None => bare.head_sha()?,
+    };
 
     // 4. Compare against the SHA we last indexed.
     let r_uid = nestweaver_schema::repo_uid(instance_id, &job.repo_url);
@@ -411,6 +414,7 @@ mod tests {
             attempt: 1,
             max_attempts: 4,
             error_msg: None,
+            branch: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -451,6 +455,7 @@ mod tests {
             attempt: 1,
             max_attempts: 4,
             error_msg: None,
+            branch: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -479,7 +484,7 @@ mod tests {
         // Set up components.
         let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
         queue
-            .upsert("test-repo", &url, JobTrigger::Unindexed)
+            .upsert("test-repo", &url, JobTrigger::Unindexed, None)
             .unwrap();
         let queue = Arc::new(Mutex::new(queue));
 
@@ -542,7 +547,7 @@ mod tests {
 
         let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
         queue
-            .upsert("status-test-repo", &url, JobTrigger::Unindexed)
+            .upsert("status-test-repo", &url, JobTrigger::Unindexed, None)
             .unwrap();
         let queue = Arc::new(Mutex::new(queue));
 

@@ -97,6 +97,7 @@ pub struct IndexJob {
     pub attempt: i32,
     pub max_attempts: i32,
     pub error_msg: Option<String>,
+    pub branch: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub started_at: Option<i64>,
@@ -138,6 +139,7 @@ impl JobQueue {
                 attempt      INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 4,
                 error_msg    TEXT,
+                branch       TEXT,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -145,6 +147,8 @@ impl JobQueue {
                 UNIQUE(repo_id)
             );",
         )?;
+        // Migration: add branch column to existing databases.
+        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN branch TEXT;");
         Ok(Self { conn })
     }
 
@@ -168,6 +172,7 @@ impl JobQueue {
                 attempt      INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 4,
                 error_msg    TEXT,
+                branch       TEXT,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -193,6 +198,7 @@ impl JobQueue {
         repo_id: &str,
         repo_url: &str,
         trigger: JobTrigger,
+        branch: Option<&str>,
     ) -> Result<(), rusqlite::Error> {
         let priority = trigger.priority();
         let trigger_str = trigger.as_str();
@@ -203,9 +209,12 @@ impl JobQueue {
         // - succeeded/dead_letter: reset to pending with new trigger, clear attempt
         //   counter so the job gets a fresh run.
         // - running: no-op — don't interrupt in-progress work.
+        //
+        // Branch is always updated when a new value is provided (Some), regardless
+        // of status, so the worker always uses the most recently configured branch.
         self.conn.execute(
-            "INSERT INTO index_jobs (repo_id, repo_url, trigger, priority, status)
-             VALUES (?1, ?2, ?3, ?4, 'pending')
+            "INSERT INTO index_jobs (repo_id, repo_url, trigger, priority, status, branch)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
              ON CONFLICT (repo_id) DO UPDATE SET
                priority   = CASE WHEN status IN ('pending', 'failed')
                                  THEN MIN(excluded.priority, priority)
@@ -221,9 +230,11 @@ impl JobQueue {
                                  THEN 'pending' ELSE status END,
                attempt    = CASE WHEN status IN ('succeeded', 'dead_letter')
                                  THEN 0 ELSE attempt END,
+               branch     = CASE WHEN excluded.branch IS NOT NULL
+                                 THEN excluded.branch ELSE branch END,
                updated_at = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter')
                                  THEN strftime('%s','now') ELSE updated_at END",
-            params![repo_id, repo_url, trigger_str, priority],
+            params![repo_id, repo_url, trigger_str, priority, branch],
         )?;
         Ok(())
     }
@@ -249,7 +260,7 @@ impl JobQueue {
                  LIMIT 1
              )
              RETURNING id, repo_id, repo_url, trigger, priority, status,
-                       attempt, max_attempts, error_msg,
+                       attempt, max_attempts, error_msg, branch,
                        created_at, updated_at, started_at, completed_at",
             params![debounce_secs],
             |row| row_to_job(row),
@@ -369,7 +380,7 @@ impl JobQueue {
     pub fn dead_letters(&self) -> Result<Vec<IndexJob>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, repo_id, repo_url, trigger, priority, status,
-                    attempt, max_attempts, error_msg,
+                    attempt, max_attempts, error_msg, branch,
                     created_at, updated_at, started_at, completed_at
              FROM index_jobs
              WHERE status = 'dead_letter'
@@ -457,10 +468,11 @@ fn row_to_job(row: &rusqlite::Row) -> Result<IndexJob, rusqlite::Error> {
         attempt: row.get(6)?,
         max_attempts: row.get(7)?,
         error_msg: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
-        started_at: row.get(11)?,
-        completed_at: row.get(12)?,
+        branch: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        started_at: row.get(12)?,
+        completed_at: row.get(13)?,
     })
 }
 
@@ -479,6 +491,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -493,9 +506,10 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll)
+        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll, None)
             .unwrap();
 
         let depth = q.queue_depth().unwrap();
@@ -506,13 +520,14 @@ mod tests {
     fn upsert_keeps_higher_priority() {
         let q = queue();
         // Insert with lower priority (poll = 2)
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll)
+        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll, None)
             .unwrap();
         // Upsert with higher priority (webhook = 1)
         q.upsert(
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -529,6 +544,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
         // Upsert with lower priority (scheduled = 3)
@@ -536,6 +552,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Scheduled,
+            None,
         )
         .unwrap();
 
@@ -551,18 +568,21 @@ mod tests {
             "repo-low",
             "https://github.com/org/low",
             JobTrigger::Scheduled,
+            None,
         )
         .unwrap();
         q.upsert(
             "repo-high",
             "https://github.com/org/high",
             JobTrigger::Unindexed,
+            None,
         )
         .unwrap();
         q.upsert(
             "repo-mid",
             "https://github.com/org/mid",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -585,6 +605,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -604,6 +625,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
@@ -622,6 +644,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -665,6 +688,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
@@ -686,6 +710,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
@@ -721,6 +746,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
@@ -736,6 +762,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -751,9 +778,10 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
-        q.upsert("repo-2", "https://github.com/org/repo-2", JobTrigger::Poll)
+        q.upsert("repo-2", "https://github.com/org/repo-2", JobTrigger::Poll, None)
             .unwrap();
 
         // Dead-letter repo-1
@@ -770,11 +798,11 @@ mod tests {
     fn queue_depth_counts_all_statuses() {
         let q = queue();
         // Create 3 jobs in different states
-        q.upsert("repo-a", "https://github.com/org/a", JobTrigger::Webhook)
+        q.upsert("repo-a", "https://github.com/org/a", JobTrigger::Webhook, None)
             .unwrap();
-        q.upsert("repo-b", "https://github.com/org/b", JobTrigger::Poll)
+        q.upsert("repo-b", "https://github.com/org/b", JobTrigger::Poll, None)
             .unwrap();
-        q.upsert("repo-c", "https://github.com/org/c", JobTrigger::Scheduled)
+        q.upsert("repo-c", "https://github.com/org/c", JobTrigger::Scheduled, None)
             .unwrap();
 
         // Claim and complete repo-a
@@ -799,6 +827,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 
@@ -834,8 +863,8 @@ mod tests {
         let id1 = canonical_repo_id(url);
         let id2 = canonical_repo_id(&format!("{}.git", url));
 
-        q.upsert(&id1, url, JobTrigger::Webhook).unwrap();
-        q.upsert(&id2, url, JobTrigger::Poll).unwrap();
+        q.upsert(&id1, url, JobTrigger::Webhook, None).unwrap();
+        q.upsert(&id2, url, JobTrigger::Poll, None).unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.pending, 1, "same repo should coalesce");
@@ -848,6 +877,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Scheduled,
+            None,
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
@@ -859,6 +889,7 @@ mod tests {
             "repo-1",
             "https://github.com/org/repo-1",
             JobTrigger::Webhook,
+            None,
         )
         .unwrap();
 

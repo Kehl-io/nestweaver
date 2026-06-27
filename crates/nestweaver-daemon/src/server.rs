@@ -3442,7 +3442,7 @@ pub async fn run_server(
                             // fall back to HEAD (symref of the remote's default
                             // branch) so we aren't hardcoded to "main".
                             let url = repo_url.clone();
-                            let ref_spec = branch.unwrap_or_else(|| "HEAD".to_string());
+                            let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
                             if let Ok(output) = std::process::Command::new("git")
                                 .args(["ls-remote", &url, &ref_spec])
                                 .output()
@@ -3456,7 +3456,7 @@ pub async fn run_server(
                                     let jobs_path = nestweaver_engine::sidecar_path(&poll_db, ".jobs.sqlite");
                                     if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
                                         let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&url);
-                                        let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll);
+                                        let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll, branch.as_deref());
                                     }
                                 }
                             }

@@ -27,12 +27,17 @@ impl BareClone {
 
     /// Fetch the latest commits and trees from origin (no blobs unless demanded).
     pub fn fetch(&self) -> Result<()> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.path)
-            .args(["fetch", "origin"])
-            .output()
-            .context("failed to run git fetch")?;
+        self.fetch_branch(None)
+    }
+
+    /// Fetch a specific branch from origin, or all refs if `branch` is `None`.
+    pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.path).args(["fetch", "origin"]);
+        if let Some(b) = branch {
+            cmd.arg(b);
+        }
+        let output = cmd.output().context("failed to run git fetch")?;
         if !output.status.success() {
             anyhow::bail!(
                 "git fetch failed for {}: {}",
@@ -41,6 +46,24 @@ impl BareClone {
             );
         }
         Ok(())
+    }
+
+    /// Resolve the SHA for an arbitrary ref (e.g. `origin/develop`).
+    pub fn sha_for_ref(&self, reference: &str) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["rev-parse", reference])
+            .output()
+            .with_context(|| format!("failed to run git rev-parse {reference}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git rev-parse {} failed: {}",
+                reference,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     /// Get the SHA of HEAD (the default branch tip).
