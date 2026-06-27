@@ -3349,10 +3349,10 @@ pub async fn run_server(
             use nestweaver_engine::scheduler::PollScheduler;
             use std::time::Duration;
             let indexing_cfg = poll_cfg.as_ref().map(|c| &c.server.indexing);
-            let min_poll = indexing_cfg
+            let mut min_poll = indexing_cfg
                 .and_then(|c| nestweaver_engine::config::parse_duration(&c.min_poll))
                 .unwrap_or(Duration::from_secs(45));
-            let max_poll = indexing_cfg
+            let mut max_poll = indexing_cfg
                 .and_then(|c| nestweaver_engine::config::parse_duration(&c.max_poll))
                 .unwrap_or(Duration::from_secs(8 * 3600));
             let mut scheduler = PollScheduler::new(min_poll, max_poll);
@@ -3403,7 +3403,9 @@ pub async fn run_server(
                                 nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
                                     scheduler.remove_repo(&repo_id);
                                 }
-                                nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos } => {
+                                nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos, min_poll: new_min, max_poll: new_max } => {
+                                    if let Some(m) = new_min { min_poll = m; }
+                                    if let Some(m) = new_max { max_poll = m; }
                                     scheduler = PollScheduler::new(min_poll, max_poll);
                                     for (id, url, ovr) in repos {
                                         scheduler.add_repo(id, url, ovr);

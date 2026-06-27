@@ -45,6 +45,8 @@ pub enum SchedulerCommand {
     },
     ReloadConfig {
         repos: Vec<(String, String, Option<PollOverride>)>,
+        min_poll: Option<std::time::Duration>,
+        max_poll: Option<std::time::Duration>,
     },
 }
 

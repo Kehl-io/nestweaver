@@ -611,7 +611,13 @@ pub async fn reload_config(
                     });
                     (repo_name, r.url.clone(), poll_override)
                 }).collect();
-                let _ = tx.send(nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos }).await;
+                let new_min_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
+                let new_max_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
+                let _ = tx.send(nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig {
+                    repos,
+                    min_poll: new_min_poll,
+                    max_poll: new_max_poll,
+                }).await;
             }
         }
     }
