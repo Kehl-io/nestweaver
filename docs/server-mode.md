@@ -130,14 +130,14 @@ curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
 
 ```bash
 # Generate a self-signed certificate (development/internal use)
-nestweaver server init-tls --output ./certs
+nestweaver server init-tls --output-dir ./tls
 
 # Start with TLS
 nestweaver daemon --db ./brain.lbug run \
   --server \
   --bind 0.0.0.0:9378 \
-  --tls-cert ./certs/server.crt \
-  --tls-key ./certs/server.key \
+  --tls-cert ./tls/server.pem \
+  --tls-key ./tls/server-key.pem \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 ```
 
@@ -149,8 +149,8 @@ Provide any PEM-encoded certificate and key:
 nestweaver daemon --db ./brain.lbug run \
   --server \
   --bind 0.0.0.0:9378 \
-  --tls-cert /etc/nestweaver/tls/server.crt \
-  --tls-key /etc/nestweaver/tls/server.key
+  --tls-cert /etc/nestweaver/tls/server.pem \
+  --tls-key /etc/nestweaver/tls/server-key.pem
 ```
 
 When TLS is enabled:
@@ -389,7 +389,7 @@ compatibility: BREAKING (function signature changed)
 nestweaver pre-push-impact origin/main...HEAD --format json
 
 # Post a formatted comment to the PR
-nestweaver pre-push-impact origin/main...HEAD format-comment | gh pr comment --body-file -
+nestweaver pre-push-impact origin/main...HEAD --format json | nestweaver format-comment --input - | gh pr comment --body-file -
 ```
 
 ### Two-tier blast radius
