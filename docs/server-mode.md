@@ -287,7 +287,7 @@ nestweaver brain status
 
 The client discovers upstream servers from (highest priority first):
 
-1. `NESTWEAVER_SERVER_URL` and `NESTWEAVER_TOKEN` environment variables
+1. `NESTWEAVER_UPSTREAM` and `NESTWEAVER_TOKEN` environment variables
 2. `.nestweaver/server.toml` in the current repo (checked into source)
 3. `~/.nestweaver/server.toml` (user config)
 4. `nestweaver-instance.toml` `[[upstream]]` section
@@ -380,10 +380,10 @@ compatibility: BREAKING (function signature changed)
 
 ```bash
 # In CI: analyze a PR diff against the server
-nestweaver impact --diff origin/main...HEAD --format json
+nestweaver pre-push-impact origin/main...HEAD --format json
 
 # Post a formatted comment to the PR
-nestweaver impact --diff origin/main...HEAD format-comment | gh pr comment --body-file -
+nestweaver pre-push-impact origin/main...HEAD format-comment | gh pr comment --body-file -
 ```
 
 ### Two-tier blast radius
@@ -408,7 +408,7 @@ When connected to a server, `blast_radius` returns two-tier results:
 
 ```bash
 # Save a snapshot of the current database
-nestweaver server backup save --destination /backups
+nestweaver backup save --destination /backups
 
 # Output: /backups/brain-2026-06-25T10-30-00.nwsnap.zst
 ```
@@ -424,7 +424,7 @@ The backup process:
 
 ```bash
 # Restore a snapshot
-nestweaver server backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
+nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --db ./brain.lbug
 
 # All queries work immediately after restore
@@ -434,13 +434,13 @@ nestweaver server backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
 ### Inspect a backup
 
 ```bash
-nestweaver server backup inspect /backups/brain-2026-06-25T10-30-00.nwsnap.zst
+nestweaver backup inspect /backups/brain-2026-06-25T10-30-00.nwsnap.zst
 # => repos: 200, notes: 5000, size: 1.2 GB, created: 2026-06-25T10:30:00Z
 ```
 
 ### Automatic backups
 
-Backup configuration is planned for a future release. Use `nestweaver server backup save` (CLI) for manual backups.
+Backup configuration is planned for a future release. Use `nestweaver backup save` (CLI) for manual backups.
 
 ---
 
@@ -519,7 +519,7 @@ docker compose up -d
 docker compose logs -f nestweaver
 
 # Backup
-docker compose exec nestweaver nestweaver server backup save --destination /data/backups
+docker compose exec nestweaver nestweaver backup save --destination /data/backups
 ```
 
 ### Resource requirements
