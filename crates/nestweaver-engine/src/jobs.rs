@@ -436,11 +436,11 @@ impl JobQueue {
 /// and `https://github.com/org/repo` all map to the same key.
 pub fn canonical_repo_id(url: &str) -> String {
     let mut s = url.to_string();
-    if s.ends_with(".git") {
-        s.truncate(s.len() - 4);
-    }
     while s.ends_with('/') {
         s.pop();
+    }
+    if s.ends_with(".git") {
+        s.truncate(s.len() - 4);
     }
     s
 }
@@ -818,6 +818,11 @@ mod tests {
         );
         assert_eq!(
             canonical_repo_id("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+        // repo.git/ must match repo.git (slash-then-git edge case)
+        assert_eq!(
+            canonical_repo_id("https://github.com/org/repo.git/"),
             "https://github.com/org/repo"
         );
     }
