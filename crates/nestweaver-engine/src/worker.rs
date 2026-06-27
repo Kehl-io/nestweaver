@@ -19,6 +19,10 @@ pub struct IndexingStatus {
     pub current_repo: Arc<tokio::sync::RwLock<String>>,
     /// Number of pending + running jobs.
     pub queue_depth: Arc<AtomicU32>,
+    /// Number of spawned tasks that are still running. Used together with
+    /// the SQLite queue depth to avoid prematurely reporting idle when
+    /// tasks are in flight but no jobs are pending.
+    pub in_flight: Arc<AtomicU32>,
 }
 
 impl IndexingStatus {
@@ -27,6 +31,7 @@ impl IndexingStatus {
             active: Arc::new(AtomicBool::new(false)),
             current_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
             queue_depth: Arc::new(AtomicU32::new(0)),
+            in_flight: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -40,6 +45,7 @@ impl IndexingStatus {
             active,
             current_repo,
             queue_depth,
+            in_flight: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -172,11 +178,15 @@ impl WorkerPool {
             let job = match job {
                 Ok(Some(job)) => job,
                 Ok(None) => {
-                    // No jobs available — mark idle.
+                    // No pending jobs — only mark fully idle when no
+                    // spawned tasks are still running.
                     if let Some(ref st) = status {
-                        st.active.store(false, Ordering::Relaxed);
-                        *st.current_repo.write().await = String::new();
-                        st.queue_depth.store(0, Ordering::Relaxed);
+                        let flying = st.in_flight.load(Ordering::Relaxed);
+                        if flying == 0 {
+                            st.active.store(false, Ordering::Relaxed);
+                            *st.current_repo.write().await = String::new();
+                            st.queue_depth.store(0, Ordering::Relaxed);
+                        }
                     }
                     // Wait briefly or until shutdown.
                     tokio::select! {
@@ -199,6 +209,11 @@ impl WorkerPool {
             if let Some(ref st) = status {
                 st.active.store(true, Ordering::Relaxed);
                 *st.current_repo.write().await = job.repo_id.clone();
+            }
+
+            // Track in-flight tasks so queue depth reflects running work.
+            if let Some(ref st) = status {
+                st.in_flight.fetch_add(1, Ordering::Relaxed);
             }
 
             // Acquire a semaphore permit to bound concurrency.
@@ -249,13 +264,15 @@ impl WorkerPool {
                     }
                 }
 
-                // Update queue depth after job completion.
+                // Update queue depth and in-flight count after job completion.
                 if let Some(ref st) = status_clone {
+                    let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
                     let q = queue.lock().expect("job queue lock poisoned");
                     if let Ok(depth) = q.queue_depth() {
                         let total = (depth.pending + depth.running) as u32;
-                        st.queue_depth.store(total, Ordering::Relaxed);
-                        if total == 0 {
+                        st.queue_depth
+                            .store(total.max(remaining_in_flight), Ordering::Relaxed);
+                        if total == 0 && remaining_in_flight == 0 {
                             st.active.store(false, Ordering::Relaxed);
                             // Clear current_repo — requires async, so we
                             // spawn a minimal task.
