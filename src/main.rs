@@ -2762,7 +2762,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             instance,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -2771,7 +2771,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "list_repos", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3645,14 +3645,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::SuggestLinks {
             db,
             json,
-            config: _,
+            config: config_opt,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "suggest_links", args)
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "suggest_links", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -4074,14 +4074,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             top,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "top": top });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "bridge_nodes", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4214,7 +4214,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             resolution,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
@@ -4224,7 +4224,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "clusters", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -5387,7 +5387,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "query": query, "limit": limit });
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "search_symbols", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "search_symbols", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -6290,7 +6290,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
             repo: repo_filter,
-            config: _,
+            config: config_opt,
             ..
         } => {
             // ── daemon guard ──────────────────────────────────────
@@ -6299,7 +6299,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
-                    None,
+                    config_opt.as_deref(),
                     "brain_impact",
                     serde_json::json!({
                         "symbol": name_or_uid,
