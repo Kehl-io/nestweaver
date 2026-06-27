@@ -310,7 +310,13 @@ name = "team-server"
 url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
+ca_cert = "/path/to/ca.crt"   # optional: for self-signed certificates
 ```
+
+When connecting to a server using self-signed TLS certificates (e.g., generated
+by `nestweaver server init-tls`), set `ca_cert` to the path of the CA certificate
+PEM file. This tells the client to trust the server's certificate even though it
+is not signed by a public CA.
 
 ---
 

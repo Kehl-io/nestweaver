@@ -549,6 +549,9 @@ pub struct UpstreamEntry {
     pub repos: Vec<String>,
     #[serde(default = "default_upstream_timeout")]
     pub timeout: String,
+    /// Path to CA certificate PEM file for self-signed TLS.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
 }
 
 fn default_upstream_mode() -> String {

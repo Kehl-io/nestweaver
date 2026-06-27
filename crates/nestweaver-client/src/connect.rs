@@ -74,6 +74,7 @@ pub async fn connect_upstream(
         repos: vec![],
         mode,
         timeout: "1s".to_string(),
+        ca_cert: None,
     };
 
     let saved_path = save_upstream(&config)?;

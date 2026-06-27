@@ -1710,6 +1710,7 @@ mod tests {
             repos: vec![],
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let cfg2 = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -1718,6 +1719,7 @@ mod tests {
             repos: vec![],
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
 
         let h1 = UpstreamHandle::from_config(&cfg1).unwrap();
@@ -1930,6 +1932,7 @@ mod tests {
             repos: vec![],
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         handle.mark_unhealthy();
@@ -1951,6 +1954,7 @@ mod tests {
             repos: vec![],
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         let healthy_ref = handle.healthy_ref();
@@ -2223,6 +2227,7 @@ mod tests {
             repos: vec!["acme/*".to_string()],
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let cfg_partner = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -2231,6 +2236,7 @@ mod tests {
             repos: vec!["partner/*".to_string()],
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
 
         let h1 = UpstreamHandle::from_config(&cfg_acme).unwrap();

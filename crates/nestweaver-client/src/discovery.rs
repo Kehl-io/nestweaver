@@ -48,6 +48,9 @@ pub struct UpstreamConfig {
     /// Per-query timeout in human-readable form (e.g., "1s").
     #[serde(default = "default_timeout")]
     pub timeout: String,
+    /// Path to CA certificate PEM file for self-signed TLS.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
 }
 
 fn default_timeout() -> String {
@@ -103,6 +106,7 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
             repos: vec![],
             mode: RoutingMode::default(),
             timeout: default_timeout(),
+            ca_cert: None,
         }];
     }
 
@@ -200,6 +204,7 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
                         repos: vec![],
                         mode: parsed.upstream.mode,
                         timeout: default_timeout(),
+                        ca_cert: None,
                     });
                 }
             }
@@ -238,6 +243,8 @@ struct InstanceUpstreamEntry {
     repos: Vec<String>,
     #[serde(default = "default_timeout")]
     timeout: String,
+    #[serde(default)]
+    ca_cert: Option<String>,
 }
 
 fn default_mode_string() -> String {
@@ -258,6 +265,7 @@ impl InstanceUpstreamEntry {
             mode,
             repos: self.repos,
             timeout: self.timeout,
+            ca_cert: self.ca_cert,
         }
     }
 }

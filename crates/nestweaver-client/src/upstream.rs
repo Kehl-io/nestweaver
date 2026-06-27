@@ -33,11 +33,20 @@ impl UpstreamHandle {
         let url = normalize_url(&config.url);
 
         let per_rpc_timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
-        let channel = Channel::from_shared(url)
+        let mut endpoint = Channel::from_shared(url)
             .context("invalid upstream URL")?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(per_rpc_timeout)
-            .connect_lazy();
+            .timeout(per_rpc_timeout);
+
+        if let Some(ref ca_path) = config.ca_cert {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("failed to read CA cert: {ca_path}"))?;
+            let ca = tonic::transport::Certificate::from_pem(pem);
+            let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
+            endpoint = endpoint.tls_config(tls).context("TLS config failed")?;
+        }
+
+        let channel = endpoint.connect_lazy();
 
         let patterns: Vec<_> = config
             .repos
@@ -214,6 +223,7 @@ mod tests {
             repos: vec!["acme/*".to_string()],
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert_eq!(handle.name, "test");
@@ -232,6 +242,7 @@ mod tests {
             repos: vec![],
             mode: RoutingMode::default(),
             timeout: "1s".to_string(),
+            ca_cert: None,
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert!(handle.matches_repo("anything/at/all"));
