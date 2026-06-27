@@ -509,8 +509,13 @@ mod tests {
             None,
         )
         .unwrap();
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll, None)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Poll,
+            None,
+        )
+        .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.pending, 1, "should coalesce into one job");
@@ -520,8 +525,13 @@ mod tests {
     fn upsert_keeps_higher_priority() {
         let q = queue();
         // Insert with lower priority (poll = 2)
-        q.upsert("repo-1", "https://github.com/org/repo-1", JobTrigger::Poll, None)
-            .unwrap();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Poll,
+            None,
+        )
+        .unwrap();
         // Upsert with higher priority (webhook = 1)
         q.upsert(
             "repo-1",
@@ -781,8 +791,13 @@ mod tests {
             None,
         )
         .unwrap();
-        q.upsert("repo-2", "https://github.com/org/repo-2", JobTrigger::Poll, None)
-            .unwrap();
+        q.upsert(
+            "repo-2",
+            "https://github.com/org/repo-2",
+            JobTrigger::Poll,
+            None,
+        )
+        .unwrap();
 
         // Dead-letter repo-1
         let job = q.claim_next(0).unwrap().unwrap();
@@ -798,12 +813,22 @@ mod tests {
     fn queue_depth_counts_all_statuses() {
         let q = queue();
         // Create 3 jobs in different states
-        q.upsert("repo-a", "https://github.com/org/a", JobTrigger::Webhook, None)
-            .unwrap();
+        q.upsert(
+            "repo-a",
+            "https://github.com/org/a",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
         q.upsert("repo-b", "https://github.com/org/b", JobTrigger::Poll, None)
             .unwrap();
-        q.upsert("repo-c", "https://github.com/org/c", JobTrigger::Scheduled, None)
-            .unwrap();
+        q.upsert(
+            "repo-c",
+            "https://github.com/org/c",
+            JobTrigger::Scheduled,
+            None,
+        )
+        .unwrap();
 
         // Claim and complete repo-a
         let job_a = q.claim_next(0).unwrap().unwrap();

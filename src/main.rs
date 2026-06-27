@@ -2771,7 +2771,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args) {
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args)
+                {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3651,9 +3653,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "suggest_links", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc(
+                    true,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "suggest_links",
+                    args,
+                ) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -4081,7 +4087,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "top": top });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4224,7 +4231,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args) {
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args)
+                {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }

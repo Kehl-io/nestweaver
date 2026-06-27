@@ -213,10 +213,7 @@ impl HybridClient {
     /// Server-preferred routing: query upstream first, fall back to local.
     async fn query_server_preferred(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         let timeout = self.upstream_timeout(params);
-        match self
-            .query_upstream(tool_name, params, timeout)
-            .await
-        {
+        match self.query_upstream(tool_name, params, timeout).await {
             Ok(mut r) => {
                 inject_provenance(&mut r, &["server"], &[]);
                 Ok(r)
@@ -283,10 +280,7 @@ impl HybridClient {
             threshold = FALLBACK_THRESHOLD,
             "fallback: local results sparse, querying server"
         );
-        match self
-            .query_upstream(tool_name, params, timeout)
-            .await
-        {
+        match self.query_upstream(tool_name, params, timeout).await {
             Ok(server_result) => {
                 let merged = merge_json_results(&local_result, &server_result);
                 Ok(merged)
