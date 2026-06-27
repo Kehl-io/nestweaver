@@ -93,6 +93,7 @@ impl WorkerPool {
             &mut shutdown,
             status,
             None,
+            None,
         )
         .await;
     }
@@ -111,6 +112,7 @@ impl WorkerPool {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
         drained: Arc<AtomicBool>,
+        write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     ) {
         self.run_inner(
             queue,
@@ -120,6 +122,7 @@ impl WorkerPool {
             &mut shutdown,
             status,
             Some(drained),
+            write_mutex,
         )
         .await;
     }
@@ -133,6 +136,7 @@ impl WorkerPool {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
         drained: Option<Arc<AtomicBool>>,
+        write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     ) {
         loop {
             // Check shutdown signal.
@@ -204,6 +208,7 @@ impl WorkerPool {
             let store = store.clone();
             let instance_id = instance_id.clone();
             let status_clone = status.clone();
+            let write_mutex = write_mutex.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -213,6 +218,9 @@ impl WorkerPool {
                 let result = {
                     let job_clone = job.clone();
                     tokio::task::spawn_blocking(move || {
+                        // Acquire the daemon's write mutex to prevent concurrent
+                        // writes to the graph store from RPC handlers.
+                        let _write_guard = write_mutex.as_ref().map(|m| m.blocking_lock());
                         process_job(&job_clone, &workspace, &store, &instance_id)
                     })
                     .await

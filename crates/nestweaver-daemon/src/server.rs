@@ -3329,6 +3329,7 @@ pub async fn run_server(
             let worker_instance = instance_id.clone();
             let worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
+            let worker_write_mutex = Arc::clone(&state.write_mutex);
             let worker_count = state
                 .instance_cfg
                 .as_ref()
@@ -3375,6 +3376,7 @@ pub async fn run_server(
                     worker_shutdown,
                     Some(indexing_status),
                     worker_drained,
+                    Some(worker_write_mutex),
                 )
                 .await;
             });
