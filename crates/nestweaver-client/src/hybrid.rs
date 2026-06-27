@@ -199,7 +199,30 @@ impl HybridClient {
                 // Combined tools return status/metadata objects — preserve shape,
                 // don't flatten into { results: [...] }.
                 let mut result = self.query_local(tool_name, params).await?;
-                inject_provenance(&mut result, &["local"], &[]);
+                // Try to enrich with upstream status data (best-effort).
+                if self.has_upstreams() {
+                    let timeout = self.upstream_timeout(params);
+                    if let Ok(server) = self.query_upstream(tool_name, params, timeout).await {
+                        // Merge scalar/missing keys from server into local result.
+                        if let (Some(local_obj), Some(server_obj)) =
+                            (result.as_object_mut(), server.as_object())
+                        {
+                            for (k, v) in server_obj {
+                                if k.starts_with('_') {
+                                    continue;
+                                }
+                                if !local_obj.contains_key(k) {
+                                    local_obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        inject_provenance(&mut result, &["local", "server"], &[]);
+                    } else {
+                        inject_provenance(&mut result, &["local"], &[]);
+                    }
+                } else {
+                    inject_provenance(&mut result, &["local"], &[]);
+                }
                 Ok(result)
             }
             ToolRouting::Merge | ToolRouting::FanOut => self.query_merge(tool_name, params).await,
