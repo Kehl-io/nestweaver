@@ -114,6 +114,13 @@ pub struct QueueDepth {
     pub dead_letter: i64,
 }
 
+/// Info about a currently running job, for admin API reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunningJobInfo {
+    pub repo: String,
+    pub started: Option<i64>,
+}
+
 /// SQLite-backed job queue. One instance per server process.
 pub struct JobQueue {
     conn: Connection,
@@ -391,6 +398,20 @@ impl JobQueue {
             }
         }
         Ok(depth)
+    }
+
+    /// Return info about currently running jobs.
+    pub fn running_jobs(&self) -> Result<Vec<RunningJobInfo>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT repo_id, started_at FROM index_jobs WHERE status = 'running'")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunningJobInfo {
+                repo: row.get(0)?,
+                started: row.get(1)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Return all dead-lettered jobs.

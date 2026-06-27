@@ -418,11 +418,33 @@ pub async fn trigger_reindex(
 pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -> Json<QueueInfo> {
     let depth = state.indexing_queue_depth.load(Ordering::Relaxed);
     let drained = state.drained.load(Ordering::Relaxed);
+
+    // Read actual running jobs from the SQLite job queue.
+    let db_path = state.db_path.clone();
+    let running_jobs: Option<Vec<serde_json::Value>> = tokio::task::spawn_blocking(move || {
+        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+            .ok()
+            .and_then(|q| q.running_jobs().ok())
+            .map(|jobs| {
+                jobs.into_iter()
+                    .map(|j| {
+                        serde_json::json!({
+                            "repo": j.repo,
+                            "started": j.started,
+                        })
+                    })
+                    .collect()
+            })
+    })
+    .await
+    .unwrap_or(None);
+
     Json(QueueInfo {
         depth,
         drained,
         by_priority: None,
-        running: None,
+        running: running_jobs,
     })
 }
 
@@ -807,18 +829,25 @@ pub async fn get_status(
     .await
     .unwrap_or((0, 0));
 
-    // Count dead-letter entries for the nested stats.
+    // Count dead-letter entries and running jobs from the job queue.
     let db_path = state.db_path.clone();
-    let dead_letter_count = tokio::task::spawn_blocking(move || {
+    let (dead_letter_count, running_count) = tokio::task::spawn_blocking(move || {
         let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-        nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .ok()
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
+        let dead = queue
+            .as_ref()
             .and_then(|q| q.dead_letters().ok())
             .map(|d| d.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let running = queue
+            .as_ref()
+            .and_then(|q| q.running_jobs().ok())
+            .map(|r| r.len() as u32)
+            .unwrap_or(0);
+        (dead, running)
     })
     .await
-    .unwrap_or(0);
+    .unwrap_or((0, 0));
 
     let queue_depth = state.indexing_queue_depth.load(Ordering::Relaxed);
 
@@ -843,7 +872,7 @@ pub async fn get_status(
         },
         queue: QueueStats {
             pending: queue_depth,
-            running: state.active_writes.load(Ordering::Relaxed),
+            running: running_count,
             dead_letter: dead_letter_count,
         },
     })
