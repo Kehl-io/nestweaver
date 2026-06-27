@@ -220,6 +220,11 @@ pub struct InstanceConfig {
     /// Local embedding model and hybrid-search blend configuration (`[embedding]`).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+    /// Upstream NestWeaver servers (`[[upstream]]`). Parsed here so the
+    /// sections are not silently ignored; the client crate re-reads them
+    /// via its own discovery layer.
+    #[serde(default)]
+    pub upstream: Vec<UpstreamEntry>,
 }
 
 /// `[embedding]` — local embedding model and hybrid-search blend configuration.
@@ -524,6 +529,33 @@ pub struct McpServerConfig {
     /// Timeout in seconds for tool calls to this server (default 30).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// A single `[[upstream]]` entry in the instance config.
+///
+/// Mirrors the `UpstreamConfig` shape from `nestweaver-client` but lives in
+/// the engine crate to avoid a circular dependency. The client crate
+/// re-reads these entries via its own discovery layer at connect time.
+#[derive(Debug, Deserialize, Clone)]
+pub struct UpstreamEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_upstream_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default = "default_upstream_timeout")]
+    pub timeout: String,
+}
+
+fn default_upstream_mode() -> String {
+    "fallback".to_string()
+}
+fn default_upstream_timeout() -> String {
+    "1s".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

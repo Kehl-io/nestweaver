@@ -121,6 +121,34 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
     vec![]
 }
 
+/// Discover upstream server configurations, including any `[[upstream]]`
+/// entries from the instance config file.
+///
+/// Extends [`discover_upstreams`] by also reading `[[upstream]]` sections
+/// from `config_path` (the `instance.toml`). Instance-config upstreams are
+/// appended after the standard discovery sources; entries with duplicate
+/// URLs are deduplicated (first occurrence wins).
+pub fn discover_upstreams_with_config(
+    start_dir: &Path,
+    config_path: Option<&Path>,
+) -> Vec<UpstreamConfig> {
+    let mut upstreams = discover_upstreams(start_dir);
+
+    if let Some(path) = config_path {
+        if let Some(config_upstreams) = load_instance_upstreams(path) {
+            let existing_urls: std::collections::HashSet<String> =
+                upstreams.iter().map(|u| u.url.clone()).collect();
+            for entry in config_upstreams {
+                if !existing_urls.contains(&entry.url) {
+                    upstreams.push(entry);
+                }
+            }
+        }
+    }
+
+    upstreams
+}
+
 /// Save a single upstream to `~/.config/nestweaver/upstreams.toml`.
 ///
 /// Replaces an existing entry with the same URL, or appends.
@@ -181,6 +209,73 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
         }
     }
     None
+}
+
+/// Partial parse of an instance config file — extracts only `[[upstream]]`.
+///
+/// This avoids depending on `nestweaver-engine` for the full `InstanceConfig`
+/// struct while still being able to read the upstream entries from the same
+/// TOML file.
+#[derive(Debug, Deserialize)]
+struct InstanceUpstreamsOnly {
+    #[serde(default)]
+    upstream: Vec<InstanceUpstreamEntry>,
+}
+
+/// A single `[[upstream]]` entry as written in the instance config.
+/// The `mode` field is a string here (e.g. "fallback", "merge", "primary")
+/// and is parsed into [`RoutingMode`] during conversion.
+#[derive(Debug, Deserialize)]
+struct InstanceUpstreamEntry {
+    #[serde(default)]
+    name: Option<String>,
+    url: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default = "default_mode_string")]
+    mode: String,
+    #[serde(default)]
+    repos: Vec<String>,
+    #[serde(default = "default_timeout")]
+    timeout: String,
+}
+
+fn default_mode_string() -> String {
+    "fallback".to_string()
+}
+
+impl InstanceUpstreamEntry {
+    fn into_upstream_config(self) -> UpstreamConfig {
+        let mode = match self.mode.as_str() {
+            "merge" => RoutingMode::Merge,
+            "primary" => RoutingMode::Primary,
+            _ => RoutingMode::Fallback,
+        };
+        UpstreamConfig {
+            name: self.name,
+            url: self.url,
+            token: self.token,
+            mode,
+            repos: self.repos,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// Load `[[upstream]]` entries from an instance config file.
+fn load_instance_upstreams(config_path: &Path) -> Option<Vec<UpstreamConfig>> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let parsed: InstanceUpstreamsOnly = toml::from_str(&content).ok()?;
+    if parsed.upstream.is_empty() {
+        return None;
+    }
+    Some(
+        parsed
+            .upstream
+            .into_iter()
+            .map(|e| e.into_upstream_config())
+            .collect(),
+    )
 }
 
 /// Load upstreams from `~/.config/nestweaver/upstreams.toml`.

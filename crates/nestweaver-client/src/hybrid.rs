@@ -21,7 +21,7 @@ use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{JsonRequest, JsonResponse};
 
 use crate::DaemonClient;
-use crate::discovery::{RoutingMode, discover_upstreams};
+use crate::discovery::{RoutingMode, discover_upstreams_with_config};
 use crate::merge::rrf_merge;
 use crate::routing::{ToolRouting, tool_routing};
 use crate::upstream::UpstreamHandle;
@@ -69,14 +69,15 @@ impl HybridClient {
     ///
     /// Upstream discovery walks `start_dir` upward looking for
     /// `.nestweaver/server.toml`, checks `~/.config/nestweaver/upstreams.toml`,
-    /// and honors the `NESTWEAVER_UPSTREAM` env var.
+    /// honors the `NESTWEAVER_UPSTREAM` env var, and reads any `[[upstream]]`
+    /// entries from the instance config file (`config_path`).
     pub async fn connect(
         db_path: &Path,
         config_path: Option<&Path>,
         start_dir: &Path,
     ) -> Result<Self> {
         let local = DaemonClient::connect(db_path, config_path).await?;
-        let upstream_configs = discover_upstreams(start_dir);
+        let upstream_configs = discover_upstreams_with_config(start_dir, config_path);
 
         let mut upstreams = Vec::new();
         for cfg in &upstream_configs {
