@@ -55,8 +55,8 @@ admin_token = "${NESTWEAVER_ADMIN_TOKEN}"
 
 [server.indexing]
 workers = 8
-poll_min = "45s"
-poll_max = "8h"
+min_poll = "45s"
+max_poll = "8h"
 
 [server.webhook]
 secret = "${NESTWEAVER_WEBHOOK_SECRET}"

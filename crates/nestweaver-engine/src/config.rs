@@ -536,9 +536,9 @@ pub struct ServerConfig {
 pub struct IndexingConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
-    #[serde(default = "default_min_poll")]
+    #[serde(default = "default_min_poll", alias = "poll_min")]
     pub min_poll: String,
-    #[serde(default = "default_max_poll")]
+    #[serde(default = "default_max_poll", alias = "poll_max")]
     pub max_poll: String,
 }
 
