@@ -81,4 +81,11 @@ pub struct AdminState {
     /// scheduler is running (non-server mode or no admin token).
     pub scheduler_tx:
         Option<tokio::sync::mpsc::Sender<nestweaver_engine::scheduler::SchedulerCommand>>,
+    /// Webhook allowed repos set, shared with the webhook handler via RwLock.
+    /// Reload updates this so new repos are accepted without restart.
+    pub webhook_allowed_repos:
+        Option<Arc<std::sync::RwLock<Option<std::collections::HashSet<String>>>>>,
+    /// Webhook per-repo branch map, shared with the webhook handler via RwLock.
+    pub webhook_repo_branches:
+        Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
 }

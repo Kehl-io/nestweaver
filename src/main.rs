@@ -1531,7 +1531,7 @@ enum DaemonAction {
         server: bool,
 
         /// TCP bind address for server mode
-        #[arg(long, default_value = "127.0.0.1:9378")]
+        #[arg(long, default_value = "127.0.0.1:9378", env = "NESTWEAVER_BIND")]
         bind: String,
 
         /// Path to TLS certificate PEM file. Enables TLS when set.

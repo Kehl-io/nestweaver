@@ -3142,6 +3142,15 @@ pub async fn run_server(
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
 
+        // Shared webhook state Arcs — populated inside the webhook block,
+        // then passed to AdminState so /admin/api/reload can update them.
+        let mut webhook_allowed_repos: Option<
+            std::sync::Arc<std::sync::RwLock<Option<std::collections::HashSet<String>>>>,
+        > = None;
+        let mut webhook_repo_branches: Option<
+            std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+        > = None;
+
         // Mount webhook endpoint when a secret is configured.
         if let Some(ref secret) = opts.webhook_secret {
             let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
@@ -3172,14 +3181,18 @@ pub async fn run_server(
                         .collect()
                 })
                 .unwrap_or_default();
+            let shared_allowed = std::sync::Arc::new(std::sync::RwLock::new(allowed_repos));
+            let shared_branches = std::sync::Arc::new(std::sync::RwLock::new(repo_branches));
+            webhook_allowed_repos = Some(std::sync::Arc::clone(&shared_allowed));
+            webhook_repo_branches = Some(std::sync::Arc::clone(&shared_branches));
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
                 config: crate::webhook::WebhookConfig {
                     secret: secret.clone(),
                     secret_old: opts.webhook_secret_old.clone(),
                 },
                 job_queue: std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
-                allowed_repos,
-                repo_branches,
+                allowed_repos: shared_allowed,
+                repo_branches: shared_branches,
             });
             mcp_router = mcp_router.route(
                 "/webhook",
@@ -3202,6 +3215,8 @@ pub async fn run_server(
                 db_path: db_path.clone(),
                 config_path: config_path.map(|p| p.to_path_buf()),
                 scheduler_tx: Some(scheduler_tx.clone()),
+                webhook_allowed_repos: webhook_allowed_repos.clone(),
+                webhook_repo_branches: webhook_repo_branches.clone(),
             });
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);

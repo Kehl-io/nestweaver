@@ -7,7 +7,7 @@
 //! the worker pool handle the actual index update.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -34,11 +34,13 @@ pub struct WebhookState {
     /// When `Some`, only repos whose canonical ID is in this set get enqueued.
     /// Repos with `poll = "manual"` or not in the instance config are excluded.
     /// When `None`, all validly-signed webhooks are accepted (backwards-compat).
-    pub allowed_repos: Option<HashSet<String>>,
+    /// Wrapped in Arc<RwLock> so `/admin/api/reload` can update it without restart.
+    pub allowed_repos: Arc<RwLock<Option<HashSet<String>>>>,
     /// Configured branch per repo (canonical_id → branch). When a webhook
     /// fires for a repo with a configured branch, the job carries that branch
     /// so the worker indexes the correct ref instead of defaulting to HEAD.
-    pub repo_branches: HashMap<String, String>,
+    /// Wrapped in Arc<RwLock> so `/admin/api/reload` can update it without restart.
+    pub repo_branches: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// POST /webhook — receives push events from GitHub/GitLab.
@@ -72,20 +74,25 @@ pub async fn handle_webhook(
     };
 
     // 2b. Check whether this repo is in the allowed set.
-    if let Some(ref allowed) = state.allowed_repos {
-        let canonical = nestweaver_engine::jobs::canonical_repo_id(&url);
-        if !allowed.contains(&canonical) {
-            tracing::info!(%url, "webhook ignored: repo not in allowed set");
-            return (StatusCode::OK, "ignored");
+    let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+    if let Ok(allowed_guard) = state.allowed_repos.read() {
+        if let Some(ref allowed) = *allowed_guard {
+            if !allowed.contains(&repo_id) {
+                tracing::info!(%url, "webhook ignored: repo not in allowed set");
+                return (StatusCode::OK, "ignored");
+            }
         }
     }
 
     // 3. Enqueue job with the configured branch (if any).
-    let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
-    let branch = state.repo_branches.get(&repo_id).map(|s| s.as_str());
+    let branch: Option<String> = state
+        .repo_branches
+        .read()
+        .ok()
+        .and_then(|g| g.get(&repo_id).cloned());
     let enqueue_result = {
         let queue = state.job_queue.lock().expect("job queue lock poisoned");
-        queue.upsert(&repo_id, &url, JobTrigger::Webhook, branch)
+        queue.upsert(&repo_id, &url, JobTrigger::Webhook, branch.as_deref())
     };
 
     if let Err(e) = enqueue_result {

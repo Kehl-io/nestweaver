@@ -637,6 +637,40 @@ pub async fn reload_config(
         }
     }
 
+    // Update webhook state so new/changed repos take effect without restart.
+    if let Some(ref config_path) = state.config_path {
+        if let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path) {
+            if let Some(ref lock) = state.webhook_allowed_repos {
+                let new_allowed: std::collections::HashSet<String> = cfg
+                    .repos
+                    .iter()
+                    .filter(|r| r.poll.as_deref() != Some("manual"))
+                    .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                    .collect();
+                if let Ok(mut guard) = lock.write() {
+                    *guard = Some(new_allowed);
+                }
+            }
+            if let Some(ref lock) = state.webhook_repo_branches {
+                let new_branches: std::collections::HashMap<String, String> = cfg
+                    .repos
+                    .iter()
+                    .filter_map(|r| {
+                        r.branch.as_ref().map(|b| {
+                            (
+                                nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                                b.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+                if let Ok(mut guard) = lock.write() {
+                    *guard = new_branches;
+                }
+            }
+        }
+    }
+
     Ok(Json(MessageResponse { message }))
 }
 
@@ -696,6 +730,8 @@ mod tests {
             db_path: db_path_clone,
             config_path: None,
             scheduler_tx: None,
+            webhook_allowed_repos: None,
+            webhook_repo_branches: None,
         })
     }
 

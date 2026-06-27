@@ -223,10 +223,10 @@ The webhook secret is set via CLI flag or environment variable (not the config f
 
 NestWeaver supports two webhook secrets simultaneously for zero-downtime rotation:
 
-1. Set the new secret in your instance config
-2. Set the old secret as `webhook_secret_old`
-3. Update the secret on GitHub/GitLab
-4. Once all webhooks use the new secret, remove `webhook_secret_old`
+1. Add `--webhook-secret-old "$CURRENT_SECRET"` (or set `NESTWEAVER_WEBHOOK_SECRET_OLD`)
+2. Change `--webhook-secret` (or `NESTWEAVER_WEBHOOK_SECRET`) to the new secret
+3. Restart the daemon, then update the secret on GitHub/GitLab
+4. Once all webhooks use the new secret, remove `--webhook-secret-old`
 
 During rotation, the server checks the new secret first, falls back to the old secret, and logs a deprecation warning when the old secret matches.
 
@@ -469,9 +469,9 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
   http://localhost:9379/admin/api/repos
 
-# Force reindex
+# Force reindex (use the repo UID from GET /admin/api/repos)
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://localhost:9379/admin/api/repos/api-service/reindex
+  http://localhost:9379/admin/api/repos/myinstance%3A%3Ahttps%3A%2F%2Fgithub.com%2Facme%2Fapi-service/reindex
 
 # Drain the queue (pause indexing)
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
@@ -602,11 +602,13 @@ nestweaver brain reindex-search
 # Check which repos are behind
 nestweaver brain stale-check
 
-# Force reindex a specific repo
+# Force reindex a specific repo (use UID from GET /admin/api/repos)
+REPO_UID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:9379/admin/api/repos | jq -r '.[0].id')
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9379/admin/api/repos/api-service/reindex
+  "http://localhost:9379/admin/api/repos/${REPO_UID}/reindex"
 
-# Check adaptive polling is working
+# Check indexed repos
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9379/admin/api/repos | jq '.[].last_polled'
+  http://localhost:9379/admin/api/repos | jq '.[].name'
 ```
