@@ -139,8 +139,7 @@ nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TO
 |------|----------|---------|
 | 9377 | HTTP | Web UI + Prometheus `/metrics` |
 | 9378 | gRPC | Query API (TCP + TLS) |
-| 9379 | HTTP | MCP-over-HTTP (AI agents) |
-| 9380 | HTTP | Webhook endpoint |
+| 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` |
 
 ### Docker
 

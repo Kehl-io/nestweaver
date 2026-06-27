@@ -45,21 +45,16 @@ All flags can be set via environment variables:
 
 ### Instance config (nestweaver-instance.toml)
 
-Server settings can also be declared in the instance config:
+Server settings can also be declared in the instance config. Note that `bind`, `auth_token`,
+`admin_token`, and `webhook_secret` are **not** config-file keys — they come from CLI flags
+(`--bind`, `--auth-token`, `--admin-token`, `--webhook-secret`) or their corresponding
+environment variables (see table above).
 
 ```toml
-[server]
-bind = "0.0.0.0:9378"
-auth_token = "${NESTWEAVER_AUTH_TOKEN}"
-admin_token = "${NESTWEAVER_ADMIN_TOKEN}"
-
 [server.indexing]
 workers = 8
 min_poll = "45s"
 max_poll = "8h"
-
-[server.webhook]
-secret = "${NESTWEAVER_WEBHOOK_SECRET}"
 
 [server.backup]
 enabled = true
@@ -73,23 +68,24 @@ retain = 7
 
 ## Network Architecture
 
-The server listens on four ports:
+The server listens on three ports. Webhook and admin API endpoints are mounted as routes on the MCP HTTP server (:9379), not on separate ports.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                 NestWeaver Server                     │
-│                                                       │
-│  :9377  HTTP    Web UI + Prometheus /metrics           │
-│  :9378  gRPC    Query API (TCP + TLS)                 │
-│  :9379  HTTP    MCP-over-HTTP (AI agents)             │
-│  :9380  HTTP    Webhook endpoint (GitHub/GitLab)      │
-│                                                       │
-│  ┌─────────────────────────────────────────────┐      │
-│  │            Daemon Core                       │      │
-│  │  Single-writer + Index job queue             │      │
-│  │  LadybugDB + Tantivy + Embeddings            │      │
-│  └─────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   NestWeaver Server                       │
+│                                                           │
+│  :9377  HTTP    Web UI + Prometheus /metrics               │
+│  :9378  gRPC    Query API (TCP + TLS)                     │
+│  :9379  HTTP    MCP-over-HTTP (AI agents)                 │
+│                  ├─ /webhook      (GitHub/GitLab push)    │
+│                  └─ /admin/api/*  (repo & queue mgmt)     │
+│                                                           │
+│  ┌─────────────────────────────────────────────────┐      │
+│  │            Daemon Core                           │      │
+│  │  Single-writer + Index job queue                 │      │
+│  │  LadybugDB + Tantivy + Embeddings                │      │
+│  └─────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────┘
      ▲ gRPC         ▲ gRPC          ▲ MCP-over-HTTP
      │               │               │
   Dev A (local)   Dev B (local)   AI Agent (Claude/Cursor)
@@ -99,8 +95,7 @@ The server listens on four ports:
 |------|----------|------|---------|
 | 9377 | HTTP | None (bind to localhost in production) | Web UI graph visualization, Prometheus `/metrics` |
 | 9378 | gRPC | Bearer token (TLS recommended) | Primary query API for CLI clients and local daemons |
-| 9379 | HTTP | Bearer token | MCP-over-HTTP for AI agents (Streamable HTTP transport) |
-| 9380 | HTTP | HMAC signature | Webhook endpoint for GitHub/GitLab/Gitea push events |
+| 9379 | HTTP | Bearer token / HMAC | MCP-over-HTTP for AI agents, plus `/webhook` (HMAC) and `/admin/api/*` (admin token) |
 
 ---
 
@@ -131,7 +126,7 @@ Admin API endpoints require a separate `admin_token`. This token grants access t
 
 ```bash
 curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://nestweaver.internal:9377/admin/repos
+  http://nestweaver.internal:9379/admin/api/repos
 ```
 
 ---
@@ -210,7 +205,7 @@ Webhooks provide near-instant re-indexing when code is pushed. The server also r
 ### GitHub
 
 1. In your repo or org settings, go to **Webhooks > Add webhook**
-2. Set the payload URL to `http://nestweaver.internal:9380/webhooks/github`
+2. Set the payload URL to `http://nestweaver.internal:9379/webhook`
 3. Set content type to `application/json`
 4. Set the secret to your `NESTWEAVER_WEBHOOK_SECRET`
 5. Select "Just the push event"
@@ -218,15 +213,17 @@ Webhooks provide near-instant re-indexing when code is pushed. The server also r
 ### GitLab
 
 1. Go to **Settings > Webhooks**
-2. Set URL to `http://nestweaver.internal:9380/webhooks/gitlab`
+2. Set URL to `http://nestweaver.internal:9379/webhook`
 3. Set the secret token
 4. Check "Push events"
 
 ### Webhook configuration
 
-```toml
-[server.webhook]
-secret = "${NESTWEAVER_WEBHOOK_SECRET}"
+The webhook secret is set via CLI flag or environment variable (not the config file):
+
+```bash
+--webhook-secret "$NESTWEAVER_WEBHOOK_SECRET"
+# or: export NESTWEAVER_WEBHOOK_SECRET=...
 ```
 
 ### Dual-secret rotation
@@ -463,34 +460,35 @@ retain = 7               # keep 7 most recent backups
 
 ## Admin API
 
-The admin API is served on the web UI port (`:9377`) and requires the admin token.
+The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` and requires the admin token. Prometheus metrics are served on the web UI port (`:9377`).
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/admin/repos` | GET | List all indexed repos with status |
-| `/admin/repos` | POST | Add a new repo to the index |
-| `/admin/repos/{id}` | DELETE | Remove a repo from the index |
-| `/admin/repos/{id}/reindex` | POST | Force reindex of a specific repo |
-| `/admin/queue` | GET | View the indexing job queue |
-| `/admin/queue/drain` | POST | Pause job processing |
-| `/admin/queue/resume` | POST | Resume job processing |
-| `/admin/queue/dead-letter` | GET | View failed jobs |
-| `/admin/queue/dead-letter` | DELETE | Clear failed jobs |
-| `/admin/backup/save` | POST | Trigger a backup |
-| `/metrics` | GET | Prometheus metrics (no auth required) |
+| `/admin/api/repos` | GET | List all indexed repos with status |
+| `/admin/api/repos` | POST | Add a new repo to the index |
+| `/admin/api/repos/{id}` | DELETE | Remove a repo from the index |
+| `/admin/api/repos/{id}/reindex` | POST | Force reindex of a specific repo |
+| `/admin/api/reload` | POST | Reload server configuration |
+| `/admin/api/queue` | GET | View the indexing job queue |
+| `/admin/api/queue/drain` | POST | Pause job processing |
+| `/admin/api/queue/resume` | POST | Resume job processing |
+| `/admin/api/queue/dead-letter` | GET | View failed jobs |
+| `/admin/api/queue/dead-letter` | DELETE | Clear failed jobs |
+| `/admin/api/backup/save` | POST | Trigger a backup |
+| `/metrics` | GET | Prometheus metrics on `:9377` (no auth required) |
 
 ```bash
 # List repos
 curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://localhost:9377/admin/repos
+  http://localhost:9379/admin/api/repos
 
 # Force reindex
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://localhost:9377/admin/repos/api-service/reindex
+  http://localhost:9379/admin/api/repos/api-service/reindex
 
 # Drain the queue (pause indexing)
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
-  http://localhost:9377/admin/queue/drain
+  http://localhost:9379/admin/api/queue/drain
 ```
 
 ---
@@ -508,8 +506,7 @@ services:
     ports:
       - "9377:9377"   # Web UI + metrics
       - "9378:9378"   # gRPC
-      - "9379:9379"   # MCP-over-HTTP
-      - "9380:9380"   # Webhooks
+      - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:
       - nestweaver-data:/data
       - ./nestweaver-instance.toml:/etc/nestweaver/instance.toml:ro
@@ -585,11 +582,11 @@ openssl s_client -connect nestweaver.internal:9378 </dev/null
 # Check webhook delivery in GitHub (Settings > Webhooks > Recent Deliveries)
 # Verify the HMAC secret matches
 # Check the webhook endpoint is reachable
-curl -v http://nestweaver.internal:9380/webhooks/github
+curl -v http://nestweaver.internal:9379/webhook
 
 # Check the admin queue for failed jobs
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9377/admin/queue/dead-letter
+  http://localhost:9379/admin/api/queue/dead-letter
 ```
 
 ### High query latency
@@ -620,9 +617,9 @@ nestweaver brain stale-check
 
 # Force reindex a specific repo
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9377/admin/repos/api-service/reindex
+  http://localhost:9379/admin/api/repos/api-service/reindex
 
 # Check adaptive polling is working
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:9377/admin/repos | jq '.[].last_polled'
+  http://localhost:9379/admin/api/repos | jq '.[].last_polled'
 ```
