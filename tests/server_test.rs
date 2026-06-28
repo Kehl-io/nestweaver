@@ -849,6 +849,125 @@ async fn server_mcp_sessions_tracked() {
     );
 }
 
+/// Regression guard: the MCP-over-HTTP transport must thread `server_mode`
+/// into tool dispatch. Before the fix, `brain_status` over HTTP reported
+/// `server_mode: false` even when running `--server`, and the same missing
+/// thread-local made `read_symbols` read from an empty filesystem.
+#[tokio::test]
+async fn server_mcp_http_reports_server_mode_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": { "name": "brain_status", "arguments": {} }
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP tools/call request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let structured = &body["result"]["structuredContent"];
+    assert_eq!(
+        structured["server_mode"],
+        json!(true),
+        "brain_status over MCP-HTTP must report server_mode=true when running --server, got: {structured}"
+    );
+}
+
+/// Regression guard: in server mode, `read_symbols` over MCP-HTTP must take the
+/// server (bare-clone) code path rather than silently reading the filesystem.
+/// This harness indexes from a working tree with no bare-clone workspace, so
+/// the server branch is exercised and surfaces the bare-clone diagnostic note —
+/// which only appears when `is_server_mode()` is true on the HTTP dispatch
+/// thread. The companion `bare_index_test` proves GitBareReader returns bodies.
+#[tokio::test]
+async fn server_mcp_http_read_symbols_takes_server_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "read_symbols",
+                "arguments": { "targets": ["greet"] }
+            }
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP read_symbols request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["isError"],
+        json!(false),
+        "read_symbols over HTTP should not error: {}",
+        body
+    );
+    let structured = &body["result"]["structuredContent"];
+    let note = structured["server_note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("server mode"),
+        "read_symbols in server mode must take the server code path (server_note expected); got: {structured}"
+    );
+}
+
 // ── Webhook integration tests ───────────────────────────────────────────
 
 /// Compute HMAC-SHA256 signature in GitHub's `sha256=<hex>` format.
