@@ -797,6 +797,21 @@ url = "https://github.com/example/repo"
 "#;
 
     #[test]
+    fn shipped_docker_instance_toml_is_valid() {
+        // The instance.toml committed at the repo root is mounted by
+        // docker-compose. It must parse and validate or the container fails to
+        // start. Regression guard for "Docker deployment not ready".
+        let shipped = include_str!("../../../instance.toml");
+        let cfg = InstanceConfig::from_toml_str(shipped)
+            .expect("shipped Docker instance.toml must be a valid InstanceConfig");
+        assert_eq!(cfg.instance_id, "nestweaver-server");
+        assert!(
+            !cfg.inference.endpoint.is_empty(),
+            "inference.endpoint must be set"
+        );
+    }
+
+    #[test]
     fn parses_minimal_config() {
         let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
         assert_eq!(cfg.instance_id, "test-instance");

@@ -1,8 +1,37 @@
+# Keep the Docker build context small and reproducible. Only the Rust sources
+# (Cargo.toml/lock, src/, crates/) and the embedded frontend/dist are needed to
+# `cargo build --release --bin nestweaver`.
+
+# Build artifacts
 target/
-.git/
-node_modules/
+**/node_modules
 *.lbug
 *.lbug.*
-test-results/
-.claude/
+*.nwsnap
+*.nwsnap.*
+
+# Large/irrelevant trees (e.g. _docs/ is ~29G and never built)
+_docs/
+docs/
+app/
+extensions/
+npm/
+
+# Local state, snapshots, and graph data
+.git/
 .nestweaver/
+test-results/
+scratch/
+graphify-out/
+
+# Editor / agent / tooling
+.claude/
+.agents/
+.codex/
+.gitnexus/
+.playwright-cli/
+.superpowers/
+.devcontainer/
+.vscode/
+.github/
+.idea/

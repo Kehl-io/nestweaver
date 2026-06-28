@@ -9,6 +9,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y git ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/nestweaver /usr/local/bin/nestweaver
 VOLUME /data
-EXPOSE 9378 9379
+# 9377 web UI + Prometheus metrics, 9378 gRPC, 9379 MCP-over-HTTP + webhook + admin
+EXPOSE 9377 9378 9379
 ENTRYPOINT ["nestweaver"]
-CMD ["daemon", "--db", "/data/nestweaver/brain.lbug", "run", "--server", "--bind", "0.0.0.0:9378", "--config", "/etc/nestweaver/instance.toml"]
+# Argument order matches docker-compose.yml. (`--db` is a global flag on the
+# daemon command, so it is accepted before or after `run`.)
+CMD ["daemon", "run", "--server", "--bind", "0.0.0.0:9378", "--db", "/data/nestweaver/brain.lbug", "--config", "/etc/nestweaver/instance.toml"]

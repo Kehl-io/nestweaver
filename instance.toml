@@ -1,0 +1,35 @@
+# NestWeaver server instance configuration (Docker deployment).
+#
+# docker-compose.yml mounts this file read-only at
+# /etc/nestweaver/instance.toml. Edit it to declare the repos this server
+# indexes, then `docker compose up -d`. Repos can also be added at runtime via
+# the admin API or git webhooks.
+
+instance_id = "nestweaver-server"
+
+# Repos this server indexes. Start empty and add one [[repos]] block per repo,
+# e.g.:
+#   [[repos]]
+#   url = "https://github.com/your-org/your-repo"
+#   branch = "main"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/data/nestweaver/snapshots"
+
+[workspace]
+backend = "local"
+path = "/data/nestweaver/workspace"
+
+[inference]
+# Embeddings are optional on the server — BM25 + PageRank is the baseline and
+# needs no inference endpoint. To enable semantic search, point this at an
+# Ollama / OpenAI-compatible endpoint and pick models.
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+# How the server authenticates to clone/fetch private repos: "ssh" or "token".
+credential_method = "ssh"
