@@ -167,7 +167,7 @@ pub use index::{
     CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
     incremental_index_with_name, index_directory, index_directory_in_memory,
     index_directory_with_options, index_directory_with_store, index_with_reader,
-    load_filemeta_cache, save_filemeta_cache,
+    index_with_reader_and_write_gate, load_filemeta_cache, save_filemeta_cache,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,

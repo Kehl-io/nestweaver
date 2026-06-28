@@ -393,7 +393,33 @@ pub fn index_with_reader(
     indexed_sha: &str,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
-    let result = index_into_store(
+    index_with_reader_and_write_gate(
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        name,
+        || Ok::<_, anyhow::Error>(()),
+    )
+}
+
+/// Index via an arbitrary [`ContentReader`] and acquire the caller-provided
+/// write gate after file scan/parse/collection but before graph mutations.
+#[allow(clippy::too_many_arguments)]
+pub fn index_with_reader_and_write_gate<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    name: Option<&str>,
+    acquire_write_guard: F,
+) -> Result<IndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let result = index_into_store_with_write_gate(
         reader,
         store,
         instance_id,
@@ -404,8 +430,9 @@ pub fn index_with_reader(
         None,
         None,
         name,
+        true,
+        acquire_write_guard,
     )?;
-    store.bump_and_persist_generation();
     Ok(result)
 }
 
@@ -494,8 +521,36 @@ fn containing_symbol_for_line<'a>(symbols: &'a [RawSymbol], line: u32) -> Option
 /// matches a cache entry will return their symbols/references from the
 /// cache instead of being skipped. Newly parsed files are inserted into
 /// the cache so callers can persist it after indexing.
-#[allow(clippy::too_many_arguments)]
 fn index_into_store(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    filemeta_cache: Option<&FileMetaCache>,
+    new_filemeta: Option<&mut FileMetaCache>,
+    parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
+    resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
+    name: Option<&str>,
+) -> Result<IndexResult, anyhow::Error> {
+    index_into_store_with_write_gate(
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        filemeta_cache,
+        new_filemeta,
+        parsed_cache,
+        resolution_deps,
+        name,
+        false,
+        || Ok::<_, anyhow::Error>(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_into_store_with_write_gate<G, F>(
     reader: &dyn crate::content_reader::ContentReader,
     store: &GraphStore,
     instance_id: &str,
@@ -506,25 +561,18 @@ fn index_into_store(
     mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
-) -> Result<IndexResult, anyhow::Error> {
+    bump_generation_after_write: bool,
+    acquire_write_guard: F,
+) -> Result<IndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
     let started = Instant::now();
 
-    // 1. Insert the Repo node if it doesn't exist yet.
-    //    SHA update is deferred until after bulk_index_write succeeds so that
-    //    a write failure doesn't leave a stale SHA that skips future re-indexes.
+    // 1. Compute the Repo UID. Graph mutations are deferred until after file
+    // scan/parse/collection so worker threads can fan out expensive parsing and
+    // only serialize LadybugDB writes.
     let r_uid = repo_uid(instance_id, repo_url);
-    let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
-    if existing_repo.is_none() {
-        let repo = Repo {
-            uid: r_uid.clone(),
-            url: repo_url.trim_end_matches('/').to_string(),
-            indexed_sha: indexed_sha.to_string(),
-            staleness_commits_behind: 0,
-            instance_id: instance_id.to_string(),
-            name: name.map(String::from),
-        };
-        store.insert_repo(&repo).context("insert_repo")?;
-    }
 
     // ── Phase 1: Scan files ───────────────────────────────────────────────
     let _phase1_span = tracing::info_span!("index_phase_scan").entered();
@@ -958,6 +1006,24 @@ fn index_into_store(
     }
 
     drop(_phase_collect_span);
+
+    let _write_guard = acquire_write_guard()?;
+
+    // Insert the Repo node if it doesn't exist yet. SHA update for existing
+    // repos is deferred until after bulk_index_write succeeds so that a write
+    // failure doesn't leave a stale SHA that skips future re-indexes.
+    let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
+    if existing_repo.is_none() {
+        let repo = Repo {
+            uid: r_uid.clone(),
+            url: repo_url.trim_end_matches('/').to_string(),
+            indexed_sha: indexed_sha.to_string(),
+            staleness_commits_behind: 0,
+            instance_id: instance_id.to_string(),
+            name: name.map(String::from),
+        };
+        store.insert_repo(&repo).context("insert_repo")?;
+    }
 
     // 2b. When re-indexing over an existing store (tiered detection is active
     //     and some files changed), clean up old File nodes and their symbols
@@ -1394,6 +1460,10 @@ fn index_into_store(
         symbols = symbols_count,
         "indexing complete"
     );
+
+    if bump_generation_after_write {
+        store.bump_and_persist_generation();
+    }
 
     Ok(IndexResult {
         symbols_count,
@@ -2764,6 +2834,63 @@ function hello(name) { return "Hello " + name; }
     fn filemeta_cache_missing_file_returns_empty() {
         let cache = load_filemeta_cache(Path::new("/nonexistent/filemeta.json"));
         assert!(cache.is_empty());
+    }
+
+    struct GateOrderReader {
+        root: PathBuf,
+        read_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::content_reader::ContentReader for GateOrderReader {
+        fn read_file(&self, _rel_path: &Path) -> Result<String, anyhow::Error> {
+            self.read_seen
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("pub fn gate_order() {}".to_string())
+        }
+
+        fn list_files(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+            Ok(vec![PathBuf::from("src/lib.rs")])
+        }
+
+        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+            Ok(None)
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn version_id(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn reader_write_gate_is_acquired_after_parse_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let read_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = GateOrderReader {
+            root: tmp.path().to_path_buf(),
+            read_seen: read_seen.clone(),
+        };
+        let store = GraphStore::in_memory().unwrap();
+
+        index_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test",
+            "file://gate-order",
+            "abc",
+            None,
+            || {
+                assert!(
+                    read_seen.load(std::sync::atomic::Ordering::SeqCst),
+                    "write gate should not be acquired until after files are read and parsed"
+                );
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .unwrap();
     }
 
     #[test]

@@ -5350,8 +5350,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
-                        let candidates: Vec<nestweaver_engine::SymbolCandidate> =
-                            serde_json::from_value(value).unwrap_or_default();
+                        let candidates = hybrid_search_candidates_from_value(value);
                         if candidates.is_empty() {
                             println!("No symbols found matching '{query}'.");
                         } else {
@@ -8627,6 +8626,43 @@ fn try_hybrid_json_rpc(
                 config, &start_dir, rpc_name, &args,
             ))
             .ok(),
+    }
+}
+
+fn hybrid_search_candidates_from_value(
+    value: serde_json::Value,
+) -> Vec<nestweaver_engine::SymbolCandidate> {
+    let payload = value.get("results").cloned().unwrap_or(value);
+    serde_json::from_value(payload).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod hybrid_cli_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_search_candidates_reads_wrapped_results() {
+        let value = serde_json::json!({
+            "results": [
+                {
+                    "uid": "sym:1",
+                    "name": "processPayment",
+                    "kind": "Function",
+                    "file_path": "src/payments.rs",
+                    "start_line": 42
+                }
+            ],
+            "_meta": {
+                "sources": ["server"],
+                "stale_repos": [],
+                "scope": "server"
+            }
+        });
+
+        let candidates = hybrid_search_candidates_from_value(value);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "processPayment");
     }
 }
 

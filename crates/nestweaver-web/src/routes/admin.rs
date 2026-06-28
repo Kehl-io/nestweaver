@@ -13,6 +13,7 @@ use axum::{
     http::{StatusCode, request::Parts},
 };
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::state::AdminState;
 
@@ -37,7 +38,13 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match token {
-            Some(t) if t == admin_state.admin_token => Ok(AdminAuth),
+            Some(t)
+                if t.as_bytes()
+                    .ct_eq(admin_state.admin_token.as_bytes())
+                    .into() =>
+            {
+                Ok(AdminAuth)
+            }
             _ => Err((StatusCode::UNAUTHORIZED, "admin token required")),
         }
     }
@@ -461,6 +468,7 @@ pub async fn trigger_reindex(
     let store = state.daemon_store.clone();
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
     let uid = repo_uid.clone();
+    let branch_map = state.webhook_repo_branches.clone();
 
     tokio::task::spawn_blocking(move || {
         // Look up the repo URL from the store.
@@ -481,12 +489,13 @@ pub async fn trigger_reindex(
             )
         })?;
         let repo_id = nestweaver_engine::jobs::canonical_repo_id(&repo.url);
+        let branch = configured_branch_for_repo(&branch_map, &repo_id);
         queue
             .upsert(
                 &repo_id,
                 &repo.url,
                 nestweaver_engine::jobs::JobTrigger::Webhook,
-                None,
+                branch.as_deref(),
             )
             .map_err(|e| {
                 (
@@ -507,6 +516,18 @@ pub async fn trigger_reindex(
     Ok(Json(MessageResponse {
         message: format!("reindex queued for repo {}", repo_uid),
     }))
+}
+
+fn configured_branch_for_repo(
+    branch_map: &Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    repo_id: &str,
+) -> Option<String> {
+    branch_map.as_ref().and_then(|branches| {
+        branches
+            .read()
+            .ok()
+            .and_then(|map| map.get(repo_id).cloned())
+    })
 }
 
 // ── Queue management ───────────────────────────────────────────────────
@@ -1060,6 +1081,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn configured_branch_for_repo_reads_shared_branch_map() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("github.com/org/repo".to_string(), "release".to_string());
+        let branch_map = Some(Arc::new(std::sync::RwLock::new(map)));
+
+        assert_eq!(
+            configured_branch_for_repo(&branch_map, "github.com/org/repo"),
+            Some("release".to_string())
+        );
+        assert_eq!(configured_branch_for_repo(&branch_map, "missing"), None);
     }
 
     #[tokio::test]

@@ -47,6 +47,53 @@ pub struct McpSession {
     pub created_at: Instant,
     pub last_active: Instant,
     pub request_count: u64,
+    pub rate_window_start: Instant,
+}
+
+#[derive(Debug)]
+struct HttpTokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Simple per-client token bucket for stateless MCP-over-HTTP requests.
+#[derive(Debug)]
+pub struct HttpRateLimiter {
+    buckets: DashMap<String, HttpTokenBucket>,
+    capacity: f64,
+    refill_per_sec: f64,
+}
+
+impl HttpRateLimiter {
+    fn new(requests_per_min: u64) -> Self {
+        Self {
+            buckets: DashMap::new(),
+            capacity: requests_per_min as f64,
+            refill_per_sec: requests_per_min as f64 / 60.0,
+        }
+    }
+
+    fn check(&self, client_key: &str) -> bool {
+        let now = Instant::now();
+        let mut bucket = self
+            .buckets
+            .entry(client_key.to_string())
+            .or_insert_with(|| HttpTokenBucket {
+                tokens: self.capacity,
+                last_refill: now,
+            });
+
+        let elapsed_secs = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed_secs * self.refill_per_sec).min(self.capacity);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Shared state for the MCP HTTP handler.
@@ -71,6 +118,7 @@ pub struct McpHttpState {
     /// Optional admin bearer token. When query auth is enabled, this token is
     /// also accepted so MCP and gRPC query auth share the same semantics.
     pub admin_token: Option<String>,
+    pub client_rate_limiter: Arc<HttpRateLimiter>,
 }
 
 impl McpHttpState {
@@ -93,6 +141,7 @@ impl McpHttpState {
             server_mode,
             auth_token: None,
             admin_token: None,
+            client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
         }
     }
 
@@ -117,6 +166,7 @@ impl McpHttpState {
             server_mode,
             auth_token: Some(auth_token),
             admin_token,
+            client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
         }
     }
 }
@@ -215,23 +265,21 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
 }
 
 /// Check per-session rate limit. Returns `true` if the request is allowed.
-/// Uses a simple sliding-window approximation: if the session has made more
-/// than `RATE_LIMIT_PER_MIN` requests and the last reset was less than 60s
-/// ago, reject.
 fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: &str) -> bool {
     if let Some(mut entry) = sessions.get_mut(session_id) {
-        let elapsed = entry.last_active.elapsed();
-        // Reset window every 60 seconds.
+        let now = Instant::now();
+        let elapsed = now.duration_since(entry.rate_window_start);
         if elapsed >= Duration::from_secs(60) {
             entry.request_count = 1;
-            entry.last_active = Instant::now();
+            entry.rate_window_start = now;
+            entry.last_active = now;
             return true;
         }
-        if entry.request_count > RATE_LIMIT_PER_MIN {
+        if entry.request_count >= RATE_LIMIT_PER_MIN {
             return false;
         }
         entry.request_count += 1;
-        entry.last_active = Instant::now();
+        entry.last_active = now;
         true
     } else {
         // Unknown session — allow (session tracking will create one on initialize).
@@ -264,13 +312,15 @@ async fn handle_mcp(
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+    let provided_bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let mut admin_bypass_rate_limit = false;
+
     // Validate bearer token when auth is configured.
     if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        match provided {
+        match provided_bearer {
             Some(t)
                 if {
                     use subtle::ConstantTimeEq;
@@ -280,6 +330,7 @@ async fn handle_mcp(
                         .as_ref()
                         .map(|admin| bool::from(t.as_bytes().ct_eq(admin.as_bytes())))
                         .unwrap_or(false);
+                    admin_bypass_rate_limit = admin_match;
                     query_match || admin_match
                 } => {}
             _ => {
@@ -329,21 +380,39 @@ async fn handle_mcp(
 
     // Per-session rate limiting (server mode only).
     if state.server_mode {
-        if let Some(ref sid) = session_id {
-            if !check_session_rate_limit(&state.sessions, sid) {
-                return (
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": null,
-                        "error": {
-                            "code": error_code::INVALID_REQUEST,
-                            "message": "rate limit exceeded: too many requests per minute",
-                        }
-                    })),
-                );
+        let client_key = if let Some(token) = provided_bearer {
+            if state
+                .admin_token
+                .as_ref()
+                .is_some_and(|admin| token == admin.as_str())
+            {
+                "bearer:admin".to_string()
+            } else {
+                "bearer:query".to_string()
             }
+        } else if let Some(ref sid) = session_id {
+            format!("session:{sid}")
+        } else {
+            "anonymous-stateless".to_string()
+        };
+
+        if !admin_bypass_rate_limit && !state.client_rate_limiter.check(&client_key) {
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                HeaderMap::new(),
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": error_code::INVALID_REQUEST,
+                        "message": "rate limit exceeded: too many requests per minute",
+                    }
+                })),
+            );
+        }
+
+        if let Some(ref sid) = session_id {
+            let _ = check_session_rate_limit(&state.sessions, sid);
         }
     } else {
         // Non-server mode: just update last_active / request_count.
@@ -359,13 +428,15 @@ async fn handle_mcp(
         "initialize" => {
             // Always create a fresh session on initialize.
             let new_id = Uuid::new_v4().to_string();
+            let now = Instant::now();
             state.sessions.insert(
                 new_id.clone(),
                 McpSession {
                     id: new_id.clone(),
-                    created_at: Instant::now(),
-                    last_active: Instant::now(),
+                    created_at: now,
+                    last_active: now,
                     request_count: 1,
+                    rate_window_start: now,
                 },
             );
 
@@ -572,6 +643,21 @@ mod tests {
         router(state)
     }
 
+    fn test_server_auth_app() -> Router {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let state = Arc::new(McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        ));
+        router(state)
+    }
+
     #[test]
     fn safeguard_rejects_over_depth_instead_of_clamping() {
         let mut args = json!({
@@ -600,6 +686,75 @@ mod tests {
         assert_eq!(result["_meta"]["limits"][0]["requested"], MAX_RESULTS + 25);
         assert_eq!(result["_meta"]["limits"][0]["applied"], MAX_RESULTS);
         assert_eq!(result["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn rate_limit_rejects_at_limit_within_window() {
+        let sessions = DashMap::new();
+        let now = Instant::now();
+        sessions.insert(
+            "sid".to_string(),
+            McpSession {
+                id: "sid".to_string(),
+                created_at: now,
+                last_active: now,
+                request_count: RATE_LIMIT_PER_MIN,
+                rate_window_start: now,
+            },
+        );
+
+        assert!(!check_session_rate_limit(&sessions, "sid"));
+    }
+
+    #[test]
+    fn rate_limit_resets_by_window_start_not_last_activity() {
+        let sessions = DashMap::new();
+        let now = Instant::now();
+        sessions.insert(
+            "sid".to_string(),
+            McpSession {
+                id: "sid".to_string(),
+                created_at: now - Duration::from_secs(120),
+                last_active: now,
+                request_count: RATE_LIMIT_PER_MIN,
+                rate_window_start: now - Duration::from_secs(61),
+            },
+        );
+
+        assert!(check_session_rate_limit(&sessions, "sid"));
+        let session = sessions.get("sid").unwrap();
+        assert_eq!(session.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn server_rate_limit_applies_without_session_header() {
+        let app = test_server_auth_app();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        });
+
+        let mut limited = false;
+        for _ in 0..=RATE_LIMIT_PER_MIN {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer query-token")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited = true;
+                break;
+            }
+        }
+
+        assert!(
+            limited,
+            "stateless authenticated MCP HTTP requests must be rate limited"
+        );
     }
 
     #[tokio::test]

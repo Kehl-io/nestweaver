@@ -22,6 +22,7 @@ uuid = { workspace = true }
 open = { workspace = true }
 futures = "0.3"
 prometheus = "0.13"
+subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

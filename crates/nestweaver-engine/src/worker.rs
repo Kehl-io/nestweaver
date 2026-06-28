@@ -7,7 +7,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 use crate::bare_clone::BareCloneWorkspace;
+use crate::circuit_breaker::RemoteCircuitBreakers;
 use crate::jobs::{IndexJob, JobQueue};
+
+#[derive(Debug)]
+struct JobCancelled;
+
+impl std::fmt::Display for JobCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("job cancelled")
+    }
+}
+
+impl std::error::Error for JobCancelled {}
 
 /// Shared indexing status that can be observed by other components (e.g. the
 /// daemon's `brain_status` handler) to report whether indexing is in progress.
@@ -144,6 +156,7 @@ impl WorkerPool {
         drained: Option<Arc<AtomicBool>>,
         write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     ) {
+        let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         loop {
             // Check shutdown signal.
             if *shutdown.borrow() {
@@ -224,6 +237,7 @@ impl WorkerPool {
             let instance_id = instance_id.clone();
             let status_clone = status.clone();
             let write_mutex = write_mutex.clone();
+            let circuit_breakers = circuit_breakers.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -234,12 +248,17 @@ impl WorkerPool {
                     let job_clone = job.clone();
                     let queue_check = queue.clone();
                     tokio::task::spawn_blocking(move || {
-                        // Acquire the daemon's write mutex to prevent concurrent
-                        // writes to the graph store from RPC handlers.
-                        let _write_guard = write_mutex.as_ref().map(|m| m.blocking_lock());
+                        let prepared = prepare_job(
+                            &job_clone,
+                            &workspace,
+                            &store,
+                            &instance_id,
+                            Some(&circuit_breakers),
+                        )?;
+
                         // Check if the job was cancelled (admin repo removal)
-                        // while we waited for the mutex. Verifies both ID and
-                        // repo_id to guard against SQLite ID reuse.
+                        // before indexing. Verifies both ID and repo_id to
+                        // guard against SQLite ID reuse.
                         {
                             let q = queue_check.lock().expect("job queue lock");
                             if !q
@@ -253,7 +272,35 @@ impl WorkerPool {
                                 return Ok(());
                             }
                         }
-                        process_job(&job_clone, &workspace, &store, &instance_id)
+                        if let Some(prepared) = prepared {
+                            let queue_for_gate = queue_check.clone();
+                            let job_for_gate = job_clone.clone();
+                            let write_mutex_for_gate = write_mutex.clone();
+                            commit_prepared_job_with_write_gate(
+                                &prepared,
+                                &store,
+                                &instance_id,
+                                move || {
+                                    let _write_guard = write_mutex_for_gate
+                                        .as_ref()
+                                        .map(|m| m.clone().blocking_lock_owned());
+                                    let q = queue_for_gate.lock().expect("job queue lock");
+                                    if !q
+                                        .job_is_active(job_for_gate.id, &job_for_gate.repo_id)
+                                        .unwrap_or(false)
+                                    {
+                                        tracing::info!(
+                                            repo = %job_for_gate.repo_id,
+                                            "job cancelled (repo removed), skipping"
+                                        );
+                                        return Err(anyhow::Error::new(JobCancelled));
+                                    }
+                                    Ok(_write_guard)
+                                },
+                            )
+                        } else {
+                            Ok(())
+                        }
                     })
                     .await
                 };
@@ -266,6 +313,11 @@ impl WorkerPool {
                             tracing::info!(repo = %job.repo_id, "re-queued: push arrived during indexing");
                         }
                         tracing::info!(repo = job.repo_id, "index complete");
+                    }
+                    Ok(Err(e)) if is_job_cancelled_error(&e) => {
+                        let q = queue.lock().expect("job queue lock poisoned");
+                        let _ = q.complete(job.id, &job.repo_id);
+                        tracing::info!(repo = job.repo_id, "index cancelled");
                     }
                     Ok(Err(e)) => {
                         let is_poison = is_poison_error(&e);
@@ -306,22 +358,56 @@ impl WorkerPool {
 }
 
 /// Process a single indexing job: fetch, compare SHAs, index if needed.
+#[allow(dead_code)]
 fn process_job(
     job: &IndexJob,
     workspace: &BareCloneWorkspace,
     store: &nestweaver_store::GraphStore,
     instance_id: &str,
 ) -> Result<(), anyhow::Error> {
-    // 1. Ensure the bare clone exists.
-    let bare = workspace.ensure_clone(&job.repo_url)?;
+    let Some(prepared) = prepare_job(job, workspace, store, instance_id, None)? else {
+        return Ok(());
+    };
+    commit_prepared_job(&prepared, store, instance_id)
+}
 
-    // 2. Fetch latest refs from origin.
-    bare.fetch_branch(job.branch.as_deref())?;
+#[derive(Debug)]
+struct PreparedIndexJob {
+    repo_id: String,
+    repo_url: String,
+    bare_path: std::path::PathBuf,
+    remote_sha: String,
+}
 
-    // 3. Discover remote SHA — use the configured branch if set.
-    let remote_sha = match &job.branch {
-        Some(branch) => bare.sha_for_ref(&format!("refs/heads/{}", branch))?,
-        None => bare.head_sha()?,
+fn prepare_job(
+    job: &IndexJob,
+    workspace: &BareCloneWorkspace,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    circuit_breakers: Option<&RemoteCircuitBreakers>,
+) -> Result<Option<PreparedIndexJob>, anyhow::Error> {
+    let fetch = || -> Result<_, anyhow::Error> {
+        // 1. Ensure the bare clone exists.
+        let bare = workspace.ensure_clone(&job.repo_url)?;
+
+        // 2. Fetch latest refs from origin.
+        bare.fetch_branch(job.branch.as_deref())?;
+
+        // 3. Discover remote SHA — use the configured branch if set.
+        let remote_sha = match &job.branch {
+            Some(branch) => bare.sha_for_ref(&format!("refs/heads/{}", branch))?,
+            None => bare.head_sha()?,
+        };
+
+        Ok((bare.path.clone(), remote_sha))
+    };
+
+    let (bare_path, remote_sha) = if let Some(cb) = circuit_breakers {
+        let host = RemoteCircuitBreakers::extract_host(&job.repo_url);
+        cb.call(&host, fetch)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        fetch()?
     };
 
     // 4. Compare against the SHA we last indexed.
@@ -335,25 +421,69 @@ fn process_job(
 
     if remote_sha == indexed_sha {
         tracing::debug!(repo = job.repo_id, "already up to date");
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedIndexJob {
+        repo_id: job.repo_id.clone(),
+        repo_url: job.repo_url.clone(),
+        bare_path,
+        remote_sha,
+    }))
+}
+
+fn commit_prepared_job(
+    prepared: &PreparedIndexJob,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+) -> Result<(), anyhow::Error> {
+    commit_prepared_job_with_write_gate(prepared, store, instance_id, || Ok::<_, anyhow::Error>(()))
+}
+
+fn commit_prepared_job_with_write_gate<G, F>(
+    prepared: &PreparedIndexJob,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    acquire_write_guard: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let r_uid = nestweaver_schema::repo_uid(instance_id, &prepared.repo_url);
+    let indexed_sha = store
+        .lookup_repo(&r_uid)
+        .ok()
+        .flatten()
+        .map(|r| r.indexed_sha)
+        .unwrap_or_default();
+
+    if prepared.remote_sha == indexed_sha {
+        tracing::debug!(repo = prepared.repo_id, "already up to date");
         return Ok(());
     }
 
-    // 5. Build a reader over the bare clone at the new SHA.
-    let reader = crate::content_reader::GitBareReader::new(&bare.path, &remote_sha);
+    // Build a reader over the bare clone at the new SHA.
+    let reader =
+        crate::content_reader::GitBareReader::new(&prepared.bare_path, &prepared.remote_sha);
 
-    // 6. Full index via index_with_reader.
+    // Full index via index_with_reader.
     //    Incremental indexing through ContentReader is a follow-up optimization;
     //    for v1 we always do a full index.
-    crate::index_with_reader(
+    crate::index_with_reader_and_write_gate(
         &reader,
         store,
         instance_id,
-        &job.repo_url,
-        &remote_sha,
+        &prepared.repo_url,
+        &prepared.remote_sha,
         None,
+        acquire_write_guard,
     )?;
 
     Ok(())
+}
+
+fn is_job_cancelled_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<JobCancelled>().is_some()
 }
 
 /// Heuristic: is this an error that will never succeed on retry?
@@ -518,6 +648,39 @@ mod tests {
         process_job(&job, &ws, &store, instance_id).unwrap();
         // No assertion needed beyond "it didn't error" — the second call
         // should detect identical SHAs and return early.
+    }
+
+    #[test]
+    fn prepare_job_respects_open_circuit_breaker() {
+        let tmp = TempDir::new().unwrap();
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let cb = RemoteCircuitBreakers::new();
+        let host = RemoteCircuitBreakers::extract_host("https://example.com/org/repo.git");
+        for _ in 0..5 {
+            cb.record_failure(&host);
+        }
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "blocked-repo".to_string(),
+            repo_url: "https://example.com/org/repo.git".to_string(),
+            trigger: JobTrigger::Webhook,
+            priority: 1,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        let err = prepare_job(&job, &ws, &store, "test-instance", Some(&cb)).unwrap_err();
+
+        assert!(err.to_string().contains("circuit breaker open"));
     }
 
     #[tokio::test]
