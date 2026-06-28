@@ -172,7 +172,6 @@ fn impact_diff_produces_json() {
 // ── Test 2: format-comment produces markdown ────────────────────────────
 
 #[test]
-#[ignore = "depends on the format-comment subcommand being implemented"]
 fn format_comment_produces_markdown() {
     let dir = tempfile::tempdir().unwrap();
     let input_path = dir.path().join("impact.json");
@@ -201,7 +200,6 @@ fn format_comment_produces_markdown() {
 
     let output = nestweaver()
         .args([
-            "impact",
             "format-comment",
             "--input",
             &input_path.display().to_string(),
