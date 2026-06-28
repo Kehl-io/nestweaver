@@ -65,32 +65,78 @@ pub fn compute_scope_hash(scope_chain: Option<&str>, start_line: Option<u32>) ->
 }
 
 /// Extract a [`SymbolIdentity`] from a JSON result value.
-/// Returns `None` if required fields are missing.
+///
+/// Handles both naming conventions:
+/// - Standard: `repo_url`/`repo`, `file_path`/`file`, `symbol_name`/`name`/`symbol`
+/// - Brain search/context: `uid` (contains repo info), `location` ("file:line"),
+///   `title` (symbol name)
+///
+/// Returns `None` if not enough fields are present to form an identity.
 pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
-    let repo_url = result
-        .get("repo_url")
-        .or_else(|| result.get("repo"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let file_path = result
-        .get("file_path")
-        .or_else(|| result.get("file"))
-        .and_then(|v| v.as_str())?
-        .to_string();
+    // Symbol name: try standard fields first, then brain_search/brain_context `title`.
     let symbol_name = result
         .get("symbol_name")
         .or_else(|| result.get("name"))
         .or_else(|| result.get("symbol"))
+        .or_else(|| result.get("title"))
         .and_then(|v| v.as_str())?
         .to_string();
+
+    // File path: try standard fields, then extract from `location` ("path:line").
+    let file_path = result
+        .get("file_path")
+        .or_else(|| result.get("file"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            result
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(|loc| {
+                    // "src/lib.rs:42" -> "src/lib.rs"
+                    loc.rsplit_once(':')
+                        .map(|(path, _line)| path.to_string())
+                        .unwrap_or_else(|| loc.to_string())
+                })
+        })?;
+
+    // Repo URL: try standard fields, then extract from `uid` if it encodes
+    // repo info (e.g. "repo:github.com/acme/api:src/lib.rs#symbol").
+    let repo_url = result
+        .get("repo_url")
+        .or_else(|| result.get("repo"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            result.get("uid").and_then(|v| v.as_str()).and_then(|uid| {
+                // UID format: "repo:<url>:<path>#<name>" or "sym:<repo_uid>:<path>#<name>".
+                // Extract the repo segment if present.
+                uid.split_once(':')
+                    .and_then(|(_, rest)| rest.split_once(':'))
+                    .map(|(repo_part, _)| repo_part.to_string())
+            })
+        })
+        // If no repo could be extracted, use the file_path as a stand-in so
+        // same-file symbols still deduplicate against each other.
+        .unwrap_or_else(|| file_path.clone());
+
     let scope_chain = result
         .get("scope_chain")
         .or_else(|| result.get("scope"))
         .and_then(|v| v.as_str());
+
+    // Start line: try standard field, then parse from `location` ("path:42").
     let start_line = result
         .get("start_line")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|v| v as u32)
+        .or_else(|| {
+            result
+                .get("location")
+                .and_then(|v| v.as_str())
+                .and_then(|loc| loc.rsplit_once(':'))
+                .and_then(|(_, line)| line.parse::<u32>().ok())
+        });
 
     let scope_hash = compute_scope_hash(scope_chain, start_line);
 
@@ -273,7 +319,55 @@ mod tests {
     }
 
     #[test]
+    fn extract_identity_from_brain_search_fields() {
+        // brain_search results use uid, title, location instead of
+        // repo_url, symbol_name, file_path.
+        let result = json!({
+            "uid": "sym:repo:github.com/acme/api:src/lib.rs#process_payment",
+            "kind": "Symbol/Function",
+            "title": "process_payment",
+            "location": "src/lib.rs:42",
+        });
+        let id = extract_identity(&result).unwrap();
+        assert_eq!(id.symbol_name, "process_payment");
+        assert_eq!(id.file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn extract_identity_from_brain_context_fields() {
+        // brain_context connected items use uid, title, location.
+        let result = json!({
+            "uid": "note:vault:my-vault:notes/design.md",
+            "kind": "note",
+            "title": "Design Notes",
+            "location": "notes/design.md:1",
+        });
+        let id = extract_identity(&result).unwrap();
+        assert_eq!(id.symbol_name, "Design Notes");
+        assert_eq!(id.file_path, "notes/design.md");
+    }
+
+    #[test]
+    fn extract_identity_deduplicates_brain_search_results() {
+        // Two results with the same title+location should merge.
+        let local = json!({
+            "uid": "sym:repo:acme:src/lib.rs#Handler",
+            "title": "Handler",
+            "location": "src/lib.rs:10",
+        });
+        let server = json!({
+            "uid": "sym:repo:acme:src/lib.rs#Handler",
+            "title": "Handler",
+            "location": "src/lib.rs:10",
+        });
+        let id_local = extract_identity(&local).unwrap();
+        let id_server = extract_identity(&server).unwrap();
+        assert_eq!(id_local, id_server);
+    }
+
+    #[test]
     fn extract_identity_returns_none_when_missing_fields() {
+        // No title/name/symbol_name at all -> None
         let result = json!({ "repo_url": "github.com/acme/api" });
         assert!(extract_identity(&result).is_none());
     }
