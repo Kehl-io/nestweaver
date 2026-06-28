@@ -196,11 +196,7 @@ impl QuerySafeguards {
     /// hard cap when the client requests more. The returned `DepthResult`
     /// carries a `clamped` flag and the original requested value so callers can
     /// communicate the clamping in response metadata.
-    pub fn effective_depth(
-        &self,
-        tool: &str,
-        client_requested: Option<u32>,
-    ) -> DepthResult {
+    pub fn effective_depth(&self, tool: &str, client_requested: Option<u32>) -> DepthResult {
         let default = self.default_depths.get(tool).copied().unwrap_or(3);
         let max = self.max_depths.get(tool).copied().unwrap_or(10);
 

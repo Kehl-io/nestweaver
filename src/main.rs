@@ -7902,9 +7902,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 Ok((EXIT_SUCCESS, None))
             }
-            ServerAction::Backup { command } => {
-                run_backup(command).map(|c| (c, None))
-            }
+            ServerAction::Backup { command } => run_backup(command).map(|c| (c, None)),
         },
 
         Commands::Info { hardware } => {

@@ -230,14 +230,9 @@ impl DaemonService {
             if let Some(ref dr) = depth_result {
                 if dr.clamped {
                     if let Some(obj) = value.as_object_mut() {
-                        let meta = obj
-                            .entry("_meta")
-                            .or_insert_with(|| serde_json::json!({}));
+                        let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
                         if let Some(meta_obj) = meta.as_object_mut() {
-                            meta_obj.insert(
-                                "_clamped".to_string(),
-                                serde_json::json!(true),
-                            );
+                            meta_obj.insert("_clamped".to_string(), serde_json::json!(true));
                             meta_obj.insert(
                                 "_original_depth".to_string(),
                                 serde_json::json!(dr.original_depth),
