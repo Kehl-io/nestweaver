@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn test_unix_to_utc_known_date() {
         // 2026-06-25T12:30:45Z = 1782382245
-        let (y, mo, d, h, mi, s) = unix_to_utc(1_782_382_245);
+        let (y, mo, _d, _h, _mi, _s) = unix_to_utc(1_782_382_245);
         assert_eq!(y, 2026);
         assert_eq!(mo, 6);
         // Exact day/time verified by calculation.
