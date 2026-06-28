@@ -687,6 +687,105 @@ impl InstanceConfig {
     }
 }
 
+/// Append a `[[repos]]` entry to an instance config file if it is not already
+/// present. Returns `true` when the file was changed.
+pub fn append_repo_to_config_file(
+    path: &std::path::Path,
+    url: &str,
+    branch: Option<&str>,
+) -> Result<bool, anyhow::Error> {
+    let mut contents = std::fs::read_to_string(path)?;
+    let cfg = InstanceConfig::from_toml_str(&contents)?;
+    let target = crate::jobs::canonical_repo_id(url);
+    if cfg
+        .repos
+        .iter()
+        .any(|repo| crate::jobs::canonical_repo_id(&repo.url) == target)
+    {
+        return Ok(false);
+    }
+
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str("\n[[repos]]\n");
+    contents.push_str("url = ");
+    contents.push_str(&toml_basic_string(url)?);
+    contents.push('\n');
+    if let Some(branch) = branch {
+        contents.push_str("branch = ");
+        contents.push_str(&toml_basic_string(branch)?);
+        contents.push('\n');
+    }
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+/// Remove a `[[repos]]` entry from an instance config file by canonical repo
+/// URL. Returns `true` when the file was changed.
+pub fn remove_repo_from_config_file(
+    path: &std::path::Path,
+    url: &str,
+) -> Result<bool, anyhow::Error> {
+    let contents = std::fs::read_to_string(path)?;
+    let target = crate::jobs::canonical_repo_id(url);
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed = false;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if lines[i].trim() == "[[repos]]" {
+            let start = i;
+            i += 1;
+            while i < lines.len() {
+                let trimmed = lines[i].trim();
+                if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+                    break;
+                }
+                i += 1;
+            }
+            let block = lines[start..i].join("\n");
+            if repo_block_matches_url(&block, &target)? {
+                removed = true;
+            } else {
+                out.extend_from_slice(&lines[start..i]);
+            }
+        } else {
+            out.push(lines[i]);
+            i += 1;
+        }
+    }
+
+    if removed {
+        let mut next = out.join("\n");
+        if contents.ends_with('\n') {
+            next.push('\n');
+        }
+        std::fs::write(path, next)?;
+    }
+    Ok(removed)
+}
+
+fn repo_block_matches_url(block: &str, target: &str) -> Result<bool, anyhow::Error> {
+    let value: toml::Value = toml::from_str(block)?;
+    let Some(repos) = value.get("repos").and_then(|v| v.as_array()) else {
+        return Ok(false);
+    };
+    let Some(url) = repos
+        .first()
+        .and_then(|repo| repo.get("url"))
+        .and_then(|url| url.as_str())
+    else {
+        return Ok(false);
+    };
+    Ok(crate::jobs::canonical_repo_id(url) == target)
+}
+
+fn toml_basic_string(value: &str) -> Result<String, anyhow::Error> {
+    Ok(serde_json::to_string(value)?)
+}
+
 /// Set of `SymbolKind` variant names accepted by [`SeedResolutionConfig::kind_priority`].
 /// Kept in sync with the variants at `crates/nestweaver-schema/src/nodes.rs`.
 const VALID_SYMBOL_KINDS: &[&str] = &[
@@ -1328,6 +1427,72 @@ path_deboost = []
         let cfg: RepoConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.branch.is_none());
         assert!(cfg.poll.is_none());
+    }
+
+    #[test]
+    fn append_repo_to_config_file_adds_once_with_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+
+        let changed =
+            append_repo_to_config_file(&path, "https://github.com/example/new", Some("main"))
+                .unwrap();
+        assert!(changed);
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert!(cfg.repos.iter().any(|repo| {
+            repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
+        }));
+
+        let changed =
+            append_repo_to_config_file(&path, "https://github.com/example/new/", Some("main"))
+                .unwrap();
+        assert!(!changed, "canonical duplicate should not be appended");
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.repos
+                .iter()
+                .filter(|repo| crate::jobs::canonical_repo_id(&repo.url)
+                    == crate::jobs::canonical_repo_id("https://github.com/example/new"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn remove_repo_from_config_file_removes_only_matching_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{MINIMAL_TOML}
+
+[[repos]]
+url = "https://github.com/example/remove-me"
+branch = "main"
+
+[[repos]]
+url = "https://github.com/example/keep-me"
+"#
+            ),
+        )
+        .unwrap();
+
+        let removed =
+            remove_repo_from_config_file(&path, "https://github.com/example/remove-me/").unwrap();
+        assert!(removed);
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert!(
+            !cfg.repos
+                .iter()
+                .any(|repo| repo.url == "https://github.com/example/remove-me")
+        );
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|repo| repo.url == "https://github.com/example/keep-me")
+        );
     }
 
     #[test]

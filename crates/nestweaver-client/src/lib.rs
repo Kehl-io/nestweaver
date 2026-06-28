@@ -73,6 +73,18 @@ impl DaemonClient {
         Ok(client)
     }
 
+    /// Connect to an already-running daemon for this database without
+    /// auto-starting a new process.
+    pub async fn connect_existing(db_path: &Path) -> Result<Self> {
+        let canonical_db = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&canonical_db);
+        let sock_path = nestweaver_daemon::lifecycle::socket_path(&instance_id);
+        if !sock_path.exists() {
+            anyhow::bail!("daemon socket not found at {}", sock_path.display());
+        }
+        Self::connect_to_socket(&sock_path).await
+    }
+
     /// Connect to an existing socket without auto-start or version check.
     #[allow(clippy::ptr_arg)]
     async fn connect_to_socket(sock_path: &PathBuf) -> Result<Self> {

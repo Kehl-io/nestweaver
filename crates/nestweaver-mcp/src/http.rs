@@ -68,6 +68,9 @@ pub struct McpHttpState {
     /// Optional bearer token for MCP-over-HTTP authentication. When set,
     /// requests must include `Authorization: Bearer <token>` or receive 401.
     pub auth_token: Option<String>,
+    /// Optional admin bearer token. When query auth is enabled, this token is
+    /// also accepted so MCP and gRPC query auth share the same semantics.
+    pub admin_token: Option<String>,
 }
 
 impl McpHttpState {
@@ -89,6 +92,7 @@ impl McpHttpState {
             sessions: Arc::new(DashMap::new()),
             server_mode,
             auth_token: None,
+            admin_token: None,
         }
     }
 
@@ -101,6 +105,7 @@ impl McpHttpState {
         instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
         server_mode: bool,
         auth_token: String,
+        admin_token: Option<String>,
     ) -> Self {
         Self {
             lite,
@@ -111,6 +116,7 @@ impl McpHttpState {
             sessions: Arc::new(DashMap::new()),
             server_mode,
             auth_token: Some(auth_token),
+            admin_token,
         }
     }
 }
@@ -128,23 +134,28 @@ pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
     });
 }
 
-/// Clamp depth and result-count parameters in tool arguments to server caps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedLimit {
+    param: &'static str,
+    requested: u64,
+    applied: u64,
+}
+
+/// Validate depth parameters and cap result-count parameters in tool arguments.
 ///
-/// Mutates the `arguments` JSON object in place, capping `depth` to
-/// [`MAX_DEPTH`] and `limit` / `max_results` to [`MAX_RESULTS`].
-fn clamp_safeguard_params(arguments: &mut Value) {
+/// Depth above [`MAX_DEPTH`] is rejected because traversals become ambiguous
+/// and expensive. Result counts above [`MAX_RESULTS`] are capped and disclosed
+/// on the MCP response metadata so callers know the returned page was bounded.
+fn apply_safeguard_params(arguments: &mut Value) -> Result<Vec<AppliedLimit>, String> {
+    let mut limits = Vec::new();
     if let Some(obj) = arguments.as_object_mut() {
         for key in &["depth", "max_depth"] {
             if let Some(val) = obj.get_mut(*key) {
                 if let Some(n) = val.as_u64() {
                     if n > MAX_DEPTH {
-                        tracing::warn!(
-                            param = *key,
-                            requested = n,
-                            capped = MAX_DEPTH,
-                            "clamped parameter"
-                        );
-                        *val = Value::Number(serde_json::Number::from(MAX_DEPTH));
+                        return Err(format!(
+                            "invalid-argument: parameter '{key}' requested depth {n}, maximum allowed depth is {MAX_DEPTH}"
+                        ));
                     }
                 }
             }
@@ -159,12 +170,48 @@ fn clamp_safeguard_params(arguments: &mut Value) {
                             capped = MAX_RESULTS,
                             "clamped parameter"
                         );
+                        limits.push(AppliedLimit {
+                            param: *key,
+                            requested: n,
+                            applied: MAX_RESULTS,
+                        });
                         *val = Value::Number(serde_json::Number::from(MAX_RESULTS));
                     }
                 }
             }
         }
     }
+    Ok(limits)
+}
+
+fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
+    if limits.is_empty() {
+        return result;
+    }
+
+    if let Some(obj) = result.as_object_mut() {
+        let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert(
+                "limits".to_string(),
+                Value::Array(
+                    limits
+                        .iter()
+                        .map(|limit| {
+                            json!({
+                                "param": limit.param,
+                                "requested": limit.requested,
+                                "applied": limit.applied,
+                                "reason": "server_cap",
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    result
 }
 
 /// Check per-session rate limit. Returns `true` if the request is allowed.
@@ -227,7 +274,13 @@ async fn handle_mcp(
             Some(t)
                 if {
                     use subtle::ConstantTimeEq;
-                    bool::from(t.as_bytes().ct_eq(expected.as_bytes()))
+                    let query_match = bool::from(t.as_bytes().ct_eq(expected.as_bytes()));
+                    let admin_match = state
+                        .admin_token
+                        .as_ref()
+                        .map(|admin| bool::from(t.as_bytes().ct_eq(admin.as_bytes())))
+                        .unwrap_or(false);
+                    query_match || admin_match
                 } => {}
             _ => {
                 return (
@@ -386,11 +439,28 @@ async fn handle_mcp(
             let lite = state.lite;
             let server_mode = state.server_mode;
 
-            // Clamp depth / result-count parameters to server caps so MCP
-            // clients cannot request unbounded traversals or result sets.
+            // Validate depth and cap result-count parameters to server caps so
+            // MCP clients cannot request unbounded traversals or result sets.
             let mut arguments = arguments;
+            let mut applied_limits = Vec::new();
             if server_mode {
-                clamp_safeguard_params(&mut arguments);
+                match apply_safeguard_params(&mut arguments) {
+                    Ok(limits) => applied_limits = limits,
+                    Err(message) => {
+                        return (
+                            axum::http::StatusCode::OK,
+                            HeaderMap::new(),
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": error_code::INVALID_PARAMS,
+                                    "message": message,
+                                }
+                            })),
+                        );
+                    }
+                }
             }
 
             // Run tool dispatch on a blocking thread — graph queries are
@@ -416,11 +486,15 @@ async fn handle_mcp(
             .await;
 
             match result {
-                Ok(Ok(Ok(value))) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": tools::wrap_tool_result(value),
-                }),
+                Ok(Ok(Ok(value))) => {
+                    let result =
+                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits);
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    })
+                }
                 Ok(Ok(Err(e))) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -483,6 +557,51 @@ mod tests {
         router(state)
     }
 
+    fn test_auth_app() -> Router {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let state = Arc::new(McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            false,
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        ));
+        router(state)
+    }
+
+    #[test]
+    fn safeguard_rejects_over_depth_instead_of_clamping() {
+        let mut args = json!({
+            "depth": MAX_DEPTH + 1,
+            "limit": 10,
+        });
+
+        let err = apply_safeguard_params(&mut args).unwrap_err();
+
+        assert!(err.contains("invalid-argument"));
+        assert!(err.contains("maximum allowed depth"));
+        assert_eq!(args["depth"], MAX_DEPTH + 1);
+    }
+
+    #[test]
+    fn safeguard_caps_result_limit_and_records_metadata() {
+        let mut args = json!({
+            "limit": MAX_RESULTS + 25,
+        });
+
+        let limits = apply_safeguard_params(&mut args).unwrap();
+        let result = add_limit_metadata(tools::wrap_tool_result(json!({"ok": true})), &limits);
+
+        assert_eq!(args["limit"], MAX_RESULTS);
+        assert_eq!(result["_meta"]["limits"][0]["param"], "limit");
+        assert_eq!(result["_meta"]["limits"][0]["requested"], MAX_RESULTS + 25);
+        assert_eq!(result["_meta"]["limits"][0]["applied"], MAX_RESULTS);
+        assert_eq!(result["structuredContent"]["ok"], true);
+    }
+
     #[tokio::test]
     async fn initialize_returns_server_info() {
         let app = test_app();
@@ -535,6 +654,33 @@ mod tests {
         assert_eq!(json["id"], 2);
         let tools = json["result"]["tools"].as_array().expect("tools array");
         assert!(tools.len() >= 30, "expected 30+ tools, got {}", tools.len());
+    }
+
+    #[tokio::test]
+    async fn admin_token_is_accepted_for_mcp_http_query_auth() {
+        for token in ["query-token", "admin-token"] {
+            let app = test_auth_app();
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": token,
+                "method": "tools/list",
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json["result"]["tools"].is_array(), "{json}");
+        }
     }
 
     #[tokio::test]

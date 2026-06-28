@@ -125,6 +125,18 @@ pub static MCP_SESSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
     g
 });
 
+pub static ACTIVE_READS: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("nestweaver_active_reads", "Active read operations").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+pub static ACTIVE_WRITES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("nestweaver_active_writes", "Active write operations").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
 // ── Queries ──────────────────────────────────────────────────────────────
 
 pub static QUERY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -145,6 +157,19 @@ pub static SLOW_QUERIES: LazyLock<IntCounter> = LazyLock::new(|| {
     let c = IntCounter::new(
         "nestweaver_slow_queries_total",
         "Total queries exceeding 80% of timeout",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+pub static QUERY_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "nestweaver_query_errors_total",
+            "Total query errors by tool",
+        ),
+        &["tool"],
     )
     .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
@@ -182,9 +207,22 @@ pub fn init_metrics() {
     let _ = &*POLL_CHANGES_DETECTED;
     let _ = &*GRPC_CONNECTIONS;
     let _ = &*MCP_SESSIONS;
+    let _ = &*ACTIVE_READS;
+    let _ = &*ACTIVE_WRITES;
     let _ = &*QUERY_DURATION;
     let _ = &*SLOW_QUERIES;
+    let _ = &*QUERY_ERRORS;
     let _ = &*GRPC_REQUESTS;
+
+    REPOS_TOTAL.with_label_values(&["indexed"]).set(0);
+    QUEUE_DEPTH.with_label_values(&["total"]).set(0);
+    JOBS_TOTAL.with_label_values(&["succeeded"]);
+    JOBS_TOTAL.with_label_values(&["failed"]);
+    JOBS_TOTAL.with_label_values(&["dead_letter"]);
+    JOBS_TOTAL.with_label_values(&["cancelled"]);
+    JOB_DURATION.with_label_values(&[]);
+    QUERY_ERRORS.with_label_values(&["unknown"]);
+    GRPC_REQUESTS.with_label_values(&["unknown"]);
 }
 
 /// Prometheus text-format endpoint. No auth required (standard practice —

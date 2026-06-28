@@ -1,11 +1,12 @@
 # Build stage
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-trixie AS builder
 WORKDIR /build
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --bin nestweaver
+RUN RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" cargo build --release --bin nestweaver
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y git ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/nestweaver /usr/local/bin/nestweaver
 VOLUME /data

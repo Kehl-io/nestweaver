@@ -117,6 +117,7 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
+        let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
         nestweaver_web::routes::metrics::GRPC_REQUESTS
             .with_label_values(&[tool_name])
@@ -124,13 +125,29 @@ impl DaemonService {
 
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
+        let timeout = safeguards.effective_timeout(&tool, None);
         let handler = self.dispatch_json_tool_inner(tool_name, args_json);
 
-        if self.state.server_mode {
+        let response = if self.state.server_mode {
             with_safeguard(&tool, safeguards, None, handler).await
         } else {
             handler.await
+        };
+
+        let elapsed = started.elapsed();
+        nestweaver_web::routes::metrics::QUERY_DURATION
+            .with_label_values(&[tool.as_str()])
+            .observe(elapsed.as_secs_f64());
+        if elapsed >= timeout.mul_f64(0.8) {
+            nestweaver_web::routes::metrics::SLOW_QUERIES.inc();
         }
+        if response.is_err() {
+            nestweaver_web::routes::metrics::QUERY_ERRORS
+                .with_label_values(&[tool.as_str()])
+                .inc();
+        }
+
+        response
     }
 
     /// Inner dispatch without safeguard wrapper. Extracted so
@@ -275,6 +292,7 @@ impl DaemonService {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
+        let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
         nestweaver_web::routes::metrics::GRPC_REQUESTS
             .with_label_values(&[tool_name])
@@ -282,13 +300,29 @@ impl DaemonService {
 
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
+        let timeout = safeguards.effective_timeout(&tool, None);
         let handler = self.dispatch_tool_json_inner(tool_name, args);
 
-        if self.state.server_mode {
+        let response = if self.state.server_mode {
             with_safeguard(&tool, safeguards, None, handler).await
         } else {
             handler.await
+        };
+
+        let elapsed = started.elapsed();
+        nestweaver_web::routes::metrics::QUERY_DURATION
+            .with_label_values(&[tool.as_str()])
+            .observe(elapsed.as_secs_f64());
+        if elapsed >= timeout.mul_f64(0.8) {
+            nestweaver_web::routes::metrics::SLOW_QUERIES.inc();
         }
+        if response.is_err() {
+            nestweaver_web::routes::metrics::QUERY_ERRORS
+                .with_label_values(&[tool.as_str()])
+                .inc();
+        }
+
+        response
     }
 
     /// Inner dispatch without safeguard wrapper.
@@ -2846,13 +2880,10 @@ pub async fn run_server(
 ) -> Result<(), anyhow::Error> {
     // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
     // The DB will be created by GraphStore::open_or_create below.
-    let db_path = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
-        // Ensure parent directory exists so the DB can be created
-        if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        db_path.to_path_buf()
-    });
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let db_path = lifecycle::canonical_db_path(db_path);
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
@@ -3211,6 +3242,7 @@ pub async fn run_server(
                 state.instance_cfg.clone(),
                 state.server_mode,
                 token.clone(),
+                opts.admin_token.clone(),
             )
         } else {
             nestweaver_mcp::http::McpHttpState::new(
@@ -3245,6 +3277,37 @@ pub async fn run_server(
             std::sync::Arc::new(std::sync::Mutex::new(jq))
         };
         shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
+
+        if let Some(ref cfg) = state.instance_cfg {
+            if let Ok(queue) = shared_job_queue.lock() {
+                for repo_cfg in &cfg.repos {
+                    let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
+                    let needs_initial_index = state
+                        .store
+                        .lookup_repo(&repo_uid)
+                        .ok()
+                        .flatten()
+                        .map(|repo| repo.indexed_sha.is_empty())
+                        .unwrap_or(true);
+                    if needs_initial_index {
+                        let canonical_id =
+                            nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
+                        if let Err(e) = queue.upsert(
+                            &canonical_id,
+                            &repo_cfg.url,
+                            nestweaver_engine::jobs::JobTrigger::Unindexed,
+                            repo_cfg.branch.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                repo = %repo_cfg.url,
+                                error = %e,
+                                "failed to enqueue config repo for initial indexing"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Mount webhook endpoint when a secret is configured.
         if let Some(ref secret) = opts.webhook_secret {
@@ -3618,10 +3681,14 @@ pub async fn run_server(
     {
         let metrics_store = Arc::clone(&state.store);
         let metrics_queue_depth = Arc::clone(&state.indexing_queue_depth);
+        let metrics_active_reads = Arc::clone(&state.active_reads);
+        let metrics_active_writes = Arc::clone(&state.active_writes);
+        let metrics_job_queue = shared_job_queue_opt.clone();
         let metrics_instance = instance_id.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use nestweaver_web::routes::metrics;
+            let mut last_metric_job_id = 0_i64;
             loop {
                 // Update repo gauge.
                 if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
@@ -3631,10 +3698,42 @@ pub async fn run_server(
                 }
 
                 // Update queue depth gauge.
-                let depth = metrics_queue_depth.load(Ordering::Relaxed);
+                let depth = metrics_job_queue
+                    .as_ref()
+                    .and_then(|queue| {
+                        let guard = queue.lock().ok()?;
+                        let depth = guard.queue_depth().ok()?;
+                        Some(depth.pending + depth.running)
+                    })
+                    .unwrap_or_else(|| metrics_queue_depth.load(Ordering::Relaxed) as i64);
                 metrics::QUEUE_DEPTH
                     .with_label_values(&["total"])
-                    .set(depth as i64);
+                    .set(depth);
+                metrics::ACTIVE_READS.set(metrics_active_reads.load(Ordering::Relaxed) as i64);
+                metrics::ACTIVE_WRITES.set(metrics_active_writes.load(Ordering::Relaxed) as i64);
+                metrics::GRPC_CONNECTIONS.set(
+                    (metrics_active_reads.load(Ordering::Relaxed)
+                        + metrics_active_writes.load(Ordering::Relaxed)) as i64,
+                );
+
+                if let Some(queue) = &metrics_job_queue
+                    && let Ok(guard) = queue.lock()
+                    && let Ok(completed) = guard.completed_job_metrics_after(last_metric_job_id)
+                {
+                    for job in completed {
+                        last_metric_job_id = last_metric_job_id.max(job.id);
+                        let result = match job.status {
+                            nestweaver_engine::jobs::JobStatus::Succeeded => "succeeded",
+                            nestweaver_engine::jobs::JobStatus::DeadLetter => "dead_letter",
+                            nestweaver_engine::jobs::JobStatus::Cancelled => "cancelled",
+                            _ => "failed",
+                        };
+                        metrics::JOBS_TOTAL.with_label_values(&[result]).inc();
+                        metrics::JOB_DURATION
+                            .with_label_values(&[])
+                            .observe(job.duration_s);
+                    }
+                }
 
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}

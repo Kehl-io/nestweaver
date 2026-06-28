@@ -217,12 +217,34 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
     md
 }
 
+/// Render a full impact report, including top-level error metadata.
+pub fn render_impact_report_markdown(report: &ImpactReport, config: &FormatConfig) -> String {
+    if let Some(error) = report.error.as_deref() {
+        return render_error_report(error, config);
+    }
+
+    render_impact_markdown(&report.impacts, config)
+}
+
 /// Render the "clean PR" comment (no impacts detected).
 fn render_clean_pr(marker: &str) -> String {
     format!(
         "<!-- {} -->\n## NestWeaver Impact Analysis\n\nNo cross-repo impact detected. Changes are contained to this repository.\n",
         marker
     )
+}
+
+fn render_error_report(error: &str, config: &FormatConfig) -> String {
+    let mut md = format!(
+        "<!-- {} -->\n## NestWeaver Impact Analysis\n\n",
+        config.marker
+    );
+    md.push_str("Impact analysis did not complete.\n\n");
+    md.push_str(&format!("**Error:** `{}`\n\n", error));
+    md.push_str(
+        "No production-readiness conclusion was made from this run. Retry when the NestWeaver server is reachable.",
+    );
+    md
 }
 
 /// Enforce GitHub's character limit by progressively removing detail blocks.
@@ -793,5 +815,21 @@ mod tests {
         assert_eq!(report.changes, Some(3));
 
         std::fs::remove_file(tmp_file).ok();
+    }
+
+    #[test]
+    fn test_server_unavailable_report_does_not_render_clean_pr() {
+        let report = ImpactReport {
+            changes: None,
+            impacts: vec![],
+            total_impacted_files: None,
+            total_impacted_repos: None,
+            error: Some("server_unavailable".to_string()),
+        };
+        let md = render_impact_report_markdown(&report, &FormatConfig::default());
+
+        assert!(md.contains("Impact analysis did not complete"));
+        assert!(md.contains("server_unavailable"));
+        assert!(!md.contains("No cross-repo impact detected"));
     }
 }

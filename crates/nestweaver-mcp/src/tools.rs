@@ -1679,6 +1679,16 @@ fn tool_brain_context(
         );
     }
 
+    if result.connected.is_empty() && !result.seeds.is_empty() {
+        let mut present: std::collections::HashSet<String> =
+            result.connected.iter().map(|n| n.uid.clone()).collect();
+        for seed in result.seeds.iter().cloned() {
+            if present.insert(seed.uid.clone()) {
+                result.connected.push(seed);
+            }
+        }
+    }
+
     // Feature F8: embed high-relevance bodies inline when the caller opted in
     // via `include_bodies: true`. Off by default → output unchanged. Threshold
     // and per-body cap come from [response] config when supplied, else defaults.
@@ -6276,6 +6286,36 @@ mod project_context_bug12_tests {
             "all {} member notes must surface in connected; got {uids:?}",
             note_uids.len()
         );
+    }
+
+    #[test]
+    fn brain_context_surfaces_resolved_seed_when_no_neighbors() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:t:abc:leaf",
+                "repo:t:abc",
+                "src/leaf.rs",
+                "LeafOnlySymbol",
+            ))
+            .unwrap();
+
+        let resp = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["LeafOnlySymbol"], "token_budget": 5000 }),
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        assert!(
+            connected
+                .iter()
+                .any(|n| n["title"].as_str() == Some("LeafOnlySymbol")),
+            "resolved seed should be visible when it has no connected neighbors: {connected:?}"
+        );
+        assert_eq!(resp["seeds_expanded"].as_u64(), Some(1));
     }
 
     // Feature F8: brain_context with include_bodies embeds the source span of

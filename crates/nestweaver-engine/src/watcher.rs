@@ -101,6 +101,8 @@ pub struct BrainWatcher {
     /// Pre-opened TantivyIndex from the caller (e.g. daemon). When set,
     /// `run_inner` uses this instead of opening its own from `tantivy_path`.
     external_tantivy: Option<Arc<TantivyIndex>>,
+    #[cfg(test)]
+    ready_signal: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl BrainWatcher {
@@ -129,6 +131,8 @@ impl BrainWatcher {
             debounce_ms: 200,
             ignore_set,
             external_tantivy: None,
+            #[cfg(test)]
+            ready_signal: None,
         }
     }
 
@@ -160,6 +164,12 @@ impl BrainWatcher {
     /// Set the debounce interval for filesystem events.
     pub fn with_debounce_ms(mut self, ms: u64) -> Self {
         self.debounce_ms = ms;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ready_signal(mut self, ready: std::sync::mpsc::Sender<()>) -> Self {
+        self.ready_signal = Some(ready);
         self
     }
 
@@ -257,6 +267,10 @@ impl BrainWatcher {
             .watcher()
             .watch(&self.vault_root, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", self.vault_root.display()))?;
+        #[cfg(test)]
+        if let Some(ready) = &self.ready_signal {
+            let _ = ready.send(());
+        }
 
         tracing::info!(
             vault = %self.vault_root.display(),
@@ -971,8 +985,17 @@ fn format_system_time(t: std::time::SystemTime) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::Duration;
+
+    static WATCHER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial_watcher_test() -> MutexGuard<'static, ()> {
+        WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Build a vault on disk with the given files, return temp dir + path.
     fn make_vault(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1009,6 +1032,7 @@ mod tests {
     #[test]
     #[ignore = "depends on platform fs-event timing"]
     fn watcher_picks_up_a_new_file() {
+        let _guard = serial_watcher_test();
         let (_dir, root) = make_vault(&[("seed.md", "# Seed\n\nbody\n")]);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
@@ -1016,12 +1040,14 @@ mod tests {
         // Seed the DB by indexing once so the Vault node is set up.
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
 
-        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "default", "test").with_ready_signal(ready_tx);
         let stop = watcher.shutdown_handle();
         let handle = thread::spawn(|| watcher.run());
-
-        // Give the watcher time to start before we mutate the tree.
-        thread::sleep(Duration::from_millis(150));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should start");
 
         let new_path = root.join("just-added.md");
         fs::write(&new_path, "# Just Added\n\nfresh content\n").unwrap();
@@ -1044,17 +1070,21 @@ mod tests {
     #[test]
     #[ignore = "depends on platform fs-event timing"]
     fn watcher_handles_modify_via_cascade_delete_then_reinsert() {
+        let _guard = serial_watcher_test();
         let (_dir, root) = make_vault(&[("note.md", "# Original Title\n\nbody\n")]);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
 
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
 
-        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "default", "test").with_ready_signal(ready_tx);
         let stop = watcher.shutdown_handle();
         let handle = thread::spawn(|| watcher.run());
-
-        thread::sleep(Duration::from_millis(150));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should start");
         fs::write(
             root.join("note.md"),
             "# Renamed Title\n\nmore body\n\n## New Heading\n\nmore\n",
@@ -1075,6 +1105,7 @@ mod tests {
     #[test]
     #[ignore = "depends on platform fs-event timing"]
     fn watcher_handles_delete() {
+        let _guard = serial_watcher_test();
         let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("doomed.md", "# Doomed\n")]);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
@@ -1085,11 +1116,14 @@ mod tests {
             2
         );
 
-        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "default", "test").with_ready_signal(ready_tx);
         let stop = watcher.shutdown_handle();
         let handle = thread::spawn(|| watcher.run());
-
-        thread::sleep(Duration::from_millis(150));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should start");
         fs::remove_file(root.join("doomed.md")).unwrap();
         thread::sleep(Duration::from_millis(700));
         stop.stop();
@@ -1109,17 +1143,21 @@ mod tests {
     #[test]
     #[ignore = "depends on platform fs-event timing"]
     fn watcher_ignores_files_in_obsidian_dir() {
+        let _guard = serial_watcher_test();
         let (_dir, root) = make_vault(&[(".obsidian/config.json", "{}")]);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
         let before = GraphStore::open(&db_path).unwrap().count_notes().unwrap();
 
-        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher =
+            BrainWatcher::new(&db_path, &root, "default", "test").with_ready_signal(ready_tx);
         let stop = watcher.shutdown_handle();
         let handle = thread::spawn(|| watcher.run());
-
-        thread::sleep(Duration::from_millis(150));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should start");
         fs::write(root.join(".obsidian/note-in-config.md"), "# X\n").unwrap();
         thread::sleep(Duration::from_millis(700));
         stop.stop();

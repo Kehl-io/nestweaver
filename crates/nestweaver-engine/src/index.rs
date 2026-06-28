@@ -393,7 +393,7 @@ pub fn index_with_reader(
     indexed_sha: &str,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
-    index_into_store(
+    let result = index_into_store(
         reader,
         store,
         instance_id,
@@ -404,7 +404,82 @@ pub fn index_with_reader(
         None,
         None,
         name,
-    )
+    )?;
+    store.bump_and_persist_generation();
+    Ok(result)
+}
+
+fn infer_cross_repo_call_edges(
+    store: &GraphStore,
+    current_repo_uid: &str,
+    parsed_files: &[ParsedFileEntry],
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    use nestweaver_parser::ReferenceKind;
+    use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge, Visibility};
+
+    let local_symbol_names: std::collections::HashSet<String> = parsed_files
+        .iter()
+        .flat_map(|(_, symbols, _, _)| symbols.iter().map(|s| s.name.clone()))
+        .collect();
+    let mut edges = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (rel_path, symbols, references, _) in parsed_files {
+        for reference in references {
+            if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
+                continue;
+            }
+            if local_symbol_names.contains(&reference.name) {
+                continue;
+            }
+
+            let Some(source_symbol) = containing_symbol_for_line(symbols, reference.start_line)
+            else {
+                continue;
+            };
+            let source_uid = symbol_uid(
+                current_repo_uid,
+                rel_path,
+                &source_symbol.name,
+                source_symbol.start_line,
+            );
+
+            for target in store
+                .lookup_symbols_by_name(&reference.name)
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                if target.repo_uid == current_repo_uid || target.uid == source_uid {
+                    continue;
+                }
+                if target.visibility == Visibility::Private {
+                    continue;
+                }
+                if seen.insert((source_uid.clone(), target.uid.clone())) {
+                    edges.push(ResolvedEdge {
+                        source_uid: source_uid.clone(),
+                        target_uid: target.uid,
+                        edge_type: EdgeType::CrossRepoLink,
+                        confidence: 0.7,
+                        link_type: Some(CrossRepoLinkType::SharedImport),
+                        evidence: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(edges)
+}
+
+fn containing_symbol_for_line<'a>(symbols: &'a [RawSymbol], line: u32) -> Option<&'a RawSymbol> {
+    symbols
+        .iter()
+        .filter(|s| s.start_line <= line && line <= s.end_line)
+        .max_by_key(|s| s.start_line)
+        .or_else(|| {
+            symbols
+                .iter()
+                .filter(|s| s.start_line <= line)
+                .max_by_key(|s| s.start_line)
+        })
 }
 
 /// Core indexing logic shared by both public functions.
@@ -1161,6 +1236,19 @@ fn index_into_store(
     store
         .batch_insert_edges(&insertable_edges)
         .context("batch_insert_edges (resolved)")?;
+
+    let inferred_cross_repo_edges =
+        infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?;
+    if !inferred_cross_repo_edges.is_empty() {
+        edges_count += inferred_cross_repo_edges.len();
+        store
+            .batch_insert_edges(&inferred_cross_repo_edges)
+            .context("batch_insert_edges (inferred cross-repo calls)")?;
+        tracing::debug!(
+            count = inferred_cross_repo_edges.len(),
+            "emitted inferred CROSS_REPO_LINK edges"
+        );
+    }
 
     // Record file-level dependency information for future incremental runs.
     if let Some(ref mut rd) = resolution_deps {
@@ -2122,6 +2210,67 @@ function hello(name) { return "Hello " + name; }
         let (result, _store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         assert!(result.edges_count > 0, "expected CALLS edges, got 0");
+    }
+
+    #[test]
+    fn index_infers_cross_repo_call_edges_for_exported_symbol_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("api");
+        let web = dir.path().join("web");
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir_all(&web).unwrap();
+        fs::write(
+            api.join("payment.js"),
+            "export function processPayment(amount, currency) {\n  return { amount, currency };\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            web.join("checkout.js"),
+            "export function WebCheckoutSymbol(cart) {\n  return processPayment(cart.total, 'USD');\n}\n",
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let api_reader = crate::content_reader::FilesystemReader::new(&api);
+        let web_reader = crate::content_reader::FilesystemReader::new(&web);
+        index_into_store(
+            &api_reader,
+            &store,
+            "test",
+            "https://example.com/api",
+            "api-sha",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        index_into_store(
+            &web_reader,
+            &store,
+            "test",
+            "https://example.com/web",
+            "web-sha",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let process_payment = store
+            .lookup_symbols_by_name("processPayment")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("processPayment indexed");
+        let impacted = store.impact(&process_payment.uid, 3, 0.0).unwrap();
+        assert!(
+            impacted.iter().any(|s| s.name == "WebCheckoutSymbol"),
+            "expected WebCheckoutSymbol in impact set, got {impacted:#?}"
+        );
     }
 
     #[test]

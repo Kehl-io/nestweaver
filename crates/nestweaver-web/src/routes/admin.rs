@@ -228,6 +228,33 @@ pub async fn add_repo(
         )
     })??;
 
+    // Persist admin-added repos into instance config so scheduler/webhook
+    // allowlisting survives daemon restarts.
+    if let Some(config_path) = state.config_path.clone() {
+        let repo_url = req.url.clone();
+        let branch = req.branch.clone();
+        tokio::task::spawn_blocking(move || {
+            nestweaver_engine::append_repo_to_config_file(
+                &config_path,
+                &repo_url,
+                branch.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task panicked: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist repo config: {e}"),
+            )
+        })?;
+    }
+
     // Update live scheduler so the new repo is polled without restart.
     if let Some(ref tx) = state.scheduler_tx {
         let repo_name = nestweaver_engine::pull::repo_name_from_url(&req.url);
@@ -299,6 +326,27 @@ pub async fn remove_repo(
             }
         })
         .await;
+    }
+
+    // Persist the removal before deleting graph data so a failed config write
+    // cannot leave the next restart re-admitting the repo silently.
+    if let (Some(config_path), Some(url)) = (state.config_path.clone(), repo_url.clone()) {
+        tokio::task::spawn_blocking(move || {
+            nestweaver_engine::remove_repo_from_config_file(&config_path, &url)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task panicked: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist repo removal: {e}"),
+            )
+        })?;
     }
 
     // Delete graph data under write mutex. An already-claimed worker will
@@ -887,27 +935,25 @@ pub async fn get_status(
     .await
     .unwrap_or((0, 0));
 
-    // Count dead-letter entries and running jobs from the job queue.
+    // Count pending/running/dead-letter entries from the job queue. The
+    // persisted queue is the operator-facing source of truth, especially while
+    // workers are drained and the atomic worker-depth hint is zero.
     let db_path = state.db_path.clone();
-    let (dead_letter_count, running_count) = tokio::task::spawn_blocking(move || {
-        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
-        let dead = queue
-            .as_ref()
-            .and_then(|q| q.dead_letters().ok())
-            .map(|d| d.len())
-            .unwrap_or(0);
-        let running = queue
-            .as_ref()
-            .and_then(|q| q.running_jobs().ok())
-            .map(|r| r.len() as u32)
-            .unwrap_or(0);
-        (dead, running)
-    })
-    .await
-    .unwrap_or((0, 0));
+    let (pending_count, dead_letter_count, running_count) =
+        tokio::task::spawn_blocking(move || {
+            let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+            let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
+            let depth = queue.as_ref().and_then(|q| q.queue_depth().ok());
+            let dead = depth.as_ref().map(|d| d.dead_letter as usize).unwrap_or(0);
+            let running = depth.as_ref().map(|d| d.running as u32).unwrap_or(0);
+            let pending = depth.as_ref().map(|d| d.pending as u32);
+            (pending, dead, running)
+        })
+        .await
+        .unwrap_or((None, 0, 0));
 
-    let queue_depth = state.indexing_queue_depth.load(Ordering::Relaxed);
+    let queue_depth =
+        pending_count.unwrap_or_else(|| state.indexing_queue_depth.load(Ordering::Relaxed));
 
     Json(AdminStatus {
         instance_id: state.instance_id.clone(),
@@ -929,7 +975,7 @@ pub async fn get_status(
             total: symbol_count,
         },
         queue: QueueStats {
-            pending: queue_depth.saturating_sub(running_count),
+            pending: queue_depth,
             running: running_count,
             dead_letter: dead_letter_count,
         },
@@ -943,7 +989,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use axum::{Router, routing::get};
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
     use tower::ServiceExt;
 
     fn test_admin_state() -> Arc<AdminState> {
@@ -1048,5 +1097,117 @@ mod tests {
             .unwrap();
         let status: DrainStatus = serde_json::from_slice(&body).unwrap();
         assert!(!status.drained);
+    }
+
+    #[tokio::test]
+    async fn status_uses_persisted_pending_queue_count() {
+        let state = test_admin_state();
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).unwrap();
+        queue
+            .upsert(
+                "repo-a",
+                "file:///tmp/repo-a",
+                nestweaver_engine::jobs::JobTrigger::Webhook,
+                None,
+            )
+            .unwrap();
+
+        let app = Router::new()
+            .route("/admin/api/status", get(get_status))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/status")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["queue_depth"], 1);
+        assert_eq!(status["queue"]["pending"], 1);
+    }
+
+    #[tokio::test]
+    async fn add_repo_persists_instance_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "https://github.com/example/existing"
+"#,
+        )
+        .unwrap();
+        let store =
+            nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
+        let state = Arc::new(AdminState {
+            admin_token: "test-admin-token".to_string(),
+            daemon_store: Arc::new(store),
+            instance_id: "test".to_string(),
+            start_time: std::time::Instant::now(),
+            active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            db_path,
+            config_path: Some(config_path.clone()),
+            scheduler_tx: None,
+            webhook_allowed_repos: None,
+            webhook_repo_branches: None,
+            write_mutex: None,
+        });
+
+        let app = Router::new()
+            .route("/admin/api/repos", post(add_repo))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/repos")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://github.com/example/new","branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
+        assert!(cfg.repos.iter().any(|repo| {
+            repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
+        }));
     }
 }

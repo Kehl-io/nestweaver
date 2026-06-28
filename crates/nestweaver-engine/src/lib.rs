@@ -136,7 +136,8 @@ pub use config::{
     CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
     InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
     ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, WikiSourceConfig,
-    WorkspaceConfig, default_kind_priority, default_test_path_patterns,
+    WorkspaceConfig, append_repo_to_config_file, default_kind_priority, default_test_path_patterns,
+    remove_repo_from_config_file,
 };
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,

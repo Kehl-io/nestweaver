@@ -2,6 +2,26 @@
 
 use std::path::{Path, PathBuf};
 
+/// Canonicalize a database path even before the database file exists.
+///
+/// `std::fs::canonicalize(path)` only succeeds once the file exists. Daemon
+/// startup often receives a not-yet-created DB path, so canonicalize the parent
+/// directory and append the original filename. This keeps socket IDs stable for
+/// paths such as macOS `/tmp/...` and `/private/tmp/...`.
+pub fn canonical_db_path(db_path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        return canonical;
+    }
+
+    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
+        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+    {
+        return canonical_parent.join(file_name);
+    }
+
+    db_path.to_path_buf()
+}
+
 /// Derive a stable, short instance ID from a database path.
 ///
 /// Returns ONLY the 8-character hex hash of the canonical path.
@@ -10,7 +30,7 @@ use std::path::{Path, PathBuf};
 /// For a human-readable label (parent-dir + hash), use
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let canonical = canonical_db_path(db_path);
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -23,7 +43,7 @@ pub fn instance_id_from_db_path(db_path: &Path) -> String {
 /// Never use this in path construction — use [`instance_id_from_db_path`]
 /// (the bare 8-char hash) to keep socket paths short.
 pub fn instance_label_from_db_path(db_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let canonical = canonical_db_path(db_path);
     let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
@@ -144,6 +164,30 @@ mod tests {
         let id1 = instance_id_from_db_path(path);
         let id2 = instance_id_from_db_path(path);
         assert_eq!(id1, id2, "same path must produce same ID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_id_canonicalizes_parent_for_missing_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real");
+        let linked_parent = tmp.path().join("linked");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+
+        let via_real = real_parent.join("missing.lbug");
+        let via_link = linked_parent.join("missing.lbug");
+
+        assert_eq!(
+            canonical_db_path(&via_link),
+            canonical_db_path(&via_real),
+            "missing DB paths should canonicalize through their parent"
+        );
+        assert_eq!(
+            instance_id_from_db_path(&via_link),
+            instance_id_from_db_path(&via_real),
+            "socket instance ID should not depend on symlink spelling"
+        );
     }
 
     #[test]

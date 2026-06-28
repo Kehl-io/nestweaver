@@ -126,6 +126,14 @@ pub struct RunningJobInfo {
     pub duration_s: f64,
 }
 
+/// Completed job observation for metrics export.
+#[derive(Debug, Clone)]
+pub struct CompletedJobMetric {
+    pub id: i64,
+    pub status: JobStatus,
+    pub duration_s: f64,
+}
+
 /// SQLite-backed job queue. One instance per server process.
 pub struct JobQueue {
     conn: Connection,
@@ -454,6 +462,31 @@ impl JobQueue {
                 repo: row.get(0)?,
                 started_at: started_epoch.map(|e| format!("{e}")),
                 duration_s: duration,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Return completed jobs after `last_id`, with elapsed duration where available.
+    pub fn completed_job_metrics_after(
+        &self,
+        last_id: i64,
+    ) -> Result<Vec<CompletedJobMetric>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, status,
+                    MAX(0.0, CAST(completed_at AS REAL) - CAST(started_at AS REAL)) AS dur
+             FROM index_jobs
+             WHERE id > ?1
+               AND completed_at IS NOT NULL
+               AND started_at IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![last_id], |row| {
+            let status: String = row.get(1)?;
+            Ok(CompletedJobMetric {
+                id: row.get(0)?,
+                status: JobStatus::from_str(&status),
+                duration_s: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
             })
         })?;
         rows.collect()

@@ -3467,70 +3467,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_default = default_db_path();
                 let db_path = db.as_deref().unwrap_or(&db_default);
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                        db_path,
-                        config.as_deref(),
-                    ));
-                    if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::BrainContextRequest {
-                            seeds: seeds.clone(),
-                            token_budget: token_budget.unwrap_or(0) as i32,
-                            response_format: String::new(),
-                            repos: vec![],
-                            vaults: vec![],
-                            kinds: vec![],
-                            path_prefix: String::new(),
-                            tags: vec![],
-                            exclude_tags: vec![],
-                            weight_ppr: 0.0,
-                            weight_bm25: 0.0,
-                            intent: intent.clone().unwrap_or_default(),
-                            include_seeds: true,
-                            include_bodies: false,
-                            root: String::new(),
-                            prf: false,
-                            rerank: false,
-                            weight_semantic: 0.0,
-                            since: String::new(),
-                            recency_weight: 0.0,
-                            recency_half_life_days: 0.0,
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .get_context(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                let result: nestweaver_engine::BrainContextResult =
-                                    serde_json::from_str(&resp.result_json)?;
-                                let cut = match token_budget {
-                                    Some(budget) => {
-                                        token_budgeted_truncate(&result.connected, budget)
-                                    }
-                                    None => effective_limit.min(result.connected.len()),
-                                };
-                                if json {
-                                    print_brain_context_json(&result, cut)?;
-                                } else {
-                                    print_brain_context_text(&result, cut, token_budget);
-                                }
-                                let stats = format!(
-                                    "{} seeds, {} connected nodes in {} (via daemon)",
-                                    result.seeds.len(),
-                                    cut,
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
-                            }
-                            Err(e) => {
-                                eprintln!("Daemon RPC failed, falling back to local: {e}");
-                            }
-                        }
+                let hybrid_args = serde_json::json!({
+                    "seeds": seeds.clone(),
+                    "token_budget": token_budget.unwrap_or(0),
+                    "intent": intent.clone().unwrap_or_default(),
+                    "include_seeds": true,
+                });
+                if let Some(result_json) = try_hybrid_json_rpc(
+                    use_daemon,
+                    db_path,
+                    config.as_deref(),
+                    "brain_context",
+                    hybrid_args,
+                ) {
+                    let result: nestweaver_engine::BrainContextResult =
+                        serde_json::from_value(result_json)?;
+                    let cut = match token_budget {
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        None => effective_limit.min(result.connected.len()),
+                    };
+                    if json {
+                        print_brain_context_json(&result, cut)?;
+                    } else {
+                        print_brain_context_text(&result, cut, token_budget);
                     }
+                    let stats = format!(
+                        "{} seeds, {} connected nodes in {} (via hybrid)",
+                        result.seeds.len(),
+                        cut,
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -6196,7 +6163,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             use nestweaver_engine::format_comment::{
                 FormatConfig, GitHubCommentConfig, GitLabCommentConfig, read_impact_report,
-                render_impact_markdown,
+                render_impact_report_markdown,
             };
 
             let report = read_impact_report(&input)
@@ -6206,7 +6173,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 marker: marker.clone(),
                 artifact_url,
             };
-            let markdown = render_impact_markdown(&report.impacts, &config);
+            let markdown = render_impact_report_markdown(&report, &config);
 
             // Determine output destination
             if let Some(output_path) = output {
@@ -8651,13 +8618,16 @@ fn try_hybrid_json_rpc(
     }
     let rt = tokio::runtime::Runtime::new().ok()?;
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut hybrid = rt
-        .block_on(nestweaver_client::hybrid::HybridClient::connect(
-            db_path, config, &start_dir,
-        ))
-        .ok()?;
-    let result = rt.block_on(hybrid.query(rpc_name, &args)).ok()?;
-    Some(result)
+    match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+        db_path, config, &start_dir,
+    )) {
+        Ok(mut hybrid) => rt.block_on(hybrid.query(rpc_name, &args)).ok(),
+        Err(_) => rt
+            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                config, &start_dir, rpc_name, &args,
+            ))
+            .ok(),
+    }
 }
 
 fn run_brain(
@@ -12450,10 +12420,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                     db_path.display()
                 );
             }
+            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
 
             let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
-
-            let daemon_running = nestweaver_daemon::launchd::is_running(&instance_id);
 
             let workspace_path = if include_clones {
                 db_path.parent().map(|p| p.join("workspace"))
@@ -12469,32 +12438,38 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 workspace_path,
             };
 
+            let rt = tokio::runtime::Runtime::new()?;
+            #[cfg(target_os = "macos")]
+            let launchd_running = nestweaver_daemon::launchd::is_running(&instance_id);
+            #[cfg(not(target_os = "macos"))]
+            let launchd_running = false;
+            let existing_daemon =
+                rt.block_on(nestweaver_client::DaemonClient::connect_existing(&db_path));
+            let daemon_running = launchd_running || existing_daemon.is_ok();
+
             let result = if daemon_running {
                 // Route through the daemon: call PrepareBackup to quiesce,
                 // then copy files read-only (no lock contention).
                 eprintln!("Daemon is running — quiescing database via PrepareBackup RPC...");
-                let rt = tokio::runtime::Runtime::new()?;
-                let prepare_ok = rt.block_on(async {
-                    match nestweaver_client::DaemonClient::connect(&db_path, None).await {
-                        Ok(mut client) => {
-                            match client
-                                .inner_mut()
-                                .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
-                                .await
-                            {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    eprintln!("PrepareBackup RPC failed: {e}");
-                                    false
-                                }
+                let prepare_ok = match existing_daemon {
+                    Ok(mut client) => rt.block_on(async {
+                        match client
+                            .inner_mut()
+                            .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(e) => {
+                                eprintln!("PrepareBackup RPC failed: {e}");
+                                false
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to connect to daemon: {e}");
-                            false
-                        }
+                    }),
+                    Err(e) => {
+                        eprintln!("Failed to connect to daemon: {e}");
+                        false
                     }
-                });
+                };
 
                 if !prepare_ok && !force {
                     eprintln!("Cannot quiesce database. Stop the daemon first, or use --force.");

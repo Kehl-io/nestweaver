@@ -477,6 +477,10 @@ mod tests {
         // Verify: some symbols were indexed.
         let count = store.count_symbols().unwrap();
         assert!(count > 0, "should have indexed symbols from the repo");
+        assert!(
+            store.graph_generation() > 0,
+            "server-mode reader indexing should invalidate generation-keyed caches"
+        );
     }
 
     #[test]

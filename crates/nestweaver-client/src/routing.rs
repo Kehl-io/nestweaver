@@ -34,7 +34,9 @@ pub enum ToolRouting {
 pub fn tool_routing(tool_name: &str) -> ToolRouting {
     match tool_name {
         // Search tools — merge
-        "brain_search" | "brain_context" | "project_context" => ToolRouting::Merge,
+        "brain_search" | "brain_context" | "project_context" | "search_symbols" => {
+            ToolRouting::Merge
+        }
 
         // Navigation tools — local-first
         "read_symbols" | "investigate" | "investigate_hydrate" => ToolRouting::LocalFirst,
@@ -100,6 +102,7 @@ mod tests {
         assert_eq!(tool_routing("brain_search"), ToolRouting::Merge);
         assert_eq!(tool_routing("brain_context"), ToolRouting::Merge);
         assert_eq!(tool_routing("project_context"), ToolRouting::Merge);
+        assert_eq!(tool_routing("search_symbols"), ToolRouting::Merge);
     }
 
     #[test]

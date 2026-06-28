@@ -663,6 +663,56 @@ impl HybridClient {
     }
 }
 
+/// Query a configured upstream directly when the local daemon is unavailable.
+///
+/// This keeps server-backed read commands useful on machines where the local
+/// daemon cannot be started, while still refusing local-only tools whose
+/// semantics require the local graph.
+pub async fn query_configured_upstreams_only(
+    config_path: Option<&Path>,
+    start_dir: &Path,
+    tool_name: &str,
+    params: &Value,
+) -> Result<Value> {
+    if tool_routing(tool_name) == ToolRouting::LocalOnly {
+        anyhow::bail!("{tool_name} requires the local daemon");
+    }
+
+    let upstreams = discover_upstreams_with_config(start_dir, config_path)
+        .into_iter()
+        .filter_map(|cfg| match UpstreamHandle::from_config(&cfg) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(
+                    url = %cfg.url,
+                    error = %e,
+                    "failed to create upstream handle"
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let repo_hint = extract_repo_hint(params);
+    let upstream =
+        find_upstream_for_repo(&upstreams, repo_hint).context("no healthy upstream servers")?;
+    let mut client = upstream.client();
+    let token = upstream.auth_token().map(|t| t.to_string());
+    let mut result = tokio::time::timeout(
+        upstream.timeout,
+        dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "upstream query timed out after {}ms",
+            upstream.timeout.as_millis()
+        )
+    })??;
+    inject_or_wrap_provenance(&mut result, &["server"], &[]);
+    Ok(result)
+}
+
 // ── Dispatch helper ───────────────────────────────────────────────────
 
 /// Dispatch a tool call to the gRPC daemon via `JsonRequest`/`JsonResponse`.
@@ -1310,6 +1360,32 @@ fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String
                 "scope": scope,
             }),
         );
+    }
+}
+
+/// Add provenance to a response, wrapping bare result arrays when needed.
+///
+/// Most structured RPC responses are JSON objects and can receive `_meta`
+/// directly. A few legacy JSON RPCs, notably `search_symbols`, still return a
+/// bare array. In the upstream-only fallback path callers still need to know
+/// that the data came from the server, so preserve the array under `results`.
+fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String]) {
+    if result.is_array() {
+        let items = result.take();
+        *result = serde_json::json!({
+            "results": items,
+            "_meta": {
+                "sources": sources,
+                "stale_repos": stale_repos,
+                "scope": if sources.len() > 1 {
+                    "hybrid"
+                } else {
+                    sources.first().copied().unwrap_or("local")
+                },
+            },
+        });
+    } else {
+        inject_provenance(result, sources, stale_repos);
     }
 }
 
@@ -2068,6 +2144,16 @@ mod tests {
         let results = vec![json!({"name": "a"})];
         let wrapped = wrap_merged_response(results, &["local"]);
         assert_eq!(wrapped["_meta"]["scope"], "local");
+    }
+
+    #[test]
+    fn inject_or_wrap_provenance_wraps_bare_array() {
+        let mut val = json!([{"name": "server_only"}]);
+        inject_or_wrap_provenance(&mut val, &["server"], &[]);
+
+        assert_eq!(val["results"][0]["name"], "server_only");
+        assert_eq!(val["_meta"]["sources"][0], "server");
+        assert_eq!(val["_meta"]["scope"], "server");
     }
 
     #[test]
