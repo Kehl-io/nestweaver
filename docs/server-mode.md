@@ -512,8 +512,8 @@ services:
       GH_TOKEN: "${GH_TOKEN}"
     command: >
       daemon --db /data/brain.lbug
-      --config /etc/nestweaver/instance.toml
       run --server --bind 0.0.0.0:9378
+      --config /etc/nestweaver/instance.toml
 
 volumes:
   nestweaver-data:
