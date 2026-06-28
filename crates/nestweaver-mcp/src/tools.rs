@@ -627,16 +627,18 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 /// Attempt to read symbol source spans from bare git clones in server mode.
 ///
 /// Derives the bare clone workspace root from the current DB path
-/// (convention: `<db_parent>/workspace/`). For each target, resolves the
-/// symbol's repo, finds the matching `<repo_name>.git` bare clone, and
-/// reads the source span via `GitBareReader`. Returns `None` if the
-/// workspace directory doesn't exist or if no repo can be resolved.
+/// (convention: `<db_parent>/workspace/`). Groups targets by repo so that
+/// symbols from different repos each get their own `GitBareReader`.
+/// Returns `None` if the workspace directory doesn't exist or if no repo
+/// can be resolved for any target.
 fn try_read_symbols_from_bare(
     store: &GraphStore,
     targets: &[String],
     neighbors: u8,
     token_budget: Option<usize>,
 ) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
+    use std::collections::HashMap;
+
     // Derive workspace root from the thread-local db_path.
     let db_path = current_db_path(store).ok()?;
     let workspace_root = db_path.parent()?.join("workspace");
@@ -644,11 +646,77 @@ fn try_read_symbols_from_bare(
         return None;
     }
 
-    // Resolve the first target to discover which repo we need.
-    // (All targets in a single call typically belong to the same repo.)
-    let first_spec = targets.first()?;
-    let repo_uid = resolve_repo_for_spec(store, first_spec)?;
-    let repo = store.lookup_repo(&repo_uid).ok().flatten()?;
+    // Group targets by repo_uid, preserving input order within each group.
+    // Targets that cannot be resolved go into a special "unresolved" bucket
+    // so they appear in the final not_found list.
+    let mut repo_groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut repo_index: HashMap<String, usize> = HashMap::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for spec in targets {
+        if let Some(repo_uid) = resolve_repo_for_spec(store, spec) {
+            if let Some(&idx) = repo_index.get(&repo_uid) {
+                repo_groups[idx].1.push(spec.clone());
+            } else {
+                let idx = repo_groups.len();
+                repo_index.insert(repo_uid.clone(), idx);
+                repo_groups.push((repo_uid, vec![spec.clone()]));
+            }
+        } else {
+            unresolved.push(spec.clone());
+        }
+    }
+
+    if repo_groups.is_empty() {
+        return None;
+    }
+
+    // Read symbols per repo group and merge results.
+    let mut merged = nestweaver_engine::read_symbols::ReadSymbolsResult::default();
+    merged.not_found.extend(unresolved);
+    let mut remaining_budget = token_budget;
+
+    for (repo_uid, group_targets) in &repo_groups {
+        let reader = match bare_reader_for_repo(store, &workspace_root, repo_uid) {
+            Some(r) => r,
+            None => {
+                // Cannot open this repo's bare clone — mark all targets as not_found.
+                merged.not_found.extend(group_targets.iter().cloned());
+                continue;
+            }
+        };
+
+        let partial = nestweaver_engine::read_symbols::read_symbols(
+            store,
+            group_targets,
+            &reader,
+            neighbors,
+            remaining_budget,
+        );
+
+        // Subtract consumed budget.
+        if let Some(budget) = remaining_budget {
+            let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
+            remaining_budget = Some(budget.saturating_sub(used));
+        }
+
+        merged.symbols.extend(partial.symbols);
+        merged.not_found.extend(partial.not_found);
+        merged.ambiguous.extend(partial.ambiguous);
+        merged.dropped.extend(partial.dropped);
+        merged.truncated = merged.truncated || partial.truncated;
+    }
+
+    Some(merged)
+}
+
+/// Build a `GitBareReader` for the given repo_uid.
+fn bare_reader_for_repo(
+    store: &GraphStore,
+    workspace_root: &std::path::Path,
+    repo_uid: &str,
+) -> Option<nestweaver_engine::content_reader::GitBareReader> {
+    let repo = store.lookup_repo(repo_uid).ok().flatten()?;
     let repo_name = repo
         .name
         .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
@@ -656,15 +724,7 @@ fn try_read_symbols_from_bare(
     if !bare_path.is_dir() {
         return None;
     }
-
-    let reader = nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()?;
-    Some(nestweaver_engine::read_symbols::read_symbols(
-        store,
-        targets,
-        &reader,
-        neighbors,
-        token_budget,
-    ))
+    nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()
 }
 
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
@@ -721,7 +781,7 @@ fn tool_schema_read_symbols() -> Value {
 /// without shelling out to rg/grep.
 fn tool_regex_search(
     store: &GraphStore,
-    tantivy: Option<&TantivyIndex>,
+    _tantivy: Option<&TantivyIndex>,
     args: Value,
 ) -> Result<Value, anyhow::Error> {
     let pattern = args
@@ -730,67 +790,8 @@ fn tool_regex_search(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
 
-    // In server mode there are no source files to grep — use brain_search
-    // as the primary fallback (it searches Tantivy + graph store and is known
-    // to return results). Direct Tantivy search is tried first; if it returns
-    // empty, we fall through to brain_search.
-    if is_server_mode() {
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(20);
-
-        // Try Tantivy FTS first.
-        let tantivy_results: Vec<Value> = if let Some(idx) = tantivy {
-            idx.search(pattern, limit)
-                .unwrap_or_default()
-                .iter()
-                .map(|hit| {
-                    json!({
-                        "uid": hit.uid,
-                        "kind": hit.kind,
-                        "title": hit.title,
-                        "score": hit.score,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        if !tantivy_results.is_empty() {
-            let total = tantivy_results.len();
-            return Ok(json!({
-                "results": tantivy_results,
-                "total_matches": total,
-                "truncated": false,
-                "server_note": format!(
-                    "Running in server mode — no source files to scan. \
-                     regex_search redirected to Tantivy FTS with pattern '{}'. \
-                     Results are BM25-ranked text matches, not regex matches. \
-                     For precise regex matching, use a local client with filesystem access.",
-                    pattern
-                ),
-            }));
-        }
-
-        // Tantivy returned empty — fall back to brain_search which queries
-        // the graph store as well and handles tokenization differently.
-        let search_args = json!({
-            "query": pattern,
-            "limit": limit,
-        });
-        return tool_brain_search(store, tantivy, search_args).map(|mut result| {
-            result["server_note"] = json!(format!(
-                "Running in server mode — no source files to scan. \
-                 regex_search fell back to brain_search with pattern '{}'. \
-                 For precise regex matching, use a local client with filesystem access.",
-                pattern
-            ));
-            result
-        });
-    }
+    // Note: regex_search works in server mode — GraphStore::regex_search
+    // searches over indexed symbol text, not raw source files on disk.
 
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
