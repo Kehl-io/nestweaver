@@ -186,7 +186,12 @@ impl HybridClient {
     /// TwoTier, FanOut, LocalOnly, Combined, Continuation). When no
     /// upstreams are configured, all queries go to the local daemon.
     pub async fn query(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        if !self.has_upstreams() {
+        // Short-circuit only when no upstreams are *configured*. Previously
+        // this checked `has_upstreams()` (which requires at least one to be
+        // healthy), causing queries to silently go local-only when all
+        // upstreams were temporarily unhealthy. Individual routing functions
+        // already handle the "no healthy upstream" case with graceful fallback.
+        if self.upstreams.is_empty() {
             let mut result = self.query_local(tool_name, params).await?;
             inject_provenance(&mut result, &["local"], &[]);
             return Ok(result);
@@ -328,13 +333,14 @@ impl HybridClient {
         // 1. Always query local first.
         let mut local_result = self.query_local(tool_name, params).await?;
 
-        // 2. If no healthy upstreams, return local as-is with provenance.
-        if !self.has_upstreams() {
+        // 2. If no upstreams are configured, return local as-is.
+        if self.upstreams.is_empty() {
             inject_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
 
-        // 3. Check if local results are sufficient.
+        // 3. Check if local results are sufficient. When local returns 0
+        // results, always query the server regardless of threshold.
         let local_count = count_results(&local_result);
         if local_count >= FALLBACK_THRESHOLD {
             debug!(
@@ -378,7 +384,7 @@ impl HybridClient {
     /// Merge routing: query both local and server in parallel, merge via
     /// weighted RRF + scope-hash dedup.
     pub async fn query_merge(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        if !self.has_upstreams() {
+        if self.upstreams.is_empty() {
             let mut result = self.query_local(tool_name, params).await?;
             inject_provenance(&mut result, &["local"], &[]);
             return Ok(result);
