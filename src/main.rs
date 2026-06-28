@@ -12617,6 +12617,8 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                     let db_str = db.display().to_string();
                     match std::process::Command::new(&exe)
                         .args(["daemon", "run", "--db", &db_str])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
                         .spawn()
                     {
                         Ok(mut child) => {
