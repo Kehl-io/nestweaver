@@ -730,20 +730,21 @@ fn tool_regex_search(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
 
-    // In server mode there are no source files to grep — redirect to
-    // Tantivy FTS which searches the indexed text (note bodies, symbol
-    // signatures, section content).
+    // In server mode there are no source files to grep — use brain_search
+    // as the primary fallback (it searches Tantivy + graph store and is known
+    // to return results). Direct Tantivy search is tried first; if it returns
+    // empty, we fall through to brain_search.
     if is_server_mode() {
-        if let Some(idx) = tantivy {
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(20);
-            let hits = idx
-                .search(pattern, limit)
-                .map_err(|e| anyhow!("tantivy search (regex_search redirect): {e}"))?;
-            let results: Vec<Value> = hits
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(20);
+
+        // Try Tantivy FTS first.
+        let tantivy_results: Vec<Value> = if let Some(idx) = tantivy {
+            idx.search(pattern, limit)
+                .unwrap_or_default()
                 .iter()
                 .map(|hit| {
                     json!({
@@ -753,10 +754,15 @@ fn tool_regex_search(
                         "score": hit.score,
                     })
                 })
-                .collect();
-            let total = results.len();
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if !tantivy_results.is_empty() {
+            let total = tantivy_results.len();
             return Ok(json!({
-                "results": results,
+                "results": tantivy_results,
                 "total_matches": total,
                 "truncated": false,
                 "server_note": format!(
@@ -768,8 +774,22 @@ fn tool_regex_search(
                 ),
             }));
         }
-        // No Tantivy available — fall through to the graph-based regex_search
-        // which searches indexed text in the graph store.
+
+        // Tantivy returned empty — fall back to brain_search which queries
+        // the graph store as well and handles tokenization differently.
+        let search_args = json!({
+            "query": pattern,
+            "limit": limit,
+        });
+        return tool_brain_search(store, tantivy, search_args).map(|mut result| {
+            result["server_note"] = json!(format!(
+                "Running in server mode — no source files to scan. \
+                 regex_search fell back to brain_search with pattern '{}'. \
+                 For precise regex matching, use a local client with filesystem access.",
+                pattern
+            ));
+            result
+        });
     }
 
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
