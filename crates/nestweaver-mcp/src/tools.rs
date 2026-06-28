@@ -2968,7 +2968,7 @@ fn tool_brain_status(
         "wikilinks": wikilinks,
         "repos": repos_json,
         "repo_count": repos.len(),
-        "server_mode": false,
+        "server_mode": is_server_mode(),
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,
         "watcher_pid": watcher_pid,
@@ -6101,6 +6101,36 @@ fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Er
             .clone()
             .ok_or_else(|| anyhow!("database path not set on server"))
     })
+}
+
+#[cfg(test)]
+mod server_mode_tests {
+    use super::*;
+
+    // brain_status must report the ACTUAL server mode (the thread-local set by
+    // the transport handler), not a hardcoded value. Regression guard for the
+    // MCP-over-HTTP path reporting server_mode: false even when running
+    // --server, which also masked the read_symbols empty-body bug.
+    #[test]
+    fn brain_status_reflects_server_mode_flag() {
+        let store = GraphStore::in_memory().unwrap();
+
+        set_server_mode(true);
+        let status = tool_brain_status(&store, None).unwrap();
+        assert_eq!(
+            status["server_mode"],
+            serde_json::json!(true),
+            "brain_status should report server_mode=true when the flag is set"
+        );
+
+        set_server_mode(false);
+        let status = tool_brain_status(&store, None).unwrap();
+        assert_eq!(
+            status["server_mode"],
+            serde_json::json!(false),
+            "brain_status should report server_mode=false when the flag is unset"
+        );
+    }
 }
 
 #[cfg(test)]

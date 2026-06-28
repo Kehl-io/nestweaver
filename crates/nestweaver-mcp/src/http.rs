@@ -48,6 +48,11 @@ pub struct McpHttpState {
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
     pub sessions: Arc<DashMap<String, McpSession>>,
+    /// Whether the daemon is running in server mode. Threaded into the tool
+    /// dispatch thread-local so server-only code paths (e.g. `read_symbols`
+    /// reading content via `git show` from blobless bare clones, `brain_status`
+    /// reporting) behave correctly over HTTP, matching the gRPC handler.
+    pub server_mode: bool,
     /// Optional bearer token for MCP-over-HTTP authentication. When set,
     /// requests must include `Authorization: Bearer <token>` or receive 401.
     pub auth_token: Option<String>,
@@ -61,6 +66,7 @@ impl McpHttpState {
         tantivy: Option<Arc<TantivyIndex>>,
         db_path: PathBuf,
         instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+        server_mode: bool,
     ) -> Self {
         Self {
             lite,
@@ -69,6 +75,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            server_mode,
             auth_token: None,
         }
     }
@@ -80,6 +87,7 @@ impl McpHttpState {
         tantivy: Option<Arc<TantivyIndex>>,
         db_path: PathBuf,
         instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+        server_mode: bool,
         auth_token: String,
     ) -> Self {
         Self {
@@ -89,6 +97,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            server_mode,
             auth_token: Some(auth_token),
         }
     }
@@ -255,6 +264,7 @@ async fn handle_mcp(
             let db_path = state.db_path.clone();
             let instance_cfg = state.instance_cfg.clone();
             let lite = state.lite;
+            let server_mode = state.server_mode;
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
@@ -262,6 +272,11 @@ async fn handle_mcp(
                 tools::set_current_db_path(db_path);
                 tools::set_lite_mode(lite);
                 tools::set_current_instance_config(instance_cfg);
+                // Match the gRPC handler: server-only code paths (read_symbols
+                // via git, brain_status) key off this thread-local. Without it,
+                // HTTP requests in server mode read from an empty filesystem and
+                // return empty bodies.
+                tools::set_server_mode(server_mode);
 
                 tools::dispatch(&store, tantivy.as_deref(), &name, arguments, None)
             })
@@ -320,6 +335,7 @@ mod tests {
             None,
             PathBuf::from("/tmp/test.lbug"),
             None,
+            false,
         ));
         router(state)
     }

@@ -3143,6 +3143,7 @@ pub async fn run_server(
                 state.tantivy.clone(),
                 state.db_path.clone(),
                 state.instance_cfg.clone(),
+                state.server_mode,
                 token.clone(),
             )
         } else {
@@ -3152,6 +3153,7 @@ pub async fn run_server(
                 state.tantivy.clone(),
                 state.db_path.clone(),
                 state.instance_cfg.clone(),
+                state.server_mode,
             )
         });
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
