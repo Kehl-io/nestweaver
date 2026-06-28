@@ -1504,6 +1504,11 @@ enum ServerAction {
         #[arg(long)]
         client: bool,
     },
+    /// Backup and restore the NestWeaver database (alias for `nestweaver backup`)
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7896,6 +7901,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 println!("SANs: {}", effective_sans.join(", "));
 
                 Ok((EXIT_SUCCESS, None))
+            }
+            ServerAction::Backup { command } => {
+                run_backup(command).map(|c| (c, None))
             }
         },
 
