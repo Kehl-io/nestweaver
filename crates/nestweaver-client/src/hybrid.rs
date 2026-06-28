@@ -10,7 +10,7 @@
 //! - **Primary**: always query server; local only for uncommitted file overlay.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -53,6 +53,11 @@ const FALLBACK_THRESHOLD: usize = 5;
 /// Default timeout for upstream queries.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a cached staleness check stays fresh before the next query
+/// triggers a background-style refresh. Keeps `_meta.stale_repos` populated
+/// without paying a `RepoStates` round-trip on every query.
+const STALE_TTL: Duration = Duration::from_secs(30);
+
 /// Hybrid client that routes queries to a local daemon and optional upstream
 /// servers.
 ///
@@ -62,6 +67,11 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct HybridClient {
     local: DaemonClient,
     upstreams: Vec<UpstreamHandle>,
+    /// Cached list of repo URLs where the local index is behind an upstream.
+    /// Refreshed lazily (see [`STALE_TTL`]) to keep per-query latency low while
+    /// still populating `_meta.stale_repos` on responses.
+    stale_cache: Vec<String>,
+    stale_checked_at: Option<Instant>,
 }
 
 impl HybridClient {
@@ -100,7 +110,12 @@ impl HybridClient {
             }
         }
 
-        Ok(Self { local, upstreams })
+        Ok(Self {
+            local,
+            upstreams,
+            stale_cache: Vec::new(),
+            stale_checked_at: None,
+        })
     }
 
     /// Create from an existing `DaemonClient` with no upstreams.
@@ -108,13 +123,20 @@ impl HybridClient {
         Self {
             local: client,
             upstreams: vec![],
+            stale_cache: Vec::new(),
+            stale_checked_at: None,
         }
     }
 
     /// Create from an existing `DaemonClient` with explicit upstreams.
     /// Useful for tests.
     pub fn from_parts(local: DaemonClient, upstreams: Vec<UpstreamHandle>) -> Self {
-        Self { local, upstreams }
+        Self {
+            local,
+            upstreams,
+            stale_cache: Vec::new(),
+            stale_checked_at: None,
+        }
     }
 
     /// Access the underlying `DaemonClient`.
@@ -189,6 +211,26 @@ impl HybridClient {
             }
         }
 
+        let mut result = self.route_query(routing, tool_name, params).await?;
+
+        // Populate `_meta.stale_repos` provenance (TTL-cached) so callers know
+        // which repos the local index is behind on. Without this the field was
+        // always empty even when the local graph was stale.
+        let stale = self.current_stale_repos().await;
+        if !stale.is_empty() {
+            set_stale_repos(&mut result, &stale);
+        }
+        Ok(result)
+    }
+
+    /// Dispatch to the concrete routing strategy. Split out of [`query`] so the
+    /// latter can apply cross-cutting provenance (staleness) to every path.
+    async fn route_query(
+        &mut self,
+        routing: ToolRouting,
+        tool_name: &str,
+        params: &Value,
+    ) -> Result<Value> {
         match routing {
             ToolRouting::LocalOnly => {
                 let mut result = self.query_local(tool_name, params).await?;
@@ -313,7 +355,10 @@ impl HybridClient {
         );
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(server_result) => {
-                let merged = merge_json_results(&local_result, &server_result);
+                // Use the structured merge so brain_context / project_context
+                // responses keep their `connected` schema; it falls back to the
+                // flat envelope for non-structured tools internally.
+                let merged = merge_structured_results(&local_result, &server_result);
                 Ok(merged)
             }
             Err(e) => {
@@ -376,6 +421,21 @@ impl HybridClient {
                 Ok(result)
             }
         }
+    }
+
+    /// Return the current set of stale repos, refreshing the cache when it has
+    /// expired (see [`STALE_TTL`]). Used to populate `_meta.stale_repos` on
+    /// query responses without a `RepoStates` round-trip on every call.
+    async fn current_stale_repos(&mut self) -> Vec<String> {
+        let fresh = self
+            .stale_checked_at
+            .map(|t| t.elapsed() < STALE_TTL)
+            .unwrap_or(false);
+        if !fresh {
+            self.stale_cache = self.check_staleness().await;
+            self.stale_checked_at = Some(Instant::now());
+        }
+        self.stale_cache.clone()
     }
 
     /// Compare local repo SHAs against each upstream's `RepoStates`.
@@ -1057,11 +1117,32 @@ fn count_results(value: &Value) -> usize {
         results.len()
     } else if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
         items.len()
+    } else if let Some(connected) = value.get("connected").and_then(|v| v.as_array()) {
+        // Structured responses (brain_context / project_context) carry their
+        // payload in `connected` — count those so the fallback threshold is
+        // meaningful instead of always treating the whole object as 1 result.
+        connected.len()
     } else if value.is_object() {
         // A single object counts as 1 result.
         1
     } else {
         0
+    }
+}
+
+/// Set (or replace) the `_meta.stale_repos` provenance on a response, creating
+/// the `_meta` object if absent. No-op for non-object responses.
+fn set_stale_repos(result: &mut Value, stale: &[String]) {
+    if let Some(obj) = result.as_object_mut() {
+        let meta = obj
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert(
+                "stale_repos".to_string(),
+                serde_json::to_value(stale).unwrap_or(Value::Null),
+            );
+        }
     }
 }
 
@@ -1798,6 +1879,65 @@ mod tests {
     fn count_results_single_object() {
         let v = json!({"name": "foo"});
         assert_eq!(count_results(&v), 1);
+    }
+
+    #[test]
+    fn count_results_structured_connected() {
+        // brain_context / project_context return a structured object whose real
+        // payload is the `connected` array. Fallback must count that, not treat
+        // the whole response as a single result (which would always trip the
+        // server query and then mangle the merge).
+        let v = json!({
+            "seeds": ["x"],
+            "connected": [{"name": "a"}, {"name": "b"}, {"name": "c"}],
+        });
+        assert_eq!(count_results(&v), 3);
+    }
+
+    #[test]
+    fn merge_structured_results_preserves_connected_schema() {
+        // Merging two structured responses must keep the structured schema
+        // (top-level `connected`), not wrap both whole responses into a flat
+        // `results` envelope. Regression guard for the fallback merge bug.
+        let local = json!({
+            "seeds": ["s"],
+            "connected": [{"uid": "sym:1", "name": "a", "location": "a.rs"}],
+        });
+        let server = json!({
+            "seeds": ["s"],
+            "connected": [{"uid": "sym:2", "name": "b", "location": "b.rs"}],
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert!(
+            merged.get("connected").and_then(|v| v.as_array()).is_some(),
+            "merged response must retain the `connected` array; got: {merged}"
+        );
+        assert!(
+            merged.get("results").is_none(),
+            "structured merge must not flatten into a `results` envelope"
+        );
+        let connected = merged["connected"].as_array().unwrap();
+        assert_eq!(
+            connected.len(),
+            2,
+            "both repos' connected items should merge"
+        );
+        assert_eq!(merged["_meta"]["sources"][0], "local");
+        assert_eq!(merged["_meta"]["sources"][1], "server");
+    }
+
+    #[test]
+    fn set_stale_repos_populates_meta() {
+        let mut v = json!({"results": [], "_meta": {"sources": ["local", "server"]}});
+        set_stale_repos(&mut v, &["github.com/acme/api".to_string()]);
+        assert_eq!(v["_meta"]["stale_repos"][0], "github.com/acme/api");
+    }
+
+    #[test]
+    fn set_stale_repos_creates_meta_when_missing() {
+        let mut v = json!({"results": []});
+        set_stale_repos(&mut v, &["r".to_string()]);
+        assert_eq!(v["_meta"]["stale_repos"][0], "r");
     }
 
     #[test]
