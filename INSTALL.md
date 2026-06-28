@@ -18,6 +18,11 @@ nestweaver --version
 # Expected: nestweaver X.Y.Z
 ```
 
+> **Building from source?** If you previously installed via `cargo install` and
+> are now building from a local checkout, run `cargo install --path .` after
+> each build to update `~/.cargo/bin/nestweaver`. Otherwise the installed binary
+> will be stale and may lack newer subcommands (e.g. `server`, `connect`).
+
 ## Option 3: Pre-built binary
 
 Download the latest release for your platform from
