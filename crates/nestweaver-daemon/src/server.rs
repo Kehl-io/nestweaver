@@ -3298,8 +3298,24 @@ pub async fn run_server(
 
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);
+            // Mount top-level /admin redirect → /admin/api/status so that
+            // hitting /admin in a browser doesn't 404.
+            mcp_router = mcp_router.route(
+                "/admin",
+                axum::routing::get(|| async {
+                    axum::response::Redirect::permanent("/admin/api/status")
+                }),
+            );
             tracing::info!("admin API enabled at /admin/api/*");
         }
+
+        // Mount /metrics at the top level of the MCP HTTP router so
+        // Prometheus scrapers can use the standard path without knowing
+        // the /admin/api prefix. Works even without an admin token.
+        mcp_router = mcp_router.route(
+            "/metrics",
+            axum::routing::get(nestweaver_web::routes::metrics::metrics_handler),
+        );
 
         // Parse the bind address to determine the MCP port.  When the gRPC
         // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
