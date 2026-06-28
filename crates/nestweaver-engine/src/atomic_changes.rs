@@ -585,6 +585,12 @@ pub fn analyze_impact(
             .unwrap_or_else(|| repo_uid.to_string())
     };
 
+    // Depth-bounded traversal: collect direct references (depth 1) then
+    // transitively follow callers up to max_depth.  Direct references get
+    // the natural severity; each additional hop downgrades to Warning/Info
+    // because the call site is indirectly affected.
+    let effective_depth = max_depth.max(1);
+
     for change in changes {
         match change {
             AtomicChange::SignatureChanged {
@@ -595,31 +601,24 @@ pub fn analyze_impact(
                 file_path: _,
             } => {
                 if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
-                    let refs = store.references_to(&symbol.uid)?;
-                    for ref_sym in refs {
-                        if !include_tests && is_test_file(&ref_sym.file_path) {
-                            continue;
-                        }
-                        let severity = classify_signature_change(
-                            old_signature,
-                            new_signature,
-                            &ref_sym.file_path,
-                        );
-                        let repo_url = resolve_repo_url(&ref_sym.repo_uid);
-                        let reason = format_impact_reason(change, &severity);
-                        impacts.push(ImpactResult {
-                            change_canonical_id: canonical_id.clone(),
-                            change_kind: "SIGNATURE_CHANGED".to_string(),
-                            affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
-                            affected_name: ref_sym.name.clone(),
-                            affected_repo_url: repo_url,
-                            affected_file: ref_sym.file_path.clone(),
-                            affected_line: ref_sym.start_line,
-                            affected_signature: ref_sym.signature.clone(),
-                            severity,
-                            reason,
-                        });
-                    }
+                    let direct_severity = classify_signature_change(
+                        old_signature,
+                        new_signature,
+                        &symbol.file_path,
+                    );
+                    let direct_reason = format_impact_reason(change, &direct_severity);
+                    collect_transitive_references(
+                        store,
+                        &symbol.uid,
+                        canonical_id,
+                        "SIGNATURE_CHANGED",
+                        direct_severity,
+                        &direct_reason,
+                        effective_depth,
+                        include_tests,
+                        &resolve_repo_url,
+                        &mut impacts,
+                    );
                 }
             }
             AtomicChange::SymbolRemoved {
@@ -634,25 +633,19 @@ pub fn analyze_impact(
                     "SYMBOL_REMOVED"
                 };
                 if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
-                    let refs = store.references_to(&symbol.uid)?;
-                    for ref_sym in refs {
-                        if !include_tests && is_test_file(&ref_sym.file_path) {
-                            continue;
-                        }
-                        let repo_url = resolve_repo_url(&ref_sym.repo_uid);
-                        impacts.push(ImpactResult {
-                            change_canonical_id: canonical_id.clone(),
-                            change_kind: change_kind.to_string(),
-                            affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
-                            affected_name: ref_sym.name.clone(),
-                            affected_repo_url: repo_url,
-                            affected_file: ref_sym.file_path.clone(),
-                            affected_line: ref_sym.start_line,
-                            affected_signature: ref_sym.signature.clone(),
-                            severity: ImpactSeverity::Breaking,
-                            reason: format!("'{}' was removed — reference will break", name),
-                        });
-                    }
+                    let reason = format!("'{}' was removed — reference will break", name);
+                    collect_transitive_references(
+                        store,
+                        &symbol.uid,
+                        canonical_id,
+                        change_kind,
+                        ImpactSeverity::Breaking,
+                        &reason,
+                        effective_depth,
+                        include_tests,
+                        &resolve_repo_url,
+                        &mut impacts,
+                    );
                 }
             }
             AtomicChange::SymbolRenamed {
@@ -730,6 +723,94 @@ pub fn analyze_impact(
     }
 
     Ok(impacts)
+}
+
+/// Collect direct references to `root_uid` and then transitively follow
+/// callers up to `max_depth`. Direct references (depth 1) inherit the
+/// provided `direct_severity`; deeper hops are downgraded to at most
+/// Warning (depth 2) or Info (depth 3+).
+fn collect_transitive_references(
+    store: &nestweaver_store::GraphStore,
+    root_uid: &str,
+    change_canonical_id: &str,
+    change_kind: &str,
+    direct_severity: ImpactSeverity,
+    direct_reason: &str,
+    max_depth: u32,
+    include_tests: bool,
+    resolve_repo_url: &dyn Fn(&str) -> String,
+    impacts: &mut Vec<ImpactResult>,
+) {
+    let mut visited = HashSet::new();
+    visited.insert(root_uid.to_string());
+
+    // BFS frontier: (uid, depth)
+    let mut frontier: Vec<(String, u32)> = vec![(root_uid.to_string(), 0)];
+
+    while let Some((uid, depth)) = frontier.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        let refs = match store.references_to(&uid) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        for ref_sym in refs {
+            if visited.contains(&ref_sym.uid) {
+                continue;
+            }
+            visited.insert(ref_sym.uid.clone());
+
+            if !include_tests && is_test_file(&ref_sym.file_path) {
+                continue;
+            }
+
+            let hop = depth + 1;
+            let severity = if hop == 1 {
+                direct_severity
+            } else if hop == 2 {
+                // Indirect caller — at most Warning.
+                match direct_severity {
+                    ImpactSeverity::Breaking => ImpactSeverity::Warning,
+                    other => other,
+                }
+            } else {
+                ImpactSeverity::Info
+            };
+
+            let reason = if hop == 1 {
+                direct_reason.to_string()
+            } else {
+                format!(
+                    "{} (indirect caller, {} hop{} away)",
+                    direct_reason,
+                    hop,
+                    if hop > 1 { "s" } else { "" }
+                )
+            };
+
+            let repo_url = resolve_repo_url(&ref_sym.repo_uid);
+            impacts.push(ImpactResult {
+                change_canonical_id: change_canonical_id.to_string(),
+                change_kind: change_kind.to_string(),
+                affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
+                affected_name: ref_sym.name.clone(),
+                affected_repo_url: repo_url,
+                affected_file: ref_sym.file_path.clone(),
+                affected_line: ref_sym.start_line,
+                affected_signature: ref_sym.signature.clone(),
+                severity,
+                reason,
+            });
+
+            // Enqueue for deeper traversal
+            if hop < max_depth {
+                frontier.push((ref_sym.uid.clone(), hop));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
