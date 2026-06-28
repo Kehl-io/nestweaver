@@ -109,7 +109,8 @@ impl PollScheduler {
     /// - Adaptive: `clamp(time_since_last_commit / 2, floor, max_poll)`.
     ///   The floor is `min_poll` (45s) normally, or 5 minutes when webhooks
     ///   are healthy.
-    pub fn next_interval(&self, repo: &RepoSchedule) -> Duration {
+    #[allow(dead_code, private_interfaces)]
+    pub(crate) fn next_interval(&self, repo: &RepoSchedule) -> Duration {
         compute_interval(repo, self.min_poll, self.max_poll, self.webhook_healthy)
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1838,7 +1838,7 @@ fn process_added_or_modified_file_txn(
     rel_path: &std::path::Path,
     r_uid: &str,
     repo_url: &str,
-    store: &nestweaver_store::GraphStore,
+    _store: &nestweaver_store::GraphStore,
     conn: &nestweaver_store::DbConnection<'_>,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};

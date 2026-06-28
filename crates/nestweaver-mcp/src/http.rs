@@ -138,7 +138,12 @@ fn clamp_safeguard_params(arguments: &mut Value) {
             if let Some(val) = obj.get_mut(*key) {
                 if let Some(n) = val.as_u64() {
                     if n > MAX_DEPTH {
-                        tracing::warn!(param = *key, requested = n, capped = MAX_DEPTH, "clamped parameter");
+                        tracing::warn!(
+                            param = *key,
+                            requested = n,
+                            capped = MAX_DEPTH,
+                            "clamped parameter"
+                        );
                         *val = Value::Number(serde_json::Number::from(MAX_DEPTH));
                     }
                 }
@@ -148,7 +153,12 @@ fn clamp_safeguard_params(arguments: &mut Value) {
             if let Some(val) = obj.get_mut(*key) {
                 if let Some(n) = val.as_u64() {
                     if n > MAX_RESULTS {
-                        tracing::warn!(param = *key, requested = n, capped = MAX_RESULTS, "clamped parameter");
+                        tracing::warn!(
+                            param = *key,
+                            requested = n,
+                            capped = MAX_RESULTS,
+                            "clamped parameter"
+                        );
                         *val = Value::Number(serde_json::Number::from(MAX_RESULTS));
                     }
                 }

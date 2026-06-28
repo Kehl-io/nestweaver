@@ -601,11 +601,8 @@ pub fn analyze_impact(
                 file_path: _,
             } => {
                 if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
-                    let direct_severity = classify_signature_change(
-                        old_signature,
-                        new_signature,
-                        &symbol.file_path,
-                    );
+                    let direct_severity =
+                        classify_signature_change(old_signature, new_signature, &symbol.file_path);
                     let direct_reason = format_impact_reason(change, &direct_severity);
                     collect_transitive_references(
                         store,

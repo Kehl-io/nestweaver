@@ -89,15 +89,12 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| {
-            result
-                .get("location")
-                .and_then(|v| v.as_str())
-                .map(|loc| {
-                    // "src/lib.rs:42" -> "src/lib.rs"
-                    loc.rsplit_once(':')
-                        .map(|(path, _line)| path.to_string())
-                        .unwrap_or_else(|| loc.to_string())
-                })
+            result.get("location").and_then(|v| v.as_str()).map(|loc| {
+                // "src/lib.rs:42" -> "src/lib.rs"
+                loc.rsplit_once(':')
+                    .map(|(path, _line)| path.to_string())
+                    .unwrap_or_else(|| loc.to_string())
+            })
         })?;
 
     // Repo URL: try standard fields, then extract from `uid` if it encodes

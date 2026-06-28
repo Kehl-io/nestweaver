@@ -5281,7 +5281,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let mut hybrid = rt
+                let hybrid = rt
                     .block_on(nestweaver_client::hybrid::HybridClient::connect(
                         &db_path,
                         config.as_deref().map(std::path::Path::new),
@@ -12705,7 +12705,7 @@ fn run_mcp_hybrid(
     rt: tokio::runtime::Runtime,
     lite: bool,
     track_interactions: bool,
-    db_path: &Path,
+    _db_path: &Path,
 ) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
@@ -13193,7 +13193,7 @@ fn atomic_change_to_proto(
             old_canonical_id,
             old_name,
             new_name,
-            new_canonical_id,
+            new_canonical_id: _,
             file_path,
         } => AtomicChangeProto {
             kind: ChangeKind::SymbolRenamed.into(),

@@ -3504,7 +3504,7 @@ pub async fn run_server(
                             continue;
                         }
                         let due = scheduler.due_repos();
-                        for (repo_id, repo_url, branch) in due {
+                        for (_repo_id, repo_url, branch) in due {
                             // Determine which branch ref to check. If the repo
                             // config specifies a branch, use that ref; otherwise
                             // fall back to HEAD (symref of the remote's default
@@ -3579,7 +3579,7 @@ fn flow_trace_continue_impl(
     let trace_id = req.trace_id.clone();
 
     // Build the visited set from the request.
-    let mut visited: HashSet<String> = req.visited_canonical_ids.into_iter().collect();
+    let visited: HashSet<String> = req.visited_canonical_ids.into_iter().collect();
 
     // Look up the entry symbol by canonical_id.
     let entry = store
@@ -3602,10 +3602,6 @@ fn flow_trace_continue_impl(
 
     // Get the repo URL for source annotation.
     let repo_url = store.repo_url_for_uid(&entry.repo_uid).unwrap_or_default();
-
-    let mut spans: Vec<TraceSpanProto> = Vec::new();
-    let mut boundaries: Vec<BoundarySymbolProto> = Vec::new();
-    let mut truncated = false;
 
     // Recursive trace builder.
     struct TraceCtx<'a> {
