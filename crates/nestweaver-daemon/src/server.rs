@@ -3132,6 +3132,12 @@ pub async fn run_server(
     let (scheduler_tx, scheduler_rx) =
         tokio::sync::mpsc::channel::<nestweaver_engine::scheduler::SchedulerCommand>(64);
 
+    // Shared job queue Arc — created once and shared across webhook handler,
+    // worker pool, and poll scheduler to avoid concurrent SQLite opens.
+    let mut shared_job_queue_opt: Option<
+        std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>>,
+    > = None;
+
     // MCP-over-HTTP server — spawned alongside the gRPC servers.
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
@@ -3168,11 +3174,20 @@ pub async fn run_server(
             std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
         > = None;
 
+        // Single shared job queue for webhook handler, worker pool, and
+        // poll scheduler.  Opening the same SQLite file from multiple
+        // independent connections caused Bus errors (SIGBUS) on macOS
+        // when WAL checkpointing raced with a concurrent open.
+        let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        let shared_job_queue: std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>> = {
+            let jq = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
+                .expect("open shared job queue");
+            std::sync::Arc::new(std::sync::Mutex::new(jq))
+        };
+        shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
+
         // Mount webhook endpoint when a secret is configured.
         if let Some(ref secret) = opts.webhook_secret {
-            let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-            let job_queue = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
-                .expect("open webhook job queue");
             let allowed_repos: Option<std::collections::HashSet<String>> =
                 state.instance_cfg.as_ref().map(|cfg| {
                     cfg.repos
@@ -3207,7 +3222,7 @@ pub async fn run_server(
                     secret: secret.clone(),
                     secret_old: opts.webhook_secret_old.clone(),
                 },
-                job_queue: std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+                job_queue: std::sync::Arc::clone(&shared_job_queue),
                 allowed_repos: shared_allowed,
                 repo_branches: shared_branches,
             });
@@ -3363,23 +3378,18 @@ pub async fn run_server(
                 state.indexing_repo.clone(),
                 Arc::clone(&state.indexing_queue_depth),
             );
+            let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             tokio::spawn(async move {
-                let jobs_path = nestweaver_engine::sidecar_path(&worker_db, ".jobs.sqlite");
                 let workspace_dir = worker_db
                     .parent()
                     .unwrap_or(Path::new("."))
                     .join("workspace");
-                let job_queue = match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        tracing::error!("failed to open job queue for worker pool: {e}");
-                        return;
-                    }
-                };
                 // Recover any stale running jobs from a previous crash.
-                if let Ok(recovered) = job_queue.recover_stale(1800) {
-                    if recovered > 0 {
-                        tracing::info!(recovered, "recovered stale running jobs");
+                if let Ok(guard) = worker_job_queue.lock() {
+                    if let Ok(recovered) = guard.recover_stale(1800) {
+                        if recovered > 0 {
+                            tracing::info!(recovered, "recovered stale running jobs");
+                        }
                     }
                 }
                 let workspace =
@@ -3392,7 +3402,7 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count);
                 pool.run_with_drain(
-                    std::sync::Arc::new(std::sync::Mutex::new(job_queue)),
+                    worker_job_queue,
                     std::sync::Arc::new(workspace),
                     worker_store,
                     worker_instance,
@@ -3409,8 +3419,8 @@ pub async fn run_server(
     // Spawn adaptive poll scheduler in server mode.
     if server_opts.is_some() {
         let poll_store = Arc::clone(&state.store);
-        let poll_db = db_path.clone();
         let poll_instance = instance_id.clone();
+        let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
@@ -3511,10 +3521,11 @@ pub async fn run_server(
                                 let indexed_sha = poll_store.lookup_repo(&r_uid)
                                     .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
                                 if !remote_sha.is_empty() && remote_sha != indexed_sha {
-                                    let jobs_path = nestweaver_engine::sidecar_path(&poll_db, ".jobs.sqlite");
-                                    if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
-                                        let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&url);
-                                        let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll, branch.as_deref());
+                                    if let Some(ref jq) = poll_job_queue {
+                                        if let Ok(queue) = jq.lock() {
+                                            let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+                                            let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll, branch.as_deref());
+                                        }
                                     }
                                 }
                             }
