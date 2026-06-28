@@ -362,7 +362,12 @@ impl HybridClient {
                 Ok(merged)
             }
             Err(e) => {
-                debug!(error = %e, "fallback: server query failed, using local only");
+                warn!(
+                    tool = tool_name,
+                    local_count,
+                    error = %e,
+                    "fallback: upstream query failed, returning local-only results"
+                );
                 inject_provenance(&mut local_result, &["local"], &[]);
                 Ok(local_result)
             }
