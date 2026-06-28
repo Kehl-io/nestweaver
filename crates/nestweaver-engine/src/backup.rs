@@ -116,15 +116,36 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
         config.workspace_path.as_deref(),
     )?;
 
+    // Gather graph statistics for the manifest while the store is still open.
+    let symbol_count = store.count_symbols().unwrap_or(0);
+    let per_repo = store.count_symbols_by_repo().unwrap_or_default();
+    let repos: Vec<BackupRepoInfo> = store
+        .list_repos(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| BackupRepoInfo {
+            symbols: per_repo.get(&r.uid).copied().unwrap_or(0),
+            url: r.url,
+            indexed_sha: r.indexed_sha,
+        })
+        .collect();
+
     let write_pause = pause_start.elapsed();
     drop(store);
 
     // Phase 2: Package (safe to release the database).
-    let manifest = build_backup_manifest(config, staging.path())?;
+    let mut manifest = build_backup_manifest(config, staging.path(), repos, symbol_count)?;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
     package_tar_zstd(staging.path(), &config.output_path)?;
+
+    // The compressed size is only known after packaging, so it cannot live in
+    // the sealed in-archive manifest. Fill it on the returned manifest here;
+    // backup_inspect recomputes it from the archive on disk.
+    manifest.sizes.total_compressed = std::fs::metadata(&config.output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     Ok(BackupResult {
         manifest,
@@ -144,7 +165,15 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
         let mut entry = entry?;
         let path = entry.path()?;
         if path.to_str() == Some("./manifest.json") || path.to_str() == Some("manifest.json") {
-            let manifest: BackupManifest = serde_json::from_reader(&mut entry)?;
+            let mut manifest: BackupManifest = serde_json::from_reader(&mut entry)?;
+            // The in-archive manifest cannot record its own compressed size
+            // (sealed before compression finishes). Recompute it from the
+            // archive file on disk so inspect/list report a real figure.
+            if manifest.sizes.total_compressed == 0 {
+                manifest.sizes.total_compressed = std::fs::metadata(archive_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            }
             return Ok(manifest);
         }
     }
@@ -272,7 +301,12 @@ fn copy_db_files(
 }
 
 /// Build the backup manifest by inspecting staged files.
-fn build_backup_manifest(config: &BackupConfig, staging: &Path) -> anyhow::Result<BackupManifest> {
+fn build_backup_manifest(
+    config: &BackupConfig,
+    staging: &Path,
+    repos: Vec<BackupRepoInfo>,
+    symbol_count: usize,
+) -> anyhow::Result<BackupManifest> {
     let db_filename = config
         .db_path
         .file_name()
@@ -333,9 +367,9 @@ fn build_backup_manifest(config: &BackupConfig, staging: &Path) -> anyhow::Resul
         schema_version: 1,
         created_at,
         instance_id: config.instance_id.clone(),
-        repos: Vec::new(),
-        repo_count: 0,
-        symbol_count: 0,
+        repo_count: repos.len(),
+        symbol_count,
+        repos,
         sizes: BackupSizes {
             db: db_size,
             tantivy: tantivy_size,
@@ -489,6 +523,80 @@ mod tests {
         let manifest = backup_inspect(&output).unwrap();
         assert_eq!(manifest.instance_id, "test");
         assert_eq!(manifest.version, 1);
+    }
+
+    #[test]
+    fn manifest_reports_real_counts_and_compressed_size() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo-1".to_string(),
+                url: "https://github.com/acme/api".to_string(),
+                indexed_sha: "deadbeef".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+            })
+            .unwrap();
+        for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym-{i}"),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo-1".to_string(),
+                    file_path: format!("src/{name}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: format!("h{i}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let output = dir.path().join("test.nwsnap.zst");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+        };
+
+        let result = backup_save(&config).unwrap();
+        // Headline counts must reflect the real graph, not hardcoded zeros.
+        assert_eq!(result.manifest.repo_count, 1, "repo_count");
+        assert_eq!(result.manifest.symbol_count, 3, "symbol_count");
+        assert_eq!(result.manifest.repos.len(), 1);
+        assert_eq!(result.manifest.repos[0].symbols, 3, "per-repo symbol count");
+        assert!(
+            result.manifest.sizes.total_compressed > 0,
+            "compressed size must be reported on the save result"
+        );
+
+        // Inspect (reading the sealed archive) must also report a real
+        // compressed size and the same counts.
+        let inspected = backup_inspect(&output).unwrap();
+        assert_eq!(inspected.repo_count, 1);
+        assert_eq!(inspected.symbol_count, 3);
+        assert!(
+            inspected.sizes.total_compressed > 0,
+            "inspect must recompute compressed size from the archive"
+        );
     }
 
     #[test]
