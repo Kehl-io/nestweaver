@@ -409,6 +409,15 @@ message FlowTraceContinueResponse {
   bool truncated = 3;
 }
 
+// ─── Backup ─────────────────────────────────────────────────────────
+
+message PrepareBackupRequest {}
+
+message PrepareBackupResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -438,6 +447,9 @@ service NestWeaverDaemon {
   rpc WatchVault(WatchVaultRequest) returns (WatchVaultResponse);
   rpc WatchCode(WatchCodeRequest) returns (WatchCodeResponse);
   rpc StopWatch(StopWatchRequest) returns (StopWatchResponse);
+
+  // Backup
+  rpc PrepareBackup(PrepareBackupRequest) returns (PrepareBackupResponse);
 
   // Export
   rpc ExportGraph(JsonRequest) returns (JsonResponse);

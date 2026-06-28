@@ -541,6 +541,37 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
 
+    // ── Backup ──────────────────────────────────────────────────────
+
+    async fn prepare_backup(
+        &self,
+        _request: Request<PrepareBackupRequest>,
+    ) -> Result<Response<PrepareBackupResponse>, Status> {
+        tracing::info!("prepare_backup: acquiring write mutex");
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::write(&self.state);
+
+        let store = self.state.store.clone();
+        tokio::task::spawn_blocking(move || {
+            // Flush in-memory embedding index to disk.
+            if let Err(e) = store.flush_embedding_index() {
+                tracing::warn!("prepare_backup: flush_embedding_index failed: {e}");
+            }
+            // Run CHECKPOINT to merge the WAL into the main database file.
+            if let Err(e) = store.checkpoint() {
+                tracing::warn!("prepare_backup: CHECKPOINT failed: {e}");
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("prepare_backup task panicked: {e}")))?;
+
+        tracing::info!("prepare_backup: database quiesced for backup");
+        Ok(Response::new(PrepareBackupResponse {
+            ok: true,
+            message: "database quiesced — safe to copy files".to_string(),
+        }))
+    }
+
     // ── Watching ─────────────────────────────────────────────────────
 
     async fn watch_vault(

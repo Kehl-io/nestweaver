@@ -12449,22 +12449,7 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
 
             let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
 
-            // Warn if the daemon is running — concurrent writes can produce
-            // an inconsistent snapshot.
-            if nestweaver_daemon::launchd::is_running(&instance_id) && !force {
-                eprintln!(
-                    "Error: daemon is running for this database. The backup may be inconsistent."
-                );
-                eprintln!(
-                    "Stop the daemon first (`nestweaver daemon stop`), or use --force to proceed."
-                );
-                return Ok(EXIT_ERROR);
-            }
-            if nestweaver_daemon::launchd::is_running(&instance_id) && force {
-                eprintln!(
-                    "Warning: daemon is running — backup may be inconsistent (--force specified)."
-                );
-            }
+            let daemon_running = nestweaver_daemon::launchd::is_running(&instance_id);
 
             let workspace_path = if include_clones {
                 db_path.parent().map(|p| p.join("workspace"))
@@ -12473,15 +12458,53 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             };
 
             let config = nestweaver_engine::BackupConfig {
-                db_path,
+                db_path: db_path.clone(),
                 output_path: output,
                 include_clones,
-                instance_id,
+                instance_id: instance_id.clone(),
                 workspace_path,
             };
 
-            eprintln!("Creating backup...");
-            let result = nestweaver_engine::backup_save(&config)?;
+            let result = if daemon_running {
+                // Route through the daemon: call PrepareBackup to quiesce,
+                // then copy files read-only (no lock contention).
+                eprintln!("Daemon is running — quiescing database via PrepareBackup RPC...");
+                let rt = tokio::runtime::Runtime::new()?;
+                let prepare_ok = rt.block_on(async {
+                    match nestweaver_client::DaemonClient::connect(&db_path, None).await {
+                        Ok(mut client) => {
+                            match client
+                                .inner_mut()
+                                .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
+                                .await
+                            {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    eprintln!("PrepareBackup RPC failed: {e}");
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to daemon: {e}");
+                            false
+                        }
+                    }
+                });
+
+                if !prepare_ok && !force {
+                    eprintln!(
+                        "Cannot quiesce database. Stop the daemon first, or use --force."
+                    );
+                    return Ok(EXIT_ERROR);
+                }
+
+                eprintln!("Creating backup (read-only)...");
+                nestweaver_engine::backup_save_read_only(&config)?
+            } else {
+                eprintln!("Creating backup...");
+                nestweaver_engine::backup_save(&config)?
+            };
             let m = &result.manifest;
 
             eprintln!("Backup saved to {}", result.output_path.display());

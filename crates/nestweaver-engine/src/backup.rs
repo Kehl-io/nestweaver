@@ -133,7 +133,59 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
     let write_pause = pause_start.elapsed();
     drop(store);
 
-    // Phase 2: Package (safe to release the database).
+    finish_backup(config, staging, repos, symbol_count, start, write_pause)
+}
+
+/// Create a backup using read-only database access.
+///
+/// Used when the daemon is running and has already quiesced the database
+/// via the PrepareBackup RPC. The caller does NOT need write access.
+pub fn backup_save_read_only(config: &BackupConfig) -> anyhow::Result<BackupResult> {
+    let start = Instant::now();
+    let staging = tempfile::tempdir()?;
+    let pause_start = Instant::now();
+
+    // Open read-only — no write lock contention with the daemon.
+    let store = nestweaver_store::GraphStore::open_read_only(&config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open database (read-only): {e}"))?;
+
+    // Copy files to staging (quiescing already done by PrepareBackup RPC).
+    copy_db_files(
+        &config.db_path,
+        staging.path(),
+        config.include_clones,
+        config.workspace_path.as_deref(),
+    )?;
+
+    // Gather graph statistics for the manifest while the store is still open.
+    let symbol_count = store.count_symbols().unwrap_or(0);
+    let per_repo = store.count_symbols_by_repo().unwrap_or_default();
+    let repos: Vec<BackupRepoInfo> = store
+        .list_repos(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| BackupRepoInfo {
+            symbols: per_repo.get(&r.uid).copied().unwrap_or(0),
+            url: r.url,
+            indexed_sha: r.indexed_sha,
+        })
+        .collect();
+
+    let write_pause = pause_start.elapsed();
+    drop(store);
+
+    finish_backup(config, staging, repos, symbol_count, start, write_pause)
+}
+
+/// Common packaging step shared by `backup_save` and `backup_save_read_only`.
+fn finish_backup(
+    config: &BackupConfig,
+    staging: tempfile::TempDir,
+    repos: Vec<BackupRepoInfo>,
+    symbol_count: usize,
+    start: Instant,
+    write_pause: Duration,
+) -> anyhow::Result<BackupResult> {
     let mut manifest = build_backup_manifest(config, staging.path(), repos, symbol_count)?;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
