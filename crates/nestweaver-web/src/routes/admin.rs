@@ -66,6 +66,8 @@ pub struct QueueInfo {
     pub depth: u32,
     pub drained: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub by_priority: Option<std::collections::HashMap<String, u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running: Option<Vec<serde_json::Value>>,
@@ -466,31 +468,39 @@ pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -
     let depth = state.indexing_queue_depth.load(Ordering::Relaxed);
     let drained = state.drained.load(Ordering::Relaxed);
 
-    // Read actual running jobs from the SQLite job queue.
+    // Read actual running jobs and pending count from the SQLite job queue.
+    // Show pending jobs regardless of drain state so operators can see what
+    // is waiting to be processed.
     let db_path = state.db_path.clone();
-    let running_jobs: Option<Vec<serde_json::Value>> = tokio::task::spawn_blocking(move || {
-        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-        nestweaver_engine::jobs::JobQueue::open(&jobs_path)
-            .ok()
-            .and_then(|q| q.running_jobs().ok())
-            .map(|jobs| {
-                jobs.into_iter()
-                    .map(|j| {
-                        serde_json::json!({
-                            "repo": j.repo,
-                            "started_at": j.started_at,
-                            "duration_s": j.duration_s,
-                        })
-                    })
-                    .collect()
-            })
-    })
-    .await
-    .unwrap_or(None);
+    let (running_jobs, pending_count): (Option<Vec<serde_json::Value>>, Option<i64>) =
+        tokio::task::spawn_blocking(move || {
+            let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+            match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+                Ok(q) => {
+                    let running = q.running_jobs().ok().map(|jobs| {
+                        jobs.into_iter()
+                            .map(|j| {
+                                serde_json::json!({
+                                    "repo": j.repo,
+                                    "started_at": j.started_at,
+                                    "duration_s": j.duration_s,
+                                })
+                            })
+                            .collect()
+                    });
+                    let pending = q.queue_depth().ok().map(|d| d.pending);
+                    (running, pending)
+                }
+                Err(_) => (None, None),
+            }
+        })
+        .await
+        .unwrap_or((None, None));
 
     Json(QueueInfo {
         depth,
         drained,
+        pending: pending_count,
         by_priority: None,
         running: running_jobs,
     })
