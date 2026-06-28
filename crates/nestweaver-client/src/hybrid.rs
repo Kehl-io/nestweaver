@@ -358,7 +358,8 @@ impl HybridClient {
                 // Use the structured merge so brain_context / project_context
                 // responses keep their `connected` schema; it falls back to the
                 // flat envelope for non-structured tools internally.
-                let merged = merge_structured_results(&local_result, &server_result);
+                let mut merged = merge_structured_results(&local_result, &server_result);
+                inject_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }
             Err(e) => {
@@ -402,7 +403,9 @@ impl HybridClient {
         });
 
         let Some(server_fut) = server_task else {
-            return self.query_local(tool_name, params).await;
+            let mut result = self.query_local(tool_name, params).await?;
+            inject_provenance(&mut result, &["local"], &[]);
+            return Ok(result);
         };
 
         // Now borrow self.local mutably for the local query.
@@ -412,7 +415,11 @@ impl HybridClient {
         let local = local_result?;
 
         match server_result {
-            Ok(Ok(server)) => Ok(merge_structured_results(&local, &server)),
+            Ok(Ok(server)) => {
+                let mut merged = merge_structured_results(&local, &server);
+                inject_provenance(&mut merged, &["local", "server"], &[]);
+                Ok(merged)
+            }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
                 let mut result = local;
