@@ -585,6 +585,54 @@ pub fn analyze_impact(
             .unwrap_or_else(|| repo_uid.to_string())
     };
 
+    // Look up a symbol by canonical_id, falling back to name + file_path
+    // when canonical_id doesn't match (common when the repo URL used during
+    // diff analysis differs from the indexed URL, e.g. git@ vs https://,
+    // or local path vs remote URL).
+    let resolve_symbol =
+        |canonical_id: &str, change: &AtomicChange| -> Result<Option<nestweaver_schema::Symbol>, anyhow::Error> {
+            if let Some(sym) = store.symbol_by_canonical_id(canonical_id)? {
+                return Ok(Some(sym));
+            }
+            // Fallback: extract name and file_path from the change to search
+            // by those fields instead of the repo-url-dependent canonical_id.
+            let (name, file_path) = match change {
+                AtomicChange::SignatureChanged {
+                    name, file_path, ..
+                }
+                | AtomicChange::SymbolRemoved {
+                    name, file_path, ..
+                }
+                | AtomicChange::ExportRemoved {
+                    name, file_path, ..
+                }
+                | AtomicChange::SymbolAdded {
+                    name, file_path, ..
+                }
+                | AtomicChange::ExportAdded {
+                    name, file_path, ..
+                }
+                | AtomicChange::SymbolMoved {
+                    name,
+                    old_file: file_path,
+                    ..
+                } => (name.as_str(), file_path.as_str()),
+                AtomicChange::SymbolRenamed {
+                    old_name, file_path, ..
+                } => (old_name.as_str(), file_path.as_str()),
+            };
+            if let Some(sym) = store.find_symbol_by_name_and_file(name, file_path)? {
+                tracing::debug!(
+                    canonical_id,
+                    name,
+                    file_path,
+                    "canonical_id lookup failed, found symbol by name+file fallback"
+                );
+                return Ok(Some(sym));
+            }
+            Ok(None)
+        };
+
     // Depth-bounded traversal: collect direct references (depth 1) then
     // transitively follow callers up to max_depth.  Direct references get
     // the natural severity; each additional hop downgrades to Warning/Info
@@ -600,7 +648,7 @@ pub fn analyze_impact(
                 new_signature,
                 file_path: _,
             } => {
-                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                if let Some(symbol) = resolve_symbol(canonical_id, change)? {
                     let direct_severity =
                         classify_signature_change(old_signature, new_signature, &symbol.file_path);
                     let direct_reason = format_impact_reason(change, &direct_severity);
@@ -629,7 +677,7 @@ pub fn analyze_impact(
                 } else {
                     "SYMBOL_REMOVED"
                 };
-                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                if let Some(symbol) = resolve_symbol(canonical_id, change)? {
                     let reason = format!("'{}' was removed — reference will break", name);
                     collect_transitive_references(
                         store,
@@ -651,7 +699,7 @@ pub fn analyze_impact(
                 new_name,
                 ..
             } => {
-                if let Some(symbol) = store.symbol_by_canonical_id(old_canonical_id)? {
+                if let Some(symbol) = resolve_symbol(old_canonical_id, change)? {
                     let importers = store.importers_of(&symbol.uid)?;
                     for importer in importers {
                         if !include_tests && is_test_file(&importer.file_path) {
@@ -688,7 +736,7 @@ pub fn analyze_impact(
                 old_file,
                 new_file,
             } => {
-                if let Some(symbol) = store.symbol_by_canonical_id(canonical_id)? {
+                if let Some(symbol) = resolve_symbol(canonical_id, change)? {
                     let importers = store.importers_of(&symbol.uid)?;
                     for importer in importers {
                         if !include_tests && is_test_file(&importer.file_path) {

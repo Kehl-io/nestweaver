@@ -515,6 +515,61 @@ impl GraphStore {
         }
     }
 
+    /// Return ALL symbols matching a canonical_id (not just the first).
+    /// Used by cross-repo impact analysis where the same canonical_id
+    /// appears in multiple repos (e.g., a shared interface).
+    pub fn find_symbols_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.canonical_id = $cid RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("cid", Value::String(canonical_id.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Find a symbol by name and file path. Used as a fallback when
+    /// canonical_id lookup fails (e.g., repo URL mismatch between the
+    /// diff analysis and the indexed graph).
+    pub fn find_symbol_by_name_and_file(
+        &self,
+        name: &str,
+        file_path: &str,
+    ) -> Result<Option<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.name = $name AND s.file_path = $fp RETURN {} LIMIT 1",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("name", Value::String(name.to_string())),
+                    ("fp", Value::String(file_path.to_string())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Some(row_to_symbol(&row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Returns all Symbol nodes that have any incoming edge (CALLS, IMPORTS,
     /// EXTENDS_SYM, IMPLEMENTS_SYM, INCLUDES_SYM) pointing TO `uid`.
     /// Used by impact analysis for SymbolRemoved/ExportRemoved changes.
