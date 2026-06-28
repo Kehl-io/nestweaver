@@ -302,6 +302,86 @@ mod tests {
         store.insert_edge(&edge).unwrap();
     }
 
+    /// `references_to` backs the ImpactAnalysis RPC / pre-push-impact. It must
+    /// follow CROSS_REPO_LINK so that pre-push impact reports cross-repo
+    /// consumers, not just same-repo references.
+    #[test]
+    fn references_to_includes_cross_repo_link() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("api", "ApiHandler", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("client", "RemoteClient", "repo-2", "b.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let refs = store.references_to("api").unwrap();
+        assert!(
+            refs.iter().any(|s| s.uid == "client"),
+            "references_to must include cross-repo consumers via CROSS_REPO_LINK; got: {:?}",
+            refs.iter().map(|s| s.uid.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn count_symbols_by_repo_groups_correctly() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("a", "fa", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b", "fb", "repo-1", "b.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c", "fc", "repo-2", "c.rs"))
+            .unwrap();
+
+        let counts = store.count_symbols_by_repo().unwrap();
+        assert_eq!(counts.get("repo-1").copied(), Some(2));
+        assert_eq!(counts.get("repo-2").copied(), Some(1));
+    }
+
+    /// `callees_of` backs flow_trace's forward traversal. It must follow
+    /// CROSS_REPO_LINK so a trace can continue across a repo boundary into the
+    /// downstream symbol in another repo.
+    #[test]
+    fn callees_of_includes_cross_repo_link() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("caller", "LocalCaller", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("remote", "RemoteCallee", "repo-2", "b.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "remote".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let callees = store.callees_of("caller").unwrap();
+        assert!(
+            callees.iter().any(|s| s.uid == "remote"),
+            "callees_of must include cross-repo callees via CROSS_REPO_LINK; got: {:?}",
+            callees.iter().map(|s| s.uid.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     // ── Brain extension round-trip tests ────────────────────────────────
 
     #[test]

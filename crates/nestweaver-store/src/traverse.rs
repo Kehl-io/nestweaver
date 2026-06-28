@@ -181,7 +181,8 @@ impl GraphStore {
         Ok(results)
     }
 
-    /// Internal: fetch all direct callers of `uid` across CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM.
+    /// Internal: fetch all direct callers of `uid` across
+    /// CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM/INCLUDES_SYM/CROSS_REPO_LINK.
     fn direct_callers_of(
         &self,
         uid: &str,
@@ -196,6 +197,10 @@ impl GraphStore {
             EdgeType::Extends.rel_table_name(),
             EdgeType::Implements.rel_table_name(),
             EdgeType::Includes.rel_table_name(),
+            // Cross-repo links carry downstream consumers in other repos. Without
+            // this, impact analysis stops at repo boundaries and misses org-wide
+            // callers in a unified multi-repo graph.
+            EdgeType::CrossRepoLink.rel_table_name(),
         ];
         let mut rows: Vec<CallerRow> = Vec::new();
 
@@ -429,6 +434,43 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    /// Impact analysis must follow CROSS_REPO_LINK edges so that callers in
+    /// other repos (modeled as cross-repo links in a unified multi-repo graph)
+    /// are reported. Regression guard for cross-boundary intelligence: without
+    /// CROSS_REPO_LINK in the traversal, brain_impact / blast_radius silently
+    /// miss every downstream cross-repo consumer.
+    #[test]
+    fn impact_includes_cross_repo_link_callers() {
+        use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "ApiHandler"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("consumer", "RemoteCaller"))
+            .unwrap();
+
+        // A consumer in another repo depends on `target` via a cross-repo link.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "consumer".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let impacted = store.impact("target", 5, 0.0).unwrap();
+        assert!(
+            impacted.iter().any(|n| n.uid == "consumer"),
+            "impact must surface cross-repo callers linked via CROSS_REPO_LINK; got: {:?}",
+            impacted.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// Convenience: empty [`SeedResolutionConfig`] for legacy cache tests

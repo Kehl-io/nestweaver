@@ -114,11 +114,15 @@ pub fn analyze_blast_radius(
     // Step 1: Map changed files to symbols.
     let mut changed_symbols: Vec<ChangedSymbol> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // Repos that own the changed symbols — used to separate same-repo ("local")
+    // impact from cross-repo ("org-wide") impact below.
+    let mut changed_repos: HashSet<String> = HashSet::new();
 
     for file in changed_files {
         let file_str = file.to_string_lossy();
         let syms = store.symbols_in_file(&file_str).unwrap_or_default();
         for sym in syms {
+            changed_repos.insert(sym.repo_uid.clone());
             if changed_uids.insert(sym.uid.clone()) {
                 changed_symbols.push(ChangedSymbol {
                     uid: sym.uid.clone(),
@@ -131,9 +135,24 @@ pub fn analyze_blast_radius(
         }
     }
 
+    // Resolve repo_uid -> display name (repo URL when available, else the uid)
+    // for org-wide impact reporting.
+    let repo_display: std::collections::HashMap<String, String> = store
+        .list_repos(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.uid.clone(), if r.url.is_empty() { r.uid } else { r.url }))
+        .collect();
+
     // Step 2: For each changed symbol, run transitive impact analysis.
     let mut affected_symbols: Vec<AffectedSymbol> = Vec::new();
     let mut affected_uids: HashSet<String> = HashSet::new();
+    // Cross-repo (org-wide) impact items, bucketed by severity, plus the set of
+    // downstream repos touched.
+    let mut org_breaking: Vec<OrgImpactItem> = Vec::new();
+    let mut org_warnings: Vec<OrgImpactItem> = Vec::new();
+    let mut org_info: Vec<OrgImpactItem> = Vec::new();
+    let mut impacted_repos: HashSet<String> = HashSet::new();
 
     for cs in &changed_symbols {
         let impact_nodes = store.impact(&cs.uid, max_depth, 0.0).unwrap_or_default();
@@ -143,11 +162,46 @@ pub fn analyze_blast_radius(
                 continue;
             }
             if affected_uids.insert(node.uid.clone()) {
-                // Look up the symbol's kind from the store.
-                let kind = store
-                    .lookup_symbol(&node.uid)
+                // Look up the symbol so we know its kind and owning repo.
+                let affected_sym = store.lookup_symbol(&node.uid).ok();
+                let kind = affected_sym
+                    .as_ref()
                     .map(|s| s.kind.to_string())
                     .unwrap_or_default();
+                let affected_repo = affected_sym
+                    .as_ref()
+                    .map(|s| s.repo_uid.clone())
+                    .unwrap_or_default();
+
+                // If the affected symbol lives in a different repo than any
+                // changed symbol, it is a cross-repo (org-wide) impact.
+                if !affected_repo.is_empty() && !changed_repos.contains(&affected_repo) {
+                    impacted_repos.insert(affected_repo.clone());
+                    let repo_label = repo_display
+                        .get(&affected_repo)
+                        .cloned()
+                        .unwrap_or_else(|| affected_repo.clone());
+                    let item = OrgImpactItem {
+                        change_name: cs.name.clone(),
+                        change_kind: cs.kind.clone(),
+                        affected_name: node.name.clone(),
+                        affected_repo: repo_label,
+                        affected_file: node.file_path.clone(),
+                        affected_line: node.start_line as i32,
+                        severity: classify_org_severity(node.impact_score).to_string(),
+                        reason: format!(
+                            "cross-repo dependency (via {}) — verify the downstream consumer \
+                             still works against the changed symbol",
+                            node.edge_type
+                        ),
+                    };
+                    match classify_org_severity(node.impact_score) {
+                        "breaking" => org_breaking.push(item),
+                        "warning" => org_warnings.push(item),
+                        _ => org_info.push(item),
+                    }
+                }
+
                 affected_symbols.push(AffectedSymbol {
                     uid: node.uid,
                     name: node.name,
@@ -217,14 +271,52 @@ pub fn analyze_blast_radius(
         risk_level,
     );
 
+    // Build the org-wide (cross-repo) impact summary, if any. Sourced from this
+    // daemon's unified multi-repo graph. A connected upstream server can augment
+    // or override this at the client layer.
+    let org_wide = if impacted_repos.is_empty() {
+        None
+    } else {
+        let mut repos: Vec<String> = impacted_repos
+            .iter()
+            .map(|uid| {
+                repo_display
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.clone())
+            })
+            .collect();
+        repos.sort();
+        Some(OrgWideImpact {
+            breaking: org_breaking,
+            warnings: org_warnings,
+            info: org_info,
+            impacted_repos: repos,
+            source_server: "local".to_string(),
+        })
+    };
+
     Ok(BlastRadiusResult {
         changed_symbols,
         affected_symbols,
         affected_clusters,
         risk_level,
         summary,
-        org_wide: None,
+        org_wide,
     })
+}
+
+/// Classify a cross-repo impact by its decayed impact score.
+/// High scores (direct, high-confidence cross-repo links) are breaking;
+/// weaker transitive reach is a warning, and faint reach is informational.
+fn classify_org_severity(impact_score: f64) -> &'static str {
+    if impact_score >= 0.5 {
+        "breaking"
+    } else if impact_score >= 0.25 {
+        "warning"
+    } else {
+        "info"
+    }
 }
 
 /// Compute risk level based on affected count, clusters, and centrality.
@@ -493,6 +585,122 @@ mod tests {
         assert!(
             (score - 0.9).abs() < 1e-6,
             "expected impact_score ~0.9, got {score}"
+        );
+    }
+
+    #[test]
+    fn org_wide_populated_for_cross_repo_impact() {
+        use nestweaver_schema::{
+            CrossRepoLinkType, EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility,
+        };
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 3,
+            end_line: 9,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: Some(0.2),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        // A symbol in repo:api is consumed by a symbol in repo:client via a
+        // cross-repo link. Changing the api symbol must surface repo:client as
+        // an org-wide (cross-repo) impact.
+        store
+            .insert_symbol(&mk("api", "Handler", "repo:api", "src/api.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&mk("client", "Caller", "repo:client", "src/client.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], 3, None).unwrap();
+
+        let org = result
+            .org_wide
+            .expect("org_wide must be populated when a change impacts another repo");
+        assert!(
+            org.impacted_repos.iter().any(|r| r == "repo:client"),
+            "impacted_repos should include the downstream repo; got: {:?}",
+            org.impacted_repos
+        );
+        let all_items = org.breaking.len() + org.warnings.len() + org.info.len();
+        assert!(all_items >= 1, "expected at least one org-wide impact item");
+        assert!(
+            org.breaking
+                .iter()
+                .chain(&org.warnings)
+                .chain(&org.info)
+                .any(|i| i.affected_name == "Caller" && i.affected_repo == "repo:client"),
+            "org-wide item should describe the cross-repo consumer"
+        );
+    }
+
+    #[test]
+    fn org_wide_none_when_impact_stays_in_repo() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&mk("a", "fn_a", "src/a.rs")).unwrap();
+        store.insert_symbol(&mk("b", "fn_b", "src/b.rs")).unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b".to_string(),
+                target_uid: "a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 3, None).unwrap();
+        assert!(
+            result.org_wide.is_none(),
+            "org_wide must stay None when all impact is within one repo"
         );
     }
 

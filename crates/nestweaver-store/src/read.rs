@@ -526,6 +526,9 @@ impl GraphStore {
             "EXTENDS_SYM",
             "IMPLEMENTS_SYM",
             "INCLUDES_SYM",
+            // Cross-repo consumers must surface in impact analysis so pre-push /
+            // ImpactAnalysis reports breaking changes across repo boundaries.
+            "CROSS_REPO_LINK",
         ];
         let mut all: Vec<Symbol> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1001,6 +1004,25 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Count symbols grouped by their owning repo (`repo_uid` -> count).
+    /// Used by backup manifests to report per-repo symbol totals without
+    /// loading full symbol rows.
+    pub fn count_symbols_by_repo(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, StoreError> {
+        let conn = self.conn()?;
+        let result = conn
+            .query("MATCH (s:Symbol) RETURN s.repo_uid, count(s.uid)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut counts = std::collections::HashMap::new();
+        for row in result {
+            let repo_uid = extract_string(&row, 0)?;
+            let count = extract_i64(&row, 1).unwrap_or(0).max(0) as usize;
+            counts.insert(repo_uid, count);
+        }
+        Ok(counts)
+    }
+
     /// Returns the dimension of stored embeddings, or 0 if none exist.
     ///
     /// Checks the sidecar `EmbeddingIndex` (the authoritative source since
@@ -1376,14 +1398,27 @@ impl GraphStore {
     pub fn callees_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS.replace("s.", "t.");
-        let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:CALLS]->(t:Symbol) RETURN {cols}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let result = conn
-            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        result.map(|row| row_to_symbol(&row)).collect()
+        // CALLS for in-repo callees; CROSS_REPO_LINK so flow_trace can continue
+        // forward across a repo boundary into the downstream symbol.
+        let edge_types = ["CALLS", "CROSS_REPO_LINK"];
+        let mut all: Vec<Symbol> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:{et}]->(t:Symbol) RETURN {cols}");
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let sym = row_to_symbol(&row)?;
+                if seen.insert(sym.uid.clone()) {
+                    all.push(sym);
+                }
+            }
+        }
+        Ok(all)
     }
 
     /// Returns direct members of a class/container via MEMBER_OF edges.
