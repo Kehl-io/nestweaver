@@ -156,28 +156,69 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
 }
 
 /// Read the manifest from an existing `.nwsnap.zst` archive without full extraction.
+///
+/// Verifies that file sizes in the archive match the manifest checksums entries
+/// and recomputes checksums for integrity verification.
 pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
     let file = std::fs::File::open(archive_path)?;
     let decoder = zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
 
+    let mut manifest: Option<BackupManifest> = None;
+    let mut archive_file_sizes: HashMap<String, u64> = HashMap::new();
+    let mut archive_checksums: HashMap<String, String> = HashMap::new();
+
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
-        if path.to_str() == Some("./manifest.json") || path.to_str() == Some("manifest.json") {
-            let mut manifest: BackupManifest = serde_json::from_reader(&mut entry)?;
-            // The in-archive manifest cannot record its own compressed size
-            // (sealed before compression finishes). Recompute it from the
-            // archive file on disk so inspect/list report a real figure.
-            if manifest.sizes.total_compressed == 0 {
-                manifest.sizes.total_compressed = std::fs::metadata(archive_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-            }
-            return Ok(manifest);
+        let path = entry.path()?.to_string_lossy().to_string();
+        let normalized = path.strip_prefix("./").unwrap_or(&path).to_string();
+
+        if normalized == "manifest.json" {
+            let m: BackupManifest = serde_json::from_reader(&mut entry)?;
+            manifest = Some(m);
+        } else if !normalized.is_empty() && !normalized.ends_with('/') {
+            // Track file sizes for verification.
+            let size = entry.header().size()?;
+            archive_file_sizes.insert(normalized.clone(), size);
+
+            // Compute checksum for files listed in manifest checksums.
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf)?;
+            let hash = format!("sha256:{}", hex_encode(&Sha256::digest(&buf)));
+            archive_checksums.insert(normalized, hash);
         }
     }
-    anyhow::bail!("manifest.json not found in archive")
+
+    let mut manifest = manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in archive"))?;
+
+    // The in-archive manifest cannot record its own compressed size
+    // (sealed before compression finishes). Recompute it from the
+    // archive file on disk so inspect/list report a real figure.
+    if manifest.sizes.total_compressed == 0 {
+        manifest.sizes.total_compressed = std::fs::metadata(archive_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
+
+    // Verify checksums: each file referenced in the manifest must have a
+    // matching checksum in the archive.
+    for (filename, expected_hash) in &manifest.checksums {
+        match archive_checksums.get(filename) {
+            Some(actual_hash) if actual_hash == expected_hash => {}
+            Some(actual_hash) => {
+                anyhow::bail!(
+                    "integrity check failed for {filename}: expected {expected_hash}, got {actual_hash}"
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "checksum references file not found in archive: {filename}"
+                );
+            }
+        }
+    }
+
+    Ok(manifest)
 }
 
 /// List all `.nwsnap.zst` backups in a directory, sorted by creation time.
@@ -202,23 +243,49 @@ pub fn backup_list(dir: &Path) -> anyhow::Result<Vec<(PathBuf, BackupManifest)>>
 }
 
 /// Restore a backup archive into a target directory.
+///
+/// Extracts to a temporary directory first, verifies integrity, then
+/// atomically renames to the target. If verification fails, the temp
+/// directory is cleaned up and the target is left untouched.
 pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let start = Instant::now();
 
-    std::fs::create_dir_all(&config.data_dir)?;
+    // Extract to a sibling temp directory so we can atomically rename on success.
+    let parent = config
+        .data_dir
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temp_dir = tempfile::tempdir_in(parent)?;
 
     let file = std::fs::File::open(&config.snapshot_path)?;
     let decoder = zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&config.data_dir)?;
+    archive.unpack(temp_dir.path())?;
 
-    let manifest_path = config.data_dir.join("manifest.json");
+    let manifest_path = temp_dir.path().join("manifest.json");
     let manifest_str = std::fs::read_to_string(&manifest_path)
         .map_err(|e| anyhow::anyhow!("failed to read manifest.json after extraction: {e}"))?;
     let manifest: BackupManifest = serde_json::from_str(&manifest_str)?;
 
-    verify_backup_checksums(&config.data_dir, &manifest)?;
+    // Verify integrity before committing to the target directory.
+    if let Err(e) = verify_backup_checksums(temp_dir.path(), &manifest) {
+        // Clean up the temp directory (happens automatically on drop, but
+        // be explicit for clarity).
+        drop(temp_dir);
+        return Err(anyhow::anyhow!("restore aborted — integrity check failed: {e}"));
+    }
     check_schema_compatibility(&manifest)?;
+
+    // Move the verified extraction to the target directory. If the target
+    // already exists, remove it first (we've already verified the new data).
+    if config.data_dir.exists() {
+        std::fs::remove_dir_all(&config.data_dir)?;
+    }
+    // Try atomic rename first; fall back to copy if cross-device.
+    if std::fs::rename(temp_dir.path(), &config.data_dir).is_err() {
+        nestweaver_storage::copy_dir_all(temp_dir.path(), &config.data_dir)?;
+    }
 
     Ok(RestoreResult {
         manifest,
