@@ -147,12 +147,16 @@ fn impact_diff_produces_json() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The output should be valid JSON.
-    let json_start = stdout.find('{');
-    assert!(json_start.is_some(), "expected JSON output, got: {stdout}");
-
+    // stdout must be a SINGLE clean JSON document — no leading status text.
+    // Regression guard for CI JSON pollution: in --format json, all status and
+    // progress messages must go to stderr so jq / format-comment can parse stdout.
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('{'),
+        "stdout must start with JSON (status text must go to stderr), got: {stdout:?}"
+    );
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout[json_start.unwrap()..]).expect("output should be valid JSON");
+        serde_json::from_str(trimmed).expect("entire stdout should be valid JSON");
 
     // Verify expected top-level structure.
     assert!(
@@ -296,25 +300,26 @@ fn impact_server_down_graceful() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // When server is down and format is json, output should contain empty
-    // impacts or an error indicator.
-    if let Some(json_start) = stdout.find('{') {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&stdout[json_start..]).unwrap_or_default();
-        let impacts = parsed
-            .get("impacts")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        assert_eq!(
-            impacts, 0,
-            "impacts should be empty when server is unreachable"
-        );
-        // Should include an error indicator
-        assert!(
-            parsed.get("error").is_some(),
-            "JSON output should include an 'error' field when server is down, got: {parsed}"
-        );
-    }
-    // If no JSON output at all, that's also acceptable (warning printed to stderr).
+    // When server is down and format is json, stdout must still be a clean JSON
+    // document (status/warnings go to stderr) with empty impacts and an error.
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('{'),
+        "stdout must be clean JSON even on server failure, got: {stdout:?}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("entire stdout should be valid JSON");
+    let impacts = parsed
+        .get("impacts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        impacts, 0,
+        "impacts should be empty when server is unreachable"
+    );
+    assert!(
+        parsed.get("error").is_some(),
+        "JSON output should include an 'error' field when server is down, got: {parsed}"
+    );
 }

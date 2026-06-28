@@ -5916,7 +5916,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if changes.is_empty() {
                 if !out.quiet {
-                    println!("No local changes detected.");
+                    // In JSON mode, status text must go to stderr so stdout
+                    // stays a single clean JSON document for jq / format-comment.
+                    if format == "json" {
+                        eprintln!("No local changes detected.");
+                    } else {
+                        println!("No local changes detected.");
+                    }
                 }
                 if format == "json" {
                     let output = serde_json::json!({
@@ -5954,7 +5960,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             if !out.quiet {
-                println!("  Analyzing {} change(s)...", changes.len());
+                // Keep stdout clean for JSON consumers; route progress to stderr.
+                if format == "json" {
+                    eprintln!("  Analyzing {} change(s)...", changes.len());
+                } else {
+                    println!("  Analyzing {} change(s)...", changes.len());
+                }
             }
 
             // Parse min_severity
@@ -12619,8 +12630,33 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                         .args(["daemon", "run", "--db", &db_str])
                         .spawn()
                     {
-                        Ok(child) => {
-                            eprintln!("  Daemon started (pid {})", child.id());
+                        Ok(mut child) => {
+                            // spawn() returns as soon as the fork succeeds — before
+                            // the daemon initializes or binds. Give it a moment, then
+                            // confirm it did not immediately exit (port/socket
+                            // conflict, unreadable db, ...) before claiming success.
+                            std::thread::sleep(std::time::Duration::from_millis(700));
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    eprintln!(
+                                        "  Daemon exited immediately ({status}) — it is NOT running."
+                                    );
+                                    eprintln!(
+                                        "  Run manually to see the error: nestweaver daemon run --db {}",
+                                        db.display()
+                                    );
+                                }
+                                Ok(None) => {
+                                    eprintln!("  Daemon started (pid {})", child.id());
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  Daemon spawned (pid {}) but its status could not be \
+                                         confirmed: {e}",
+                                        child.id()
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("  Failed to start daemon: {e}");
