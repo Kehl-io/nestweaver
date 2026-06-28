@@ -62,11 +62,16 @@ pub async fn handle_webhook(
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok());
 
+    // Track all incoming webhook requests.
+    nestweaver_web::routes::metrics::WEBHOOKS_RECEIVED.inc();
+
     if let Some(token) = gitlab_token {
         if token != state.config.secret && state.config.secret_old.as_deref() != Some(token) {
+            nestweaver_web::routes::metrics::WEBHOOK_SIG_FAILURES.inc();
             return (StatusCode::UNAUTHORIZED, "invalid token");
         }
     } else if !verify_signature(&body, sig_header, &state.config) {
+        nestweaver_web::routes::metrics::WEBHOOK_SIG_FAILURES.inc();
         return (StatusCode::UNAUTHORIZED, "invalid signature");
     }
 

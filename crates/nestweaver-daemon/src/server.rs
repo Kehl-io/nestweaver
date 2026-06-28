@@ -117,6 +117,11 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
+        // Increment gRPC request counter for this tool/method.
+        nestweaver_web::routes::metrics::GRPC_REQUESTS
+            .with_label_values(&[tool_name])
+            .inc();
+
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let handler = self.dispatch_json_tool_inner(tool_name, args_json);
@@ -251,6 +256,11 @@ impl DaemonService {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
+        // Increment gRPC request counter for this tool/method.
+        nestweaver_web::routes::metrics::GRPC_REQUESTS
+            .with_label_values(&[tool_name])
+            .inc();
+
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let handler = self.dispatch_tool_json_inner(tool_name, args);
@@ -3531,6 +3541,38 @@ pub async fn run_server(
                             }
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Spawn a periodic metrics refresh task that updates gauge-type metrics
+    // (queue depth, repo count, MCP sessions) from live state. Counter-type
+    // metrics (gRPC requests, webhooks, jobs) are incremented at their call sites.
+    {
+        let metrics_store = Arc::clone(&state.store);
+        let metrics_queue_depth = Arc::clone(&state.indexing_queue_depth);
+        let metrics_instance = instance_id.clone();
+        let mut metrics_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            use nestweaver_web::routes::metrics;
+            loop {
+                // Update repo gauge.
+                if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
+                    metrics::REPOS_TOTAL
+                        .with_label_values(&["indexed"])
+                        .set(repos.len() as i64);
+                }
+
+                // Update queue depth gauge.
+                let depth = metrics_queue_depth.load(Ordering::Relaxed);
+                metrics::QUEUE_DEPTH
+                    .with_label_values(&["total"])
+                    .set(depth as i64);
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = metrics_shutdown.changed() => break,
                 }
             }
         });
