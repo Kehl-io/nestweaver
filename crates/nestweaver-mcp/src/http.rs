@@ -250,6 +250,26 @@ async fn handle_mcp(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    // Reject unknown session IDs (except for `initialize` which creates one).
+    // If a client sends a session ID that isn't in our DashMap, it likely
+    // expired or belongs to a previous server instance — ask it to re-init.
+    if let Some(ref sid) = session_id {
+        if req.method != "initialize" && !state.sessions.contains_key(sid) {
+            return (
+                axum::http::StatusCode::OK,
+                HeaderMap::new(),
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": error_code::INVALID_REQUEST,
+                        "message": "unknown or expired session ID — please re-initialize",
+                    }
+                })),
+            );
+        }
+    }
+
     // Per-session rate limiting (server mode only).
     if state.server_mode {
         if let Some(ref sid) = session_id {
@@ -537,5 +557,38 @@ mod tests {
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["id"], 3);
         assert_eq!(json["error"]["code"], error_code::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_id_rejected() {
+        let app = test_app();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/list",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", "nonexistent-session-id")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["id"], 4);
+        assert_eq!(json["error"]["code"], error_code::INVALID_REQUEST);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("re-initialize"),
+        );
     }
 }
