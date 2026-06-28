@@ -176,21 +176,24 @@ fn format_comment_produces_markdown() {
     let dir = tempfile::tempdir().unwrap();
     let input_path = dir.path().join("impact.json");
 
-    // Write a sample ImpactResult JSON array matching the engine struct.
-    let impact_data = serde_json::json!([
-        {
-            "change_canonical_id": "sym:repo:lib.js:processOrder:1",
-            "change_kind": "SignatureChanged",
-            "affected_canonical_id": "sym:repo:app.js:handleCheckout:5",
-            "affected_name": "handleCheckout",
-            "affected_repo_url": "https://github.com/acme/frontend.git",
-            "affected_file": "app.js",
-            "affected_line": 5,
-            "affected_signature": "function handleCheckout(order)",
-            "severity": "Breaking",
-            "reason": "Calls processOrder which changed signature"
-        }
-    ]);
+    // Write a sample ImpactReport JSON matching the engine struct.
+    let impact_data = serde_json::json!({
+        "changes": 1,
+        "impacts": [
+            {
+                "change_canonical_id": "sym:repo:lib.js:processOrder:1",
+                "change_kind": "SignatureChanged",
+                "affected_canonical_id": "sym:repo:app.js:handleCheckout:5",
+                "affected_name": "handleCheckout",
+                "affected_repo_url": "https://github.com/acme/frontend.git",
+                "affected_file": "app.js",
+                "affected_line": 5,
+                "affected_signature": "function handleCheckout(order)",
+                "severity": "Breaking",
+                "reason": "Calls processOrder which changed signature"
+            }
+        ]
+    });
 
     std::fs::write(
         &input_path,
