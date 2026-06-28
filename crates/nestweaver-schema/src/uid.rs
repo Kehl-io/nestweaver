@@ -79,19 +79,19 @@ pub fn project_uid(instance: &str, name: &str) -> String {
 /// The scope_hash is derived from the scope chain (module::class::method),
 /// NOT from the line number. This makes the ID stable across edits that
 /// shift line numbers without changing the symbol's logical position.
+///
+/// When the scope chain is empty (top-level symbols), the hash falls back to
+/// the symbol name alone — never the line number — so that inserting blank
+/// lines above a symbol does not change its identity. This stability is relied
+/// on by cross-boundary flow-trace stitching and atomic-change matching.
 pub fn canonical_symbol_id(
     repo_url: &str,
     file_path: &str,
     name: &str,
     scope_chain: &str,
-    line: u32,
 ) -> String {
     let repo_hash = truncated_hash(repo_url.trim_end_matches('/'));
-    let scope_hash = if scope_chain.is_empty() {
-        truncated_hash(&format!("{}@{}", name, line))
-    } else {
-        truncated_hash(scope_chain)
-    };
+    let scope_hash = scope_hash(scope_chain, name);
     format!("{}:{}#{}:{}", repo_hash, file_path, name, scope_hash)
 }
 
@@ -315,28 +315,20 @@ mod tests {
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
-            42,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
-            42,
         );
         assert_eq!(a, b);
     }
 
     #[test]
     fn canonical_id_same_across_trailing_slash() {
-        let a = canonical_symbol_id(
-            "https://github.com/acme/api/",
-            "src/lib.rs",
-            "foo",
-            "foo",
-            1,
-        );
-        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "foo", "foo", 1);
+        let a = canonical_symbol_id("https://github.com/acme/api/", "src/lib.rs", "foo", "foo");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "foo", "foo");
         assert_eq!(a, b, "trailing slash should not change canonical_id");
     }
 
@@ -347,14 +339,12 @@ mod tests {
             "src/lib.rs",
             "process",
             "ModA::ClassA::process",
-            10,
         );
         let b = canonical_symbol_id(
             "https://github.com/acme/api",
             "src/lib.rs",
             "process",
             "ModB::ClassB::process",
-            10,
         );
         assert_ne!(a, b, "different scopes should produce different IDs");
     }
@@ -366,7 +356,6 @@ mod tests {
             "src/billing/webhook.rs",
             "processPayment",
             "billing::PaymentService::processPayment",
-            42,
         );
         assert!(id.contains("src/billing/webhook.rs"));
         assert!(id.contains("#processPayment:"));
@@ -375,33 +364,27 @@ mod tests {
     }
 
     #[test]
-    fn canonical_id_empty_scope_falls_back_to_name_and_line() {
-        let a = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "", 1);
-        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "", 1);
+    fn canonical_id_empty_scope_falls_back_to_name() {
+        let a = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "");
         assert_eq!(a, b, "empty scope chain should still be deterministic");
-        // The scope hash should be the hash of name@line
-        assert!(a.ends_with(&format!(":{}", truncated_hash("main@1"))));
+        // The scope hash should be the hash of the bare name — never the line.
+        assert!(a.ends_with(&format!(":{}", truncated_hash("main"))));
     }
 
     #[test]
-    fn canonical_id_empty_scope_different_lines_differ() {
-        let a = canonical_symbol_id(
-            "https://github.com/acme/api",
-            "src/lib.rs",
-            "helper",
-            "",
-            10,
-        );
-        let b = canonical_symbol_id(
-            "https://github.com/acme/api",
-            "src/lib.rs",
-            "helper",
-            "",
-            50,
-        );
-        assert_ne!(
+    fn canonical_id_empty_scope_stable_across_line_shifts() {
+        // Adding blank lines above a top-level symbol shifts its start line but
+        // must NOT change its canonical ID — the ID is a logical identity, not a
+        // position. This is the core stability guarantee the PRD depends on for
+        // cross-boundary flow-trace stitching and atomic-change matching.
+        // Both calls represent the same logical symbol after a line shift; the
+        // line number is no longer part of the signature, so identity is stable.
+        let a = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "helper", "");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "helper", "");
+        assert_eq!(
             a, b,
-            "same name on different lines with no scope should differ"
+            "line shifts must not change the canonical_id of a top-level symbol"
         );
     }
 

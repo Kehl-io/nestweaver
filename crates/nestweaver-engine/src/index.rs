@@ -804,13 +804,8 @@ fn index_into_store(
                     }
 
                     let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-                    let canonical = canonical_symbol_id(
-                        repo_url,
-                        &rel_path,
-                        &raw_sym.name,
-                        scope_str,
-                        raw_sym.start_line,
-                    );
+                    let canonical =
+                        canonical_symbol_id(repo_url, &rel_path, &raw_sym.name, scope_str);
 
                     all_symbols.push(Symbol {
                         uid: s_uid.clone(),
@@ -1759,13 +1754,7 @@ fn process_added_or_modified_file(
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(
-            repo_url,
-            &rel_str,
-            &raw_sym.name,
-            scope_str,
-            raw_sym.start_line,
-        );
+        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -1896,13 +1885,7 @@ fn process_added_or_modified_file_txn(
     for raw_sym in &parsed.symbols {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
         let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(
-            repo_url,
-            &rel_str,
-            &raw_sym.name,
-            scope_str,
-            raw_sym.start_line,
-        );
+        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),

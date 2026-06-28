@@ -90,7 +90,7 @@ impl AtomicChange {
 /// Compute a canonical ID for a `RawSymbol` within a given file and repo.
 fn raw_symbol_canonical_id(sym: &RawSymbol, file_path: &str, repo_url: &str) -> String {
     let scope = sym.scope_chain.as_deref().unwrap_or("");
-    canonical_symbol_id(repo_url, file_path, &sym.name, scope, sym.start_line)
+    canonical_symbol_id(repo_url, file_path, &sym.name, scope)
 }
 
 /// Match old and new symbols by canonical_id to detect changes.
@@ -738,6 +738,107 @@ mod tests {
 
     const REPO_URL: &str = "https://github.com/acme/api";
 
+    /// analyze_impact (the ImpactAnalysis RPC / pre-push-impact path) must report
+    /// consumers in OTHER repos. Regression guard for cross-boundary intelligence:
+    /// removing a symbol used by a downstream repo via a cross-repo link must be
+    /// flagged, not silently dropped at the repo boundary.
+    #[test]
+    fn analyze_impact_reports_cross_repo_consumers() {
+        use nestweaver_schema::{
+            CrossRepoLinkType, EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility,
+        };
+        use nestweaver_store::GraphStore;
+
+        let store = GraphStore::in_memory().unwrap();
+
+        // Two repos: an api repo that owns the changed symbol, and a client repo
+        // whose symbol consumes it across the boundary.
+        for (uid, url) in [
+            ("repo:api", "https://github.com/acme/api"),
+            ("repo:client", "https://github.com/acme/client"),
+        ] {
+            store
+                .insert_repo(&Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "sha".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "inst".to_string(),
+                    name: None,
+                })
+                .unwrap();
+        }
+
+        let canonical =
+            canonical_symbol_id("https://github.com/acme/api", "src/api.rs", "Handler", "");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str, cid: Option<String>| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 5,
+            end_line: 9,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: cid,
+        };
+        store
+            .insert_symbol(&mk(
+                "api",
+                "Handler",
+                "repo:api",
+                "src/api.rs",
+                Some(canonical.clone()),
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "client",
+                "Caller",
+                "repo:client",
+                "src/client.rs",
+                None,
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let changes = vec![AtomicChange::SymbolRemoved {
+            canonical_id: canonical,
+            name: "Handler".to_string(),
+            kind: SymbolKind::Function,
+            file_path: "src/api.rs".to_string(),
+        }];
+
+        let impacts = analyze_impact(&store, &changes, 5, true).unwrap();
+        assert!(
+            impacts.iter().any(|i| i.affected_name == "Caller"
+                && i.affected_repo_url == "https://github.com/acme/client"),
+            "analyze_impact must report the cross-repo consumer; got: {:?}",
+            impacts
+                .iter()
+                .map(|i| (&i.affected_name, &i.affected_repo_url))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn detects_signature_change() {
         let old = "pub fn process(amount: f64) -> bool { true }";
@@ -806,9 +907,8 @@ mod tests {
     #[test]
     fn line_shift_does_not_produce_false_positive_for_scoped_symbols() {
         // Adding a comment above should NOT trigger a change for SCOPED symbols
-        // (those with a scope chain like Foo::bar). Top-level symbols without a
-        // scope chain (like `impl Foo` itself) DO change canonical_id when their
-        // line shifts — that's expected and correct per the spec.
+        // (those with a scope chain like Foo::bar). Canonical IDs are line-shift
+        // stable, so neither scoped nor top-level symbols change identity here.
         let old = "impl Foo {\n    pub fn bar(&self) {}\n}";
         let new = "// new comment\nimpl Foo {\n    pub fn bar(&self) {}\n}";
         let changes = compute_file_changes(old, new, "src/lib.rs", REPO_URL).unwrap();
@@ -826,6 +926,31 @@ mod tests {
             bar_changes.is_empty(),
             "scoped symbol 'bar' should not produce false positives on line shift; got: {:?}",
             bar_changes
+        );
+    }
+
+    #[test]
+    fn line_shift_does_not_produce_false_positive_for_top_level_symbols() {
+        // Inserting blank lines / a comment above a TOP-LEVEL function (empty
+        // scope chain) must not register as a change. Canonical IDs are stable
+        // across line shifts, so the symbol keeps its identity. Regression guard
+        // for the canonical_id line-shift instability bug.
+        let old = "pub fn helper(x: i32) -> i32 { x + 1 }";
+        let new = "// added a doc line\n\npub fn helper(x: i32) -> i32 { x + 1 }";
+        let changes = compute_file_changes(old, new, "src/lib.rs", REPO_URL).unwrap();
+        let helper_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| match c {
+                AtomicChange::SymbolAdded { name, .. }
+                | AtomicChange::SymbolRemoved { name, .. }
+                | AtomicChange::SignatureChanged { name, .. } => name == "helper",
+                _ => false,
+            })
+            .collect();
+        assert!(
+            helper_changes.is_empty(),
+            "top-level symbol 'helper' should not produce false positives on line shift; got: {:?}",
+            helper_changes
         );
     }
 
