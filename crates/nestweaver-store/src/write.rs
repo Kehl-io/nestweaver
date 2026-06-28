@@ -228,10 +228,15 @@ impl GraphStore {
     }
 
     /// Insert a File node using an externally-provided connection (for transaction batching).
+    ///
+    /// Uses `MERGE` so that re-indexing a modified file upserts the node
+    /// instead of failing with a duplicate primary-key error.
     pub fn insert_file_on(conn: &lbug::Connection<'_>, file: &File) -> Result<(), StoreError> {
         exec_params(
             conn,
-            "CREATE (:File {uid: $uid, path: $path, repo_uid: $repo, content_hash: $hash})",
+            "MERGE (f:File {uid: $uid}) \
+             ON CREATE SET f.path = $path, f.repo_uid = $repo, f.content_hash = $hash \
+             ON MATCH SET f.path = $path, f.repo_uid = $repo, f.content_hash = $hash",
             vec![
                 ("uid", lbug::Value::String(file.uid.clone())),
                 ("path", lbug::Value::String(file.path.clone())),
