@@ -567,10 +567,10 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 
     // In server mode, try to read source spans from bare clones via
     // GitBareReader instead of the filesystem (which has no checkout tree).
-    let (value, used_bare) = if is_server_mode() {
+    let value = if is_server_mode() {
         let bare_result = try_read_symbols_from_bare(store, &targets, neighbors, token_budget);
         match bare_result {
-            Some(res) => (serde_json::to_value(res)?, true),
+            Some(res) => serde_json::to_value(res)?,
             None => {
                 let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
                 let res = nestweaver_engine::read_symbols::read_symbols(
@@ -580,7 +580,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
                     neighbors,
                     token_budget,
                 );
-                (serde_json::to_value(res)?, false)
+                serde_json::to_value(res)?
             }
         }
     } else {
@@ -592,13 +592,13 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
             neighbors,
             token_budget,
         );
-        (serde_json::to_value(res)?, false)
+        serde_json::to_value(res)?
     };
     let mut value = value;
 
-    // If we're in server mode and couldn't use bare clones (or they returned
-    // empty bodies), add a diagnostic note for AI agents.
-    if is_server_mode() && !used_bare {
+    // If we're in server mode and the result has no symbols with bodies,
+    // add a diagnostic note for AI agents.
+    if is_server_mode() {
         let has_empty_bodies = value
             .get("symbols")
             .and_then(|v| v.as_array())
