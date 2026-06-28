@@ -3355,7 +3355,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
 
-                // ── daemon guard ──────────────────────────────────
+                // ── daemon guard (routed through HybridClient for upstream merge) ──
                 if use_daemon {
                     let instance_cfg = nestweaver_engine::InstanceConfig::from_file(config_path)?;
                     if let Some(fc) = instance_cfg
@@ -3365,71 +3365,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     {
                         let db_default = default_db_path();
                         let db_path = db.as_deref().unwrap_or(&db_default);
-                        if let Ok(rt) = tokio::runtime::Runtime::new() {
-                            let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                                db_path,
-                                config.as_deref(),
-                            ));
-                            if let Ok(mut client) = connect {
-                                let req = nestweaver_proto::BrainContextRequest {
-                                    seeds: fc.entry_points.clone(),
-                                    token_budget: token_budget.unwrap_or(0) as i32,
-                                    response_format: String::new(),
-                                    repos: fc.repos.clone(),
-                                    vaults: vec![],
-                                    kinds: vec![],
-                                    path_prefix: String::new(),
-                                    tags: vec![],
-                                    exclude_tags: vec![],
-                                    weight_ppr: 0.0,
-                                    weight_bm25: 0.0,
-                                    intent: intent.clone().unwrap_or_default(),
-                                    include_seeds: true,
-                                    include_bodies: false,
-                                    root: String::new(),
-                                    prf: false,
-                                    rerank: false,
-                                    weight_semantic: 0.0,
-                                    since: String::new(),
-                                    recency_weight: 0.0,
-                                    recency_half_life_days: 0.0,
-                                };
-                                let rpc = rt.block_on(async {
-                                    client
-                                        .inner_mut()
-                                        .get_context(req)
-                                        .await
-                                        .map(|r| r.into_inner())
-                                });
-                                match rpc {
-                                    Ok(resp) => {
-                                        let result: nestweaver_engine::BrainContextResult =
-                                            serde_json::from_str(&resp.result_json)?;
-                                        let effective_limit = limit.unwrap_or(30);
-                                        let cut = match token_budget {
-                                            Some(budget) => {
-                                                token_budgeted_truncate(&result.connected, budget)
-                                            }
-                                            None => effective_limit.min(result.connected.len()),
-                                        };
-                                        if json {
-                                            print_brain_context_json(&result, cut)?;
-                                        } else {
-                                            print_brain_context_text(&result, cut, token_budget);
-                                        }
-                                        let stats = format!(
-                                            "{} seeds, {} connected nodes in {} (via daemon)",
-                                            result.seeds.len(),
-                                            cut,
-                                            format_elapsed(t0.elapsed())
-                                        );
-                                        return Ok((EXIT_SUCCESS, Some(stats)));
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Daemon RPC failed, falling back to local: {e}");
-                                    }
+                        let hybrid_args = serde_json::json!({
+                            "seeds": fc.entry_points,
+                            "token_budget": token_budget.unwrap_or(0),
+                            "repos": fc.repos,
+                            "intent": intent.clone().unwrap_or_default(),
+                            "include_seeds": true,
+                        });
+                        if let Some(result_json) = try_hybrid_json_rpc(
+                            use_daemon,
+                            db_path,
+                            config.as_deref(),
+                            "brain_context",
+                            hybrid_args,
+                        ) {
+                            let result: nestweaver_engine::BrainContextResult =
+                                serde_json::from_value(result_json)?;
+                            let effective_limit = limit.unwrap_or(30);
+                            let cut = match token_budget {
+                                Some(budget) => {
+                                    token_budgeted_truncate(&result.connected, budget)
                                 }
+                                None => effective_limit.min(result.connected.len()),
+                            };
+                            if json {
+                                print_brain_context_json(&result, cut)?;
+                            } else {
+                                print_brain_context_text(&result, cut, token_budget);
                             }
+                            let stats = format!(
+                                "{} seeds, {} connected nodes in {} (via hybrid)",
+                                result.seeds.len(),
+                                cut,
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
                         }
                     }
                 }
