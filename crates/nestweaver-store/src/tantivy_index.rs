@@ -375,12 +375,24 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Reload the reader so subsequent searches see any newly committed
+    /// segments. This is cheap: it just checks for new segment metadata
+    /// and opens any new segment readers. A no-op when nothing changed.
+    pub fn reload(&self) -> Result<(), TantivyError> {
+        self.reader.reload()?;
+        Ok(())
+    }
+
     /// BM25 search across title + body fields. Returns up to `limit`
     /// hits ranked by Tantivy's default BM25 scoring.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // Ensure the reader sees the latest committed segments (cheap no-op
+        // when nothing changed). Covers the case where a background worker
+        // committed new documents since the reader was last opened.
+        let _ = self.reader.reload();
         let searcher = self.reader.searcher();
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
