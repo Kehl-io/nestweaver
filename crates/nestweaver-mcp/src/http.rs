@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
 use axum::{Json, Router, extract::State, routing::post};
@@ -27,6 +27,18 @@ const SESSION_TTL_SECS: u64 = 3600; // 1 hour
 
 /// How often the background sweeper runs.
 const SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+/// Default per-tool timeout for MCP HTTP requests.
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
+
+/// Hard cap on graph traversal depth parameters.
+const MAX_DEPTH: u64 = 15;
+
+/// Hard cap on result count parameters (limit / max_results).
+const MAX_RESULTS: u64 = 5_000;
+
+/// Requests allowed per session per minute before rate limiting kicks in.
+const RATE_LIMIT_PER_MIN: u64 = 120;
 
 /// Per-client MCP session metadata.
 #[derive(Debug)]
@@ -116,6 +128,60 @@ pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
     });
 }
 
+/// Clamp depth and result-count parameters in tool arguments to server caps.
+///
+/// Mutates the `arguments` JSON object in place, capping `depth` to
+/// [`MAX_DEPTH`] and `limit` / `max_results` to [`MAX_RESULTS`].
+fn clamp_safeguard_params(arguments: &mut Value) {
+    if let Some(obj) = arguments.as_object_mut() {
+        for key in &["depth"] {
+            if let Some(val) = obj.get_mut(*key) {
+                if let Some(n) = val.as_u64() {
+                    if n > MAX_DEPTH {
+                        tracing::warn!(param = *key, requested = n, capped = MAX_DEPTH, "clamped parameter");
+                        *val = Value::Number(serde_json::Number::from(MAX_DEPTH));
+                    }
+                }
+            }
+        }
+        for key in &["limit", "max_results"] {
+            if let Some(val) = obj.get_mut(*key) {
+                if let Some(n) = val.as_u64() {
+                    if n > MAX_RESULTS {
+                        tracing::warn!(param = *key, requested = n, capped = MAX_RESULTS, "clamped parameter");
+                        *val = Value::Number(serde_json::Number::from(MAX_RESULTS));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check per-session rate limit. Returns `true` if the request is allowed.
+/// Uses a simple sliding-window approximation: if the session has made more
+/// than `RATE_LIMIT_PER_MIN` requests and the last reset was less than 60s
+/// ago, reject.
+fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: &str) -> bool {
+    if let Some(mut entry) = sessions.get_mut(session_id) {
+        let elapsed = entry.last_active.elapsed();
+        // Reset window every 60 seconds.
+        if elapsed >= Duration::from_secs(60) {
+            entry.request_count = 1;
+            entry.last_active = Instant::now();
+            return true;
+        }
+        if entry.request_count > RATE_LIMIT_PER_MIN {
+            return false;
+        }
+        entry.request_count += 1;
+        entry.last_active = Instant::now();
+        true
+    } else {
+        // Unknown session — allow (session tracking will create one on initialize).
+        true
+    }
+}
+
 /// Build an axum [`Router`] that serves `POST /mcp`.
 pub fn router(state: Arc<McpHttpState>) -> Router {
     Router::new()
@@ -174,11 +240,31 @@ async fn handle_mcp(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Update last_active / request_count for existing sessions.
-    if let Some(ref sid) = session_id {
-        if let Some(mut entry) = state.sessions.get_mut(sid) {
-            entry.last_active = Instant::now();
-            entry.request_count += 1;
+    // Per-session rate limiting (server mode only).
+    if state.server_mode {
+        if let Some(ref sid) = session_id {
+            if !check_session_rate_limit(&state.sessions, sid) {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": error_code::INVALID_REQUEST,
+                            "message": "rate limit exceeded: too many requests per minute",
+                        }
+                    })),
+                );
+            }
+        }
+    } else {
+        // Non-server mode: just update last_active / request_count.
+        if let Some(ref sid) = session_id {
+            if let Some(mut entry) = state.sessions.get_mut(sid) {
+                entry.last_active = Instant::now();
+                entry.request_count += 1;
+            }
         }
     }
 
@@ -266,38 +352,61 @@ async fn handle_mcp(
             let lite = state.lite;
             let server_mode = state.server_mode;
 
+            // Clamp depth / result-count parameters to server caps so MCP
+            // clients cannot request unbounded traversals or result sets.
+            let mut arguments = arguments;
+            if server_mode {
+                clamp_safeguard_params(&mut arguments);
+            }
+
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
-            let result = tokio::task::spawn_blocking(move || {
-                tools::set_current_db_path(db_path);
-                tools::set_lite_mode(lite);
-                tools::set_current_instance_config(instance_cfg);
-                // Match the gRPC handler: server-only code paths (read_symbols
-                // via git, brain_status) key off this thread-local. Without it,
-                // HTTP requests in server mode read from an empty filesystem and
-                // return empty bodies.
-                tools::set_server_mode(server_mode);
+            // Wrap in a timeout to match the gRPC safeguard behaviour.
+            let timeout = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
+            let tool_name = name.clone();
+            let result = tokio::time::timeout(
+                timeout,
+                tokio::task::spawn_blocking(move || {
+                    tools::set_current_db_path(db_path);
+                    tools::set_lite_mode(lite);
+                    tools::set_current_instance_config(instance_cfg);
+                    // Match the gRPC handler: server-only code paths (read_symbols
+                    // via git, brain_status) key off this thread-local. Without it,
+                    // HTTP requests in server mode read from an empty filesystem and
+                    // return empty bodies.
+                    tools::set_server_mode(server_mode);
 
-                tools::dispatch(&store, tantivy.as_deref(), &name, arguments, None)
-            })
+                    tools::dispatch(&store, tantivy.as_deref(), &tool_name, arguments, None)
+                }),
+            )
             .await;
 
             match result {
-                Ok(Ok(value)) => json!({
+                Ok(Ok(Ok(value))) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": tools::wrap_tool_result(value),
                 }),
-                Ok(Err(e)) => json!({
+                Ok(Ok(Err(e))) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": tools::wrap_tool_error(&e.to_string()),
                 }),
-                Err(e) => json!({
+                Ok(Err(e)) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": tools::wrap_tool_error(&format!("dispatch panicked: {e}")),
                 }),
+                Err(_elapsed) => {
+                    tracing::warn!(tool = %name, timeout_secs = DEFAULT_TOOL_TIMEOUT_SECS, "MCP tool dispatch timed out");
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": tools::wrap_tool_error(&format!(
+                            "{name} query exceeded {DEFAULT_TOOL_TIMEOUT_SECS}s timeout"
+                        )),
+                    })
+                }
             }
         }
 
