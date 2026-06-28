@@ -175,18 +175,18 @@ impl DaemonService {
             // In server mode, clamp depth and result limits per safeguard config
             // before passing to the tool handler.
             let mut args = args;
-            if state.server_mode {
+            let depth_result = if state.server_mode {
                 // Clamp depth parameter.
                 let client_depth = args
                     .get("depth")
                     .or_else(|| args.get("max_depth"))
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
-                let effective_depth = state.safeguards.effective_depth(&tool_name, client_depth)?;
+                let dr = state.safeguards.effective_depth(&tool_name, client_depth);
                 if args.get("depth").is_some() {
-                    args["depth"] = serde_json::json!(effective_depth);
+                    args["depth"] = serde_json::json!(dr.depth);
                 } else if args.get("max_depth").is_some() {
-                    args["max_depth"] = serde_json::json!(effective_depth);
+                    args["max_depth"] = serde_json::json!(dr.depth);
                 }
 
                 // Clamp result limit parameter.
@@ -200,7 +200,10 @@ impl DaemonService {
                 if args.get("limit").is_some() {
                     args["limit"] = serde_json::json!(effective_limit);
                 }
-            }
+                Some(dr)
+            } else {
+                None
+            };
 
             let embed_ref = embed_arc.as_deref();
             tracing::debug!(
@@ -209,7 +212,7 @@ impl DaemonService {
             );
 
             let t_dispatch = std::time::Instant::now();
-            let value = nestweaver_mcp::tools::dispatch(
+            let mut value = nestweaver_mcp::tools::dispatch(
                 &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
@@ -222,6 +225,27 @@ impl DaemonService {
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
                 "dispatch completed"
             );
+
+            // Communicate depth clamping in response metadata.
+            if let Some(ref dr) = depth_result {
+                if dr.clamped {
+                    if let Some(obj) = value.as_object_mut() {
+                        let meta = obj
+                            .entry("_meta")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(meta_obj) = meta.as_object_mut() {
+                            meta_obj.insert(
+                                "_clamped".to_string(),
+                                serde_json::json!(true),
+                            );
+                            meta_obj.insert(
+                                "_original_depth".to_string(),
+                                serde_json::json!(dr.original_depth),
+                            );
+                        }
+                    }
+                }
+            }
 
             let t_ser = std::time::Instant::now();
             let json = serde_json::to_string(&value)

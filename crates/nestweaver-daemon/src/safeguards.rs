@@ -15,6 +15,18 @@ use tonic::Status;
 
 // ── Timeout & depth configuration ──────────────────────────────────────
 
+/// Result of depth clamping. Carries the effective depth along with
+/// metadata indicating whether the original request was clamped.
+#[derive(Debug, Clone)]
+pub struct DepthResult {
+    /// The depth to use for the query.
+    pub depth: u32,
+    /// Whether the requested depth was clamped to the hard cap.
+    pub clamped: bool,
+    /// The client's original requested depth, if it was clamped.
+    pub original_depth: Option<u32>,
+}
+
 /// Per-tool safeguard configuration for server-mode query protection.
 #[derive(Debug, Clone)]
 pub struct QuerySafeguards {
@@ -180,23 +192,42 @@ impl QuerySafeguards {
         }
     }
 
-    /// Returns the effective depth for a graph traversal tool.
-    /// Returns `Err` with an INVALID_ARGUMENT status if the requested depth
-    /// exceeds the hard cap.
+    /// Returns the effective depth for a graph traversal tool, clamping to the
+    /// hard cap when the client requests more. The returned `DepthResult`
+    /// carries a `clamped` flag and the original requested value so callers can
+    /// communicate the clamping in response metadata.
     pub fn effective_depth(
         &self,
         tool: &str,
         client_requested: Option<u32>,
-    ) -> Result<u32, Status> {
+    ) -> DepthResult {
         let default = self.default_depths.get(tool).copied().unwrap_or(3);
         let max = self.max_depths.get(tool).copied().unwrap_or(10);
 
         match client_requested {
-            Some(req) if req > max => Err(Status::invalid_argument(format!(
-                "{tool} depth {req} exceeds maximum allowed depth of {max}"
-            ))),
-            Some(req) => Ok(req),
-            None => Ok(default),
+            Some(req) if req > max => {
+                tracing::info!(
+                    tool,
+                    requested = req,
+                    clamped_to = max,
+                    "depth clamped to hard cap"
+                );
+                DepthResult {
+                    depth: max,
+                    clamped: true,
+                    original_depth: Some(req),
+                }
+            }
+            Some(req) => DepthResult {
+                depth: req,
+                clamped: false,
+                original_depth: None,
+            },
+            None => DepthResult {
+                depth: default,
+                clamped: false,
+                original_depth: None,
+            },
         }
     }
 
@@ -402,22 +433,26 @@ mod tests {
     #[test]
     fn depth_limit_default() {
         let sg = QuerySafeguards::default_server();
-        assert_eq!(sg.effective_depth("blast_radius", None).unwrap(), 3);
-        assert_eq!(sg.effective_depth("flow_trace", None).unwrap(), 5);
+        assert_eq!(sg.effective_depth("blast_radius", None).depth, 3);
+        assert_eq!(sg.effective_depth("flow_trace", None).depth, 5);
+        assert!(!sg.effective_depth("blast_radius", None).clamped);
     }
 
     #[test]
-    fn depth_limit_rejects_oversize() {
+    fn depth_limit_clamps_oversize() {
         let sg = QuerySafeguards::default_server();
-        let err = sg.effective_depth("blast_radius", Some(15)).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("exceeds maximum"));
+        let result = sg.effective_depth("blast_radius", Some(15));
+        assert!(result.clamped);
+        assert_eq!(result.depth, 10); // hard cap for blast_radius
+        assert_eq!(result.original_depth, Some(15));
     }
 
     #[test]
     fn depth_limit_allows_within_cap() {
         let sg = QuerySafeguards::default_server();
-        assert_eq!(sg.effective_depth("blast_radius", Some(8)).unwrap(), 8);
+        let result = sg.effective_depth("blast_radius", Some(8));
+        assert_eq!(result.depth, 8);
+        assert!(!result.clamped);
     }
 
     #[test]
