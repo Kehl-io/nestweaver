@@ -589,49 +589,52 @@ pub fn analyze_impact(
     // when canonical_id doesn't match (common when the repo URL used during
     // diff analysis differs from the indexed URL, e.g. git@ vs https://,
     // or local path vs remote URL).
-    let resolve_symbol =
-        |canonical_id: &str, change: &AtomicChange| -> Result<Option<nestweaver_schema::Symbol>, anyhow::Error> {
-            if let Some(sym) = store.symbol_by_canonical_id(canonical_id)? {
-                return Ok(Some(sym));
+    let resolve_symbol = |canonical_id: &str,
+                          change: &AtomicChange|
+     -> Result<Option<nestweaver_schema::Symbol>, anyhow::Error> {
+        if let Some(sym) = store.symbol_by_canonical_id(canonical_id)? {
+            return Ok(Some(sym));
+        }
+        // Fallback: extract name and file_path from the change to search
+        // by those fields instead of the repo-url-dependent canonical_id.
+        let (name, file_path) = match change {
+            AtomicChange::SignatureChanged {
+                name, file_path, ..
             }
-            // Fallback: extract name and file_path from the change to search
-            // by those fields instead of the repo-url-dependent canonical_id.
-            let (name, file_path) = match change {
-                AtomicChange::SignatureChanged {
-                    name, file_path, ..
-                }
-                | AtomicChange::SymbolRemoved {
-                    name, file_path, ..
-                }
-                | AtomicChange::ExportRemoved {
-                    name, file_path, ..
-                }
-                | AtomicChange::SymbolAdded {
-                    name, file_path, ..
-                }
-                | AtomicChange::ExportAdded {
-                    name, file_path, ..
-                }
-                | AtomicChange::SymbolMoved {
-                    name,
-                    old_file: file_path,
-                    ..
-                } => (name.as_str(), file_path.as_str()),
-                AtomicChange::SymbolRenamed {
-                    old_name, file_path, ..
-                } => (old_name.as_str(), file_path.as_str()),
-            };
-            if let Some(sym) = store.find_symbol_by_name_and_file(name, file_path)? {
-                tracing::debug!(
-                    canonical_id,
-                    name,
-                    file_path,
-                    "canonical_id lookup failed, found symbol by name+file fallback"
-                );
-                return Ok(Some(sym));
+            | AtomicChange::SymbolRemoved {
+                name, file_path, ..
             }
-            Ok(None)
+            | AtomicChange::ExportRemoved {
+                name, file_path, ..
+            }
+            | AtomicChange::SymbolAdded {
+                name, file_path, ..
+            }
+            | AtomicChange::ExportAdded {
+                name, file_path, ..
+            }
+            | AtomicChange::SymbolMoved {
+                name,
+                old_file: file_path,
+                ..
+            } => (name.as_str(), file_path.as_str()),
+            AtomicChange::SymbolRenamed {
+                old_name,
+                file_path,
+                ..
+            } => (old_name.as_str(), file_path.as_str()),
         };
+        if let Some(sym) = store.find_symbol_by_name_and_file(name, file_path)? {
+            tracing::debug!(
+                canonical_id,
+                name,
+                file_path,
+                "canonical_id lookup failed, found symbol by name+file fallback"
+            );
+            return Ok(Some(sym));
+        }
+        Ok(None)
+    };
 
     // Depth-bounded traversal: collect direct references (depth 1) then
     // transitively follow callers up to max_depth.  Direct references get

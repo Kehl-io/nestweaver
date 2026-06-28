@@ -3383,9 +3383,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
                             let cut = match token_budget {
-                                Some(budget) => {
-                                    token_budgeted_truncate(&result.connected, budget)
-                                }
+                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
                                 None => effective_limit.min(result.connected.len()),
                             };
                             if json {
@@ -12493,9 +12491,7 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 });
 
                 if !prepare_ok && !force {
-                    eprintln!(
-                        "Cannot quiesce database. Stop the daemon first, or use --force."
-                    );
+                    eprintln!("Cannot quiesce database. Stop the daemon first, or use --force.");
                     return Ok(EXIT_ERROR);
                 }
 

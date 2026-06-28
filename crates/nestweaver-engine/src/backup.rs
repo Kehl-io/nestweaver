@@ -241,7 +241,8 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
         }
     }
 
-    let mut manifest = manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in archive"))?;
+    let mut manifest =
+        manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in archive"))?;
 
     // The in-archive manifest cannot record its own compressed size
     // (sealed before compression finishes). Recompute it from the
@@ -263,9 +264,7 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
                 );
             }
             None => {
-                anyhow::bail!(
-                    "checksum references file not found in archive: {filename}"
-                );
+                anyhow::bail!("checksum references file not found in archive: {filename}");
             }
         }
     }
@@ -325,7 +324,9 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         // Clean up the temp directory (happens automatically on drop, but
         // be explicit for clarity).
         drop(temp_dir);
-        return Err(anyhow::anyhow!("restore aborted — integrity check failed: {e}"));
+        return Err(anyhow::anyhow!(
+            "restore aborted — integrity check failed: {e}"
+        ));
     }
     check_schema_compatibility(&manifest)?;
 
