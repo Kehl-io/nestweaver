@@ -51,15 +51,22 @@
           echo "ERROR: fail-on-error is enabled — failing the job"
           exit 1
         fi
-        exit 0
+        echo '{"impacts":[],"error":"server_unavailable"}' > impact.json
       fi
     - |
-      nestweaver format-comment \
-        --input impact.json \
-        --gitlab-project "$CI_PROJECT_ID" \
-        --mr "$CI_MERGE_REQUEST_IID" \
-        --gitlab-token "$GITLAB_TOKEN" \
-        --marker "nestweaver-impact" || true
+      # Skip the comment if the server was unavailable — there's no
+      # useful data to post and "No impact" would be misleading.
+      if jq -e '.error' impact.json > /dev/null 2>&1; then
+        ERROR_MSG=$(jq -r '.error' impact.json)
+        echo "WARNING: Skipping MR comment — impact analysis unavailable: ${ERROR_MSG}"
+      else
+        nestweaver format-comment \
+          --input impact.json \
+          --gitlab-project "$CI_PROJECT_ID" \
+          --mr "$CI_MERGE_REQUEST_IID" \
+          --gitlab-token "$GITLAB_TOKEN" \
+          --marker "nestweaver-impact" || true
+      fi
     - |
       if [ "$NESTWEAVER_FAIL_ON_BREAKING" = "true" ]; then
         if jq -e '.impacts[] | select(.severity == "Breaking")' impact.json > /dev/null 2>&1; then
