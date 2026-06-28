@@ -222,8 +222,8 @@ impl JobQueue {
         // conditionally updates based on current status:
         //
         // - pending/failed: upgrade priority if new one is higher, reset to pending.
-        // - succeeded/dead_letter: reset to pending with new trigger, clear attempt
-        //   counter so the job gets a fresh run.
+        // - succeeded/dead_letter/cancelled: reset to pending with new trigger,
+        //   clear attempt counter so the job gets a fresh run.
         // - running: no-op — don't interrupt in-progress work.
         //
         // Branch is always updated when a new value is provided (Some), regardless
@@ -234,17 +234,17 @@ impl JobQueue {
              ON CONFLICT (repo_id) DO UPDATE SET
                priority   = CASE WHEN status IN ('pending', 'failed')
                                  THEN MIN(excluded.priority, priority)
-                                 WHEN status IN ('succeeded', 'dead_letter')
+                                 WHEN status IN ('succeeded', 'dead_letter', 'cancelled')
                                  THEN excluded.priority
                                  ELSE priority END,
                trigger    = CASE WHEN status IN ('pending', 'failed') AND excluded.priority < priority
                                  THEN excluded.trigger
-                                 WHEN status IN ('succeeded', 'dead_letter')
+                                 WHEN status IN ('succeeded', 'dead_letter', 'cancelled')
                                  THEN excluded.trigger
                                  ELSE trigger END,
-               status     = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter')
+               status     = CASE WHEN status IN ('pending', 'failed', 'succeeded', 'dead_letter', 'cancelled')
                                  THEN 'pending' ELSE status END,
-               attempt    = CASE WHEN status IN ('succeeded', 'dead_letter')
+               attempt    = CASE WHEN status IN ('succeeded', 'dead_letter', 'cancelled')
                                  THEN 0 ELSE attempt END,
                branch     = CASE WHEN excluded.branch IS NOT NULL
                                  THEN excluded.branch ELSE branch END,
