@@ -75,6 +75,10 @@ async fn spa_fallback(request: Request) -> Response {
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    // Touch all lazy metric statics so the /metrics endpoint always reports
+    // the full set of metric names, even before any events occur.
+    routes::metrics::init_metrics();
+
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
         .route("/api/v1/version", get(routes::version::version))
@@ -206,6 +210,9 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
         .route("/dead-letter/{id}", delete(admin::dismiss_dead_letter))
         .route("/reload", post(admin::reload_config))
         .route("/status", get(admin::get_status))
+        // Expose /metrics on the admin port as well so Prometheus can scrape
+        // a single endpoint regardless of which port it targets.
+        .route("/metrics", get(routes::metrics::metrics_handler))
         .with_state(state)
 }
 
