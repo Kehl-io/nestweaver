@@ -134,7 +134,7 @@ pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
 /// [`MAX_DEPTH`] and `limit` / `max_results` to [`MAX_RESULTS`].
 fn clamp_safeguard_params(arguments: &mut Value) {
     if let Some(obj) = arguments.as_object_mut() {
-        for key in &["depth"] {
+        for key in &["depth", "max_depth"] {
             if let Some(val) = obj.get_mut(*key) {
                 if let Some(n) = val.as_u64() {
                     if n > MAX_DEPTH {
