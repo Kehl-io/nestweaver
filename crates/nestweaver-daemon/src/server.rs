@@ -3278,6 +3278,31 @@ pub async fn run_server(
                 .ok();
         });
 
+        // Validate TLS config BEFORE binding any ports so we don't
+        // advertise addresses that will never serve traffic.
+        let tls_config = match (&opts.tls_cert, &opts.tls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                // Install the ring crypto provider for rustls. This is
+                // required by rustls 0.23+ and must happen before any TLS
+                // config is created.
+                let _ = rustls::crypto::ring::default_provider().install_default();
+
+                let cert_pem = std::fs::read(cert_path)
+                    .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
+                let key_pem = std::fs::read(key_path)
+                    .with_context(|| format!("read TLS key: {}", key_path.display()))?;
+                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+                tracing::info!("TLS enabled for TCP server");
+                eprintln!("[daemon] TLS enabled for TCP server");
+                Some(tls)
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
+            }
+            (None, None) => None,
+        };
+
         // TCP listener for server mode — spawned before the blocking UDS serve.
         {
             let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
@@ -3305,30 +3330,6 @@ pub async fn run_server(
             );
             let tcp_svc =
                 tonic::service::interceptor::InterceptedService::new(svc.clone(), interceptor);
-
-            // Build the TLS config when both cert and key are provided.
-            let tls_config = match (&opts.tls_cert, &opts.tls_key) {
-                (Some(cert_path), Some(key_path)) => {
-                    // Install the ring crypto provider for rustls. This is
-                    // required by rustls 0.23+ and must happen before any TLS
-                    // config is created.
-                    let _ = rustls::crypto::ring::default_provider().install_default();
-
-                    let cert_pem = std::fs::read(cert_path)
-                        .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
-                    let key_pem = std::fs::read(key_path)
-                        .with_context(|| format!("read TLS key: {}", key_path.display()))?;
-                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                    tracing::info!("TLS enabled for TCP server");
-                    eprintln!("[daemon] TLS enabled for TCP server");
-                    Some(tls)
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
-                }
-                (None, None) => None,
-            };
 
             tokio::spawn(async move {
                 let mut builder = tonic::transport::Server::builder();
