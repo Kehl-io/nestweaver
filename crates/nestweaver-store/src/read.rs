@@ -1449,13 +1449,15 @@ impl GraphStore {
         Ok(edges)
     }
 
-    /// Returns all Symbol nodes that `uid` calls (outgoing CALLS edges).
+    /// Returns all Symbol nodes that `uid` calls or imports (outgoing edges).
+    ///
+    /// Follows CALLS, IMPORTS, and CROSS_REPO_LINK edges so that
+    /// `flow_trace` can traverse function calls, import relationships,
+    /// and cross-repo boundaries.
     pub fn callees_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS.replace("s.", "t.");
-        // CALLS for in-repo callees; CROSS_REPO_LINK so flow_trace can continue
-        // forward across a repo boundary into the downstream symbol.
-        let edge_types = ["CALLS", "CROSS_REPO_LINK"];
+        let edge_types = ["CALLS", "IMPORTS", "CROSS_REPO_LINK"];
         let mut all: Vec<Symbol> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for et in &edge_types {
