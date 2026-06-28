@@ -224,7 +224,10 @@ async fn handle_mcp(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match provided {
-            Some(t) if t == expected => {}
+            Some(t) if {
+                use subtle::ConstantTimeEq;
+                bool::from(t.as_bytes().ct_eq(expected.as_bytes()))
+            } => {}
             _ => {
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
