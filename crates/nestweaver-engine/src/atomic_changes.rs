@@ -395,7 +395,12 @@ pub fn classify_change(change: &AtomicChange) -> ImpactSeverity {
     match change {
         AtomicChange::SymbolRemoved { .. } => ImpactSeverity::Breaking,
         AtomicChange::ExportRemoved { .. } => ImpactSeverity::Breaking,
-        AtomicChange::SignatureChanged { .. } => ImpactSeverity::Breaking,
+        AtomicChange::SignatureChanged {
+            old_signature,
+            new_signature,
+            file_path,
+            ..
+        } => classify_signature_change(old_signature, new_signature, file_path),
         AtomicChange::SymbolRenamed { .. } => ImpactSeverity::Breaking,
         AtomicChange::SymbolMoved { .. } => ImpactSeverity::Warning,
         AtomicChange::SymbolAdded { .. } => ImpactSeverity::Info,
@@ -1290,6 +1295,30 @@ mod tests {
             "src/caller.rs",
         );
         assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_change_optional_param_addition_is_info() {
+        let change = AtomicChange::SignatureChanged {
+            canonical_id: "test:src/caller.py#foo:abc".into(),
+            name: "foo".into(),
+            old_signature: "def foo(a)".into(),
+            new_signature: "def foo(a, b=None)".into(),
+            file_path: "src/caller.py".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Info);
+    }
+
+    #[test]
+    fn classify_change_required_param_addition_static_is_breaking() {
+        let change = AtomicChange::SignatureChanged {
+            canonical_id: "test:src/lib.rs#foo:abc".into(),
+            name: "foo".into(),
+            old_signature: "fn foo(a: i32) -> bool".into(),
+            new_signature: "fn foo(a: i32, b: String) -> bool".into(),
+            file_path: "src/lib.rs".into(),
+        };
+        assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
     }
 
     #[test]
