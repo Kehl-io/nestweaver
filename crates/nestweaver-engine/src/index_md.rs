@@ -57,12 +57,11 @@ const SKIP_DIRS: &[&str] = &[
 /// `.trash`).
 fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
     for component in rel_path.components() {
-        if let std::path::Component::Normal(name) = component {
-            if let Some(s) = name.to_str() {
-                if SKIP_DIRS.contains(&s) {
-                    return true;
-                }
-            }
+        if let std::path::Component::Normal(name) = component
+            && let Some(s) = name.to_str()
+            && SKIP_DIRS.contains(&s)
+        {
+            return true;
         }
     }
     false
@@ -275,19 +274,20 @@ pub fn index_markdown_directory_since_with_ignore(
         files_checked += 1;
 
         // Filter by modification time via ContentReader metadata.
-        let (mtime_secs, file_size) = match reader.file_meta(&rel_path) {
-            Ok(Some((m, s))) => (m, s),
-            _ => continue,
+        // Bare repos (GitBareReader) return None — skip mtime filter, always process.
+        match reader.file_meta(&rel_path) {
+            Ok(Some((mtime_secs, file_size))) => {
+                if mtime_secs < since_secs {
+                    continue;
+                }
+                if file_size > MAX_FILE_SIZE_BYTES {
+                    tracing::warn!("skipping oversized file: {}", rel_str);
+                    continue;
+                }
+            }
+            Ok(None) => {} // bare repo: no mtime, process unconditionally
+            Err(_) => continue,
         };
-        if mtime_secs < since_secs {
-            continue;
-        }
-
-        // Size guard.
-        if file_size > MAX_FILE_SIZE_BYTES {
-            tracing::warn!("skipping oversized file: {}", rel_str);
-            continue;
-        }
 
         let source = match reader.read_file(&rel_path) {
             Ok(s) => s,
@@ -694,14 +694,14 @@ fn index_into_store(
         }
 
         // Size guard.
-        if let Ok(Some((_, size))) = reader.file_meta(&rel_path) {
-            if size > MAX_FILE_SIZE_BYTES {
-                skipped.push(SkippedFile {
-                    path: rel_str.into_owned(),
-                    reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
-                });
-                continue;
-            }
+        if let Ok(Some((_, size))) = reader.file_meta(&rel_path)
+            && size > MAX_FILE_SIZE_BYTES
+        {
+            skipped.push(SkippedFile {
+                path: rel_str.into_owned(),
+                reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
+            });
+            continue;
         }
 
         scanned_notes.push(ScannedNote { rel_path });
@@ -2152,5 +2152,34 @@ sub b body
             "drafts/wip.md should be excluded by .brainignore"
         );
         assert_eq!(result.notes_count, 1);
+    }
+
+    #[test]
+    fn bare_repo_markdown_not_skipped_by_mtime() {
+        use crate::content_reader::ContentReader;
+        use std::path::{Path, PathBuf};
+
+        struct MockBareReader;
+        impl ContentReader for MockBareReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                Ok("# Test Note\n\nSome content.".to_string())
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("notes/test.md")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path { Path::new("/fake/bare") }
+            fn version_id(&self) -> &str { "abc123" }
+        }
+
+        let reader = MockBareReader;
+        let files = reader.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        let meta = reader.file_meta(&files[0]).unwrap();
+        assert!(meta.is_none());
+        let content = reader.read_file(&files[0]).unwrap();
+        assert!(content.contains("# Test Note"));
     }
 }
