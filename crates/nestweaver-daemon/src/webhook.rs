@@ -66,9 +66,18 @@ pub async fn handle_webhook(
     nestweaver_web::routes::metrics::WEBHOOKS_RECEIVED.inc();
 
     if let Some(token) = gitlab_token {
-        if token != state.config.secret && state.config.secret_old.as_deref() != Some(token) {
+        let current_match = crate::auth::secure_eq(token.as_bytes(), state.config.secret.as_bytes());
+        let old_match = state
+            .config
+            .secret_old
+            .as_deref()
+            .is_some_and(|old| crate::auth::secure_eq(token.as_bytes(), old.as_bytes()));
+        if !current_match && !old_match {
             nestweaver_web::routes::metrics::WEBHOOK_SIG_FAILURES.inc();
             return (StatusCode::UNAUTHORIZED, "invalid token");
+        }
+        if old_match && !current_match {
+            tracing::warn!("GitLab webhook matched old secret — rotate to new secret");
         }
     } else if !verify_signature(&body, sig_header, &state.config) {
         nestweaver_web::routes::metrics::WEBHOOK_SIG_FAILURES.inc();
@@ -87,13 +96,12 @@ pub async fn handle_webhook(
 
     // 2b. Check whether this repo is in the allowed set.
     let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
-    if let Ok(allowed_guard) = state.allowed_repos.read() {
-        if let Some(ref allowed) = *allowed_guard {
-            if !allowed.contains(&repo_id) {
-                tracing::info!(%url, "webhook ignored: repo not in allowed set");
-                return (StatusCode::OK, "ignored");
-            }
-        }
+    if let Ok(allowed_guard) = state.allowed_repos.read()
+        && let Some(ref allowed) = *allowed_guard
+        && !allowed.contains(&repo_id)
+    {
+        tracing::info!(%url, "webhook ignored: repo not in allowed set");
+        return (StatusCode::OK, "ignored");
     }
 
     // 3. Enqueue job with the configured branch (if any).
@@ -132,11 +140,11 @@ fn verify_signature(body: &[u8], sig_header: Option<&str>, config: &WebhookConfi
     }
 
     // Fall back to old secret (dual-secret rotation).
-    if let Some(ref old) = config.secret_old {
-        if verify_hmac(body, sig_hex, old) {
-            tracing::warn!("webhook matched old secret — rotate to new secret");
-            return true;
-        }
+    if let Some(ref old) = config.secret_old
+        && verify_hmac(body, sig_hex, old)
+    {
+        tracing::warn!("webhook matched old secret — rotate to new secret");
+        return true;
     }
 
     false
