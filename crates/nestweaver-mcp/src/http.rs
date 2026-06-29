@@ -5,12 +5,17 @@
 //! `tools/call` — the latter delegates to the same `tools::dispatch`
 //! function used by the stdio server.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    routing::post,
+};
 use dashmap::DashMap;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
@@ -24,6 +29,13 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a session can be idle before the sweeper removes it.
 const SESSION_TTL_SECS: u64 = 3600; // 1 hour
+
+/// How long a rate-limit bucket can be idle before the sweeper evicts it.
+/// A bucket that has not been touched for this long has fully refilled and is
+/// therefore indistinguishable from a fresh one, so evicting it loses no state.
+/// This bounds the growth of [`HttpRateLimiter::buckets`], which would
+/// otherwise retain one entry for every distinct client key ever observed.
+const BUCKET_TTL_SECS: u64 = 600; // 10 minutes
 
 /// How often the background sweeper runs.
 const SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -115,6 +127,17 @@ impl HttpRateLimiter {
             false
         }
     }
+
+    /// Evict buckets whose last activity (`last_refill`) is older than `ttl`
+    /// relative to `now`. Pure over its inputs so it can be unit-tested with a
+    /// frozen clock; the background sweeper supplies `(self.clock)()` for `now`.
+    /// Returns the number of buckets removed.
+    fn sweep_idle_buckets(&self, now: Instant, ttl: Duration) -> usize {
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_key, bucket| now.duration_since(bucket.last_refill) < ttl);
+        before - self.buckets.len()
+    }
 }
 
 /// Shared state for the MCP HTTP handler.
@@ -202,6 +225,22 @@ pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
             tokio::time::sleep(interval).await;
             let now = Instant::now();
             sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
+        }
+    });
+}
+
+/// Spawn a background task that evicts rate-limit buckets idle longer than
+/// [`BUCKET_TTL_SECS`], mirroring [`spawn_session_sweeper`]. Without this the
+/// limiter's `buckets` map grows without bound — it gains an entry for every
+/// distinct client key ever seen and never releases one.
+pub fn spawn_bucket_sweeper(limiter: Arc<HttpRateLimiter>) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(SWEEP_INTERVAL_SECS);
+        let ttl = Duration::from_secs(BUCKET_TTL_SECS);
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = (limiter.clock)();
+            limiter.sweep_idle_buckets(now, ttl);
         }
     });
 }
@@ -307,6 +346,38 @@ fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: 
     }
 }
 
+/// Derive the rate-limit bucket key for a request.
+///
+/// `trust_session_id` MUST be false for `initialize` and any other pre-session
+/// request: there the `mcp-session-id` header is attacker-controlled and not
+/// yet bound to a real session. Keying on it in that case would let a caller
+/// rotate the header on every `initialize` and mint a brand-new full bucket
+/// each time, never getting throttled. Pre-session requests instead fall back
+/// to a stable client identity — the peer IP when available, otherwise the
+/// bearer identity, otherwise a single shared anonymous bucket — so the
+/// identity gets throttled regardless of how the header is rotated.
+fn http_client_rate_limit_key(
+    provided_bearer: Option<&str>,
+    session_id: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
+    trust_session_id: bool,
+    admin_bypass_rate_limit: bool,
+) -> String {
+    if admin_bypass_rate_limit {
+        return "bearer:admin".to_string();
+    }
+    if trust_session_id && let Some(sid) = session_id {
+        return format!("session:{sid}");
+    }
+    if let Some(ip) = peer_ip {
+        return format!("ip:{ip}");
+    }
+    if provided_bearer.is_some() {
+        return "bearer:query".to_string();
+    }
+    "anonymous-stateless".to_string()
+}
+
 /// Build an axum [`Router`] that serves `POST /mcp`.
 pub fn router(state: Arc<McpHttpState>) -> Router {
     Router::new()
@@ -327,11 +398,43 @@ struct JsonRpcRequest {
     params: Option<Value>,
 }
 
+/// Optional peer-address extractor.
+///
+/// `ConnectInfo<SocketAddr>` *rejects* the request when connection info is
+/// absent (the TLS listener serves connections directly via hyper without it,
+/// and `oneshot` in tests supplies none), and axum 0.8 does not implement
+/// `OptionalFromRequestParts` for it. This wrapper reads the `ConnectInfo`
+/// extension directly and yields `None` instead of failing, so the handler can
+/// fall back to a different rate-limit identity.
+struct OptionalPeerAddr(Option<SocketAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for OptionalPeerAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr),
+        ))
+    }
+}
+
 async fn handle_mcp(
     State(state): State<Arc<McpHttpState>>,
+    // Peer address, populated by `into_make_service_with_connect_info` on the
+    // plaintext listener; `None` over TLS (served directly via hyper) and in
+    // unit tests (`oneshot`). When absent we fall back to the bearer identity
+    // for keying.
+    OptionalPeerAddr(peer_addr): OptionalPeerAddr,
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+    let peer_ip = peer_addr.map(|addr| addr.ip());
     let provided_bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -399,19 +502,25 @@ async fn handle_mcp(
         );
     }
 
+    // The client-supplied session id is only a trustworthy rate-limit key once
+    // it names an established session. `initialize` always mints a fresh
+    // session, so its inbound id is never trusted — this is what closes the
+    // rotate-the-header bypass (see `http_client_rate_limit_key`).
+    let trust_session_id = req.method != "initialize"
+        && session_id
+            .as_deref()
+            .map(|sid| state.sessions.contains_key(sid))
+            .unwrap_or(false);
+
     // Per-session rate limiting (server mode only).
     if state.server_mode {
-        let client_key = if provided_bearer.is_some() {
-            if admin_bypass_rate_limit {
-                "bearer:admin".to_string()
-            } else {
-                "bearer:query".to_string()
-            }
-        } else if let Some(ref sid) = session_id {
-            format!("session:{sid}")
-        } else {
-            "anonymous-stateless".to_string()
-        };
+        let client_key = http_client_rate_limit_key(
+            provided_bearer,
+            session_id.as_deref(),
+            peer_ip,
+            trust_session_id,
+            admin_bypass_rate_limit,
+        );
 
         if !admin_bypass_rate_limit && !state.client_rate_limiter.check(&client_key) {
             return (
@@ -660,6 +769,39 @@ mod tests {
         router(state)
     }
 
+    fn test_server_auth_app_with_limiter(requests_per_min: u64) -> Router {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+            "shared-query-token".to_string(),
+            Some("admin-token".to_string()),
+        );
+        let frozen = Instant::now();
+        state.client_rate_limiter = Arc::new(HttpRateLimiter::new_with_clock(
+            requests_per_min,
+            Arc::new(move || frozen),
+        ));
+        let state = Arc::new(state);
+        for sid in ["session-a", "session-b"] {
+            state.sessions.insert(
+                sid.to_string(),
+                McpSession {
+                    id: sid.to_string(),
+                    created_at: frozen,
+                    last_active: frozen,
+                    request_count: 0,
+                    rate_window_start: frozen,
+                },
+            );
+        }
+        router(state)
+    }
+
     #[test]
     fn safeguard_rejects_over_depth_instead_of_clamping() {
         let mut args = json!({
@@ -757,6 +899,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sweep_idle_buckets_evicts_entries_idle_past_ttl() {
+        let frozen = Instant::now();
+        let limiter = HttpRateLimiter::new_with_clock(RATE_LIMIT_PER_MIN, Arc::new(move || frozen));
+
+        // Touch three distinct clients so each gets a bucket (last_refill = frozen).
+        for key in ["a", "b", "c"] {
+            assert!(limiter.check(key));
+        }
+        assert_eq!(limiter.buckets.len(), 3);
+
+        // Sweeping at the frozen instant evicts nothing — every bucket is fresh.
+        let ttl = Duration::from_secs(BUCKET_TTL_SECS);
+        assert_eq!(limiter.sweep_idle_buckets(frozen, ttl), 0);
+        assert_eq!(limiter.buckets.len(), 3);
+
+        // Advancing `now` past the TTL makes every bucket idle and evictable,
+        // bounding the map's growth instead of leaking an entry per client key.
+        let later = frozen + ttl + Duration::from_secs(1);
+        assert_eq!(limiter.sweep_idle_buckets(later, ttl), 3);
+        assert_eq!(limiter.buckets.len(), 0);
+    }
+
+    #[test]
+    fn rate_limit_key_ignores_client_session_id_for_pre_session_requests() {
+        // Pre-session (initialize): a rotating, untrusted session id must not
+        // change the key — it resolves to the stable bearer identity instead,
+        // so the caller cannot mint a fresh full bucket per request.
+        let k1 = http_client_rate_limit_key(Some("tok"), Some("rotating-1"), None, false, false);
+        let k2 = http_client_rate_limit_key(Some("tok"), Some("rotating-2"), None, false, false);
+        assert_eq!(k1, k2);
+        assert_eq!(k1, "bearer:query");
+
+        // With a peer IP available the pre-session key is the IP — still stable
+        // across rotated session ids.
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let k3 = http_client_rate_limit_key(None, Some("rotating-1"), Some(ip), false, false);
+        let k4 = http_client_rate_limit_key(None, Some("rotating-2"), Some(ip), false, false);
+        assert_eq!(k3, k4);
+        assert_eq!(k3, "ip:203.0.113.7");
+
+        // An established (trusted) session still keys per session, as before.
+        let k5 = http_client_rate_limit_key(Some("tok"), Some("sess-x"), None, true, false);
+        assert_eq!(k5, "session:sess-x");
+
+        // Admin always bypasses to its own bucket regardless of the session id.
+        let k6 = http_client_rate_limit_key(Some("tok"), Some("sess-x"), None, true, true);
+        assert_eq!(k6, "bearer:admin");
+    }
+
     #[tokio::test]
     async fn initialize_returns_server_info() {
         let app = test_app();
@@ -836,6 +1028,76 @@ mod tests {
             let json: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(json["result"]["tools"].is_array(), "{json}");
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_rate_limit_is_keyed_by_session_when_present() {
+        let app = test_server_auth_app_with_limiter(1);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/list",
+        });
+
+        for sid in ["session-a", "session-b"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer shared-query-token")
+                .header("mcp-session-id", sid)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "session {sid} should not inherit another session's bearer bucket"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json["result"]["tools"].is_array(), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rotating_session_id_on_initialize_does_not_mint_fresh_buckets() {
+        // Capacity of 1: the same identity gets exactly one request before
+        // being throttled. Rotating the mcp-session-id header across repeated
+        // `initialize` calls must NOT escape the throttle — the old code keyed
+        // on the client-supplied session id and minted a fresh full bucket each
+        // time, so it never throttled.
+        let app = test_server_auth_app_with_limiter(1);
+
+        let mut statuses = Vec::new();
+        for sid in ["rotating-1", "rotating-2"] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer shared-query-token")
+                .header("mcp-session-id", sid)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            statuses.push(resp.status());
+        }
+
+        assert_eq!(statuses[0], StatusCode::OK, "first initialize is allowed");
+        assert_eq!(
+            statuses[1],
+            StatusCode::TOO_MANY_REQUESTS,
+            "rotating the session id must not mint a fresh bucket — the identity stays throttled"
+        );
     }
 
     #[tokio::test]
