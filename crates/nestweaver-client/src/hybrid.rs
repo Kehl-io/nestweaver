@@ -4,8 +4,8 @@
 //! `DaemonClient`. When upstreams exist, queries are routed based on the
 //! upstream's routing mode:
 //!
-//! - **Fallback**: query local first; if results are sparse (< threshold),
-//!   query server as fallback.
+//! - **Fallback**: query local first; if results are sparse (< threshold) or
+//!   the matching local repo is stale, query server as fallback.
 //! - **Merge**: query both in parallel, merge via weighted RRF + scope-hash dedup.
 //! - **Primary**: always query server; local only for uncommitted file overlay.
 
@@ -217,6 +217,8 @@ impl HybridClient {
         }
 
         let mut routing = tool_routing(tool_name);
+        let mut fallback_mode = false;
+        let repo_hint = extract_repo_hint(params);
 
         // Let the upstream's RoutingMode override the per-tool default.
         // LocalOnly and TwoTier are never overridden (they have tool-specific
@@ -224,23 +226,28 @@ impl HybridClient {
         if routing != ToolRouting::LocalOnly
             && routing != ToolRouting::TwoTier
             && routing != ToolRouting::Combined
+            && let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint)
         {
-            let repo_hint = extract_repo_hint(params);
-            if let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint) {
-                match upstream.mode {
-                    RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
-                    RoutingMode::Merge => routing = ToolRouting::Merge,
-                    RoutingMode::Fallback => routing = ToolRouting::LocalFirst,
+            match upstream.mode {
+                RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
+                RoutingMode::Merge => routing = ToolRouting::Merge,
+                RoutingMode::Fallback => {
+                    routing = ToolRouting::LocalFirst;
+                    fallback_mode = true;
                 }
             }
         }
-
-        let mut result = self.route_query(routing, tool_name, params).await?;
 
         // Populate `_meta.stale_repos` provenance (TTL-cached) so callers know
         // which repos the local index is behind on. Without this the field was
         // always empty even when the local graph was stale.
         let stale = self.current_stale_repos().await;
+        let force_fallback_server = fallback_mode && query_targets_stale_repo(repo_hint, &stale);
+
+        let mut result = self
+            .route_query(routing, tool_name, params, force_fallback_server)
+            .await?;
+
         if !stale.is_empty() {
             set_stale_repos(&mut result, &stale);
         }
@@ -254,6 +261,7 @@ impl HybridClient {
         routing: ToolRouting,
         tool_name: &str,
         params: &Value,
+        force_fallback_server: bool,
     ) -> Result<Value> {
         match routing {
             ToolRouting::LocalOnly => {
@@ -295,7 +303,10 @@ impl HybridClient {
                 Ok(result)
             }
             ToolRouting::Merge | ToolRouting::FanOut => self.query_merge(tool_name, params).await,
-            ToolRouting::LocalFirst => self.query_fallback(tool_name, params).await,
+            ToolRouting::LocalFirst => {
+                self.query_fallback_with_staleness(tool_name, params, force_fallback_server)
+                    .await
+            }
         }
     }
 
@@ -353,6 +364,17 @@ impl HybridClient {
     /// Fallback routing: query local first, query server only if local
     /// results are sparse (fewer than [`FALLBACK_THRESHOLD`]).
     pub async fn query_fallback(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        self.query_fallback_with_staleness(tool_name, params, false)
+            .await
+    }
+
+    /// Fallback routing with a stale-repo override from [`query`].
+    async fn query_fallback_with_staleness(
+        &mut self,
+        tool_name: &str,
+        params: &Value,
+        force_server_for_stale_repo: bool,
+    ) -> Result<Value> {
         // 1. Always query local first.
         let mut local_result = self.query_local(tool_name, params).await?;
 
@@ -362,10 +384,10 @@ impl HybridClient {
             return Ok(local_result);
         }
 
-        // 3. Check if local results are sufficient. When local returns 0
-        // results, always query the server regardless of threshold.
+        // 3. Check if local results are sufficient and fresh. When local
+        // returns 0 results or the repo is stale, query the server.
         let local_count = count_results(&local_result);
-        if local_count >= FALLBACK_THRESHOLD {
+        if !fallback_should_query_server(local_count, force_server_for_stale_repo) {
             debug!(
                 tool = tool_name,
                 local_count, "fallback: local results sufficient, skipping server"
@@ -380,7 +402,8 @@ impl HybridClient {
             tool = tool_name,
             local_count,
             threshold = FALLBACK_THRESHOLD,
-            "fallback: local results sparse, querying server"
+            stale_repo = force_server_for_stale_repo,
+            "fallback: local results sparse or stale, querying server"
         );
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(server_result) => {
@@ -516,8 +539,9 @@ impl HybridClient {
 
             if let Ok(resp) = client.repo_states(req).await {
                 for server_repo in resp.into_inner().repos {
-                    if let Some(local_sha) = local_states.get(&server_repo.repo_url)
-                        && local_sha != &server_repo.indexed_sha
+                    if let Some(local_sha) =
+                        local_sha_for_server_repo(&local_states, &server_repo.repo_url)
+                        && local_sha != server_repo.indexed_sha.as_str()
                         && !server_repo.indexed_sha.is_empty()
                     {
                         stale.push(server_repo.repo_url.clone());
@@ -566,8 +590,9 @@ impl HybridClient {
                     status.repo_count = server_repos.len();
 
                     for server_repo in &server_repos {
-                        if let Some(local_sha) = local_states.get(&server_repo.repo_url)
-                            && local_sha != &server_repo.indexed_sha
+                        if let Some(local_sha) =
+                            local_sha_for_server_repo(&local_states, &server_repo.repo_url)
+                            && local_sha != server_repo.indexed_sha.as_str()
                             && !server_repo.indexed_sha.is_empty()
                         {
                             status.stale_repos.push(server_repo.repo_url.clone());
@@ -585,6 +610,28 @@ impl HybridClient {
     /// Query the local daemon via its gRPC channel.
     async fn query_local(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         dispatch_json_rpc(self.local.inner_mut(), tool_name, params).await
+    }
+
+    /// The set of `repo_uid`s the LOCAL daemon has indexed.
+    ///
+    /// Used by flow_trace boundary detection to tell a genuinely cross-repo
+    /// leaf (foreign repo, not resolvable here) apart from a leaf that resolves
+    /// into another repo the local index *also* knows about. The latter is
+    /// followed locally, not stitched from the server. Returns an empty set on
+    /// RPC failure, which preserves the prior (foreign-repo == boundary)
+    /// behavior so detection degrades safely rather than dropping boundaries.
+    async fn local_repo_uids(&mut self) -> std::collections::HashSet<String> {
+        let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+        match self.local.inner_mut().repo_states(req).await {
+            Ok(resp) => resp
+                .into_inner()
+                .repos
+                .into_iter()
+                .map(|r| r.repo_uid)
+                .filter(|uid| !uid.is_empty())
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        }
     }
 
     /// Query an upstream server via its gRPC channel with a timeout.
@@ -1240,6 +1287,122 @@ fn extract_repo_hint(params: &Value) -> Option<&str> {
         .or_else(|| params.get("repo_url").and_then(|v| v.as_str()))
 }
 
+fn query_targets_stale_repo(repo_hint: Option<&str>, stale_repos: &[String]) -> bool {
+    if stale_repos.is_empty() {
+        return false;
+    }
+    let Some(repo_hint) = repo_hint else {
+        return true;
+    };
+    stale_repos
+        .iter()
+        .any(|stale| repo_urls_equivalent(stale, repo_hint))
+}
+
+fn repo_urls_equivalent(a: &str, b: &str) -> bool {
+    normalized_repo_key(a) == normalized_repo_key(b)
+        || repo_name(a)
+            .zip(repo_name(b))
+            .is_some_and(|(a_name, b_name)| a_name.eq_ignore_ascii_case(&b_name))
+}
+
+fn fallback_should_query_server(local_count: usize, stale_repo: bool) -> bool {
+    stale_repo || local_count < FALLBACK_THRESHOLD
+}
+
+fn local_sha_for_server_repo<'a>(
+    local_states: &'a std::collections::HashMap<String, String>,
+    server_repo_url: &str,
+) -> Option<&'a str> {
+    if let Some(sha) = local_states.get(server_repo_url) {
+        return Some(sha.as_str());
+    }
+
+    let server_key = normalized_repo_key(server_repo_url);
+    for (local_url, sha) in local_states {
+        if normalized_repo_key(local_url) == server_key {
+            return Some(sha.as_str());
+        }
+    }
+
+    let server_name = repo_name(server_repo_url)?;
+    let mut match_sha = None;
+    for (local_url, sha) in local_states {
+        let Some(local_name) = repo_name(local_url) else {
+            continue;
+        };
+        if local_name.eq_ignore_ascii_case(&server_name) {
+            if match_sha.is_some() {
+                return None;
+            }
+            match_sha = Some(sha.as_str());
+        }
+    }
+    match_sha
+}
+
+fn normalized_repo_key(repo_url: &str) -> String {
+    let repo = strip_git_suffix(strip_url_suffix(repo_url.trim()).trim_end_matches('/'));
+
+    if let Some(path) = repo.strip_prefix("file://") {
+        return path_leaf(path);
+    }
+
+    if let Some((_, rest)) = repo.split_once("://") {
+        return normalize_remote_path(rest);
+    }
+
+    if let Some((_, rest)) = repo.split_once('@')
+        && let Some((host, path)) = rest.split_once(':')
+    {
+        return format!("{host}/{path}")
+            .trim_matches('/')
+            .to_ascii_lowercase();
+    }
+
+    if repo.starts_with('/') || repo.starts_with("./") || repo.starts_with("../") {
+        return path_leaf(repo);
+    }
+
+    repo.trim_matches('/').to_ascii_lowercase()
+}
+
+fn repo_name(repo_url: &str) -> Option<String> {
+    let key = normalized_repo_key(repo_url);
+    key.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+}
+
+fn normalize_remote_path(remote: &str) -> String {
+    let without_auth = remote
+        .split_once('/')
+        .map(|(host, path)| {
+            let host = host.rsplit('@').next().unwrap_or(host);
+            format!("{host}/{path}")
+        })
+        .unwrap_or_else(|| remote.to_string());
+    without_auth.trim_matches('/').to_ascii_lowercase()
+}
+
+fn path_leaf(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn strip_url_suffix(repo_url: &str) -> &str {
+    repo_url.split(['?', '#']).next().unwrap_or(repo_url)
+}
+
+fn strip_git_suffix(repo_url: &str) -> &str {
+    repo_url.strip_suffix(".git").unwrap_or(repo_url)
+}
+
 // ── Result helpers ────────────────────────────────────────────────────
 
 /// Count the number of result items in a JSON response.
@@ -1477,10 +1640,20 @@ pub struct TraceBoundary {
 /// Detect cross-repo boundary symbols in a flow_trace JSON result tree.
 ///
 /// A boundary is a leaf node whose `repo_uid` differs from the root
-/// node's `repo_uid` (the locally-initiated trace). These represent
-/// cross-repo call edges — the callee resolves in another repo (a
-/// `CROSS_REPO_LINK` stub), so it is unresolved in the local repo and the
-/// upstream server should continue the trace from there.
+/// node's `repo_uid` (the locally-initiated trace) **and** is not itself a
+/// repo the local index knows about. These represent cross-repo call edges
+/// the local daemon cannot follow — the callee resolves in another repo (a
+/// `CROSS_REPO_LINK` stub) that is unresolved locally, so the upstream
+/// server should continue the trace from there.
+///
+/// `local_repos` is the set of `repo_uid`s the LOCAL daemon has indexed (see
+/// [`HybridClient::local_repo_uids`]). When the local daemon indexes more
+/// than one repo, a trace can legitimately resolve *into* another local repo;
+/// that leaf carries a foreign `repo_uid` but is still locally followed, so
+/// flagging it would emit a spurious server continuation. Excluding leaves
+/// whose `repo_uid` is in `local_repos` prevents that false positive. An
+/// empty set restores the prior "any foreign-repo leaf is a boundary"
+/// behavior, which is the safe default when the local repo set is unknown.
 ///
 /// Two flow_trace response shapes are handled:
 /// - the standard single-root trace `{ root_uid, tree: {...} }`, and
@@ -1493,12 +1666,15 @@ pub struct TraceBoundary {
 /// them and therefore yield no boundaries).
 ///
 /// See architecture spec: cross-boundary-flow-trace.md
-pub fn detect_boundaries_in_trace(result: &Value) -> Vec<TraceBoundary> {
+pub fn detect_boundaries_in_trace(
+    result: &Value,
+    local_repos: &std::collections::HashSet<String>,
+) -> Vec<TraceBoundary> {
     let mut boundaries = Vec::new();
 
     if let Some(tree) = result.get("tree") {
         // Standard single-root trace.
-        collect_from_root(tree, &mut boundaries);
+        collect_from_root(tree, local_repos, &mut boundaries);
     } else if let Some(methods) = result.get("methods").and_then(|v| v.as_array()) {
         // Class-expanded trace: each method is its own subtree rooted in the
         // class's repo. Use the first method that carries a repo_uid as the
@@ -1514,12 +1690,12 @@ pub fn detect_boundaries_in_trace(result: &Value) -> Vec<TraceBoundary> {
         } else {
             for method in methods {
                 let mut path = Vec::new();
-                collect_boundaries(method, &root_repo, &mut path, &mut boundaries);
+                collect_boundaries(method, &root_repo, local_repos, &mut path, &mut boundaries);
             }
         }
     } else {
         // The result itself may be a bare trace node.
-        collect_from_root(result, &mut boundaries);
+        collect_from_root(result, local_repos, &mut boundaries);
     }
 
     debug!(
@@ -1539,19 +1715,24 @@ fn nonempty_repo_uid(node: &Value) -> Option<String> {
 
 /// Walk a single trace tree rooted at `root`, collecting boundaries against
 /// the root's own `repo_uid`. A no-op when the root lacks a `repo_uid`.
-fn collect_from_root(root: &Value, out: &mut Vec<TraceBoundary>) {
+fn collect_from_root(
+    root: &Value,
+    local_repos: &std::collections::HashSet<String>,
+    out: &mut Vec<TraceBoundary>,
+) {
     let Some(root_repo) = nonempty_repo_uid(root) else {
         debug!("detect_boundaries_in_trace: root node lacks repo_uid, cannot detect boundaries");
         return;
     };
     let mut path = Vec::new();
-    collect_boundaries(root, &root_repo, &mut path, out);
+    collect_boundaries(root, &root_repo, local_repos, &mut path, out);
 }
 
 /// Recursively walk the flow_trace tree collecting boundary nodes.
 fn collect_boundaries(
     node: &Value,
     root_repo: &str,
+    local_repos: &std::collections::HashSet<String>,
     path: &mut Vec<String>,
     out: &mut Vec<TraceBoundary>,
 ) {
@@ -1564,9 +1745,18 @@ fn collect_boundaries(
         .unwrap_or("");
     let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-    // A boundary: different repo than the root, is a leaf (trace couldn't follow),
-    // and has a canonical_id for cross-boundary matching.
-    if is_leaf && !repo_uid.is_empty() && repo_uid != root_repo && !canonical_id.is_empty() {
+    // A boundary: different repo than the root, is a leaf (trace couldn't
+    // follow), has a canonical_id for cross-boundary matching, and is NOT a
+    // repo the local index knows about. The last clause is the false-positive
+    // guard: a foreign-repo leaf that the local daemon *can* resolve (another
+    // locally-indexed repo) was already followed here, so continuing it on the
+    // server would be a spurious round-trip.
+    if is_leaf
+        && !repo_uid.is_empty()
+        && repo_uid != root_repo
+        && !canonical_id.is_empty()
+        && !local_repos.contains(repo_uid)
+    {
         out.push(TraceBoundary {
             canonical_id: canonical_id.to_string(),
             name: name.to_string(),
@@ -1577,7 +1767,7 @@ fn collect_boundaries(
     if let Some(children) = children {
         path.push(name.to_string());
         for child in children {
-            collect_boundaries(child, root_repo, path, out);
+            collect_boundaries(child, root_repo, local_repos, path, out);
         }
         path.pop();
     }
@@ -1728,9 +1918,12 @@ pub async fn flow_trace_with_stitching(
     // 1. Run flow_trace locally.
     let mut local_result = client.query_local("flow_trace", params).await?;
 
-    // 2. Detect boundaries (from JSON or explicit).
+    // 2. Detect boundaries (from JSON or explicit). Auto-detection needs the
+    // set of repos the LOCAL index knows about so a leaf that resolves into
+    // another local repo isn't mistaken for a server continuation boundary.
     let boundaries = if explicit_boundaries.is_empty() {
-        detect_boundaries_in_trace(&local_result)
+        let local_repos = client.local_repo_uids().await;
+        detect_boundaries_in_trace(&local_result, &local_repos)
     } else {
         explicit_boundaries.to_vec()
     };
@@ -2319,6 +2512,41 @@ mod tests {
         assert!(count_results(&local) < FALLBACK_THRESHOLD);
     }
 
+    #[test]
+    fn fallback_queries_server_when_repo_is_stale_even_with_sufficient_local_results() {
+        assert!(
+            fallback_should_query_server(FALLBACK_THRESHOLD, true),
+            "stale fallback repos must query upstream even when local has enough hits"
+        );
+        assert!(
+            !fallback_should_query_server(FALLBACK_THRESHOLD, false),
+            "fresh repos with enough local hits should keep the local fast path"
+        );
+    }
+
+    #[test]
+    fn repo_state_lookup_matches_file_checkout_to_remote_url() {
+        let local_states = std::collections::HashMap::from([
+            (
+                "file:///home/user/dev/workspaces/api".to_string(),
+                "local-sha".to_string(),
+            ),
+            (
+                "file:///home/user/dev/workspaces/billing".to_string(),
+                "billing-sha".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            local_sha_for_server_repo(&local_states, "https://github.com/acme/api.git"),
+            Some("local-sha")
+        );
+        assert_eq!(
+            local_sha_for_server_repo(&local_states, "git@github.com:acme/billing.git"),
+            Some("billing-sha")
+        );
+    }
+
     // ── Merge helpers test ────────────────────────────────────────
 
     #[test]
@@ -2578,6 +2806,12 @@ mod tests {
         assert_eq!(local_result, original);
     }
 
+    /// Empty local-repo set: the common single-repo case where every
+    /// foreign-repo leaf is a genuine cross-repo boundary.
+    fn no_local_repos() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn detect_boundaries_needs_root_repo_uid() {
         // Concise / unannotated traces have no repo_uid on the root, so the
@@ -2589,7 +2823,7 @@ mod tests {
             }
         });
         assert!(
-            detect_boundaries_in_trace(&result).is_empty(),
+            detect_boundaries_in_trace(&result, &no_local_repos()).is_empty(),
             "no repo_uid on root means no boundaries"
         );
     }
@@ -2611,7 +2845,7 @@ mod tests {
                 }]
             }
         });
-        let boundaries = detect_boundaries_in_trace(&result);
+        let boundaries = detect_boundaries_in_trace(&result, &no_local_repos());
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].name, "funcB");
         assert_eq!(boundaries[0].canonical_id, "def:src/api.rs#funcB:uvw");
@@ -2642,7 +2876,7 @@ mod tests {
                 }]
             }
         });
-        let boundaries = detect_boundaries_in_trace(&result);
+        let boundaries = detect_boundaries_in_trace(&result, &no_local_repos());
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].canonical_id, "b:leaf");
         assert_eq!(
@@ -2667,7 +2901,7 @@ mod tests {
             }
         });
         assert!(
-            detect_boundaries_in_trace(&result).is_empty(),
+            detect_boundaries_in_trace(&result, &no_local_repos()).is_empty(),
             "same-repo leaves and canonical-id-less foreign leaves are not boundaries"
         );
     }
@@ -2693,7 +2927,7 @@ mod tests {
             }
         });
         assert!(
-            detect_boundaries_in_trace(&result).is_empty(),
+            detect_boundaries_in_trace(&result, &no_local_repos()).is_empty(),
             "a foreign node with local children is not a leaf boundary"
         );
     }
@@ -2726,11 +2960,70 @@ mod tests {
                 }
             ]
         });
-        let boundaries = detect_boundaries_in_trace(&result);
+        let boundaries = detect_boundaries_in_trace(&result, &no_local_repos());
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].name, "remoteApi");
         assert_eq!(boundaries[0].canonical_id, "b:remoteApi");
         assert_eq!(boundaries[0].parent_path, vec!["methodCalls".to_string()]);
+    }
+
+    #[test]
+    fn detect_boundaries_skips_leaf_resolvable_in_another_local_repo() {
+        // Multi-repo local daemon: the trace resolves from repo A INTO repo B,
+        // and the local index also has repo B indexed. That leaf carries a
+        // foreign repo_uid but is locally followed, so it must NOT be flagged
+        // as a cross-repo boundary (no spurious server continuation).
+        let result = json!({
+            "tree": {
+                "name": "funcA",
+                "repo_uid": "local-repo-a",
+                "canonical_id": "a:src/lib.rs#funcA",
+                "children": [{
+                    "name": "funcB",
+                    "repo_uid": "local-repo-b",
+                    "canonical_id": "b:src/api.rs#funcB",
+                    "children": []
+                }]
+            }
+        });
+        let local_repos: std::collections::HashSet<String> =
+            ["local-repo-a".to_string(), "local-repo-b".to_string()]
+                .into_iter()
+                .collect();
+        assert!(
+            detect_boundaries_in_trace(&result, &local_repos).is_empty(),
+            "a foreign-repo leaf the local index can resolve is not a boundary"
+        );
+    }
+
+    #[test]
+    fn detect_boundaries_flags_leaf_in_unindexed_foreign_repo() {
+        // Same multi-repo daemon, but the leaf resolves into a repo the local
+        // index does NOT know about. That is a genuine cross-repo edge the
+        // server must continue, so it stays a boundary even when other repos
+        // are indexed locally.
+        let result = json!({
+            "tree": {
+                "name": "funcA",
+                "repo_uid": "local-repo-a",
+                "canonical_id": "a:src/lib.rs#funcA",
+                "children": [{
+                    "name": "funcRemote",
+                    "repo_uid": "server-only-repo",
+                    "canonical_id": "r:src/remote.rs#funcRemote",
+                    "children": []
+                }]
+            }
+        });
+        // Local set has another repo (B) but NOT "server-only-repo".
+        let local_repos: std::collections::HashSet<String> =
+            ["local-repo-a".to_string(), "local-repo-b".to_string()]
+                .into_iter()
+                .collect();
+        let boundaries = detect_boundaries_in_trace(&result, &local_repos);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].name, "funcRemote");
+        assert_eq!(boundaries[0].canonical_id, "r:src/remote.rs#funcRemote");
     }
 
     #[test]

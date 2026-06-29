@@ -69,6 +69,53 @@ fn device_http_base(url: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}:{http_port}"))
 }
 
+/// Control-flow decision for one iteration of the device-flow token poll.
+///
+/// Extracted from the poll loop so the branch logic (RFC 8628 §3.5) is unit
+/// testable without driving real HTTP, sleeps, or a browser.
+#[derive(Debug, PartialEq, Eq)]
+enum PollOutcome {
+    /// Access token granted — carries the extracted token.
+    Granted(String),
+    /// Approval still pending — keep polling at the current interval.
+    Pending,
+    /// Server asked us to slow down — back off, then keep polling.
+    SlowDown,
+    /// Terminal failure with a user-facing message.
+    Failed(String),
+}
+
+/// Classify one `/auth/token` response into a [`PollOutcome`].
+///
+/// `status_success` is whether the HTTP status was 2xx; `status_code` is the raw
+/// status used only to enrich the catch-all error message; `body` is the parsed
+/// JSON (or `Null` if the body didn't parse). The access token is never logged.
+fn classify_token_response(
+    status_success: bool,
+    status_code: u16,
+    body: &serde_json::Value,
+) -> PollOutcome {
+    if status_success {
+        return match body.get("access_token").and_then(|v| v.as_str()) {
+            Some(token) => PollOutcome::Granted(token.to_string()),
+            None => PollOutcome::Failed(
+                "token endpoint returned success without an access token".to_string(),
+            ),
+        };
+    }
+
+    match body.get("error").and_then(|v| v.as_str()) {
+        Some("authorization_pending") => PollOutcome::Pending,
+        // RFC 8628 §3.5: back off by 5s and keep polling.
+        Some("slow_down") => PollOutcome::SlowDown,
+        Some("expired_token") => PollOutcome::Failed(
+            "device code expired before approval — please run connect again".to_string(),
+        ),
+        Some(other) => PollOutcome::Failed(format!("device authorization failed: {other}")),
+        None => PollOutcome::Failed(format!("device authorization failed (HTTP {status_code})")),
+    }
+}
+
 /// Build an HTTP client, trusting an optional self-signed CA (matching the
 /// `--ca-cert` used for the gRPC connection).
 fn build_http_client(ca_cert: Option<&std::path::Path>) -> Result<reqwest::Client> {
@@ -151,25 +198,16 @@ pub async fn device_flow_authenticate(
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
-        if status.is_success() {
-            if let Some(token) = body.get("access_token").and_then(|v| v.as_str()) {
+        match classify_token_response(status.is_success(), status.as_u16(), &body) {
+            PollOutcome::Granted(token) => {
                 eprintln!("Authentication successful.");
-                return Ok(token.to_string());
+                return Ok(token);
             }
-            anyhow::bail!("token endpoint returned success without an access token");
-        }
-
-        match body.get("error").and_then(|v| v.as_str()) {
-            Some("authorization_pending") => continue,
-            Some("slow_down") => {
-                // RFC 8628 §3.5: back off by 5s and keep polling.
+            PollOutcome::Pending => continue,
+            PollOutcome::SlowDown => {
                 interval += std::time::Duration::from_secs(5);
             }
-            Some("expired_token") => {
-                anyhow::bail!("device code expired before approval — please run connect again")
-            }
-            Some(other) => anyhow::bail!("device authorization failed: {other}"),
-            None => anyhow::bail!("device authorization failed (HTTP {status})"),
+            PollOutcome::Failed(msg) => anyhow::bail!(msg),
         }
     }
 }
@@ -313,6 +351,64 @@ mod tests {
     #[test]
     fn device_http_base_rejects_non_numeric_port() {
         assert!(device_http_base("grpc://host:abc").is_err());
+    }
+
+    #[test]
+    fn classify_token_response_extracts_access_token_on_success() {
+        let body = serde_json::json!({ "access_token": "org-query-token" });
+        assert_eq!(
+            classify_token_response(true, 200, &body),
+            PollOutcome::Granted("org-query-token".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_token_response_success_without_token_is_failure() {
+        let body = serde_json::json!({ "something_else": true });
+        match classify_token_response(true, 200, &body) {
+            PollOutcome::Failed(msg) => assert!(msg.contains("without an access token")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_token_response_maps_pending_and_slow_down() {
+        let pending = serde_json::json!({ "error": "authorization_pending" });
+        assert_eq!(
+            classify_token_response(false, 400, &pending),
+            PollOutcome::Pending
+        );
+
+        let slow = serde_json::json!({ "error": "slow_down" });
+        assert_eq!(
+            classify_token_response(false, 400, &slow),
+            PollOutcome::SlowDown
+        );
+    }
+
+    #[test]
+    fn classify_token_response_maps_expired_and_other_errors() {
+        let expired = serde_json::json!({ "error": "expired_token" });
+        match classify_token_response(false, 400, &expired) {
+            PollOutcome::Failed(msg) => assert!(msg.contains("expired")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let other = serde_json::json!({ "error": "access_denied" });
+        match classify_token_response(false, 403, &other) {
+            PollOutcome::Failed(msg) => assert!(msg.contains("access_denied")),
+            outcome => panic!("expected Failed, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_token_response_unparseable_body_includes_status() {
+        // No `error` field (e.g. body failed to parse → Null) surfaces the HTTP
+        // status in the message so the failure is diagnosable.
+        match classify_token_response(false, 503, &serde_json::Value::Null) {
+            PollOutcome::Failed(msg) => assert!(msg.contains("503")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
