@@ -29,7 +29,7 @@ use crate::upstream::UpstreamHandle;
 /// Provenance metadata injected into every hybrid response.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProvenanceMeta {
-    /// Which sources contributed to this response (e.g. ["local"], ["local", "acme"]).
+    /// Which sources contributed to this response (e.g. ["local"], ["local", "server"]).
     pub sources: Vec<String>,
     /// Repos where local index is behind the server's indexed SHA.
     pub stale_repos: Vec<String>,
@@ -50,8 +50,27 @@ pub struct UpstreamStatus {
 /// Minimum result count before we consider querying the server in fallback mode.
 const FALLBACK_THRESHOLD: usize = 5;
 
-/// Default timeout for upstream queries.
+/// Fallback timeout used only when no upstream matches a query's repo hint.
+/// The live per-query timeout is computed adaptively by [`effective_timeout`].
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Multiplier applied to the observed latency EWMA when deriving the adaptive
+/// timeout. ~1.75x the smoothed mean approximates a p95-ish trigger point
+/// without maintaining a full histogram — "The Tail at Scale" (Dean &
+/// Barroso, 2013) argues for hedging/aborting around the 95th percentile
+/// rather than a fixed deadline.
+const TIMEOUT_K: f64 = 1.75;
+
+/// Lower bound on any adaptive timeout. Below this, scheduling jitter
+/// dominates and a tight deadline only manufactures spurious timeouts.
+const TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
+
+/// Hard cap on the *Fallback*-mode upstream timeout. In Fallback mode the
+/// local index is the fast path and the server is consulted only when local
+/// results are sparse, so the upstream must never block the local answer past
+/// the product's <200ms budget. Merge/Primary keep the configured ceiling
+/// (~1s) because the richer upstream answer is the entire point of those modes.
+const FALLBACK_MODE_CAP: Duration = Duration::from_millis(250);
 
 /// How long a cached staleness check stays fresh before the next query
 /// triggers a background-style refresh. Keeps `_meta.stale_repos` populated
@@ -280,11 +299,15 @@ impl HybridClient {
         }
     }
 
-    /// Resolve the configured timeout for the best-matching upstream.
+    /// Resolve the mode-aware adaptive timeout for the best-matching upstream.
+    ///
+    /// See [`effective_timeout`] for the clamp formula and rationale. Falls
+    /// back to [`UPSTREAM_TIMEOUT`] only when no upstream matches the query's
+    /// repo hint.
     fn upstream_timeout(&self, params: &Value) -> Duration {
         let repo_hint = extract_repo_hint(params);
         find_upstream_for_repo(&self.upstreams, repo_hint)
-            .map(|u| u.timeout)
+            .map(|u| effective_timeout(u.mode, u))
             .unwrap_or(UPSTREAM_TIMEOUT)
     }
 
@@ -394,17 +417,25 @@ impl HybridClient {
         // Pick the first healthy upstream and clone its client (cheap channel clone).
         let repo_hint = extract_repo_hint(params);
         let server_task = find_upstream_for_repo(&self.upstreams, repo_hint).map(|u| {
-            let timeout = u.timeout;
+            let timeout = effective_timeout(u.mode, u);
             let mut client = u.client();
             let token = u.auth_token().map(|t| t.to_string());
             let tool = tool_name.to_string();
             let p = params.clone();
+            // Clone the EWMA cell — the future can't borrow `u` because the
+            // local query borrows `self.local` mutably for `tokio::join!`.
+            let latency = u.latency_ewma_ref();
             async move {
-                tokio::time::timeout(
+                let started = Instant::now();
+                let res = tokio::time::timeout(
                     timeout,
                     dispatch_json_rpc_authed(&mut client, &tool, &p, token.as_deref()),
                 )
-                .await
+                .await;
+                if let Ok(Ok(_)) = &res {
+                    crate::upstream::record_latency_into(&latency, started.elapsed());
+                }
+                res
             }
         });
 
@@ -572,13 +603,17 @@ impl HybridClient {
 
         let mut client = upstream.client();
         let token = upstream.auth_token().map(|t| t.to_string());
+        let started = Instant::now();
         match tokio::time::timeout(
             timeout,
             dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
         )
         .await
         {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => {
+                upstream.record_latency(started.elapsed());
+                Ok(result)
+            }
             Ok(Err(e)) => {
                 warn!(
                     upstream = %upstream.name,
@@ -695,17 +730,15 @@ pub async fn query_configured_upstreams_only(
         find_upstream_for_repo(&upstreams, repo_hint).context("no healthy upstream servers")?;
     let mut client = upstream.client();
     let token = upstream.auth_token().map(|t| t.to_string());
+    let timeout = effective_timeout(upstream.mode, upstream);
+    let started = Instant::now();
     let mut result = tokio::time::timeout(
-        upstream.timeout,
+        timeout,
         dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
     )
     .await
-    .with_context(|| {
-        format!(
-            "upstream query timed out after {}ms",
-            upstream.timeout.as_millis()
-        )
-    })??;
+    .with_context(|| format!("upstream query timed out after {}ms", timeout.as_millis()))??;
+    upstream.record_latency(started.elapsed());
     inject_or_wrap_provenance(&mut result, &["server"], &[]);
     Ok(result)
 }
@@ -1157,6 +1190,43 @@ fn find_upstream_for_repo<'a>(
         }
     }
     upstreams.iter().find(|u| u.is_healthy())
+}
+
+/// Compute the mode-aware *adaptive* upstream timeout for `handle`.
+///
+/// Rationale: a single static deadline rots as fleet latency drifts (the
+/// InfoQ adaptive-hedging finding), so we scale off a rolling EWMA of observed
+/// successful upstream latencies rather than a fixed 1s:
+///
+/// ```text
+/// effective = clamp(K * latency_ewma, FLOOR, mode_ceiling)
+/// ```
+///
+/// where `K ≈ 1.75` puts the deadline near the upstream's p95 ("The Tail at
+/// Scale", Dean & Barroso, 2013) and `FLOOR = 50ms` avoids deadlines so tight
+/// that scheduling jitter alone trips them. The per-upstream *configured*
+/// timeout is the hard ceiling; `mode_ceiling = min(configured, mode_cap)`
+/// where the Fallback cap is 250ms (keep the local fast path unblocked —
+/// honors the <200ms budget) and Merge/Primary keep the full configured
+/// ceiling (the richer upstream answer is the point). On a cold start (no
+/// EWMA samples yet) we use `mode_ceiling`.
+fn effective_timeout(mode: RoutingMode, handle: &UpstreamHandle) -> Duration {
+    let configured = handle.timeout;
+    let mode_ceiling = match mode {
+        RoutingMode::Fallback => configured.min(FALLBACK_MODE_CAP),
+        RoutingMode::Merge | RoutingMode::Primary => configured,
+    };
+
+    match handle.latency_ewma_ms() {
+        // Cold start — no observed latency yet. Use the mode ceiling.
+        None => mode_ceiling,
+        Some(ewma_ms) => {
+            let scaled = Duration::from_secs_f64((TIMEOUT_K * ewma_ms).max(0.0) / 1000.0);
+            // `min(FLOOR, ceiling)` keeps the clamp bounds ordered even when an
+            // explicit configured timeout is below the floor (e.g. "30ms").
+            scaled.clamp(TIMEOUT_FLOOR.min(mode_ceiling), mode_ceiling)
+        }
+    }
 }
 
 /// Extract a repo hint from query params — checks `repos[0]`, `repo`, `repo_url`.
@@ -1948,6 +2018,118 @@ mod tests {
         let upstreams: Vec<UpstreamHandle> = vec![];
         let has = upstreams.iter().any(|u| u.is_healthy());
         assert!(!has);
+    }
+
+    // ── Mode-aware adaptive timeout (`effective_timeout`) ─────────────────
+
+    fn handle_with(mode: RoutingMode, timeout: &str) -> UpstreamHandle {
+        use crate::discovery::UpstreamConfig;
+        let cfg = UpstreamConfig {
+            name: Some("t".to_string()),
+            url: "http://127.0.0.1:19999".to_string(),
+            token: None,
+            repos: vec![],
+            mode,
+            timeout: timeout.to_string(),
+            ca_cert: None,
+        };
+        UpstreamHandle::from_config(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_cold_start_uses_mode_ceiling() {
+        // Fallback with the default 1s config: ceiling is capped at 250ms.
+        let h = handle_with(RoutingMode::Fallback, "1s");
+        assert_eq!(
+            effective_timeout(RoutingMode::Fallback, &h),
+            Duration::from_millis(250)
+        );
+        // Merge with default 1s config: ceiling is the full configured 1s.
+        let h = handle_with(RoutingMode::Merge, "1s");
+        assert_eq!(
+            effective_timeout(RoutingMode::Merge, &h),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_warm_scales_by_k() {
+        // Small p95: 80ms EWMA, Merge mode, 1s ceiling -> ~K*ewma = 140ms.
+        let h = handle_with(RoutingMode::Merge, "1s");
+        h.record_latency(Duration::from_millis(80));
+        assert_eq!(
+            effective_timeout(RoutingMode::Merge, &h),
+            Duration::from_secs_f64(0.140)
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_fallback_capped_at_250ms() {
+        // Even with a 1s config and a high EWMA, Fallback never exceeds 250ms.
+        let h = handle_with(RoutingMode::Fallback, "1s");
+        h.record_latency(Duration::from_millis(400)); // K*400 = 700ms
+        assert_eq!(
+            effective_timeout(RoutingMode::Fallback, &h),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_merge_primary_up_to_configured_ceiling() {
+        // A large EWMA clamps up to the configured 1s ceiling, not beyond.
+        let h = handle_with(RoutingMode::Merge, "1s");
+        h.record_latency(Duration::from_millis(2000)); // K*2000 = 3.5s
+        assert_eq!(
+            effective_timeout(RoutingMode::Merge, &h),
+            Duration::from_secs(1)
+        );
+        let h = handle_with(RoutingMode::Primary, "1s");
+        h.record_latency(Duration::from_millis(2000));
+        assert_eq!(
+            effective_timeout(RoutingMode::Primary, &h),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_explicit_small_config_caps_all_modes() {
+        // An explicit "200ms" config is the hard ceiling for every mode.
+        for mode in [
+            RoutingMode::Fallback,
+            RoutingMode::Merge,
+            RoutingMode::Primary,
+        ] {
+            let h = handle_with(mode, "200ms");
+            h.record_latency(Duration::from_millis(900)); // K*900 = 1.575s
+            assert_eq!(
+                effective_timeout(mode, &h),
+                Duration::from_millis(200),
+                "mode {mode:?} should cap at the configured 200ms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_respects_floor() {
+        // A tiny EWMA would scale below the 50ms floor — clamp up to it.
+        let h = handle_with(RoutingMode::Merge, "1s");
+        h.record_latency(Duration::from_millis(5)); // K*5 = 8.75ms
+        assert_eq!(
+            effective_timeout(RoutingMode::Merge, &h),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_timeout_floor_clamp_ordered_for_tiny_config() {
+        // Configured ceiling below the floor must not panic the clamp; the
+        // ceiling wins (effective bounds become [ceiling, ceiling]).
+        let h = handle_with(RoutingMode::Merge, "30ms");
+        h.record_latency(Duration::from_millis(5));
+        assert_eq!(
+            effective_timeout(RoutingMode::Merge, &h),
+            Duration::from_millis(30)
+        );
     }
 
     // ── Result helper tests ───────────────────────────────────────

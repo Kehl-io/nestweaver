@@ -90,6 +90,10 @@ struct UpstreamSection {
     token: Option<String>,
     #[serde(default)]
     mode: RoutingMode,
+    /// Per-query timeout (e.g. "1s", "250ms"). Parsed into a `Duration` later
+    /// by `UpstreamHandle::from_config` via `parse_duration`.
+    #[serde(default = "default_timeout")]
+    timeout: String,
 }
 
 /// Parsed content of `~/.config/nestweaver/upstreams.toml`.
@@ -225,7 +229,7 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
                 token: parsed.upstream.token,
                 repos: vec![],
                 mode: parsed.upstream.mode,
-                timeout: default_timeout(),
+                timeout: parsed.upstream.timeout,
                 ca_cert: None,
             };
             expand_config_token(&mut cfg);
@@ -485,5 +489,44 @@ url = "grpcs://minimal.example.com:9378"
         assert_eq!(parsed.upstream.url, "grpcs://minimal.example.com:9378");
         assert!(parsed.upstream.token.is_none());
         assert_eq!(parsed.upstream.mode, RoutingMode::Fallback);
+        // Timeout falls back to the default when absent.
+        assert_eq!(parsed.upstream.timeout, "1s");
+    }
+
+    #[test]
+    fn server_toml_honors_explicit_timeout() {
+        let input = r#"
+[upstream]
+url = "grpcs://acme.example.com:9378"
+mode = "merge"
+timeout = "250ms"
+"#;
+        let parsed: ServerToml = toml::from_str(input).unwrap();
+        assert_eq!(parsed.upstream.timeout, "250ms");
+    }
+
+    #[test]
+    fn discover_from_server_toml_carries_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("NESTWEAVER_UPSTREAM") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let nw_dir = tmp.path().join(".nestweaver");
+        fs::create_dir_all(&nw_dir).unwrap();
+        fs::write(
+            nw_dir.join("server.toml"),
+            r#"
+[upstream]
+url = "grpcs://acme.example.com:9378"
+timeout = "500ms"
+"#,
+        )
+        .unwrap();
+
+        let upstreams = discover_upstreams(tmp.path());
+        assert_eq!(upstreams.len(), 1);
+        // The server.toml [upstream] timeout flows into the UpstreamConfig
+        // instead of being hardcoded to the default.
+        assert_eq!(upstreams[0].timeout, "500ms");
     }
 }
