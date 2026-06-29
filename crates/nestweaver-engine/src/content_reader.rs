@@ -1,14 +1,17 @@
 // content_reader.rs — abstracts how the indexer reads file contents and discovers files.
 // `FilesystemReader` for local repos, `GitBareReader` for server-side bare clones (Task 6).
 
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
 /// Abstracts how the indexer reads file contents and discovers files.
 /// `FilesystemReader` preserves local behavior; `GitBareReader` (added in Task 6)
-/// reads from blobless bare clones via pooled `git cat-file --batch`.
+/// reads from blobless bare clones via a pooled, persistent `git cat-file --batch`
+/// subprocess (one process per reader, reused for every file read).
 pub trait ContentReader: Send + Sync {
     /// Read the full content of a file at `rel_path` (repo-relative).
     fn read_file(&self, rel_path: &Path) -> Result<String>;
@@ -107,14 +110,124 @@ impl ContentReader for FilesystemReader {
     }
 }
 
+/// One object resolved from the `git cat-file --batch` stream.
+enum BatchObject {
+    /// Object found — its full content as raw bytes.
+    Found(Vec<u8>),
+    /// Git reported `<spec> missing` — no such object/path at this revision.
+    Missing,
+}
+
+/// A persistent, pooled `git cat-file --batch` subprocess.
+///
+/// Spawned once per [`GitBareReader`] (lazily, on the first read) and reused for
+/// every file read, so a full index pass over an N-file repo forks a single git
+/// process instead of N. Each request writes one `<sha>:<path>` line and reads
+/// back the framed response (`<oid> <type> <size>\n`, then `<size>` bytes, then a
+/// trailing newline).
+struct CatFileBatch {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl CatFileBatch {
+    /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout.
+    fn spawn(bare_path: &Path) -> Result<Self> {
+        let mut child = Command::new("git")
+            .args([
+                "-C",
+                &bare_path.display().to_string(),
+                "cat-file",
+                "--batch",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn git cat-file --batch")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("cat-file --batch child has no stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("cat-file --batch child has no stdout")?;
+        Ok(Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// Resolve one object by its `<sha>:<path>` spec.
+    ///
+    /// Returns `Ok(BatchObject::Missing)` when git reports the path missing.
+    /// Returns `Err` only for I/O failures (the batch process has likely died),
+    /// so the caller can fall back to a one-shot `git show`.
+    fn request(&mut self, sha: &str, rel_path: &Path) -> Result<BatchObject> {
+        // Send the request line: "<sha>:<path>\n".
+        writeln!(self.stdin, "{}:{}", sha, rel_path.display())
+            .context("write request to cat-file --batch")?;
+        self.stdin.flush().context("flush cat-file --batch stdin")?;
+
+        // Read the header: "<oid> <type> <size>\n" or "<spec> missing\n".
+        let mut header = String::new();
+        let n = self
+            .stdout
+            .read_line(&mut header)
+            .context("read cat-file --batch header")?;
+        if n == 0 {
+            anyhow::bail!("cat-file --batch closed its output unexpectedly");
+        }
+        let header = header.trim_end_matches('\n');
+        if header.ends_with(" missing") {
+            return Ok(BatchObject::Missing);
+        }
+
+        // Object size is the final whitespace-separated field of the header.
+        let size: usize = header
+            .rsplit(' ')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .with_context(|| format!("malformed cat-file --batch header: {header:?}"))?;
+
+        // Read exactly `size` bytes of content, then consume the trailing newline.
+        let mut content = vec![0u8; size];
+        self.stdout
+            .read_exact(&mut content)
+            .context("read cat-file --batch object content")?;
+        let mut newline = [0u8; 1];
+        self.stdout
+            .read_exact(&mut newline)
+            .context("read cat-file --batch trailing newline")?;
+
+        Ok(BatchObject::Found(content))
+    }
+}
+
+impl Drop for CatFileBatch {
+    fn drop(&mut self) {
+        // Kill and reap the child so no zombie git process leaks.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Reads file contents from a bare git clone without a working tree.
 ///
-/// Uses `git show <sha>:<path>` for individual file reads and
-/// `git ls-tree -r --name-only <sha>` for file listing. This avoids
-/// needing a checkout — the server only needs transient access to blobs.
+/// Individual file reads go through a persistent, pooled `git cat-file --batch`
+/// subprocess (spawned lazily on first read), falling back to a one-shot
+/// `git show <sha>:<path>` if that process cannot be spawned or has died. File
+/// listing uses `git ls-tree -r --name-only <sha>`. This avoids needing a
+/// checkout — the server only needs transient access to blobs.
 pub struct GitBareReader {
     bare_path: PathBuf,
     sha: String,
+    /// Lazily-spawned pooled `cat-file --batch` process. `None` until the first
+    /// read; reset to `None` if the process dies so the next read re-spawns.
+    batch: Mutex<Option<CatFileBatch>>,
 }
 
 impl GitBareReader {
@@ -122,6 +235,7 @@ impl GitBareReader {
         Self {
             bare_path: bare_path.to_path_buf(),
             sha: sha.to_string(),
+            batch: Mutex::new(None),
         }
     }
 
@@ -143,10 +257,10 @@ impl GitBareReader {
             .to_string();
         Ok(Self::new(bare_path, &sha))
     }
-}
 
-impl ContentReader for GitBareReader {
-    fn read_file(&self, rel_path: &Path) -> Result<String> {
+    /// One-shot fallback read used when the pooled `cat-file --batch` process is
+    /// unavailable (failed to spawn, or died mid-stream).
+    fn read_file_via_show(&self, rel_path: &Path) -> Result<String> {
         let spec = format!("{}:{}", self.sha, rel_path.display());
         let output = Command::new("git")
             .args(["-C", &self.bare_path.display().to_string(), "show", &spec])
@@ -161,6 +275,46 @@ impl ContentReader for GitBareReader {
         }
         String::from_utf8(output.stdout)
             .with_context(|| format!("non-utf8 content in {}", rel_path.display()))
+    }
+}
+
+impl ContentReader for GitBareReader {
+    fn read_file(&self, rel_path: &Path) -> Result<String> {
+        let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Lazily spawn the pooled batch process on the first read.
+        if guard.is_none() {
+            match CatFileBatch::spawn(&self.bare_path) {
+                Ok(batch) => *guard = Some(batch),
+                Err(err) => {
+                    tracing::warn!(
+                        "cat-file --batch spawn failed ({err}); falling back to git show"
+                    );
+                    drop(guard);
+                    return self.read_file_via_show(rel_path);
+                }
+            }
+        }
+
+        let batch = guard.as_mut().expect("batch initialized above");
+        match batch.request(&self.sha, rel_path) {
+            Ok(BatchObject::Found(content)) => String::from_utf8(content)
+                .with_context(|| format!("non-utf8 content in {}", rel_path.display())),
+            Ok(BatchObject::Missing) => anyhow::bail!(
+                "path {} not found at {} in {}",
+                rel_path.display(),
+                self.sha,
+                self.bare_path.display()
+            ),
+            Err(err) => {
+                // The batch process likely died — discard it (so the next read
+                // re-spawns) and fall back to a one-shot `git show`.
+                tracing::warn!("cat-file --batch read failed ({err}); falling back to git show");
+                *guard = None;
+                drop(guard);
+                self.read_file_via_show(rel_path)
+            }
+        }
     }
 
     fn list_files(&self) -> Result<Vec<PathBuf>> {
@@ -461,5 +615,46 @@ mod tests {
         let reader = GitBareReader::from_head(&bare).unwrap();
         assert_eq!(reader.version_id(), sha);
         assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn git_bare_reader_reads_multiple_files_one_reader() {
+        // The pooled cat-file --batch process must stay in sync across many
+        // reads (including repeats and nested paths) through a single reader.
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("a.txt", "alpha"),
+            ("dir/b.txt", "bravo"),
+            ("dir/sub/c.txt", "charlie\nmultiline"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "alpha");
+        assert_eq!(reader.read_file(Path::new("dir/b.txt")).unwrap(), "bravo");
+        assert_eq!(
+            reader.read_file(Path::new("dir/sub/c.txt")).unwrap(),
+            "charlie\nmultiline"
+        );
+        // Repeat reads return identical content — the persistent stream framing
+        // is consumed exactly per request.
+        assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "alpha");
+        assert_eq!(reader.read_file(Path::new("dir/b.txt")).unwrap(), "bravo");
+    }
+
+    #[test]
+    fn git_bare_reader_missing_path_does_not_wedge_stream() {
+        // A missing path must error cleanly without desyncing the batch stream,
+        // so subsequent valid reads still succeed through the same reader.
+        let (_tmp, bare, sha) = setup_bare_repo(&[("present.txt", "here")]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        assert_eq!(reader.read_file(Path::new("present.txt")).unwrap(), "here");
+        assert!(reader.read_file(Path::new("absent.txt")).is_err());
+        assert_eq!(reader.read_file(Path::new("present.txt")).unwrap(), "here");
+    }
+
+    #[test]
+    fn git_bare_reader_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<GitBareReader>();
     }
 }
