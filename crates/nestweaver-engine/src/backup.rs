@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -332,12 +333,29 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
 
     // Move the verified extraction to the target directory. If the target
     // already exists, remove it first (we've already verified the new data).
-    if config.data_dir.exists() {
-        std::fs::remove_dir_all(&config.data_dir)?;
+    // Atomic restore: rename-aside pattern (similar to dpkg atomic upgrades).
+    let restoring_dir = config.data_dir.with_extension("restoring");
+
+    // Clean up any leftover .restoring dir from a previous interrupted restore.
+    if restoring_dir.exists() {
+        let _ = std::fs::remove_dir_all(&restoring_dir);
     }
-    // Try atomic rename first; fall back to copy if cross-device.
+
+    if config.data_dir.exists() {
+        // Step 1: Move existing data aside (crash here = old data at .restoring, recoverable).
+        std::fs::rename(&config.data_dir, &restoring_dir)
+            .with_context(|| format!("rename {} to {}", config.data_dir.display(), restoring_dir.display()))?;
+    }
+
+    // Step 2: Move new data into place (crash here = old data at .restoring, recoverable).
     if std::fs::rename(temp_dir.path(), &config.data_dir).is_err() {
+        // Cross-device: fall back to copy.
         nestweaver_storage::copy_dir_all(temp_dir.path(), &config.data_dir)?;
+    }
+
+    // Step 3: Remove the old data (crash here = orphan .restoring, harmless).
+    if restoring_dir.exists() {
+        let _ = std::fs::remove_dir_all(&restoring_dir);
     }
 
     Ok(RestoreResult {
@@ -400,18 +418,16 @@ fn copy_db_files(
     }
 
     // Full-tier: copy workspace .git directories.
-    if include_clones {
-        if let Some(ws) = workspace_path {
-            let clones_dir = staging.join("clones");
-            if ws.exists() {
-                std::fs::create_dir_all(&clones_dir)?;
-                for entry in std::fs::read_dir(ws)? {
-                    let entry = entry?;
-                    let git_dir = entry.path().join(".git");
-                    if git_dir.is_dir() {
-                        let dest = clones_dir.join(entry.file_name()).join(".git");
-                        nestweaver_storage::copy_dir_all(&git_dir, &dest)?;
-                    }
+    if include_clones && let Some(ws) = workspace_path {
+        let clones_dir = staging.join("clones");
+        if ws.exists() {
+            std::fs::create_dir_all(&clones_dir)?;
+            for entry in std::fs::read_dir(ws)? {
+                let entry = entry?;
+                let git_dir = entry.path().join(".git");
+                if git_dir.is_dir() {
+                    let dest = clones_dir.join(entry.file_name()).join(".git");
+                    nestweaver_storage::copy_dir_all(&git_dir, &dest)?;
                 }
             }
         }
@@ -612,7 +628,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]
