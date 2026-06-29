@@ -8,9 +8,13 @@ mod helpers;
 use std::process::Command as StdCommand;
 
 use hmac::{Hmac, KeyInit, Mac};
+use nestweaver_client::DaemonClient;
+use nestweaver_client::discovery::{RoutingMode, UpstreamConfig};
+use nestweaver_client::hybrid::{HybridClient, TraceBoundary, flow_trace_with_stitching};
+use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{BrainStatusRequest, JsonRequest, RepoStatesRequest};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::Sha256;
 use tonic::transport::{Certificate, ClientTlsConfig};
 
@@ -41,6 +45,121 @@ fn write_test_repo(dir: &std::path::Path) {
         .current_dir(dir)
         .output()
         .unwrap();
+}
+
+/// Create a git repo populated with the given `(relative_path, contents)`
+/// files. Parent directories are created on demand so callers can place files
+/// under subdirectories (e.g. `"server/main.js"`).
+fn write_repo_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    for (rel, contents) in files {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+    }
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+}
+
+/// Index `repo_dir` into `db_path` using the no-daemon path (so the on-disk DB
+/// exists before a `ServerGuard` serves it). Panics with the indexer's stderr
+/// on failure.
+fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A bearer token that satisfies the daemon's 32-byte minimum for
+/// `--auth-token`. Used for every server started in the hybrid tests.
+const HYBRID_TOKEN: &str = "hybrid-integration-secret-token-0123456789abcdef";
+
+/// Connect a local `DaemonClient` to an already-running daemon (started via
+/// `ServerGuard`) over its Unix domain socket. The socket is bound before the
+/// port file is written, so by the time `ServerGuard::start` returns it should
+/// exist — but retry briefly to absorb any accept-loop start-up jitter.
+async fn connect_local(db_path: &std::path::Path) -> DaemonClient {
+    let mut last_err = None;
+    for _ in 0..10 {
+        match DaemonClient::connect_existing(db_path).await {
+            Ok(client) => return client,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "failed to connect to local daemon over UDS: {}",
+        last_err.expect("at least one attempt")
+    );
+}
+
+/// Build an `UpstreamHandle` in `Merge` mode pointing at a `ServerGuard`'s gRPC
+/// address with the given bearer token. Empty `repos` globs => matches every
+/// query, so the merge path always selects it.
+fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
+    let cfg = UpstreamConfig {
+        name: Some("server".to_string()),
+        url: grpc_addr,
+        token: Some(token.to_string()),
+        mode: RoutingMode::Merge,
+        repos: vec![],
+        timeout: "5s".to_string(),
+        ca_cert: None,
+    };
+    UpstreamHandle::from_config(&cfg).expect("build upstream handle")
+}
+
+/// Collect `_meta.sources` from a hybrid response as owned strings.
+fn meta_sources(resp: &Value) -> Vec<String> {
+    resp["_meta"]["sources"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]
@@ -238,7 +357,10 @@ async fn server_auth_rejects_unauthenticated() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let guard = helpers::server_guard::ServerGuard::start_with_auth(&db_path, "test-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_auth(
+        &db_path,
+        "test-secret-token-0123456789abcdef",
+    );
 
     // Connect without a bearer token — should be rejected.
     let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
@@ -284,7 +406,10 @@ async fn server_auth_passes_valid_token() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let guard = helpers::server_guard::ServerGuard::start_with_auth(&db_path, "test-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_auth(
+        &db_path,
+        "test-secret-token-0123456789abcdef",
+    );
 
     // Connect WITH a valid bearer token — should succeed.
     let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
@@ -295,8 +420,10 @@ async fn server_auth_passes_valid_token() {
 
     let mut client =
         NestWeaverDaemonClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
-            req.metadata_mut()
-                .insert("authorization", "Bearer test-secret".parse().unwrap());
+            req.metadata_mut().insert(
+                "authorization",
+                "Bearer test-secret-token-0123456789abcdef".parse().unwrap(),
+            );
             Ok(req)
         });
 
@@ -1003,7 +1130,7 @@ async fn server_webhook_enqueues_job() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let secret = "webhook-test-secret";
+    let secret = "webhook-test-secret-token-0123456789abcdef";
     let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
     let mcp_addr = guard.mcp_addr();
 
@@ -1219,5 +1346,344 @@ async fn export_graph_rejects_file_output() {
     assert!(
         !output_path.exists(),
         "export output file should NOT have been created in server mode"
+    );
+}
+
+#[tokio::test]
+async fn export_graph_rejects_msgpack_file_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index first (no daemon) so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let output_path = dir.path().join("export_output.graph.msgpack");
+    let args_json = serde_json::to_string(&json!({
+        "format": "msgpack",
+        "output": output_path.display().to_string(),
+    }))
+    .unwrap();
+
+    let result = client.export_graph(JsonRequest { args_json }).await;
+
+    assert!(result.is_err(), "expected PERMISSION_DENIED error");
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::PermissionDenied,
+        "expected PERMISSION_DENIED, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+
+    assert!(
+        !output_path.exists(),
+        "msgpack export output file should NOT have been created in server mode"
+    );
+}
+
+// ── Hybrid (local + server) end-to-end tests ────────────────────────────────
+//
+// These exercise `nestweaver_client::HybridClient` against TWO real daemons:
+// a local daemon (reached over its Unix socket via `DaemonClient`) and a
+// `--server` daemon (reached over authenticated gRPC via an `UpstreamHandle`).
+// Each daemon indexes a different repo into a different DB, so a genuine merge
+// must combine both sources. Tokens are always >= 32 bytes (`HYBRID_TOKEN`).
+
+/// MUST-HAVE: a real local+server MERGE. Repo A is indexed into an
+/// authenticated server; a *different* repo B into a separate local daemon. A
+/// `brain_search` routed through `HybridClient` (upstream mode = Merge) must
+/// report BOTH `"local"` and `"server"` in `_meta.sources` (never `"upstream"`)
+/// and the merged results must contain the server-only symbol — proving data
+/// actually flowed across the boundary rather than the sources label being
+/// cosmetic.
+#[tokio::test]
+async fn hybrid_merge_combines_local_and_server_sources() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Server side: repo A in its own subdir/DB (separate `server.port`).
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[(
+            "main.js",
+            "function serverfn(x) { return x; }\nfunction sharedfn(x) { return x; }",
+        )],
+    );
+    index_repo(&server_repo, &db_server);
+
+    // Local side: repo B in its own subdir/DB.
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[(
+            "main.js",
+            "function localfn(x) { return x; }\nfunction sharedfn(x) { return x; }",
+        )],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+
+    let local = connect_local(&db_local).await;
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    // `serverfn` exists ONLY on the server. If it shows up in the merged
+    // response, the server query genuinely contributed.
+    let resp = hybrid
+        .query("brain_search", &json!({ "query": "serverfn", "limit": 20 }))
+        .await
+        .expect("hybrid brain_search merge query");
+
+    let sources = meta_sources(&resp);
+    assert!(
+        sources.iter().any(|s| s == "local"),
+        "merge sources must include 'local'; got {sources:?} in {resp}"
+    );
+    assert!(
+        sources.iter().any(|s| s == "server"),
+        "merge sources must include 'server'; got {sources:?} in {resp}"
+    );
+    assert!(
+        !sources.iter().any(|s| s == "upstream"),
+        "sources must label the remote 'server', never 'upstream'; got {sources:?}"
+    );
+    assert!(
+        resp.to_string().contains("serverfn"),
+        "merged results must contain the server-only symbol 'serverfn' \
+         (proof the server side contributed); got {resp}"
+    );
+
+    // Symmetry: a local-only symbol must also surface through the same merge,
+    // with both sources still labelled.
+    let resp_local = hybrid
+        .query("brain_search", &json!({ "query": "localfn", "limit": 20 }))
+        .await
+        .expect("hybrid brain_search merge query (local symbol)");
+    let sources_local = meta_sources(&resp_local);
+    assert!(
+        sources_local.iter().any(|s| s == "local") && sources_local.iter().any(|s| s == "server"),
+        "merge for a local-only symbol must still report both sources; got {sources_local:?}"
+    );
+    assert!(
+        resp_local.to_string().contains("localfn"),
+        "merged results must contain the local-only symbol 'localfn'; got {resp_local}"
+    );
+}
+
+/// ATTEMPT: two-tier `blast_radius`. The local daemon indexes a file under
+/// `local/`, the server a file under `server/`. With both paths in
+/// `changed_files`, the two-tier response must carry a populated `local_impact`
+/// (local changed symbols) AND a server-sourced `org_impact` whose results
+/// survive the same-repo dedup (distinct path prefixes) — i.e. both tiers
+/// populated with real data, with the org tier genuinely reached over
+/// authenticated gRPC.
+#[tokio::test]
+async fn hybrid_blast_radius_two_tier_populates_both_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[("server/main.js", "function serverimpactfn(x) { return x; }")],
+    );
+    index_repo(&server_repo, &db_server);
+
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("local/main.js", "function localimpactfn(x) { return x; }")],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+
+    let local = connect_local(&db_local).await;
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    let resp = hybrid
+        .query(
+            "blast_radius",
+            &json!({ "changed_files": ["local/main.js", "server/main.js"], "max_depth": 3 }),
+        )
+        .await
+        .expect("hybrid blast_radius two-tier query");
+
+    assert_eq!(
+        resp["tier"], "two_tier",
+        "blast_radius through the hybrid client must produce a two-tier response; got {resp}"
+    );
+
+    // Local tier populated with the local repo's changed symbol.
+    let local_changed = resp["local_impact"]["changed_symbols"]
+        .as_array()
+        .expect("local_impact.changed_symbols array");
+    assert!(
+        !local_changed.is_empty(),
+        "local_impact must contain the local changed symbol; got {}",
+        resp["local_impact"]
+    );
+    assert!(
+        resp["local_impact"].to_string().contains("localimpactfn"),
+        "local_impact should reference 'localimpactfn'; got {}",
+        resp["local_impact"]
+    );
+
+    // Org tier genuinely reached the authenticated server (not the
+    // "unavailable" fallback) and carries the server repo's symbol.
+    assert_eq!(
+        resp["org_impact"]["source_server"], "server",
+        "org_impact must be attributed to the 'server' upstream; got {}",
+        resp["org_impact"]
+    );
+    assert!(
+        resp["org_impact"].get("status").is_none(),
+        "org_impact must NOT be the 'unavailable' fallback — the server tier \
+         must be reached; got {}",
+        resp["org_impact"]
+    );
+    let org_changed = resp["org_impact"]["results"]["changed_symbols"]
+        .as_array()
+        .expect("org_impact.results.changed_symbols array");
+    assert!(
+        !org_changed.is_empty(),
+        "org_impact.results must contain the server's changed symbol (survives \
+         same-repo dedup via distinct path prefix); got {}",
+        resp["org_impact"]
+    );
+    assert!(
+        resp["org_impact"].to_string().contains("serverimpactfn"),
+        "org_impact should reference the server-only 'serverimpactfn'; got {}",
+        resp["org_impact"]
+    );
+
+    let sources = meta_sources(&resp);
+    assert!(
+        sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
+        "two-tier response must report both 'local' and 'server' sources; got {sources:?}"
+    );
+}
+
+/// ATTEMPT: cross-boundary `flow_trace` continuation. The same repo is indexed
+/// into both daemons so symbol `canonical_id`s line up across them (they are
+/// URL-derived). `flow_trace_with_stitching` runs the trace locally, then sends
+/// a `FlowTraceContinue` RPC to the authenticated server for the boundary
+/// symbol and stitches the returned spans back into the tree. We assert the
+/// stitched result gained server-sourced nodes (`source: "server:server"`),
+/// proving the continuation returned a non-empty result across the boundary.
+#[tokio::test]
+async fn hybrid_flow_trace_continue_stitches_server_spans() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // One repo, indexed into both DBs => matching canonical_ids on both sides.
+    let repo = dir.path().join("flowrepo");
+    write_repo_files(
+        &repo,
+        &[(
+            "main.js",
+            "function serverfn(x) { return serverhelper(x); }\n\
+             function serverhelper(y) { return y + 1; }",
+        )],
+    );
+    let db_server = dir.path().join("server").join("server.lbug");
+    let db_local = dir.path().join("local").join("local.lbug");
+    index_repo(&repo, &db_server);
+    index_repo(&repo, &db_local);
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+
+    let mut local = connect_local(&db_local).await;
+
+    // Pull the entry symbol's canonical_id from the local trace; the same id
+    // resolves on the server because both indexed the same repo URL.
+    let ft_args = serde_json::to_string(&json!({ "symbol": "serverfn", "max_depth": 5 })).unwrap();
+    let ft_resp = local
+        .inner_mut()
+        .flow_trace(JsonRequest { args_json: ft_args })
+        .await
+        .expect("local flow_trace RPC")
+        .into_inner();
+    let ft: Value = serde_json::from_str(&ft_resp.result_json).expect("flow_trace JSON");
+    let entry_cid = ft["tree"]["canonical_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| panic!("flow_trace tree must carry a canonical_id; got {ft}"))
+        .to_string();
+    // The local trace must have followed the in-repo call edge.
+    assert!(
+        ft["tree"]["children"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "local flow_trace should follow serverfn -> serverhelper; got {ft}"
+    );
+
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    let boundary = TraceBoundary {
+        canonical_id: entry_cid,
+        name: "serverfn".to_string(),
+        parent_path: vec![],
+    };
+    let params = json!({ "symbol": "serverfn", "max_depth": 5 });
+    let stitched = flow_trace_with_stitching(&mut hybrid, &params, std::slice::from_ref(&boundary))
+        .await
+        .expect("flow_trace_with_stitching");
+
+    let serialized = stitched.to_string();
+    assert!(
+        serialized.contains("server:server"),
+        "stitched trace must contain server-sourced nodes (source = \"server:server\"), \
+         proving FlowTraceContinue returned a non-empty continuation across the boundary; \
+         got {stitched}"
+    );
+    // The server continuation walked the call graph (serverfn -> serverhelper),
+    // so the stitched-in server subtree carries serverhelper.
+    assert!(
+        serialized.matches("serverhelper").count() >= 2,
+        "server continuation should re-walk serverfn -> serverhelper and stitch it in \
+         (expected serverhelper both locally and from the server); got {stitched}"
+    );
+
+    let sources = meta_sources(&stitched);
+    assert!(
+        sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
+        "stitched flow_trace must report both 'local' and 'server' sources; got {sources:?}"
     );
 }
