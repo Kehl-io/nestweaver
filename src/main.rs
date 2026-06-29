@@ -3909,7 +3909,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &store, cfg_ref, rules_ref, &tool_docs,
                 )?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
-                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
+                "agents-md" => generate_agents_md_with_rules(
+                    &store,
+                    cfg_ref,
+                    rules_ref,
+                    Some(tool_docs.len()),
+                )?,
                 "claude-md" => generate_claude_md_with_rules(&store, cfg_ref, rules_ref)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
@@ -13514,5 +13519,56 @@ mod server_status_tests {
 
         assert!(out.contains("Indexing:      idle"));
         assert!(out.contains("Mode:          server (drained)"));
+    }
+
+    /// Contract guard: serialize the *real* `nestweaver_web` `AdminStatus` (the
+    /// server's wire shape) and deserialize it into the CLI's mirror struct. If
+    /// a future rename/removal on the server side drops a field the CLI reads,
+    /// this round-trip fails — catching drift the hand-built JSON tests above
+    /// can't, because they encode the CLI's own expectations rather than the
+    /// server's actual type.
+    #[test]
+    fn admin_status_round_trips_into_cli_mirror() {
+        use nestweaver_web::routes::admin::{AdminStatus, QueueStats, RepoStats, SymbolStats};
+
+        let server = AdminStatus {
+            instance_id: "my-brain".to_string(),
+            uptime_seconds: 4321,
+            server_mode: true,
+            repo_count: 9,
+            active_reads: 5,
+            active_writes: 2,
+            queue_depth: 4,
+            drained: false,
+            version: "1.2.3".to_string(),
+            repos: RepoStats {
+                total: 9,
+                indexed: 8,
+                stale: 1,
+                dead_letter: 0,
+            },
+            symbols: SymbolStats { total: 8192 },
+            queue: QueueStats {
+                pending: 4,
+                running: 2,
+                dead_letter: 0,
+            },
+        };
+
+        // Serialize the server's struct, then deserialize into the CLI mirror.
+        let wire = serde_json::to_value(&server).expect("serialize AdminStatus");
+        let mirror: ServerStatusResponse = serde_json::from_value(wire)
+            .expect("AdminStatus wire shape must deserialize into ServerStatusResponse");
+
+        // Every field the CLI reads must survive the round-trip unchanged.
+        assert_eq!(mirror.instance_id, "my-brain");
+        assert_eq!(mirror.version, "1.2.3");
+        assert!(mirror.server_mode);
+        assert_eq!(mirror.repo_count, 9);
+        assert_eq!(mirror.active_reads, 5);
+        assert_eq!(mirror.active_writes, 2);
+        assert_eq!(mirror.queue_depth, 4);
+        assert!(!mirror.drained);
+        assert_eq!(mirror.symbols.total, 8192);
     }
 }

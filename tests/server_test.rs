@@ -1182,7 +1182,10 @@ async fn server_webhook_rejects_invalid_sig() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "correct-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(
+        &db_path,
+        "correct-webhook-secret-0123456789",
+    );
     let mcp_addr = guard.mcp_addr();
 
     let payload = json!({
@@ -1192,7 +1195,7 @@ async fn server_webhook_rejects_invalid_sig() {
     });
     let body = serde_json::to_vec(&payload).unwrap();
     // Sign with the wrong secret.
-    let wrong_sig = webhook_sign(&body, "wrong-secret");
+    let wrong_sig = webhook_sign(&body, "wrong-webhook-secret-0123456789");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -1227,7 +1230,10 @@ async fn server_webhook_rejects_missing_sig() {
         .unwrap();
     assert!(output.status.success());
 
-    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, "my-secret");
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(
+        &db_path,
+        "my-webhook-secret-abcdef",
+    );
     let mcp_addr = guard.mcp_addr();
 
     let payload = json!({
@@ -1269,7 +1275,7 @@ async fn server_webhook_rejects_bad_json() {
         .unwrap();
     assert!(output.status.success());
 
-    let secret = "my-secret";
+    let secret = "my-webhook-secret-abcdef";
     let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
     let mcp_addr = guard.mcp_addr();
 
@@ -1287,6 +1293,200 @@ async fn server_webhook_rejects_bad_json() {
         .expect("webhook POST failed");
 
     assert_eq!(resp.status(), 400);
+}
+
+// ── Device-flow integration tests ───────────────────────────────────────
+
+/// End-to-end OAuth 2.0 device grant (RFC 8628) over real HTTP: a developer
+/// requests a code, polls before approval (authorization_pending), an admin
+/// approves with the user code, and the next poll exchanges the device code for
+/// the configured query token. This drives the same three endpoints as
+/// `nestweaver_client::connect::device_flow_authenticate` without its
+/// browser-open/stdin side effects; the client's poll-loop branch logic is
+/// unit-tested separately in `nestweaver-client/src/connect.rs`.
+#[tokio::test]
+async fn server_device_flow_grants_query_token_after_admin_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let auth_token = "device-flow-query-token-0123456789abcdef";
+    let admin_token = "device-flow-admin-token-0123456789abcdef";
+    let guard = helpers::server_guard::ServerGuard::start_with_admin_and_auth(
+        &db_path,
+        auth_token,
+        admin_token,
+    );
+    let base = guard.mcp_addr();
+    let client = reqwest::Client::new();
+
+    // 1. Request a device + user code.
+    let resp = client
+        .post(format!("{base}/auth/device"))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("POST /auth/device failed");
+    assert_eq!(resp.status(), 200);
+    let device: Value = resp.json().await.unwrap();
+    let device_code = device["device_code"]
+        .as_str()
+        .expect("device_code present")
+        .to_string();
+    let user_code = device["user_code"]
+        .as_str()
+        .expect("user_code present")
+        .to_string();
+
+    // 2. Poll before approval — must report authorization_pending (not 2xx).
+    let resp = client
+        .post(format!("{base}/auth/token"))
+        .json(&json!({ "device_code": device_code }))
+        .send()
+        .await
+        .expect("POST /auth/token (pending) failed");
+    assert!(
+        !resp.status().is_success(),
+        "token poll before approval should not succeed"
+    );
+    let pending: Value = resp.json().await.unwrap();
+    assert_eq!(pending["error"], json!("authorization_pending"));
+
+    // 3. Approval is admin-gated: an unauthenticated approve must be rejected so
+    // a developer can't self-approve their own grant.
+    let resp = client
+        .post(format!("{base}/auth/device/approve"))
+        .json(&json!({ "user_code": user_code }))
+        .send()
+        .await
+        .expect("POST /auth/device/approve (no token) failed");
+    assert_eq!(
+        resp.status(),
+        401,
+        "approve without admin token must be 401"
+    );
+
+    // 4. Admin approves the pending grant by user code.
+    let resp = client
+        .post(format!("{base}/auth/device/approve"))
+        .bearer_auth(admin_token)
+        .json(&json!({ "user_code": user_code }))
+        .send()
+        .await
+        .expect("POST /auth/device/approve failed");
+    assert_eq!(resp.status(), 200, "admin approval should succeed");
+
+    // 5. Next poll exchanges the device code for the configured query token.
+    let resp = client
+        .post(format!("{base}/auth/token"))
+        .json(&json!({ "device_code": device_code }))
+        .send()
+        .await
+        .expect("POST /auth/token (granted) failed");
+    assert_eq!(resp.status(), 200);
+    let granted: Value = resp.json().await.unwrap();
+    assert_eq!(
+        granted["access_token"],
+        json!(auth_token),
+        "device flow must return the configured query token"
+    );
+}
+
+// ── `server status` CLI integration tests ───────────────────────────────
+
+/// `nestweaver server status` over the admin HTTP API: with the correct admin
+/// token it renders the concise status summary; with a wrong token it maps the
+/// 401 to a clear authentication error and a non-zero exit.
+#[tokio::test]
+async fn server_status_cli_happy_path_and_401() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let auth_token = "status-query-token-0123456789abcdef0123";
+    let admin_token = "status-admin-token-0123456789abcdef0123";
+    let guard = helpers::server_guard::ServerGuard::start_with_admin_and_auth(
+        &db_path,
+        auth_token,
+        admin_token,
+    );
+    let url = guard.mcp_addr();
+
+    // Happy path: correct admin token → exit 0, concise summary on stdout.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_ADMIN_TOKEN")
+        .args(["server", "status", "--url", &url, "--token", admin_token])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "server status should succeed with the admin token; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Connected to") && stdout.contains("Instance:"),
+        "status summary missing expected fields; got: {stdout}"
+    );
+
+    // 401 mapping: wrong admin token → non-zero exit, clear auth error.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_ADMIN_TOKEN")
+        .args([
+            "server",
+            "status",
+            "--url",
+            &url,
+            "--token",
+            "wrong-admin-token-0123456789abcdef0123",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "server status with a wrong token should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("authentication failed"),
+        "wrong token should map to an authentication error; got: {stderr}"
+    );
 }
 
 #[tokio::test]

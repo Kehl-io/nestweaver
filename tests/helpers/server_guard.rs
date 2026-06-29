@@ -27,17 +27,32 @@ impl ServerGuard {
 
     /// Spawn the server with a bearer auth token.
     pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
-        Self::spawn_inner(db_path, Some(token), None, None, None)
+        Self::spawn_inner(db_path, Some(token), None, None, None, None)
+    }
+
+    /// Spawn the server with both a query auth token and an admin token.
+    ///
+    /// Used by the device-flow integration test: the admin token approves a
+    /// pending grant, which then hands the developer the configured query token.
+    pub fn start_with_admin_and_auth(db_path: &Path, auth_token: &str, admin_token: &str) -> Self {
+        Self::spawn_inner(
+            db_path,
+            Some(auth_token),
+            None,
+            None,
+            None,
+            Some(admin_token),
+        )
     }
 
     /// Spawn the server with TLS enabled.
     pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
-        Self::spawn_inner(db_path, None, Some(cert), Some(key), None)
+        Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None)
     }
 
     /// Spawn the server with a webhook secret configured.
     pub fn start_with_webhook(db_path: &Path, secret: &str) -> Self {
-        Self::spawn_inner(db_path, None, None, None, Some(secret))
+        Self::spawn_inner(db_path, None, None, None, Some(secret), None)
     }
 
     /// Return the TCP port the server bound to (read from the port file, line 1).
@@ -79,7 +94,7 @@ impl ServerGuard {
     // ── internal ──────────────────────────────────────────────────────
 
     fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
-        Self::spawn_inner(db_path, auth_token, None, None, None)
+        Self::spawn_inner(db_path, auth_token, None, None, None, None)
     }
 
     fn spawn_inner(
@@ -88,6 +103,7 @@ impl ServerGuard {
         tls_cert: Option<&Path>,
         tls_key: Option<&Path>,
         webhook_secret: Option<&str>,
+        admin_token: Option<&str>,
     ) -> Self {
         let port_file = db_path
             .parent()
@@ -125,6 +141,10 @@ impl ServerGuard {
 
         if let Some(secret) = webhook_secret {
             cmd.args(["--webhook-secret", secret]);
+        }
+
+        if let Some(token) = admin_token {
+            cmd.args(["--admin-token", token]);
         }
 
         // Run in foreground — launchd-style daemonisation doesn't work in tests.
