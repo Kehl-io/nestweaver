@@ -207,20 +207,56 @@ fn jittered(interval: Duration) -> Duration {
 pub struct ReindexTracker {
     /// Map repo_id -> incremental update count since last full index.
     counts: HashMap<String, u32>,
-    /// Map repo_id -> timestamp of last full re-index.
-    last_full_reindex: HashMap<String, Instant>,
+    /// Map repo_id -> wall-clock time of last full re-index, as a Unix epoch
+    /// timestamp (seconds). Stored as wall clock (not [`Instant`]) so the
+    /// 7-day backstop survives a daemon restart — a monotonic `Instant` is
+    /// meaningless across process lifetimes.
+    last_full_reindex: HashMap<String, i64>,
 }
 
-/// Maximum interval between full re-indexes (7 days). Even when the
-/// count-based threshold hasn't been hit, a full re-index ensures the
+/// Maximum interval between full re-indexes, in seconds (7 days). Even when
+/// the count-based threshold hasn't been hit, a full re-index ensures the
 /// graph doesn't silently drift from source over long periods.
-const FULL_REINDEX_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
+const FULL_REINDEX_INTERVAL_SECS: i64 = 7 * 24 * 3600;
+
+/// Current wall-clock time as a Unix epoch timestamp (seconds).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 impl ReindexTracker {
     pub fn new() -> Self {
         Self {
             counts: HashMap::new(),
             last_full_reindex: HashMap::new(),
+        }
+    }
+
+    /// Rehydrate a tracker from persisted state (e.g. rows loaded from the
+    /// job-queue's `reindex_state` table at daemon startup). Each tuple is
+    /// `(repo_id, update_count, last_full_unix)`; a `None` timestamp means the
+    /// repo has never had a recorded full re-index.
+    pub fn from_persisted(rows: impl IntoIterator<Item = (String, u32, Option<i64>)>) -> Self {
+        let mut tracker = Self::new();
+        tracker.load_persisted(rows);
+        tracker
+    }
+
+    /// Replace the in-memory cache with persisted state. Used to rehydrate an
+    /// already-constructed tracker (e.g. inside the worker pool) at startup.
+    pub fn load_persisted(&mut self, rows: impl IntoIterator<Item = (String, u32, Option<i64>)>) {
+        self.counts.clear();
+        self.last_full_reindex.clear();
+        for (repo_id, count, last_full) in rows {
+            if count > 0 {
+                self.counts.insert(repo_id.clone(), count);
+            }
+            if let Some(ts) = last_full {
+                self.last_full_reindex.insert(repo_id, ts);
+            }
         }
     }
 
@@ -239,11 +275,12 @@ impl ReindexTracker {
             return true;
         }
         // Time-based backstop: trigger a full re-index if the last one was
-        // more than 7 days ago. Repos that have never been reset (no entry)
-        // are not triggered by time — the count threshold handles their first
-        // full index, and `reset()` records the timestamp for future checks.
+        // more than 7 days ago, compared against the wall clock so the timer
+        // survives restarts. Repos that have never been reset (no entry) are
+        // not triggered by time — the count threshold handles their first full
+        // index, and `reset()` records the timestamp for future checks.
         match self.last_full_reindex.get(repo_id) {
-            Some(last) => last.elapsed() > FULL_REINDEX_INTERVAL,
+            Some(last) => now_unix() - last >= FULL_REINDEX_INTERVAL_SECS,
             None => false,
         }
     }
@@ -252,12 +289,19 @@ impl ReindexTracker {
     pub fn reset(&mut self, repo_id: &str) {
         self.counts.remove(repo_id);
         self.last_full_reindex
-            .insert(repo_id.to_string(), Instant::now());
+            .insert(repo_id.to_string(), now_unix());
     }
 
     /// Current incremental count for a repo.
     pub fn count(&self, repo_id: &str) -> u32 {
         self.counts.get(repo_id).copied().unwrap_or(0)
+    }
+
+    /// Wall-clock time (Unix epoch seconds) of the last full re-index for a
+    /// repo, or `None` if it has never been recorded. Used to write the
+    /// tracker's state through to the persisted store.
+    pub fn last_full_unix(&self, repo_id: &str) -> Option<i64> {
+        self.last_full_reindex.get(repo_id).copied()
     }
 
     /// 0.25% random spot-check: returns true with probability 1/400.
@@ -481,5 +525,48 @@ mod tests {
         }
         assert!(tracker.needs_full_reindex("repo-a", 100));
         assert!(!tracker.needs_full_reindex("repo-b", 100));
+    }
+
+    #[test]
+    fn reset_records_wall_clock_and_does_not_immediately_retrigger() {
+        let mut tracker = ReindexTracker::new();
+        tracker.reset("repo");
+        // A fresh reset stamps "now", so the 7-day backstop must not fire.
+        assert!(!tracker.needs_full_reindex("repo", 100));
+        assert!(
+            tracker.last_full_unix("repo").is_some(),
+            "reset should stamp a wall-clock timestamp"
+        );
+    }
+
+    #[test]
+    fn rehydrate_restores_count_and_last_full() {
+        let last_full = now_unix() - 3600; // 1 hour ago
+        let tracker =
+            ReindexTracker::from_persisted([("repo".to_string(), 42u32, Some(last_full))]);
+        assert_eq!(tracker.count("repo"), 42);
+        assert_eq!(tracker.last_full_unix("repo"), Some(last_full));
+        // 1 hour ago is well within the 7-day window — no forced full.
+        assert!(!tracker.needs_full_reindex("repo", 100));
+    }
+
+    #[test]
+    fn rehydrated_at_threshold_count_triggers_full() {
+        // A restored count at/over the floor threshold must still force a full.
+        let tracker = ReindexTracker::from_persisted([("repo".to_string(), 150u32, None)]);
+        assert!(tracker.needs_full_reindex("repo", 100));
+    }
+
+    #[test]
+    fn rehydrated_old_last_full_triggers_time_backstop() {
+        // Persisted last_full 8 days ago should fire the wall-clock backstop
+        // even with a zero update count.
+        let eight_days_ago = now_unix() - 8 * 24 * 3600;
+        let tracker =
+            ReindexTracker::from_persisted([("repo".to_string(), 0u32, Some(eight_days_ago))]);
+        assert!(
+            tracker.needs_full_reindex("repo", 100),
+            "7-day wall-clock backstop should fire from a persisted old last_full"
+        );
     }
 }

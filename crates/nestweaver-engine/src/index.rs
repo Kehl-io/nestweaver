@@ -1010,15 +1010,15 @@ where
 
     let _write_guard = acquire_write_guard()?;
 
-    // Insert the Repo node if it doesn't exist yet. SHA update for existing
-    // repos is deferred until after bulk_index_write succeeds so that a write
-    // failure doesn't leave a stale SHA that skips future re-indexes.
+    // Insert the Repo node if it doesn't exist yet. The target SHA is recorded
+    // only after every required graph write succeeds, so a later write failure
+    // cannot make retry preparation think this commit is already indexed.
     let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
     if existing_repo.is_none() {
         let repo = Repo {
             uid: r_uid.clone(),
             url: repo_url.trim_end_matches('/').to_string(),
-            indexed_sha: indexed_sha.to_string(),
+            indexed_sha: String::new(),
             staleness_commits_behind: 0,
             instance_id: instance_id.to_string(),
             name: name.map(String::from),
@@ -1110,14 +1110,6 @@ where
         "phase write complete"
     );
     drop(_phase_write_span);
-
-    // Update the Repo SHA now that file/symbol data is committed.
-    // For new repos, insert_repo already set the SHA; only update for existing repos.
-    if existing_repo.is_some() {
-        store
-            .update_repo_sha(&r_uid, indexed_sha)
-            .context("update_repo_sha")?;
-    }
 
     // ── Phase 3: Resolve cross-file references ────────────────────────────
     let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
@@ -1424,6 +1416,10 @@ where
         "phase contracts complete"
     );
     drop(_phase_contracts_span);
+
+    store
+        .update_repo_sha(&r_uid, indexed_sha)
+        .context("update_repo_sha")?;
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -1849,6 +1845,166 @@ pub fn incremental_index_with_name(
     }
 
     // P0.2: incremental index mutated the graph; bump + persist the generation.
+    store.bump_and_persist_generation();
+
+    Ok(result)
+}
+
+/// Incrementally re-index a repository using an arbitrary content reader.
+///
+/// Server mode keeps blobless bare clones rather than checked-out worktrees, so
+/// this entry point uses `git_repo_path` for diff/ancestor checks and `reader`
+/// for file contents at `new_sha`.
+pub(crate) fn incremental_index_with_reader_and_write_gate<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    git_repo_path: &Path,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    new_sha: &str,
+    acquire_write_guard: F,
+) -> Result<IncrementalResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    let old_sha = store
+        .lookup_repo(&r_uid)
+        .with_context(|| "lookup_repo failed")?
+        .map(|r| r.indexed_sha)
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
+
+    if old_sha == new_sha {
+        tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
+        return Ok(IncrementalResult::default());
+    }
+
+    if !crate::git_diff::is_ancestor(git_repo_path, &old_sha, new_sha) {
+        return Ok(IncrementalResult {
+            fell_back_to_full: true,
+            ..IncrementalResult::default()
+        });
+    }
+
+    let changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
+        .with_context(|| "detect_changes")?;
+
+    tracing::info!(
+        count = changes.len(),
+        old_sha,
+        new_sha,
+        "processing server incremental changes"
+    );
+
+    let _write_guard = acquire_write_guard()?;
+    let txn = store
+        .begin_transaction()
+        .with_context(|| "begin incremental transaction")?;
+    let mut result = IncrementalResult::default();
+
+    for change in &changes {
+        match change {
+            crate::git_diff::FileChange::Added(rel_path) => {
+                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                    result.files_skipped += 1;
+                    continue;
+                }
+                let added = process_added_or_modified_file_txn(
+                    reader, rel_path, &r_uid, repo_url, store, &txn,
+                )?;
+                result.symbols_added += added;
+                result.files_added += 1;
+            }
+            crate::git_diff::FileChange::Modified(rel_path) => {
+                if path_in_skip_dir(rel_path) || !is_parseable(rel_path) {
+                    result.files_skipped += 1;
+                    continue;
+                }
+                let rel_str = rel_path.to_string_lossy();
+                let removed =
+                    nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
+                        .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
+                result.symbols_removed += removed;
+
+                let added = process_added_or_modified_file_txn(
+                    reader, rel_path, &r_uid, repo_url, store, &txn,
+                )?;
+                result.symbols_added += added;
+                result.files_modified += 1;
+            }
+            crate::git_diff::FileChange::Deleted(rel_path) => {
+                let rel_str = rel_path.to_string_lossy();
+                let removed =
+                    nestweaver_store::GraphStore::delete_symbols_in_file_on(&txn, &r_uid, &rel_str)
+                        .with_context(|| format!("delete_symbols_in_file {}", rel_str))?;
+                result.symbols_removed += removed;
+
+                let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
+                nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
+                    .with_context(|| format!("delete_file_node {}", rel_str))?;
+                result.files_deleted += 1;
+            }
+            crate::git_diff::FileChange::Renamed { from, to } => {
+                let from_str = from.to_string_lossy();
+                let to_str = to.to_string_lossy();
+
+                if is_parseable(to) && !path_in_skip_dir(to) {
+                    nestweaver_store::GraphStore::update_symbol_file_paths_on(
+                        &txn, &r_uid, &from_str, &to_str,
+                    )
+                    .with_context(|| {
+                        format!("update_symbol_file_paths {} -> {}", from_str, to_str)
+                    })?;
+                } else {
+                    let removed = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                        &txn, &r_uid, &from_str,
+                    )
+                    .with_context(|| format!("delete_symbols_in_file {}", from_str))?;
+                    result.symbols_removed += removed;
+                }
+
+                let old_f_uid = nestweaver_schema::file_uid(&r_uid, &from_str);
+                nestweaver_store::GraphStore::delete_file_node_on(&txn, &old_f_uid)
+                    .with_context(|| format!("delete_file_node (rename from) {}", from_str))?;
+
+                if is_parseable(to) && !path_in_skip_dir(to) {
+                    let removed2 = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                        &txn, &r_uid, &to_str,
+                    )
+                    .with_context(|| "delete_symbols_in_file (rename to)")?;
+                    result.symbols_removed += removed2;
+
+                    let added = process_added_or_modified_file_txn(
+                        reader, to, &r_uid, repo_url, store, &txn,
+                    )?;
+                    result.symbols_added += added;
+                }
+
+                result.files_renamed += 1;
+            }
+        }
+    }
+
+    nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
+        .with_context(|| "update_repo_sha")?;
+    store
+        .commit_transaction(&txn)
+        .with_context(|| "commit incremental transaction")?;
+    drop(txn);
+
+    store
+        .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+        .with_context(|| "compute_pagerank after incremental index")?;
+
+    if let Some(db_path) = store.db_path() {
+        crate::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
+        let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
+        if let Err(e) = store.save_pagerank_cache(&pr_path) {
+            tracing::warn!("failed to save pagerank cache: {e}");
+        }
+    }
+
     store.bump_and_persist_generation();
 
     Ok(result)

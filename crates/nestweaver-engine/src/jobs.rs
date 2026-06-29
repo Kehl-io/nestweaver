@@ -8,6 +8,16 @@
 use rusqlite::{Connection, params};
 use std::path::Path;
 
+/// Schema for the persisted periodic-full reindex tracker. One row per repo:
+/// `update_count` is the number of incremental updates since the last full
+/// re-index, `last_full_unix` is the wall-clock time (Unix epoch seconds) of
+/// that last full, or NULL if one has never been recorded.
+const REINDEX_STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS reindex_state (
+    repo_id        TEXT PRIMARY KEY,
+    update_count   INTEGER NOT NULL DEFAULT 0,
+    last_full_unix INTEGER
+);";
+
 /// What triggered this indexing job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobTrigger {
@@ -173,6 +183,10 @@ impl JobQueue {
         let _ = conn.execute_batch(
             "ALTER TABLE index_jobs ADD COLUMN requeue_needed INTEGER NOT NULL DEFAULT 0;",
         );
+        // Persisted periodic-full reindex state (one row per repo). Lives in
+        // the same DB as the job queue so it shares the daemon's lifecycle and
+        // survives restarts — the in-memory `ReindexTracker` is only a cache.
+        conn.execute_batch(REINDEX_STATE_DDL)?;
         Ok(Self { conn })
     }
 
@@ -205,6 +219,7 @@ impl JobQueue {
                 UNIQUE(repo_id)
             );",
         )?;
+        conn.execute_batch(REINDEX_STATE_DDL)?;
         Ok(Self { conn })
     }
 
@@ -553,6 +568,45 @@ impl JobQueue {
             params![job_id],
         )?;
         Ok(deleted > 0)
+    }
+
+    /// Load all persisted periodic-full reindex state. Each tuple is
+    /// `(repo_id, update_count, last_full_unix)`. Used to rehydrate the
+    /// in-memory `ReindexTracker` at daemon startup so the update counter and
+    /// 7-day backstop survive restarts.
+    pub fn load_reindex_state(&self) -> Result<Vec<(String, u32, Option<i64>)>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT repo_id, update_count, last_full_unix FROM reindex_state")?;
+        let rows = stmt.query_map([], |row| {
+            let count: i64 = row.get(1)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                count.max(0) as u32,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Write through the reindex tracker's state for a single repo. Called on
+    /// every tracker mutation (incremental bump or full-reindex reset) so the
+    /// persisted store stays the cross-restart source of truth.
+    pub fn upsert_reindex_state(
+        &self,
+        repo_id: &str,
+        update_count: u32,
+        last_full_unix: Option<i64>,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO reindex_state (repo_id, update_count, last_full_unix)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (repo_id) DO UPDATE SET
+               update_count   = excluded.update_count,
+               last_full_unix = excluded.last_full_unix",
+            params![repo_id, update_count as i64, last_full_unix],
+        )?;
+        Ok(())
     }
 }
 

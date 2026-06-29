@@ -1,5 +1,5 @@
 //! Worker pool that claims jobs from the SQLite queue, fetches repos via bare
-//! clones, and indexes them via `GitBareReader` + `index_with_reader`.
+//! clones, and indexes them via `GitBareReader`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -71,8 +71,8 @@ impl Default for IndexingStatus {
 }
 
 /// Coordinates concurrent indexing workers. Each worker claims a job from the
-/// queue, fetches the latest commits into a bare clone, and runs full indexing
-/// via `index_with_reader`.
+/// queue, fetches the latest commits into a bare clone, and indexes changed
+/// code repos incrementally unless a full refresh is required.
 pub struct WorkerPool {
     concurrency: usize,
     semaphore: Arc<Semaphore>,
@@ -82,6 +82,9 @@ pub struct WorkerPool {
     /// Populated from the instance config by the daemon; empty by default, so
     /// an unconfigured pool indexes everything as code (the prior behaviour).
     repo_types: Arc<HashMap<String, RepoType>>,
+    /// Tracks successful incremental code updates so server mode can
+    /// periodically force a full refresh and bound graph drift.
+    reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
 }
 
 impl WorkerPool {
@@ -90,6 +93,7 @@ impl WorkerPool {
             concurrency,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             repo_types: Arc::new(HashMap::new()),
+            reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
     }
 
@@ -179,6 +183,28 @@ impl WorkerPool {
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
+
+        // Rehydrate the reindex tracker from the persisted store so the
+        // periodic-full update counter and 7-day backstop survive a daemon
+        // restart. The in-memory tracker is only a cache; the DB is the
+        // cross-restart source of truth.
+        {
+            let rows = {
+                let q = queue.lock().expect("job queue lock poisoned");
+                q.load_reindex_state()
+            };
+            match rows {
+                Ok(rows) => {
+                    let mut tracker = self
+                        .reindex_tracker
+                        .lock()
+                        .expect("reindex tracker lock poisoned");
+                    tracker.load_persisted(rows);
+                }
+                Err(e) => tracing::error!("load reindex state: {e}"),
+            }
+        }
+
         loop {
             // Check shutdown signal.
             if *shutdown.borrow() {
@@ -261,6 +287,7 @@ impl WorkerPool {
             let write_mutex = write_mutex.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
+            let reindex_tracker = self.reindex_tracker.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -305,10 +332,25 @@ impl WorkerPool {
                             let queue_for_gate = queue_check.clone();
                             let job_for_gate = job_clone.clone();
                             let write_mutex_for_gate = write_mutex.clone();
-                            commit_prepared_job_with_write_gate(
+                            let force_full_reindex = if prepared.repo_type == RepoType::Code {
+                                let tracker = reindex_tracker
+                                    .lock()
+                                    .expect("reindex tracker lock poisoned");
+                                should_force_full_reindex(
+                                    Some(&tracker),
+                                    &prepared.repo_id,
+                                    current_file_count(&store, &instance_id, &prepared.repo_url),
+                                    crate::scheduler::ReindexTracker::random_spot_check(),
+                                )
+                            } else {
+                                false
+                            };
+
+                            let outcome = commit_prepared_job_with_reindex_decision(
                                 &prepared,
                                 &store,
                                 &instance_id,
+                                force_full_reindex,
                                 move || {
                                     let _write_guard = write_mutex_for_gate
                                         .as_ref()
@@ -326,7 +368,37 @@ impl WorkerPool {
                                     }
                                     Ok(_write_guard)
                                 },
-                            )
+                            )?;
+
+                            if prepared.repo_type == RepoType::Code {
+                                let (count, last_full) = {
+                                    let mut tracker = reindex_tracker
+                                        .lock()
+                                        .expect("reindex tracker lock poisoned");
+                                    record_reindex_outcome(
+                                        &mut tracker,
+                                        &prepared.repo_id,
+                                        outcome,
+                                    );
+                                    (
+                                        tracker.count(&prepared.repo_id),
+                                        tracker.last_full_unix(&prepared.repo_id),
+                                    )
+                                };
+                                // Write-through to the persisted store so the
+                                // counter/backstop survive a restart.
+                                let q = queue_check.lock().expect("job queue lock");
+                                if let Err(e) =
+                                    q.upsert_reindex_state(&prepared.repo_id, count, last_full)
+                                {
+                                    tracing::error!(
+                                        repo = %prepared.repo_id,
+                                        "persist reindex state: {e}"
+                                    );
+                                }
+                            }
+
+                            Ok(())
                         } else {
                             Ok(())
                         }
@@ -429,7 +501,9 @@ fn prepare_job(
         // 3. Discover remote SHA — use the configured branch if set.
         let remote_sha = match &job.branch {
             Some(branch) => bare.sha_for_ref(&format!("refs/heads/{}", branch))?,
-            None => bare.head_sha()?,
+            None => bare
+                .sha_for_ref("FETCH_HEAD")
+                .or_else(|_| bare.head_sha())?,
         };
 
         Ok((bare.path.clone(), remote_sha))
@@ -483,17 +557,108 @@ fn commit_prepared_job_with_write_gate<G, F>(
 where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
+    commit_prepared_job_with_reindex_tracker(
+        prepared,
+        store,
+        instance_id,
+        None,
+        acquire_write_guard,
+    )
+}
+
+fn commit_prepared_job_with_reindex_tracker<G, F>(
+    prepared: &PreparedIndexJob,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    mut reindex_tracker: Option<&mut crate::scheduler::ReindexTracker>,
+    acquire_write_guard: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let force_full_reindex = should_force_full_reindex(
+        reindex_tracker.as_deref(),
+        &prepared.repo_id,
+        current_file_count(store, instance_id, &prepared.repo_url),
+        false,
+    );
+
+    let outcome = commit_prepared_job_with_reindex_decision(
+        prepared,
+        store,
+        instance_id,
+        force_full_reindex,
+        acquire_write_guard,
+    )?;
+
+    if let Some(tracker) = reindex_tracker.as_mut() {
+        record_reindex_outcome(tracker, &prepared.repo_id, outcome);
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReindexOutcome {
+    Skipped,
+    Full,
+    Incremental,
+}
+
+fn current_file_count(
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+) -> u64 {
+    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    store
+        .list_files_by_repo(&r_uid)
+        .map(|files| files.len() as u64)
+        .unwrap_or(0)
+}
+
+fn should_force_full_reindex(
+    reindex_tracker: Option<&crate::scheduler::ReindexTracker>,
+    repo_id: &str,
+    file_count: u64,
+    spot_check: bool,
+) -> bool {
+    reindex_tracker
+        .is_some_and(|tracker| tracker.needs_full_reindex(repo_id, file_count) || spot_check)
+}
+
+fn record_reindex_outcome(
+    tracker: &mut crate::scheduler::ReindexTracker,
+    repo_id: &str,
+    outcome: ReindexOutcome,
+) {
+    match outcome {
+        ReindexOutcome::Incremental => tracker.record_incremental(repo_id),
+        ReindexOutcome::Full => tracker.reset(repo_id),
+        ReindexOutcome::Skipped => {}
+    }
+}
+
+fn commit_prepared_job_with_reindex_decision<G, F>(
+    prepared: &PreparedIndexJob,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    force_full_reindex: bool,
+    acquire_write_guard: F,
+) -> Result<ReindexOutcome, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
     let r_uid = nestweaver_schema::repo_uid(instance_id, &prepared.repo_url);
-    let indexed_sha = store
-        .lookup_repo(&r_uid)
-        .ok()
-        .flatten()
-        .map(|r| r.indexed_sha)
-        .unwrap_or_default();
+    let existing_repo = store.lookup_repo(&r_uid).ok().flatten();
+    let indexed_sha = existing_repo
+        .as_ref()
+        .map(|r| r.indexed_sha.as_str())
+        .unwrap_or("");
 
     if prepared.remote_sha == indexed_sha {
         tracing::debug!(repo = prepared.repo_id, "already up to date");
-        return Ok(());
+        return Ok(ReindexOutcome::Skipped);
     }
 
     // Build a reader over the bare clone at the new SHA.
@@ -516,24 +681,46 @@ where
                 &prepared.remote_sha,
                 acquire_write_guard,
             )?;
+            Ok(ReindexOutcome::Full)
         }
         RepoType::Code => {
-            // Full index via index_with_reader.
-            //    Incremental indexing through ContentReader is a follow-up
-            //    optimization; for v1 we always do a full index.
-            crate::index_with_reader_and_write_gate(
-                &reader,
-                store,
-                instance_id,
-                &prepared.repo_url,
-                &prepared.remote_sha,
-                None,
-                acquire_write_guard,
-            )?;
+            let can_incremental = !indexed_sha.is_empty()
+                && !force_full_reindex
+                && crate::git_diff::is_ancestor(
+                    &prepared.bare_path,
+                    indexed_sha,
+                    &prepared.remote_sha,
+                );
+
+            if can_incremental {
+                let result = crate::index::incremental_index_with_reader_and_write_gate(
+                    &reader,
+                    &prepared.bare_path,
+                    store,
+                    instance_id,
+                    &prepared.repo_url,
+                    &prepared.remote_sha,
+                    acquire_write_guard,
+                )?;
+                if result.fell_back_to_full {
+                    Ok(ReindexOutcome::Full)
+                } else {
+                    Ok(ReindexOutcome::Incremental)
+                }
+            } else {
+                crate::index_with_reader_and_write_gate(
+                    &reader,
+                    store,
+                    instance_id,
+                    &prepared.repo_url,
+                    &prepared.remote_sha,
+                    None,
+                    acquire_write_guard,
+                )?;
+                Ok(ReindexOutcome::Full)
+            }
         }
     }
-
-    Ok(())
 }
 
 fn is_job_cancelled_error(e: &anyhow::Error) -> bool {
@@ -594,6 +781,24 @@ mod tests {
             .unwrap();
     }
 
+    fn commit_file(repo: &std::path::Path, path: &str, content: &str, message: &str) {
+        let full = repo.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+    }
+
     #[test]
     fn is_poison_detects_auth_errors() {
         let e = anyhow::anyhow!("remote: HTTP 401 Unauthorized");
@@ -613,6 +818,24 @@ mod tests {
 
         let e = anyhow::anyhow!("timeout after 30s");
         assert!(!is_poison_error(&e));
+    }
+
+    #[test]
+    fn reindex_decision_includes_random_spot_check() {
+        let tracker = crate::scheduler::ReindexTracker::new();
+
+        assert!(
+            should_force_full_reindex(Some(&tracker), "repo-a", 10_000, true),
+            "random spot checks must force a full server-mode reindex"
+        );
+        assert!(
+            !should_force_full_reindex(Some(&tracker), "repo-a", 10_000, false),
+            "fresh repos below count/time thresholds should stay incremental"
+        );
+        assert!(
+            !should_force_full_reindex(None, "repo-a", 10_000, true),
+            "spot checks only apply when server-mode tracking is enabled"
+        );
     }
 
     #[test]
@@ -702,6 +925,162 @@ mod tests {
         process_job(&job, &ws, &store, instance_id).unwrap();
         // No assertion needed beyond "it didn't error" — the second call
         // should detect identical SHAs and return early.
+    }
+
+    #[test]
+    fn code_repo_uses_incremental_index_after_initial_full_index() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let mut tracker = crate::scheduler::ReindexTracker::new();
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "incremental-repo".to_string(),
+            repo_url: url.clone(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &first,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(
+            tracker.count(&job.repo_id),
+            0,
+            "initial code indexing must be a full index"
+        );
+
+        commit_file(
+            &src,
+            "src/added.rs",
+            "pub fn two() -> i32 { 2 }\n",
+            "add file",
+        );
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated code repo should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &second,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("repo should exist after incremental index");
+        assert_eq!(repo.indexed_sha, second.remote_sha);
+        assert_eq!(
+            tracker.count(&job.repo_id),
+            1,
+            "server-mode code updates should use the incremental path"
+        );
+    }
+
+    #[test]
+    fn code_repo_full_refresh_resets_reindex_tracker() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let mut tracker = crate::scheduler::ReindexTracker::new();
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "refresh-repo".to_string(),
+            repo_url: url.clone(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &first,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            tracker.record_incremental(&job.repo_id);
+        }
+        assert!(tracker.needs_full_reindex(&job.repo_id, 1));
+
+        commit_file(
+            &src,
+            "src/lib.rs",
+            "pub fn one() -> i32 { 11 }\n",
+            "modify file",
+        );
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated code repo should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &second,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("repo should exist after full refresh");
+        assert_eq!(repo.indexed_sha, second.remote_sha);
+        assert_eq!(
+            tracker.count(&job.repo_id),
+            0,
+            "periodic full refresh should reset incremental update count"
+        );
     }
 
     #[test]
@@ -945,5 +1324,56 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// Persist tracker state to a file-backed queue, then rehydrate a fresh
+    /// tracker from a *new* `JobQueue` on the same DB (simulating a daemon
+    /// restart) and assert the counter + last_full survive.
+    #[test]
+    fn reindex_state_survives_restart() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("jobs.db");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // First "process": write through a near-threshold count + a last_full.
+        {
+            let queue = JobQueue::open(&db).unwrap();
+            queue
+                .upsert_reindex_state("repo-a", 150, Some(now - 3600))
+                .unwrap();
+            // A repo that has only accumulated incremental updates.
+            queue.upsert_reindex_state("repo-b", 7, None).unwrap();
+            // A repo whose last full was 8 days ago (time backstop).
+            queue
+                .upsert_reindex_state("repo-c", 0, Some(now - 8 * 24 * 3600))
+                .unwrap();
+        }
+
+        // "Restart": new connection on the same DB, rehydrate the tracker.
+        let queue = JobQueue::open(&db).unwrap();
+        let tracker =
+            crate::scheduler::ReindexTracker::from_persisted(queue.load_reindex_state().unwrap());
+
+        // Counts and timestamps are restored.
+        assert_eq!(tracker.count("repo-a"), 150);
+        assert_eq!(tracker.last_full_unix("repo-a"), Some(now - 3600));
+        assert_eq!(tracker.count("repo-b"), 7);
+        assert_eq!(tracker.last_full_unix("repo-b"), None);
+
+        // A restored at-threshold count still triggers a full re-index.
+        assert!(
+            tracker.needs_full_reindex("repo-a", 100),
+            "restored at-threshold count should force a full"
+        );
+
+        // The 7-day wall-clock backstop fires from a persisted old last_full,
+        // even though repo-c's update count is zero.
+        assert!(
+            tracker.needs_full_reindex("repo-c", 100),
+            "persisted old last_full should fire the time backstop after restart"
+        );
     }
 }
