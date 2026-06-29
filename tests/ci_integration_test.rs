@@ -224,6 +224,146 @@ fn format_comment_produces_markdown() {
     );
 }
 
+// ── Test 4: --fail-on-breaking exits nonzero when breaking change detected ─
+
+#[test]
+fn fail_on_breaking_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+
+    // Set up a git repo with a function and a caller of that function,
+    // so the store records a CALLS edge that makes removal Breaking.
+    init_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function processOrder(orderId) { return orderId; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("app.js"),
+        "function handleCheckout(order) { return processOrder(order.id); }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "initial: add processOrder and handleCheckout",
+        ],
+    );
+
+    // Index the repo so the CALLS edge processOrder <- handleCheckout is stored.
+    index_repo(&repo_dir, &db_path);
+
+    // Second commit: remove processOrder — this is a Breaking change for handleCheckout.
+    std::fs::write(repo_dir.join("lib.js"), "// processOrder removed\n").unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "remove processOrder",
+        ],
+    );
+
+    // Run pre-push-impact with --fail-on-breaking. The removal of processOrder
+    // should be detected as Breaking because handleCheckout calls it.
+    let output = nestweaver()
+        .args([
+            "pre-push-impact",
+            "--diff",
+            "HEAD~1..HEAD",
+            "--fail-on-breaking",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "pre-push-impact --fail-on-breaking should exit nonzero when breaking change detected \
+         (exit {}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── Test 5: --fail-on-error exits nonzero when server is unreachable ───────
+
+#[test]
+fn fail_on_error_exits_nonzero_when_server_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+
+    // Minimal repo with a local change so pre-push-impact has something to analyze.
+    init_git_repo(&repo_dir);
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function hello() { return 1; }\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+
+    // Create a local (uncommitted) change so --local-changes detects something.
+    std::fs::write(
+        repo_dir.join("lib.js"),
+        "function hello(name) { return name; }\n",
+    )
+    .unwrap();
+
+    // Point --server at an address where nothing is listening. With --fail-on-error
+    // the command must exit nonzero instead of silently degrading.
+    let output = nestweaver()
+        .args([
+            "pre-push-impact",
+            "--local-changes",
+            "--server",
+            "http://127.0.0.1:1",
+            "--fail-on-error",
+            "--repo",
+            &repo_dir.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "pre-push-impact --fail-on-error should exit nonzero when server is unreachable \
+         (exit {}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ── Test 3: graceful degradation when server is unreachable ─────────────
 
 #[test]
