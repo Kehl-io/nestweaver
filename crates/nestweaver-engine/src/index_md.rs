@@ -73,7 +73,7 @@ fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
 /// logged warning. Architecture doc §9.7 specifies 1 MB; multi-MB markdown
 /// is almost always machine-generated (pasted logs, exported data dumps)
 /// and parsing them takes seconds while tanking ranking quality.
-const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
+pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
 
 /// Index a markdown vault into a persistent `GraphStore` at `db_path`.
 ///

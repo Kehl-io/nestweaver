@@ -5,8 +5,24 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+
+use crate::index_md::MAX_FILE_SIZE_BYTES;
+
+/// Maximum time to wait for a single `git cat-file --batch` response.
+///
+/// A hung-but-alive git process (e.g. a wedged pack read on a corrupt or
+/// network-backed object store) would otherwise block the [`GitBareReader`]
+/// `batch` Mutex — and every rayon parse thread queued behind it —
+/// indefinitely, since the underlying `read_line`/`read_exact` calls have no
+/// deadline. On timeout we kill the child so the reader thread unblocks, then
+/// return `Err` so `read_file` falls back to a one-shot `git show` and the next
+/// read re-spawns a fresh batch process.
+const CAT_FILE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Abstracts how the indexer reads file contents and discovers files.
 /// `FilesystemReader` preserves local behavior; `GitBareReader` (added in Task 6)
@@ -116,6 +132,23 @@ enum BatchObject {
     Found(Vec<u8>),
     /// Git reported `<spec> missing` — no such object/path at this revision.
     Missing,
+    /// The object's git-reported size exceeded [`MAX_FILE_SIZE_BYTES`]. Its bytes
+    /// were read-and-discarded (never materialized) to keep the stream framed;
+    /// the caller skips the file, mirroring the filesystem oversized-file guard.
+    TooLarge,
+}
+
+/// Read and discard exactly `n` bytes from `r` using a small fixed buffer, so an
+/// oversized object is never materialized in memory. Keeps the `cat-file --batch`
+/// stream framed after a skipped blob. Pure (testable against any `Read`).
+fn discard_exact<R: Read>(r: &mut R, mut n: usize) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    while n > 0 {
+        let want = n.min(buf.len());
+        r.read_exact(&mut buf[..want])?;
+        n -= want;
+    }
+    Ok(())
 }
 
 /// A persistent, pooled `git cat-file --batch` subprocess.
@@ -128,11 +161,18 @@ enum BatchObject {
 struct CatFileBatch {
     child: Child,
     stdin: BufWriter<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    /// Parsed responses produced by the dedicated reader thread, in request
+    /// order. `request` writes one spec to `stdin`, then `recv_timeout`s here so
+    /// a wedged git read can never block the caller past [`CAT_FILE_READ_TIMEOUT`].
+    responses: mpsc::Receiver<Result<BatchObject>>,
+    /// Handle to the reader thread. Joined on drop (after the child is killed,
+    /// which closes its stdout and unblocks the thread) so no thread leaks.
+    reader: Option<JoinHandle<()>>,
 }
 
 impl CatFileBatch {
-    /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout.
+    /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout, plus
+    /// a dedicated reader thread that owns stdout and parses framed responses.
     fn spawn(bare_path: &Path) -> Result<Self> {
         let mut child = Command::new("git")
             .args([
@@ -154,64 +194,133 @@ impl CatFileBatch {
             .stdout
             .take()
             .context("cat-file --batch child has no stdout")?;
+
+        // The reader thread owns stdout so the blocking `read_line`/`read_exact`
+        // calls happen off the request path; `request` only writes stdin and
+        // waits on the channel with a deadline.
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name("cat-file-batch-reader".to_string())
+            .spawn(move || read_loop(BufReader::new(stdout), tx))
+            .context("failed to spawn cat-file --batch reader thread")?;
+
         Ok(Self {
             child,
             stdin: BufWriter::new(stdin),
-            stdout: BufReader::new(stdout),
+            responses: rx,
+            reader: Some(reader),
         })
     }
 
     /// Resolve one object by its `<sha>:<path>` spec.
     ///
-    /// Returns `Ok(BatchObject::Missing)` when git reports the path missing.
-    /// Returns `Err` only for I/O failures (the batch process has likely died),
-    /// so the caller can fall back to a one-shot `git show`.
+    /// Returns `Ok(BatchObject::Missing)` when git reports the path missing,
+    /// `Ok(BatchObject::TooLarge)` when the blob exceeds the size cap, and
+    /// `Err` for I/O failures or a read timeout (the batch process has died or
+    /// hung), so the caller can fall back to a one-shot `git show`.
     fn request(&mut self, sha: &str, rel_path: &Path) -> Result<BatchObject> {
         // Send the request line: "<sha>:<path>\n".
         writeln!(self.stdin, "{}:{}", sha, rel_path.display())
             .context("write request to cat-file --batch")?;
         self.stdin.flush().context("flush cat-file --batch stdin")?;
 
-        // Read the header: "<oid> <type> <size>\n" or "<spec> missing\n".
-        let mut header = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut header)
-            .context("read cat-file --batch header")?;
-        if n == 0 {
-            anyhow::bail!("cat-file --batch closed its output unexpectedly");
+        // Wait for the reader thread's parsed response, but never longer than
+        // CAT_FILE_READ_TIMEOUT — a hung-but-alive git must not wedge the Mutex.
+        match self.responses.recv_timeout(CAT_FILE_READ_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Kill the child so its stdout closes and the reader thread
+                // unblocks and exits (joined on drop). Surface an error so the
+                // caller discards this batch and falls back to `git show`.
+                let _ = self.child.kill();
+                anyhow::bail!(
+                    "cat-file --batch read timed out after {}s",
+                    CAT_FILE_READ_TIMEOUT.as_secs()
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("cat-file --batch reader thread exited unexpectedly")
+            }
         }
-        let header = header.trim_end_matches('\n');
-        if header.ends_with(" missing") {
-            return Ok(BatchObject::Missing);
-        }
-
-        // Object size is the final whitespace-separated field of the header.
-        let size: usize = header
-            .rsplit(' ')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .with_context(|| format!("malformed cat-file --batch header: {header:?}"))?;
-
-        // Read exactly `size` bytes of content, then consume the trailing newline.
-        let mut content = vec![0u8; size];
-        self.stdout
-            .read_exact(&mut content)
-            .context("read cat-file --batch object content")?;
-        let mut newline = [0u8; 1];
-        self.stdout
-            .read_exact(&mut newline)
-            .context("read cat-file --batch trailing newline")?;
-
-        Ok(BatchObject::Found(content))
     }
+}
+
+/// Reader-thread loop: parse framed `cat-file --batch` responses from `stdout`
+/// and forward each to `tx` in request order. Stops on the first parse/I/O error
+/// (the stream is then desynced or closed) or once the receiver is dropped.
+fn read_loop(mut stdout: BufReader<ChildStdout>, tx: mpsc::Sender<Result<BatchObject>>) {
+    loop {
+        let result = read_one(&mut stdout);
+        let is_err = result.is_err();
+        if tx.send(result).is_err() {
+            // Receiver gone (the batch was discarded) — nothing left to do.
+            break;
+        }
+        if is_err {
+            // The stream is broken or closed; further reads are meaningless.
+            break;
+        }
+    }
+}
+
+/// Parse exactly one framed response: `<oid> <type> <size>\n` then `<size>`
+/// content bytes and a trailing newline, or `<spec> missing\n`. Blobs over
+/// [`MAX_FILE_SIZE_BYTES`] are read-and-discarded (not allocated) and reported
+/// as [`BatchObject::TooLarge`].
+fn read_one(stdout: &mut BufReader<ChildStdout>) -> Result<BatchObject> {
+    // Read the header: "<oid> <type> <size>\n" or "<spec> missing\n".
+    let mut header = String::new();
+    let n = stdout
+        .read_line(&mut header)
+        .context("read cat-file --batch header")?;
+    if n == 0 {
+        anyhow::bail!("cat-file --batch closed its output unexpectedly");
+    }
+    let header = header.trim_end_matches('\n');
+    if header.ends_with(" missing") {
+        return Ok(BatchObject::Missing);
+    }
+
+    // Object size is the final whitespace-separated field of the header.
+    let size: usize = header
+        .rsplit(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("malformed cat-file --batch header: {header:?}"))?;
+
+    // Enforce the file-size ceiling. A bare clone has no filesystem size for the
+    // scan-phase guard to check (file_meta returns None), so without this an
+    // accident- or attacker-sized blob would be allocated whole via vec![0u8;
+    // size]. Discard exactly `size` bytes plus the trailing newline to keep the
+    // stream framed, but never materialize the blob.
+    if size as u64 > MAX_FILE_SIZE_BYTES {
+        discard_exact(stdout, size + 1).context("discard oversized cat-file --batch object")?;
+        return Ok(BatchObject::TooLarge);
+    }
+
+    // Read exactly `size` bytes of content, then consume the trailing newline.
+    let mut content = vec![0u8; size];
+    stdout
+        .read_exact(&mut content)
+        .context("read cat-file --batch object content")?;
+    let mut newline = [0u8; 1];
+    stdout
+        .read_exact(&mut newline)
+        .context("read cat-file --batch trailing newline")?;
+
+    Ok(BatchObject::Found(content))
 }
 
 impl Drop for CatFileBatch {
     fn drop(&mut self) {
-        // Kill and reap the child so no zombie git process leaks.
+        // Kill and reap the child so no zombie git process leaks. Killing it
+        // closes the child's stdout, which unblocks the reader thread's pending
+        // read so it can exit.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -306,6 +415,23 @@ impl ContentReader for GitBareReader {
                 self.sha,
                 self.bare_path.display()
             ),
+            Ok(BatchObject::TooLarge) => {
+                // Mirror the filesystem oversized-file skip: the blob was already
+                // read-and-discarded (never materialized) so the stream stays
+                // framed. Do NOT fall back to `git show` — that would re-read the
+                // oversized blob whole. Return Err so callers skip this one file
+                // (their existing read_file Err branch) without failing the index.
+                tracing::warn!(
+                    "skipping oversized blob {} (exceeds {} bytes)",
+                    rel_path.display(),
+                    MAX_FILE_SIZE_BYTES
+                );
+                anyhow::bail!(
+                    "blob too large, skipped: {} exceeds {} bytes",
+                    rel_path.display(),
+                    MAX_FILE_SIZE_BYTES
+                )
+            }
             Err(err) => {
                 // The batch process likely died — discard it (so the next read
                 // re-spawns) and fall back to a one-shot `git show`.
@@ -656,5 +782,144 @@ mod tests {
     fn git_bare_reader_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GitBareReader>();
+    }
+
+    // ---------- discard_exact (pure helper) ----------
+
+    #[test]
+    fn discard_exact_consumes_exact_bytes() {
+        use std::io::Cursor;
+        let data = b"0123456789ABCDEF";
+        let mut cur = Cursor::new(&data[..]);
+        discard_exact(&mut cur, 10).unwrap();
+        // The cursor is positioned exactly past the discarded bytes.
+        let mut rest = Vec::new();
+        cur.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"ABCDEF");
+    }
+
+    #[test]
+    fn discard_exact_spans_internal_buffer() {
+        use std::io::Cursor;
+        // Larger than discard_exact's 8 KiB scratch buffer to exercise looping.
+        let data = vec![7u8; 20_000];
+        let mut cur = Cursor::new(data);
+        discard_exact(&mut cur, 19_999).unwrap();
+        let mut rest = Vec::new();
+        cur.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, vec![7u8]);
+    }
+
+    #[test]
+    fn discard_exact_errors_on_short_stream() {
+        use std::io::Cursor;
+        let mut cur = Cursor::new(vec![0u8; 5]);
+        assert!(discard_exact(&mut cur, 10).is_err());
+    }
+
+    // ---------- FIX 1: pooled child death / git show fallback ----------
+
+    /// Kill (and reap) the pooled `cat-file --batch` child out from under the
+    /// reader, simulating a dead process, then confirm reads recover.
+    #[test]
+    fn git_bare_reader_recovers_when_pooled_child_dies() {
+        let (_tmp, bare, sha) =
+            setup_bare_repo(&[("a.txt", "alpha"), ("b.txt", "bravo"), ("c.txt", "charlie")]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        // First read spawns and uses the pooled batch process.
+        assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "alpha");
+        assert!(
+            reader.batch.lock().unwrap().is_some(),
+            "batch process should be spawned after first read"
+        );
+
+        // Kill the pooled child to simulate a dead/hung-then-killed git.
+        {
+            let mut guard = reader.batch.lock().unwrap();
+            let batch = guard.as_mut().expect("batch spawned above");
+            batch.child.kill().unwrap();
+            batch.child.wait().unwrap();
+        }
+
+        // The next read must still return correct content via the git show
+        // fallback, and clear the dead batch so the following read re-spawns.
+        assert_eq!(reader.read_file(Path::new("b.txt")).unwrap(), "bravo");
+        assert!(
+            reader.batch.lock().unwrap().is_none(),
+            "dead batch should be discarded so the next read re-spawns"
+        );
+
+        // A subsequent read re-spawns through the batch path and works.
+        assert_eq!(reader.read_file(Path::new("c.txt")).unwrap(), "charlie");
+        assert!(
+            reader.batch.lock().unwrap().is_some(),
+            "batch process should be re-spawned after a fallback read"
+        );
+        // ...and the re-spawned stream stays in sync across further reads.
+        assert_eq!(reader.read_file(Path::new("a.txt")).unwrap(), "alpha");
+    }
+
+    /// Directly exercise the one-shot `git show` fallback path.
+    #[test]
+    fn git_bare_reader_read_file_via_show() {
+        let (_tmp, bare, sha) =
+            setup_bare_repo(&[("hello.txt", "world"), ("dir/nested.txt", "deep")]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        assert_eq!(
+            reader.read_file_via_show(Path::new("hello.txt")).unwrap(),
+            "world"
+        );
+        assert_eq!(
+            reader
+                .read_file_via_show(Path::new("dir/nested.txt"))
+                .unwrap(),
+            "deep"
+        );
+        // A missing path must error rather than return empty content.
+        assert!(reader.read_file_via_show(Path::new("absent.txt")).is_err());
+    }
+
+    // ---------- FIX 2: oversized blob cap on bare clones ----------
+
+    /// A blob whose git-reported size exceeds MAX_FILE_SIZE_BYTES must be skipped
+    /// without being materialized, and the batch stream must stay framed so later
+    /// valid reads through the same reader still succeed.
+    #[test]
+    fn git_bare_reader_skips_oversized_blob_and_keeps_stream_usable() {
+        // Just over the cap; setup_bare_repo borrows &str so build it first.
+        let big = "x".repeat(MAX_FILE_SIZE_BYTES as usize + 1_000);
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("small.txt", "tiny"),
+            ("big.txt", big.as_str()),
+            ("after.txt", "still here"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        // A normal read first, to prime the pooled batch process.
+        assert_eq!(reader.read_file(Path::new("small.txt")).unwrap(), "tiny");
+
+        // The oversized blob is skipped via a clear error (read_file's Err branch
+        // makes callers skip just this file, not fail the whole index).
+        let err = reader.read_file(Path::new("big.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected an oversized-skip error, got: {err}"
+        );
+        // The batch must NOT have been discarded — the stream was kept framed by
+        // read-and-discard, so it is still the live pooled process.
+        assert!(
+            reader.batch.lock().unwrap().is_some(),
+            "oversized skip must not kill the pooled batch process"
+        );
+
+        // Later valid reads through the SAME reader still succeed, proving the
+        // stream stayed in sync after discarding the oversized object.
+        assert_eq!(
+            reader.read_file(Path::new("after.txt")).unwrap(),
+            "still here"
+        );
+        assert_eq!(reader.read_file(Path::new("small.txt")).unwrap(), "tiny");
     }
 }
