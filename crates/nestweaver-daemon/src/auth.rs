@@ -14,6 +14,16 @@ use tonic::{Request, Status};
 
 use crate::safeguards::ClientRateLimiters;
 
+/// Constant-time byte comparison for authentication tokens.
+/// Prevents timing side-channel attacks (CWE-208).
+/// Note: returns false immediately for different-length inputs (length is not
+/// constant-time). This is acceptable for high-entropy tokens where length is
+/// not sensitive.
+pub fn secure_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
 /// Returns a tonic interceptor that validates bearer tokens and enforces
 /// per-client rate limits.
 ///
@@ -53,10 +63,8 @@ pub fn bearer_auth_interceptor(
                 }
 
                 // Rate limit check — admin tokens are exempt.
-                if !is_admin {
-                    if let Some(ref rl) = rate_limiters {
-                        rl.check(bearer)?;
-                    }
+                if !is_admin && let Some(ref rl) = rate_limiters {
+                    rl.check(bearer)?;
                 }
 
                 Ok(req)
@@ -131,6 +139,21 @@ mod tests {
         for _ in 0..50 {
             assert!(f(request_with_token("admin-token")).is_ok());
         }
+    }
+
+    #[test]
+    fn secure_eq_matches_identical() {
+        assert!(super::secure_eq(b"secret-token", b"secret-token"));
+    }
+
+    #[test]
+    fn secure_eq_rejects_different() {
+        assert!(!super::secure_eq(b"secret-token", b"wrong-token"));
+    }
+
+    #[test]
+    fn secure_eq_rejects_different_lengths() {
+        assert!(!super::secure_eq(b"short", b"longer-token"));
     }
 
     #[test]
