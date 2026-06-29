@@ -309,9 +309,9 @@ impl HybridClient {
     /// Delegates to `two_tier_query` for blast_radius/brain_impact/
     /// affected_tests tools.
     async fn query_two_tier(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        two_tier_query(self, tool_name, params).await.or_else(|e| {
+        two_tier_query(self, tool_name, params).await.map_err(|e| {
             debug!(error = %e, tool = tool_name, "two-tier query failed");
-            Err(e)
+            e
         })
     }
 
@@ -485,12 +485,11 @@ impl HybridClient {
 
             if let Ok(resp) = client.repo_states(req).await {
                 for server_repo in resp.into_inner().repos {
-                    if let Some(local_sha) = local_states.get(&server_repo.repo_url) {
-                        if local_sha != &server_repo.indexed_sha
-                            && !server_repo.indexed_sha.is_empty()
-                        {
-                            stale.push(server_repo.repo_url.clone());
-                        }
+                    if let Some(local_sha) = local_states.get(&server_repo.repo_url)
+                        && local_sha != &server_repo.indexed_sha
+                        && !server_repo.indexed_sha.is_empty()
+                    {
+                        stale.push(server_repo.repo_url.clone());
                     }
                 }
             }
@@ -536,12 +535,11 @@ impl HybridClient {
                     status.repo_count = server_repos.len();
 
                     for server_repo in &server_repos {
-                        if let Some(local_sha) = local_states.get(&server_repo.repo_url) {
-                            if local_sha != &server_repo.indexed_sha
-                                && !server_repo.indexed_sha.is_empty()
-                            {
-                                status.stale_repos.push(server_repo.repo_url.clone());
-                            }
+                        if let Some(local_sha) = local_states.get(&server_repo.repo_url)
+                            && local_sha != &server_repo.indexed_sha
+                            && !server_repo.indexed_sha.is_empty()
+                        {
+                            status.stale_repos.push(server_repo.repo_url.clone());
                         }
                     }
                 }
@@ -640,12 +638,11 @@ impl HybridClient {
 
                     let mut c = client.clone();
                     let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
-                    if let Some(t) = token {
-                        if let Ok(val) =
+                    if let Some(t) = token
+                        && let Ok(val) =
                             format!("Bearer {}", t).parse::<tonic::metadata::MetadataValue<_>>()
-                        {
-                            req.metadata_mut().insert("authorization", val);
-                        }
+                    {
+                        req.metadata_mut().insert("authorization", val);
                     }
 
                     match tokio::time::timeout(Duration::from_secs(2), c.health_check(req)).await {
@@ -764,10 +761,10 @@ async fn dispatch_json_rpc_authed(
     let args_json = serde_json::to_string(params)?;
     let mut request = tonic::Request::new(JsonRequest { args_json });
 
-    if let Some(token) = auth_token {
-        if let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>() {
-            request.metadata_mut().insert("authorization", val);
-        }
+    if let Some(token) = auth_token
+        && let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>()
+    {
+        request.metadata_mut().insert("authorization", val);
     }
 
     let response: JsonResponse = match tool_name {
@@ -825,17 +822,17 @@ async fn dispatch_json_rpc_authed(
     .with_context(|| format!("{tool_name} RPC failed"))?
     .into_inner();
 
-    let parsed: Value = serde_json::from_str(&response.result_json)
-        .unwrap_or_else(|_| Value::String(response.result_json));
+    let parsed: Value =
+        serde_json::from_str(&response.result_json).unwrap_or(Value::String(response.result_json));
     Ok(parsed)
 }
 
 /// Inject an optional bearer token into a tonic request.
 fn inject_bearer_token<T>(request: &mut tonic::Request<T>, auth_token: Option<&str>) {
-    if let Some(token) = auth_token {
-        if let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>() {
-            request.metadata_mut().insert("authorization", val);
-        }
+    if let Some(token) = auth_token
+        && let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>()
+    {
+        request.metadata_mut().insert("authorization", val);
     }
 }
 
@@ -1003,7 +1000,7 @@ async fn dispatch_typed_brain_context(
         .context("brain_context RPC failed")?
         .into_inner();
     let parsed: Value =
-        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+        serde_json::from_str(&resp.result_json).unwrap_or(Value::String(resp.result_json));
     Ok(parsed)
 }
 
@@ -1060,7 +1057,7 @@ async fn dispatch_typed_project_context(
         .context("project_context RPC failed")?
         .into_inner();
     let parsed: Value =
-        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+        serde_json::from_str(&resp.result_json).unwrap_or(Value::String(resp.result_json));
     Ok(parsed)
 }
 
@@ -1126,7 +1123,7 @@ async fn dispatch_typed_hub_nodes(
         .context("hub_nodes RPC failed")?
         .into_inner();
     let parsed: Value =
-        serde_json::from_str(&resp.result_json).unwrap_or_else(|_| Value::String(resp.result_json));
+        serde_json::from_str(&resp.result_json).unwrap_or(Value::String(resp.result_json));
     Ok(parsed)
 }
 
@@ -1550,31 +1547,31 @@ pub fn stitch_server_spans(
         server_name: &str,
     ) -> bool {
         // Check if this node is the boundary (leaf with matching canonical_id).
-        if let Some(cid) = node.get("canonical_id").and_then(|v| v.as_str()) {
-            if cid == boundary_cid {
-                // Inject children.
-                if let Some(children) = node.get_mut("children") {
-                    if let Some(arr) = children.as_array_mut() {
-                        arr.extend_from_slice(subtrees);
-                    }
-                } else if let Some(obj) = node.as_object_mut() {
-                    obj.insert("children".to_string(), Value::Array(subtrees.to_vec()));
-                    obj.insert(
-                        "boundary_crossed".to_string(),
-                        Value::String(format!("-> {}", server_name)),
-                    );
+        if let Some(cid) = node.get("canonical_id").and_then(|v| v.as_str())
+            && cid == boundary_cid
+        {
+            // Inject children.
+            if let Some(children) = node.get_mut("children") {
+                if let Some(arr) = children.as_array_mut() {
+                    arr.extend_from_slice(subtrees);
                 }
-                return true;
+            } else if let Some(obj) = node.as_object_mut() {
+                obj.insert("children".to_string(), Value::Array(subtrees.to_vec()));
+                obj.insert(
+                    "boundary_crossed".to_string(),
+                    Value::String(format!("-> {}", server_name)),
+                );
             }
+            return true;
         }
 
         // Recurse into children.
-        if let Some(children) = node.get_mut("children") {
-            if let Some(arr) = children.as_array_mut() {
-                for child in arr.iter_mut() {
-                    if inject_at_boundary(child, boundary_cid, subtrees, server_name) {
-                        return true;
-                    }
+        if let Some(children) = node.get_mut("children")
+            && let Some(arr) = children.as_array_mut()
+        {
+            for child in arr.iter_mut() {
+                if inject_at_boundary(child, boundary_cid, subtrees, server_name) {
+                    return true;
                 }
             }
         }
@@ -1588,11 +1585,11 @@ pub fn stitch_server_spans(
     }
 
     // Also try "methods" array for class-expanded traces.
-    if let Some(methods) = local_result.get_mut("methods") {
-        if let Some(arr) = methods.as_array_mut() {
-            for method in arr.iter_mut() {
-                inject_at_boundary(method, boundary_canonical_id, &subtrees, server_name);
-            }
+    if let Some(methods) = local_result.get_mut("methods")
+        && let Some(arr) = methods.as_array_mut()
+    {
+        for method in arr.iter_mut() {
+            inject_at_boundary(method, boundary_canonical_id, &subtrees, server_name);
         }
     }
 }
@@ -1635,7 +1632,7 @@ pub async fn flow_trace_with_stitching(
         .get("max_depth")
         .and_then(|v| v.as_i64())
         .unwrap_or(10) as i32;
-    let trace_id = format!("trace-{}", uuid_v4_simple());
+    let trace_id = format!("trace-{}", trace_id());
 
     let upstream = match client.upstreams.iter().find(|u| u.is_healthy()) {
         Some(u) => u,
@@ -1712,14 +1709,18 @@ pub async fn flow_trace_with_stitching(
     Ok(local_result)
 }
 
-/// Generate a simple pseudo-UUID for trace IDs.
-fn uuid_v4_simple() -> String {
+fn trace_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    format!("{:032x}", t)
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let id: u128 = ((pid & 0xFFFF) as u128) << 112 | ((seq as u128) << 64) | (ts as u128);
+    format!("{:032x}", id)
 }
 
 // ── Two-tier blast_radius ───────────────────────────────────────────────
@@ -1928,7 +1929,7 @@ mod tests {
 
         h2.mark_unhealthy();
 
-        let upstreams = vec![h1, h2];
+        let upstreams = [h1, h2];
         let info: Vec<(&str, bool)> = upstreams
             .iter()
             .map(|u| (u.name.as_str(), u.is_healthy()))
@@ -2208,7 +2209,7 @@ mod tests {
         handle.mark_unhealthy();
 
         // has_upstreams should return false when all upstreams are unhealthy.
-        let upstreams = vec![handle];
+        let upstreams = [handle];
         let has_healthy = upstreams.iter().any(|u| u.is_healthy());
         assert!(!has_healthy);
     }
@@ -2378,7 +2379,7 @@ mod tests {
 
     #[test]
     fn uuid_simple_generates_hex() {
-        let id = uuid_v4_simple();
+        let id = trace_id();
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
