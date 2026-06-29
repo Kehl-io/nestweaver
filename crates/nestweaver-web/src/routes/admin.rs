@@ -420,6 +420,22 @@ fn validate_repo_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a config-declared repo URL is safe to enqueue during a reload.
+///
+/// Applies the same synchronous SSRF checks as `add_repo` (`validate_repo_url`)
+/// so repos loaded from `instance.toml` can't smuggle in an internal/private
+/// target that the add-repo API would reject. DNS resolution is intentionally
+/// not performed here — config reload must stay non-blocking — so only the
+/// synchronous checks (scheme, literal/encoded internal IPs, localhost/metadata
+/// hostnames) apply; that matches add_repo's pre-resolution gate.
+///
+/// Exposed `pub` so the daemon's startup config-repo enqueue path
+/// (`server.rs`) can gate `instance.toml`-declared repos through the same SSRF
+/// check before they are cloned/indexed, not just the reload path.
+pub fn config_repo_url_allowed(url: &str) -> bool {
+    validate_repo_url(url).is_ok()
+}
+
 /// POST /admin/api/repos — add a new repo.
 pub async fn add_repo(
     _auth: AdminAuth,
@@ -1061,10 +1077,26 @@ pub async fn reload_config(
 
                 let mut new_repos = 0usize;
                 let mut orphaned_repos = 0usize;
+                let mut skipped_repos = 0usize;
 
                 // New repos in config but not yet indexed: enqueue.
                 for r in &cfg.repos {
                     if !indexed_urls.contains(&r.url) {
+                        // Config-sourced repos bypass the add_repo API and its
+                        // SSRF validation, so re-run the same synchronous URL
+                        // checks here and refuse to enqueue any internal/private
+                        // target declared in config. DNS resolution is skipped
+                        // (reload must stay non-blocking); literal/encoded
+                        // internal IPs and localhost/metadata hosts are still
+                        // rejected.
+                        if !config_repo_url_allowed(&r.url) {
+                            tracing::warn!(
+                                url = %r.url,
+                                "config reload: skipping repo — URL rejected by SSRF guard"
+                            );
+                            skipped_repos += 1;
+                            continue;
+                        }
                         tracing::info!(url = %r.url, "config reload: new repo — queueing for indexing");
                         if let Some(ref q) = queue {
                             let repo_id = nestweaver_engine::jobs::canonical_repo_id(&r.url);
@@ -1100,6 +1132,12 @@ pub async fn reload_config(
                 }
                 if orphaned_repos > 0 {
                     msg.push_str(&format!(", {} orphaned repos", orphaned_repos));
+                }
+                if skipped_repos > 0 {
+                    msg.push_str(&format!(
+                        ", {} repos skipped (rejected URL)",
+                        skipped_repos
+                    ));
                 }
                 Ok(msg)
             }
@@ -1266,6 +1304,171 @@ const DEVICE_POLL_INTERVAL_SECS: u64 = 5;
 /// (0/O, 1/I/L) so codes are easy to read aloud and type.
 const USER_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
+/// Per-IP request budget (per minute) for the unauthenticated `/auth/device`
+/// and `/auth/token` endpoints. A legitimate device-flow client polls `/token`
+/// every `DEVICE_POLL_INTERVAL_SECS` (~12/min), so this leaves ample headroom
+/// while throttling floods.
+pub const AUTH_RATE_PER_MIN: u64 = 60;
+/// Upper bound on the number of distinct client keys the auth rate limiter
+/// tracks. Prevents the limiter map from becoming its own unbounded-growth DoS
+/// when an attacker rotates source IPs.
+pub const AUTH_RATE_MAX_KEYS: usize = 4096;
+/// Max request body accepted on the `/auth` router. Device-flow bodies are a
+/// tiny JSON object (`device_code`/`user_code`); 4 KiB is generous.
+pub const AUTH_BODY_LIMIT_BYTES: usize = 4096;
+
+struct AuthTokenBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+/// Bounded, per-client token-bucket rate limiter for the public device-flow
+/// endpoints. Mirrors the MCP `HttpRateLimiter` token-bucket math but caps the
+/// number of tracked keys so a flood of distinct source IPs can't turn the
+/// limiter itself into an unbounded-growth leak (we'd just move the DoS).
+///
+/// Pure and synchronous so the refill/eviction logic is unit-testable with an
+/// injectable clock.
+pub struct AuthRateLimiter {
+    buckets: std::sync::Mutex<std::collections::HashMap<String, AuthTokenBucket>>,
+    capacity: f64,
+    refill_per_sec: f64,
+    max_keys: usize,
+    clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
+}
+
+impl AuthRateLimiter {
+    pub fn new(requests_per_min: u64, max_keys: usize) -> Self {
+        Self::new_with_clock(
+            requests_per_min,
+            max_keys,
+            Arc::new(std::time::Instant::now),
+        )
+    }
+
+    fn new_with_clock(
+        requests_per_min: u64,
+        max_keys: usize,
+        clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
+    ) -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity: requests_per_min as f64,
+            refill_per_sec: requests_per_min as f64 / 60.0,
+            max_keys,
+            clock,
+        }
+    }
+
+    /// Consume one token for `key`. Returns `true` if the request is allowed.
+    ///
+    /// When the tracked-key cap is reached and `key` is new, fully-refilled
+    /// (idle) buckets are evicted first; if the map is still full the request is
+    /// rejected rather than inserting an unbounded new key.
+    pub fn check(&self, key: &str) -> bool {
+        let now = (self.clock)();
+        let mut buckets = self.buckets.lock().unwrap();
+
+        if buckets.len() >= self.max_keys && !buckets.contains_key(key) {
+            // Drop buckets that have fully refilled — they carry no state worth
+            // keeping and freeing them keeps the map bounded.
+            let cap = self.capacity;
+            let refill = self.refill_per_sec;
+            buckets.retain(|_, b| {
+                let elapsed = now.duration_since(b.last_refill).as_secs_f64();
+                (b.tokens + elapsed * refill) < cap
+            });
+            if buckets.len() >= self.max_keys {
+                return false;
+            }
+        }
+
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| AuthTokenBucket {
+                tokens: self.capacity,
+                last_refill: now,
+            });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Derive the rate-limit key for an inbound `/auth` request.
+///
+/// Prefers the direct peer address (`ConnectInfo`, unspoofable) when the server
+/// wired it; otherwise falls back to a reverse-proxy-supplied client IP
+/// (`X-Forwarded-For`/`X-Real-IP`); if neither is available the key collapses to
+/// a single global bucket, which degrades the per-IP limit to a global rate cap
+/// on `/auth` (the documented fallback when no peer-addr source exists).
+fn auth_rate_limit_key(req: &axum::extract::Request) -> String {
+    if let Some(ci) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return format!("ip:{}", ci.0.ip());
+    }
+    if let Some(ip) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("xff:{ip}");
+    }
+    if let Some(ip) = req
+        .headers()
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("xrip:{ip}");
+    }
+    "global".to_string()
+}
+
+/// Axum middleware enforcing [`AuthRateLimiter`] on the public device-flow
+/// endpoints. On rejection, the token endpoint returns the RFC 8628 `slow_down`
+/// error (so polling clients back off); other endpoints get a plain 429.
+pub async fn auth_rate_limit(
+    limiter: Arc<AuthRateLimiter>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let key = auth_rate_limit_key(&req);
+    if !limiter.check(&key) {
+        if req.uri().path().ends_with("/token") {
+            // RFC 8628 §3.5: tell polling clients to slow down.
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(DeviceErrorResponse {
+                    error: "slow_down".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded; slow down".to_string(),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 #[derive(Serialize)]
 pub struct DeviceAuthResponse {
     pub device_code: String,
@@ -1296,16 +1499,63 @@ pub struct DeviceApproveRequest {
     pub user_code: String,
 }
 
+/// Number of characters in a generated user code.
+const USER_CODE_LEN: usize = 8;
+/// Hard cap on concurrently-pending device grants. The map is also TTL-pruned,
+/// but the cap bounds memory against an unauthenticated flood on `/auth/device`
+/// (the endpoint is public, so without this it could grow without bound).
+const MAX_PENDING_DEVICES: usize = 1024;
+/// Bound on how many times we re-roll a colliding `user_code` before giving up.
+/// With a 30^8 space and ≤1024 pending grants, a single roll almost never
+/// collides; the cap just guarantees termination.
+const USER_CODE_MAX_ATTEMPTS: usize = 16;
+
 /// Generate a short, human-readable user code (8 chars from an unambiguous
-/// uppercase-alnum alphabet). Randomness comes from a v4 UUID so we don't pull
-/// in an extra RNG dependency.
+/// uppercase-alnum alphabet). Randomness comes from v4 UUIDs (getrandom-backed)
+/// so we don't pull in an extra RNG dependency.
+///
+/// Bytes are mapped to the alphabet by **rejection sampling**, not `% len`: the
+/// alphabet has 30 symbols and 256 is not a multiple of 30, so a plain modulo
+/// would bias the first 16 symbols. We discard any byte ≥ the largest multiple
+/// of the alphabet length that fits in a `u8` (240), leaving a uniform mapping.
 fn generate_user_code() -> String {
-    uuid::Uuid::new_v4()
-        .into_bytes()
-        .iter()
-        .take(8)
-        .map(|b| USER_CODE_ALPHABET[(*b as usize) % USER_CODE_ALPHABET.len()] as char)
-        .collect()
+    let alpha_len = USER_CODE_ALPHABET.len() as u16; // 30
+    // Largest multiple of the alphabet length that fits in a u8 (240). Bytes at
+    // or above this are rejected to avoid modulo bias.
+    let reject_threshold = (256 / alpha_len * alpha_len) as u8;
+
+    let mut out = String::with_capacity(USER_CODE_LEN);
+    while out.len() < USER_CODE_LEN {
+        // Pull a fresh batch of CSPRNG bytes; UUID v4 is getrandom-backed.
+        for &b in uuid::Uuid::new_v4().into_bytes().iter() {
+            if out.len() >= USER_CODE_LEN {
+                break;
+            }
+            if b < reject_threshold {
+                out.push(USER_CODE_ALPHABET[(b % alpha_len as u8) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Generate a `user_code` that is unique among the currently-pending grants
+/// (compared canonically). Returns `None` if a unique code couldn't be found
+/// within `USER_CODE_MAX_ATTEMPTS` rolls (practically impossible at our cap).
+fn generate_unique_user_code(
+    map: &std::collections::HashMap<String, PendingDevice>,
+) -> Option<String> {
+    let taken: std::collections::HashSet<String> = map
+        .values()
+        .map(|p| normalize_user_code(&p.user_code))
+        .collect();
+    for _ in 0..USER_CODE_MAX_ATTEMPTS {
+        let code = generate_user_code();
+        if !taken.contains(&normalize_user_code(&code)) {
+            return Some(code);
+        }
+    }
+    None
 }
 
 /// Canonicalize a user code for comparison: uppercase, keep only alphanumerics
@@ -1355,37 +1605,57 @@ fn verification_base(headers: &axum::http::HeaderMap) -> String {
 pub async fn device_authorize(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
-) -> Json<DeviceAuthResponse> {
+) -> Result<Json<DeviceAuthResponse>, (StatusCode, String)> {
     let device_code = uuid::Uuid::new_v4().to_string();
-    let user_code = generate_user_code();
+
+    let expires_at =
+        std::time::Instant::now() + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS);
+
+    let user_code = {
+        let mut map = state.device_flow.write().await;
+        prune_expired(&mut map);
+
+        // Bound the pending map: the endpoint is unauthenticated, so without a
+        // cap a flood could grow it without limit (TTL pruning alone lags). Once
+        // pruning can't free a slot, shed load rather than grow.
+        if map.len() >= MAX_PENDING_DEVICES {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "device authorization capacity reached; retry later".to_string(),
+            ));
+        }
+
+        // Pick a code that doesn't collide with another pending grant, so an
+        // admin approving a code can never match two devices.
+        let Some(code) = generate_unique_user_code(&map) else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not allocate a unique user code; retry later".to_string(),
+            ));
+        };
+        map.insert(
+            device_code.clone(),
+            PendingDevice {
+                user_code: code.clone(),
+                expires_at,
+                approved_token: None,
+            },
+        );
+        code
+    };
 
     let base = verification_base(&headers);
     let verification_uri = format!("{base}/admin");
     let verification_uri_complete = format!("{base}/admin?user_code={user_code}");
 
-    let expires_at =
-        std::time::Instant::now() + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS);
-    {
-        let mut map = state.device_flow.write().await;
-        prune_expired(&mut map);
-        map.insert(
-            device_code.clone(),
-            PendingDevice {
-                user_code: user_code.clone(),
-                expires_at,
-                approved_token: None,
-            },
-        );
-    }
-
-    Json(DeviceAuthResponse {
+    Ok(Json(DeviceAuthResponse {
         device_code,
         user_code,
         verification_uri,
         verification_uri_complete,
         expires_in: DEVICE_CODE_TTL_SECS,
         interval: DEVICE_POLL_INTERVAL_SECS,
-    })
+    }))
 }
 
 /// POST /auth/token — exchange a `device_code` for the granted token (no auth).
@@ -1430,23 +1700,51 @@ pub async fn device_approve(
     if wanted.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "user_code required".to_string()));
     }
-    let granted = state.auth_token.clone().unwrap_or_default();
+    // Refuse to hand out an empty token: when the server has no query token
+    // configured, approval would otherwise grant `""`, silently authenticating
+    // the developer as the empty (no-auth) principal.
+    //
+    // 409 Conflict (vs. 503): this is a misconfiguration of the approval target,
+    // not a transient outage — retrying without reconfiguring the server's query
+    // token will never succeed, so a 4xx is the honest class. Kept as 409 to
+    // match the ambiguous-user_code conflict below and the existing test.
+    let Some(granted) = state.auth_token.clone().filter(|t| !t.is_empty()) else {
+        return Err((
+            StatusCode::CONFLICT,
+            "server has no query token configured; device flow unavailable".to_string(),
+        ));
+    };
 
     let mut map = state.device_flow.write().await;
     prune_expired(&mut map);
-    for entry in map.values_mut() {
-        if normalize_user_code(&entry.user_code) == wanted {
-            entry.approved_token = Some(granted);
-            return Ok(Json(MessageResponse {
-                message: "device approved".to_string(),
-            }));
-        }
-    }
 
-    Err((
-        StatusCode::NOT_FOUND,
-        "no pending device with that code".to_string(),
-    ))
+    // Collect every grant whose code matches. `user_code`s are generated to be
+    // unique among pending grants, so >1 match means an invariant broke; treat
+    // it as an error rather than approving an arbitrary device.
+    let matched: Vec<String> = map
+        .iter()
+        .filter(|(_, entry)| normalize_user_code(&entry.user_code) == wanted)
+        .map(|(device_code, _)| device_code.clone())
+        .collect();
+
+    match matched.as_slice() {
+        [] => Err((
+            StatusCode::NOT_FOUND,
+            "no pending device with that code".to_string(),
+        )),
+        [device_code] => {
+            if let Some(entry) = map.get_mut(device_code) {
+                entry.approved_token = Some(granted);
+            }
+            Ok(Json(MessageResponse {
+                message: "device approved".to_string(),
+            }))
+        }
+        _ => Err((
+            StatusCode::CONFLICT,
+            "ambiguous user_code: multiple pending grants match".to_string(),
+        )),
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1463,6 +1761,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_admin_state() -> Arc<AdminState> {
+        admin_state_with_auth(Some("test-query-token".to_string()))
+    }
+
+    fn admin_state_with_auth(auth_token: Option<String>) -> Arc<AdminState> {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db_path = dir.path().join("test.lbug");
         let store =
@@ -1472,7 +1774,7 @@ mod tests {
         std::mem::forget(dir);
         Arc::new(AdminState {
             admin_token: "test-admin-token".to_string(),
-            auth_token: Some("test-query-token".to_string()),
+            auth_token,
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             daemon_store: Arc::new(store),
             instance_id: "test".to_string(),
@@ -2099,5 +2401,217 @@ url = "https://github.com/example/existing"
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn device_authorize_rejects_past_capacity() {
+        let state = test_admin_state();
+        // Fill the pending map to capacity with non-expired grants.
+        {
+            let mut map = state.device_flow.write().await;
+            for i in 0..MAX_PENDING_DEVICES {
+                map.insert(
+                    format!("code-{i}"),
+                    PendingDevice {
+                        user_code: format!("USERCODE{i}"),
+                        expires_at: std::time::Instant::now()
+                            + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS),
+                        approved_token: None,
+                    },
+                );
+            }
+        }
+        let app = device_router(state.clone());
+        let (status, _) = post_json(&app, "/auth/device", None, "{}").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The map must not have grown past the cap.
+        assert_eq!(state.device_flow.read().await.len(), MAX_PENDING_DEVICES);
+    }
+
+    #[tokio::test]
+    async fn device_approve_rejected_when_no_query_token_configured() {
+        let state = admin_state_with_auth(None);
+        // Seed a pending grant so the failure is the missing token, not a miss.
+        {
+            let mut map = state.device_flow.write().await;
+            map.insert(
+                "dev-code".to_string(),
+                PendingDevice {
+                    user_code: "ABCD2345".to_string(),
+                    expires_at: std::time::Instant::now()
+                        + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS),
+                    approved_token: None,
+                },
+            );
+        }
+        let app = device_router(state.clone());
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            r#"{"user_code":"ABCD2345"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // The grant must remain unapproved (no empty token granted).
+        let map = state.device_flow.read().await;
+        assert!(map.get("dev-code").unwrap().approved_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn device_approve_empty_string_token_also_rejected() {
+        // A configured-but-empty token is as unusable as None; reject it too.
+        let state = admin_state_with_auth(Some(String::new()));
+        {
+            let mut map = state.device_flow.write().await;
+            map.insert(
+                "dev-code".to_string(),
+                PendingDevice {
+                    user_code: "ABCD2345".to_string(),
+                    expires_at: std::time::Instant::now()
+                        + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS),
+                    approved_token: None,
+                },
+            );
+        }
+        let app = device_router(state);
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            r#"{"user_code":"ABCD2345"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn generate_user_code_is_unbiased_and_within_alphabet() {
+        // Sample many codes: every byte must be in the alphabet, and across a
+        // large sample every alphabet symbol should appear (a biased mapping
+        // would still stay in-alphabet, so the spread check guards the sampler).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let code = generate_user_code();
+            assert_eq!(code.len(), USER_CODE_LEN);
+            for b in code.bytes() {
+                assert!(
+                    USER_CODE_ALPHABET.contains(&b),
+                    "byte {b} outside the user-code alphabet"
+                );
+                seen.insert(b);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            USER_CODE_ALPHABET.len(),
+            "some alphabet symbols never appeared — distribution looks skewed"
+        );
+    }
+
+    #[test]
+    fn generate_unique_user_code_avoids_collisions() {
+        let mut map = std::collections::HashMap::new();
+        for i in 0..256 {
+            let code = generate_unique_user_code(&map)
+                .expect("should always find a unique code at this size");
+            map.insert(
+                format!("device-{i}"),
+                PendingDevice {
+                    user_code: code,
+                    expires_at: std::time::Instant::now()
+                        + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS),
+                    approved_token: None,
+                },
+            );
+        }
+        let distinct: std::collections::HashSet<String> = map
+            .values()
+            .map(|p| normalize_user_code(&p.user_code))
+            .collect();
+        assert_eq!(distinct.len(), map.len());
+    }
+
+    #[tokio::test]
+    async fn device_approve_ambiguous_user_code_is_conflict() {
+        // Two pending grants sharing a code (an invariant break) must not be
+        // silently approved — the handler reports a conflict.
+        let state = test_admin_state();
+        {
+            let mut map = state.device_flow.write().await;
+            for code in ["dev-a", "dev-b"] {
+                map.insert(
+                    code.to_string(),
+                    PendingDevice {
+                        user_code: "DUPCODE9".to_string(),
+                        expires_at: std::time::Instant::now()
+                            + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS),
+                        approved_token: None,
+                    },
+                );
+            }
+        }
+        let app = device_router(state);
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            r#"{"user_code":"DUPCODE9"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn config_repo_url_allowed_rejects_internal_and_accepts_public() {
+        // Internal/private targets declared in config must be skipped by reload.
+        assert!(!config_repo_url_allowed("http://localhost/repo.git"));
+        assert!(!config_repo_url_allowed("https://127.0.0.1/repo.git"));
+        assert!(!config_repo_url_allowed(
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!config_repo_url_allowed("https://10.0.0.5/internal.git"));
+        // Alternate-encoded loopback (decimal) must also be rejected.
+        assert!(!config_repo_url_allowed("git://2130706433/repo"));
+        // Public HTTPS repos remain allowed.
+        assert!(config_repo_url_allowed("https://github.com/acme/api.git"));
+    }
+
+    #[test]
+    fn auth_rate_limiter_throttles_and_stays_bounded() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        // Frozen clock so refill is deterministic.
+        let start = Instant::now();
+        thread_local! {
+            static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+        }
+        NOW.with(|n| n.set(Some(start)));
+        let clock = Arc::new(|| NOW.with(|n| n.get().unwrap()));
+
+        let limiter = AuthRateLimiter::new_with_clock(3, 2, clock);
+
+        // Same key: first 3 allowed, 4th rejected (bucket empty, clock frozen).
+        assert!(limiter.check("ip:1.2.3.4"));
+        assert!(limiter.check("ip:1.2.3.4"));
+        assert!(limiter.check("ip:1.2.3.4"));
+        assert!(!limiter.check("ip:1.2.3.4"));
+
+        // After enough time the bucket refills.
+        NOW.with(|n| n.set(Some(start + Duration::from_secs(60))));
+        assert!(limiter.check("ip:1.2.3.4"));
+
+        // Key-cap bound: with two saturated keys, a third distinct key is
+        // rejected rather than growing the map without bound.
+        let bounded = AuthRateLimiter::new(3, 2);
+        for key in ["ip:a", "ip:b"] {
+            assert!(bounded.check(key));
+            assert!(bounded.check(key));
+            assert!(bounded.check(key)); // drains each bucket
+        }
+        assert!(!bounded.check("ip:c"));
     }
 }

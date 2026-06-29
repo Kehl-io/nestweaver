@@ -222,12 +222,34 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
 /// `/device` and `/token` are public (developers without a token reach them);
 /// `/device/approve` is guarded by the `AdminAuth` extractor inside the handler.
 pub fn create_device_flow_router(state: Arc<AdminState>) -> Router {
+    use axum::extract::{DefaultBodyLimit, Request};
+    use axum::middleware::{Next, from_fn};
     use routes::admin;
 
-    Router::new()
+    // Shared, bounded per-IP rate limiter for the two public endpoints. These
+    // are unauthenticated and the MCP limiter lives inside the /mcp handler, so
+    // without this /auth would have no throttle at all.
+    let limiter = Arc::new(admin::AuthRateLimiter::new(
+        admin::AUTH_RATE_PER_MIN,
+        admin::AUTH_RATE_MAX_KEYS,
+    ));
+
+    // Rate limit only the unauthenticated endpoints; /device/approve is admin
+    // authenticated and IP-throttling it could lock an operator out.
+    let public = Router::new()
         .route("/device", post(admin::device_authorize))
         .route("/token", post(admin::device_token))
+        .layer(from_fn(move |req: Request, next: Next| {
+            let limiter = limiter.clone();
+            admin::auth_rate_limit(limiter, req, next)
+        }));
+
+    Router::new()
+        .merge(public)
         .route("/device/approve", post(admin::device_approve))
+        // Cap request bodies on the whole /auth router so an unauthenticated
+        // caller can't stream a large body before any handler runs.
+        .layer(DefaultBodyLimit::max(admin::AUTH_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -260,6 +282,13 @@ pub async fn start_server_with_router(
         }
     }
 
-    axum::serve(listener, app).await?;
+    // Serve with peer-address info so IP-keyed middleware (e.g. the device-flow
+    // rate limiter on the nested /auth router) can read the direct client IP via
+    // `ConnectInfo`. Purely additive for routers that don't use it.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
