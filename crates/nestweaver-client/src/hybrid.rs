@@ -1478,35 +1478,74 @@ pub struct TraceBoundary {
 ///
 /// A boundary is a leaf node whose `repo_uid` differs from the root
 /// node's `repo_uid` (the locally-initiated trace). These represent
-/// cross-repo call edges where the upstream server should continue
-/// the trace.
+/// cross-repo call edges — the callee resolves in another repo (a
+/// `CROSS_REPO_LINK` stub), so it is unresolved in the local repo and the
+/// upstream server should continue the trace from there.
+///
+/// Two flow_trace response shapes are handled:
+/// - the standard single-root trace `{ root_uid, tree: {...} }`, and
+/// - the class-expanded trace `{ root_uid, methods: [ {...}, ... ] }`
+///   produced when the root symbol is a class (mirrors the `methods`
+///   handling in [`stitch_server_spans`]).
 ///
 /// Requires flow_trace output to include `repo_uid` and `canonical_id`
-/// fields on each node (added in the detailed output format).
+/// fields on each node (the detailed output format; concise traces omit
+/// them and therefore yield no boundaries).
 ///
 /// See architecture spec: cross-boundary-flow-trace.md
 pub fn detect_boundaries_in_trace(result: &Value) -> Vec<TraceBoundary> {
-    let tree = result.get("tree").or(Some(result));
-    let Some(tree) = tree else {
-        return vec![];
-    };
-
-    // Extract root repo_uid — the "local" repo for this trace.
-    let root_repo = tree.get("repo_uid").and_then(|v| v.as_str()).unwrap_or("");
-    if root_repo.is_empty() {
-        debug!("detect_boundaries_in_trace: root node lacks repo_uid, cannot detect boundaries");
-        return vec![];
-    }
-
     let mut boundaries = Vec::new();
-    let mut path = Vec::new();
-    collect_boundaries(tree, root_repo, &mut path, &mut boundaries);
+
+    if let Some(tree) = result.get("tree") {
+        // Standard single-root trace.
+        collect_from_root(tree, &mut boundaries);
+    } else if let Some(methods) = result.get("methods").and_then(|v| v.as_array()) {
+        // Class-expanded trace: each method is its own subtree rooted in the
+        // class's repo. Use the first method that carries a repo_uid as the
+        // local-repo reference (all methods of a class share its repo).
+        let root_repo = methods
+            .iter()
+            .find_map(nonempty_repo_uid)
+            .unwrap_or_default();
+        if root_repo.is_empty() {
+            debug!(
+                "detect_boundaries_in_trace: class-expanded trace lacks repo_uid, cannot detect boundaries"
+            );
+        } else {
+            for method in methods {
+                let mut path = Vec::new();
+                collect_boundaries(method, &root_repo, &mut path, &mut boundaries);
+            }
+        }
+    } else {
+        // The result itself may be a bare trace node.
+        collect_from_root(result, &mut boundaries);
+    }
 
     debug!(
         count = boundaries.len(),
         "detect_boundaries_in_trace: found boundary nodes"
     );
     boundaries
+}
+
+/// The node's `repo_uid` as an owned `String`, or `None` when absent/empty.
+fn nonempty_repo_uid(node: &Value) -> Option<String> {
+    node.get("repo_uid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Walk a single trace tree rooted at `root`, collecting boundaries against
+/// the root's own `repo_uid`. A no-op when the root lacks a `repo_uid`.
+fn collect_from_root(root: &Value, out: &mut Vec<TraceBoundary>) {
+    let Some(root_repo) = nonempty_repo_uid(root) else {
+        debug!("detect_boundaries_in_trace: root node lacks repo_uid, cannot detect boundaries");
+        return;
+    };
+    let mut path = Vec::new();
+    collect_boundaries(root, &root_repo, &mut path, out);
 }
 
 /// Recursively walk the flow_trace tree collecting boundary nodes.
@@ -1672,11 +1711,15 @@ pub fn stitch_server_spans(
 ///    FlowTraceContinue RPCs
 /// 3. Stitches server spans into the local result
 ///
-/// Currently, boundary detection from JSON is limited (see
-/// `detect_boundaries_in_trace`). Full integration requires the MCP
-/// tool to annotate boundary nodes with canonical_ids. When boundaries
-/// are provided explicitly (e.g., from a store-aware caller), they
-/// are used directly.
+/// Boundary detection is automatic: when `explicit_boundaries` is empty,
+/// [`detect_boundaries_in_trace`] runs against the local result and finds
+/// cross-repo edges from the `repo_uid` + `canonical_id` annotations the
+/// flow_trace tool emits on detailed (non-concise) nodes. This is the
+/// default path taken by `query_with_continuation`, which calls this with
+/// no explicit boundaries. Concise traces omit those annotations and so
+/// yield no auto-detected boundaries. Explicit boundaries are retained
+/// only as an override (e.g., from a store-aware caller); when provided
+/// they are used directly and auto-detection is skipped.
 pub async fn flow_trace_with_stitching(
     client: &mut HybridClient,
     params: &Value,
@@ -1730,6 +1773,9 @@ pub async fn flow_trace_with_stitching(
 
     let mut all_visited: Vec<String> = Vec::new();
     let server_name = upstream.name.clone();
+    // Route cross-boundary continuation through the adaptive resolver rather
+    // than the static configured timeout, mirroring the other upstream paths.
+    let up_timeout = effective_timeout(upstream.mode, upstream);
 
     for boundary in &boundaries {
         let mut up_client = upstream.client();
@@ -1744,8 +1790,10 @@ pub async fn flow_trace_with_stitching(
         });
         upstream.inject_auth(&mut req);
 
-        match tokio::time::timeout(upstream.timeout, up_client.flow_trace_continue(req)).await {
+        let started = Instant::now();
+        match tokio::time::timeout(up_timeout, up_client.flow_trace_continue(req)).await {
             Ok(Ok(resp)) => {
+                upstream.record_latency(started.elapsed());
                 let resp = resp.into_inner();
                 // Collect visited canonical_ids from server spans.
                 for span in &resp.spans {
@@ -1839,17 +1887,23 @@ pub async fn two_tier_query(
     let server_name = upstream.name.clone();
     let mut up_client = upstream.client();
     let token = upstream.auth_token().map(|t| t.to_string());
-    let timeout = upstream.timeout;
+    // Route the org-wide tier through the adaptive resolver instead of the
+    // static configured timeout, mirroring query_upstream/query_merge.
+    let timeout = effective_timeout(upstream.mode, upstream);
     let tool = tool_name.to_string();
 
     let server_params = params.clone();
+    let started = Instant::now();
     let server_result = match tokio::time::timeout(
         timeout,
         dispatch_json_rpc_authed(&mut up_client, &tool, &server_params, token.as_deref()),
     )
     .await
     {
-        Ok(Ok(result)) => Some(result),
+        Ok(Ok(result)) => {
+            upstream.record_latency(started.elapsed());
+            Some(result)
+        }
         Ok(Err(e)) => {
             debug!(error = %e, tool = %tool, "org-wide two-tier query failed");
             None
@@ -2525,21 +2579,25 @@ mod tests {
     }
 
     #[test]
-    fn detect_boundaries_returns_empty_for_now() {
-        // No repo_uid on root -> no boundaries detected.
+    fn detect_boundaries_needs_root_repo_uid() {
+        // Concise / unannotated traces have no repo_uid on the root, so the
+        // local-repo reference is unknown and nothing can be flagged.
         let result = json!({
             "tree": {
                 "name": "funcA",
                 "children": [{"name": "funcB", "children": []}]
             }
         });
-        let boundaries = detect_boundaries_in_trace(&result);
         assert!(
-            boundaries.is_empty(),
+            detect_boundaries_in_trace(&result).is_empty(),
             "no repo_uid on root means no boundaries"
         );
+    }
 
-        // Cross-repo leaf with canonical_id -> detected as boundary.
+    #[test]
+    fn detect_boundaries_flags_cross_repo_leaf() {
+        // A leaf whose repo_uid differs from the root's, carrying a
+        // canonical_id, is a cross-repo boundary the server should continue.
         let result = json!({
             "tree": {
                 "name": "funcA",
@@ -2557,6 +2615,122 @@ mod tests {
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].name, "funcB");
         assert_eq!(boundaries[0].canonical_id, "def:src/api.rs#funcB:uvw");
+        // parent_path records the chain of node names from the root down to
+        // (but excluding) the boundary, for stitching the continuation back.
+        assert_eq!(boundaries[0].parent_path, vec!["funcA".to_string()]);
+    }
+
+    #[test]
+    fn detect_boundaries_records_nested_parent_path() {
+        // root(A) -> mid(A) -> leaf(B): the boundary is the deep leaf and its
+        // parent_path is the full name chain above it.
+        let result = json!({
+            "tree": {
+                "name": "root",
+                "repo_uid": "A",
+                "canonical_id": "a:root",
+                "children": [{
+                    "name": "mid",
+                    "repo_uid": "A",
+                    "canonical_id": "a:mid",
+                    "children": [{
+                        "name": "leaf",
+                        "repo_uid": "B",
+                        "canonical_id": "b:leaf",
+                        "children": []
+                    }]
+                }]
+            }
+        });
+        let boundaries = detect_boundaries_in_trace(&result);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].canonical_id, "b:leaf");
+        assert_eq!(
+            boundaries[0].parent_path,
+            vec!["root".to_string(), "mid".to_string()]
+        );
+    }
+
+    #[test]
+    fn detect_boundaries_ignores_same_repo_and_uncrossable_leaves() {
+        // A same-repo leaf is not a boundary; a foreign leaf without a
+        // canonical_id cannot be matched on the server, so it is skipped too.
+        let result = json!({
+            "tree": {
+                "name": "root",
+                "repo_uid": "A",
+                "canonical_id": "a:root",
+                "children": [
+                    { "name": "localChild", "repo_uid": "A", "canonical_id": "a:child", "children": [] },
+                    { "name": "foreignNoCid", "repo_uid": "B", "canonical_id": "", "children": [] }
+                ]
+            }
+        });
+        assert!(
+            detect_boundaries_in_trace(&result).is_empty(),
+            "same-repo leaves and canonical-id-less foreign leaves are not boundaries"
+        );
+    }
+
+    #[test]
+    fn detect_boundaries_requires_leaf() {
+        // A foreign node that still has locally-resolved children is not a
+        // leaf: the local trace already followed past it, so it is not a
+        // continuation boundary (only the genuine leaf below it could be).
+        let result = json!({
+            "tree": {
+                "name": "root",
+                "repo_uid": "A",
+                "canonical_id": "a:root",
+                "children": [{
+                    "name": "foreignWithChild",
+                    "repo_uid": "B",
+                    "canonical_id": "b:foreign",
+                    "children": [
+                        { "name": "deeperLocal", "repo_uid": "A", "canonical_id": "a:deep", "children": [] }
+                    ]
+                }]
+            }
+        });
+        assert!(
+            detect_boundaries_in_trace(&result).is_empty(),
+            "a foreign node with local children is not a leaf boundary"
+        );
+    }
+
+    #[test]
+    fn detect_boundaries_walks_class_expanded_methods() {
+        // Class-expanded traces have no `tree`; each method is its own subtree
+        // rooted in the class's repo. A cross-repo leaf under any method must
+        // still be detected (parity with stitch_server_spans' `methods`
+        // handling).
+        let result = json!({
+            "root_uid": "sym:repoA::Klass",
+            "root_kind": "class",
+            "methods": [
+                {
+                    "name": "methodNoCross",
+                    "repo_uid": "A",
+                    "canonical_id": "a:m1",
+                    "children": [
+                        { "name": "localHelper", "repo_uid": "A", "canonical_id": "a:h", "children": [] }
+                    ]
+                },
+                {
+                    "name": "methodCalls",
+                    "repo_uid": "A",
+                    "canonical_id": "a:m2",
+                    "children": [
+                        { "name": "remoteApi", "repo_uid": "B", "canonical_id": "b:remoteApi", "children": [] }
+                    ]
+                }
+            ]
+        });
+        let boundaries = detect_boundaries_in_trace(&result);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].name, "remoteApi");
+        assert_eq!(boundaries[0].canonical_id, "b:remoteApi");
+        assert_eq!(boundaries[0].parent_path, vec!["methodCalls".to_string()]);
     }
 
     #[test]
