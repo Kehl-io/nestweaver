@@ -3415,50 +3415,105 @@ pub async fn run_server(
             std::net::SocketAddr::from((mcp_bind_addr.ip(), mcp_bind_addr.port() + 1))
         };
 
-        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
-            .await
-            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
-        let mcp_actual_addr = mcp_listener.local_addr()?;
-        tracing::info!(%mcp_actual_addr, "MCP HTTP server listening");
-        eprintln!("[daemon] MCP HTTP server listening on {}", mcp_actual_addr);
-
-        // Store the MCP port — written alongside the gRPC port below.
-        let mcp_port_for_file = mcp_actual_addr.port();
-
-        let mut mcp_shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            axum::serve(mcp_listener, mcp_router)
-                .with_graceful_shutdown(async move {
-                    let _ = mcp_shutdown_rx.changed().await;
-                })
-                .await
-                .ok();
-        });
-
         // Validate TLS config BEFORE binding any ports so we don't
         // advertise addresses that will never serve traffic.
         let tls_config = match (&opts.tls_cert, &opts.tls_key) {
             (Some(cert_path), Some(key_path)) => {
-                // Install the ring crypto provider for rustls. This is
-                // required by rustls 0.23+ and must happen before any TLS
-                // config is created.
                 let _ = rustls::crypto::ring::default_provider().install_default();
 
                 let cert_pem = std::fs::read(cert_path)
                     .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
                 let key_pem = std::fs::read(key_path)
                     .with_context(|| format!("read TLS key: {}", key_path.display()))?;
-                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                tracing::info!("TLS enabled for TCP server");
-                eprintln!("[daemon] TLS enabled for TCP server");
-                Some(tls)
+
+                let identity =
+                    tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone());
+                let tonic_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+                let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("parse TLS certificate PEM")?;
+                let key = rustls_pemfile::private_key(&mut &key_pem[..])
+                    .context("parse TLS private key PEM")?
+                    .context("no private key found in PEM")?;
+                let mut server_config = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .context("build rustls ServerConfig")?;
+                server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                let tls_acceptor =
+                    tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+                tracing::info!("TLS enabled for TCP server and MCP HTTP");
+                eprintln!("[daemon] TLS enabled for TCP server and MCP HTTP");
+                Some((tonic_tls, tls_acceptor))
             }
             (Some(_), None) | (None, Some(_)) => {
                 anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
             }
             (None, None) => None,
         };
+
+        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
+            .await
+            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
+        let mcp_actual_addr = mcp_listener.local_addr()?;
+        let mcp_tls_label = if tls_config.is_some() { " (TLS)" } else { "" };
+        tracing::info!(%mcp_actual_addr, "MCP HTTP server listening{}", mcp_tls_label);
+        eprintln!("[daemon] MCP HTTP server listening{mcp_tls_label} on {mcp_actual_addr}");
+
+        // Store the MCP port — written alongside the gRPC port below.
+        let mcp_port_for_file = mcp_actual_addr.port();
+
+        let mcp_tls_acceptor = tls_config.as_ref().map(|(_, a)| a.clone());
+        let mut mcp_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Some(acceptor) = mcp_tls_acceptor {
+                let incoming = async_stream::stream! {
+                    loop {
+                        match mcp_listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let result: Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error> = Ok(tls_stream);
+                                        yield result;
+                                    }
+                                    Err(e) => tracing::debug!("MCP TLS handshake failed: {e}"),
+                                }
+                            }
+                            Err(e) => tracing::debug!("MCP TCP accept failed: {e}"),
+                        }
+                    }
+                };
+                use futures::StreamExt;
+                tokio::pin!(incoming);
+                let mut shutdown = Box::pin(mcp_shutdown_rx.changed());
+                loop {
+                    tokio::select! {
+                        Some(Ok(stream)) = incoming.next() => {
+                            let svc = mcp_router.clone();
+                            tokio::spawn(async move {
+                                let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper_util::server::conn::auto::Builder::new(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                )
+                                .serve_connection(io, hyper_svc)
+                                .await;
+                            });
+                        }
+                        _ = &mut shutdown => break,
+                    }
+                }
+            } else {
+                axum::serve(mcp_listener, mcp_router)
+                    .with_graceful_shutdown(async move {
+                        let _ = mcp_shutdown_rx.changed().await;
+                    })
+                    .await
+                    .ok();
+            }
+        });
 
         // TCP listener for server mode — spawned before the blocking UDS serve.
         {
@@ -3490,8 +3545,11 @@ pub async fn run_server(
 
             tokio::spawn(async move {
                 let mut builder = tonic::transport::Server::builder();
-                if let Some(tls) = tls_config {
-                    builder = builder.tls_config(tls).expect("invalid TLS configuration");
+                // Safe: cert/key validated in the TLS config block above.
+                if let Some((tonic_tls, _)) = tls_config {
+                    builder = builder
+                        .tls_config(tonic_tls)
+                        .expect("TLS configuration validated at startup");
                 }
                 let _ = builder
                     .add_service(tcp_svc)

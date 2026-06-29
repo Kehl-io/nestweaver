@@ -33,6 +33,11 @@ libc = "0.2"
 dirs = "6"
 governor = { version = "0.8", features = ["dashmap"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+hyper-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
