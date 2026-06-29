@@ -21,7 +21,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 open = { workspace = true }
 futures = "0.3"
-prometheus = "0.13"
+url = "2"
+prometheus = "0.14"
 subtle = { workspace = true }
 
 [dev-dependencies]

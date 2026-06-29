@@ -199,6 +199,40 @@ pub async fn add_repo(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<AddRepoRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    // Validate URL scheme to prevent SSRF via file:// or other unexpected schemes.
+    let allowed_schemes = ["https", "http", "git", "ssh"];
+    let parsed = match url::Url::parse(&req.url) {
+        Ok(p) if allowed_schemes.contains(&p.scheme()) => p,
+        Ok(parsed) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unsupported URL scheme '{}': allowed schemes are {}", parsed.scheme(), allowed_schemes.join(", ")),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid URL '{}': {e}", req.url),
+            ));
+        }
+    };
+
+    // SSRF prevention: reject private/loopback IPs (OWASP SSRF Prevention Cheat Sheet).
+    if let Some(host) = parsed.host_str() {
+        if host == "localhost" || host == "metadata.google.internal" {
+            return Err((StatusCode::BAD_REQUEST, format!("rejected hostname '{host}': internal addresses not allowed")));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let is_private = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => v6.is_loopback(),
+            };
+            if is_private {
+                return Err((StatusCode::BAD_REQUEST, format!("rejected IP '{ip}': private/loopback addresses not allowed")));
+            }
+        }
+    }
+
     // Derive the jobs database path from the brain database path.
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
     let repo_url = req.url.clone();
@@ -277,21 +311,19 @@ pub async fn add_repo(
 
     // Update webhook allowed repos so pushes are accepted immediately.
     let canonical = nestweaver_engine::jobs::canonical_repo_id(&req.url);
-    if let Some(ref lock) = state.webhook_allowed_repos {
-        if let Ok(mut guard) = lock.write() {
-            if let Some(ref mut set) = *guard {
-                set.insert(canonical.clone());
-            }
-        }
+    if let Some(ref lock) = state.webhook_allowed_repos
+        && let Ok(mut guard) = lock.write()
+        && let Some(ref mut set) = *guard
+    {
+        set.insert(canonical.clone());
     }
 
     // Update webhook branch map if a branch was specified.
-    if let Some(ref branch) = req.branch {
-        if let Some(ref lock) = state.webhook_repo_branches {
-            if let Ok(mut guard) = lock.write() {
-                guard.insert(canonical, branch.clone());
-            }
-        }
+    if let Some(ref branch) = req.branch
+        && let Some(ref lock) = state.webhook_repo_branches
+        && let Ok(mut guard) = lock.write()
+    {
+        guard.insert(canonical, branch.clone());
     }
 
     Ok(Json(MessageResponse {
@@ -440,17 +472,16 @@ pub async fn remove_repo(
     // Remove from webhook allowed repos.
     if let Some(ref url) = repo_url {
         let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
-        if let Some(ref lock) = state.webhook_allowed_repos {
-            if let Ok(mut guard) = lock.write() {
-                if let Some(ref mut set) = *guard {
-                    set.remove(&canonical);
-                }
-            }
+        if let Some(ref lock) = state.webhook_allowed_repos
+            && let Ok(mut guard) = lock.write()
+            && let Some(ref mut set) = *guard
+        {
+            set.remove(&canonical);
         }
-        if let Some(ref lock) = state.webhook_repo_branches {
-            if let Ok(mut guard) = lock.write() {
-                guard.remove(&canonical);
-            }
+        if let Some(ref lock) = state.webhook_repo_branches
+            && let Ok(mut guard) = lock.write()
+        {
+            guard.remove(&canonical);
         }
     }
 
@@ -866,73 +897,70 @@ pub async fn reload_config(
 
     // Notify the live scheduler so it picks up added/removed repos
     // without a daemon restart.
-    if let Some(ref tx) = state.scheduler_tx {
-        if let Some(ref config_path) = state.config_path {
-            if let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path) {
-                let repos: Vec<_> = cfg
-                    .repos
-                    .iter()
-                    .map(|r| {
-                        let repo_name = r
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&r.url));
-                        let poll_override = r.poll.as_deref().and_then(|p| match p {
-                            "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
-                            "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
-                            other => nestweaver_engine::config::parse_duration(other)
-                                .map(nestweaver_engine::scheduler::PollOverride::Fixed),
-                        });
-                        (repo_name, r.url.clone(), poll_override, r.branch.clone())
-                    })
-                    .collect();
-                let new_min_poll =
-                    nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
-                let new_max_poll =
-                    nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
-                let _ = tx
-                    .send(
-                        nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig {
-                            repos,
-                            min_poll: new_min_poll,
-                            max_poll: new_max_poll,
-                        },
-                    )
-                    .await;
-            }
-        }
+    if let Some(ref tx) = state.scheduler_tx
+        && let Some(ref config_path) = state.config_path
+        && let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path)
+    {
+        let repos: Vec<_> = cfg
+            .repos
+            .iter()
+            .map(|r| {
+                let repo_name = r
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&r.url));
+                let poll_override = r.poll.as_deref().and_then(|p| match p {
+                    "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                    "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                    other => nestweaver_engine::config::parse_duration(other)
+                        .map(nestweaver_engine::scheduler::PollOverride::Fixed),
+                });
+                (repo_name, r.url.clone(), poll_override, r.branch.clone())
+            })
+            .collect();
+        let new_min_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.min_poll);
+        let new_max_poll = nestweaver_engine::config::parse_duration(&cfg.server.indexing.max_poll);
+        let _ = tx
+            .send(
+                nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig {
+                    repos,
+                    min_poll: new_min_poll,
+                    max_poll: new_max_poll,
+                },
+            )
+            .await;
     }
 
     // Update webhook state so new/changed repos take effect without restart.
-    if let Some(ref config_path) = state.config_path {
-        if let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path) {
-            if let Some(ref lock) = state.webhook_allowed_repos {
-                let new_allowed: std::collections::HashSet<String> = cfg
-                    .repos
-                    .iter()
-                    .filter(|r| r.poll.as_deref() != Some("manual"))
-                    .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
-                    .collect();
-                if let Ok(mut guard) = lock.write() {
-                    *guard = Some(new_allowed);
-                }
+    if let Some(ref config_path) = state.config_path
+        && let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path)
+    {
+        if let Some(ref lock) = state.webhook_allowed_repos {
+            let new_allowed: std::collections::HashSet<String> = cfg
+                .repos
+                .iter()
+                .filter(|r| r.poll.as_deref() != Some("manual"))
+                .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                .collect();
+            if let Ok(mut guard) = lock.write() {
+                *guard = Some(new_allowed);
             }
-            if let Some(ref lock) = state.webhook_repo_branches {
-                let new_branches: std::collections::HashMap<String, String> = cfg
-                    .repos
-                    .iter()
-                    .filter_map(|r| {
-                        r.branch.as_ref().map(|b| {
-                            (
-                                nestweaver_engine::jobs::canonical_repo_id(&r.url),
-                                b.clone(),
-                            )
-                        })
+        }
+        if let Some(ref lock) = state.webhook_repo_branches {
+            let new_branches: std::collections::HashMap<String, String> = cfg
+                .repos
+                .iter()
+                .filter_map(|r| {
+                    r.branch.as_ref().map(|b| {
+                        (
+                            nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                            b.clone(),
+                        )
                     })
-                    .collect();
-                if let Ok(mut guard) = lock.write() {
-                    *guard = new_branches;
-                }
+                })
+                .collect();
+            if let Ok(mut guard) = lock.write() {
+                *guard = new_branches;
             }
         }
     }
