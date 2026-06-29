@@ -9,7 +9,7 @@ use std::process::Command as StdCommand;
 
 use hmac::{Hmac, KeyInit, Mac};
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
-use nestweaver_proto::{BrainStatusRequest, RepoStatesRequest};
+use nestweaver_proto::{BrainStatusRequest, JsonRequest, RepoStatesRequest};
 use serde_json::json;
 use sha2::Sha256;
 use tonic::transport::{Certificate, ClientTlsConfig};
@@ -1160,4 +1160,66 @@ async fn server_webhook_rejects_bad_json() {
         .expect("webhook POST failed");
 
     assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn export_graph_rejects_file_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index first (no daemon) so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let output_path = dir.path().join("export_output.cypher");
+    let args_json = serde_json::to_string(&json!({
+        "format": "cypher",
+        "output": output_path.display().to_string(),
+    }))
+    .unwrap();
+
+    let result = client
+        .export_graph(JsonRequest { args_json })
+        .await;
+
+    assert!(result.is_err(), "expected PERMISSION_DENIED error");
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::PermissionDenied,
+        "expected PERMISSION_DENIED, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+
+    assert!(
+        !output_path.exists(),
+        "export output file should NOT have been created in server mode"
+    );
 }
