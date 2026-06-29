@@ -177,6 +177,26 @@ pub fn index_markdown_directory_in_memory(
     Ok((result, store))
 }
 
+/// Index markdown notes from a caller-provided [`ContentReader`] into `store`.
+///
+/// Unlike [`index_markdown_directory_with_store`], this does not assume a
+/// canonical on-disk vault directory — it indexes whatever the `reader`
+/// exposes. This is the entry point used by the server-mode worker when a repo
+/// is declared as a markdown vault (`type = "vault"`): the reader is a
+/// [`crate::content_reader::GitBareReader`] over a bare clone, which has no
+/// working tree and therefore no on-disk `.brainignore`. In that case the
+/// ignore set falls back to the built-in defaults (see
+/// [`crate::brainignore::load_brain_ignore`]).
+pub fn index_markdown_with_reader(
+    reader: &dyn ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    index_into_store(reader, store, instance_id, vault_name, &ignore_set)
+}
+
 /// Outcome of an incremental (`--since`) markdown refresh run.
 pub struct MarkdownSinceResult {
     pub vault_name: String,
@@ -2185,5 +2205,98 @@ sub b body
         assert!(meta.is_none());
         let content = reader.read_file(&files[0]).unwrap();
         assert!(content.contains("# Test Note"));
+    }
+
+    /// Create a source repo with `files`, commit, and clone it as a bare repo.
+    /// Returns `(tempdir, bare_path, head_sha)`. Mirrors the helper used by the
+    /// `GitBareReader` tests in `content_reader.rs`.
+    fn setup_bare_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src_repo");
+        fs::create_dir_all(&src).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        }
+        for (path, content) in files {
+            let full = src.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, content).unwrap();
+        }
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        let bare = tmp.path().join("repo.git");
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        let sha_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        (tmp, bare, sha)
+    }
+
+    /// The worker's vault path: indexing a `type = "vault"` repo runs the
+    /// markdown indexer over a bare clone, producing Note/Section nodes rather
+    /// than code symbols. The bare clone has no on-disk `.brainignore`, which
+    /// `index_markdown_with_reader` must tolerate.
+    #[test]
+    fn index_markdown_with_reader_over_bare_clone_makes_notes() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("README.md", "# Readme\n\nProject overview.\n"),
+            ("docs/guide.md", "# Guide\n\n## Setup\n\ninstall steps\n"),
+            // A non-markdown source file that must NOT become a code symbol.
+            ("src/lib.rs", "pub fn greet() -> &'static str { \"hi\" }"),
+        ]);
+
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+        let result =
+            index_markdown_with_reader(&reader, &store, "test-instance", "vault-repo").unwrap();
+
+        // Markdown nodes were produced.
+        assert_eq!(result.notes_count, 2, "both .md files should be indexed");
+        assert!(result.headings_count >= 2);
+        assert!(result.sections_count >= 2);
+        assert!(store.count_notes().unwrap() >= 2);
+        assert!(store.count_sections().unwrap() >= 2);
+
+        // Crucially, the markdown path indexes no code symbols — the .rs file
+        // is ignored by the markdown indexer.
+        assert_eq!(
+            store.count_symbols().unwrap(),
+            0,
+            "vault indexing must not produce code symbols"
+        );
     }
 }

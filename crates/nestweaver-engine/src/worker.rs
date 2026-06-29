@@ -1,6 +1,7 @@
 //! Worker pool that claims jobs from the SQLite queue, fetches repos via bare
 //! clones, and indexes them via `GitBareReader` + `index_with_reader`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +9,8 @@ use tokio::sync::Semaphore;
 
 use crate::bare_clone::BareCloneWorkspace;
 use crate::circuit_breaker::RemoteCircuitBreakers;
-use crate::jobs::{IndexJob, JobQueue};
+use crate::config::RepoType;
+use crate::jobs::{IndexJob, JobQueue, canonical_repo_id};
 
 #[derive(Debug)]
 struct JobCancelled;
@@ -74,6 +76,12 @@ impl Default for IndexingStatus {
 pub struct WorkerPool {
     concurrency: usize,
     semaphore: Arc<Semaphore>,
+    /// Per-repo index strategy, keyed by [`canonical_repo_id`] of the repo URL.
+    /// Repos absent from the map (or mapped to [`RepoType::Code`]) are indexed
+    /// as code; entries mapped to [`RepoType::Vault`] are indexed as markdown.
+    /// Populated from the instance config by the daemon; empty by default, so
+    /// an unconfigured pool indexes everything as code (the prior behaviour).
+    repo_types: Arc<HashMap<String, RepoType>>,
 }
 
 impl WorkerPool {
@@ -81,7 +89,18 @@ impl WorkerPool {
         Self {
             concurrency,
             semaphore: Arc::new(Semaphore::new(concurrency)),
+            repo_types: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Attach per-repo index strategies resolved from the instance config.
+    ///
+    /// The map is keyed by [`canonical_repo_id`] of each repo's URL. Only repos
+    /// that should be indexed as something other than code need an entry, but
+    /// supplying the full set is also fine.
+    pub fn with_repo_types(mut self, repo_types: HashMap<String, RepoType>) -> Self {
+        self.repo_types = Arc::new(repo_types);
+        self
     }
 
     /// Number of concurrent workers this pool allows.
@@ -159,6 +178,7 @@ impl WorkerPool {
         write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
+        let repo_types = self.repo_types.clone();
         loop {
             // Check shutdown signal.
             if *shutdown.borrow() {
@@ -240,6 +260,7 @@ impl WorkerPool {
             let status_clone = status.clone();
             let write_mutex = write_mutex.clone();
             let circuit_breakers = circuit_breakers.clone();
+            let repo_types = repo_types.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -249,6 +270,11 @@ impl WorkerPool {
                 let result = {
                     let job_clone = job.clone();
                     let queue_check = queue.clone();
+                    // Resolve how this repo should be indexed (code vs vault).
+                    let repo_type = repo_types
+                        .get(&canonical_repo_id(&job_clone.repo_url))
+                        .cloned()
+                        .unwrap_or(RepoType::Code);
                     tokio::task::spawn_blocking(move || {
                         let prepared = prepare_job(
                             &job_clone,
@@ -256,6 +282,7 @@ impl WorkerPool {
                             &store,
                             &instance_id,
                             Some(&circuit_breakers),
+                            repo_type,
                         )?;
 
                         // Check if the job was cancelled (admin repo removal)
@@ -367,7 +394,8 @@ fn process_job(
     store: &nestweaver_store::GraphStore,
     instance_id: &str,
 ) -> Result<(), anyhow::Error> {
-    let Some(prepared) = prepare_job(job, workspace, store, instance_id, None)? else {
+    let Some(prepared) = prepare_job(job, workspace, store, instance_id, None, RepoType::Code)?
+    else {
         return Ok(());
     };
     commit_prepared_job(&prepared, store, instance_id)
@@ -379,6 +407,8 @@ struct PreparedIndexJob {
     repo_url: String,
     bare_path: std::path::PathBuf,
     remote_sha: String,
+    /// How the repo's contents should be indexed (code vs markdown vault).
+    repo_type: RepoType,
 }
 
 fn prepare_job(
@@ -387,6 +417,7 @@ fn prepare_job(
     store: &nestweaver_store::GraphStore,
     instance_id: &str,
     circuit_breakers: Option<&RemoteCircuitBreakers>,
+    repo_type: RepoType,
 ) -> Result<Option<PreparedIndexJob>, anyhow::Error> {
     let fetch = || -> Result<_, anyhow::Error> {
         // 1. Ensure the bare clone exists.
@@ -431,6 +462,7 @@ fn prepare_job(
         repo_url: job.repo_url.clone(),
         bare_path,
         remote_sha,
+        repo_type,
     }))
 }
 
@@ -468,18 +500,30 @@ where
     let reader =
         crate::content_reader::GitBareReader::new(&prepared.bare_path, &prepared.remote_sha);
 
-    // Full index via index_with_reader.
-    //    Incremental indexing through ContentReader is a follow-up optimization;
-    //    for v1 we always do a full index.
-    crate::index_with_reader_and_write_gate(
-        &reader,
-        store,
-        instance_id,
-        &prepared.repo_url,
-        &prepared.remote_sha,
-        None,
-        acquire_write_guard,
-    )?;
+    match prepared.repo_type {
+        RepoType::Vault => {
+            // Markdown-vault repo: index Note/Section/Heading nodes via the
+            // markdown indexer. It performs all graph mutations in one pass,
+            // so acquire the caller's write gate up front and hold it for the
+            // duration (also performs the job-cancellation check).
+            let _write_guard = acquire_write_guard()?;
+            crate::index_markdown_with_reader(&reader, store, instance_id, &prepared.repo_url)?;
+        }
+        RepoType::Code => {
+            // Full index via index_with_reader.
+            //    Incremental indexing through ContentReader is a follow-up
+            //    optimization; for v1 we always do a full index.
+            crate::index_with_reader_and_write_gate(
+                &reader,
+                store,
+                instance_id,
+                &prepared.repo_url,
+                &prepared.remote_sha,
+                None,
+                acquire_write_guard,
+            )?;
+        }
+    }
 
     Ok(())
 }
@@ -680,7 +724,15 @@ mod tests {
             completed_at: None,
         };
 
-        let err = prepare_job(&job, &ws, &store, "test-instance", Some(&cb)).unwrap_err();
+        let err = prepare_job(
+            &job,
+            &ws,
+            &store,
+            "test-instance",
+            Some(&cb),
+            RepoType::Code,
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("circuit breaker open"));
     }

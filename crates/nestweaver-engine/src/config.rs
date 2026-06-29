@@ -449,9 +449,23 @@ pub struct GitConfig {
     pub credential_method: String,
 }
 
+/// How a repo's contents are indexed. `Code` (the default) runs the language
+/// indexer producing Symbol/File nodes; `Vault` runs the markdown indexer
+/// producing Note/Section/Heading nodes. Declared via `type = "code" | "vault"`
+/// in a `[[repos]]` block — mirrors the `type` discriminator on [`LinkConfig`].
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoType {
+    Code,
+    Vault,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RepoConfig {
     pub url: String,
+    /// Index strategy for this repo. Absent → treated as [`RepoType::Code`].
+    #[serde(rename = "type", default)]
+    pub repo_type: Option<RepoType>,
     /// Optional repo display-name alias. When set, project and feature
     /// configs may refer to the repo by this name even if the DB-indexed
     /// repo is stored under a different display name (typically the
@@ -578,7 +592,7 @@ pub struct IndexingConfig {
 }
 
 fn default_workers() -> usize {
-    2
+    8
 }
 fn default_min_poll() -> String {
     "45s".to_string()
@@ -1498,7 +1512,7 @@ url = "https://github.com/example/keep-me"
     #[test]
     fn server_indexing_config_defaults() {
         let cfg = IndexingConfig::default();
-        assert_eq!(cfg.workers, 2);
+        assert_eq!(cfg.workers, 8);
         assert_eq!(cfg.min_poll, "45s");
         assert_eq!(cfg.max_poll, "8h");
     }
