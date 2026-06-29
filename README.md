@@ -137,9 +137,11 @@ nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TO
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9377 | HTTP | Web UI + Prometheus `/metrics` |
+| 9377 | HTTP | Web UI (optional, `nestweaver ui`) |
 | 9378 | gRPC | Query API (TCP + TLS) |
-| 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` |
+| 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` + Prometheus `/metrics` |
+
+In server mode the daemon serves Prometheus `/metrics` on the MCP HTTP port (9379) — gRPC port + 1, inheriting the `--bind` IP. The same metrics are also exposed on 9377 when the web UI is running (`nestweaver ui`).
 
 ### Docker
 

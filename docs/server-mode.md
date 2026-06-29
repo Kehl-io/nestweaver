@@ -85,10 +85,12 @@ The server listens on three ports. Webhook and admin API endpoints are mounted a
 
 `daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (:9377) is started separately via `nestweaver ui` and is not part of the server container default.
 
+The MCP HTTP listener is always **gRPC port + 1** and inherits the `--bind` IP. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker.
+
 | Port | Protocol | Auth | Purpose |
 |------|----------|------|---------|
 | 9378 | gRPC | Bearer token (TLS recommended) | Primary query API for CLI clients and local daemons |
-| 9379 | HTTP | Bearer token / HMAC | MCP-over-HTTP for AI agents, plus `/webhook` (HMAC) and `/admin/api/*` (admin token) |
+| 9379 | HTTP | Bearer token / HMAC | MCP-over-HTTP for AI agents, plus `/webhook` (HMAC), `/admin/api/*` (admin token), and `/metrics` (Prometheus) |
 
 ---
 
@@ -107,6 +109,8 @@ nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TO
 ```
 
 The token is a shared secret — all team members use the same token. This is intentional: NestWeaver assumes everyone in the org has code read access. Fine-grained ACLs are an enterprise feature.
+
+`--auth-token` and `--admin-token` (and their `NESTWEAVER_AUTH_TOKEN` / `NESTWEAVER_ADMIN_TOKEN` equivalents) must be **at least 32 bytes**. The daemon refuses to start if a supplied token is shorter — short tokens are trivially brute-forceable. Generate one with `openssl rand -hex 32` (or `head -c 32 /dev/urandom | base64`).
 
 ### Admin authentication
 
@@ -177,6 +181,18 @@ poll = "2m"              # optional: override adaptive polling interval
 url = "https://github.com/acme/shared-vault"
 type = "vault"           # index as markdown vault, not code
 ```
+
+### Vault repos
+
+A repo declared with `type = "vault"` is indexed as a **markdown vault** rather than source code: the server parses every `.md` file into `Note` / `Section` / `Heading` nodes (plus a `Vault` node and `Tag` links) instead of code symbols. This is the same model `nestweaver` uses for an Obsidian-style knowledge vault, applied to a cloned repo. Use it for design-doc repos, runbooks, ADR archives, or any markdown knowledge base you want queryable alongside code.
+
+Once indexed, vault notes are queryable from any connected client just like local notes:
+
+- `brain_search` / `note_get` find and read notes by title or keyword
+- `brain_context` seeds from a note title to pull related notes and code
+- `backlinks` finds what links to a note
+
+In server mode these tools route to the server (merge or fallback), so a developer with no local copy of the vault still gets its notes in results, tagged `"server"` in `_meta.sources`.
 
 ### Git credentials
 
@@ -274,11 +290,25 @@ poll = "30s"    # high-traffic repo: poll aggressively
 
 ### Connect to a server
 
-```bash
-# One-time setup: register a server
-nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TOKEN"
+**Recommended — device flow (one command, no token to copy):**
 
-# Verify the connection
+```bash
+# gh-style browser onboarding
+nestweaver connect grpcs://nestweaver.internal:9378 --device
+```
+
+This runs the OAuth 2.0 Device Authorization Grant (RFC 8628): the client prints a short user code, opens your browser to the verification page, and waits while an admin approves the request. On approval the issued token is written to your client config automatically — no token needs to be shared out-of-band. `--device` is implied when you omit `--token`, so `nestweaver connect <url>` alone triggers the same flow.
+
+**Alternative — explicit token:**
+
+```bash
+# One-time setup: register a server with a pre-shared bearer token
+nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TOKEN"
+```
+
+**Verify either way:**
+
+```bash
 nestweaver brain status
 # => server_mode: true, repo_count: 200, indexing_active: false
 ```
@@ -311,6 +341,7 @@ name = "team-server"
 url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
+timeout = "1s"                # optional: upstream request ceiling (default 1s)
 ca_cert = "/path/to/ca.crt"   # optional: for self-signed certificates
 ```
 
@@ -356,6 +387,23 @@ The client compares local `indexed_sha` against server `RepoStates` using `git l
 - `brain_status` shows `stale_repos` in the response
 - Results include `_meta.sources` indicating which data sources contributed
 - Fallback mode automatically routes stale repos to the server
+
+### Upstream timeout
+
+Each `[[upstream]]` entry takes an optional `timeout` key (default `1s`) that sets the **ceiling** for a single upstream request:
+
+```toml
+[[upstream]]
+url = "grpcs://nestweaver.internal:9378"
+timeout = "1s"    # ceiling; the live deadline is adaptive (see below)
+```
+
+The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client scales off a rolling EWMA of observed upstream latencies and clamps the result per routing mode:
+
+- **`fallback`** keeps the deadline tight (capped at ~250ms) so the local fast path is never blocked waiting on the server.
+- **`merge`** and **`primary`** allow up to the configured `timeout` ceiling (default 1s) — the richer org-wide answer is the whole point of those modes.
+
+On a cold start (no latency samples yet) the mode ceiling is used directly. Raising `timeout` only affects `merge`/`primary`; the fallback cap is fixed.
 
 ---
 
@@ -404,7 +452,7 @@ When connected to a server, `blast_radius` returns two-tier results:
   "local_impact": [...],
   "org_wide_impact": [...],
   "_meta": {
-    "sources": ["local", "team-server"]
+    "sources": ["local", "server"]
   }
 }
 ```
@@ -471,7 +519,7 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/dead-letter` | GET | View failed jobs |
 | `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
 | `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
-| `/metrics` | GET | Prometheus metrics (served on the web UI port when running `nestweaver ui`) |
+| `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; no admin token required) |
 
 ```bash
 # List repos
@@ -486,6 +534,19 @@ curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
 curl -X POST -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
   http://localhost:9379/admin/api/drain
 ```
+
+### Checking server status
+
+`nestweaver server status` queries a running server's `GET /admin/api/status` endpoint and prints a concise, human-readable summary — no curl/jq needed:
+
+```bash
+nestweaver server status --url http://nestweaver.internal:9379 --token "$NESTWEAVER_ADMIN_TOKEN"
+```
+
+- `--url` is the admin/MCP HTTP base URL (the gRPC port + 1, e.g. `:9379`).
+- `--token` is the admin bearer token; it defaults to the `NESTWEAVER_ADMIN_TOKEN` environment variable, so you can omit the flag when that is set.
+
+The output reports the instance ID, version, mode (`server`/`daemon`, plus `(drained)` when paused), repos indexed, total symbols, queue depth, indexing state (`active`/`idle`), and active read/write counts.
 
 ---
 
@@ -588,9 +649,9 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ```bash
 # Check Prometheus metrics
-# Metrics are served by `nestweaver ui` (not the server daemon).
-# If running the UI alongside the server:
-# curl http://localhost:9377/metrics | grep nestweaver_query
+# The daemon serves /metrics on the MCP HTTP port (gRPC port + 1):
+curl http://localhost:9379/metrics | grep nestweaver_query
+# The same metrics are also exposed on :9377 when the web UI is running.
 
 # Expected p95 latencies (LAN):
 #   brain_search:    <50ms
