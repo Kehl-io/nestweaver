@@ -134,7 +134,7 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                   nestweaver search \"UserService\"\n  \
                   nestweaver symbol \"processPayment\"\n  \
                   nestweaver repo-map --token-budget 2000",
-    after_help = "Supported languages: JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Dart, Swift, COBOL\n\
+    after_help = "Supported languages (32): JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Swift, Dart, COBOL, Lua, Bash, Scala, Elixir, Zig, Objective-C, Groovy, PowerShell, Julia, SQL, HCL/Terraform, Fortran, Pascal, Vue, Svelte, Astro, SystemVerilog\n\
                   Default database: ./nestweaver.lbug\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
@@ -5937,7 +5937,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     // Convert engine AtomicChange -> proto AtomicChangeProto
                     let proto_changes: Vec<nestweaver_proto::AtomicChangeProto> =
-                        changes.iter().map(|c| atomic_change_to_proto(c)).collect();
+                        changes.iter().map(atomic_change_to_proto).collect();
 
                     let mut req = tonic::Request::new(nestweaver_proto::ImpactAnalysisRequest {
                         changes: proto_changes,
@@ -5966,7 +5966,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let impacts: Vec<nestweaver_engine::atomic_changes::ImpactResult> = response
                         .impacts
                         .into_iter()
-                        .map(|item| impact_item_to_result(item))
+                        .map(impact_item_to_result)
                         .collect();
 
                     Ok::<_, anyhow::Error>(impacts)
@@ -8634,36 +8634,6 @@ fn hybrid_search_candidates_from_value(
 ) -> Vec<nestweaver_engine::SymbolCandidate> {
     let payload = value.get("results").cloned().unwrap_or(value);
     serde_json::from_value(payload).unwrap_or_default()
-}
-
-#[cfg(test)]
-mod hybrid_cli_tests {
-    use super::*;
-
-    #[test]
-    fn hybrid_search_candidates_reads_wrapped_results() {
-        let value = serde_json::json!({
-            "results": [
-                {
-                    "uid": "sym:1",
-                    "name": "processPayment",
-                    "kind": "Function",
-                    "file_path": "src/payments.rs",
-                    "start_line": 42
-                }
-            ],
-            "_meta": {
-                "sources": ["server"],
-                "stale_repos": [],
-                "scope": "server"
-            }
-        });
-
-        let candidates = hybrid_search_candidates_from_value(value);
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].name, "processPayment");
-    }
 }
 
 fn run_brain(
@@ -13307,5 +13277,35 @@ fn impact_item_to_result(
         affected_signature: item.affected_signature,
         severity,
         reason: item.reason,
+    }
+}
+
+#[cfg(test)]
+mod hybrid_cli_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_search_candidates_reads_wrapped_results() {
+        let value = serde_json::json!({
+            "results": [
+                {
+                    "uid": "sym:1",
+                    "name": "processPayment",
+                    "kind": "Function",
+                    "file_path": "src/payments.rs",
+                    "start_line": 42
+                }
+            ],
+            "_meta": {
+                "sources": ["server"],
+                "stale_repos": [],
+                "scope": "server"
+            }
+        });
+
+        let candidates = hybrid_search_candidates_from_value(value);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "processPayment");
     }
 }
