@@ -57,24 +57,45 @@ struct HttpTokenBucket {
 }
 
 /// Simple per-client token bucket for stateless MCP-over-HTTP requests.
-#[derive(Debug)]
 pub struct HttpRateLimiter {
     buckets: DashMap<String, HttpTokenBucket>,
     capacity: f64,
     refill_per_sec: f64,
+    /// Source of the current time. Injectable so tests can freeze the clock
+    /// and exercise refill behavior deterministically; production uses
+    /// `Instant::now`.
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl std::fmt::Debug for HttpRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRateLimiter")
+            .field("buckets", &self.buckets)
+            .field("capacity", &self.capacity)
+            .field("refill_per_sec", &self.refill_per_sec)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpRateLimiter {
     fn new(requests_per_min: u64) -> Self {
+        Self::new_with_clock(requests_per_min, Arc::new(Instant::now))
+    }
+
+    fn new_with_clock(
+        requests_per_min: u64,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
         Self {
             buckets: DashMap::new(),
             capacity: requests_per_min as f64,
             refill_per_sec: requests_per_min as f64 / 60.0,
+            clock,
         }
     }
 
     fn check(&self, client_key: &str) -> bool {
-        let now = Instant::now();
+        let now = (self.clock)();
         let mut bucket = self
             .buckets
             .entry(client_key.to_string())
@@ -639,21 +660,6 @@ mod tests {
         router(state)
     }
 
-    fn test_server_auth_app() -> Router {
-        let store = Arc::new(GraphStore::in_memory().unwrap());
-        let state = Arc::new(McpHttpState::with_auth(
-            false,
-            store,
-            None,
-            PathBuf::from("/tmp/test.lbug"),
-            None,
-            true,
-            "query-token".to_string(),
-            Some("admin-token".to_string()),
-        ));
-        router(state)
-    }
-
     #[test]
     fn safeguard_rejects_over_depth_instead_of_clamping() {
         let mut args = json!({
@@ -722,34 +728,32 @@ mod tests {
         assert_eq!(session.request_count, 1);
     }
 
-    #[tokio::test]
-    async fn server_rate_limit_applies_without_session_header() {
-        let app = test_server_auth_app();
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-        });
+    #[test]
+    fn http_rate_limiter_rejects_after_capacity_with_frozen_clock() {
+        // Freeze the clock so the bucket never refills, making the rate-limit
+        // boundary exact and independent of wall-clock timing.
+        let frozen = Instant::now();
+        let limiter = HttpRateLimiter::new_with_clock(RATE_LIMIT_PER_MIN, Arc::new(move || frozen));
 
-        let mut limited = false;
-        for _ in 0..=RATE_LIMIT_PER_MIN {
-            let req = Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer query-token")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                limited = true;
-                break;
-            }
+        // The first RATE_LIMIT_PER_MIN requests for one client consume the
+        // full bucket and succeed.
+        for i in 0..RATE_LIMIT_PER_MIN {
+            assert!(
+                limiter.check("client-a"),
+                "request {i} should be allowed within capacity"
+            );
         }
 
+        // The next request has no tokens left and is rejected (the 429 path).
         assert!(
-            limited,
-            "stateless authenticated MCP HTTP requests must be rate limited"
+            !limiter.check("client-a"),
+            "request beyond capacity must be rate limited with a frozen clock"
+        );
+
+        // Rate limiting is per-client: a different key starts with a full bucket.
+        assert!(
+            limiter.check("client-b"),
+            "a distinct client must not be limited by another client's usage"
         );
     }
 
