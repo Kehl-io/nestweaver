@@ -872,6 +872,12 @@ impl NestWeaverDaemon for DaemonService {
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
                 "msgpack" => {
+                    if state.server_mode {
+                        return Err(Status::permission_denied(
+                            "msgpack export writes to disk and is disabled in server mode; export locally",
+                        ));
+                    }
+
                     let graph = nestweaver_engine::export_in_memory_graph(&state.store)
                         .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
                     let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
@@ -944,6 +950,8 @@ impl NestWeaverDaemon for DaemonService {
         // admin dashboard SPA can reach its backend on the same origin.
         let mut web_router = nestweaver_web::create_router(app_state);
         if let Some(admin_state) = state.admin_state.get() {
+            let device_router = nestweaver_web::create_device_flow_router(admin_state.clone());
+            web_router = web_router.nest("/auth", device_router);
             let admin_router = nestweaver_web::create_admin_router(admin_state.clone());
             web_router = web_router.nest("/admin/api", admin_router);
             tracing::info!("admin API also mounted on web UI server");
@@ -2876,6 +2884,51 @@ pub struct ServerOpts {
     pub admin_token: Option<String>,
 }
 
+/// Minimum byte length for auth/admin tokens supplied via [`ServerOpts`].
+/// Short tokens are trivially brute-forceable, so startup rejects them.
+const MIN_TOKEN_LEN: usize = 32;
+
+/// Reject any present auth/admin token shorter than [`MIN_TOKEN_LEN`] bytes.
+/// `None` tokens (auth disabled) are accepted. The error names which token is
+/// too short and the required minimum.
+fn validate_token_lengths(
+    auth_token: &Option<String>,
+    admin_token: &Option<String>,
+) -> anyhow::Result<()> {
+    for (name, token) in [("auth", auth_token), ("admin", admin_token)] {
+        if let Some(t) = token
+            && t.len() < MIN_TOKEN_LEN
+        {
+            anyhow::bail!(
+                "{name} token is too short ({} bytes); minimum is {MIN_TOKEN_LEN} bytes",
+                t.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the per-repo index-strategy map consumed by
+/// [`nestweaver_engine::worker::WorkerPool::with_repo_types`]. Keyed by the same
+/// [`canonical_repo_id`](nestweaver_engine::jobs::canonical_repo_id) the worker
+/// uses for lookup so vault repos index as markdown; untyped repos default to
+/// [`RepoType::Code`](nestweaver_engine::RepoType::Code).
+fn build_repo_types(
+    repos: &[nestweaver_engine::RepoConfig],
+) -> std::collections::HashMap<String, nestweaver_engine::RepoType> {
+    repos
+        .iter()
+        .map(|repo| {
+            (
+                nestweaver_engine::jobs::canonical_repo_id(&repo.url),
+                repo.repo_type
+                    .clone()
+                    .unwrap_or(nestweaver_engine::RepoType::Code),
+            )
+        })
+        .collect()
+}
+
 pub async fn run_server(
     db_path: &Path,
     idle_timeout: Option<Duration>,
@@ -3019,6 +3072,14 @@ pub async fn run_server(
     let admin_token = server_opts
         .as_ref()
         .and_then(|opts| opts.admin_token.clone());
+
+    // Reject any present auth/admin token that is too short to be safe.
+    validate_token_lengths(
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.auth_token.clone()),
+        &admin_token,
+    )?;
 
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
@@ -3363,6 +3424,10 @@ pub async fn run_server(
         if let Some(ref admin_tok) = opts.admin_token {
             let admin_state = std::sync::Arc::new(nestweaver_web::state::AdminState {
                 admin_token: admin_tok.clone(),
+                auth_token: opts.auth_token.clone(),
+                device_flow: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 daemon_store: state.store.clone(),
                 instance_id: state.instance_id.clone(),
                 start_time: state.start_time,
@@ -3380,6 +3445,11 @@ pub async fn run_server(
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).
             let _ = state.admin_state.set(admin_state.clone());
+
+            // Device-flow auth endpoints (RFC 8628) share the admin state so
+            // approvals can hand back the configured org query token.
+            let device_router = nestweaver_web::create_device_flow_router(admin_state.clone());
+            mcp_router = mcp_router.nest("/auth", device_router);
 
             let admin_router = nestweaver_web::create_admin_router(admin_state);
             mcp_router = mcp_router.nest("/admin/api", admin_router);
@@ -3572,12 +3642,20 @@ pub async fn run_server(
                 .instance_cfg
                 .as_ref()
                 .map(|c| c.server.indexing.workers)
-                .unwrap_or(2);
+                .unwrap_or(8);
             let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
                 Arc::clone(&state.indexing_active),
                 state.indexing_repo.clone(),
                 Arc::clone(&state.indexing_queue_depth),
             );
+            // Map each declared repo to its index strategy so vault repos index
+            // as markdown instead of code. Keyed by the same canonical repo id
+            // the worker uses for lookup.
+            let worker_repo_types = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| build_repo_types(&c.repos))
+                .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
             tokio::spawn(async move {
                 let workspace_dir = worker_db
@@ -3599,7 +3677,8 @@ pub async fn run_server(
                             return;
                         }
                     };
-                let pool = nestweaver_engine::worker::WorkerPool::new(worker_count);
+                let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
+                    .with_repo_types(worker_repo_types);
                 pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),
@@ -3703,7 +3782,7 @@ pub async fn run_server(
                             continue;
                         }
                         let due = scheduler.due_repos();
-                        for (_repo_id, repo_url, branch) in due {
+                        for (repo_id, repo_url, branch) in due {
                             // Determine which branch ref to check. If the repo
                             // config specifies a branch, use that ref; otherwise
                             // fall back to HEAD (symref of the remote's default
@@ -3731,6 +3810,15 @@ pub async fn run_server(
                                         &url,
                                         nestweaver_engine::jobs::JobTrigger::Poll,
                                         branch.as_deref(),
+                                    );
+                                    // A new commit was just observed — record it so
+                                    // the scheduler's adaptive interval shortens for
+                                    // active repos. Only on new-commit detection;
+                                    // calling this every poll would peg the interval
+                                    // at the min_poll floor.
+                                    scheduler.update_commit_time(
+                                        &repo_id,
+                                        std::time::Instant::now(),
                                     );
                                 }
                             }
@@ -4216,5 +4304,62 @@ fn proto_to_atomic_change(
             file_path: proto.file_path.clone(),
         }),
         ChangeKind::Unspecified => None,
+    }
+}
+
+#[cfg(test)]
+mod startup_helper_tests {
+    use super::*;
+    use nestweaver_engine::{RepoConfig, RepoType};
+
+    #[test]
+    fn validate_token_lengths_rejects_short_token() {
+        let short = Some("abcd".to_string());
+        assert!(validate_token_lengths(&short, &None).is_err());
+        assert!(validate_token_lengths(&None, &short).is_err());
+    }
+
+    #[test]
+    fn validate_token_lengths_accepts_min_length() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        assert_eq!(tok.as_ref().unwrap().len(), MIN_TOKEN_LEN);
+        assert!(validate_token_lengths(&tok, &None).is_ok());
+        assert!(validate_token_lengths(&tok, &tok).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_accepts_none() {
+        assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    fn repo_cfg(url: &str, repo_type: Option<RepoType>) -> RepoConfig {
+        RepoConfig {
+            url: url.to_string(),
+            repo_type,
+            name: None,
+            sparse: None,
+            pin_sha: None,
+            use_git_activity: None,
+            branch: None,
+            poll: None,
+        }
+    }
+
+    #[test]
+    fn build_repo_types_maps_vault_and_code_under_canonical_keys() {
+        let vault_url = "https://github.com/kory/notes.git";
+        let code_url = "https://github.com/kory/app.git";
+        let repos = vec![
+            repo_cfg(vault_url, Some(RepoType::Vault)),
+            // Untyped repo defaults to code.
+            repo_cfg(code_url, None),
+        ];
+        let map = build_repo_types(&repos);
+
+        let vault_key = nestweaver_engine::jobs::canonical_repo_id(vault_url);
+        assert_eq!(map.get(&vault_key), Some(&RepoType::Vault));
+
+        let code_key = nestweaver_engine::jobs::canonical_repo_id(code_url);
+        assert_eq!(map.get(&code_key), Some(&RepoType::Code));
     }
 }
