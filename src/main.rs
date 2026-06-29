@@ -1460,6 +1460,10 @@ enum Commands {
         /// Bearer token for authentication
         #[arg(long, env = "NESTWEAVER_TOKEN")]
         token: Option<String>,
+        /// Authenticate interactively via device flow (opens a browser).
+        /// Implied when no --token / NESTWEAVER_TOKEN is provided.
+        #[arg(long)]
+        device: bool,
         /// Name for this upstream (default: "upstream")
         #[arg(long)]
         name: Option<String>,
@@ -1509,6 +1513,72 @@ enum ServerAction {
         #[command(subcommand)]
         command: BackupCommands,
     },
+    /// Query a running server's status over its admin HTTP API
+    #[command(
+        after_help = "Examples:\n  nestweaver server status --url http://nestweaver.internal:9379\n  NESTWEAVER_ADMIN_TOKEN=secret nestweaver server status --url https://nestweaver.internal:9379"
+    )]
+    Status {
+        /// Admin/MCP HTTP base URL (the gRPC port + 1), e.g. http://host:9379
+        #[arg(long)]
+        url: String,
+        /// Admin bearer token (defaults to the NESTWEAVER_ADMIN_TOKEN env var)
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        token: Option<String>,
+    },
+}
+
+/// Subset of the admin `GET /admin/api/status` response rendered by
+/// `nestweaver server status`.
+///
+/// Mirrors [`nestweaver_web::routes::admin::AdminStatus`], which is
+/// serialize-only, so we keep a local deserialize-side struct here. Unknown
+/// fields are ignored, letting the server payload grow without breaking the CLI.
+#[derive(serde::Deserialize)]
+struct ServerStatusResponse {
+    instance_id: String,
+    version: String,
+    server_mode: bool,
+    repo_count: usize,
+    active_reads: u32,
+    active_writes: u32,
+    queue_depth: u32,
+    #[serde(default)]
+    drained: bool,
+    #[serde(default)]
+    symbols: ServerSymbolStats,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ServerSymbolStats {
+    total: usize,
+}
+
+/// Render a concise, human-readable summary of a server's status.
+fn format_server_status(url: &str, status: &ServerStatusResponse) -> String {
+    let indexing = if status.queue_depth > 0 || status.active_writes > 0 {
+        "active"
+    } else {
+        "idle"
+    };
+    let mode = if status.server_mode {
+        "server"
+    } else {
+        "daemon"
+    };
+    let drained = if status.drained { " (drained)" } else { "" };
+    [
+        format!("Connected to {url}"),
+        format!("  Instance:      {}", status.instance_id),
+        format!("  Version:       {}", status.version),
+        format!("  Mode:          {mode}{drained}"),
+        format!("  Repos indexed: {}", status.repo_count),
+        format!("  Symbols:       {}", status.symbols.total),
+        format!("  Queue depth:   {}", status.queue_depth),
+        format!("  Indexing:      {indexing}"),
+        format!("  Active reads:  {}", status.active_reads),
+        format!("  Active writes: {}", status.active_writes),
+    ]
+    .join("\n")
 }
 
 #[derive(Subcommand)]
@@ -7793,6 +7863,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Connect {
             url,
             token,
+            device,
             name,
             mode,
             ca_cert,
@@ -7807,9 +7878,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
             let rt = tokio::runtime::Runtime::new().unwrap();
+
+            // Resolve the bearer token. Run the device flow when explicitly
+            // requested, or when no token was supplied (gh-style). The
+            // existing --token / NESTWEAVER_TOKEN path is left untouched.
+            let resolved_token: Option<String> = if device || token.is_none() {
+                match rt.block_on(nestweaver_client::connect::device_flow_authenticate(
+                    &url,
+                    ca_cert.as_deref(),
+                )) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        if device {
+                            // Explicit opt-in: a failure is fatal.
+                            eprintln!("error: device authentication failed: {e:#}");
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        // No token and no explicit --device: fall back to a
+                        // token-less connect (works for servers without auth).
+                        tracing::debug!(
+                            "device flow unavailable, connecting without a token: {e:#}"
+                        );
+                        token.clone()
+                    }
+                }
+            } else {
+                token.clone()
+            };
+
             match rt.block_on(nestweaver_client::connect::connect_upstream(
                 &url,
-                token.as_deref(),
+                resolved_token.as_deref(),
                 name.as_deref(),
                 mode,
                 ca_cert.as_deref(),
@@ -7869,6 +7968,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok((EXIT_SUCCESS, None))
             }
             ServerAction::Backup { command } => run_backup(command).map(|c| (c, None)),
+            ServerAction::Status { url, token } => {
+                let base = url.trim_end_matches('/').to_string();
+                let endpoint = format!("{base}/admin/api/status");
+                let rt = tokio::runtime::Runtime::new()?;
+                let result = rt.block_on(async {
+                    let client = reqwest::Client::new();
+                    let mut req = client.get(&endpoint);
+                    if let Some(token) = token.as_deref() {
+                        // bearer_auth sets the Authorization header; the token is
+                        // never logged or echoed.
+                        req = req.bearer_auth(token);
+                    }
+                    let resp = req
+                        .send()
+                        .await
+                        .with_context(|| format!("could not reach server at {base}"))?;
+                    let http_status = resp.status();
+                    if http_status == reqwest::StatusCode::UNAUTHORIZED
+                        || http_status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        anyhow::bail!(
+                            "authentication failed (HTTP {http_status}); check --token / NESTWEAVER_ADMIN_TOKEN"
+                        );
+                    }
+                    if !http_status.is_success() {
+                        anyhow::bail!("server returned HTTP {http_status}");
+                    }
+                    let status: ServerStatusResponse = resp
+                        .json()
+                        .await
+                        .context("could not parse server status response")?;
+                    Ok::<ServerStatusResponse, anyhow::Error>(status)
+                });
+
+                match result {
+                    Ok(status) => {
+                        println!("{}", format_server_status(&base, &status));
+                        Ok((EXIT_SUCCESS, None))
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to query server status: {e:#}");
+                        Ok((EXIT_ERROR, None))
+                    }
+                }
+            }
         },
 
         Commands::Info { hardware } => {
@@ -13307,5 +13451,68 @@ mod hybrid_cli_tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "processPayment");
+    }
+}
+
+#[cfg(test)]
+mod server_status_tests {
+    use super::*;
+
+    /// A full `AdminStatus` payload (matching the admin endpoint shape) should
+    /// deserialize into our mirror struct and render a concise summary.
+    #[test]
+    fn formats_concise_summary() {
+        let json = serde_json::json!({
+            "instance_id": "my-brain",
+            "uptime_seconds": 1234,
+            "server_mode": true,
+            "repo_count": 7,
+            "active_reads": 2,
+            "active_writes": 1,
+            "queue_depth": 3,
+            "drained": false,
+            "version": "0.9.0",
+            "repos": { "total": 7, "indexed": 7, "stale": 0, "dead_letter": 0 },
+            "symbols": { "total": 4096 },
+            "queue": { "pending": 3, "running": 1, "dead_letter": 0 }
+        });
+        let status: ServerStatusResponse = serde_json::from_value(json).unwrap();
+        let out = format_server_status("http://127.0.0.1:9379", &status);
+
+        assert!(out.contains("Connected to http://127.0.0.1:9379"));
+        assert!(out.contains("Instance:      my-brain"));
+        assert!(out.contains("Version:       0.9.0"));
+        assert!(out.contains("Mode:          server"));
+        assert!(out.contains("Repos indexed: 7"));
+        assert!(out.contains("Symbols:       4096"));
+        assert!(out.contains("Queue depth:   3"));
+        // queue_depth > 0 → indexing is active
+        assert!(out.contains("Indexing:      active"));
+        assert!(out.contains("Active reads:  2"));
+        assert!(out.contains("Active writes: 1"));
+    }
+
+    /// With an empty queue and no active writes, indexing reads as idle.
+    #[test]
+    fn indexing_idle_when_queue_empty_and_no_writes() {
+        let json = serde_json::json!({
+            "instance_id": "i",
+            "uptime_seconds": 0,
+            "server_mode": true,
+            "repo_count": 1,
+            "active_reads": 0,
+            "active_writes": 0,
+            "queue_depth": 0,
+            "drained": true,
+            "version": "1.0.0",
+            "repos": { "total": 1, "indexed": 1, "stale": 0, "dead_letter": 0 },
+            "symbols": { "total": 10 },
+            "queue": { "pending": 0, "running": 0, "dead_letter": 0 }
+        });
+        let status: ServerStatusResponse = serde_json::from_value(json).unwrap();
+        let out = format_server_status("http://x", &status);
+
+        assert!(out.contains("Indexing:      idle"));
+        assert!(out.contains("Mode:          server (drained)"));
     }
 }
