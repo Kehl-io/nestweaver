@@ -503,11 +503,19 @@ where
     match prepared.repo_type {
         RepoType::Vault => {
             // Markdown-vault repo: index Note/Section/Heading nodes via the
-            // markdown indexer. It performs all graph mutations in one pass,
-            // so acquire the caller's write gate up front and hold it for the
-            // duration (also performs the job-cancellation check).
-            let _write_guard = acquire_write_guard()?;
-            crate::index_markdown_with_reader(&reader, store, instance_id, &prepared.repo_url)?;
+            // markdown indexer, then record the indexed SHA on the Repo node
+            // (nw-003) so an unchanged vault is skipped on the next poll. The
+            // scan + parse passes run off the write gate; the gate is acquired
+            // only for the database-write phase (nw-006) — mirroring the code
+            // path — and the closure also performs the job-cancellation check.
+            crate::index_markdown_with_reader_and_write_gate(
+                &reader,
+                store,
+                instance_id,
+                &prepared.repo_url,
+                &prepared.remote_sha,
+                acquire_write_guard,
+            )?;
         }
         RepoType::Code => {
             // Full index via index_with_reader.
@@ -694,6 +702,74 @@ mod tests {
         process_job(&job, &ws, &store, instance_id).unwrap();
         // No assertion needed beyond "it didn't error" — the second call
         // should detect identical SHAs and return early.
+    }
+
+    #[test]
+    fn vault_repo_records_indexed_sha_and_second_poll_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("README.md", "# Readme\n\nProject overview.\n"),
+                ("docs/guide.md", "# Guide\n\n## Setup\n\ninstall steps\n"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "vault-repo".to_string(),
+            repo_url: url.clone(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        // First poll: nothing indexed yet, so the job is prepared and committed
+        // through the vault path.
+        let prepared = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Vault)
+            .unwrap()
+            .expect("first vault index should be prepared");
+        let remote_sha = prepared.remote_sha.clone();
+        commit_prepared_job(&prepared, &store, instance_id).unwrap();
+
+        // The vault was actually indexed.
+        assert!(
+            store.count_notes().unwrap() >= 2,
+            "vault index should have produced notes"
+        );
+
+        // nw-003: the Repo node now carries the indexed SHA.
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("vault index must upsert a Repo node");
+        assert_eq!(
+            repo.indexed_sha, remote_sha,
+            "vault repo must persist the indexed SHA so unchanged vaults are skipped"
+        );
+
+        // Second poll at the same SHA: the up-to-date short-circuit fires and
+        // prepare_job returns None instead of re-indexing.
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Vault).unwrap();
+        assert!(
+            second.is_none(),
+            "an unchanged vault must be skipped on the next poll"
+        );
     }
 
     #[test]

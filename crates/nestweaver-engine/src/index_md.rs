@@ -17,8 +17,8 @@ use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
 use nestweaver_schema::{
-    EdgeType, Heading, Note, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid, section_uid,
-    tag_uid, vault_uid,
+    EdgeType, Heading, Note, Repo, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid,
+    repo_uid, section_uid, tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
 // walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
@@ -195,6 +195,68 @@ pub fn index_markdown_with_reader(
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
     index_into_store(reader, store, instance_id, vault_name, &ignore_set)
+}
+
+/// Server-mode vault entry point: index the markdown exposed by `reader` and
+/// record `indexed_sha` on the repo's `Repo` node, while narrowing the caller's
+/// write gate to the database-write phase only — the scan and parse passes run
+/// off-lock (nw-006).
+///
+/// `repo_url` doubles as the vault display name and the key from which the
+/// `Repo` UID is derived. Recording the SHA (nw-003) lets the worker's
+/// up-to-date short-circuit skip an unchanged vault on the next poll; without it
+/// the `Repo` row keeps an empty `indexed_sha` and the vault re-indexes every
+/// cycle. Mirrors [`crate::index_with_reader_and_write_gate`] for the code path.
+pub fn index_markdown_with_reader_and_write_gate<G, F>(
+    reader: &dyn ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    acquire_write_guard: F,
+) -> Result<MarkdownIndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    index_into_store_with_write_gate(
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        &ignore_set,
+        Some(indexed_sha),
+        acquire_write_guard,
+    )
+}
+
+/// Upsert the `Repo` node for `repo_url` so its `indexed_sha` equals `sha`,
+/// mirroring what the code path does inside its own gated write region
+/// (`index.rs`): insert the row when absent, otherwise update the SHA in place.
+fn record_repo_indexed_sha(
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    sha: &str,
+) -> Result<(), anyhow::Error> {
+    let r_uid = repo_uid(instance_id, repo_url);
+    if store.lookup_repo(&r_uid).context("lookup_repo")?.is_none() {
+        store
+            .insert_repo(&Repo {
+                uid: r_uid,
+                url: repo_url.trim_end_matches('/').to_string(),
+                indexed_sha: sha.to_string(),
+                staleness_commits_behind: 0,
+                instance_id: instance_id.to_string(),
+                name: None,
+            })
+            .context("insert_repo")?;
+    } else {
+        store
+            .update_repo_sha(&r_uid, sha)
+            .context("update_repo_sha")?;
+    }
+    Ok(())
 }
 
 /// Outcome of an incremental (`--since`) markdown refresh run.
@@ -647,6 +709,40 @@ fn index_into_store(
     vault_name: &str,
     ignore_set: &GlobSet,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_into_store_with_write_gate(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        None,
+        || Ok::<_, anyhow::Error>(()),
+    )
+}
+
+/// Core markdown indexer. The expensive scan and parse passes run *off* the
+/// caller's write gate; only the database writes — vault upsert, tag/bulk
+/// inserts, and the optional repo-SHA recording — are performed under
+/// `acquire_write_guard` (nw-006). This mirrors the code path's
+/// `index_into_store_with_write_gate` in `index.rs`, which likewise builds
+/// off-lock and acquires the gate just before its write phase.
+///
+/// `record_repo_sha` is `Some(sha)` only for the server-mode vault path, where
+/// `vault_name` is the repo URL: it upserts the repo's `Repo` node with that
+/// SHA (nw-003) so an unchanged vault is skipped on the next poll. For
+/// local-directory vaults (which have no remote SHA) it is `None`.
+fn index_into_store_with_write_gate<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
+    acquire_write_guard: F,
+) -> Result<MarkdownIndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
     let started = Instant::now();
 
     // The caller canonicalizes vault_root before constructing the reader, so
@@ -656,20 +752,9 @@ fn index_into_store(
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
 
-    // 1. Insert the Vault node. If the vault was already indexed, cascade-
-    //    delete the old data first so re-indexing is idempotent.
-    if store.lookup_vault(&v_uid).is_ok() {
-        store
-            .delete_vault_cascade(&v_uid)
-            .context("delete_vault_cascade (re-index)")?;
-    }
-    let vault = Vault {
-        uid: v_uid.clone(),
-        name: vault_name.to_string(),
-        root_path: root_str.clone(),
-        instance_id: instance_id.to_string(),
-    };
-    store.insert_vault(&vault).context("insert_vault")?;
+    // The Vault node is upserted later, under the write gate, alongside the
+    // bulk commit (see "gated write region" below). Computing v_uid here is a
+    // pure operation that does not touch the store.
 
     // ── Phase 1: Scan notes ───────────────────────────────────────────────
     let scan_pb = ProgressBar::new_spinner();
@@ -1044,6 +1129,32 @@ fn index_into_store(
     }
     let tags_count = all_tags.len();
 
+    // ── Gated write region (nw-006) ───────────────────────────────────────
+    // Everything above (scan + parse + in-memory tag/wikilink resolution) is
+    // read-only with respect to the store, so it ran off the caller's write
+    // gate. Acquire the gate now and hold it through the final commit. The
+    // gate closure also performs the job-cancellation check in server mode, so
+    // a cancelled job returns here after the off-lock parse — matching the code
+    // path's behaviour exactly.
+    let _write_guard = acquire_write_guard()?;
+
+    // Upsert the Vault node. If the vault was already indexed, cascade-delete
+    // the old data first so re-indexing is idempotent. Done under the gate (and
+    // before the edge writes below, which MATCH the Vault node).
+    if store.lookup_vault(&v_uid).is_ok() {
+        store
+            .delete_vault_cascade(&v_uid)
+            .context("delete_vault_cascade (re-index)")?;
+    }
+    store
+        .insert_vault(&Vault {
+            uid: v_uid.clone(),
+            name: vault_name.to_string(),
+            root_path: root_str.clone(),
+            instance_id: instance_id.to_string(),
+        })
+        .context("insert_vault")?;
+
     // Insert tag nodes outside the main transaction so that duplicate tags
     // from earlier index runs are silently skipped rather than aborting the
     // whole batch.
@@ -1209,6 +1320,16 @@ fn index_into_store(
         && let Err(e) = store.batch_insert_edges(&typed_edges)
     {
         tracing::warn!("failed to insert typed relationship edges: {e}");
+    }
+
+    // nw-003: record the indexed SHA on the repo's Repo node (server-mode vault
+    // path only). The markdown indexer above only writes Note/Section/Heading
+    // nodes and never touches the Repo row, so without this the row keeps an
+    // empty indexed_sha and the worker's up-to-date short-circuit never fires —
+    // re-indexing the whole vault every poll. `vault_name` is the repo URL in
+    // this path; recorded under the same write gate as the vault commit.
+    if let Some(sha) = record_repo_sha {
+        record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
 
     // ── Summary ───────────────────────────────────────────────────────────
@@ -2297,6 +2418,102 @@ sub b body
             store.count_symbols().unwrap(),
             0,
             "vault indexing must not produce code symbols"
+        );
+    }
+
+    /// nw-003: the gated vault entry point must upsert a `Repo` node carrying
+    /// the indexed SHA, and re-indexing must update it in place (insert when
+    /// absent, update when present — mirroring the code path). Without this the
+    /// worker's `remote_sha == indexed_sha` short-circuit never fires for vault
+    /// repos.
+    #[test]
+    fn gated_vault_index_records_repo_indexed_sha() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("README.md", "# Readme\n\nbody\n")]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+
+        // The write gate is acquired exactly once and only for the commit phase.
+        let gate_calls = std::cell::Cell::new(0u32);
+        index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || {
+                gate_calls.set(gate_calls.get() + 1);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(gate_calls.get(), 1, "write gate acquired exactly once");
+
+        let r_uid = repo_uid("test-instance", "vault-repo");
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("vault index must upsert a Repo node carrying the SHA");
+        assert_eq!(
+            repo.indexed_sha, sha,
+            "indexed_sha must equal the indexed remote SHA"
+        );
+
+        // Re-index at the same SHA: the existing Repo row is updated in place
+        // (the helper's update branch), still resolving to the same SHA.
+        index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        let repo = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert_eq!(repo.indexed_sha, sha);
+    }
+
+    /// nw-006: every store write — including the Vault upsert, which previously
+    /// ran at the top of `index_into_store` before the parse — now happens
+    /// inside the gated region. A failing write gate must therefore leave the
+    /// store completely untouched: no Vault node, no notes, no Repo SHA.
+    #[test]
+    fn gated_vault_index_commits_nothing_when_write_gate_fails() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("README.md", "# Readme\n\nbody\n"),
+            ("docs/guide.md", "# Guide\n\n## Setup\n\nsteps\n"),
+        ]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+
+        let result = index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Err::<(), _>(anyhow::anyhow!("simulated job cancellation")),
+        );
+
+        assert!(
+            result.is_err(),
+            "a failing write gate must propagate as an error"
+        );
+        // The Vault node is upserted under the gate, so it must not exist.
+        let v_uid = vault_uid("test-instance", &reader.root().to_string_lossy());
+        assert!(
+            store.lookup_vault(&v_uid).is_err(),
+            "no Vault node may be committed when the gate fails"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            0,
+            "no notes committed when the gate fails"
+        );
+        let r_uid = repo_uid("test-instance", "vault-repo");
+        assert!(
+            store.lookup_repo(&r_uid).unwrap().is_none(),
+            "no Repo SHA recorded when the gate fails"
         );
     }
 }

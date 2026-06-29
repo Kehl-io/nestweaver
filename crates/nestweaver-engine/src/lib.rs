@@ -173,7 +173,8 @@ pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
     index_markdown_directory_in_memory, index_markdown_directory_since,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
-    index_markdown_directory_with_store, index_markdown_with_reader, load_alias_sidecar,
+    index_markdown_directory_with_store, index_markdown_with_reader,
+    index_markdown_with_reader_and_write_gate, load_alias_sidecar,
 };
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
