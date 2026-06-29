@@ -139,11 +139,14 @@ hex = "0.4"
 [[bench]]
 name = "brain_benchmarks"
 harness = false
+test = false
 
 [[bench]]
 name = "embed_latency"
 harness = false
+test = false
 
 [[bench]]
 name = "index_benchmarks"
 harness = false
+test = false
