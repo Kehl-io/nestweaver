@@ -3277,7 +3277,7 @@ pub async fn run_server(
         let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
         let shared_job_queue: std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>> = {
             let jq = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
-                .expect("open shared job queue");
+                .with_context(|| format!("open shared job queue: {}", jobs_db_path.display()))?;
             std::sync::Arc::new(std::sync::Mutex::new(jq))
         };
         shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
