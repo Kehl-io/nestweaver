@@ -146,6 +146,7 @@ impl McpHttpState {
     }
 
     /// Create a new state with bearer token authentication enabled.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_auth(
         lite: bool,
         store: Arc<GraphStore>,
@@ -200,34 +201,32 @@ fn apply_safeguard_params(arguments: &mut Value) -> Result<Vec<AppliedLimit>, St
     let mut limits = Vec::new();
     if let Some(obj) = arguments.as_object_mut() {
         for key in &["depth", "max_depth"] {
-            if let Some(val) = obj.get_mut(*key) {
-                if let Some(n) = val.as_u64() {
-                    if n > MAX_DEPTH {
-                        return Err(format!(
-                            "invalid-argument: parameter '{key}' requested depth {n}, maximum allowed depth is {MAX_DEPTH}"
-                        ));
-                    }
-                }
+            if let Some(val) = obj.get_mut(*key)
+                && let Some(n) = val.as_u64()
+                && n > MAX_DEPTH
+            {
+                return Err(format!(
+                    "invalid-argument: parameter '{key}' requested depth {n}, maximum allowed depth is {MAX_DEPTH}"
+                ));
             }
         }
         for key in &["limit", "max_results"] {
-            if let Some(val) = obj.get_mut(*key) {
-                if let Some(n) = val.as_u64() {
-                    if n > MAX_RESULTS {
-                        tracing::warn!(
-                            param = *key,
-                            requested = n,
-                            capped = MAX_RESULTS,
-                            "clamped parameter"
-                        );
-                        limits.push(AppliedLimit {
-                            param: *key,
-                            requested: n,
-                            applied: MAX_RESULTS,
-                        });
-                        *val = Value::Number(serde_json::Number::from(MAX_RESULTS));
-                    }
-                }
+            if let Some(val) = obj.get_mut(*key)
+                && let Some(n) = val.as_u64()
+                && n > MAX_RESULTS
+            {
+                tracing::warn!(
+                    param = key,
+                    requested = n,
+                    capped = MAX_RESULTS,
+                    "clamped parameter"
+                );
+                limits.push(AppliedLimit {
+                    param: key,
+                    requested: n,
+                    applied: MAX_RESULTS,
+                });
+                *val = Value::Number(serde_json::Number::from(MAX_RESULTS));
             }
         }
     }
@@ -361,31 +360,28 @@ async fn handle_mcp(
     // Reject unknown session IDs (except for `initialize` which creates one).
     // If a client sends a session ID that isn't in our DashMap, it likely
     // expired or belongs to a previous server instance — ask it to re-init.
-    if let Some(ref sid) = session_id {
-        if req.method != "initialize" && !state.sessions.contains_key(sid) {
-            return (
-                axum::http::StatusCode::OK,
-                HeaderMap::new(),
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": error_code::INVALID_REQUEST,
-                        "message": "unknown or expired session ID — please re-initialize",
-                    }
-                })),
-            );
-        }
+    if let Some(ref sid) = session_id
+        && req.method != "initialize"
+        && !state.sessions.contains_key(sid)
+    {
+        return (
+            axum::http::StatusCode::OK,
+            HeaderMap::new(),
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": error_code::INVALID_REQUEST,
+                    "message": "unknown or expired session ID — please re-initialize",
+                }
+            })),
+        );
     }
 
     // Per-session rate limiting (server mode only).
     if state.server_mode {
-        let client_key = if let Some(token) = provided_bearer {
-            if state
-                .admin_token
-                .as_ref()
-                .is_some_and(|admin| token == admin.as_str())
-            {
+        let client_key = if provided_bearer.is_some() {
+            if admin_bypass_rate_limit {
                 "bearer:admin".to_string()
             } else {
                 "bearer:query".to_string()
@@ -416,11 +412,11 @@ async fn handle_mcp(
         }
     } else {
         // Non-server mode: just update last_active / request_count.
-        if let Some(ref sid) = session_id {
-            if let Some(mut entry) = state.sessions.get_mut(sid) {
-                entry.last_active = Instant::now();
-                entry.request_count += 1;
-            }
+        if let Some(ref sid) = session_id
+            && let Some(mut entry) = state.sessions.get_mut(sid)
+        {
+            entry.last_active = Instant::now();
+            entry.request_count += 1;
         }
     }
 
