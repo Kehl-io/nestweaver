@@ -717,10 +717,11 @@ fn bare_reader_for_repo(
     repo_uid: &str,
 ) -> Option<nestweaver_engine::content_reader::GitBareReader> {
     let repo = store.lookup_repo(repo_uid).ok().flatten()?;
-    let repo_name = repo
-        .name
-        .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
-    let bare_path = workspace_root.join(format!("{repo_name}.git"));
+    // The bare clone is named solely from the URL by `ensure_clone` (it never
+    // sees the explicit repo name), so resolve the on-disk dir the same way —
+    // via the URL-hashed clone-dir name, not the display/identity basename.
+    let clone_dir = nestweaver_engine::pull::clone_dir_name_from_url(&repo.url);
+    let bare_path = workspace_root.join(format!("{clone_dir}.git"));
     if !bare_path.is_dir() {
         return None;
     }

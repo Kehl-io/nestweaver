@@ -137,8 +137,9 @@ impl BareClone {
 
 /// Manages all bare clones in a workspace directory.
 ///
-/// Each clone lives at `<root>/<repo-name>.git`. The repo name is derived
-/// from the URL via [`crate::pull::repo_name_from_url`].
+/// Each clone lives at `<root>/<repo-name>.git`. The directory name is derived
+/// from the URL via [`crate::pull::clone_dir_name_from_url`], which appends a
+/// short URL hash so same-basename repos from different hosts/orgs don't collide.
 pub struct BareCloneWorkspace {
     /// Root directory for all bare clones.
     pub root: PathBuf,
@@ -159,17 +160,23 @@ impl BareCloneWorkspace {
     /// If the clone already exists and is valid, returns it immediately.
     /// Otherwise creates a new blobless bare clone.
     pub fn ensure_clone(&self, url: &str) -> Result<BareClone> {
-        let name = crate::pull::repo_name_from_url(url);
+        let name = crate::pull::clone_dir_name_from_url(url);
         let dest = self.root.join(format!("{}.git", name));
 
         if dest.exists() && BareClone::is_valid_at(&dest) {
-            return Ok(BareClone {
-                path: dest,
-                url: url.to_string(),
-            });
+            // Defense-in-depth: even with the URL-hashed dir name, confirm the
+            // stored origin matches the requested URL before reusing. A mismatch
+            // means the directory holds a different repo's clone (stale or a hash
+            // collision) — fall through to remove and re-clone.
+            if read_origin_url(&dest).ok().as_deref() == Some(url) {
+                return Ok(BareClone {
+                    path: dest,
+                    url: url.to_string(),
+                });
+            }
         }
 
-        // Remove any invalid remnant before cloning.
+        // Remove any invalid remnant (or origin-mismatched clone) before cloning.
         if dest.exists() {
             std::fs::remove_dir_all(&dest).ok();
         }
@@ -204,7 +211,7 @@ impl BareCloneWorkspace {
 
     /// Remove a bare clone for a repo URL.
     pub fn remove(&self, url: &str) -> Result<()> {
-        let name = crate::pull::repo_name_from_url(url);
+        let name = crate::pull::clone_dir_name_from_url(url);
         let dest = self.root.join(format!("{}.git", name));
         if dest.exists() {
             std::fs::remove_dir_all(&dest)
@@ -367,6 +374,71 @@ mod tests {
 
         // Same path returned both times.
         assert_eq!(clone1.path, clone2.path);
+    }
+
+    #[test]
+    fn bare_clone_workspace_distinct_dirs_for_same_basename() {
+        let tmp = TempDir::new().unwrap();
+        // Two different source repos that share the same basename ("api"),
+        // mirroring github.com/acme/api vs gitlab.com/vendor/api.
+        let src1 = tmp.path().join("acme").join("api");
+        let src2 = tmp.path().join("vendor").join("api");
+        create_source_repo(&src1, &[("a.txt", "from acme")]);
+        create_source_repo(&src2, &[("b.txt", "from vendor")]);
+        let url1 = format!("file://{}", src1.display());
+        let url2 = format!("file://{}", src2.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let clone1 = ws.ensure_clone(&url1).unwrap();
+        let clone2 = ws.ensure_clone(&url2).unwrap();
+
+        // Distinct clone directories despite the shared basename.
+        assert_ne!(
+            clone1.path, clone2.path,
+            "same-basename URLs must not share a clone dir"
+        );
+        assert!(clone1.is_valid());
+        assert!(clone2.is_valid());
+
+        // Each clone tracks its own origin.
+        assert_eq!(read_origin_url(&clone1.path).unwrap(), url1);
+        assert_eq!(read_origin_url(&clone2.path).unwrap(), url2);
+
+        // Both clones coexist on disk.
+        let clones = ws.list_clones().unwrap();
+        assert_eq!(clones.len(), 2);
+    }
+
+    #[test]
+    fn ensure_clone_reclones_on_origin_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("hello.txt", "world")]);
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let clone = ws.ensure_clone(&url).unwrap();
+
+        // Simulate a foreign/stale clone occupying the dir by rewriting origin.
+        Command::new("git")
+            .arg("-C")
+            .arg(&clone.path)
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://example.com/other.git",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            read_origin_url(&clone.path).unwrap(),
+            "https://example.com/other.git"
+        );
+
+        // ensure_clone must detect the mismatch, drop the dir, and re-clone.
+        let reclone = ws.ensure_clone(&url).unwrap();
+        assert_eq!(reclone.path, clone.path);
+        assert_eq!(read_origin_url(&reclone.path).unwrap(), url);
     }
 
     #[test]

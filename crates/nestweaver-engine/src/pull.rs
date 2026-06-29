@@ -27,17 +27,36 @@ pub fn resolve_path(workspace_root: &Path, repo_name: &str, file_path: &str) -> 
     workspace_root.join(repo_name).join(file_path)
 }
 
+/// Derive a repo's display/identity basename from its URL: the trailing path
+/// segment with any `.git` suffix stripped and path separators sanitized.
+///
+/// This is the user-facing basename used for display, name matching, and
+/// scheduler ids when a repo has no explicit `name` override (see
+/// [`crate::repo_display_name`]). It is intentionally NOT unique across hosts
+/// or orgs that share a basename — for naming an on-disk clone directory use
+/// [`clone_dir_name_from_url`] instead.
 pub fn repo_name_from_url(url: &str) -> String {
     let raw = url
         .rsplit('/')
         .next()
         .unwrap_or(url)
         .trim_end_matches(".git");
-    let sanitized = raw.replace("..", "");
-    sanitized
+    raw.replace("..", "")
         .chars()
         .map(|c| if c == '/' || c == '\\' { '_' } else { c })
         .collect::<String>()
+}
+
+/// Derive the on-disk clone-directory name for a repo URL: the sanitized
+/// basename plus a short hash of the *full* URL so distinct URLs that share a
+/// basename (e.g. github.com/acme/api vs gitlab.com/vendor/api) map to distinct
+/// clone directories instead of silently colliding. This value names the
+/// on-disk clone dir only; it is not a persisted identity key (that role
+/// belongs to `canonical_repo_id`).
+pub fn clone_dir_name_from_url(url: &str) -> String {
+    let sanitized = repo_name_from_url(url);
+    let hash = crate::hash::blake3_hex(url);
+    format!("{sanitized}_{}", &hash[..8])
 }
 
 fn validate_repo_dest(workspace_root: &Path, dest: &Path) -> Result<(), PullError> {
@@ -75,7 +94,7 @@ pub fn pull_repo(
     options: &PullOptions,
 ) -> Result<PullResult, PullError> {
     ensure_workspace_hygiene(workspace_root)?;
-    let repo_name = repo_name_from_url(repo_url);
+    let repo_name = clone_dir_name_from_url(repo_url);
     if repo_name.is_empty() || repo_name == "." || repo_name.contains("..") {
         return Err(PullError::Other(anyhow::anyhow!(
             "invalid repo name derived from URL: '{}'",
@@ -230,7 +249,7 @@ fn count_commits_between(repo_dir: &Path, old: &str, new: &str) -> Result<u32, a
 
 // Cleanup for ephemeral pulls
 pub fn cleanup_repo(workspace_root: &Path, repo_url: &str) -> Result<(), anyhow::Error> {
-    let name = repo_name_from_url(repo_url);
+    let name = clone_dir_name_from_url(repo_url);
     let path = workspace_root.join(&name);
     if path.exists() {
         std::fs::remove_dir_all(&path)?;
@@ -244,18 +263,16 @@ mod tests {
 
     #[test]
     fn repo_name_from_https_url() {
-        assert_eq!(
-            repo_name_from_url("https://github.com/user/my-repo"),
-            "my-repo"
-        );
+        // The display/identity basename is the bare trailing segment, with no
+        // hash suffix (that belongs to `clone_dir_name_from_url`).
+        let name = repo_name_from_url("https://github.com/user/my-repo");
+        assert_eq!(name, "my-repo");
     }
 
     #[test]
     fn repo_name_from_url_with_git_suffix() {
-        assert_eq!(
-            repo_name_from_url("https://github.com/user/my-repo.git"),
-            "my-repo"
-        );
+        let name = repo_name_from_url("https://github.com/user/my-repo.git");
+        assert_eq!(name, "my-repo");
     }
 
     #[test]
@@ -263,10 +280,30 @@ mod tests {
         // SSH URLs like git@github.com:user/my-repo.git do have a '/' between user and repo,
         // so rsplit('/').next() correctly yields "my-repo.git", then ".git" is stripped.
         // Full SCP-style SSH URL parsing (handling the colon) can be improved later.
-        assert_eq!(
-            repo_name_from_url("git@github.com:user/my-repo.git"),
-            "my-repo"
-        );
+        let name = repo_name_from_url("git@github.com:user/my-repo.git");
+        assert_eq!(name, "my-repo");
+    }
+
+    #[test]
+    fn clone_dir_name_is_deterministic_for_same_url() {
+        let url = "https://github.com/acme/api.git";
+        assert_eq!(clone_dir_name_from_url(url), clone_dir_name_from_url(url));
+    }
+
+    #[test]
+    fn clone_dir_name_disambiguates_same_basename() {
+        // The display basename collides for same-basename repos from different
+        // hosts/orgs, but the clone-dir name must not.
+        let a_url = "https://github.com/acme/api.git";
+        let b_url = "https://gitlab.com/vendor/api.git";
+        assert_eq!(repo_name_from_url(a_url), repo_name_from_url(b_url));
+
+        let a = clone_dir_name_from_url(a_url);
+        let b = clone_dir_name_from_url(b_url);
+        assert!(a.starts_with("api_"), "got {a}");
+        assert!(b.starts_with("api_"), "got {b}");
+        assert_eq!(a.len(), "api_".len() + 8);
+        assert_ne!(a, b, "same-basename URLs must not share a clone dir");
     }
 
     #[test]
