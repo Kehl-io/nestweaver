@@ -25,7 +25,7 @@ nestweaver daemon --db ./brain.lbug run \
 | Flag | Description |
 |------|-------------|
 | `--server` | Enable server mode (TCP listener, webhook endpoint, MCP-over-HTTP) |
-| `--bind <addr>` | gRPC bind address (default: `0.0.0.0:9378`) |
+| `--bind <addr>` | gRPC bind address (default: `127.0.0.1:9378`) |
 | `--auth-token <token>` | Bearer token for query authentication |
 | `--admin-token <token>` | Bearer token for admin API endpoints |
 | `--tls-cert <path>` | PEM-encoded TLS certificate |
@@ -43,7 +43,7 @@ All flags can be set via environment variables:
 | `NESTWEAVER_WEBHOOK_SECRET` | `--webhook-secret` |
 | `NESTWEAVER_BIND` | `--bind` |
 
-### Instance config (nestweaver-instance.toml)
+### Instance config (instance.toml)
 
 Server settings can also be declared in the instance config. Note that `bind`, `auth_token`,
 `admin_token`, and `webhook_secret` are **not** config-file keys — they come from CLI flags
@@ -245,12 +245,12 @@ The server automatically polls repos for changes using `git ls-remote`. The poll
 interval = time_since_last_commit / 2
 ```
 
-Bounded between `poll_min` (default 45s) and `poll_max` (default 8h). Active repos are polled frequently; dormant repos back off.
+Bounded between `min_poll` (default 45s) and `max_poll` (default 8h). Active repos are polled frequently; dormant repos back off.
 
 ```toml
 [server.indexing]
-poll_min = "45s"    # minimum polling interval
-poll_max = "8h"     # maximum polling interval
+min_poll = "45s"    # minimum polling interval
+max_poll = "8h"     # maximum polling interval
 workers = 8         # concurrent indexing workers
 ```
 
@@ -290,7 +290,7 @@ The client discovers upstream servers from (highest priority first):
 1. `NESTWEAVER_UPSTREAM` and `NESTWEAVER_TOKEN` environment variables
 2. `.nestweaver/server.toml` in the current repo (checked into source)
 3. `~/.nestweaver/server.toml` (user config)
-4. `nestweaver-instance.toml` `[[upstream]]` section
+4. `instance.toml` `[[upstream]]` section
 
 ### Repo-level config (.nestweaver/server.toml)
 
@@ -366,7 +366,7 @@ The client compares local `indexed_sha` against server `RepoStates` using `git l
 Check what your uncommitted changes might break across the org:
 
 ```bash
-nestweaver impact --local-changes
+nestweaver pre-push-impact --local-changes
 ```
 
 This sends symbol-level diffs to the server, which queries the org-wide graph and returns:
@@ -504,7 +504,7 @@ services:
       - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:
       - nestweaver-data:/data
-      - ./nestweaver-instance.toml:/etc/nestweaver/instance.toml:ro
+      - ./instance.toml:/etc/nestweaver/instance.toml:ro
     environment:
       NESTWEAVER_AUTH_TOKEN: "${NESTWEAVER_AUTH_TOKEN}"
       NESTWEAVER_ADMIN_TOKEN: "${NESTWEAVER_ADMIN_TOKEN}"
