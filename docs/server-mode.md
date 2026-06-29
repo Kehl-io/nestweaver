@@ -69,7 +69,7 @@ The server listens on three ports. Webhook and admin API endpoints are mounted a
 │                                                           │
 │  :9378  gRPC    Query API (TCP + TLS)                     │
 │  :9379  HTTP    MCP-over-HTTP (AI agents)                 │
-│                  ├─ /webhook      (GitHub/GitLab push)    │
+│                  ├─ /webhook      (GitHub/GitLab/Gitea push) │
 │                  └─ /admin/api/*  (repo & queue mgmt)     │
 │                                                           │
 │  ┌─────────────────────────────────────────────────┐      │
@@ -226,6 +226,15 @@ Webhooks provide near-instant re-indexing when code is pushed. The server also r
 3. Set the secret token
 4. Check "Push events"
 
+### Gitea
+
+1. In your repository settings, go to **Webhooks > Add Webhook > Gitea**
+2. Set the target URL to `http://nestweaver.internal:9379/webhook`
+3. Set the secret to your `NESTWEAVER_WEBHOOK_SECRET`
+4. Trigger on **Push events**
+
+Gitea signs the payload with its own `X-Gitea-Signature` header, carrying a raw hex HMAC-SHA256 of the body — without the `sha256=` prefix that GitHub's `X-Hub-Signature-256` uses. The server accepts a request that bears *either* a valid GitHub *or* a valid Gitea signature (it tries both), using the same `--webhook-secret` / `--webhook-secret-old` rotation pair. The repo URL is read from `repository.clone_url`, just like GitHub.
+
 ### Webhook configuration
 
 The webhook secret is set via CLI flag or environment variable (not the config file):
@@ -241,7 +250,7 @@ NestWeaver supports two webhook secrets simultaneously for zero-downtime rotatio
 
 1. Add `--webhook-secret-old "$CURRENT_SECRET"` (or set `NESTWEAVER_WEBHOOK_SECRET_OLD`)
 2. Change `--webhook-secret` (or `NESTWEAVER_WEBHOOK_SECRET`) to the new secret
-3. Restart the daemon, then update the secret on GitHub/GitLab
+3. Restart the daemon, then update the secret on GitHub/GitLab/Gitea
 4. Once all webhooks use the new secret, remove `--webhook-secret-old`
 
 During rotation, the server checks the new secret first, falls back to the old secret, and logs a deprecation warning when the old secret matches.
@@ -319,7 +328,7 @@ The client discovers upstream servers from (highest priority first):
 
 1. `NESTWEAVER_UPSTREAM` and `NESTWEAVER_TOKEN` environment variables
 2. `.nestweaver/server.toml` in the current repo (checked into source)
-3. `~/.nestweaver/server.toml` (user config)
+3. `~/.config/nestweaver/upstreams.toml` (user config, written by `nestweaver connect`)
 4. `instance.toml` `[[upstream]]` section
 
 ### Repo-level config (.nestweaver/server.toml)
@@ -330,6 +339,18 @@ Check this file into your repo so every developer auto-connects:
 [upstream]
 url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
+mode = "fallback"
+```
+
+### User-level config (~/.config/nestweaver/upstreams.toml)
+
+`nestweaver connect` writes personal upstreams here:
+
+```toml
+[[upstream]]
+name = "team-server"
+url = "grpcs://nestweaver.internal:9378"
+token = "..."
 mode = "fallback"
 ```
 
@@ -354,13 +375,13 @@ is not signed by a public CA.
 
 ## Routing Modes
 
-When a local daemon is connected to an upstream server, queries are routed based on the configured mode:
+When a local daemon is connected to an upstream server, each tool first gets a tool-specific routing category. The upstream mode can override merge/local-first/server-preferred categories, but local-only, two-tier, and combined tools keep their tool-specific behavior.
 
 | Mode | Behavior | Best for |
 |------|----------|----------|
-| `fallback` | Query local first; if the repo isn't indexed locally, fall back to server | Default. Best for developers who work on a subset of repos |
-| `merge` | Query both local and server; merge results with RRF (k=60) | Cross-repo search and analysis |
-| `primary` | Query server first; local is fallback | CI environments, thin clients |
+| `fallback` | Prefer local-first routing where overridable; query the server when local results are missing, stale, or below the tool threshold | Default. Best for developers who work on a subset of repos |
+| `merge` | Prefer parallel local + server routing where overridable; merge results with RRF (k=60) | Cross-repo search and analysis |
+| `primary` | Prefer server-first routing where overridable; local remains fallback/overlay where supported | CI environments, thin clients |
 
 ```toml
 [[upstream]]
@@ -377,9 +398,12 @@ Different tools have different optimal routing:
 | Tool category | Routing | Reason |
 |--------------|---------|--------|
 | `brain_search`, `brain_context` | merge | Combine local and org-wide results |
+| `read_symbols`, `investigate` | local-first | Prefer exact local source spans, then server fallback |
 | `blast_radius`, `brain_impact` | two-tier | Show local impact + org-wide impact separately |
 | `flow_trace` | continuation | Start local, continue across repos on server |
 | `hub_nodes`, `clusters` | server-preferred | Structural analysis needs the full graph |
+| `brain_status`, `stale_check`, `brain_doc_stats` | combined | Preserve status/metadata shape while including both sources |
+| `detect_changes`, memory/admin tools | local-only | These depend on local working-tree or personal state |
 
 ### Staleness detection
 
