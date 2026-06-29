@@ -59,12 +59,11 @@ impl ContentReader for FilesystemReader {
             .git_global(true)
             .git_exclude(true)
             .filter_entry(|e| {
-                if e.file_type().is_some_and(|ft| ft.is_dir()) {
-                    if let Some(name) = e.file_name().to_str() {
-                        if crate::index::SKIP_DIRS.contains(&name) {
-                            return false;
-                        }
-                    }
+                if e.file_type().is_some_and(|ft| ft.is_dir())
+                    && let Some(name) = e.file_name().to_str()
+                    && crate::index::SKIP_DIRS.contains(&name)
+                {
+                    return false;
                 }
                 true
             })
@@ -78,10 +77,10 @@ impl ContentReader for FilesystemReader {
                     continue;
                 }
             };
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                if let Ok(rel) = entry.path().strip_prefix(&self.repo_path) {
-                    files.push(rel.to_path_buf());
-                }
+            if entry.file_type().is_some_and(|ft| ft.is_file())
+                && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
+            {
+                files.push(rel.to_path_buf());
             }
         }
         Ok(files)
@@ -192,34 +191,10 @@ impl ContentReader for GitBareReader {
         Ok(files)
     }
 
-    fn file_meta(&self, rel_path: &Path) -> Result<Option<(u64, u64)>> {
-        // Bare repos have no filesystem mtime. Return size only (mtime = 0).
-        let spec = format!("{}:{}", self.sha, rel_path.display());
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &self.bare_path.display().to_string(),
-                "cat-file",
-                "-s",
-                &spec,
-            ])
-            .output()
-            .with_context(|| format!("failed to run git cat-file -s {spec}"))?;
-        if !output.status.success() {
-            // File doesn't exist at this SHA — treat as missing.
-            anyhow::bail!(
-                "git cat-file -s {} failed: {}",
-                spec,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let size: u64 = String::from_utf8(output.stdout)
-            .context("non-utf8 cat-file output")?
-            .trim()
-            .parse()
-            .context("invalid size from cat-file -s")?;
-        // No mtime available in bare repos — return 0 for mtime.
-        Ok(Some((0, size)))
+    fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>> {
+        // Bare repos have no filesystem mtime. Return None so callers
+        // (tiered_change_check, index_md) use content-hash or always-process paths.
+        Ok(None)
     }
 
     fn root(&self) -> &Path {
@@ -455,18 +430,15 @@ mod tests {
         let (_tmp, bare, sha) = setup_bare_repo(&[("hello.txt", "world")]);
         let reader = GitBareReader::new(&bare, &sha);
         let meta = reader.file_meta(Path::new("hello.txt")).unwrap();
-        assert!(meta.is_some());
-        let (mtime, size) = meta.unwrap();
-        // Bare repos return mtime=0.
-        assert_eq!(mtime, 0);
-        assert_eq!(size, 5); // "world" is 5 bytes
+        assert!(meta.is_none(), "GitBareReader should return None (no filesystem mtime)");
     }
 
     #[test]
     fn git_bare_reader_file_meta_missing() {
         let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
         let reader = GitBareReader::new(&bare, &sha);
-        assert!(reader.file_meta(Path::new("missing.txt")).is_err());
+        let meta = reader.file_meta(Path::new("missing.txt")).unwrap();
+        assert!(meta.is_none(), "GitBareReader returns None for all paths (no filesystem mtime)");
     }
 
     #[test]

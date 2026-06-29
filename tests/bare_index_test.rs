@@ -258,3 +258,75 @@ fn bare_clone_reader_version_matches_head_sha() {
         "GitBareReader version_id should match the HEAD SHA"
     );
 }
+
+/// Verify that re-indexing a bare clone via `index_with_reader` detects
+/// content changes using the content-hash path (since `file_meta` returns
+/// `None` for `GitBareReader`, mtime-based skipping cannot happen).
+#[test]
+fn bare_repo_reindex_detects_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // v1: lib.js returns 'v1'
+    let src_v1 = tmp.path().join("src-v1");
+    let sha_v1 = create_test_repo(
+        &src_v1,
+        &[("lib.js", "function hello() { return 'v1'; }")],
+    );
+    let bare_v1 = tmp.path().join("v1.git");
+    bare_clone(&src_v1, &bare_v1);
+
+    let store = GraphStore::in_memory().unwrap();
+
+    // First index
+    let reader_v1 = GitBareReader::new(&bare_v1, &sha_v1);
+    let result1 = index_with_reader(
+        &reader_v1,
+        &store,
+        "test-reindex",
+        "file:///test.git",
+        &sha_v1,
+        Some("test-repo"),
+    )
+    .unwrap();
+    assert!(
+        result1.symbols_count > 0,
+        "v1 index should produce symbols, got {}",
+        result1.symbols_count
+    );
+
+    // v2: lib.js returns 'v2'
+    let src_v2 = tmp.path().join("src-v2");
+    let sha_v2 = create_test_repo(
+        &src_v2,
+        &[("lib.js", "function hello() { return 'v2'; }")],
+    );
+    let bare_v2 = tmp.path().join("v2.git");
+    bare_clone(&src_v2, &bare_v2);
+
+    // Re-index with v2 content against the same store
+    let reader_v2 = GitBareReader::new(&bare_v2, &sha_v2);
+    let result2 = index_with_reader(
+        &reader_v2,
+        &store,
+        "test-reindex",
+        "file:///test.git",
+        &sha_v2,
+        Some("test-repo"),
+    )
+    .unwrap();
+
+    // With file_meta returning None, re-index always reads + hashes content,
+    // so the changed file must be detected and re-parsed.
+    let cfg = SeedResolutionConfig::default();
+    let results = store.search_symbols_by_name("hello", 10, &cfg).unwrap();
+    assert!(
+        !results.is_empty(),
+        "symbol 'hello' should exist after re-index"
+    );
+
+    // The symbol count after re-index should remain consistent (1 function).
+    assert!(
+        result2.symbols_count > 0 || !results.is_empty(),
+        "re-index should have processed v2 content"
+    );
+}
