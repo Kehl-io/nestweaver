@@ -216,6 +216,21 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
         .with_state(state)
 }
 
+/// Creates the device-flow auth router (OAuth 2.0 Device Authorization Grant,
+/// RFC 8628). Mounted at `/auth` on the MCP/admin HTTP listener.
+///
+/// `/device` and `/token` are public (developers without a token reach them);
+/// `/device/approve` is guarded by the `AdminAuth` extractor inside the handler.
+pub fn create_device_flow_router(state: Arc<AdminState>) -> Router {
+    use routes::admin;
+
+    Router::new()
+        .route("/device", post(admin::device_authorize))
+        .route("/token", post(admin::device_token))
+        .route("/device/approve", post(admin::device_approve))
+        .with_state(state)
+}
+
 pub async fn start_server(
     state: Arc<AppState>,
     port: u16,

@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::state::AdminState;
+use crate::state::{AdminState, PendingDevice};
 
 // ── Admin auth extractor ───────────────────────────────────────────────
 
@@ -193,57 +193,87 @@ pub async fn list_repos(
     Ok(Json(repo_infos))
 }
 
-/// POST /admin/api/repos — add a new repo.
-pub async fn add_repo(
-    _auth: AdminAuth,
-    State(state): State<Arc<AdminState>>,
-    Json(req): Json<AddRepoRequest>,
-) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+/// Validate a repo URL's scheme and host to prevent SSRF.
+///
+/// Rejects unsupported schemes (only https/http/git/ssh are allowed) and any
+/// host that resolves to an internal/private target — `localhost`, the cloud
+/// metadata endpoint, and private/loopback/link-local/unique-local IP ranges
+/// (OWASP SSRF Prevention Cheat Sheet). The returned `Err` is the
+/// user-facing message.
+fn validate_repo_url(url: &str) -> Result<(), String> {
     // Validate URL scheme to prevent SSRF via file:// or other unexpected schemes.
     let allowed_schemes = ["https", "http", "git", "ssh"];
-    let parsed = match url::Url::parse(&req.url) {
+    let parsed = match url::Url::parse(url) {
         Ok(p) if allowed_schemes.contains(&p.scheme()) => p,
         Ok(parsed) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unsupported URL scheme '{}': allowed schemes are {}",
-                    parsed.scheme(),
-                    allowed_schemes.join(", ")
-                ),
+            return Err(format!(
+                "unsupported URL scheme '{}': allowed schemes are {}",
+                parsed.scheme(),
+                allowed_schemes.join(", ")
             ));
         }
         Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid URL '{}': {e}", req.url),
-            ));
+            return Err(format!("invalid URL '{url}': {e}"));
         }
     };
 
     // SSRF prevention: reject private/loopback IPs (OWASP SSRF Prevention Cheat Sheet).
     if let Some(host) = parsed.host_str() {
         if host == "localhost" || host == "metadata.google.internal" {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("rejected hostname '{host}': internal addresses not allowed"),
+            return Err(format!(
+                "rejected hostname '{host}': internal addresses not allowed"
             ));
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        // `host_str()` brackets IPv6 literals (e.g. `[::1]`); strip them so the
+        // address parses.
+        let host_ip = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
             let is_private = match ip {
                 std::net::IpAddr::V4(v4) => {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        // 0.0.0.0 routes to loopback on some platforms.
+                        || v4.is_unspecified()
                 }
-                std::net::IpAddr::V6(v6) => v6.is_loopback(),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback()
+                        || v6.is_unspecified()
+                        // IPv4-mapped (::ffff:a.b.c.d) hiding a private V4 target.
+                        || v6
+                            .to_ipv4_mapped()
+                            .is_some_and(|v4| {
+                                v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                            })
+                        // Unique-local fc00::/7 (is_unique_local is nightly-only).
+                        || (v6.segments()[0] & 0xfe00) == 0xfc00
+                        // Link-local fe80::/10 (is_unicast_link_local is nightly-only).
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                }
             };
             if is_private {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("rejected IP '{ip}': private/loopback addresses not allowed"),
+                return Err(format!(
+                    "rejected IP '{ip}': private/loopback addresses not allowed"
                 ));
             }
         }
     }
+
+    Ok(())
+}
+
+/// POST /admin/api/repos — add a new repo.
+pub async fn add_repo(
+    _auth: AdminAuth,
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<AddRepoRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    // Validate the URL scheme + host to prevent SSRF (file://, internal
+    // hostnames, private/loopback IPs). See `validate_repo_url`.
+    validate_repo_url(&req.url).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Derive the jobs database path from the brain database path.
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
@@ -1043,6 +1073,199 @@ pub async fn get_status(
     })
 }
 
+// ── Device-flow authentication (OAuth 2.0 Device Grant, RFC 8628) ──────
+
+/// How long a device grant stays valid before it must be re-requested.
+const DEVICE_CODE_TTL_SECS: u64 = 600;
+/// Minimum interval (seconds) the client should wait between token polls.
+const DEVICE_POLL_INTERVAL_SECS: u64 = 5;
+/// Unambiguous alphabet for user codes — omits easily confused characters
+/// (0/O, 1/I/L) so codes are easy to read aloud and type.
+const USER_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+#[derive(Serialize)]
+pub struct DeviceAuthResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Deserialize)]
+pub struct DeviceTokenRequest {
+    pub device_code: String,
+}
+
+#[derive(Serialize)]
+pub struct DeviceTokenResponse {
+    pub access_token: String,
+}
+
+#[derive(Serialize)]
+pub struct DeviceErrorResponse {
+    pub error: String,
+}
+
+#[derive(Deserialize)]
+pub struct DeviceApproveRequest {
+    pub user_code: String,
+}
+
+/// Generate a short, human-readable user code (8 chars from an unambiguous
+/// uppercase-alnum alphabet). Randomness comes from a v4 UUID so we don't pull
+/// in an extra RNG dependency.
+fn generate_user_code() -> String {
+    uuid::Uuid::new_v4()
+        .into_bytes()
+        .iter()
+        .take(8)
+        .map(|b| USER_CODE_ALPHABET[(*b as usize) % USER_CODE_ALPHABET.len()] as char)
+        .collect()
+}
+
+/// Canonicalize a user code for comparison: uppercase, keep only alphanumerics
+/// (so an admin can paste `WDJB-MJHT` or `wdjb mjht` and still match).
+fn normalize_user_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Drop expired grants so the pending map can't grow without bound.
+fn prune_expired(map: &mut std::collections::HashMap<String, PendingDevice>) {
+    let now = std::time::Instant::now();
+    map.retain(|_, v| v.expires_at > now);
+}
+
+/// Build an RFC 8628 token-endpoint error response (`400` + `{ "error": ... }`).
+fn device_error(error: &str) -> (StatusCode, Json<DeviceErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(DeviceErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+}
+
+/// Derive the externally-visible base URL of this server from request headers,
+/// honoring a reverse-proxy `X-Forwarded-Proto`. Used to build the verification
+/// URIs handed back to the developer.
+fn verification_base(headers: &axum::http::HeaderMap) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
+/// POST /auth/device — start a device-authorization grant (no auth).
+///
+/// Returns a `device_code` (opaque) and a `user_code` (shown to the developer),
+/// along with the verification URIs and polling parameters per RFC 8628 §3.2.
+pub async fn device_authorize(
+    State(state): State<Arc<AdminState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<DeviceAuthResponse> {
+    let device_code = uuid::Uuid::new_v4().to_string();
+    let user_code = generate_user_code();
+
+    let base = verification_base(&headers);
+    let verification_uri = format!("{base}/admin");
+    let verification_uri_complete = format!("{base}/admin?user_code={user_code}");
+
+    let expires_at =
+        std::time::Instant::now() + std::time::Duration::from_secs(DEVICE_CODE_TTL_SECS);
+    {
+        let mut map = state.device_flow.write().await;
+        prune_expired(&mut map);
+        map.insert(
+            device_code.clone(),
+            PendingDevice {
+                user_code: user_code.clone(),
+                expires_at,
+                approved_token: None,
+            },
+        );
+    }
+
+    Json(DeviceAuthResponse {
+        device_code,
+        user_code,
+        verification_uri,
+        verification_uri_complete,
+        expires_in: DEVICE_CODE_TTL_SECS,
+        interval: DEVICE_POLL_INTERVAL_SECS,
+    })
+}
+
+/// POST /auth/token — exchange a `device_code` for the granted token (no auth).
+///
+/// RFC 8628 §3.5: unknown/expired → `expired_token`; pending approval →
+/// `authorization_pending`; approved → `200 { access_token }` (one-shot).
+pub async fn device_token(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<DeviceTokenRequest>,
+) -> Result<Json<DeviceTokenResponse>, (StatusCode, Json<DeviceErrorResponse>)> {
+    let mut map = state.device_flow.write().await;
+    prune_expired(&mut map);
+
+    // After pruning, a missing entry means it was never issued or has expired.
+    let Some(entry) = map.get(&req.device_code) else {
+        return Err(device_error("expired_token"));
+    };
+
+    match entry.approved_token.clone() {
+        None => Err(device_error("authorization_pending")),
+        Some(token) => {
+            // Single use: remove the grant once the token is handed out.
+            map.remove(&req.device_code);
+            Ok(Json(DeviceTokenResponse {
+                access_token: token,
+            }))
+        }
+    }
+}
+
+/// POST /auth/device/approve — admin approves a pending grant (admin auth).
+///
+/// Looks up the pending grant by `user_code` and attaches the configured org
+/// query token (org-wide read token per the security model). The developer's
+/// next `POST /auth/token` then succeeds.
+pub async fn device_approve(
+    _auth: AdminAuth,
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<DeviceApproveRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let wanted = normalize_user_code(&req.user_code);
+    if wanted.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "user_code required".to_string()));
+    }
+    let granted = state.auth_token.clone().unwrap_or_default();
+
+    let mut map = state.device_flow.write().await;
+    prune_expired(&mut map);
+    for entry in map.values_mut() {
+        if normalize_user_code(&entry.user_code) == wanted {
+            entry.approved_token = Some(granted);
+            return Ok(Json(MessageResponse {
+                message: "device approved".to_string(),
+            }));
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        "no pending device with that code".to_string(),
+    ))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1066,6 +1289,8 @@ mod tests {
         std::mem::forget(dir);
         Arc::new(AdminState {
             admin_token: "test-admin-token".to_string(),
+            auth_token: Some("test-query-token".to_string()),
+            device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             daemon_store: Arc::new(store),
             instance_id: "test".to_string(),
             start_time: std::time::Instant::now(),
@@ -1245,6 +1470,8 @@ url = "https://github.com/example/existing"
             nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
         let state = Arc::new(AdminState {
             admin_token: "test-admin-token".to_string(),
+            auth_token: Some("test-query-token".to_string()),
+            device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             daemon_store: Arc::new(store),
             instance_id: "test".to_string(),
             start_time: std::time::Instant::now(),
@@ -1283,5 +1510,237 @@ url = "https://github.com/example/existing"
         assert!(cfg.repos.iter().any(|repo| {
             repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
         }));
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_internal_targets() {
+        // Bare IPv4 hosts, wrapped in an allowed scheme, must be rejected.
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+        ] {
+            let url = format!("https://{host}/repo");
+            assert!(
+                validate_repo_url(&url).is_err(),
+                "expected {url} to be rejected"
+            );
+        }
+
+        // Bare IPv6 hosts (bracketed in URLs) must be rejected: loopback,
+        // link-local, unique-local, and IPv4-mapped private.
+        for host in ["::1", "fe80::1", "fd00::1", "fc00::1", "::ffff:192.168.1.1"] {
+            let url = format!("https://[{host}]/repo");
+            assert!(
+                validate_repo_url(&url).is_err(),
+                "expected {url} to be rejected"
+            );
+        }
+
+        // Full URLs: unspecified IPv6, disallowed scheme, internal hostname.
+        for url in ["http://[::]/", "file:///etc/passwd", "git://localhost/repo"] {
+            assert!(
+                validate_repo_url(url).is_err(),
+                "expected {url} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_repo_url_accepts_public_https() {
+        for url in [
+            "https://github.com/acme/api.git",
+            "https://gitlab.com/acme/widgets.git",
+        ] {
+            assert!(
+                validate_repo_url(url).is_ok(),
+                "expected {url} to be accepted, got {:?}",
+                validate_repo_url(url)
+            );
+        }
+    }
+
+    // ── Device flow ─────────────────────────────────────────────────────
+
+    fn device_router(state: Arc<AdminState>) -> Router {
+        Router::new()
+            .route("/auth/device", post(device_authorize))
+            .route("/auth/token", post(device_token))
+            .route("/auth/device/approve", post(device_approve))
+            .with_state(state)
+    }
+
+    async fn post_json(
+        app: &Router,
+        uri: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/json");
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[test]
+    fn generate_user_code_is_eight_unambiguous_chars() {
+        let code = generate_user_code();
+        assert_eq!(code.len(), 8);
+        assert!(
+            code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)),
+            "code {code} contains chars outside the alphabet"
+        );
+    }
+
+    #[test]
+    fn normalize_user_code_strips_separators_and_uppercases() {
+        assert_eq!(normalize_user_code("wdjb-mjht"), "WDJBMJHT");
+        assert_eq!(normalize_user_code(" ab cd "), "ABCD");
+    }
+
+    #[tokio::test]
+    async fn device_flow_request_pending_approve_token() {
+        let app = device_router(test_admin_state());
+
+        // 1. Request a device code.
+        let (status, auth) = post_json(&app, "/auth/device", None, "{}").await;
+        assert_eq!(status, StatusCode::OK);
+        let device_code = auth["device_code"].as_str().unwrap().to_string();
+        let user_code = auth["user_code"].as_str().unwrap().to_string();
+        assert_eq!(auth["expires_in"], 600);
+        assert_eq!(auth["interval"], 5);
+        assert!(
+            auth["verification_uri_complete"]
+                .as_str()
+                .unwrap()
+                .contains(&user_code)
+        );
+
+        // 2. Polling before approval → authorization_pending.
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            &format!(r#"{{"device_code":"{device_code}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "authorization_pending");
+
+        // 3. Admin approves the user code.
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            &format!(r#"{{"user_code":"{user_code}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 4. Polling after approval → access token (the org query token).
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            &format!(r#"{{"device_code":"{device_code}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["access_token"], "test-query-token");
+
+        // 5. The grant is single-use: a second poll fails as expired.
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            &format!(r#"{{"device_code":"{device_code}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "expired_token");
+    }
+
+    #[tokio::test]
+    async fn device_token_unknown_code_is_expired() {
+        let app = device_router(test_admin_state());
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            r#"{"device_code":"does-not-exist"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "expired_token");
+    }
+
+    #[tokio::test]
+    async fn device_token_after_expiry_is_expired() {
+        let state = test_admin_state();
+        // Insert a grant that already expired and was approved — pruning must
+        // still treat it as expired.
+        {
+            let mut map = state.device_flow.write().await;
+            map.insert(
+                "expired-code".to_string(),
+                PendingDevice {
+                    user_code: "ABCD1234".to_string(),
+                    expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                    approved_token: Some("test-query-token".to_string()),
+                },
+            );
+        }
+        let app = device_router(state);
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            r#"{"device_code":"expired-code"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "expired_token");
+    }
+
+    #[tokio::test]
+    async fn device_approve_requires_admin_token() {
+        let app = device_router(test_admin_state());
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            None,
+            r#"{"user_code":"ABCD1234"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn device_approve_unknown_code_is_not_found() {
+        let app = device_router(test_admin_state());
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            r#"{"user_code":"NOSUCHCODE"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

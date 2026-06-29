@@ -1,4 +1,5 @@
 use nestweaver_store::{GraphStore, TantivyIndex};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
@@ -62,10 +63,31 @@ impl AppState {
     }
 }
 
+/// A pending device-authorization grant (RFC 8628 Device Authorization Grant).
+///
+/// Created by `POST /auth/device`, approved by an admin via
+/// `POST /auth/device/approve`, then exchanged for the org query token by the
+/// developer via `POST /auth/token`.
+pub struct PendingDevice {
+    /// Short, human-readable code shown to the developer and approved by an
+    /// admin. Stored canonicalized (uppercase alnum, no separators).
+    pub user_code: String,
+    /// When this grant expires and should be pruned.
+    pub expires_at: Instant,
+    /// Set once an admin approves; holds the granted query token. `None` while
+    /// the grant is still pending.
+    pub approved_token: Option<String>,
+}
+
 /// Shared state for admin API routes. Provides access to daemon-level
 /// resources (store, queue depth, drain state) that the admin API needs.
 pub struct AdminState {
     pub admin_token: String,
+    /// Configured org-wide query (read) token, handed to developers on
+    /// device-flow approval. `None` when the server runs without query auth.
+    pub auth_token: Option<String>,
+    /// In-flight device-authorization grants, keyed by `device_code`.
+    pub device_flow: Arc<tokio::sync::RwLock<HashMap<String, PendingDevice>>>,
     pub daemon_store: Arc<GraphStore>,
     pub instance_id: String,
     pub start_time: Instant,
