@@ -121,6 +121,7 @@ impl WorkerPool {
     /// When `drained` is `Some(flag)` and the flag is `true`, the worker
     /// sleeps instead of claiming new jobs. In-flight jobs are unaffected
     /// (they finish naturally).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_drain(
         &self,
         queue: Arc<Mutex<JobQueue>>,
@@ -145,6 +146,7 @@ impl WorkerPool {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
         queue: Arc<Mutex<JobQueue>>,
@@ -164,14 +166,14 @@ impl WorkerPool {
             }
 
             // If drained, sleep instead of claiming new jobs.
-            if let Some(ref flag) = drained {
-                if flag.load(Ordering::Relaxed) {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                        _ = shutdown.changed() => {}
-                    }
-                    continue;
+            if let Some(ref flag) = drained
+                && flag.load(Ordering::Relaxed)
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = shutdown.changed() => {}
                 }
+                continue;
             }
 
             // Try to claim the next job (behind a std::sync::Mutex since
@@ -179,11 +181,11 @@ impl WorkerPool {
             let job = {
                 let q = queue.lock().expect("job queue lock poisoned");
                 // Update queue depth while we hold the lock.
-                if let Some(ref st) = status {
-                    if let Ok(depth) = q.queue_depth() {
-                        st.queue_depth
-                            .store((depth.pending + depth.running) as u32, Ordering::Relaxed);
-                    }
+                if let Some(ref st) = status
+                    && let Ok(depth) = q.queue_depth()
+                {
+                    st.queue_depth
+                        .store((depth.pending + depth.running) as u32, Ordering::Relaxed);
                 }
                 q.claim_next(2) // 2s debounce
             };

@@ -206,7 +206,11 @@ pub async fn add_repo(
         Ok(parsed) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("unsupported URL scheme '{}': allowed schemes are {}", parsed.scheme(), allowed_schemes.join(", ")),
+                format!(
+                    "unsupported URL scheme '{}': allowed schemes are {}",
+                    parsed.scheme(),
+                    allowed_schemes.join(", ")
+                ),
             ));
         }
         Err(e) => {
@@ -220,15 +224,23 @@ pub async fn add_repo(
     // SSRF prevention: reject private/loopback IPs (OWASP SSRF Prevention Cheat Sheet).
     if let Some(host) = parsed.host_str() {
         if host == "localhost" || host == "metadata.google.internal" {
-            return Err((StatusCode::BAD_REQUEST, format!("rejected hostname '{host}': internal addresses not allowed")));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("rejected hostname '{host}': internal addresses not allowed"),
+            ));
         }
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             let is_private = match ip {
-                std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                }
                 std::net::IpAddr::V6(v6) => v6.is_loopback(),
             };
             if is_private {
-                return Err((StatusCode::BAD_REQUEST, format!("rejected IP '{ip}': private/loopback addresses not allowed")));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rejected IP '{ip}': private/loopback addresses not allowed"),
+                ));
             }
         }
     }

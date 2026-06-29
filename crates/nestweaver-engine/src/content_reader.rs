@@ -430,7 +430,10 @@ mod tests {
         let (_tmp, bare, sha) = setup_bare_repo(&[("hello.txt", "world")]);
         let reader = GitBareReader::new(&bare, &sha);
         let meta = reader.file_meta(Path::new("hello.txt")).unwrap();
-        assert!(meta.is_none(), "GitBareReader should return None (no filesystem mtime)");
+        assert!(
+            meta.is_none(),
+            "GitBareReader should return None (no filesystem mtime)"
+        );
     }
 
     #[test]
@@ -438,7 +441,10 @@ mod tests {
         let (_tmp, bare, sha) = setup_bare_repo(&[("a.txt", "x")]);
         let reader = GitBareReader::new(&bare, &sha);
         let meta = reader.file_meta(Path::new("missing.txt")).unwrap();
-        assert!(meta.is_none(), "GitBareReader returns None for all paths (no filesystem mtime)");
+        assert!(
+            meta.is_none(),
+            "GitBareReader returns None for all paths (no filesystem mtime)"
+        );
     }
 
     #[test]

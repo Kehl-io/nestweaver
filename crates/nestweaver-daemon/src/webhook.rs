@@ -66,7 +66,8 @@ pub async fn handle_webhook(
     nestweaver_web::routes::metrics::WEBHOOKS_RECEIVED.inc();
 
     if let Some(token) = gitlab_token {
-        let current_match = crate::auth::secure_eq(token.as_bytes(), state.config.secret.as_bytes());
+        let current_match =
+            crate::auth::secure_eq(token.as_bytes(), state.config.secret.as_bytes());
         let old_match = state
             .config
             .secret_old

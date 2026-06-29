@@ -88,10 +88,10 @@ impl UpstreamHandle {
 
     /// Inject bearer token into a tonic request.
     pub fn inject_auth<T>(&self, req: &mut tonic::Request<T>) {
-        if let Some(ref token) = self.token {
-            if let Ok(val) = format!("Bearer {}", token).parse::<MetadataValue<_>>() {
-                req.metadata_mut().insert("authorization", val);
-            }
+        if let Some(ref token) = self.token
+            && let Ok(val) = format!("Bearer {}", token).parse::<MetadataValue<_>>()
+        {
+            req.metadata_mut().insert("authorization", val);
         }
     }
 

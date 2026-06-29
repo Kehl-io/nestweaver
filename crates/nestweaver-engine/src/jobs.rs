@@ -290,7 +290,7 @@ impl JobQueue {
                        attempt, max_attempts, error_msg, branch,
                        created_at, updated_at, started_at, completed_at",
             params![debounce_secs],
-            |row| row_to_job(row),
+            row_to_job,
         );
 
         match result {
@@ -502,7 +502,7 @@ impl JobQueue {
              WHERE status = 'dead_letter'
              ORDER BY updated_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| row_to_job(row))?;
+        let rows = stmt.query_map([], row_to_job)?;
         rows.collect()
     }
 
@@ -989,9 +989,8 @@ mod tests {
         let job = q.claim_next(0).unwrap().unwrap();
         q.complete(job.id, &job.repo_id).unwrap();
         // No external event happened — should NOT requeue
-        assert_eq!(
-            q.requeue_if_stale("repo-1").unwrap(),
-            false,
+        assert!(
+            !q.requeue_if_stale("repo-1").unwrap(),
             "should not requeue when no external event arrived during indexing"
         );
     }

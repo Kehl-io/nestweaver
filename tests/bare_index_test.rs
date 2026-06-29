@@ -268,10 +268,7 @@ fn bare_repo_reindex_detects_changes() {
 
     // v1: lib.js returns 'v1'
     let src_v1 = tmp.path().join("src-v1");
-    let sha_v1 = create_test_repo(
-        &src_v1,
-        &[("lib.js", "function hello() { return 'v1'; }")],
-    );
+    let sha_v1 = create_test_repo(&src_v1, &[("lib.js", "function hello() { return 'v1'; }")]);
     let bare_v1 = tmp.path().join("v1.git");
     bare_clone(&src_v1, &bare_v1);
 
@@ -296,10 +293,7 @@ fn bare_repo_reindex_detects_changes() {
 
     // v2: lib.js returns 'v2'
     let src_v2 = tmp.path().join("src-v2");
-    let sha_v2 = create_test_repo(
-        &src_v2,
-        &[("lib.js", "function hello() { return 'v2'; }")],
-    );
+    let sha_v2 = create_test_repo(&src_v2, &[("lib.js", "function hello() { return 'v2'; }")]);
     let bare_v2 = tmp.path().join("v2.git");
     bare_clone(&src_v2, &bare_v2);
 

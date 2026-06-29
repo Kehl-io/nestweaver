@@ -224,14 +224,14 @@ impl BareCloneWorkspace {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".git") && BareClone::is_valid_at(&path) {
-                        // Try to read the origin URL from git config.
-                        let url = read_origin_url(&path).unwrap_or_default();
-                        clones.push(BareClone { path, url });
-                    }
-                }
+            if path.is_dir()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".git")
+                && BareClone::is_valid_at(&path)
+            {
+                // Try to read the origin URL from git config.
+                let url = read_origin_url(&path).unwrap_or_default();
+                clones.push(BareClone { path, url });
             }
         }
 

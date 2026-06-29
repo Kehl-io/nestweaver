@@ -224,25 +224,25 @@ fn signatures_similar(a: &str, b: &str) -> bool {
 
 /// Count the number of parameters in a function signature string.
 fn count_params(sig: &str) -> usize {
-    if let Some(start) = sig.find('(') {
-        if let Some(end) = sig[start..].find(')') {
-            let params = &sig[start + 1..start + end];
-            let trimmed = params.trim();
-            if trimmed.is_empty() {
-                return 0;
-            }
-            // Filter out self/&self/cls -- not real parameters
-            return trimmed
-                .split(',')
-                .filter(|p| {
-                    let p = p.trim();
-                    !p.starts_with("self")
-                        && !p.starts_with("&self")
-                        && !p.starts_with("&mut self")
-                        && !p.starts_with("cls")
-                })
-                .count();
+    if let Some(start) = sig.find('(')
+        && let Some(end) = sig[start..].find(')')
+    {
+        let params = &sig[start + 1..start + end];
+        let trimmed = params.trim();
+        if trimmed.is_empty() {
+            return 0;
         }
+        // Filter out self/&self/cls -- not real parameters
+        return trimmed
+            .split(',')
+            .filter(|p| {
+                let p = p.trim();
+                !p.starts_with("self")
+                    && !p.starts_with("&self")
+                    && !p.starts_with("&mut self")
+                    && !p.starts_with("cls")
+            })
+            .count();
     }
     0
 }
@@ -335,10 +335,7 @@ pub fn compute_local_changes(
         };
 
         // Get new content from working tree
-        let new_content = match std::fs::read_to_string(repo_path.join(file)) {
-            Ok(c) => c,
-            Err(_) => String::new(), // Deleted file -- no new content
-        };
+        let new_content = std::fs::read_to_string(repo_path.join(file)).unwrap_or_default();
 
         if old_content.is_empty() && new_content.is_empty() {
             continue;
@@ -448,25 +445,25 @@ fn is_dynamic_language_file(path: &str) -> bool {
 }
 
 fn has_default_params(sig: &str, old_count: usize) -> bool {
-    if let Some(start) = sig.find('(') {
-        if let Some(end) = sig[start..].find(')') {
-            let params_str = &sig[start + 1..start + end];
-            let params: Vec<&str> = params_str
-                .split(',')
-                .filter(|p| {
-                    let p = p.trim();
-                    !p.starts_with("self")
-                        && !p.starts_with("&self")
-                        && !p.starts_with("&mut self")
-                        && !p.starts_with("cls")
-                })
-                .collect();
-            if params.len() > old_count {
-                let new_params = &params[old_count..];
-                return new_params
-                    .iter()
-                    .all(|p| p.contains('=') || p.contains("Option<"));
-            }
+    if let Some(start) = sig.find('(')
+        && let Some(end) = sig[start..].find(')')
+    {
+        let params_str = &sig[start + 1..start + end];
+        let params: Vec<&str> = params_str
+            .split(',')
+            .filter(|p| {
+                let p = p.trim();
+                !p.starts_with("self")
+                    && !p.starts_with("&self")
+                    && !p.starts_with("&mut self")
+                    && !p.starts_with("cls")
+            })
+            .collect();
+        if params.len() > old_count {
+            let new_params = &params[old_count..];
+            return new_params
+                .iter()
+                .all(|p| p.contains('=') || p.contains("Option<"));
         }
     }
     false
@@ -782,6 +779,7 @@ pub fn analyze_impact(
 /// callers up to `max_depth`. Direct references (depth 1) inherit the
 /// provided `direct_severity`; deeper hops are downgraded to at most
 /// Warning (depth 2) or Info (depth 3+).
+#[allow(clippy::too_many_arguments)]
 fn collect_transitive_references(
     store: &nestweaver_store::GraphStore,
     root_uid: &str,

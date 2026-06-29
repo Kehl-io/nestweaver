@@ -111,10 +111,10 @@ fn tiered_change_check(
                 .read_file(rel)
                 .with_context(|| format!("read {rel_path}"))?;
             let content_hash = content_hash_hex(&source);
-            if let Some(cached) = cache.get(rel_path) {
-                if content_hash == cached.content_hash {
-                    return Ok(ChangeVerdict::Unchanged);
-                }
+            if let Some(cached) = cache.get(rel_path)
+                && content_hash == cached.content_hash
+            {
+                return Ok(ChangeVerdict::Unchanged);
             }
             return Ok(ChangeVerdict::Changed {
                 meta: CachedFileMeta {
@@ -496,7 +496,7 @@ fn infer_cross_repo_call_edges(
     Ok(edges)
 }
 
-fn containing_symbol_for_line<'a>(symbols: &'a [RawSymbol], line: u32) -> Option<&'a RawSymbol> {
+fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSymbol> {
     symbols
         .iter()
         .filter(|s| s.start_line <= line && line <= s.end_line)
@@ -521,6 +521,7 @@ fn containing_symbol_for_line<'a>(symbols: &'a [RawSymbol], line: u32) -> Option
 /// matches a cache entry will return their symbols/references from the
 /// cache instead of being skipped. Newly parsed files are inserted into
 /// the cache so callers can persist it after indexing.
+#[allow(clippy::too_many_arguments)]
 fn index_into_store(
     reader: &dyn crate::content_reader::ContentReader,
     store: &GraphStore,

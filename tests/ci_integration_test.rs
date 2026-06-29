@@ -313,11 +313,7 @@ fn fail_on_error_exits_nonzero_when_server_unreachable() {
 
     // Minimal repo with a local change so pre-push-impact has something to analyze.
     init_git_repo(&repo_dir);
-    std::fs::write(
-        repo_dir.join("lib.js"),
-        "function hello() { return 1; }\n",
-    )
-    .unwrap();
+    std::fs::write(repo_dir.join("lib.js"), "function hello() { return 1; }\n").unwrap();
     git(&repo_dir, &["add", "."]);
     git(
         &repo_dir,

@@ -602,8 +602,8 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     if s.is_empty() {
         return None;
     }
-    let (num_str, unit) = if s.ends_with("ms") {
-        (&s[..s.len() - 2], "ms")
+    let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
     } else {
         let last = s.chars().last()?;
         (

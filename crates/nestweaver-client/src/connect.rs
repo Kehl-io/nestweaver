@@ -66,10 +66,10 @@ pub async fn connect_upstream(
 
     // Query RepoStates to show available repos.
     let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
-    if let Some(t) = token {
-        if let Ok(val) = format!("Bearer {}", t).parse() {
-            req.metadata_mut().insert("authorization", val);
-        }
+    if let Some(t) = token
+        && let Ok(val) = format!("Bearer {}", t).parse()
+    {
+        req.metadata_mut().insert("authorization", val);
     }
     let repo_count = client
         .repo_states(req)

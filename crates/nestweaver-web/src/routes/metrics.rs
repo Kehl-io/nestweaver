@@ -220,7 +220,7 @@ pub fn init_metrics() {
     JOBS_TOTAL.with_label_values(&["failed"]);
     JOBS_TOTAL.with_label_values(&["dead_letter"]);
     JOBS_TOTAL.with_label_values(&["cancelled"]);
-    JOB_DURATION.with_label_values(&[]);
+    JOB_DURATION.with_label_values(&[] as &[&str]);
     QUERY_ERRORS.with_label_values(&["unknown"]);
     GRPC_REQUESTS.with_label_values(&["unknown"]);
 }

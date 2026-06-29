@@ -317,7 +317,10 @@ mod tests {
         let interval = sched.next_interval(&sched.repos[0]);
         // Allow small timing slop from elapsed() measurement
         let secs = interval.as_secs();
-        assert!(secs >= 1799 && secs <= 1801, "expected ~1800s, got {secs}s");
+        assert!(
+            (1799..=1801).contains(&secs),
+            "expected ~1800s, got {secs}s"
+        );
     }
 
     #[test]

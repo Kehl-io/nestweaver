@@ -343,8 +343,13 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
 
     if config.data_dir.exists() {
         // Step 1: Move existing data aside (crash here = old data at .restoring, recoverable).
-        std::fs::rename(&config.data_dir, &restoring_dir)
-            .with_context(|| format!("rename {} to {}", config.data_dir.display(), restoring_dir.display()))?;
+        std::fs::rename(&config.data_dir, &restoring_dir).with_context(|| {
+            format!(
+                "rename {} to {}",
+                config.data_dir.display(),
+                restoring_dir.display()
+            )
+        })?;
     }
 
     // Step 2: Move new data into place (crash here = old data at .restoring, recoverable).

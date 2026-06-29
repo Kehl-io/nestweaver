@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 
 # Optional: S3 backend
-aws-sdk-s3 = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-config = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
 

@@ -1204,9 +1204,7 @@ async fn export_graph_rejects_file_output() {
     }))
     .unwrap();
 
-    let result = client
-        .export_graph(JsonRequest { args_json })
-        .await;
+    let result = client.export_graph(JsonRequest { args_json }).await;
 
     assert!(result.is_err(), "expected PERMISSION_DENIED error");
     let status = result.unwrap_err();

@@ -13,19 +13,15 @@ use serde::{Deserialize, Serialize};
 /// Routing mode for an upstream server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RoutingMode {
     /// Query local first. If repo isn't indexed locally, query server.
+    #[default]
     Fallback,
     /// Query both in parallel, merge results via RRF.
     Merge,
     /// Always query server. Local is only for uncommitted file overlay.
     Primary,
-}
-
-impl Default for RoutingMode {
-    fn default() -> Self {
-        Self::Fallback
-    }
 }
 
 /// Configuration for a single upstream server.
@@ -136,10 +132,10 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
     }
 
     // 3. User config: ~/.config/nestweaver/upstreams.toml
-    if let Some(configs) = load_user_upstreams() {
-        if !configs.is_empty() {
-            return configs;
-        }
+    if let Some(configs) = load_user_upstreams()
+        && !configs.is_empty()
+    {
+        return configs;
     }
 
     vec![]
@@ -158,14 +154,14 @@ pub fn discover_upstreams_with_config(
 ) -> Vec<UpstreamConfig> {
     let mut upstreams = discover_upstreams(start_dir);
 
-    if let Some(path) = config_path {
-        if let Some(config_upstreams) = load_instance_upstreams(path) {
-            let existing_urls: std::collections::HashSet<String> =
-                upstreams.iter().map(|u| u.url.clone()).collect();
-            for entry in config_upstreams {
-                if !existing_urls.contains(&entry.url) {
-                    upstreams.push(entry);
-                }
+    if let Some(path) = config_path
+        && let Some(config_upstreams) = load_instance_upstreams(path)
+    {
+        let existing_urls: std::collections::HashSet<String> =
+            upstreams.iter().map(|u| u.url.clone()).collect();
+        for entry in config_upstreams {
+            if !existing_urls.contains(&entry.url) {
+                upstreams.push(entry);
             }
         }
     }
@@ -219,22 +215,21 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
     let mut dir = start_dir.to_path_buf();
     loop {
         let candidate = dir.join(".nestweaver").join("server.toml");
-        if candidate.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                if let Ok(parsed) = toml::from_str::<ServerToml>(&content) {
-                    let mut cfg = UpstreamConfig {
-                        name: None,
-                        url: parsed.upstream.url,
-                        token: parsed.upstream.token,
-                        repos: vec![],
-                        mode: parsed.upstream.mode,
-                        timeout: default_timeout(),
-                        ca_cert: None,
-                    };
-                    expand_config_token(&mut cfg);
-                    return Some(cfg);
-                }
-            }
+        if candidate.is_file()
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+            && let Ok(parsed) = toml::from_str::<ServerToml>(&content)
+        {
+            let mut cfg = UpstreamConfig {
+                name: None,
+                url: parsed.upstream.url,
+                token: parsed.upstream.token,
+                repos: vec![],
+                mode: parsed.upstream.mode,
+                timeout: default_timeout(),
+                ca_cert: None,
+            };
+            expand_config_token(&mut cfg);
+            return Some(cfg);
         }
         if !dir.pop() {
             break;

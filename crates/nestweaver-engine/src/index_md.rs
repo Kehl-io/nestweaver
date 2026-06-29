@@ -2170,8 +2170,12 @@ sub b body
             fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
                 Ok(None)
             }
-            fn root(&self) -> &Path { Path::new("/fake/bare") }
-            fn version_id(&self) -> &str { "abc123" }
+            fn root(&self) -> &Path {
+                Path::new("/fake/bare")
+            }
+            fn version_id(&self) -> &str {
+                "abc123"
+            }
         }
 
         let reader = MockBareReader;

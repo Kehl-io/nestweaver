@@ -15,10 +15,10 @@ pub fn extract_scope_chain(node: Node, source: &str, lang: &str) -> Option<Strin
     let mut current = node.parent();
 
     while let Some(parent) = current {
-        if scope_node_types.contains(&parent.kind()) {
-            if let Some(name) = extract_name_from_scope_node(parent, source) {
-                chain.push(name);
-            }
+        if scope_node_types.contains(&parent.kind())
+            && let Some(name) = extract_name_from_scope_node(parent, source)
+        {
+            chain.push(name);
         }
         current = parent.parent();
     }
@@ -41,10 +41,10 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
     }
 
     // 2. For Rust impl blocks, look for the "type" field
-    if node.kind() == "impl_item" {
-        if let Some(type_node) = node.child_by_field_name("type") {
-            return Some(type_node.utf8_text(source_bytes).ok()?.to_string());
-        }
+    if node.kind() == "impl_item"
+        && let Some(type_node) = node.child_by_field_name("type")
+    {
+        return Some(type_node.utf8_text(source_bytes).ok()?.to_string());
     }
 
     // 3. For Elixir defmodule (which is a `call` node), extract the module name
@@ -55,10 +55,10 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
             let target_text = target.utf8_text(source_bytes).ok()?;
             if target_text == "defmodule" {
                 // The module name is the first argument
-                if let Some(args) = node.child_by_field_name("arguments") {
-                    if let Some(first_arg) = args.child(0) {
-                        return Some(first_arg.utf8_text(source_bytes).ok()?.to_string());
-                    }
+                if let Some(args) = node.child_by_field_name("arguments")
+                    && let Some(first_arg) = args.child(0)
+                {
+                    return Some(first_arg.utf8_text(source_bytes).ok()?.to_string());
                 }
             }
         }
@@ -99,15 +99,14 @@ fn extract_name_from_scope_node(node: Node, source: &str) -> Option<String> {
     // 5. Walk children looking for an identifier
     let count = node.child_count();
     for i in 0..count {
-        if let Some(child) = node.child(i as u32) {
-            if child.kind() == "identifier"
+        if let Some(child) = node.child(i as u32)
+            && (child.kind() == "identifier"
                 || child.kind() == "type_identifier"
                 || child.kind() == "name"
-                || child.kind() == "constant"
-            // Ruby module/class names are constants
-            {
-                return Some(child.utf8_text(source_bytes).ok()?.to_string());
-            }
+                || child.kind() == "constant")
+        // Ruby module/class names are constants
+        {
+            return Some(child.utf8_text(source_bytes).ok()?.to_string());
         }
     }
 
@@ -268,10 +267,10 @@ mod tests {
             }
             let n = node.child_count();
             for i in 0..n {
-                if let Some(child) = node.child(i as u32) {
-                    if let Some(found) = find_node(child, kind, substr, source) {
-                        return Some(found);
-                    }
+                if let Some(child) = node.child(i as u32)
+                    && let Some(found) = find_node(child, kind, substr, source)
+                {
+                    return Some(found);
                 }
             }
             None

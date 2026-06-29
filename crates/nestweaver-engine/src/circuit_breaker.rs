@@ -98,16 +98,16 @@ impl RemoteCircuitBreakers {
     /// Handles `https://github.com/...`, `git@github.com:...`, `ssh://git@host/...`
     pub fn extract_host(url: &str) -> String {
         // SSH shorthand: git@github.com:owner/repo.git
-        if let Some(rest) = url.strip_prefix("git@") {
-            if let Some(idx) = rest.find(':') {
-                return rest[..idx].to_string();
-            }
+        if let Some(rest) = url.strip_prefix("git@")
+            && let Some(idx) = rest.find(':')
+        {
+            return rest[..idx].to_string();
         }
         // URL form: extract host from authority.
-        if let Ok(parsed) = url::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                return host.to_string();
-            }
+        if let Ok(parsed) = url::Url::parse(url)
+            && let Some(host) = parsed.host_str()
+        {
+            return host.to_string();
         }
         // Fallback: use the whole URL as the key.
         url.to_string()
