@@ -45,9 +45,9 @@ runs:
       run: |
         VERSION="${{ inputs.version }}"
         if [ "$VERSION" = "latest" ]; then
-          URL="https://github.com/nestweaver/nestweaver/releases/latest/download/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+          URL="https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-${{ runner.os }}-${{ runner.arch }}"
         else
-          URL="https://github.com/nestweaver/nestweaver/releases/download/v${VERSION}/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+          URL="https://github.com/Kehl-io/nestweaver/releases/download/v${VERSION}/nestweaver-${{ runner.os }}-${{ runner.arch }}"
         fi
         curl -sSL "$URL" -o /usr/local/bin/nestweaver
         chmod +x /usr/local/bin/nestweaver

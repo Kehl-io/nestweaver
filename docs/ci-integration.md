@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0            # full history needed for diff
-      - uses: nestweaver/impact-action@v1
+      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
         with:
           server: ${{ secrets.NESTWEAVER_URL }}
           token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -40,7 +40,7 @@ Add this to your `.gitlab-ci.yml`:
 
 ```yaml
 include:
-  - remote: 'https://raw.githubusercontent.com/nestweaver/nestweaver/main/ci/gitlab-template.yml'
+  - remote: 'https://raw.githubusercontent.com/Kehl-io/nestweaver/main/ci/gitlab-template.yml'
 
 nestweaver-impact:
   extends: .nestweaver-impact
@@ -90,7 +90,7 @@ pipeline availability to the NestWeaver server.
 
 GitHub Actions:
 ```yaml
-- uses: nestweaver/impact-action@v1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -113,7 +113,7 @@ treat a missing report as a pipeline failure.
 
 GitHub Actions:
 ```yaml
-- uses: nestweaver/impact-action@v1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}

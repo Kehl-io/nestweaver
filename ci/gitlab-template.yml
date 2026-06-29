@@ -2,7 +2,7 @@
 #
 # Include in your .gitlab-ci.yml:
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/nestweaver/nestweaver/main/ci/gitlab-template.yml'
+#     - remote: 'https://raw.githubusercontent.com/Kehl-io/nestweaver/main/ci/gitlab-template.yml'
 #
 # Required CI/CD variables (set in Settings > CI/CD > Variables):
 #   NESTWEAVER_URL:   NestWeaver server gRPC URL (e.g. https://nestweaver.internal:9378)
@@ -24,7 +24,7 @@
 
 .nestweaver-impact:
   stage: test
-  image: ghcr.io/nestweaver/nestweaver:latest
+  image: ghcr.io/kehl-io/nestweaver:latest
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   variables:
