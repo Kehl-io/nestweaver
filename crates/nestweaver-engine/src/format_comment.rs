@@ -113,13 +113,14 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
     md.push_str("|----------|-------|----------------|\n");
 
     if breaking_count > 0 {
-        let breaking_repos: Vec<&str> = impacts
+        let mut breaking_repos: Vec<&str> = impacts
             .iter()
             .filter(|i| i.severity == ImpactSeverity::Breaking && !i.affected_repo_url.is_empty())
             .map(|i| extract_repo_name(&i.affected_repo_url))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        breaking_repos.sort_unstable();
         md.push_str(&format!(
             "| BREAKING | {} | {} |\n",
             breaking_count,
@@ -127,13 +128,14 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         ));
     }
     if warning_count > 0 {
-        let warning_repos: Vec<&str> = impacts
+        let mut warning_repos: Vec<&str> = impacts
             .iter()
             .filter(|i| i.severity == ImpactSeverity::Warning && !i.affected_repo_url.is_empty())
             .map(|i| extract_repo_name(&i.affected_repo_url))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        warning_repos.sort_unstable();
         md.push_str(&format!(
             "| WARNING | {} | {} |\n",
             warning_count,
@@ -141,13 +143,14 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         ));
     }
     if info_count > 0 {
-        let info_repos: Vec<&str> = impacts
+        let mut info_repos: Vec<&str> = impacts
             .iter()
             .filter(|i| i.severity == ImpactSeverity::Info && !i.affected_repo_url.is_empty())
             .map(|i| extract_repo_name(&i.affected_repo_url))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        info_repos.sort_unstable();
         md.push_str(&format!(
             "| INFO | {} | {} |\n",
             info_count,
@@ -212,7 +215,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
     }
 
     // Character safety check
-    enforce_char_limit(&mut md, total_groups, &config);
+    enforce_char_limit(&mut md, total_groups, config);
 
     md
 }
@@ -269,11 +272,11 @@ fn enforce_char_limit(md: &mut String, _total_groups: usize, _config: &FormatCon
         // Summarize the rest
         for part in &parts[11..] {
             // Extract the summary line
-            if let Some(start) = part.find("<summary>") {
-                if let Some(end) = part.find("</summary>") {
-                    let summary = &part[start + 9..end];
-                    result.push_str(&format!("- {}\n", summary));
-                }
+            if let Some(start) = part.find("<summary>")
+                && let Some(end) = part.find("</summary>")
+            {
+                let summary = &part[start + 9..end];
+                result.push_str(&format!("- {}\n", summary));
             }
         }
 
@@ -333,10 +336,10 @@ fn extract_symbol_name_from_reason(reason: &str) -> Option<String> {
         }
     }
     // Try pattern "'name' was removed"
-    if reason.starts_with('\'') {
-        if let Some(end) = reason[1..].find('\'') {
-            return Some(reason[1..end + 1].to_string());
-        }
+    if let Some(stripped) = reason.strip_prefix('\'')
+        && let Some(end) = stripped.find('\'')
+    {
+        return Some(stripped[..end].to_string());
     }
     None
 }
@@ -495,12 +498,11 @@ async fn find_github_comment(
         }
 
         for comment in &comments {
-            if let Some(body) = comment.get("body").and_then(|b| b.as_str()) {
-                if body.contains(marker) {
-                    if let Some(id) = comment.get("id").and_then(|i| i.as_u64()) {
-                        return Ok(Some(id));
-                    }
-                }
+            if let Some(body) = comment.get("body").and_then(|b| b.as_str())
+                && body.contains(marker)
+                && let Some(id) = comment.get("id").and_then(|i| i.as_u64())
+            {
+                return Ok(Some(id));
             }
         }
 
@@ -594,12 +596,11 @@ async fn find_gitlab_note(
         }
 
         for note in &notes {
-            if let Some(body) = note.get("body").and_then(|b| b.as_str()) {
-                if body.contains(marker) {
-                    if let Some(id) = note.get("id").and_then(|i| i.as_u64()) {
-                        return Ok(Some(id));
-                    }
-                }
+            if let Some(body) = note.get("body").and_then(|b| b.as_str())
+                && body.contains(marker)
+                && let Some(id) = note.get("id").and_then(|i| i.as_u64())
+            {
+                return Ok(Some(id));
             }
         }
 
