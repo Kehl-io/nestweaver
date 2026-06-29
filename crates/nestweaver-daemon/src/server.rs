@@ -244,18 +244,17 @@ impl DaemonService {
             );
 
             // Communicate depth clamping in response metadata.
-            if let Some(ref dr) = depth_result {
-                if dr.clamped {
-                    if let Some(obj) = value.as_object_mut() {
-                        let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
-                        if let Some(meta_obj) = meta.as_object_mut() {
-                            meta_obj.insert("_clamped".to_string(), serde_json::json!(true));
-                            meta_obj.insert(
-                                "_original_depth".to_string(),
-                                serde_json::json!(dr.original_depth),
-                            );
-                        }
-                    }
+            if let Some(ref dr) = depth_result
+                && dr.clamped
+                && let Some(obj) = value.as_object_mut()
+            {
+                let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("_clamped".to_string(), serde_json::json!(true));
+                    meta_obj.insert(
+                        "_original_depth".to_string(),
+                        serde_json::json!(dr.original_depth),
+                    );
                 }
             }
 
@@ -854,6 +853,11 @@ impl NestWeaverDaemon for DaemonService {
                         .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
 
                     if let Some(path) = output_path {
+                        if state.server_mode {
+                            return Err(Status::permission_denied(
+                                "file output is disabled in server mode; use the returned text field",
+                            ));
+                        }
                         std::fs::write(path, &text).map_err(|e| {
                             Status::internal(format!("failed to write {path}: {e}"))
                         })?;
@@ -3278,32 +3282,31 @@ pub async fn run_server(
         };
         shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
 
-        if let Some(ref cfg) = state.instance_cfg {
-            if let Ok(queue) = shared_job_queue.lock() {
-                for repo_cfg in &cfg.repos {
-                    let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
-                    let needs_initial_index = state
-                        .store
-                        .lookup_repo(&repo_uid)
-                        .ok()
-                        .flatten()
-                        .map(|repo| repo.indexed_sha.is_empty())
-                        .unwrap_or(true);
-                    if needs_initial_index {
-                        let canonical_id =
-                            nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
-                        if let Err(e) = queue.upsert(
-                            &canonical_id,
-                            &repo_cfg.url,
-                            nestweaver_engine::jobs::JobTrigger::Unindexed,
-                            repo_cfg.branch.as_deref(),
-                        ) {
-                            tracing::warn!(
-                                repo = %repo_cfg.url,
-                                error = %e,
-                                "failed to enqueue config repo for initial indexing"
-                            );
-                        }
+        if let Some(ref cfg) = state.instance_cfg
+            && let Ok(queue) = shared_job_queue.lock()
+        {
+            for repo_cfg in &cfg.repos {
+                let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
+                let needs_initial_index = state
+                    .store
+                    .lookup_repo(&repo_uid)
+                    .ok()
+                    .flatten()
+                    .map(|repo| repo.indexed_sha.is_empty())
+                    .unwrap_or(true);
+                if needs_initial_index {
+                    let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
+                    if let Err(e) = queue.upsert(
+                        &canonical_id,
+                        &repo_cfg.url,
+                        nestweaver_engine::jobs::JobTrigger::Unindexed,
+                        repo_cfg.branch.as_deref(),
+                    ) {
+                        tracing::warn!(
+                            repo = %repo_cfg.url,
+                            error = %e,
+                            "failed to enqueue config repo for initial indexing"
+                        );
                     }
                 }
             }
@@ -3524,12 +3527,11 @@ pub async fn run_server(
                     .unwrap_or(Path::new("."))
                     .join("workspace");
                 // Recover any stale running jobs from a previous crash.
-                if let Ok(guard) = worker_job_queue.lock() {
-                    if let Ok(recovered) = guard.recover_stale(1800) {
-                        if recovered > 0 {
-                            tracing::info!(recovered, "recovered stale running jobs");
-                        }
-                    }
+                if let Ok(guard) = worker_job_queue.lock()
+                    && let Ok(recovered) = guard.recover_stale(1800)
+                    && recovered > 0
+                {
+                    tracing::info!(recovered, "recovered stale running jobs");
                 }
                 let workspace =
                     match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {
@@ -3659,13 +3661,19 @@ pub async fn run_server(
                                 let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
                                 let indexed_sha = poll_store.lookup_repo(&r_uid)
                                     .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
-                                if !remote_sha.is_empty() && remote_sha != indexed_sha {
-                                    if let Some(ref jq) = poll_job_queue {
-                                        if let Ok(queue) = jq.lock() {
-                                            let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&url);
-                                            let _ = queue.upsert(&canonical_id, &url, nestweaver_engine::jobs::JobTrigger::Poll, branch.as_deref());
-                                        }
-                                    }
+                                if !remote_sha.is_empty()
+                                    && remote_sha != indexed_sha
+                                    && let Some(ref jq) = poll_job_queue
+                                    && let Ok(queue) = jq.lock()
+                                {
+                                    let canonical_id =
+                                        nestweaver_engine::jobs::canonical_repo_id(&url);
+                                    let _ = queue.upsert(
+                                        &canonical_id,
+                                        &url,
+                                        nestweaver_engine::jobs::JobTrigger::Poll,
+                                        branch.as_deref(),
+                                    );
                                 }
                             }
                         }
@@ -3730,7 +3738,7 @@ pub async fn run_server(
                         };
                         metrics::JOBS_TOTAL.with_label_values(&[result]).inc();
                         metrics::JOB_DURATION
-                            .with_label_values(&[])
+                            .with_label_values(&[] as &[&str])
                             .observe(job.duration_s);
                     }
                 }
@@ -3822,6 +3830,7 @@ fn flow_trace_continue_impl(
         make_span_id: Box<dyn Fn() -> String>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_trace(
         ctx: &mut TraceCtx<'_>,
         uid: &str,
@@ -4009,7 +4018,7 @@ fn impact_analysis_impl(
     let changes: Vec<AtomicChange> = req
         .changes
         .iter()
-        .filter_map(|proto| proto_to_atomic_change(proto))
+        .filter_map(proto_to_atomic_change)
         .collect();
 
     if changes.is_empty() {
