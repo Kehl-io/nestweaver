@@ -24,6 +24,12 @@ pub fn secure_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+fn rate_limit_key(req: &Request<()>, bearer: &str) -> String {
+    req.remote_addr()
+        .map(|addr| format!("peer:{}", addr.ip()))
+        .unwrap_or_else(|| bearer.to_string())
+}
+
 /// Returns a tonic interceptor that validates bearer tokens and enforces
 /// per-client rate limits.
 ///
@@ -64,7 +70,7 @@ pub fn bearer_auth_interceptor(
 
                 // Rate limit check — admin tokens are exempt.
                 if !is_admin && let Some(ref rl) = rate_limiters {
-                    rl.check(bearer)?;
+                    rl.check(&rate_limit_key(&req, bearer))?;
                 }
 
                 Ok(req)
@@ -86,7 +92,9 @@ pub fn bearer_auth_interceptor_simple(
 mod tests {
     use super::*;
     use crate::safeguards::RateLimitConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tonic::metadata::MetadataValue;
+    use tonic::transport::server::TcpConnectInfo;
 
     fn request_with_token(token: &str) -> Request<()> {
         let mut req = Request::new(());
@@ -94,6 +102,18 @@ mod tests {
             "authorization",
             MetadataValue::try_from(format!("Bearer {}", token)).unwrap(),
         );
+        req
+    }
+
+    fn request_with_token_from_ip(token: &str, ip: [u8; 4]) -> Request<()> {
+        let mut req = request_with_token(token);
+        req.extensions_mut().insert(TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(ip)),
+                50_000 + u16::from(ip[3]),
+            )),
+        });
         req
     }
 
@@ -175,5 +195,43 @@ mod tests {
         // Third should be rate-limited
         let err = f(request_with_token("query-token")).unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn rate_limit_is_keyed_by_remote_peer_when_available() {
+        let config = RateLimitConfig {
+            requests_per_minute: 60,
+            burst: 1,
+            enabled: true,
+        };
+        let rl = Arc::new(ClientRateLimiters::new(&config));
+        let f = bearer_auth_interceptor(
+            Some("shared-query-token".into()),
+            Some("admin-token".into()),
+            Some(rl),
+        );
+
+        assert!(
+            f(request_with_token_from_ip(
+                "shared-query-token",
+                [10, 0, 0, 1]
+            ))
+            .is_ok()
+        );
+        let err = f(request_with_token_from_ip(
+            "shared-query-token",
+            [10, 0, 0, 1],
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        assert!(
+            f(request_with_token_from_ip(
+                "shared-query-token",
+                [10, 0, 0, 2]
+            ))
+            .is_ok(),
+            "a second TCP peer using the same shared bearer token must get an independent bucket"
+        );
     }
 }

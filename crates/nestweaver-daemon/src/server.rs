@@ -2888,6 +2888,12 @@ pub struct ServerOpts {
 /// Short tokens are trivially brute-forceable, so startup rejects them.
 const MIN_TOKEN_LEN: usize = 32;
 
+/// Minimum byte length for webhook HMAC secrets supplied via [`ServerOpts`].
+/// Webhook secrets key an HMAC over the request body rather than acting as a
+/// bearer token, so the bar is lower than [`MIN_TOKEN_LEN`], but trivially
+/// short secrets still weaken the signature, so startup rejects them.
+const MIN_WEBHOOK_SECRET_LEN: usize = 16;
+
 /// Reject any present auth/admin token shorter than [`MIN_TOKEN_LEN`] bytes.
 /// `None` tokens (auth disabled) are accepted. The error names which token is
 /// too short and the required minimum.
@@ -2902,6 +2908,30 @@ fn validate_token_lengths(
             anyhow::bail!(
                 "{name} token is too short ({} bytes); minimum is {MIN_TOKEN_LEN} bytes",
                 t.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject any present webhook secret shorter than [`MIN_WEBHOOK_SECRET_LEN`]
+/// bytes. Both the active secret and the rotation fallback are checked. `None`
+/// secrets (webhook signature verification disabled) are accepted. The error
+/// names which secret is too short and the required minimum.
+fn validate_webhook_secret_lengths(
+    webhook_secret: &Option<String>,
+    webhook_secret_old: &Option<String>,
+) -> anyhow::Result<()> {
+    for (name, secret) in [
+        ("webhook", webhook_secret),
+        ("webhook-old", webhook_secret_old),
+    ] {
+        if let Some(s) = secret
+            && s.len() < MIN_WEBHOOK_SECRET_LEN
+        {
+            anyhow::bail!(
+                "{name} secret is too short ({} bytes); minimum is {MIN_WEBHOOK_SECRET_LEN} bytes",
+                s.len()
             );
         }
     }
@@ -3079,6 +3109,16 @@ pub async fn run_server(
             .as_ref()
             .and_then(|opts| opts.auth_token.clone()),
         &admin_token,
+    )?;
+
+    // Reject any present webhook secret that is too short to be safe.
+    validate_webhook_secret_lengths(
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.webhook_secret.clone()),
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.webhook_secret_old.clone()),
     )?;
 
     let state = Arc::new(DaemonState {
@@ -3320,6 +3360,7 @@ pub async fn run_server(
             )
         });
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
+        nestweaver_mcp::http::spawn_bucket_sweeper(mcp_state.client_rate_limiter.clone());
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
 
         // Shared webhook state Arcs — populated inside the webhook block,
@@ -3356,6 +3397,22 @@ pub async fn run_server(
                     .map(|repo| repo.indexed_sha.is_empty())
                     .unwrap_or(true);
                 if needs_initial_index {
+                    // SSRF guard: repos declared in instance.toml bypass the
+                    // add_repo API and its validation, so a hostile config could
+                    // otherwise smuggle an internal/private target that gets
+                    // cloned at startup (the clone/worker path has no SSRF guard
+                    // of its own). Run the same synchronous checks add_repo and
+                    // reload_config use and refuse to enqueue rejected URLs.
+                    // DNS resolution is intentionally skipped here (matching
+                    // reload_config) to keep startup non-blocking; only
+                    // scheme/literal-IP/localhost checks apply at this stage.
+                    if !nestweaver_web::routes::admin::config_repo_url_allowed(&repo_cfg.url) {
+                        tracing::warn!(
+                            repo = %repo_cfg.url,
+                            "startup: skipping config repo — URL rejected by SSRF guard"
+                        );
+                        continue;
+                    }
                     let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
                     if let Err(e) = queue.upsert(
                         &canonical_id,
@@ -3561,6 +3618,16 @@ pub async fn run_server(
                 loop {
                     tokio::select! {
                         Some(Ok(stream)) = incoming.next() => {
+                            // Serving the router directly via hyper here does not
+                            // populate `ConnectInfo<SocketAddr>`, so the nested
+                            // device-flow `/auth` rate limiter (`auth_rate_limit_key`)
+                            // can't see the direct peer IP over TLS and falls back to
+                            // the proxy-supplied `X-Forwarded-For`/`X-Real-IP` (client
+                            // spoofable) or a single global bucket. The limiter's key
+                            // map is bounded, so a spoofed-XFF flood degrades to a
+                            // global cap rather than unbounded growth — matching the
+                            // MCP limiter's documented TLS fallback below. Terminate
+                            // TLS at a trusted proxy that sets XFF for per-IP fidelity.
                             let svc = mcp_router.clone();
                             tokio::spawn(async move {
                                 let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
@@ -3576,12 +3643,22 @@ pub async fn run_server(
                     }
                 }
             } else {
-                axum::serve(mcp_listener, mcp_router)
-                    .with_graceful_shutdown(async move {
-                        let _ = mcp_shutdown_rx.changed().await;
-                    })
-                    .await
-                    .ok();
+                // `into_make_service_with_connect_info` populates
+                // `ConnectInfo<SocketAddr>` so the MCP rate limiter can key
+                // pre-session requests (e.g. `initialize`) on the peer IP.
+                // The TLS branch above serves connections directly via hyper
+                // and cannot supply ConnectInfo, so over TLS the limiter falls
+                // back to the bearer identity — still a stable key, just
+                // coarser (residual: no per-IP granularity for TLS clients).
+                axum::serve(
+                    mcp_listener,
+                    mcp_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = mcp_shutdown_rx.changed().await;
+                })
+                .await
+                .ok();
             }
         });
 
@@ -4330,6 +4407,26 @@ mod startup_helper_tests {
     #[test]
     fn validate_token_lengths_accepts_none() {
         assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_rejects_short_secret() {
+        let short = Some("secret".to_string());
+        assert!(validate_webhook_secret_lengths(&short, &None).is_err());
+        assert!(validate_webhook_secret_lengths(&None, &short).is_err());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_accepts_min_length() {
+        let secret = Some("a".repeat(MIN_WEBHOOK_SECRET_LEN));
+        assert_eq!(secret.as_ref().unwrap().len(), MIN_WEBHOOK_SECRET_LEN);
+        assert!(validate_webhook_secret_lengths(&secret, &None).is_ok());
+        assert!(validate_webhook_secret_lengths(&secret, &secret).is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_accepts_none() {
+        assert!(validate_webhook_secret_lengths(&None, &None).is_ok());
     }
 
     fn repo_cfg(url: &str, repo_type: Option<RepoType>) -> RepoConfig {
