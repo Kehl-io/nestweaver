@@ -1,4 +1,4 @@
-//! Webhook endpoint for GitHub/GitLab push events.
+//! Webhook endpoint for GitHub/GitLab/Gitea push events.
 //!
 //! Verifies HMAC-SHA256 signatures, extracts the repo URL from the payload,
 //! and enqueues a job at webhook priority. Supports dual-secret rotation.
@@ -43,7 +43,7 @@ pub struct WebhookState {
     pub repo_branches: Arc<RwLock<HashMap<String, String>>>,
 }
 
-/// POST /webhook — receives push events from GitHub/GitLab.
+/// POST /webhook — receives push events from GitHub/GitLab/Gitea.
 ///
 /// 1. Verifies the HMAC-SHA256 signature against configured secret(s).
 /// 2. Extracts the repo URL from the JSON payload.
@@ -57,9 +57,13 @@ pub async fn handle_webhook(
     // 1. Verify webhook authentication.
     // GitLab uses X-Gitlab-Token with a plain secret comparison (no HMAC).
     // GitHub uses X-Hub-Signature-256 with HMAC-SHA256.
+    // Gitea uses X-Gitea-Signature with raw HMAC-SHA256 hex.
     let gitlab_token = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok());
     let sig_header = headers
         .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    let gitea_sig_header = headers
+        .get("x-gitea-signature")
         .and_then(|v| v.to_str().ok());
 
     // Track all incoming webhook requests.
@@ -80,7 +84,9 @@ pub async fn handle_webhook(
         if old_match && !current_match {
             tracing::warn!("GitLab webhook matched old secret — rotate to new secret");
         }
-    } else if !verify_signature(&body, sig_header, &state.config) {
+    } else if !verify_signature(&body, sig_header, &state.config)
+        && !verify_gitea_signature(&body, gitea_sig_header, &state.config)
+    {
         nestweaver_web::routes::metrics::WEBHOOK_SIG_FAILURES.inc();
         return (StatusCode::UNAUTHORIZED, "invalid signature");
     }
@@ -151,6 +157,26 @@ fn verify_signature(body: &[u8], sig_header: Option<&str>, config: &WebhookConfi
     false
 }
 
+/// Verify the raw HMAC-SHA256 signature from Gitea's `X-Gitea-Signature` header.
+fn verify_gitea_signature(body: &[u8], sig_header: Option<&str>, config: &WebhookConfig) -> bool {
+    let Some(sig_hex) = sig_header else {
+        return false;
+    };
+
+    if verify_hmac(body, sig_hex, &config.secret) {
+        return true;
+    }
+
+    if let Some(ref old) = config.secret_old
+        && verify_hmac(body, sig_hex, old)
+    {
+        tracing::warn!("Gitea webhook matched old secret — rotate to new secret");
+        return true;
+    }
+
+    false
+}
+
 /// Check whether `expected_hex` is a valid HMAC-SHA256 of `body` using `secret`.
 fn verify_hmac(body: &[u8], expected_hex: &str, secret: &str) -> bool {
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
@@ -168,6 +194,7 @@ fn verify_hmac(body: &[u8], expected_hex: &str, secret: &str) -> bool {
 /// Supports:
 /// - GitHub: `repository.clone_url`
 /// - GitLab: `project.git_http_url`
+/// - Gitea: `repository.clone_url`
 fn extract_repo_url(payload: &serde_json::Value) -> Option<String> {
     payload["repository"]["clone_url"]
         .as_str()
@@ -187,6 +214,13 @@ mod tests {
         mac.update(body);
         let result = mac.finalize().into_bytes();
         format!("sha256={}", hex::encode(result))
+    }
+
+    /// Compute a valid Gitea HMAC-SHA256 signature for the given body and secret.
+    fn sign_gitea(body: &[u8], secret: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
     }
 
     #[test]
@@ -263,6 +297,50 @@ mod tests {
     }
 
     #[test]
+    fn verify_valid_gitea_signature() {
+        let secret = "test-secret-123";
+        let body = br#"{"repository":{"clone_url":"https://gitea.example.com/acme/api.git"}}"#;
+        let sig = sign_gitea(body, secret);
+        let config = WebhookConfig {
+            secret: secret.to_string(),
+            secret_old: None,
+        };
+        assert!(verify_gitea_signature(body, Some(&sig), &config));
+    }
+
+    #[test]
+    fn verify_invalid_gitea_signature() {
+        let config = WebhookConfig {
+            secret: "correct-secret".to_string(),
+            secret_old: None,
+        };
+        let body = b"payload";
+        let wrong_sig = sign_gitea(body, "wrong-secret");
+        assert!(!verify_gitea_signature(body, Some(&wrong_sig), &config));
+    }
+
+    #[test]
+    fn verify_gitea_dual_secret_old_matches() {
+        let body = b"some payload";
+        let old_secret = "old-secret";
+        let new_secret = "new-secret";
+        // Sign with the old secret — rotation should still verify it.
+        let sig = sign_gitea(body, old_secret);
+        let config = WebhookConfig {
+            secret: new_secret.to_string(),
+            secret_old: Some(old_secret.to_string()),
+        };
+        assert!(verify_gitea_signature(body, Some(&sig), &config));
+
+        // Without the old secret configured, the same signature is rejected.
+        let config_no_old = WebhookConfig {
+            secret: new_secret.to_string(),
+            secret_old: None,
+        };
+        assert!(!verify_gitea_signature(body, Some(&sig), &config_no_old));
+    }
+
+    #[test]
     fn extract_github_repo_url() {
         let payload = serde_json::json!({
             "repository": {
@@ -285,6 +363,21 @@ mod tests {
         assert_eq!(
             extract_repo_url(&payload).as_deref(),
             Some("https://gitlab.com/acme/api-service.git")
+        );
+    }
+
+    #[test]
+    fn extract_gitea_repo_url() {
+        let payload = serde_json::json!({
+            "repository": {
+                "html_url": "https://gitea.example.com/acme/api-service",
+                "ssh_url": "git@gitea.example.com:acme/api-service.git",
+                "clone_url": "https://gitea.example.com/acme/api-service.git"
+            }
+        });
+        assert_eq!(
+            extract_repo_url(&payload).as_deref(),
+            Some("https://gitea.example.com/acme/api-service.git")
         );
     }
 
