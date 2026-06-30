@@ -604,6 +604,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<PrepareBackupRequest>,
     ) -> Result<Response<PrepareBackupResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            _request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         tracing::info!("prepare_backup: acquiring write mutex");
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
@@ -679,6 +684,11 @@ impl NestWeaverDaemon for DaemonService {
                     vault_path.display()
                 )));
             }
+        } else {
+            return Err(Status::failed_precondition(
+                "watch_vault requires an instance config (--config); \
+                 path validation cannot be performed without one",
+            ));
         }
 
         let db_path = self.state.db_path.clone();
@@ -804,6 +814,11 @@ impl NestWeaverDaemon for DaemonService {
                     repo_path.display()
                 )));
             }
+        } else {
+            return Err(Status::failed_precondition(
+                "watch_code requires an instance config (--config); \
+                 path validation cannot be performed without one",
+            ));
         }
 
         let db_path = self.state.db_path.clone();
@@ -996,6 +1011,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<ServeUiRequest>,
     ) -> Result<Response<ServeUiResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let state = self.state.clone();
 
@@ -1062,6 +1082,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let state = self.state.clone();
@@ -1249,6 +1274,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -1350,6 +1380,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MaterializeProjectsRequest>,
     ) -> Result<Response<Self::MaterializeProjectsStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -3203,6 +3238,23 @@ pub async fn run_server(
         &admin_token,
     )?;
 
+    // C1: Reject non-loopback bind without an auth token — the server would
+    // be fully open to the network because the auth interceptor passes all
+    // requests when no token is configured.
+    if let Some(ref opts) = server_opts {
+        if opts.auth_token.is_none() {
+            if let Ok(addr) = opts.bind_addr.parse::<std::net::SocketAddr>() {
+                if !addr.ip().is_loopback() {
+                    anyhow::bail!(
+                        "Cannot bind to non-loopback address {} without --auth-token; \
+                         the server would be fully open to the network",
+                        opts.bind_addr
+                    );
+                }
+            }
+        }
+    }
+
     // Reject any present webhook secret that is too short to be safe.
     validate_webhook_secret_lengths(
         &server_opts
@@ -3456,8 +3508,14 @@ pub async fn run_server(
             s.embed_model = state.embed_model.clone();
             std::sync::Arc::new(s)
         };
-        nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
-        nestweaver_mcp::http::spawn_bucket_sweeper(mcp_state.client_rate_limiter.clone());
+        nestweaver_mcp::http::spawn_session_sweeper(
+            mcp_state.sessions.clone(),
+            shutdown_tx.subscribe(),
+        );
+        nestweaver_mcp::http::spawn_bucket_sweeper(
+            mcp_state.client_rate_limiter.clone(),
+            shutdown_tx.subscribe(),
+        );
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
 
         // Shared webhook state Arcs — populated inside the webhook block,
@@ -3671,6 +3729,12 @@ pub async fn run_server(
                     tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
 
                 tracing::info!("TLS enabled for TCP server and MCP HTTP");
+                tracing::warn!(
+                    "TLS mode: MCP HTTP rate limiter uses per-token buckets instead of per-IP \
+                     because ConnectInfo is unavailable over TLS; all clients sharing the same \
+                     bearer token share one rate-limit bucket. Terminate TLS at a trusted \
+                     reverse proxy that sets X-Forwarded-For for per-IP granularity."
+                );
                 eprintln!("[daemon] TLS enabled for TCP server and MCP HTTP");
                 Some((tonic_tls, tls_acceptor))
             }

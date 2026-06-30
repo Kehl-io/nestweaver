@@ -24,6 +24,16 @@ use uuid::Uuid;
 use crate::protocol::{PROTOCOL_VERSION, error_code};
 use crate::tools;
 
+/// Tools that mutate server state and therefore require admin-level auth.
+/// Query tokens may only invoke read-only tools; mutating operations require
+/// the admin token when auth is configured.
+const MUTATING_TOOLS: &[&str] = &[
+    "brain_add_source",
+    "brain_remove_source",
+    "set_extension",
+    "prune_stale",
+];
+
 const SERVER_NAME: &str = "nestweaver-brain";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -223,14 +233,22 @@ impl McpHttpState {
 }
 
 /// Spawn a background task that removes sessions idle longer than `SESSION_TTL_SECS`.
-pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
+/// Accepts a shutdown receiver; the loop exits when the shutdown signal fires.
+pub fn spawn_session_sweeper(
+    sessions: Arc<DashMap<String, McpSession>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
         let ttl = std::time::Duration::from_secs(SESSION_TTL_SECS);
         loop {
-            tokio::time::sleep(interval).await;
-            let now = Instant::now();
-            sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    let now = Instant::now();
+                    sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
+                }
+                _ = shutdown_rx.changed() => break,
+            }
         }
     });
 }
@@ -239,14 +257,22 @@ pub fn spawn_session_sweeper(sessions: Arc<DashMap<String, McpSession>>) {
 /// [`BUCKET_TTL_SECS`], mirroring [`spawn_session_sweeper`]. Without this the
 /// limiter's `buckets` map grows without bound — it gains an entry for every
 /// distinct client key ever seen and never releases one.
-pub fn spawn_bucket_sweeper(limiter: Arc<HttpRateLimiter>) {
+/// Accepts a shutdown receiver; the loop exits when the shutdown signal fires.
+pub fn spawn_bucket_sweeper(
+    limiter: Arc<HttpRateLimiter>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(SWEEP_INTERVAL_SECS);
         let ttl = Duration::from_secs(BUCKET_TTL_SECS);
         loop {
-            tokio::time::sleep(interval).await;
-            let now = (limiter.clock)();
-            limiter.sweep_idle_buckets(now, ttl);
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    let now = (limiter.clock)();
+                    limiter.sweep_idle_buckets(now, ttl);
+                }
+                _ = shutdown_rx.changed() => break,
+            }
         }
     });
 }
@@ -647,6 +673,25 @@ async fn handle_mcp(
                     })),
                 );
             };
+
+            // C3: Mutating tools require admin token when auth is configured.
+            if MUTATING_TOOLS.contains(&name.as_str()) && state.auth_token.is_some() && !admin_bypass_rate_limit {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": error_code::INVALID_REQUEST,
+                            "message": format!(
+                                "tool '{}' is mutating and requires the admin token",
+                                name
+                            ),
+                        }
+                    })),
+                );
+            }
 
             let store = state.store.clone();
             let tantivy = state.tantivy.clone();
