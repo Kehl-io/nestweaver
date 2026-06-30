@@ -87,6 +87,23 @@ pub struct RestoreResult {
     pub duration: Duration,
 }
 
+/// Attempt a best-effort WAL checkpoint on the database.
+///
+/// Opens the store in read-write mode and runs CHECKPOINT. Returns `Ok(true)`
+/// if the checkpoint succeeded, `Ok(false)` if the store could not be opened
+/// (e.g. another process holds the write lock), or `Err` on unexpected errors.
+pub fn try_passive_checkpoint(db_path: &Path) -> anyhow::Result<bool> {
+    match nestweaver_store::GraphStore::open(db_path) {
+        Ok(store) => {
+            store
+                .checkpoint()
+                .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 /// Create a backup of the NestWeaver database and all sidecar files.
 ///
 /// The caller is responsible for ensuring exclusive access to the database
@@ -355,7 +372,24 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // Step 2: Move new data into place (crash here = old data at .restoring, recoverable).
     if std::fs::rename(temp_dir.path(), &config.data_dir).is_err() {
         // Cross-device: fall back to copy.
-        nestweaver_storage::copy_dir_all(temp_dir.path(), &config.data_dir)?;
+        if let Err(e) = nestweaver_storage::copy_dir_all(temp_dir.path(), &config.data_dir) {
+            // Partial write may have occurred. Log recovery instructions before
+            // propagating so the user knows the old data is still available.
+            tracing::error!(
+                "Cross-device copy failed: {e}. Your previous data is preserved at '{}'. \
+                 To recover, remove the partially-written '{}' and rename '{}' back to '{}'.",
+                restoring_dir.display(),
+                config.data_dir.display(),
+                restoring_dir.display(),
+                config.data_dir.display(),
+            );
+            return Err(e).with_context(|| {
+                format!(
+                    "cross-device restore copy failed; old data recoverable from {}",
+                    restoring_dir.display()
+                )
+            });
+        }
     }
 
     // Step 3: Remove the old data (crash here = orphan .restoring, harmless).
@@ -423,16 +457,25 @@ fn copy_db_files(
     }
 
     // Full-tier: copy workspace .git directories.
+    // Handles both regular clones (entry/<name>/.git/) and bare clones
+    // (entry/<name>.git/ with HEAD file directly inside).
     if include_clones && let Some(ws) = workspace_path {
         let clones_dir = staging.join("clones");
         if ws.exists() {
             std::fs::create_dir_all(&clones_dir)?;
             for entry in std::fs::read_dir(ws)? {
                 let entry = entry?;
-                let git_dir = entry.path().join(".git");
+                let path = entry.path();
+                let git_dir = path.join(".git");
                 if git_dir.is_dir() {
+                    // Regular clone: copy only the .git subdirectory.
                     let dest = clones_dir.join(entry.file_name()).join(".git");
                     nestweaver_storage::copy_dir_all(&git_dir, &dest)?;
+                } else if crate::bare_clone::BareClone::is_valid_at(&path) {
+                    // Bare clone (e.g. <name>.git): the entry IS the git dir.
+                    // Copy the entire directory.
+                    let dest = clones_dir.join(entry.file_name());
+                    nestweaver_storage::copy_dir_all(&path, &dest)?;
                 }
             }
         }

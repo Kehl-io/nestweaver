@@ -12651,6 +12651,23 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                     return Ok(EXIT_ERROR);
                 }
 
+                if !prepare_ok && force {
+                    eprintln!(
+                        "WARNING: PrepareBackup failed — WAL may not be checkpointed. \
+                         The backup might not include recent uncommitted writes."
+                    );
+                    // Best-effort: try to checkpoint the WAL directly. This will
+                    // fail silently if the daemon holds the write lock.
+                    match nestweaver_engine::try_passive_checkpoint(&db_path) {
+                        Ok(true) => eprintln!("  Passive WAL checkpoint succeeded."),
+                        Ok(false) => eprintln!(
+                            "  Could not acquire write lock for WAL checkpoint — \
+                             backup will use whatever state is on disk."
+                        ),
+                        Err(e) => eprintln!("  WAL checkpoint attempt failed: {e}"),
+                    }
+                }
+
                 eprintln!("Creating backup (read-only)...");
                 nestweaver_engine::backup_save_read_only(&config)?
             } else {

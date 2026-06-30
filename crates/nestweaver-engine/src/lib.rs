@@ -112,7 +112,8 @@ pub use agent_guide::{
 };
 pub use backup::{
     BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
-    RestoreResult, backup_inspect, backup_list, backup_restore, backup_save, backup_save_read_only,
+    RestoreResult, backup_inspect, backup_list, backup_restore, backup_save,
+    backup_save_read_only, try_passive_checkpoint,
 };
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
