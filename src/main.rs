@@ -12626,28 +12626,49 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 // Route through the daemon: call PrepareBackup to quiesce,
                 // then copy files read-only (no lock contention).
                 eprintln!("Daemon is running — quiescing database via PrepareBackup RPC...");
-                let prepare_ok = match existing_daemon {
-                    Ok(mut client) => rt.block_on(async {
-                        match client
-                            .inner_mut()
-                            .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
-                            .await
-                        {
-                            Ok(_) => true,
-                            Err(e) => {
-                                eprintln!("PrepareBackup RPC failed: {e}");
-                                false
+                let (prepare_ok, mut client) = match existing_daemon {
+                    Ok(mut client) => {
+                        let ok = rt.block_on(async {
+                            match client
+                                .inner_mut()
+                                .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
+                                .await
+                            {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    eprintln!("PrepareBackup RPC failed: {e}");
+                                    false
+                                }
                             }
-                        }
-                    }),
+                        });
+                        (ok, Some(client))
+                    }
                     Err(e) => {
                         eprintln!("Failed to connect to daemon: {e}");
-                        false
+                        (false, None)
                     }
                 };
 
+                // Helper closure to release the backup quiesce on the daemon.
+                let finish_backup =
+                    |client: &mut Option<nestweaver_client::DaemonClient>,
+                     rt: &tokio::runtime::Runtime| {
+                        if let Some(c) = client {
+                            rt.block_on(async {
+                                if let Err(e) = c
+                                    .inner_mut()
+                                    .finish_backup(nestweaver_proto::FinishBackupRequest {})
+                                    .await
+                                {
+                                    eprintln!("FinishBackup RPC failed: {e}");
+                                }
+                            });
+                        }
+                    };
+
                 if !prepare_ok && !force {
                     eprintln!("Cannot quiesce database. Stop the daemon first, or use --force.");
+                    finish_backup(&mut client, &rt);
                     return Ok(EXIT_ERROR);
                 }
 
@@ -12669,7 +12690,12 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 }
 
                 eprintln!("Creating backup (read-only)...");
-                nestweaver_engine::backup_save_read_only(&config)?
+                let backup_result = nestweaver_engine::backup_save_read_only(&config);
+
+                // Always release the quiesce, even if the backup failed.
+                finish_backup(&mut client, &rt);
+
+                backup_result?
             } else {
                 eprintln!("Creating backup...");
                 nestweaver_engine::backup_save(&config)?

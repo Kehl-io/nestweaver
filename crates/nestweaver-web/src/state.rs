@@ -113,4 +113,6 @@ pub struct AdminState {
     /// Write mutex shared with the daemon to prevent races between admin
     /// repo deletion and worker indexing. `None` in tests or non-server mode.
     pub write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// Backup quiesce flag. When `true`, write operations should be blocked.
+    pub backup_quiesced: Option<Arc<std::sync::atomic::AtomicBool>>,
 }

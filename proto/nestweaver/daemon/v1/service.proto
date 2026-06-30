@@ -418,6 +418,13 @@ message PrepareBackupResponse {
   string message = 2;
 }
 
+message FinishBackupRequest {}
+
+message FinishBackupResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -450,6 +457,7 @@ service NestWeaverDaemon {
 
   // Backup
   rpc PrepareBackup(PrepareBackupRequest) returns (PrepareBackupResponse);
+  rpc FinishBackup(FinishBackupRequest) returns (FinishBackupResponse);
 
   // Export
   rpc ExportGraph(JsonRequest) returns (JsonResponse);

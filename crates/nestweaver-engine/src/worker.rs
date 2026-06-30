@@ -127,13 +127,14 @@ impl WorkerPool {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
     ) {
-        self.run_inner(
+        self.run_with_drain_and_quiesce(
             queue,
             workspace,
             store,
             instance_id,
             &mut shutdown,
             status,
+            None,
             None,
             None,
         )
@@ -157,7 +158,7 @@ impl WorkerPool {
         drained: Arc<AtomicBool>,
         write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     ) {
-        self.run_inner(
+        self.run_with_drain_and_quiesce(
             queue,
             workspace,
             store,
@@ -166,12 +167,16 @@ impl WorkerPool {
             status,
             Some(drained),
             write_mutex,
+            None,
         )
         .await;
     }
 
+    /// Like [`run_with_drain`] but also accepts a `backup_quiesced` flag.
+    /// When the flag is `true`, worker jobs skip the write phase and re-queue
+    /// themselves so the backup file-copy can proceed without DB mutations.
     #[allow(clippy::too_many_arguments)]
-    async fn run_inner(
+    pub async fn run_with_drain_and_quiesce(
         &self,
         queue: Arc<Mutex<JobQueue>>,
         workspace: Arc<BareCloneWorkspace>,
@@ -181,6 +186,7 @@ impl WorkerPool {
         status: Option<IndexingStatus>,
         drained: Option<Arc<AtomicBool>>,
         write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+        backup_quiesced: Option<Arc<AtomicBool>>,
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
@@ -286,6 +292,7 @@ impl WorkerPool {
             let instance_id = instance_id.clone();
             let status_clone = status.clone();
             let write_mutex = write_mutex.clone();
+            let backup_quiesced = backup_quiesced.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
             let reindex_tracker = self.reindex_tracker.clone();
@@ -333,6 +340,7 @@ impl WorkerPool {
                             let queue_for_gate = queue_check.clone();
                             let job_for_gate = job_clone.clone();
                             let write_mutex_for_gate = write_mutex.clone();
+                            let backup_quiesced_for_gate = backup_quiesced.clone();
                             let force_full_reindex = if prepared.repo_type == RepoType::Code {
                                 let tracker = reindex_tracker
                                     .lock()
@@ -353,6 +361,16 @@ impl WorkerPool {
                                 &instance_id,
                                 force_full_reindex,
                                 move || {
+                                    // Block while a backup file-copy is in progress.
+                                    if let Some(ref q) = backup_quiesced_for_gate
+                                        && q.load(Ordering::Acquire)
+                                    {
+                                        tracing::info!(
+                                            repo = %job_for_gate.repo_id,
+                                            "backup quiesce active — deferring write"
+                                        );
+                                        return Err(anyhow::Error::new(JobCancelled));
+                                    }
                                     let _write_guard = write_mutex_for_gate
                                         .as_ref()
                                         .map(|m| m.clone().blocking_lock_owned());
