@@ -635,6 +635,12 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchVaultRequest>,
     ) -> Result<Response<WatchVaultResponse>, Status> {
+        if self.state.server_mode {
+            return Err(Status::unimplemented(
+                "watchers are server-managed in server mode",
+            ));
+        }
+
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -650,6 +656,29 @@ impl NestWeaverDaemon for DaemonService {
                 ok: false,
                 message: format!("vault path is not a directory: {}", vault_path.display()),
             }));
+        }
+
+        let vault_path = vault_path.canonicalize().map_err(|e| {
+            Status::invalid_argument(format!("cannot canonicalize vault path: {e}"))
+        })?;
+
+        // Only allow paths registered in the instance config.
+        if let Some(ref cfg) = self.state.instance_cfg {
+            let allowed: Vec<PathBuf> = cfg
+                .repos
+                .iter()
+                .filter(|r| r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
+                .filter_map(|r| {
+                    let p = PathBuf::from(&r.url);
+                    p.canonicalize().ok()
+                })
+                .collect();
+            if !allowed.iter().any(|a| vault_path.starts_with(a)) {
+                return Err(Status::invalid_argument(format!(
+                    "vault path {} is not in the instance's registered sources",
+                    vault_path.display()
+                )));
+            }
         }
 
         let db_path = self.state.db_path.clone();
@@ -734,6 +763,12 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchCodeRequest>,
     ) -> Result<Response<WatchCodeResponse>, Status> {
+        if self.state.server_mode {
+            return Err(Status::unimplemented(
+                "watchers are server-managed in server mode",
+            ));
+        }
+
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -747,6 +782,28 @@ impl NestWeaverDaemon for DaemonService {
                 ok: false,
                 message: format!("repo path is not a directory: {}", repo_path.display()),
             }));
+        }
+
+        let repo_path = repo_path.canonicalize().map_err(|e| {
+            Status::invalid_argument(format!("cannot canonicalize repo path: {e}"))
+        })?;
+
+        // Only allow paths registered in the instance config.
+        if let Some(ref cfg) = self.state.instance_cfg {
+            let allowed: Vec<PathBuf> = cfg
+                .repos
+                .iter()
+                .filter_map(|r| {
+                    let p = PathBuf::from(&r.url);
+                    p.canonicalize().ok()
+                })
+                .collect();
+            if !allowed.iter().any(|a| repo_path.starts_with(a)) {
+                return Err(Status::invalid_argument(format!(
+                    "repo path {} is not in the instance's registered sources",
+                    repo_path.display()
+                )));
+            }
         }
 
         let db_path = self.state.db_path.clone();
