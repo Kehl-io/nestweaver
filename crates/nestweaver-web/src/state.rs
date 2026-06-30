@@ -97,6 +97,12 @@ pub struct AdminState {
     pub indexing_queue_depth: Arc<AtomicU32>,
     /// Path to the brain database, used to derive the jobs database path.
     pub db_path: std::path::PathBuf,
+    /// Shared job-queue connection, cloned from the daemon's single `JobQueue`.
+    /// Admin routes MUST use this rather than opening their own connection to
+    /// the jobs SQLite file: independent connections race the worker's WAL
+    /// checkpoint and crash the daemon with SIGBUS on macOS. `None` in tests
+    /// and non-server mode, where a transient connection is opened on demand.
+    pub job_queue: Option<Arc<Mutex<nestweaver_engine::jobs::JobQueue>>>,
     /// Path to instance.toml for hot-reload. `None` when no config was supplied.
     pub config_path: Option<std::path::PathBuf>,
     /// Channel to send commands to the live poll scheduler. `None` when no

@@ -2858,6 +2858,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args)
                 {
+                    let value = unwrap_hybrid_payload(value);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3075,6 +3076,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "list_services", args)
                 {
+                    let value = unwrap_hybrid_payload(value);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -6516,7 +6518,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
                 try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
-                    .and_then(|v| serde_json::from_value(v).ok())
+                    .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
                     .unwrap_or_else(|| {
                         let store = open_store(db.as_deref()).expect("open_store");
                         store.list_projects().unwrap_or_default()
@@ -7197,7 +7199,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
                 {
-                    let detected: Vec<String> = serde_json::from_value(value).unwrap_or_default();
+                    let detected: Vec<String> =
+                        serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default();
                     if detected.is_empty() {
                         println!("No implicit projects detected in {}", vault.display());
                     } else {
@@ -8798,11 +8801,19 @@ fn try_hybrid_json_rpc(
     }
 }
 
+/// Unwrap the `{ "results": [...], "_meta": {...} }` envelope that the hybrid
+/// JSON-RPC path wraps around bare-array tool results, returning the inner
+/// `results` value. Bare (already-unwrapped) values — e.g. a local-daemon
+/// response — pass through unchanged, so every CLI consumer that deserializes a
+/// list result can route through this regardless of which path produced it.
+fn unwrap_hybrid_payload(value: serde_json::Value) -> serde_json::Value {
+    value.get("results").cloned().unwrap_or(value)
+}
+
 fn hybrid_search_candidates_from_value(
     value: serde_json::Value,
 ) -> Vec<nestweaver_engine::SymbolCandidate> {
-    let payload = value.get("results").cloned().unwrap_or(value);
-    serde_json::from_value(payload).unwrap_or_default()
+    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
 }
 
 fn run_brain(
@@ -10037,7 +10048,7 @@ fn run_brain(
                 if let Some(value) =
                     try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
                 {
-                    serde_json::from_value(value).unwrap_or_default()
+                    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
                 } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
                     store.list_vaults(inst_filter).unwrap_or_default()
                 } else {
@@ -13087,7 +13098,7 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 if let Some(value) =
                     try_hybrid_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
                 {
-                    serde_json::from_value(value)
+                    serde_json::from_value(unwrap_hybrid_payload(value))
                         .context("failed to deserialize repos from daemon response")?
                 } else {
                     // No daemon: read directly from the store. The CLI `index` command
@@ -13519,6 +13530,27 @@ mod hybrid_cli_tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "processPayment");
+    }
+
+    #[test]
+    fn unwrap_hybrid_payload_unwraps_results_envelope_for_list_consumers() {
+        // list-repos / list-services / detect-implicit-projects deserialize the
+        // result into a Vec, so they must strip the {results, _meta} envelope the
+        // hybrid path adds — otherwise they silently print "No ... found" against
+        // a fully populated daemon.
+        let wrapped = serde_json::json!({
+            "results": ["alpha", "beta"],
+            "_meta": { "sources": ["server"], "stale_repos": [] }
+        });
+        let items: Vec<String> =
+            serde_json::from_value(unwrap_hybrid_payload(wrapped)).unwrap_or_default();
+        assert_eq!(items, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // A bare array (local-daemon response) passes through unchanged.
+        let bare = serde_json::json!(["x"]);
+        let items: Vec<String> =
+            serde_json::from_value(unwrap_hybrid_payload(bare)).unwrap_or_default();
+        assert_eq!(items, vec!["x".to_string()]);
     }
 }
 

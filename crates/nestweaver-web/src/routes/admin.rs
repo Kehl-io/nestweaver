@@ -16,6 +16,47 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::state::{AdminState, PendingDevice};
+use nestweaver_engine::jobs::JobQueue;
+use std::sync::Mutex;
+
+// ── Shared job-queue access ────────────────────────────────────────────
+
+/// RAII handle to a job-queue connection for an admin operation. Wraps either
+/// the daemon's shared connection (held under its mutex) or a transient
+/// fallback. Derefs to [`JobQueue`] so every call site is uniform.
+pub(crate) enum JobQueueHandle<'a> {
+    Shared(std::sync::MutexGuard<'a, JobQueue>),
+    Owned(JobQueue),
+}
+
+impl std::ops::Deref for JobQueueHandle<'_> {
+    type Target = JobQueue;
+    fn deref(&self) -> &JobQueue {
+        match self {
+            JobQueueHandle::Shared(guard) => guard,
+            JobQueueHandle::Owned(queue) => queue,
+        }
+    }
+}
+
+/// Acquire a job-queue handle for an admin operation. Uses the daemon's shared
+/// connection when wired (server mode) — opening a *second* connection to the
+/// same SQLite file races the worker's WAL checkpoint and crashes the daemon
+/// with SIGBUS on macOS. Opens a transient connection only when no shared queue
+/// is present (tests / non-server mode).
+pub(crate) fn acquire_job_queue<'a>(
+    shared: &'a Option<Arc<Mutex<JobQueue>>>,
+    db_path: &std::path::Path,
+) -> anyhow::Result<JobQueueHandle<'a>> {
+    if let Some(shared) = shared {
+        let guard = shared
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job queue mutex poisoned"))?;
+        return Ok(JobQueueHandle::Shared(guard));
+    }
+    let jobs_path = nestweaver_engine::sidecar_path(db_path, ".jobs.sqlite");
+    Ok(JobQueueHandle::Owned(JobQueue::open(&jobs_path)?))
+}
 
 // ── Admin auth extractor ───────────────────────────────────────────────
 
@@ -273,13 +314,14 @@ pub async fn add_repo(
         })?;
     }
 
-    // Derive the jobs database path from the brain database path.
-    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    // Use the daemon's shared job-queue connection (or a transient fallback).
+    let job_queue = state.job_queue.clone();
+    let db_path = state.db_path.clone();
     let repo_url = req.url.clone();
     let branch = req.branch.clone();
 
     tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+        let queue = acquire_job_queue(&job_queue, &db_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
@@ -371,9 +413,10 @@ pub async fn remove_repo(
     // Purge queued jobs FIRST so no new workers can claim while we delete.
     if let Some(ref url) = repo_url {
         let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
-        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let job_queue = state.job_queue.clone();
+        let db_path = state.db_path.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(queue) = nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+            if let Ok(queue) = acquire_job_queue(&job_queue, &db_path) {
                 let _ = queue.cancel_repo(&canonical);
             }
         })
@@ -524,7 +567,8 @@ pub async fn trigger_reindex(
     Path(repo_uid): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let store = state.daemon_store.clone();
-    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let job_queue = state.job_queue.clone();
+    let db_path = state.db_path.clone();
     let uid = repo_uid.clone();
     let branch_map = state.webhook_repo_branches.clone();
 
@@ -540,7 +584,7 @@ pub async fn trigger_reindex(
             })?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("repo {} not found", uid)))?;
 
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+        let queue = acquire_job_queue(&job_queue, &db_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
@@ -599,10 +643,10 @@ pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -
     // Show pending jobs regardless of drain state so operators can see what
     // is waiting to be processed.
     let db_path = state.db_path.clone();
+    let job_queue = state.job_queue.clone();
     let (running_jobs, pending_count): (Option<Vec<serde_json::Value>>, Option<i64>) =
         tokio::task::spawn_blocking(move || {
-            let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-            match nestweaver_engine::jobs::JobQueue::open(&jobs_path) {
+            match acquire_job_queue(&job_queue, &db_path) {
                 Ok(q) => {
                     let running = q.running_jobs().ok().map(|jobs| {
                         jobs.into_iter()
@@ -678,10 +722,11 @@ pub async fn list_dead_letter(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
-    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let job_queue = state.job_queue.clone();
+    let db_path = state.db_path.clone();
 
     let entries = tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+        let queue = acquire_job_queue(&job_queue, &db_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
@@ -735,13 +780,14 @@ pub async fn retry_dead_letter(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
-    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let job_queue = state.job_queue.clone();
+    let db_path = state.db_path.clone();
     let job_id: i64 = id
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid job id: {id}")))?;
 
     let retried = tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+        let queue = acquire_job_queue(&job_queue, &db_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
@@ -780,13 +826,14 @@ pub async fn dismiss_dead_letter(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
-    let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+    let job_queue = state.job_queue.clone();
+    let db_path = state.db_path.clone();
     let job_id: i64 = id
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid job id: {id}")))?;
 
     let dismissed = tokio::task::spawn_blocking(move || {
-        let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).map_err(|e| {
+        let queue = acquire_job_queue(&job_queue, &db_path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open job queue: {e}"),
@@ -835,6 +882,7 @@ pub async fn reload_config(
     let path = config_path.clone();
     let store = state.daemon_store.clone();
     let db_path = state.db_path.clone();
+    let job_queue = state.job_queue.clone();
     let message = tokio::task::spawn_blocking(move || {
         match nestweaver_engine::InstanceConfig::from_file(&path) {
             Ok(cfg) => {
@@ -846,8 +894,7 @@ pub async fn reload_config(
                 );
 
                 // ── Reconcile declared repos vs indexed repos ─────────
-                let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-                let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
+                let queue = acquire_job_queue(&job_queue, &db_path).ok();
 
                 // Collect declared repo URLs from config.
                 let declared_urls: std::collections::HashSet<String> =
@@ -1037,10 +1084,10 @@ pub async fn get_status(
     // persisted queue is the operator-facing source of truth, especially while
     // workers are drained and the atomic worker-depth hint is zero.
     let db_path = state.db_path.clone();
+    let job_queue = state.job_queue.clone();
     let (pending_count, dead_letter_count, running_count) =
         tokio::task::spawn_blocking(move || {
-            let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
-            let queue = nestweaver_engine::jobs::JobQueue::open(&jobs_path).ok();
+            let queue = acquire_job_queue(&job_queue, &db_path).ok();
             let depth = queue.as_ref().and_then(|q| q.queue_depth().ok());
             let dead = depth.as_ref().map(|d| d.dead_letter as usize).unwrap_or(0);
             let running = depth.as_ref().map(|d| d.running as u32).unwrap_or(0);
@@ -1581,7 +1628,46 @@ mod tests {
             webhook_repo_branches: None,
             write_mutex: None,
             backup_quiesced: None,
+            job_queue: None,
         })
+    }
+
+    #[test]
+    fn acquire_job_queue_uses_shared_connection_when_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.lbug");
+        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        let shared = Arc::new(Mutex::new(
+            nestweaver_engine::jobs::JobQueue::open(&jobs_path).expect("open jobs"),
+        ));
+        // Enqueue through the shared connection.
+        {
+            let q = shared.lock().unwrap();
+            q.upsert(
+                "repo1",
+                "https://example.com/repo1",
+                nestweaver_engine::jobs::JobTrigger::Unindexed,
+                None,
+            )
+            .expect("upsert");
+        }
+        let opt = Some(Arc::clone(&shared));
+
+        let handle = acquire_job_queue(&opt, &db_path).expect("acquire");
+        // Must return the SHARED variant — never open a second connection that
+        // would race the worker's WAL checkpoint (the SIGBUS regression).
+        assert!(matches!(handle, JobQueueHandle::Shared(_)));
+        // And it operates on the same data enqueued above.
+        assert_eq!(handle.queue_depth().expect("depth").pending, 1);
+    }
+
+    #[test]
+    fn acquire_job_queue_falls_back_when_not_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.lbug");
+        let handle = acquire_job_queue(&None, &db_path).expect("acquire");
+        assert!(matches!(handle, JobQueueHandle::Owned(_)));
+        assert_eq!(handle.queue_depth().expect("depth").pending, 0);
     }
 
     fn test_router() -> Router {
@@ -1763,6 +1849,7 @@ url = "https://github.com/example/existing"
             webhook_repo_branches: None,
             write_mutex: None,
             backup_quiesced: None,
+            job_queue: None,
         });
 
         let app = Router::new()

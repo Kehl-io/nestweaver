@@ -3127,6 +3127,62 @@ fn validate_token_lengths(
             );
         }
     }
+    // The admin token must differ from the query (auth) token. Admin privilege is
+    // granted on an admin-token match, so an identical query token would silently
+    // make every query-token holder an admin.
+    if let (Some(auth), Some(admin)) = (auth_token, admin_token)
+        && auth == admin
+    {
+        anyhow::bail!(
+            "admin token must differ from the query (auth) token; identical tokens \
+             grant admin access to every query-token holder"
+        );
+    }
+    Ok(())
+}
+
+/// Enforce the bind-scope security invariants for a server-mode listener:
+/// a non-loopback bind must be both authenticated (`--auth-token`) and
+/// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
+/// that cannot be parsed as a socket address (e.g. `localhost:9378`), retain
+/// the pre-existing auth-only requirement. Returns the first violated invariant.
+fn validate_bind_security(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let tls_enabled = tls_cert.is_some() && tls_key.is_some();
+    match bind_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => { /* safe — loopback is process-local */ }
+        Ok(addr) => {
+            // Non-loopback bind: the listener is reachable from the network, so it
+            // must be both authenticated and encrypted.
+            if auth_token.is_none() {
+                anyhow::bail!(
+                    "Cannot bind to non-loopback address {addr} without --auth-token; \
+                     the server would be fully open to the network"
+                );
+            }
+            if !tls_enabled {
+                anyhow::bail!(
+                    "Cannot bind to non-loopback address {addr} without TLS; bearer \
+                     tokens and source data would be sent in cleartext. Provide \
+                     --tls-cert and --tls-key (or bind to a loopback address)."
+                );
+            }
+        }
+        Err(_) => {
+            // Bind string isn't a socket address (e.g. `localhost:9378`); we cannot
+            // confirm it is loopback. Preserve the auth-only requirement.
+            if auth_token.is_none() {
+                anyhow::bail!(
+                    "Cannot determine if bind address '{bind_addr}' is loopback. \
+                     Use --auth-token or specify an IP address."
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3327,29 +3383,17 @@ pub async fn run_server(
         &admin_token,
     )?;
 
-    // C1: Reject non-loopback bind without an auth token — the server would
-    // be fully open to the network because the auth interceptor passes all
-    // requests when no token is configured.
-    if let Some(ref opts) = server_opts
-        && opts.auth_token.is_none()
-    {
-        match opts.bind_addr.parse::<std::net::SocketAddr>() {
-            Ok(addr) if addr.ip().is_loopback() => { /* safe — loopback */ }
-            Ok(addr) => {
-                anyhow::bail!(
-                    "Cannot bind to non-loopback address {} without --auth-token; \
-                     the server would be fully open to the network",
-                    addr
-                );
-            }
-            Err(_) => {
-                anyhow::bail!(
-                    "Cannot determine if bind address '{}' is loopback. \
-                     Use --auth-token or specify an IP address.",
-                    opts.bind_addr
-                );
-            }
-        }
+    // Enforce bind-scope security invariants in one place: a non-loopback bind
+    // must be authenticated (--auth-token) AND TLS-encrypted (--tls-cert/--tls-key).
+    // Without auth the interceptor passes all requests; without TLS the bearer
+    // token and source travel in cleartext. See `validate_bind_security`.
+    if let Some(ref opts) = server_opts {
+        validate_bind_security(
+            &opts.bind_addr,
+            &opts.auth_token,
+            &opts.tls_cert,
+            &opts.tls_key,
+        )?;
     }
 
     // Reject any present webhook secret that is too short to be safe.
@@ -3754,6 +3798,10 @@ pub async fn run_server(
                 webhook_repo_branches: webhook_repo_branches.clone(),
                 write_mutex: Some(Arc::clone(&state.write_mutex)),
                 backup_quiesced: Some(Arc::clone(&state.backup_quiesced)),
+                // Share the daemon's single job-queue connection. Opening a
+                // second connection from admin routes races the worker's WAL
+                // checkpoint and crashes with SIGBUS on macOS.
+                job_queue: shared_job_queue_opt.clone(),
             });
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).
@@ -4704,12 +4752,53 @@ mod startup_helper_tests {
         let tok = Some("a".repeat(MIN_TOKEN_LEN));
         assert_eq!(tok.as_ref().unwrap().len(), MIN_TOKEN_LEN);
         assert!(validate_token_lengths(&tok, &None).is_ok());
-        assert!(validate_token_lengths(&tok, &tok).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_rejects_equal_auth_and_admin() {
+        // A query (auth) token equal to the admin token collapses the privilege
+        // boundary: admin access is granted on admin-token match, so an identical
+        // query token would make every query-token holder an admin.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let other = Some("b".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&tok, &tok).is_err());
+        // Distinct tokens of valid length remain acceptable.
+        assert!(validate_token_lengths(&tok, &other).is_ok());
     }
 
     #[test]
     fn validate_token_lengths_accepts_none() {
         assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_security_requires_tls_for_non_loopback() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+
+        // Non-loopback bind with an auth token but NO TLS must be rejected:
+        // bearer tokens and source would travel in cleartext.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None).is_err());
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &None).is_err());
+
+        // Non-loopback bind with auth token AND TLS is acceptable.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_security_requires_auth_for_non_loopback() {
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        // Preserves the pre-existing invariant: non-loopback requires auth even with TLS.
+        assert!(validate_bind_security("0.0.0.0:9378", &None, &cert, &key).is_err());
+    }
+
+    #[test]
+    fn validate_bind_security_allows_loopback_plaintext() {
+        // Loopback is process-local; no auth/TLS required (the fast local path).
+        assert!(validate_bind_security("127.0.0.1:9378", &None, &None, &None).is_ok());
+        assert!(validate_bind_security("[::1]:9378", &None, &None, &None).is_ok());
     }
 
     #[test]

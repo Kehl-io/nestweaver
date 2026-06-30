@@ -344,15 +344,20 @@ fn extract_symbol_name_from_reason(reason: &str) -> Option<String> {
     None
 }
 
+/// Render a human label for a change_kind. The input is the SCREAMING_SNAKE
+/// token the impact emitter (`analyze_impact` / the ImpactAnalysis RPC) writes
+/// on the wire — keep these arms in lockstep with the emitted kinds in
+/// `atomic_changes.rs`; the contract is exercised by
+/// `change_kind_labels_match_emitted_screaming_snake`.
 fn format_change_kind(kind: &str) -> &str {
     match kind {
-        "SignatureChanged" => "signature changed",
-        "SymbolRemoved" => "removed",
-        "ExportRemoved" => "export removed",
-        "SymbolRenamed" => "renamed",
-        "SymbolMoved" => "moved",
-        "SymbolAdded" => "added",
-        "ExportAdded" => "export added",
+        "SIGNATURE_CHANGED" => "signature changed",
+        "SYMBOL_REMOVED" => "removed",
+        "EXPORT_REMOVED" => "export removed",
+        "SYMBOL_RENAMED" => "renamed",
+        "SYMBOL_MOVED" => "moved",
+        "SYMBOL_ADDED" => "added",
+        "EXPORT_ADDED" => "export added",
         _ => kind,
     }
 }
@@ -635,7 +640,7 @@ mod tests {
     fn make_impact(severity: ImpactSeverity, name: &str, repo: &str) -> ImpactResult {
         ImpactResult {
             change_canonical_id: format!("change_{}", name),
-            change_kind: "SignatureChanged".to_string(),
+            change_kind: "SIGNATURE_CHANGED".to_string(),
             affected_canonical_id: format!("affected_{}", name),
             affected_name: format!("caller_of_{}", name),
             affected_repo_url: format!("https://github.com/org/{}", repo),
@@ -644,6 +649,32 @@ mod tests {
             affected_signature: format!("fn {}()", name),
             severity,
             reason: format!("{}(): parameter count changed (2 -> 3)", name),
+        }
+    }
+
+    #[test]
+    fn change_kind_labels_match_emitted_screaming_snake() {
+        // The impact emitter (`analyze_impact` / the ImpactAnalysis RPC) writes
+        // change_kind as SCREAMING_SNAKE on the wire. The formatter must render a
+        // human label for every emitted kind; otherwise CI comments leak raw
+        // machine tokens like "SIGNATURE_CHANGED". This crosses the emitter↔
+        // formatter contract seam that the casing bug slipped through.
+        let emitted = [
+            "SIGNATURE_CHANGED",
+            "SYMBOL_REMOVED",
+            "SYMBOL_RENAMED",
+            "SYMBOL_MOVED",
+            "EXPORT_REMOVED",
+            "EXPORT_ADDED",
+            "SYMBOL_ADDED",
+        ];
+        for kind in emitted {
+            let label = format_change_kind(kind);
+            assert_ne!(
+                label, kind,
+                "format_change_kind left {kind} as a raw machine token; emitter \
+                 and formatter casing disagree"
+            );
         }
     }
 
@@ -670,6 +701,9 @@ mod tests {
         assert!(md.contains("BREAKING"));
         assert!(md.contains("<details>"));
         assert!(md.contains("processPayment"));
+        // The human change-kind label must be rendered, not the raw wire token.
+        assert!(md.contains("signature changed"));
+        assert!(!md.contains("SIGNATURE_CHANGED"));
     }
 
     #[test]
@@ -700,7 +734,7 @@ mod tests {
         for i in 0..100 {
             impacts.push(ImpactResult {
                 change_canonical_id: format!("change_{}", i),
-                change_kind: "SignatureChanged".to_string(),
+                change_kind: "SIGNATURE_CHANGED".to_string(),
                 affected_canonical_id: format!("affected_{}", i),
                 affected_name: format!("caller_{}", i),
                 affected_repo_url: format!("https://github.com/org/repo-{}", i % 5),
@@ -756,7 +790,7 @@ mod tests {
         for i in 0..500 {
             impacts.push(ImpactResult {
                 change_canonical_id: format!("change_{}", i),
-                change_kind: "SignatureChanged".to_string(),
+                change_kind: "SIGNATURE_CHANGED".to_string(),
                 affected_canonical_id: format!("affected_{}", i),
                 affected_name: format!("caller_of_very_long_function_name_{}", i),
                 affected_repo_url: format!(

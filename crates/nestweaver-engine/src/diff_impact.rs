@@ -286,15 +286,22 @@ fn compute_rename_moves(
     let new_parsed = nestweaver_parser::parse_source(Path::new(new_path), new_content)?;
 
     // Build a set of (name, kind) for symbols in the new file.
-    let new_symbols: std::collections::HashSet<(&str, nestweaver_schema::SymbolKind)> =
-        new_parsed.symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+    let new_symbols: std::collections::HashSet<(&str, nestweaver_schema::SymbolKind)> = new_parsed
+        .symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind))
+        .collect();
 
     let mut moves = Vec::new();
     for old_sym in &old_parsed.symbols {
         if new_symbols.contains(&(old_sym.name.as_str(), old_sym.kind)) {
             let scope = old_sym.scope_chain.as_deref().unwrap_or("");
-            let canonical_id =
-                nestweaver_schema::uid::canonical_symbol_id(repo_url, old_path, &old_sym.name, scope);
+            let canonical_id = nestweaver_schema::uid::canonical_symbol_id(
+                repo_url,
+                old_path,
+                &old_sym.name,
+                scope,
+            );
             moves.push(AtomicChange::SymbolMoved {
                 canonical_id,
                 name: old_sym.name.clone(),
@@ -315,7 +322,7 @@ mod tests {
         let impacts = vec![
             ImpactResult {
                 change_canonical_id: "a".into(),
-                change_kind: "SignatureChanged".into(),
+                change_kind: "SIGNATURE_CHANGED".into(),
                 affected_canonical_id: "b".into(),
                 affected_name: "foo".into(),
                 affected_repo_url: "https://github.com/test/repo".into(),
@@ -327,7 +334,7 @@ mod tests {
             },
             ImpactResult {
                 change_canonical_id: "c".into(),
-                change_kind: "SymbolMoved".into(),
+                change_kind: "SYMBOL_MOVED".into(),
                 affected_canonical_id: "d".into(),
                 affected_name: "bar".into(),
                 affected_repo_url: "https://github.com/test/repo".into(),
@@ -339,7 +346,7 @@ mod tests {
             },
             ImpactResult {
                 change_canonical_id: "e".into(),
-                change_kind: "SymbolAdded".into(),
+                change_kind: "SYMBOL_ADDED".into(),
                 affected_canonical_id: "f".into(),
                 affected_name: "baz".into(),
                 affected_repo_url: "https://github.com/test/repo".into(),
