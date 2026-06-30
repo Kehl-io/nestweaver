@@ -118,6 +118,9 @@ pub struct AdminStatus {
     pub queue_depth: u32,
     pub drained: bool,
     pub version: String,
+    /// Size of the brain database file in bytes. Used by the frontend
+    /// Overview dashboard to display the database size.
+    pub db_size_bytes: u64,
     // Nested shapes expected by the React admin dashboard.
     pub repos: RepoStats,
     pub symbols: SymbolStats,
@@ -247,6 +250,34 @@ pub async fn add_repo(
         }
     }
 
+    // Persist admin-added repos into instance config FIRST so scheduler/webhook
+    // allowlisting survives daemon restarts. If this fails, we never enqueue the
+    // index job — the config is the source of truth for what should be indexed.
+    if let Some(config_path) = state.config_path.clone() {
+        let repo_url = req.url.clone();
+        let branch = req.branch.clone();
+        tokio::task::spawn_blocking(move || {
+            nestweaver_engine::append_repo_to_config_file(
+                &config_path,
+                &repo_url,
+                branch.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task panicked: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist repo config: {e}"),
+            )
+        })?;
+    }
+
     // Derive the jobs database path from the brain database path.
     let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
     let repo_url = req.url.clone();
@@ -282,33 +313,6 @@ pub async fn add_repo(
             format!("task panicked: {e}"),
         )
     })??;
-
-    // Persist admin-added repos into instance config so scheduler/webhook
-    // allowlisting survives daemon restarts.
-    if let Some(config_path) = state.config_path.clone() {
-        let repo_url = req.url.clone();
-        let branch = req.branch.clone();
-        tokio::task::spawn_blocking(move || {
-            nestweaver_engine::append_repo_to_config_file(
-                &config_path,
-                &repo_url,
-                branch.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("task panicked: {e}"),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persist repo config: {e}"),
-            )
-        })?;
-    }
 
     // Update live scheduler so the new repo is polled without restart.
     if let Some(ref tx) = state.scheduler_tx {
@@ -381,6 +385,33 @@ pub async fn remove_repo(
         .await;
     }
 
+    // Derive the scheduler name from the config BEFORE removing the config
+    // entry — remove_repo_from_config_file deletes the entry, so the name
+    // lookup would fail if done afterwards.
+    let sched_id = {
+        let url_derived = repo_url
+            .as_deref()
+            .map(nestweaver_engine::pull::repo_name_from_url)
+            .unwrap_or_else(|| repo_uid.clone());
+        if let Some(ref config_path) = state.config_path {
+            nestweaver_engine::InstanceConfig::from_file(config_path)
+                .ok()
+                .and_then(|cfg| {
+                    let canonical = repo_url
+                        .as_deref()
+                        .map(nestweaver_engine::jobs::canonical_repo_id)
+                        .unwrap_or_default();
+                    cfg.repos
+                        .iter()
+                        .find(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url) == canonical)
+                        .and_then(|r| r.name.clone())
+                })
+                .unwrap_or(url_derived)
+        } else {
+            url_derived
+        }
+    };
+
     // Persist the removal before deleting graph data so a failed config write
     // cannot leave the next restart re-admitting the repo silently.
     if let (Some(config_path), Some(url)) = (state.config_path.clone(), repo_url.clone()) {
@@ -438,31 +469,8 @@ pub async fn remove_repo(
         )
     })??;
 
-    // Remove from live scheduler.
+    // Remove from live scheduler (using the name derived before config removal).
     if let Some(ref tx) = state.scheduler_tx {
-        // The scheduler seeds repos with `repo_cfg.name.unwrap_or(repo_name_from_url(...))`.
-        // To match that, look up the configured name from the instance config first.
-        let url_derived = repo_url
-            .as_deref()
-            .map(nestweaver_engine::pull::repo_name_from_url)
-            .unwrap_or_else(|| repo_uid.clone());
-        let sched_id = if let Some(ref config_path) = state.config_path {
-            nestweaver_engine::InstanceConfig::from_file(config_path)
-                .ok()
-                .and_then(|cfg| {
-                    let canonical = repo_url
-                        .as_deref()
-                        .map(nestweaver_engine::jobs::canonical_repo_id)
-                        .unwrap_or_default();
-                    cfg.repos
-                        .iter()
-                        .find(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url) == canonical)
-                        .and_then(|r| r.name.clone())
-                })
-                .unwrap_or(url_derived)
-        } else {
-            url_derived
-        };
         let _ = tx
             .send(nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo {
                 repo_id: sched_id.clone(),
@@ -1040,6 +1048,10 @@ pub async fn get_status(
     let queue_depth =
         pending_count.unwrap_or_else(|| state.indexing_queue_depth.load(Ordering::Relaxed));
 
+    let db_size_bytes = std::fs::metadata(&state.db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     Json(AdminStatus {
         instance_id: state.instance_id.clone(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
@@ -1050,6 +1062,7 @@ pub async fn get_status(
         queue_depth,
         drained: state.drained.load(Ordering::Relaxed),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        db_size_bytes,
         repos: RepoStats {
             total: repo_count,
             indexed: repo_count,
@@ -1418,8 +1431,8 @@ pub async fn device_authorize(
     };
 
     let base = verification_base(&headers);
-    let verification_uri = format!("{base}/admin");
-    let verification_uri_complete = format!("{base}/admin?user_code={user_code}");
+    let verification_uri = format!("{base}/admin/device-approve");
+    let verification_uri_complete = format!("{base}/admin/device-approve?user_code={user_code}");
 
     Ok(Json(DeviceAuthResponse {
         device_code,

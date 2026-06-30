@@ -10,6 +10,7 @@ import { Repos } from "./pages/admin/Repos";
 import { Queue } from "./pages/admin/Queue";
 import { DeadLetter } from "./pages/admin/DeadLetter";
 import { Settings } from "./pages/admin/Settings";
+import { DeviceApprove } from "./pages/admin/DeviceApprove";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -22,6 +23,7 @@ createRoot(document.getElementById("root")!).render(
           <Route path="queue" element={<Queue />} />
           <Route path="dead-letter" element={<DeadLetter />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="device-approve" element={<DeviceApprove />} />
         </Route>
         <Route path="*" element={<App />} />
       </Routes>
