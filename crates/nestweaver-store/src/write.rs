@@ -1728,11 +1728,14 @@ impl GraphStore {
         // Count notes before deletion so we can return the count.
         let count = {
             let conn = self.conn()?;
-            let safe_vid = vault_uid.replace('\'', "\\'");
+            let mut stmt = conn
+                .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
+                .map_err(|e| StoreError::Query(format!("prepare count: {e}")))?;
             let rows = conn
-                .query(&format!(
-                    "MATCH (n:Note) WHERE n.vault_uid = '{safe_vid}' RETURN count(n)"
-                ))
+                .execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+                )
                 .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
@@ -1764,12 +1767,22 @@ impl GraphStore {
         //    Uses a cross-node join: LadybugDB supports `MATCH (a), (b) WHERE a.prop = b.prop`.
         //    Best-effort: silently skip if the table does not exist on older DBs.
         {
-            let safe_vid = vault_uid.replace('\'', "\\'");
-            if let Err(e) = conn.query(&format!(
-                "MATCH (n:Note), (u:UnresolvedWikilink) \
-                 WHERE n.vault_uid = '{safe_vid}' AND u.source_note_uid = n.uid \
-                 DELETE u"
-            )) {
+            let uwl_result = (|| -> Result<(), StoreError> {
+                let mut stmt = conn
+                    .prepare(
+                        "MATCH (n:Note), (u:UnresolvedWikilink) \
+                         WHERE n.vault_uid = $vid AND u.source_note_uid = n.uid \
+                         DELETE u",
+                    )
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                Ok(())
+            })();
+            if let Err(e) = uwl_result {
                 tracing::trace!("delete_vault_cascade: UnresolvedWikilink delete skipped: {e}");
             }
         }
