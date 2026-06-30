@@ -49,7 +49,7 @@ runs:
         else
           URL="https://github.com/Kehl-io/nestweaver/releases/download/v${VERSION}/nestweaver-${{ runner.os }}-${{ runner.arch }}"
         fi
-        curl -sSL "$URL" -o /usr/local/bin/nestweaver
+        curl -fsSL "$URL" -o /usr/local/bin/nestweaver
         chmod +x /usr/local/bin/nestweaver
 
     - name: Run impact analysis
@@ -86,7 +86,7 @@ runs:
         echo "impact-count=$TOTAL" >> "$GITHUB_OUTPUT"
 
     - name: Format and post comment
-      if: inputs.comment == 'true'
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
