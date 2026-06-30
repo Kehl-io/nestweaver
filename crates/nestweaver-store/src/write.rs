@@ -645,18 +645,42 @@ impl GraphStore {
         service_symbol_edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
+        Self::bulk_index_write_on(
+            &conn,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+        )?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
 
+    /// Like [`bulk_index_write`](Self::bulk_index_write) but operates on an
+    /// existing connection/transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_index_write_on(
+        conn: &lbug::Connection<'_>,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         // Insert file nodes.
-        Self::batch_insert_files_on(&conn, files)?;
+        Self::batch_insert_files_on(conn, files)?;
 
         // Insert symbol nodes.
-        Self::batch_insert_symbols_on(&conn, symbols)?;
+        Self::batch_insert_symbols_on(conn, symbols)?;
 
         // Insert REPO_HAS_FILE edges.
-        Self::batch_insert_repo_file_edges_on(&conn, repo_file_edges)?;
+        Self::batch_insert_repo_file_edges_on(conn, repo_file_edges)?;
 
         // Insert FILE_HAS_SYMBOL edges.
-        Self::batch_insert_file_symbol_edges_on(&conn, file_symbol_edges)?;
+        Self::batch_insert_file_symbol_edges_on(conn, file_symbol_edges)?;
 
         // Insert service nodes.
         if !services.is_empty() {
@@ -670,10 +694,45 @@ impl GraphStore {
         }
 
         // Insert SERVICE_HAS_SYMBOL edges.
-        Self::batch_insert_service_symbol_edges_on(&conn, service_symbol_edges)?;
+        Self::batch_insert_service_symbol_edges_on(conn, service_symbol_edges)?;
+
+        Ok(())
+    }
+
+    /// Atomically delete old repo data and insert the replacement in a single
+    /// transaction. This prevents concurrent readers from seeing an empty repo
+    /// between the delete and the insert (the concurrency bug where the
+    /// `write_mutex` serialises writes but does not block reads).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_reindex_write(
+        &self,
+        repo_uid: &str,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(usize, usize), StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Delete old data within the transaction.
+        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        Self::clear_repo_derived_nodes_on(&conn, repo_uid)?;
+
+        // Insert replacement data in the same transaction.
+        Self::bulk_index_write_on(
+            &conn,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+        )?;
 
         self.commit_transaction(&conn)?;
-        Ok(())
+        Ok(counts)
     }
 
     /// Wrap all markdown vault inserts in a single transaction.
@@ -2228,9 +2287,19 @@ impl GraphStore {
         &self,
         repo_uid: &str,
     ) -> Result<(usize, usize), StoreError> {
-        let rid = lbug::Value::String(repo_uid.to_string());
-
         let conn = self.begin_transaction()?;
+        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        self.commit_transaction(&conn)?;
+        Ok(counts)
+    }
+
+    /// Like [`bulk_delete_repo_files_and_symbols`](Self::bulk_delete_repo_files_and_symbols)
+    /// but operates on an existing connection/transaction.
+    pub fn bulk_delete_repo_files_and_symbols_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(usize, usize), StoreError> {
+        let rid = lbug::Value::String(repo_uid.to_string());
 
         // Count before deleting so the caller can log what was removed.
         let sym_count: usize = {
@@ -2278,7 +2347,6 @@ impl GraphStore {
         conn.execute(&mut stmt, vec![("rid", rid)])
             .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
 
-        self.commit_transaction(&conn)?;
         Ok((file_count, sym_count))
     }
 
@@ -2309,15 +2377,24 @@ impl GraphStore {
     /// a no-op for repos with no services/contracts.
     pub fn clear_repo_derived_nodes(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::clear_repo_derived_nodes_on(&conn, repo_uid)
+    }
+
+    /// Like [`clear_repo_derived_nodes`](Self::clear_repo_derived_nodes) but
+    /// operates on an existing connection/transaction.
+    pub fn clear_repo_derived_nodes_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         // Service nodes for this repo.
         exec_params(
-            &conn,
+            conn,
             "MATCH (s:Service {repo_uid: $uid}) DETACH DELETE s",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         )?;
         // Contract nodes for this repo (table may not exist on older DBs).
         if let Err(e) = exec_params(
-            &conn,
+            conn,
             "MATCH (c:Contract {repo_uid: $uid}) DETACH DELETE c",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         ) {

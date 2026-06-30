@@ -1039,37 +1039,40 @@ where
     // 2b. When re-indexing over an existing store (tiered detection is active
     //     and some files changed), clean up old File nodes and their symbols
     //     for files we are about to re-insert.
-    if existing_repo.is_some() {
-        if files_unchanged == 0 {
-            // Force re-index: all files are being replaced. Bulk delete is O(1) queries.
-            let _ = store.bulk_delete_repo_files_and_symbols(&r_uid);
-        } else {
-            // Incremental: only delete the specific files we're about to re-insert.
-            for file in &all_files {
-                // Remove old symbols belonging to this file.
-                let _ = store.delete_symbols_in_file(&r_uid, &file.path);
-                // Remove old File node.
-                let _ = store.delete_file_node(&file.uid);
-            }
-            // Prune File/Symbol nodes for files that vanished since the last
-            // index (e.g. a force-push that removed a file). The incremental
-            // branch above only deletes files being re-inserted, so without
-            // this pass removed files would linger. `present_files` covers
-            // Unchanged/CachedParsed/Parsed files — anything in the store but
-            // not present anymore is stale and gets dropped.
-            if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
-                for (f_uid, path) in &stored_files {
-                    if !present_files.contains(path) {
-                        let _ = store.delete_symbols_in_file(&r_uid, path);
-                        let _ = store.delete_file_node(f_uid);
-                    }
+    //
+    //     For the incremental path, per-file deletes happen here (the window
+    //     is tiny per-file). For the force re-index path, the bulk delete is
+    //     deferred to step 3 and runs inside the same transaction as the
+    //     insert — see `bulk_reindex_write` — to prevent concurrent readers
+    //     from seeing zero symbols while the CPU-heavy service-grouping work
+    //     runs between delete and insert.
+    let force_reindex = existing_repo.is_some() && files_unchanged == 0;
+    if existing_repo.is_some() && !force_reindex {
+        // Incremental: only delete the specific files we're about to re-insert.
+        for file in &all_files {
+            // Remove old symbols belonging to this file.
+            let _ = store.delete_symbols_in_file(&r_uid, &file.path);
+            // Remove old File node.
+            let _ = store.delete_file_node(&file.uid);
+        }
+        // Prune File/Symbol nodes for files that vanished since the last
+        // index (e.g. a force-push that removed a file). The incremental
+        // branch above only deletes files being re-inserted, so without
+        // this pass removed files would linger. `present_files` covers
+        // Unchanged/CachedParsed/Parsed files — anything in the store but
+        // not present anymore is stale and gets dropped.
+        if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
+            for (f_uid, path) in &stored_files {
+                if !present_files.contains(path) {
+                    let _ = store.delete_symbols_in_file(&r_uid, path);
+                    let _ = store.delete_file_node(f_uid);
                 }
             }
         }
-        // BUG FIX: clear repo-scoped derived nodes (Service, Contract) before
-        // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID is
-        // derived deterministically from repo_uid + directory, so a forced
-        // re-index would otherwise collide on the primary key. Idempotent.
+        // Clear repo-scoped derived nodes (Service, Contract) before
+        // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID
+        // is derived deterministically from repo_uid + directory, so an
+        // incremental re-index would otherwise collide on the primary key.
         let _ = store.clear_repo_derived_nodes(&r_uid);
     }
 
@@ -1117,16 +1120,33 @@ where
         .map(|(s, sym)| (s.as_str(), sym.as_str()))
         .collect();
 
-    store
-        .bulk_index_write(
-            &all_files,
-            &all_symbols,
-            &repo_file_refs,
-            &file_sym_refs,
-            &all_services,
-            &svc_sym_refs,
-        )
-        .context("bulk_index_write")?;
+    if force_reindex {
+        // Atomic delete+insert: old data is only removed within the same
+        // transaction that inserts the replacement, so concurrent readers
+        // never see an empty repo.
+        store
+            .bulk_reindex_write(
+                &r_uid,
+                &all_files,
+                &all_symbols,
+                &repo_file_refs,
+                &file_sym_refs,
+                &all_services,
+                &svc_sym_refs,
+            )
+            .context("bulk_reindex_write")?;
+    } else {
+        store
+            .bulk_index_write(
+                &all_files,
+                &all_symbols,
+                &repo_file_refs,
+                &file_sym_refs,
+                &all_services,
+                &svc_sym_refs,
+            )
+            .context("bulk_index_write")?;
+    }
     tracing::info!(
         files_written = all_files.len(),
         symbols_written = all_symbols.len(),
