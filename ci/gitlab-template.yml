@@ -56,7 +56,7 @@
     - |
       # Skip the comment if the server was unavailable — there's no
       # useful data to post and "No impact" would be misleading.
-      if jq -e '.error' impact.json > /dev/null 2>&1; then
+      if jq -e '.error // empty | select(type == "string" and . != "")' impact.json > /dev/null 2>&1; then
         ERROR_MSG=$(jq -r '.error' impact.json)
         echo "WARNING: Skipping MR comment — impact analysis unavailable: ${ERROR_MSG}"
       else

@@ -3,7 +3,6 @@ services:
     build: .
     # image: ghcr.io/kehl-io/nestweaver:latest  # when published
     ports:
-      - "9377:9377"   # Web UI + Prometheus metrics
       - "9378:9378"   # gRPC
       - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:

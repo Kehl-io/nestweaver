@@ -87,3 +87,19 @@ nestweaver index --repo . --with-git-activity
 ```
 
 This enables co-change mining (finds files that always change together) and git recency scoring for ranking. Results are stored as sidecars alongside the database.
+
+## Server Mode
+
+NestWeaver can connect to a shared upstream server for org-wide code intelligence.
+
+Connect to a server:
+```bash
+nestweaver connect <url> --token <bearer-token>
+```
+
+Or set the environment variable:
+```bash
+export NESTWEAVER_UPSTREAM=https://nestweaver.example.com
+```
+
+Local queries are automatically augmented with server-side results when an upstream is configured. See `AGENTS.md` for detailed routing behavior and configuration.
