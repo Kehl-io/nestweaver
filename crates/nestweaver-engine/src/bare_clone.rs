@@ -37,7 +37,12 @@ impl BareClone {
     /// bare repo. Without this, `git fetch origin <branch>` in a bare clone
     /// only updates FETCH_HEAD, and `rev-parse origin/<branch>` fails.
     pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
+        // SSRF guard: validate + resolve the remote immediately before fetching,
+        // pinning the connect IP for http(s) (DNS-rebinding defense). file://
+        // passes through with no args.
+        let guard = crate::ssrf::guard_git_url(&self.url)?;
         let mut cmd = Command::new("git");
+        cmd.args(&guard.config_args);
         cmd.arg("-C").arg(&self.path).args(["fetch", "origin"]);
         if let Some(b) = branch {
             cmd.arg(format!("{b}:refs/heads/{b}"));
@@ -104,7 +109,11 @@ impl BareClone {
 
     /// Check remote HEAD via `git ls-remote` (lightweight, no object transfer).
     pub fn ls_remote_head(&self) -> Result<String> {
-        let output = Command::new("git")
+        // SSRF guard before contacting the remote (see `fetch_branch`).
+        let guard = crate::ssrf::guard_git_url(&self.url)?;
+        let mut cmd = Command::new("git");
+        cmd.args(&guard.config_args);
+        let output = cmd
             .arg("-C")
             .arg(&self.path)
             .args(["ls-remote", "origin", "HEAD"])
@@ -176,12 +185,20 @@ impl BareCloneWorkspace {
             }
         }
 
+        // SSRF guard: validate the URL and resolve+pin the remote IP BEFORE any
+        // filesystem mutation or git spawn. Rejects internal targets and
+        // un-pinnable schemes (git://) up front so no clone dir is created.
+        // file:// passes through with no args.
+        let guard = crate::ssrf::guard_git_url(url)?;
+
         // Remove any invalid remnant (or origin-mismatched clone) before cloning.
         if dest.exists() {
             std::fs::remove_dir_all(&dest).ok();
         }
 
-        let output = Command::new("git")
+        let mut cmd = Command::new("git");
+        cmd.args(&guard.config_args);
+        let output = cmd
             .args([
                 "clone",
                 "--filter=blob:none",
@@ -556,6 +573,26 @@ mod tests {
 
         let usage = ws.disk_usage().unwrap();
         assert!(usage > 0, "disk usage should be > 0");
+    }
+
+    #[test]
+    fn ensure_clone_rejects_internal_and_unpinnable_schemes() {
+        let tmp = TempDir::new().unwrap();
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+
+        // Internal IP literal and an un-pinnable git:// scheme must both be
+        // rejected by the SSRF guard BEFORE git is spawned — no clone dir.
+        for url in ["https://127.0.0.1/x", "git://github.com/x"] {
+            let res = ws.ensure_clone(url);
+            assert!(res.is_err(), "expected {url} to be rejected");
+
+            let name = crate::pull::clone_dir_name_from_url(url);
+            let dest = ws.root.join(format!("{}.git", name));
+            assert!(
+                !dest.exists(),
+                "no clone dir should be created for rejected {url}"
+            );
+        }
     }
 
     #[test]

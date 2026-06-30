@@ -101,6 +101,15 @@ pub async fn handle_webhook(
         return (StatusCode::BAD_REQUEST, "no repo URL in payload");
     };
 
+    // 2a. SSRF gate: reject a payload-supplied URL pointing at an internal/
+    // private target (or a disallowed scheme) before it can be enqueued and
+    // cloned. Synchronous checks only — the worker's clone/fetch-time guard
+    // (`ssrf::guard_git_url`) does the resolve-time pinning.
+    if nestweaver_engine::ssrf::validate_repo_url(&url).is_err() {
+        tracing::warn!(%url, "webhook rejected: repo URL failed SSRF validation");
+        return (StatusCode::BAD_REQUEST, "rejected repo URL");
+    }
+
     // 2b. Check whether this repo is in the allowed set.
     let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
     if let Ok(allowed_guard) = state.allowed_repos.read()
@@ -398,5 +407,35 @@ mod tests {
             extract_repo_url(&payload).as_deref(),
             Some("https://github.com/a/b.git")
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_internal_repo_url() {
+        use axum::response::IntoResponse;
+
+        let secret = "wh-secret";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = JobQueue::open(&tmp.path().join("jobs.sqlite")).expect("open job queue");
+        let state = Arc::new(WebhookState {
+            config: WebhookConfig {
+                secret: secret.to_string(),
+                secret_old: None,
+            },
+            job_queue: Arc::new(Mutex::new(queue)),
+            allowed_repos: Arc::new(RwLock::new(None)),
+            repo_branches: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        // A validly-signed payload whose clone_url targets the cloud metadata IP
+        // must be rejected with 400 before it can be enqueued.
+        let body = br#"{"repository":{"clone_url":"http://169.254.169.254/latest/meta-data"}}"#;
+        let sig = sign(body, secret);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hub-signature-256", sig.parse().unwrap());
+
+        let resp = handle_webhook(State(state), headers, Bytes::from_static(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

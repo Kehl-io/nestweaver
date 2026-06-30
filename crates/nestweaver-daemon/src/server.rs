@@ -3866,10 +3866,20 @@ pub async fn run_server(
                             // branch) so we aren't hardcoded to "main".
                             let url = repo_url.clone();
                             let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
-                            if let Ok(output) = std::process::Command::new("git")
-                                .args(["ls-remote", &url, &ref_spec])
-                                .output()
-                            {
+                            // SSRF guard the remote probe too: reject internal targets
+                            // and pin the resolved IP (closes a DNS-rebinding vector on
+                            // the ls-remote ref probe, mirroring clone/fetch).
+                            let ls_guard = match nestweaver_engine::ssrf::guard_git_url(&url) {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    tracing::warn!(url = %url, error = %e, "skipping poll: repo URL failed SSRF guard");
+                                    continue;
+                                }
+                            };
+                            let mut ls_cmd = std::process::Command::new("git");
+                            ls_cmd.args(&ls_guard.config_args);
+                            ls_cmd.args(["ls-remote", &url, &ref_spec]);
+                            if let Ok(output) = ls_cmd.output() {
                                 let remote_sha = String::from_utf8_lossy(&output.stdout)
                                     .split_whitespace().next().unwrap_or("").to_string();
                                 let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);

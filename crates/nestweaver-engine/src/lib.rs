@@ -91,6 +91,7 @@ pub mod rerank;
 pub mod resolution_cache;
 pub mod scheduler;
 pub mod snapshot;
+pub mod ssrf;
 pub mod suggest;
 pub mod summaries;
 pub mod summary;
