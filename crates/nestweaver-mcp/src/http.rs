@@ -163,6 +163,10 @@ pub struct McpHttpState {
     /// also accepted so MCP and gRPC query auth share the same semantics.
     pub admin_token: Option<String>,
     pub client_rate_limiter: Arc<HttpRateLimiter>,
+    /// Lazily-loaded embedding model for semantic search, shared with the
+    /// daemon's gRPC path. Populated by a background task when the `embed`
+    /// feature is enabled.
+    pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
 }
 
 impl McpHttpState {
@@ -186,6 +190,7 @@ impl McpHttpState {
             auth_token: None,
             admin_token: None,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -212,6 +217,7 @@ impl McpHttpState {
             auth_token: Some(auth_token),
             admin_token,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 }
@@ -538,7 +544,20 @@ async fn handle_mcp(
         }
 
         if let Some(ref sid) = session_id {
-            let _ = check_session_rate_limit(&state.sessions, sid);
+            if !check_session_rate_limit(&state.sessions, sid) {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": error_code::INVALID_REQUEST,
+                            "message": "rate limit exceeded: too many requests per session per minute",
+                        }
+                    })),
+                );
+            }
         }
     } else {
         // Non-server mode: just update last_active / request_count.
@@ -636,6 +655,13 @@ async fn handle_mcp(
             let lite = state.lite;
             let server_mode = state.server_mode;
 
+            // Read the embed model Arc outside the blocking thread (matches the
+            // gRPC handler pattern in server.rs), then drop the RwLock guard.
+            let embed_arc = {
+                let guard = state.embed_model.read().await;
+                guard.clone()
+            };
+
             // Validate depth and cap result-count parameters to server caps so
             // MCP clients cannot request unbounded traversals or result sets.
             let mut arguments = arguments;
@@ -677,7 +703,7 @@ async fn handle_mcp(
                     // return empty bodies.
                     tools::set_server_mode(server_mode);
 
-                    tools::dispatch(&store, tantivy.as_deref(), &tool_name, arguments, None)
+                    tools::dispatch(&store, tantivy.as_deref(), &tool_name, arguments, embed_arc.as_deref())
                 }),
             )
             .await;

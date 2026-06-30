@@ -3430,27 +3430,32 @@ pub async fn run_server(
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
     if let Some(ref opts) = server_opts {
-        let mcp_state = std::sync::Arc::new(if let Some(ref token) = opts.auth_token {
-            nestweaver_mcp::http::McpHttpState::with_auth(
-                false,
-                state.store.clone(),
-                state.tantivy.clone(),
-                state.db_path.clone(),
-                state.instance_cfg.clone(),
-                state.server_mode,
-                token.clone(),
-                opts.admin_token.clone(),
-            )
-        } else {
-            nestweaver_mcp::http::McpHttpState::new(
-                false,
-                state.store.clone(),
-                state.tantivy.clone(),
-                state.db_path.clone(),
-                state.instance_cfg.clone(),
-                state.server_mode,
-            )
-        });
+        let mcp_state = {
+            let mut s = if let Some(ref token) = opts.auth_token {
+                nestweaver_mcp::http::McpHttpState::with_auth(
+                    false,
+                    state.store.clone(),
+                    state.tantivy.clone(),
+                    state.db_path.clone(),
+                    state.instance_cfg.clone(),
+                    state.server_mode,
+                    token.clone(),
+                    opts.admin_token.clone(),
+                )
+            } else {
+                nestweaver_mcp::http::McpHttpState::new(
+                    false,
+                    state.store.clone(),
+                    state.tantivy.clone(),
+                    state.db_path.clone(),
+                    state.instance_cfg.clone(),
+                    state.server_mode,
+                )
+            };
+            // Share the daemon's embed model so HTTP dispatch has parity with gRPC.
+            s.embed_model = state.embed_model.clone();
+            std::sync::Arc::new(s)
+        };
         nestweaver_mcp::http::spawn_session_sweeper(mcp_state.sessions.clone());
         nestweaver_mcp::http::spawn_bucket_sweeper(mcp_state.client_rate_limiter.clone());
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);

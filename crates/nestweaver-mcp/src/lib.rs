@@ -571,6 +571,9 @@ fn dispatch_method(
                 ));
             };
 
+            // The stdio MCP server runs outside daemon context and has no
+            // access to the lazily-loaded embedding model. Semantic search
+            // falls back to keyword-only when embed_model is None.
             match tools::dispatch(store, tantivy, &name, arguments.clone(), None) {
                 Ok(result) => {
                     if let Some(tracker) = tracker {
