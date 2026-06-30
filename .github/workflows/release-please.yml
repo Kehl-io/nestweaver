@@ -90,7 +90,7 @@ jobs:
       - name: Generate SHA-256 checksum
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.ARCHIVE }}
       - name: Upload release artifact
