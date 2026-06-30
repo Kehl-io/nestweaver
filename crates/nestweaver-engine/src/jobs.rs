@@ -73,17 +73,6 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    #[allow(dead_code)]
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::DeadLetter => "dead_letter",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     fn from_str(s: &str) -> Self {
         match s {
             "pending" => Self::Pending,
@@ -258,6 +247,8 @@ impl JobQueue {
                                  THEN MIN(excluded.priority, priority)
                                  WHEN status IN ('succeeded', 'dead_letter', 'cancelled')
                                  THEN excluded.priority
+                                 WHEN status = 'running'
+                                 THEN MIN(excluded.priority, priority)
                                  ELSE priority END,
                trigger    = CASE WHEN status IN ('pending', 'failed') AND excluded.priority < priority
                                  THEN excluded.trigger
