@@ -14,6 +14,11 @@ use tonic::{Request, Status};
 
 use crate::safeguards::ClientRateLimiters;
 
+/// Marker inserted into request extensions by the auth interceptor.
+/// Handlers can extract this to gate destructive operations.
+#[derive(Debug, Clone, Copy)]
+pub struct IsAdmin(pub bool);
+
 /// Constant-time byte comparison for authentication tokens.
 /// Prevents timing side-channel attacks (CWE-208).
 /// Note: returns false immediately for different-length inputs (length is not
@@ -73,6 +78,8 @@ pub fn bearer_auth_interceptor(
                     rl.check(&rate_limit_key(&req, bearer))?;
                 }
 
+                let mut req = req;
+                req.extensions_mut().insert(IsAdmin(is_admin));
                 Ok(req)
             }
             _ => Err(Status::unauthenticated("missing or invalid bearer token")),

@@ -528,8 +528,13 @@ impl NestWeaverDaemon for DaemonService {
 
     async fn shutdown(
         &self,
-        _request: Request<ShutdownRequest>,
+        request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         tracing::info!("shutdown requested via gRPC — draining active writes");
 
         if let Ok(mut guard) = self.state.watcher_stop.lock()
@@ -1376,6 +1381,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveVaultRequest>,
     ) -> Result<Response<RemoveVaultResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1414,6 +1424,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1465,6 +1480,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveProjectRequest>,
     ) -> Result<Response<RemoveProjectResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1506,6 +1526,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PruneStaleRequest>,
     ) -> Result<Response<PruneStaleResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1591,6 +1616,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1629,6 +1659,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PurgeInstanceRequest>,
     ) -> Result<Response<Self::PurgeInstanceStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let instance_id = req.instance_id.clone();
         let state = self.state.clone();
