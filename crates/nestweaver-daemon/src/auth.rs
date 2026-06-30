@@ -87,6 +87,18 @@ pub fn bearer_auth_interceptor(
     }
 }
 
+/// Interceptor for Unix domain socket connections.
+///
+/// UDS connections are implicitly trusted: the OS enforces file-system
+/// permissions on the socket, so only local processes running as the same
+/// user can connect. This interceptor unconditionally grants admin access
+/// so that CLI operations (shutdown, indexing, backup, etc.) work without
+/// requiring a bearer token.
+pub fn uds_admin_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
+    req.extensions_mut().insert(IsAdmin(true));
+    Ok(req)
+}
+
 /// Returns a simple bearer-token interceptor without rate limiting.
 /// Used for backward compatibility in non-server mode.
 pub fn bearer_auth_interceptor_simple(

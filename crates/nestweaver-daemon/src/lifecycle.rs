@@ -130,6 +130,104 @@ pub fn launchd_plist_path(instance_id: &str) -> std::path::PathBuf {
         .join(format!("{}.plist", launchd_label(instance_id)))
 }
 
+/// Compute the legacy instance ID using `DefaultHasher` (SipHash).
+///
+/// Before the switch to SHA-256, the instance ID was derived from
+/// `DefaultHasher`, which is documented as non-portable across Rust
+/// versions. This function reproduces the old algorithm so we can
+/// detect and clean up old runtime artifacts during upgrades.
+pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = canonical_db_path(db_path);
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
+}
+
+/// Stop a daemon running under the legacy (DefaultHasher-based) instance ID.
+///
+/// When upgrading from a version that used `DefaultHasher` to one that
+/// uses SHA-256, the instance ID changes. This leaves the old daemon
+/// orphaned — still running, still holding the DB write lock, but
+/// unreachable via the new socket path. This function detects the old
+/// daemon and shuts it down so the new daemon can start cleanly.
+pub fn stop_legacy_hash_daemon(db_path: &Path) {
+    let new_id = instance_id_from_db_path(db_path);
+    let old_id = legacy_instance_id_from_db_path(db_path);
+
+    // If the hashes happen to collide, nothing to migrate.
+    if new_id == old_id {
+        return;
+    }
+
+    let old_pid_path = pidfile_path(&old_id);
+    let old_sock_path = socket_path(&old_id);
+    let old_rt_dir = runtime_dir(&old_id);
+
+    if !old_pid_path.exists() && !old_sock_path.exists() {
+        return;
+    }
+
+    // Try to read the PID and stop the old daemon gracefully.
+    if let Ok(content) = std::fs::read_to_string(&old_pid_path)
+        && let Ok(pid) = content.trim().parse::<i32>()
+        && pid > 0
+    {
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if alive {
+            tracing::info!(
+                pid,
+                old_id = %old_id,
+                new_id = %new_id,
+                "stopping legacy daemon (hash algorithm upgrade)"
+            );
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            // Wait briefly for graceful shutdown.
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if unsafe { libc::kill(pid, 0) != 0 } {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if unsafe { libc::kill(pid, 0) == 0 } {
+                tracing::warn!(
+                    pid,
+                    "legacy daemon did not exit after SIGTERM, sending SIGKILL"
+                );
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
+    // Unload the old launchd plist on macOS if it exists.
+    let old_plist = launchd_plist_path(&old_id);
+    if old_plist.exists() {
+        let label = launchd_label(&old_id);
+        tracing::info!(label = %label, "unloading legacy launchd plist");
+        let _ = std::process::Command::new("launchctl")
+            .args([
+                "bootout",
+                &format!("gui/{}", unsafe { libc::getuid() }),
+                &old_plist.display().to_string(),
+            ])
+            .output();
+        let _ = std::fs::remove_file(&old_plist);
+    }
+
+    // Clean up stale runtime artifacts.
+    let _ = std::fs::remove_file(&old_sock_path);
+    let _ = std::fs::remove_file(&old_pid_path);
+    let _ = std::fs::remove_dir(&old_rt_dir);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

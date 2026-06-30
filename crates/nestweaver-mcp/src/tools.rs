@@ -3405,14 +3405,25 @@ async fn inline_connect_daemon(
 // TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
 #[cfg(feature = "daemon")]
 fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    // Compute the 8-char hex instance ID (same algorithm as lifecycle.rs).
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    let instance_id = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
+    // Compute the 8-char hex instance ID (same SHA-256 algorithm as lifecycle.rs).
+    let canonical = if let Ok(c) = std::fs::canonicalize(db_path) {
+        c
+    } else if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
+        && let Ok(cp) = std::fs::canonicalize(parent)
+    {
+        cp.join(file_name)
+    } else {
+        db_path.to_path_buf()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let instance_id = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    );
 
     // Must match nestweaver_daemon::lifecycle::runtime_dir() exactly.
     // $TMPDIR is deliberately NOT consulted: on macOS, different launchers

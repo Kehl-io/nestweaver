@@ -4169,8 +4169,17 @@ pub async fn run_server(
     // Set process title for easier identification via pgrep.
     set_process_title(&format!("nestweaver-daemon-{instance_id}"));
 
+    // Wrap the UDS service with an interceptor that grants admin access.
+    // Local socket connections are implicitly trusted — the OS enforces
+    // file-system permissions on the socket, so any process that can connect
+    // is on the same machine and running as the same user.
+    let uds_svc = tonic::service::interceptor::InterceptedService::new(
+        svc,
+        crate::auth::uds_admin_interceptor,
+    );
+
     tonic::transport::Server::builder()
-        .add_service(svc)
+        .add_service(uds_svc)
         .serve_with_incoming_shutdown(uds_stream, async move {
             let _ = shutdown_rx.changed().await;
         })

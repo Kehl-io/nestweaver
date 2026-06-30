@@ -69,10 +69,15 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         let _ = fs::remove_file(&sock);
     }
 
-    // Before spawning, check for a legacy daemon that may hold the DB write
-    // lock at an old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR
-    // which varies across launchers on macOS). If found, shut it down so
-    // the new daemon can acquire the lock.
+    // Before spawning, check for a legacy daemon using the old DefaultHasher-
+    // based instance ID (pre-SHA-256 upgrade). If found, shut it down so the
+    // new daemon can acquire the DB write lock.
+    nestweaver_daemon::lifecycle::stop_legacy_hash_daemon(db_path);
+
+    // Also check for a legacy daemon that may hold the DB write lock at an
+    // old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR which varies
+    // across launchers on macOS). If found, shut it down so the new daemon
+    // can acquire the lock.
     stop_legacy_daemon(&instance_id);
 
     // Release the flock before spawning so the daemon can acquire it.
