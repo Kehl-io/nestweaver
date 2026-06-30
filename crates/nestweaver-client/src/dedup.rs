@@ -106,14 +106,16 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
         .or_else(|| {
             result.get("uid").and_then(|v| v.as_str()).and_then(|uid| {
                 // UID format: "sym:repo:{instance}:{url_hash}:{file_hash}:{name_hash}:{line}".
-                // After splitting off "sym" and "repo", extract the next two
-                // colon-delimited segments ({instance}:{url_hash}) as the repo identity.
+                // After splitting off "sym" and "repo", skip {instance} and use
+                // only {url_hash} as the repo identity. This ensures the same
+                // repo indexed on different instances (e.g. local vs server)
+                // coalesces during dedup.
                 let (_, rest) = uid.split_once(':')?; // strip "sym"
                 let (_, rest) = rest.split_once(':')?; // strip "repo"
                 let mut parts = rest.splitn(3, ':');
-                let instance = parts.next()?;
+                let _instance = parts.next()?; // skip instance
                 let url_hash = parts.next()?;
-                Some(format!("{instance}:{url_hash}"))
+                Some(url_hash.to_string())
             })
         })
         // If no repo could be extracted, use the file_path as a stand-in so

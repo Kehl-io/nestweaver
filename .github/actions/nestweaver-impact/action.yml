@@ -43,14 +43,30 @@ runs:
       if: steps.cache-cli.outputs.cache-hit != 'true'
       shell: bash
       run: |
+        # Map GitHub runner OS/arch to Rust target triples used by release artifacts.
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)   TARGET="x86_64-unknown-linux-gnu" ;;
+          Linux-ARM64) TARGET="aarch64-unknown-linux-gnu" ;;
+          macOS-X64)   TARGET="x86_64-apple-darwin" ;;
+          macOS-ARM64) TARGET="aarch64-apple-darwin" ;;
+          *) echo "::error::Unsupported platform: ${{ runner.os }}-${{ runner.arch }}" && exit 1 ;;
+        esac
+
         VERSION="${{ inputs.version }}"
         if [ "$VERSION" = "latest" ]; then
-          URL="https://github.com/Kehl-io/nestweaver/releases/latest/download/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+          # GitHub redirects /releases/latest/download/ to the newest release tag.
+          TAG=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+                "https://github.com/Kehl-io/nestweaver/releases/latest" | grep -oE '[^/]+$')
         else
-          URL="https://github.com/Kehl-io/nestweaver/releases/download/v${VERSION}/nestweaver-${{ runner.os }}-${{ runner.arch }}"
+          TAG="v${VERSION}"
         fi
-        curl -fsSL "$URL" -o /usr/local/bin/nestweaver
+
+        ARCHIVE="nestweaver-${TAG}-${TARGET}.tar.gz"
+        URL="https://github.com/Kehl-io/nestweaver/releases/download/${TAG}/${ARCHIVE}"
+        curl -fsSL "$URL" -o "/tmp/${ARCHIVE}"
+        tar xzf "/tmp/${ARCHIVE}" -C /usr/local/bin
         chmod +x /usr/local/bin/nestweaver
+        rm -f "/tmp/${ARCHIVE}"
 
     - name: Run impact analysis
       id: impact

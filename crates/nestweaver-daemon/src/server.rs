@@ -496,9 +496,29 @@ impl DaemonService {
 
 // ── Trait impl ──────────────────────────────────────────────────────
 
+/// Tools that mutate server state and require admin-level auth via gRPC.
+/// Mirrors the `MUTATING_TOOLS` list in the HTTP/MCP layer (`http.rs`).
+const MUTATING_TOOLS: &[&str] = &[
+    "brain_add_source",
+    "brain_remove_source",
+    "set_extension",
+    "prune_stale",
+];
+
 /// Maps each gRPC RPC name to the MCP tool name it dispatches to.
 macro_rules! json_rpc {
     ($self:ident, $request:ident, $tool:expr) => {{
+        // Gate mutating tools behind admin auth, matching the HTTP layer.
+        if MUTATING_TOOLS.contains(&$tool) {
+            if let Some(crate::auth::IsAdmin(false)) | None =
+                $request.extensions().get::<crate::auth::IsAdmin>()
+            {
+                return Err(Status::permission_denied(format!(
+                    "tool '{}' is mutating and requires the admin token",
+                    $tool
+                )));
+            }
+        }
         let req = $request.into_inner();
         $self.dispatch_json_tool($tool, &req.args_json).await
     }};

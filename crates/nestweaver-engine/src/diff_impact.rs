@@ -163,6 +163,29 @@ pub fn compute_diff_changes(
             continue;
         }
 
+        // For renames (base_path != new_path), emit SymbolMoved for symbols
+        // that exist in both old and new content. Without this, cross-file moves
+        // are invisible because compute_file_changes operates on a single path.
+        if entry.base_path != entry.new_path && !old_content.is_empty() {
+            match compute_rename_moves(
+                &old_content,
+                &new_content,
+                &entry.base_path,
+                &entry.new_path,
+                repo_url,
+            ) {
+                Ok(moves) => all_changes.extend(moves),
+                Err(e) => {
+                    tracing::warn!(
+                        old_file = %entry.base_path,
+                        new_file = %entry.new_path,
+                        error = %e,
+                        "failed to compute rename moves, falling back to add/remove"
+                    );
+                }
+            }
+        }
+
         match compute_file_changes(&old_content, &new_content, &entry.new_path, repo_url) {
             Ok(changes) => all_changes.extend(changes),
             Err(e) => {
@@ -247,6 +270,40 @@ fn severity_ord(s: &ImpactSeverity) -> u8 {
         ImpactSeverity::Warning => 1,
         ImpactSeverity::Info => 0,
     }
+}
+
+/// For a git-detected rename (old_path -> new_path), parse both sides and emit
+/// `SymbolMoved` for every symbol that appears in both. This fills the gap
+/// where `compute_file_changes` (single-file) cannot detect cross-file moves.
+fn compute_rename_moves(
+    old_content: &str,
+    new_content: &str,
+    old_path: &str,
+    new_path: &str,
+    repo_url: &str,
+) -> Result<Vec<AtomicChange>, anyhow::Error> {
+    let old_parsed = nestweaver_parser::parse_source(Path::new(old_path), old_content)?;
+    let new_parsed = nestweaver_parser::parse_source(Path::new(new_path), new_content)?;
+
+    // Build a set of (name, kind) for symbols in the new file.
+    let new_symbols: std::collections::HashSet<(&str, nestweaver_schema::SymbolKind)> =
+        new_parsed.symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+
+    let mut moves = Vec::new();
+    for old_sym in &old_parsed.symbols {
+        if new_symbols.contains(&(old_sym.name.as_str(), old_sym.kind)) {
+            let scope = old_sym.scope_chain.as_deref().unwrap_or("");
+            let canonical_id =
+                nestweaver_schema::uid::canonical_symbol_id(repo_url, old_path, &old_sym.name, scope);
+            moves.push(AtomicChange::SymbolMoved {
+                canonical_id,
+                name: old_sym.name.clone(),
+                old_file: old_path.to_string(),
+                new_file: new_path.to_string(),
+            });
+        }
+    }
+    Ok(moves)
 }
 
 #[cfg(test)]
