@@ -1105,6 +1105,13 @@ fn webhook_sign(body: &[u8], secret: &str) -> String {
     format!("sha256={}", hex::encode(result))
 }
 
+/// Compute HMAC-SHA256 signature in Gitea's raw-hex format (no `sha256=` prefix).
+fn webhook_sign_gitea(body: &[u8], secret: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 #[tokio::test]
 async fn server_webhook_enqueues_job() {
     let dir = tempfile::tempdir().unwrap();
@@ -1147,6 +1154,60 @@ async fn server_webhook_enqueues_job() {
     let resp = client
         .post(format!("{mcp_addr}/webhook"))
         .header("x-hub-signature-256", &sig)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST failed");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, "accepted");
+}
+
+#[tokio::test]
+async fn server_webhook_gitea_enqueues_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    // Index once so the DB exists.
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let secret = "webhook-test-secret-token-0123456789abcdef";
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook(&db_path, secret);
+    let mcp_addr = guard.mcp_addr();
+
+    let payload = json!({
+        "repository": {
+            "clone_url": "https://gitea.example.com/acme/api-service.git"
+        },
+        "ref": "refs/heads/main"
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    // Gitea sends a raw-hex HMAC in x-gitea-signature (no `sha256=` prefix).
+    let sig = webhook_sign_gitea(&body, secret);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-gitea-signature", &sig)
         .header("content-type", "application/json")
         .body(body)
         .send()

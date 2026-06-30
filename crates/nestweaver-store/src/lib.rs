@@ -333,6 +333,74 @@ mod tests {
         );
     }
 
+    /// `files_referencing_file` (nw-008) returns the 1-hop reverse-dependent
+    /// files: every file with a cross-file resolved edge pointing INTO the
+    /// target file. Intra-file edges and edges into other files must be ignored.
+    #[test]
+    fn files_referencing_file_returns_cross_file_dependents() {
+        let store = test_store();
+        // b.rs imports a.rs (cross-file). c.rs has only an intra-file CALLS edge.
+        store
+            .insert_symbol(&make_symbol("a1", "exported", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b1", "importer", "repo-1", "b.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c1", "caller", "repo-1", "c.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c2", "callee", "repo-1", "c.rs"))
+            .unwrap();
+        // b.rs -> a.rs : a cross-file IMPORTS edge.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b1".to_string(),
+                target_uid: "a1".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        // c.rs -> c.rs : an intra-file CALLS edge (must NOT count as referencing a.rs).
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "c1".to_string(),
+                target_uid: "c2".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let refs = store.files_referencing_file("repo-1", "a.rs").unwrap();
+        assert!(
+            refs.contains("b.rs"),
+            "b.rs imports a.rs and must be a reverse-dependent; got: {refs:?}"
+        );
+        assert!(
+            !refs.contains("a.rs"),
+            "the file itself must never appear (intra-file edges excluded); got: {refs:?}"
+        );
+        assert!(
+            !refs.contains("c.rs"),
+            "c.rs has no edge into a.rs and must be excluded; got: {refs:?}"
+        );
+
+        // a.rs's own reverse-deps for a different target are empty.
+        let none = store.files_referencing_file("repo-1", "c.rs").unwrap();
+        assert!(
+            !none.contains("c.rs"),
+            "intra-file edge must not make c.rs reference itself; got: {none:?}"
+        );
+        assert!(
+            none.is_empty(),
+            "c.rs has no cross-file dependents; got: {none:?}"
+        );
+    }
+
     #[test]
     fn count_symbols_by_repo_groups_correctly() {
         let store = test_store();

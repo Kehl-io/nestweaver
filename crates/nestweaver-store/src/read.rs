@@ -608,6 +608,61 @@ impl GraphStore {
         Ok(all)
     }
 
+    /// Returns the set of file paths (within `repo_uid`) that contain at least
+    /// one symbol with a cross-file resolved edge pointing INTO a symbol in
+    /// `file_path`. In other words, the 1-hop reverse-dependents of `file_path`.
+    ///
+    /// Only cross-file edges are considered: edges whose source and target live
+    /// in the same file are excluded (`s.file_path <> $fp`), so the result never
+    /// contains `file_path` itself. `MEMBER_OF` (structural, intra-file) and
+    /// `CROSS_REPO_LINK` (cross-repo, handled separately) are not traversed.
+    ///
+    /// Used by incremental re-resolution to find files whose resolved edges may
+    /// need to be rebuilt after `file_path` changes.
+    pub fn files_referencing_file(
+        &self,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let edge_types = [
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "USES",
+            "ACCESSES",
+        ];
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!(
+                "MATCH (s:Symbol)-[:{et}]->(t:Symbol) \
+                 WHERE t.repo_uid = $repo AND t.file_path = $fp AND s.file_path <> $fp \
+                 RETURN DISTINCT s.file_path"
+            );
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(
+                    &mut stmt,
+                    vec![
+                        ("repo", Value::String(repo_uid.to_string())),
+                        ("fp", Value::String(file_path.to_string())),
+                    ],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let path = extract_string(&row, 0)?;
+                if !path.is_empty() {
+                    files.insert(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
     /// Returns all Symbol nodes that have an IMPORTS edge pointing TO `uid`.
     /// Used by impact analysis for SymbolRenamed changes.
     pub fn importers_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {

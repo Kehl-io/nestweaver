@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 
 const CACHE_VERSION: u32 = 1;
 
+/// Maximum number of transitive reverse-dependency hops expanded when deciding
+/// which files to re-resolve after a change. Shared by the local cache-based
+/// path ([`ResolutionDeps::affected_files`]) and the server graph-based path
+/// (`index::collect_reverse_dep_files`) so both honor the same blast bound.
+pub const MAX_HOPS: usize = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ResolutionCacheFile {
     version: u32,
@@ -52,10 +58,9 @@ impl ResolutionDeps {
     /// files that depend on B are also re-resolved (since B's exports may
     /// have changed shape).
     ///
-    /// Capped at 3 iterations to prevent cascading through the entire graph.
+    /// Capped at [`MAX_HOPS`] iterations to prevent cascading through the
+    /// entire graph.
     pub fn affected_files(&self, changed: &HashSet<String>) -> HashSet<String> {
-        const MAX_HOPS: usize = 2;
-
         let mut affected = changed.clone();
         for _ in 0..MAX_HOPS {
             let mut newly_added = Vec::new();

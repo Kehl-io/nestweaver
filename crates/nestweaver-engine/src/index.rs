@@ -791,10 +791,18 @@ where
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
     let mut actually_changed_files: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Every file still present in the working tree this index, regardless of
+    // whether it was Unchanged, CachedParsed, or Parsed. Used after the
+    // re-insert cleanup to prune File/Symbol nodes for files that were removed
+    // since the last index (e.g. a force-push that drops a file). Must NOT be
+    // derived from `all_files`, which excludes Unchanged/CachedParsed files and
+    // would wrongly delete still-present files.
+    let mut present_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for outcome in outcomes {
         match outcome {
             ParseOutcome::Unchanged { rel_path } => {
+                present_files.insert(rel_path.clone());
                 // Carry forward the existing cache entry.
                 if let (Some(ref mut new_cache), Some(cached)) =
                     (new_filemeta.as_deref_mut(), cache.get(&rel_path))
@@ -809,6 +817,7 @@ where
                 references: raw_references,
                 type_bindings: raw_type_bindings,
             } => {
+                present_files.insert(rel_path.clone());
                 // Carry forward the existing filemeta cache entry (file is unchanged).
                 if let (Some(ref mut new_cache), Some(cached)) =
                     (new_filemeta.as_deref_mut(), cache.get(&rel_path))
@@ -837,6 +846,7 @@ where
                 type_bindings: raw_type_bindings,
                 source,
             } => {
+                present_files.insert(rel_path.clone());
                 actually_changed_files.insert(rel_path.clone());
 
                 // Record in the new filemeta cache.
@@ -1040,6 +1050,20 @@ where
                 let _ = store.delete_symbols_in_file(&r_uid, &file.path);
                 // Remove old File node.
                 let _ = store.delete_file_node(&file.uid);
+            }
+            // Prune File/Symbol nodes for files that vanished since the last
+            // index (e.g. a force-push that removed a file). The incremental
+            // branch above only deletes files being re-inserted, so without
+            // this pass removed files would linger. `present_files` covers
+            // Unchanged/CachedParsed/Parsed files — anything in the store but
+            // not present anymore is stale and gets dropped.
+            if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
+                for (f_uid, path) in &stored_files {
+                    if !present_files.contains(path) {
+                        let _ = store.delete_symbols_in_file(&r_uid, path);
+                        let _ = store.delete_file_node(f_uid);
+                    }
+                }
             }
         }
         // BUG FIX: clear repo-scoped derived nodes (Service, Contract) before
@@ -1725,6 +1749,11 @@ pub fn incremental_index_with_name(
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let mut result = IncrementalResult::default();
 
+    // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
+    // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
+    let (changed_files, removed_files) = partition_changed_removed(&changes);
+    let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
     // SHA is updated inside the transaction — if we crash before commit, the
@@ -1822,6 +1851,17 @@ pub fn incremental_index_with_name(
         }
     }
 
+    // nw-008 Phase 2 — re-resolve reverse-dependents and surgically restore the
+    // cross-file edges the per-file `DETACH DELETE` removed (same transaction).
+    let reresolved = reresolve_affected_dependents(&reader, &txn, &r_uid, &changed_files, &rdeps)?;
+    if reresolved > 0 {
+        tracing::info!(
+            edges = reresolved,
+            rdeps = rdeps.len(),
+            "restored cross-file edges via transitive re-resolution"
+        );
+    }
+
     // 6. Update the stored SHA inside the transaction, then commit.
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
@@ -1896,6 +1936,12 @@ where
         new_sha,
         "processing server incremental changes"
     );
+
+    // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
+    // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
+    // edges we walk here, so this ordering is correctness-critical.
+    let (changed_files, removed_files) = partition_changed_removed(&changes);
+    let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
 
     let _write_guard = acquire_write_guard()?;
     let txn = store
@@ -1984,6 +2030,18 @@ where
                 result.files_renamed += 1;
             }
         }
+    }
+
+    // nw-008 Phase 2 — re-resolve the reverse-dependents computed in Phase 0
+    // and surgically restore the cross-file edges that the per-file
+    // `DETACH DELETE` removed (same transaction).
+    let reresolved = reresolve_affected_dependents(reader, &txn, &r_uid, &changed_files, &rdeps)?;
+    if reresolved > 0 {
+        tracing::info!(
+            edges = reresolved,
+            rdeps = rdeps.len(),
+            "restored cross-file edges via transitive re-resolution"
+        );
     }
 
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
@@ -2271,6 +2329,238 @@ fn process_added_or_modified_file_txn(
     }
 
     Ok(sym_count)
+}
+
+/// Split a set of file changes into the parseable files that still exist after
+/// the change (`changed`: Added / Modified / Renamed.to) and the files that no
+/// longer exist (`removed`: Deleted / Renamed.from). Used to seed the
+/// transitive re-resolution pass (nw-008).
+fn partition_changed_removed(
+    changes: &[crate::git_diff::FileChange],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    use crate::git_diff::FileChange;
+    let mut changed = std::collections::HashSet::new();
+    let mut removed = std::collections::HashSet::new();
+    for change in changes {
+        match change {
+            FileChange::Added(p) | FileChange::Modified(p) => {
+                if !path_in_skip_dir(p) && is_parseable(p) {
+                    changed.insert(p.to_string_lossy().into_owned());
+                }
+            }
+            FileChange::Deleted(p) => {
+                removed.insert(p.to_string_lossy().into_owned());
+            }
+            FileChange::Renamed { from, to } => {
+                removed.insert(from.to_string_lossy().into_owned());
+                if !path_in_skip_dir(to) && is_parseable(to) {
+                    changed.insert(to.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    (changed, removed)
+}
+
+/// Phase 0 of transitive re-resolution (nw-008). Starting from the
+/// changed/removed files, walk reverse-dependency edges in the **live** graph
+/// to find files whose resolved cross-file edges must be rebuilt after the
+/// changed files' symbols are deleted and re-inserted. Re-inserting a changed
+/// file shifts its symbols' UIDs and the per-file `DETACH DELETE` destroys all
+/// edges incident to the old symbols — including the `A→C` edges that
+/// *dependents* own. Those dependents must be re-resolved so the edges come
+/// back pointing at the new UIDs.
+///
+/// `changed` are the files that still exist after the change (Added / Modified
+/// / Renamed.to). `removed` are gone (Deleted / Renamed.from) but remain useful
+/// BFS seeds: files that imported a now-deleted file are reverse-dependents too.
+///
+/// Returns the reverse-dependents to re-resolve (`affected \ changed \
+/// removed`), bounded by [`crate::resolution_cache::MAX_HOPS`] hops and a
+/// `MAX_AFFECTED_FILES` total cap. On exceeding the total cap the pass is
+/// skipped (empty set returned) — a periodic full re-index is the backstop for
+/// hub/widely-imported files.
+///
+/// **CRITICAL ORDERING:** this must run BEFORE `begin_transaction`; the
+/// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
+/// query reads.
+fn collect_reverse_dep_files(
+    store: &nestweaver_store::GraphStore,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    /// Upper bound on total files touched by the transitive re-resolution pass.
+    /// Beyond this the pass is skipped (full re-index is the backstop) so a
+    /// change to a widely-imported hub file does not cascade unbounded.
+    const MAX_AFFECTED_FILES: usize = 200;
+
+    let mut seeds: HashSet<String> = changed.clone();
+    seeds.extend(removed.iter().cloned());
+    if seeds.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut affected = seeds.clone();
+    let mut frontier = seeds;
+    for _ in 0..crate::resolution_cache::MAX_HOPS {
+        let mut next: HashSet<String> = HashSet::new();
+        for file in &frontier {
+            match store.files_referencing_file(r_uid, file) {
+                Ok(rdeps) => {
+                    for dep in rdeps {
+                        if !affected.contains(&dep) {
+                            next.insert(dep);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(file = %file, "files_referencing_file failed: {e}");
+                }
+            }
+        }
+        if next.is_empty() {
+            break; // fixed point — no more transitive reverse-dependents
+        }
+        if affected.len() + next.len() > MAX_AFFECTED_FILES {
+            tracing::warn!(
+                affected = affected.len(),
+                next = next.len(),
+                cap = MAX_AFFECTED_FILES,
+                "transitive re-resolution affected-file cap exceeded; skipping pass \
+                 (full re-index is the backstop)"
+            );
+            return HashSet::new();
+        }
+        affected.extend(next.iter().cloned());
+        frontier = next;
+    }
+
+    // rdeps = affected \ changed \ removed: only the genuine reverse-dependents
+    // that still exist and were not themselves directly changed.
+    affected
+        .into_iter()
+        .filter(|f| !changed.contains(f) && !removed.contains(f))
+        .collect()
+}
+
+/// Phase 2 of transitive re-resolution (nw-008). Re-parse `S = changed ∪ rdeps`
+/// from `reader`, resolve cross-file references with the full symbol map across
+/// `S`, and surgically re-insert ONLY the edges the per-file `DETACH DELETE`
+/// removed: those whose TARGET lives in a changed file and whose SOURCE lives
+/// in a different file. Intra-file edges and edges into unchanged files were
+/// never deleted (or were re-created by single-file resolution in the mutation
+/// loop), so re-inserting them would duplicate (edge insert is `CREATE`, not
+/// `MERGE`) — the `source_file != target_file` and `target ∈ changed` filters
+/// keep the insert duplicate-free without a `delete_resolved_edges_for_file`
+/// pass.
+///
+/// Runs inside the same transaction as the mutation loop. Returns the number of
+/// edges inserted.
+fn reresolve_affected_dependents(
+    reader: &dyn crate::content_reader::ContentReader,
+    conn: &nestweaver_store::DbConnection<'_>,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    rdeps: &std::collections::HashSet<String>,
+) -> Result<usize, anyhow::Error> {
+    if rdeps.is_empty() {
+        return Ok(0);
+    }
+
+    // S = changed ∪ rdeps.
+    let mut scope: std::collections::HashSet<String> = changed.clone();
+    scope.extend(rdeps.iter().cloned());
+
+    let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = Vec::new();
+    let mut uid_to_file: HashMap<String, String> = HashMap::new();
+    let mut lang_counts: HashMap<Language, usize> = HashMap::new();
+
+    for rel_str in &scope {
+        let rel_path = Path::new(rel_str.as_str());
+        let abs_path = reader.root().join(rel_path);
+        let source = match reader.read_file(rel_path) {
+            Ok(s) => s,
+            Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
+        };
+        let parsed = match parse_source(&abs_path, &source) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Some(lang) = detect_language(&abs_path) {
+            *lang_counts.entry(lang).or_insert(0) += 1;
+        }
+        for raw_sym in &parsed.symbols {
+            let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
+            uid_to_file.insert(s_uid, rel_str.clone());
+        }
+        file_data.push((rel_str.clone(), parsed.symbols, parsed.references));
+    }
+
+    if file_data.is_empty() {
+        return Ok(0);
+    }
+
+    // Resolve with the most-common language across S (matches the full-index
+    // batch heuristic). Mixed-language scopes are rare; cross-language edges are
+    // not resolved anyway.
+    let language = lang_counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(l, _)| l)
+        .unwrap_or(Language::JavaScript);
+
+    let workspace_ctx = if matches!(
+        language,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    ) {
+        discover_workspace_context(reader.root())
+    } else {
+        Default::default()
+    };
+
+    let resolved_edges = resolve_references_with_context(
+        &file_data,
+        language,
+        r_uid,
+        &workspace_ctx,
+        None,
+        Some(&scope),
+    );
+
+    let insertable: Vec<_> = resolved_edges
+        .into_iter()
+        .filter(|e| {
+            if e.target_uid.starts_with("unresolved:") {
+                return false;
+            }
+            // Both endpoints are within S (source is filtered by resolve_only =
+            // S; we only keep targets in `changed` ⊆ S), so both lookups hit.
+            let (Some(tf), Some(sf)) = (
+                uid_to_file.get(&e.target_uid),
+                uid_to_file.get(&e.source_uid),
+            ) else {
+                return false;
+            };
+            changed.contains(tf) && sf != tf
+        })
+        .collect();
+
+    let count = insertable.len();
+    if count > 0 {
+        nestweaver_store::GraphStore::batch_insert_edges_on(conn, &insertable)
+            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
+    }
+    Ok(count)
 }
 
 /// Delete all File nodes (and their symbols) that belong to a repo,
@@ -3090,6 +3380,60 @@ function hello(name) { return "Hello " + name; }
         );
         // files_count tracks only files that were actually processed (parsed).
         assert_eq!(result2.files_count, 0, "no files should be re-indexed");
+    }
+
+    #[test]
+    fn reindex_prunes_removed_files() {
+        // nw-009 Fix #1 regression: when a file is removed between indexes (e.g.
+        // a force-push that drops it), the incremental cleanup branch only
+        // deletes files being re-inserted. Without the present_files prune pass,
+        // the removed file's File/Symbol nodes linger. This test exercises the
+        // local full path (db_path → filemeta sidecar → files_unchanged > 0),
+        // which is the actively-buggy path pre-Fix#1.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function main() {}").unwrap();
+        fs::write(src.join("helper.js"), "function helper() {}").unwrap();
+
+        let url = "https://example.com/repo";
+        let r_uid = repo_uid("test", url);
+
+        // First index — both files present.
+        let result1 = index_directory(&src, &db_path, "test", url, "abc123").unwrap();
+        assert_eq!(result1.files_count, 2);
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let files = store.list_files_by_repo(&r_uid).unwrap();
+            assert_eq!(files.len(), 2, "both files should be indexed");
+            assert!(
+                !store.symbols_in_file("helper.js").unwrap().is_empty(),
+                "helper.js should have symbols after first index"
+            );
+        }
+
+        // Remove helper.js, then re-index. main.js is unchanged, so the
+        // incremental cleanup branch runs (files_unchanged > 0).
+        fs::remove_file(src.join("helper.js")).unwrap();
+        let _result2 = index_directory(&src, &db_path, "test", url, "def456").unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            !paths.contains(&"helper.js"),
+            "removed helper.js File node should be pruned, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"main.js"),
+            "still-present main.js File node must remain, got {paths:?}"
+        );
+        assert!(
+            store.symbols_in_file("helper.js").unwrap().is_empty(),
+            "removed helper.js symbols should be pruned"
+        );
     }
 
     #[test]

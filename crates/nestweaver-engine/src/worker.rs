@@ -371,31 +371,12 @@ impl WorkerPool {
                             )?;
 
                             if prepared.repo_type == RepoType::Code {
-                                let (count, last_full) = {
-                                    let mut tracker = reindex_tracker
-                                        .lock()
-                                        .expect("reindex tracker lock poisoned");
-                                    record_reindex_outcome(
-                                        &mut tracker,
-                                        &prepared.repo_id,
-                                        outcome,
-                                    );
-                                    (
-                                        tracker.count(&prepared.repo_id),
-                                        tracker.last_full_unix(&prepared.repo_id),
-                                    )
-                                };
-                                // Write-through to the persisted store so the
-                                // counter/backstop survive a restart.
-                                let q = queue_check.lock().expect("job queue lock");
-                                if let Err(e) =
-                                    q.upsert_reindex_state(&prepared.repo_id, count, last_full)
-                                {
-                                    tracing::error!(
-                                        repo = %prepared.repo_id,
-                                        "persist reindex state: {e}"
-                                    );
-                                }
+                                persist_reindex_outcome(
+                                    &queue_check,
+                                    &reindex_tracker,
+                                    &prepared.repo_id,
+                                    outcome,
+                                );
                             }
 
                             Ok(())
@@ -639,6 +620,35 @@ fn record_reindex_outcome(
     }
 }
 
+/// Record a reindex outcome in the in-memory tracker and write the updated
+/// counter/backstop through to the persisted queue so it survives a restart.
+///
+/// A `Skipped` outcome leaves the tracker count and `last_full` unchanged
+/// (`record_reindex_outcome` is a no-op for it), so persisting would just
+/// re-write identical state on every poll of an unchanged code repo. Gate the
+/// whole block on a non-`Skipped` outcome to avoid that redundant DB upsert.
+fn persist_reindex_outcome(
+    queue: &Mutex<JobQueue>,
+    reindex_tracker: &Mutex<crate::scheduler::ReindexTracker>,
+    repo_id: &str,
+    outcome: ReindexOutcome,
+) {
+    if outcome == ReindexOutcome::Skipped {
+        return;
+    }
+    let (count, last_full) = {
+        let mut tracker = reindex_tracker
+            .lock()
+            .expect("reindex tracker lock poisoned");
+        record_reindex_outcome(&mut tracker, repo_id, outcome);
+        (tracker.count(repo_id), tracker.last_full_unix(repo_id))
+    };
+    let q = queue.lock().expect("job queue lock");
+    if let Err(e) = q.upsert_reindex_state(repo_id, count, last_full) {
+        tracing::error!(repo = %repo_id, "persist reindex state: {e}");
+    }
+}
+
 fn commit_prepared_job_with_reindex_decision<G, F>(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,
@@ -708,6 +718,19 @@ where
                     Ok(ReindexOutcome::Incremental)
                 }
             } else {
+                // Server full path: the bare reader passes no filemeta cache,
+                // so the core indexer's bulk-delete currently fires for us. That
+                // is an implicit invariant, not a guarantee — make pruning of
+                // removed files explicit here so a force-push that drops files
+                // can never leave stale File/Symbol or derived nodes behind.
+                // Purge the repo's files/symbols and derived nodes before the
+                // full re-index. Do NOT use `delete_repo_all_data`: it drops the
+                // Repo node, and the full path passes `name=None`, which would
+                // discard a display-name override on re-insert.
+                if !indexed_sha.is_empty() {
+                    let _ = store.bulk_delete_repo_files_and_symbols(&r_uid);
+                    let _ = store.clear_repo_derived_nodes(&r_uid);
+                }
                 crate::index_with_reader_and_write_gate(
                     &reader,
                     store,
@@ -797,6 +820,25 @@ mod tests {
             .current_dir(repo)
             .output()
             .unwrap();
+    }
+
+    fn make_code_job(id: i64, repo_id: &str, url: &str) -> IndexJob {
+        IndexJob {
+            id,
+            repo_id: repo_id.to_string(),
+            repo_url: url.to_string(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        }
     }
 
     #[test]
@@ -1005,6 +1047,192 @@ mod tests {
         );
     }
 
+    /// nw-008: after an incremental re-index that shifts a changed file's
+    /// exported symbol UID, the cross-file edges that *dependents* own
+    /// (destroyed by the per-file `DETACH DELETE`) must be rebuilt so impact
+    /// analysis still reaches the 1-hop and 2-hop reverse-dependents.
+    ///
+    /// Chain: a.ts → b.ts → c.ts (and d.ts → a.ts, 3 hops from c). Changing
+    /// c.ts's exported symbol shifts its UID, which destroyed `b → c` until the
+    /// next full re-index; this asserts it comes back on the incremental path.
+    #[test]
+    fn incremental_reresolves_two_hop_dependents() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("c.ts", "export function cFunc(): number { return 1; }\n"),
+                (
+                    "b.ts",
+                    "import { cFunc } from './c';\nexport function bFunc(): number { return cFunc() + 1; }\n",
+                ),
+                (
+                    "a.ts",
+                    "import { bFunc } from './b';\nexport function aFunc(): number { return bFunc() + 1; }\n",
+                ),
+                (
+                    "d.ts",
+                    "import { aFunc } from './a';\nexport function dFunc(): number { return aFunc() + 1; }\n",
+                ),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let mut tracker = crate::scheduler::ReindexTracker::new();
+        let job = make_code_job(1, "two-hop-repo", &url);
+
+        // Initial full index.
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &first,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(tracker.count(&job.repo_id), 0, "initial index must be full");
+
+        // Change c.ts's exported symbol so its start_line — and thus its
+        // symbol UID — shifts. The name stays `cFunc` so b.ts still resolves.
+        commit_file(
+            &src,
+            "c.ts",
+            "// touched: shift cFunc's line so its symbol UID changes\nexport function cFunc(): number { return 2; }\n",
+            "change c",
+        );
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated code repo should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &second,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(
+            tracker.count(&job.repo_id),
+            1,
+            "the update must take the incremental path"
+        );
+
+        // Resolve c.ts's exported symbol at its NEW UID and walk impact.
+        let new_c = store
+            .find_symbol_by_name_and_file("cFunc", "c.ts")
+            .unwrap()
+            .expect("cFunc should exist in c.ts after incremental re-index");
+
+        let impact = store.impact(&new_c.uid, 3, 0.0).unwrap();
+        let impacted_files: std::collections::HashSet<&str> =
+            impact.iter().map(|n| n.file_path.as_str()).collect();
+
+        assert!(
+            impacted_files.contains("b.ts"),
+            "1-hop dependent b.ts must reach the re-resolved c.ts; impact files: {impacted_files:?}"
+        );
+        assert!(
+            impacted_files.contains("a.ts"),
+            "2-hop dependent a.ts must reach c.ts via the restored edge; impact files: {impacted_files:?}"
+        );
+        // d.ts (3-hop) is beyond the re-resolution cap — not a required result,
+        // so we deliberately make no assertion about it.
+    }
+
+    /// nw-008 hub cap: when a changed file has more reverse-dependents than the
+    /// `MAX_AFFECTED_FILES` cap, the transitive re-resolution pass is skipped
+    /// (bounded work) but the incremental index still completes and advances the
+    /// stored SHA. A periodic full re-index is the backstop for hubs.
+    #[test]
+    fn incremental_hub_cap_skips_reresolution_but_advances_sha() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+
+        // hub.ts is imported+called by 205 files (> MAX_AFFECTED_FILES = 200).
+        const IMPORTERS: usize = 205;
+        let mut files: Vec<(String, String)> = Vec::new();
+        files.push((
+            "hub.ts".to_string(),
+            "export function hubFunc(): number { return 1; }\n".to_string(),
+        ));
+        for i in 0..IMPORTERS {
+            files.push((
+                format!("dep{i}.ts"),
+                format!(
+                    "import {{ hubFunc }} from './hub';\nexport function dep{i}(): number {{ return hubFunc() + {i}; }}\n"
+                ),
+            ));
+        }
+        let file_refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        create_source_repo(&src, &file_refs);
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let mut tracker = crate::scheduler::ReindexTracker::new();
+        let job = make_code_job(1, "hub-repo", &url);
+
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &first,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        // Change the hub: every importer is a reverse-dependent, blowing the cap.
+        commit_file(
+            &src,
+            "hub.ts",
+            "// touched\nexport function hubFunc(): number { return 2; }\n",
+            "change hub",
+        );
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated hub repo should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &second,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        // The incremental pass completed and the SHA advanced despite the cap.
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("repo should exist after incremental index");
+        assert_eq!(
+            repo.indexed_sha, second.remote_sha,
+            "incremental index must advance the stored SHA even when the hub cap skips re-resolution"
+        );
+        assert_eq!(
+            tracker.count(&job.repo_id),
+            1,
+            "the hub update must take the incremental path"
+        );
+    }
+
     #[test]
     fn code_repo_full_refresh_resets_reindex_tracker() {
         let tmp = TempDir::new().unwrap();
@@ -1080,6 +1308,122 @@ mod tests {
             tracker.count(&job.repo_id),
             0,
             "periodic full refresh should reset incremental update count"
+        );
+    }
+
+    /// Helper: rewrite history (force-push) by removing a file and amending the
+    /// commit, producing a SHA that is NOT a descendant of the previous one.
+    fn force_remove_file(repo: &std::path::Path, path: &str) {
+        Command::new("git")
+            .args(["rm", path])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--amend", "--no-edit"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn code_repo_full_refresh_prunes_force_pushed_removed_file() {
+        // nw-009 Fix #2 regression: a force-push that drops a file takes the
+        // server full re-index path (non-ancestor SHA → not incremental). The
+        // removed file's File/Symbol nodes must be pruned, not left behind.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("src/lib.rs", "pub fn one() -> i32 { 1 }\n"),
+                ("src/helper.rs", "pub fn help() -> i32 { 2 }\n"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let mut tracker = crate::scheduler::ReindexTracker::new();
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "prune-repo".to_string(),
+            repo_url: url.clone(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        // Initial full index — both files present.
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_tracker(
+            &first,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        assert!(
+            files.iter().any(|(_, p)| p == "src/helper.rs"),
+            "helper.rs should be indexed before the force-push, got {files:?}"
+        );
+
+        // Force-push: rewrite history removing helper.rs. The new SHA is not a
+        // descendant of the indexed SHA, so the full re-index path runs.
+        force_remove_file(&src, "src/helper.rs");
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("force-pushed repo should be prepared");
+        assert_ne!(
+            first.remote_sha, second.remote_sha,
+            "force-push should produce a divergent SHA"
+        );
+        commit_prepared_job_with_reindex_tracker(
+            &second,
+            &store,
+            instance_id,
+            Some(&mut tracker),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        // The Repo node survives (Fix #2 keeps it, never delete_repo_all_data).
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("Repo node must survive the force-push prune");
+        assert_eq!(repo.indexed_sha, second.remote_sha);
+
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            !paths.contains(&"src/helper.rs"),
+            "force-pushed-away helper.rs File node should be pruned, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/lib.rs"),
+            "still-present lib.rs File node must remain, got {paths:?}"
+        );
+        assert!(
+            store.symbols_in_file("src/helper.rs").unwrap().is_empty(),
+            "force-pushed-away helper.rs symbols should be pruned"
         );
     }
 
@@ -1328,6 +1672,36 @@ mod tests {
 
     /// Persist tracker state to a file-backed queue, then rehydrate a fresh
     /// tracker from a *new* `JobQueue` on the same DB (simulating a daemon
+    #[test]
+    fn skipped_reindex_outcome_issues_no_upsert() {
+        // nw-009 Part B: an unchanged code repo yields a Skipped outcome, which
+        // leaves the tracker unchanged. Persisting it would re-upsert identical
+        // state on every poll, so the write-through must be gated out entirely.
+        let tmp = TempDir::new().unwrap();
+        let queue = Mutex::new(JobQueue::open(&tmp.path().join("jobs.db")).unwrap());
+        let tracker = Mutex::new(crate::scheduler::ReindexTracker::new());
+
+        // Skipped: no tracker change, no DB upsert.
+        persist_reindex_outcome(&queue, &tracker, "repo-a", ReindexOutcome::Skipped);
+        assert!(
+            queue
+                .lock()
+                .unwrap()
+                .load_reindex_state()
+                .unwrap()
+                .is_empty(),
+            "a Skipped outcome must not write any reindex_state row"
+        );
+
+        // A non-Skipped outcome still persists (gate is outcome-specific only).
+        persist_reindex_outcome(&queue, &tracker, "repo-a", ReindexOutcome::Full);
+        assert_eq!(
+            queue.lock().unwrap().load_reindex_state().unwrap().len(),
+            1,
+            "a Full outcome must write through to the persisted state"
+        );
+    }
+
     /// restart) and assert the counter + last_full survive.
     #[test]
     fn reindex_state_survives_restart() {
