@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use nestweaver_parser::{
     AstTypeBinding, RawReference, RawSymbol, SkippedFile, detect_language, parse_source,
 };
-use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
+use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
     symbol_uid,
@@ -1160,6 +1160,7 @@ where
     };
 
     // Load workspace context (monorepo packages + tsconfig aliases) for JS/TS resolution.
+    // Uses the ContentReader so this works with both filesystem and bare-repo readers.
     let workspace_ctx = if matches!(
         language,
         Language::JavaScript
@@ -1168,7 +1169,11 @@ where
             | Language::Svelte
             | Language::Astro
     ) {
-        discover_workspace_context(repo_path)
+        discover_workspace_context_with(|rel_path| {
+            reader
+                .read_file(rel_path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })
     } else {
         Default::default()
     };
@@ -2082,7 +2087,7 @@ fn process_added_or_modified_file(
     store: &nestweaver_store::GraphStore,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
-    use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
+    use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = reader.root().join(rel_path);
@@ -2171,6 +2176,7 @@ fn process_added_or_modified_file(
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
     // Load workspace context for JS/TS monorepo resolution.
+    // Uses ContentReader so it works with bare-repo readers too.
     let workspace_ctx = if matches!(
         lang,
         nestweaver_schema::Language::JavaScript
@@ -2179,7 +2185,11 @@ fn process_added_or_modified_file(
             | nestweaver_schema::Language::Svelte
             | nestweaver_schema::Language::Astro
     ) {
-        discover_workspace_context(reader.root())
+        discover_workspace_context_with(|p| {
+            reader
+                .read_file(p)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })
     } else {
         Default::default()
     };
@@ -2215,7 +2225,7 @@ fn process_added_or_modified_file_txn(
     conn: &nestweaver_store::DbConnection<'_>,
 ) -> Result<usize, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
-    use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
+    use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = reader.root().join(rel_path);
@@ -2307,7 +2317,11 @@ fn process_added_or_modified_file_txn(
             | nestweaver_schema::Language::Svelte
             | nestweaver_schema::Language::Astro
     ) {
-        discover_workspace_context(reader.root())
+        discover_workspace_context_with(|p| {
+            reader
+                .read_file(p)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })
     } else {
         Default::default()
     };
@@ -2523,7 +2537,11 @@ fn reresolve_affected_dependents(
             | Language::Svelte
             | Language::Astro
     ) {
-        discover_workspace_context(reader.root())
+        discover_workspace_context_with(|p| {
+            reader
+                .read_file(p)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })
     } else {
         Default::default()
     };

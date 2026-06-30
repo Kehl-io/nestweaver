@@ -52,6 +52,143 @@ pub fn discover_workspace_context(repo_path: &Path) -> WorkspaceContext {
     WorkspaceContext { packages, aliases }
 }
 
+/// Discover workspace context using a content reader function.
+///
+/// Unlike [`discover_workspace_context`], this works with bare git repos
+/// by reading files through the provided `read_file` callback instead of
+/// direct filesystem access. The callback takes a repo-relative path and
+/// returns `Ok(contents)` or an error.
+///
+/// Note: workspace *glob expansion* (e.g. `packages/*`) requires directory
+/// listing which is not available through the reader; only the root-level
+/// package.json workspaces/tsconfig aliases are discovered. This is
+/// sufficient for the common case where the root package.json explicitly
+/// names workspace directories.
+pub fn discover_workspace_context_with<F>(read_file: F) -> WorkspaceContext
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
+    let packages = discover_workspace_packages_with(&read_file);
+    let aliases = load_tsconfig_aliases_with(&read_file);
+    WorkspaceContext { packages, aliases }
+}
+
+/// Discover workspace packages using a content reader function.
+///
+/// Reads `package.json` via the callback. Cannot expand glob patterns
+/// (that requires directory listing), so only explicit workspace paths
+/// are resolved.
+fn discover_workspace_packages_with<F>(read_file: &F) -> Vec<WorkspacePackage>
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
+    let mut packages = Vec::new();
+
+    // Try npm/yarn workspaces from root package.json
+    if let Ok(contents) = read_file(Path::new("package.json"))
+        && let Ok(root) = serde_json::from_str::<serde_json::Value>(&contents)
+        && let Some(globs) = extract_workspace_globs(&root)
+    {
+        // For bare repos we can't list directories, but we can try
+        // reading package.json from explicitly named (non-glob) paths.
+        for glob in &globs {
+            let clean = glob.trim_end_matches('/');
+            if clean.contains('*') {
+                // Skip glob patterns — can't enumerate without directory listing.
+                continue;
+            }
+            let pkg_json_rel = format!("{clean}/package.json");
+            if let Ok(pkg_contents) = read_file(Path::new(&pkg_json_rel))
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&pkg_contents)
+                && let Some(name) = parsed.get("name").and_then(|v| v.as_str())
+            {
+                packages.push(WorkspacePackage {
+                    name: name.to_string(),
+                    directory: clean.to_string(),
+                });
+            }
+        }
+    }
+
+    // Try pnpm-workspace.yaml
+    if packages.is_empty() {
+        if let Ok(contents) = read_file(Path::new("pnpm-workspace.yaml"))
+            && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&contents)
+            && let Some(pkgs) = yaml.get("packages").and_then(|v| v.as_array())
+        {
+            for v in pkgs {
+                if let Some(path) = v.as_str() {
+                    let clean = path.trim_end_matches('/');
+                    if clean.contains('*') {
+                        continue;
+                    }
+                    let pkg_json_rel = format!("{clean}/package.json");
+                    if let Ok(pkg_contents) = read_file(Path::new(&pkg_json_rel))
+                        && let Ok(parsed) =
+                            serde_json::from_str::<serde_json::Value>(&pkg_contents)
+                        && let Some(name) = parsed.get("name").and_then(|v| v.as_str())
+                    {
+                        packages.push(WorkspacePackage {
+                            name: name.to_string(),
+                            directory: clean.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    packages
+}
+
+/// Load tsconfig aliases using a content reader function.
+fn load_tsconfig_aliases_with<F>(read_file: &F) -> Vec<TsconfigAlias>
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
+    let candidates = ["tsconfig.json", "tsconfig.app.json", "tsconfig.base.json"];
+
+    for candidate in &candidates {
+        if let Ok(contents) = read_file(Path::new(candidate)) {
+            let stripped = strip_json_comments(&contents);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stripped) {
+                let mut aliases = extract_tsconfig_aliases(&parsed, "");
+
+                // Follow `extends` chain (one level deep for safety)
+                if aliases.is_empty()
+                    && let Some(extends) = parsed.get("extends").and_then(|v| v.as_str())
+                {
+                    // Resolve relative to the tsconfig's directory (which is
+                    // the repo root for top-level configs).
+                    let base_rel = Path::new(candidate)
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .join(extends);
+                    if let Ok(base_contents) = read_file(&base_rel) {
+                        let base_stripped = strip_json_comments(&base_contents);
+                        if let Ok(base_parsed) =
+                            serde_json::from_str::<serde_json::Value>(&base_stripped)
+                        {
+                            let base_url = parsed
+                                .get("compilerOptions")
+                                .and_then(|co| co.get("baseUrl"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            aliases = extract_tsconfig_aliases(&base_parsed, base_url);
+                        }
+                    }
+                }
+
+                if !aliases.is_empty() {
+                    return aliases;
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 /// Discover workspace packages from the repo root.
 ///
 /// Checks npm/yarn workspaces in `package.json` and pnpm `pnpm-workspace.yaml`.

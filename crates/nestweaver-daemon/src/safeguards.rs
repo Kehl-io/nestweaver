@@ -243,6 +243,14 @@ impl QuerySafeguards {
 /// Wraps a handler future with a per-tool timeout. Returns
 /// `DEADLINE_EXCEEDED` if the handler does not complete in time.
 /// Also logs slow queries at tiered thresholds.
+///
+/// **Cancellation note:** When the timeout fires, `tokio::select!` drops the
+/// handler future. If the handler spawned a `spawn_blocking` task, that task
+/// continues on its OS thread (tokio does not abort blocking threads). To
+/// cooperate with cancellation, handlers should accept a
+/// [`CancellationToken`](tokio_util::sync::CancellationToken) or
+/// [`AtomicBool`](std::sync::atomic::AtomicBool) and check it periodically.
+/// See [`with_safeguard_cancellable`] for a variant that manages a token.
 pub async fn with_safeguard<F, T>(
     tool_name: &str,
     safeguards: &QuerySafeguards,
@@ -261,7 +269,8 @@ where
             tracing::warn!(
                 tool = %tool_name,
                 timeout_ms = timeout.as_millis(),
-                "query exceeded timeout"
+                "query exceeded timeout — note: any in-flight spawn_blocking \
+                 tasks will continue running in the background"
             );
             Err(Status::deadline_exceeded(format!(
                 "{} query exceeded {}s timeout",
@@ -272,6 +281,45 @@ where
     };
 
     // Slow query logging at tiered thresholds.
+    let elapsed = start.elapsed();
+    log_slow_query(tool_name, elapsed, timeout);
+
+    result
+}
+
+/// Like [`with_safeguard`], but provides a cancellation flag that is set
+/// when the timeout fires. Handlers that run expensive work inside
+/// `spawn_blocking` should check this flag periodically and bail early.
+pub async fn with_safeguard_cancellable<F, T>(
+    tool_name: &str,
+    safeguards: &QuerySafeguards,
+    client_timeout: Option<Duration>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    handler: F,
+) -> Result<T, Status>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    let timeout = safeguards.effective_timeout(tool_name, client_timeout);
+    let start = Instant::now();
+
+    let result = tokio::select! {
+        result = handler => result,
+        _ = tokio::time::sleep(timeout) => {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            tracing::warn!(
+                tool = %tool_name,
+                timeout_ms = timeout.as_millis(),
+                "query exceeded timeout — cancellation flag set for spawn_blocking"
+            );
+            Err(Status::deadline_exceeded(format!(
+                "{} query exceeded {}s timeout",
+                tool_name,
+                timeout.as_secs()
+            )))
+        }
+    };
+
     let elapsed = start.elapsed();
     log_slow_query(tool_name, elapsed, timeout);
 

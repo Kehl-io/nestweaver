@@ -17,7 +17,10 @@ use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
-use crate::safeguards::{ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard};
+use crate::safeguards::{
+    ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard,
+    with_safeguard_cancellable,
+};
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -126,10 +129,18 @@ impl DaemonService {
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = self.dispatch_json_tool_inner(tool_name, args_json);
 
         let response = if self.state.server_mode {
-            with_safeguard(&tool, safeguards, None, handler).await
+            with_safeguard_cancellable(
+                &tool,
+                safeguards,
+                None,
+                cancelled.clone(),
+                handler,
+            )
+            .await
         } else {
             handler.await
         };
@@ -3696,7 +3707,16 @@ pub async fn run_server(
         let mcp_bind = if mcp_bind_addr.port() == 0 {
             std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
         } else {
-            std::net::SocketAddr::from((mcp_bind_addr.ip(), mcp_bind_addr.port() + 1))
+            std::net::SocketAddr::from((
+                mcp_bind_addr.ip(),
+                mcp_bind_addr
+                    .port()
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
+                        mcp_bind_addr.port()
+                    ))?,
+            ))
         };
 
         // Validate TLS config BEFORE binding any ports so we don't
@@ -4237,6 +4257,7 @@ fn flow_trace_continue_impl(
         name: &str,
         file_path: &str,
         start_line: u32,
+        repo_url: &str,
         parent_span_id: Option<&str>,
         depth: usize,
         max_depth: usize,
@@ -4263,8 +4284,14 @@ fn flow_trace_continue_impl(
                     continue;
                 }
 
-                // Check if this callee is in the same repo (we have it locally).
-                // If callees_of returned it, it's in our database.
+                // Resolve the callee's repo URL from its repo_uid. If
+                // the callee belongs to a different repo than the entry
+                // symbol, this ensures the span carries the correct URL.
+                let callee_repo_url = ctx
+                    .store
+                    .repo_url_for_uid(&callee.repo_uid)
+                    .unwrap_or_else(|| ctx.repo_url.clone());
+
                 let child_span_id = walk_trace(
                     ctx,
                     &callee.uid,
@@ -4272,6 +4299,7 @@ fn flow_trace_continue_impl(
                     &callee.name,
                     &callee.file_path,
                     callee.start_line,
+                    &callee_repo_url,
                     Some(&span_id),
                     depth + 1,
                     max_depth,
@@ -4292,7 +4320,7 @@ fn flow_trace_continue_impl(
             parent_span_id: parent_span_id.map(String::from),
             canonical_id: canonical_id.to_string(),
             name: name.to_string(),
-            repo_url: ctx.repo_url.clone(),
+            repo_url: repo_url.to_string(),
             file_path: file_path.to_string(),
             start_line: start_line as i32,
             callee_span_ids,
@@ -4325,6 +4353,7 @@ fn flow_trace_continue_impl(
         &entry.name,
         &entry.file_path,
         entry.start_line,
+        &repo_url,
         if req.parent_span_id.is_empty() {
             None
         } else {
