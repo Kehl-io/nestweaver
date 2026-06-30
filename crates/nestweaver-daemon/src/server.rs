@@ -880,6 +880,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<StopWatchRequest>,
     ) -> Result<Response<StopWatchResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            _request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let mut guard = self
             .state
             .watcher_stop
@@ -1838,6 +1843,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<ReindexSearchRequest>,
     ) -> Result<Response<ReindexSearchResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            _request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let tantivy = self
             .state
             .tantivy
@@ -2840,6 +2850,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 

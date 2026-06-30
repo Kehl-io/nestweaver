@@ -1,9 +1,7 @@
 import { useState, useEffect, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useAdminApi } from "../../hooks/useAdminApi";
 
 export function DeviceApprove() {
-  const api = useAdminApi();
   const [searchParams] = useSearchParams();
   const [userCode, setUserCode] = useState(searchParams.get("user_code") ?? "");
   const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
@@ -21,11 +19,15 @@ export function DeviceApprove() {
     setStatus("loading");
     setMessage("");
     try {
-      const res = await api.post<{ message: string }>("/device/approve", {
-        user_code: userCode.trim(),
+      const res = await fetch("/auth/device/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_code: userCode.trim() }),
       });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const data: { message?: string } = await res.json();
       setStatus("success");
-      setMessage(res.message ?? "Device approved successfully.");
+      setMessage(data.message ?? "Device approved successfully.");
     } catch (err: unknown) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : "Approval failed");

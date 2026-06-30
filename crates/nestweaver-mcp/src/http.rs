@@ -30,6 +30,7 @@ use crate::tools;
 const MUTATING_TOOLS: &[&str] = &[
     "brain_add_source",
     "brain_remove_source",
+    "brain_memory_consolidate",
     "set_extension",
     "prune_stale",
 ];

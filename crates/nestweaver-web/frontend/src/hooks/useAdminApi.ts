@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 
 export function useAdminApi() {
   const token = sessionStorage.getItem("admin_token");
@@ -56,5 +56,5 @@ export function useAdminApi() {
     [token],
   );
 
-  return { get, post, del };
+  return useMemo(() => ({ get, post, del }), [get, post, del]);
 }
