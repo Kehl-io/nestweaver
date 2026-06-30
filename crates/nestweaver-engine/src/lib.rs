@@ -112,8 +112,8 @@ pub use agent_guide::{
 };
 pub use backup::{
     BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
-    RestoreResult, backup_inspect, backup_list, backup_restore, backup_save,
-    backup_save_read_only, try_passive_checkpoint,
+    RestoreResult, backup_inspect, backup_list, backup_restore, backup_save, backup_save_read_only,
+    try_passive_checkpoint,
 };
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
@@ -142,9 +142,9 @@ pub use config::{
     default_test_path_patterns, remove_repo_from_config_file,
 };
 pub use cross_domain::{
-    CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index, build_symbol_index_with_config,
-    discover_cross_domain_links, discover_cross_domain_links_for_note,
-    discover_cross_domain_links_for_note_with_index,
+    CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
+    build_symbol_index_with_config, discover_cross_domain_links,
+    discover_cross_domain_links_for_note, discover_cross_domain_links_for_note_with_index,
     discover_cross_domain_links_for_note_with_index_and_readers,
     discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
 };

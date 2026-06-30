@@ -232,23 +232,23 @@ where
     // Load taxonomy aliases from the reader (server-mode equivalent of the
     // filesystem-based loading in index_markdown_directory_with_store).
     let aliases = load_taxonomy_aliases_from_reader(reader);
-    if !aliases.is_empty() {
-        if let Some(db_path) = store.db_path() {
-            let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
-            match serde_json::to_string(&aliases) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&sidecar_path, json) {
-                        tracing::warn!("failed to write aliases sidecar: {e}");
-                    } else {
-                        tracing::info!(
-                            path = %sidecar_path.display(),
-                            count = aliases.len(),
-                            "wrote taxonomy alias sidecar (server-mode)"
-                        );
-                    }
+    if !aliases.is_empty()
+        && let Some(db_path) = store.db_path()
+    {
+        let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
+        match serde_json::to_string(&aliases) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&sidecar_path, json) {
+                    tracing::warn!("failed to write aliases sidecar: {e}");
+                } else {
+                    tracing::info!(
+                        path = %sidecar_path.display(),
+                        count = aliases.len(),
+                        "wrote taxonomy alias sidecar (server-mode)"
+                    );
                 }
-                Err(e) => tracing::warn!("failed to serialize aliases: {e}"),
             }
+            Err(e) => tracing::warn!("failed to serialize aliases: {e}"),
         }
     }
 

@@ -236,12 +236,7 @@ pub async fn add_repo(
                     format!("task panicked: {e}"),
                 )
             })?
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("rejected hostname: {e}"),
-                )
-            })?;
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("rejected hostname: {e}")))?;
         if any_resolved_ip_is_internal(&resolved) {
             return Err((
                 StatusCode::BAD_REQUEST,

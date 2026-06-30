@@ -133,14 +133,7 @@ impl DaemonService {
         let handler = self.dispatch_json_tool_inner(tool_name, args_json);
 
         let response = if self.state.server_mode {
-            with_safeguard_cancellable(
-                &tool,
-                safeguards,
-                None,
-                cancelled.clone(),
-                handler,
-            )
-            .await
+            with_safeguard_cancellable(&tool, safeguards, None, cancelled.clone(), handler).await
         } else {
             handler.await
         };
@@ -805,9 +798,9 @@ impl NestWeaverDaemon for DaemonService {
             }));
         }
 
-        let repo_path = repo_path.canonicalize().map_err(|e| {
-            Status::invalid_argument(format!("cannot canonicalize repo path: {e}"))
-        })?;
+        let repo_path = repo_path
+            .canonicalize()
+            .map_err(|e| Status::invalid_argument(format!("cannot canonicalize repo path: {e}")))?;
 
         // Only allow paths registered in the instance config.
         if let Some(ref cfg) = self.state.instance_cfg {
@@ -3252,18 +3245,16 @@ pub async fn run_server(
     // C1: Reject non-loopback bind without an auth token — the server would
     // be fully open to the network because the auth interceptor passes all
     // requests when no token is configured.
-    if let Some(ref opts) = server_opts {
-        if opts.auth_token.is_none() {
-            if let Ok(addr) = opts.bind_addr.parse::<std::net::SocketAddr>() {
-                if !addr.ip().is_loopback() {
-                    anyhow::bail!(
-                        "Cannot bind to non-loopback address {} without --auth-token; \
-                         the server would be fully open to the network",
-                        opts.bind_addr
-                    );
-                }
-            }
-        }
+    if let Some(ref opts) = server_opts
+        && opts.auth_token.is_none()
+        && let Ok(addr) = opts.bind_addr.parse::<std::net::SocketAddr>()
+        && !addr.ip().is_loopback()
+    {
+        anyhow::bail!(
+            "Cannot bind to non-loopback address {} without --auth-token; \
+             the server would be fully open to the network",
+            opts.bind_addr
+        );
     }
 
     // Reject any present webhook secret that is too short to be safe.
@@ -3709,13 +3700,12 @@ pub async fn run_server(
         } else {
             std::net::SocketAddr::from((
                 mcp_bind_addr.ip(),
-                mcp_bind_addr
-                    .port()
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!(
+                mcp_bind_addr.port().checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
                         "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
                         mcp_bind_addr.port()
-                    ))?,
+                    )
+                })?,
             ))
         };
 

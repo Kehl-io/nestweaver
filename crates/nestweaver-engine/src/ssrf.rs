@@ -374,8 +374,7 @@ pub fn guard_git_url(url: &str) -> Result<GitNetGuard, SsrfError> {
     // reject if anything it points at is internal. DNS failure = fail closed.
     let resolved: Vec<IpAddr> = match parse_host_as_ip(host) {
         Some(ip) => vec![ip],
-        None => resolve_host(host)
-            .map_err(|_| SsrfError::ResolvesInternal(host.to_string()))?,
+        None => resolve_host(host).map_err(|_| SsrfError::ResolvesInternal(host.to_string()))?,
     };
     if any_resolved_ip_is_internal(&resolved) {
         return Err(SsrfError::ResolvesInternal(host.to_string()));
@@ -411,7 +410,7 @@ mod tests {
             "192.168.1.1",
             "169.254.1.1",
             "0.0.0.0",
-            "100.64.0.1",  // CGNAT (RFC 6598)
+            "100.64.0.1",      // CGNAT (RFC 6598)
             "100.127.255.254", // CGNAT upper bound
         ] {
             let url = format!("https://{host}/repo");
@@ -546,7 +545,7 @@ mod tests {
             "10.0.0.1",
             "169.254.1.1",
             "0.0.0.0",
-            "100.64.0.1",   // CGNAT (RFC 6598)
+            "100.64.0.1",    // CGNAT (RFC 6598)
             "100.100.100.1", // CGNAT mid-range
             "::1",
             "fe80::1",
@@ -563,8 +562,8 @@ mod tests {
         for s in [
             "8.8.8.8",
             "1.1.1.1",
-            "100.128.0.1",              // 100.128.x.x is outside CGNAT /10, public
-            "100.63.255.255",           // just below CGNAT range, public
+            "100.128.0.1",          // 100.128.x.x is outside CGNAT /10, public
+            "100.63.255.255",       // just below CGNAT range, public
             "2001:4860:4860::8888", // Google public DNS, IPv6
             "64:ff9b::808:808",     // NAT64 -> 8.8.8.8 (public)
             "2002:0808:0808::",     // 6to4 -> 8.8.8.8 (public)

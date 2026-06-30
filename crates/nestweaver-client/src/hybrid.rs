@@ -2168,11 +2168,11 @@ fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
     for key in &["changed_symbols", "affected_symbols"] {
         if let Some(arr) = local.get(key).and_then(|v| v.as_array()) {
             for item in arr {
-                if let Some(repo) = item.get("repo_uid").and_then(|v| v.as_str()) {
-                    if !repo.is_empty() {
-                        repos.insert(repo.to_string());
-                        continue;
-                    }
+                if let Some(repo) = item.get("repo_uid").and_then(|v| v.as_str())
+                    && !repo.is_empty()
+                {
+                    repos.insert(repo.to_string());
+                    continue;
                 }
                 // Fallback: use the full file_path as identity when no
                 // repo_uid is available (should not happen for indexed repos).

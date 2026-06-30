@@ -111,28 +111,26 @@ where
     }
 
     // Try pnpm-workspace.yaml
-    if packages.is_empty() {
-        if let Ok(contents) = read_file(Path::new("pnpm-workspace.yaml"))
-            && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&contents)
-            && let Some(pkgs) = yaml.get("packages").and_then(|v| v.as_array())
-        {
-            for v in pkgs {
-                if let Some(path) = v.as_str() {
-                    let clean = path.trim_end_matches('/');
-                    if clean.contains('*') {
-                        continue;
-                    }
-                    let pkg_json_rel = format!("{clean}/package.json");
-                    if let Ok(pkg_contents) = read_file(Path::new(&pkg_json_rel))
-                        && let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(&pkg_contents)
-                        && let Some(name) = parsed.get("name").and_then(|v| v.as_str())
-                    {
-                        packages.push(WorkspacePackage {
-                            name: name.to_string(),
-                            directory: clean.to_string(),
-                        });
-                    }
+    if packages.is_empty()
+        && let Ok(contents) = read_file(Path::new("pnpm-workspace.yaml"))
+        && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&contents)
+        && let Some(pkgs) = yaml.get("packages").and_then(|v| v.as_array())
+    {
+        for v in pkgs {
+            if let Some(path) = v.as_str() {
+                let clean = path.trim_end_matches('/');
+                if clean.contains('*') {
+                    continue;
+                }
+                let pkg_json_rel = format!("{clean}/package.json");
+                if let Ok(pkg_contents) = read_file(Path::new(&pkg_json_rel))
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&pkg_contents)
+                    && let Some(name) = parsed.get("name").and_then(|v| v.as_str())
+                {
+                    packages.push(WorkspacePackage {
+                        name: name.to_string(),
+                        directory: clean.to_string(),
+                    });
                 }
             }
         }

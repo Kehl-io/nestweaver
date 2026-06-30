@@ -703,7 +703,10 @@ where
                 nestweaver_schema::vault_uid(instance_id, &root_str)
             };
             let mut vault_readers = crate::cross_domain::VaultReaders::new();
-            vault_readers.insert(vault_uid, &reader as &dyn crate::content_reader::ContentReader);
+            vault_readers.insert(
+                vault_uid,
+                &reader as &dyn crate::content_reader::ContentReader,
+            );
             if let Err(e) =
                 crate::cross_domain::discover_cross_domain_links_with_readers(store, &vault_readers)
             {

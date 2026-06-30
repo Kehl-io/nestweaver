@@ -1848,7 +1848,9 @@ async fn hybrid_blast_radius_two_tier_populates_both_tiers() {
         resp["org_wide_impact"]
     );
     assert!(
-        resp["org_wide_impact"].to_string().contains("serverimpactfn"),
+        resp["org_wide_impact"]
+            .to_string()
+            .contains("serverimpactfn"),
         "org_wide_impact should reference the server-only 'serverimpactfn'; got {}",
         resp["org_wide_impact"]
     );

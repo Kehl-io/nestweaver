@@ -569,21 +569,21 @@ async fn handle_mcp(
             );
         }
 
-        if let Some(ref sid) = session_id {
-            if !check_session_rate_limit(&state.sessions, sid) {
-                return (
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": null,
-                        "error": {
-                            "code": error_code::INVALID_REQUEST,
-                            "message": "rate limit exceeded: too many requests per session per minute",
-                        }
-                    })),
-                );
-            }
+        if let Some(ref sid) = session_id
+            && !check_session_rate_limit(&state.sessions, sid)
+        {
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                HeaderMap::new(),
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": error_code::INVALID_REQUEST,
+                        "message": "rate limit exceeded: too many requests per session per minute",
+                    }
+                })),
+            );
         }
     } else {
         // Non-server mode: just update last_active / request_count.
@@ -675,7 +675,10 @@ async fn handle_mcp(
             };
 
             // C3: Mutating tools require admin token when auth is configured.
-            if MUTATING_TOOLS.contains(&name.as_str()) && state.auth_token.is_some() && !admin_bypass_rate_limit {
+            if MUTATING_TOOLS.contains(&name.as_str())
+                && state.auth_token.is_some()
+                && !admin_bypass_rate_limit
+            {
                 return (
                     axum::http::StatusCode::FORBIDDEN,
                     HeaderMap::new(),
@@ -748,7 +751,13 @@ async fn handle_mcp(
                     // return empty bodies.
                     tools::set_server_mode(server_mode);
 
-                    tools::dispatch(&store, tantivy.as_deref(), &tool_name, arguments, embed_arc.as_deref())
+                    tools::dispatch(
+                        &store,
+                        tantivy.as_deref(),
+                        &tool_name,
+                        arguments,
+                        embed_arc.as_deref(),
+                    )
                 }),
             )
             .await;

@@ -56,7 +56,13 @@ pub fn compute_diff_changes(
     // `git show base_ref:<new_path>` fails; we need the old path for the
     // base content.
     let output = Command::new("git")
-        .args(["diff", "-M", "--name-status", "--diff-filter=ACMR", diff_spec])
+        .args([
+            "diff",
+            "-M",
+            "--name-status",
+            "--diff-filter=ACMR",
+            diff_spec,
+        ])
         .current_dir(repo_path)
         .output()
         .context("git diff --name-status")?;
@@ -85,11 +91,17 @@ pub fn compute_diff_changes(
                 // Rename: old_path \t new_path
                 let old = cols.next()?.to_string();
                 let new = cols.next()?.to_string();
-                Some(FileEntry { new_path: new, base_path: old })
+                Some(FileEntry {
+                    new_path: new,
+                    base_path: old,
+                })
             } else {
                 // A/C/M: single path
                 let path = cols.next()?.to_string();
-                Some(FileEntry { new_path: path.clone(), base_path: path })
+                Some(FileEntry {
+                    new_path: path.clone(),
+                    base_path: path,
+                })
             }
         })
         .collect();

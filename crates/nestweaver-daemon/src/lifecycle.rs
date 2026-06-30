@@ -38,7 +38,10 @@ pub fn instance_id_from_db_path(db_path: &Path) -> String {
     hasher.update(canonical.to_string_lossy().as_bytes());
     let hash = hasher.finalize();
     // Take the first 4 bytes (8 hex chars) for a short, stable instance ID.
-    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
 }
 
 /// Human-readable label for logging: `<parent-dir>-<hash>`.
