@@ -167,15 +167,19 @@ pub fn any_resolved_ip_is_internal(addrs: &[IpAddr]) -> bool {
 }
 
 /// Blocking DNS resolution of a hostname to every address it maps to, via the
-/// system resolver (`std::net`). Returns an empty vec on resolution failure so
-/// callers fail open on transient DNS errors rather than blocking legitimate
-/// adds. MUST run on a blocking thread (it blocks).
-pub fn resolve_host(host: &str) -> Vec<IpAddr> {
+/// system resolver (`std::net`). Returns an error on resolution failure so
+/// callers fail closed — an unresolvable host is treated as potentially
+/// internal rather than silently allowed through. MUST run on a blocking
+/// thread (it blocks).
+pub fn resolve_host(host: &str) -> Result<Vec<IpAddr>, String> {
     use std::net::ToSocketAddrs;
-    (host, 0u16)
-        .to_socket_addrs()
-        .map(|iter| iter.map(|sa| sa.ip()).collect())
-        .unwrap_or_default()
+    match (host, 0u16).to_socket_addrs() {
+        Ok(iter) => Ok(iter.map(|sa| sa.ip()).collect()),
+        Err(e) => {
+            tracing::warn!("DNS resolution failed for host '{host}': {e}");
+            Err(format!("DNS resolution failed for '{host}': {e}"))
+        }
+    }
 }
 
 /// Extract the DNS hostname from a repo URL that still needs resolve-time SSRF
@@ -193,7 +197,7 @@ pub fn host_to_resolve(url: &str) -> Option<String> {
 
 /// Validate a repo URL's scheme and host to prevent SSRF.
 ///
-/// Rejects unsupported schemes (only https/http/git/ssh are allowed) and any
+/// Rejects unsupported schemes (only https/http/ssh are allowed) and any
 /// host that resolves to an internal/private target — `localhost`, the cloud
 /// metadata endpoint, and private/loopback/link-local/unique-local IP ranges
 /// (OWASP SSRF Prevention Cheat Sheet). Literal, alternate-encoded
@@ -203,7 +207,7 @@ pub fn host_to_resolve(url: &str) -> Option<String> {
 /// returned `Err` is the user-facing message.
 pub fn validate_repo_url(url: &str) -> Result<(), String> {
     // Validate URL scheme to prevent SSRF via file:// or other unexpected schemes.
-    let allowed_schemes = ["https", "http", "git", "ssh"];
+    let allowed_schemes = ["https", "http", "ssh"];
     let parsed = match url::Url::parse(url) {
         Ok(p) if allowed_schemes.contains(&p.scheme()) => p,
         Ok(parsed) => {
@@ -361,10 +365,11 @@ pub fn guard_git_url(url: &str) -> Result<GitNetGuard, SsrfError> {
         .ok_or_else(|| SsrfError::InvalidUrl(format!("'{url}': missing host")))?;
 
     // Resolve the host (literal IP → use it directly; DNS name → look it up) and
-    // reject if anything it points at is internal. Empty resolve = fail open.
+    // reject if anything it points at is internal. DNS failure = fail closed.
     let resolved: Vec<IpAddr> = match parse_host_as_ip(host) {
         Some(ip) => vec![ip],
-        None => resolve_host(host),
+        None => resolve_host(host)
+            .map_err(|_| SsrfError::ResolvesInternal(host.to_string()))?,
     };
     if any_resolved_ip_is_internal(&resolved) {
         return Err(SsrfError::ResolvesInternal(host.to_string()));
@@ -597,7 +602,9 @@ mod tests {
         ];
         assert!(!any_resolved_ip_is_internal(&public));
 
-        // Empty (resolution failure / fail-open) → not internal.
+        // Empty list (no addresses) → not internal by itself, but callers
+        // should never reach this state: resolve_host now returns Err on
+        // failure (fail-closed), so an empty vec only arises from a literal IP.
         assert!(!any_resolved_ip_is_internal(&[]));
     }
 
