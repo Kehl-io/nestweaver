@@ -1172,7 +1172,7 @@ where
         discover_workspace_context_with(|rel_path| {
             reader
                 .read_file(rel_path)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     } else {
         Default::default()
@@ -2188,7 +2188,7 @@ fn process_added_or_modified_file(
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     } else {
         Default::default()
@@ -2320,7 +2320,7 @@ fn process_added_or_modified_file_txn(
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     } else {
         Default::default()
@@ -2540,7 +2540,7 @@ fn reresolve_affected_dependents(
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     } else {
         Default::default()

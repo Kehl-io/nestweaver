@@ -13584,6 +13584,7 @@ mod server_status_tests {
                 stale: 1,
                 dead_letter: 0,
             },
+            db_size_bytes: 0,
             symbols: SymbolStats { total: 8192 },
             queue: QueueStats {
                 pending: 4,

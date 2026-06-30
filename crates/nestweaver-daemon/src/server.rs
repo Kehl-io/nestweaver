@@ -17,10 +17,7 @@ use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
-use crate::safeguards::{
-    ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard,
-    with_safeguard_cancellable,
-};
+use crate::safeguards::{ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard};
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -129,11 +126,10 @@ impl DaemonService {
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = self.dispatch_json_tool_inner(tool_name, args_json);
 
         let response = if self.state.server_mode {
-            with_safeguard_cancellable(&tool, safeguards, None, cancelled.clone(), handler).await
+            with_safeguard(&tool, safeguards, None, handler).await
         } else {
             handler.await
         };
@@ -3247,14 +3243,24 @@ pub async fn run_server(
     // requests when no token is configured.
     if let Some(ref opts) = server_opts
         && opts.auth_token.is_none()
-        && let Ok(addr) = opts.bind_addr.parse::<std::net::SocketAddr>()
-        && !addr.ip().is_loopback()
     {
-        anyhow::bail!(
-            "Cannot bind to non-loopback address {} without --auth-token; \
-             the server would be fully open to the network",
-            opts.bind_addr
-        );
+        match opts.bind_addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) if addr.ip().is_loopback() => { /* safe — loopback */ }
+            Ok(addr) => {
+                anyhow::bail!(
+                    "Cannot bind to non-loopback address {} without --auth-token; \
+                     the server would be fully open to the network",
+                    addr
+                );
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "Cannot determine if bind address '{}' is loopback. \
+                     Use --auth-token or specify an IP address.",
+                    opts.bind_addr
+                );
+            }
+        }
     }
 
     // Reject any present webhook secret that is too short to be safe.
