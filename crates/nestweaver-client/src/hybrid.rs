@@ -1975,7 +1975,7 @@ pub async fn flow_trace_with_stitching(
         let mut req = tonic::Request::new(nestweaver_proto::FlowTraceContinueRequest {
             trace_id: trace_id.clone(),
             entry_canonical_id: boundary.canonical_id.clone(),
-            parent_span_id: String::new(), // No span linkage in JSON mode.
+            parent_span_id: boundary.canonical_id.clone(),
             remaining_depth: max_depth
                 .saturating_sub(boundary.parent_path.len() as i32)
                 .max(1),
@@ -2136,19 +2136,28 @@ pub async fn two_tier_query(
     Ok(response)
 }
 
-/// Extract repo URLs/paths mentioned in local blast_radius results.
+/// Extract repo identifiers mentioned in local blast_radius results.
+///
+/// Prefers the `repo_uid` field on each symbol (populated from the graph
+/// store). Falls back to `file_path` as a whole-path key when `repo_uid`
+/// is absent, so entries are still tracked but dedup is path-exact rather
+/// than repo-level.
 fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
     let mut repos = std::collections::HashSet::new();
 
-    // Look for repo info in changed_symbols and affected_symbols.
     for key in &["changed_symbols", "affected_symbols"] {
         if let Some(arr) = local.get(key).and_then(|v| v.as_array()) {
             for item in arr {
-                if let Some(fp) = item.get("file_path").and_then(|v| v.as_str()) {
-                    // Extract repo-level prefix (first path component).
-                    if let Some(repo) = fp.split('/').next() {
+                if let Some(repo) = item.get("repo_uid").and_then(|v| v.as_str()) {
+                    if !repo.is_empty() {
                         repos.insert(repo.to_string());
+                        continue;
                     }
+                }
+                // Fallback: use the full file_path as identity when no
+                // repo_uid is available (should not happen for indexed repos).
+                if let Some(fp) = item.get("file_path").and_then(|v| v.as_str()) {
+                    repos.insert(fp.to_string());
                 }
             }
         }
@@ -2160,10 +2169,9 @@ fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
 /// Filter org-wide results to exclude repos already covered by local impact.
 ///
 /// Removes entries from the server's `affected_symbols` and `changed_symbols`
-/// whose file paths resolve to a repo already present in the local impact.
-/// Matching is done by repo-prefix extraction: the first path component of
-/// each `file_path` is treated as the repo identifier. Repos indexed locally
-/// are excluded from the org section to avoid duplicate noise.
+/// whose `repo_uid` matches a repo already present in the local impact set.
+/// Falls back to full `file_path` matching when `repo_uid` is absent (for
+/// backward compatibility with older servers that don't emit it).
 fn filter_org_results(server: &Value, local_repos: &std::collections::HashSet<String>) -> Value {
     if local_repos.is_empty() {
         return server.clone();
@@ -2174,11 +2182,17 @@ fn filter_org_results(server: &Value, local_repos: &std::collections::HashSet<St
     for key in &["affected_symbols", "changed_symbols"] {
         if let Some(arr) = filtered.get_mut(key).and_then(|v| v.as_array_mut()) {
             arr.retain(|item| {
+                // Prefer repo_uid for matching; fall back to full file_path.
                 let dominated = item
-                    .get("file_path")
+                    .get("repo_uid")
                     .and_then(|v| v.as_str())
-                    .and_then(|fp| fp.split('/').next())
-                    .is_some_and(|repo| local_repos.contains(repo));
+                    .filter(|r| !r.is_empty())
+                    .map(|repo| local_repos.contains(repo))
+                    .unwrap_or_else(|| {
+                        item.get("file_path")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|fp| local_repos.contains(fp))
+                    });
                 !dominated
             });
         }
@@ -2190,12 +2204,18 @@ fn filter_org_results(server: &Value, local_repos: &std::collections::HashSet<St
         .and_then(|v| v.as_array_mut())
     {
         clusters.retain(|cluster| {
-            // Keep the cluster if any of its symbols are NOT in a local repo.
+            // Prefer repo_uid; fall back to full representative_file path.
             let dominated = cluster
-                .get("representative_file")
+                .get("repo_uid")
                 .and_then(|v| v.as_str())
-                .and_then(|fp| fp.split('/').next())
-                .is_some_and(|repo| local_repos.contains(repo));
+                .filter(|r| !r.is_empty())
+                .map(|repo| local_repos.contains(repo))
+                .unwrap_or_else(|| {
+                    cluster
+                        .get("representative_file")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|fp| local_repos.contains(fp))
+                });
             !dominated
         });
     }
@@ -3036,19 +3056,35 @@ mod tests {
     // ── Two-tier blast_radius tests ──────────────────────────────
 
     #[test]
-    fn extract_local_repos_from_changed_symbols() {
+    fn extract_local_repos_from_changed_symbols_with_repo_uid() {
         let local = json!({
             "changed_symbols": [
-                {"uid": "1", "name": "foo", "file_path": "src/lib.rs"},
-                {"uid": "2", "name": "bar", "file_path": "api/handler.rs"},
+                {"uid": "1", "name": "foo", "file_path": "src/lib.rs", "repo_uid": "repo-alpha"},
+                {"uid": "2", "name": "bar", "file_path": "api/handler.rs", "repo_uid": "repo-beta"},
             ],
             "affected_symbols": [
-                {"uid": "3", "name": "baz", "file_path": "src/util.rs"},
+                {"uid": "3", "name": "baz", "file_path": "src/util.rs", "repo_uid": "repo-alpha"},
             ]
         });
         let repos = extract_local_repos(&local);
-        assert!(repos.contains("src"));
-        assert!(repos.contains("api"));
+        assert!(repos.contains("repo-alpha"));
+        assert!(repos.contains("repo-beta"));
+        // Should NOT contain path components — repo_uid takes precedence.
+        assert!(!repos.contains("src"));
+        assert!(!repos.contains("api"));
+    }
+
+    #[test]
+    fn extract_local_repos_falls_back_to_file_path() {
+        // When repo_uid is absent, falls back to full file_path.
+        let local = json!({
+            "changed_symbols": [
+                {"uid": "1", "name": "foo", "file_path": "src/lib.rs"},
+            ],
+            "affected_symbols": []
+        });
+        let repos = extract_local_repos(&local);
+        assert!(repos.contains("src/lib.rs"));
     }
 
     #[test]

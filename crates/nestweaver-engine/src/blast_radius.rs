@@ -21,6 +21,9 @@ pub struct ChangedSymbol {
     pub file_path: String,
     pub kind: String,
     pub pagerank_score: Option<f64>,
+    /// The repo_uid that owns this symbol (from the graph store).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_uid: String,
 }
 
 /// A symbol transitively affected by a change.
@@ -37,6 +40,9 @@ pub struct AffectedSymbol {
     /// decays multiplicatively through the graph). Used for sorting results
     /// so the most-affected symbols appear first.
     pub impact_score: f64,
+    /// The repo_uid that owns this symbol (from the graph store).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_uid: String,
 }
 
 /// A cluster (community) that contains affected symbols.
@@ -130,6 +136,7 @@ pub fn analyze_blast_radius(
                     file_path: sym.file_path.clone(),
                     kind: sym.kind.to_string(),
                     pagerank_score: sym.pagerank_score,
+                    repo_uid: sym.repo_uid.clone(),
                 });
             }
         }
@@ -211,6 +218,7 @@ pub fn analyze_blast_radius(
                     edge_type: node.edge_type,
                     confidence: node.confidence,
                     impact_score: node.impact_score,
+                    repo_uid: affected_repo.clone(),
                 });
             }
         }
