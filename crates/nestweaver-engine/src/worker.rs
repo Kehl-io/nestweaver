@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use crate::bare_clone::BareCloneWorkspace;
 use crate::circuit_breaker::RemoteCircuitBreakers;
 use crate::config::RepoType;
+use crate::content_reader::ContentReader;
 use crate::jobs::{IndexJob, JobQueue, canonical_repo_id};
 
 #[derive(Debug)]
@@ -691,6 +692,27 @@ where
                 &prepared.remote_sha,
                 acquire_write_guard,
             )?;
+
+            // Discover cross-domain (Note↔Symbol) edges now that the vault's
+            // notes are indexed. The GitBareReader is passed via vault_readers
+            // so note bodies can be read from the bare clone — without this,
+            // std::fs::read_to_string would fail silently (no working tree)
+            // and zero Note-to-Symbol edges would be built.
+            let vault_uid = {
+                let root_str = reader.root().to_string_lossy();
+                nestweaver_schema::vault_uid(instance_id, &root_str)
+            };
+            let mut vault_readers = crate::cross_domain::VaultReaders::new();
+            vault_readers.insert(vault_uid, &reader as &dyn crate::content_reader::ContentReader);
+            if let Err(e) =
+                crate::cross_domain::discover_cross_domain_links_with_readers(store, &vault_readers)
+            {
+                tracing::warn!(
+                    repo = %prepared.repo_url,
+                    "cross-domain discovery after vault index failed: {e}"
+                );
+            }
+
             Ok(ReindexOutcome::Full)
         }
         RepoType::Code => {

@@ -141,9 +141,11 @@ pub use config::{
     default_test_path_patterns, remove_repo_from_config_file,
 };
 pub use cross_domain::{
-    CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
+    CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index, build_symbol_index_with_config,
     discover_cross_domain_links, discover_cross_domain_links_for_note,
-    discover_cross_domain_links_for_note_with_index, discover_cross_domain_links_with_config,
+    discover_cross_domain_links_for_note_with_index,
+    discover_cross_domain_links_for_note_with_index_and_readers,
+    discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
