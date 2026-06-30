@@ -348,6 +348,20 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     }
     check_schema_compatibility(&manifest)?;
 
+    // The backup saves clones under `clones/` (historical name), but the
+    // daemon and CLI expect them at `workspace/`. Rename after extraction
+    // so the restored layout matches runtime expectations.
+    let extracted_clones = temp_dir.path().join("clones");
+    let extracted_workspace = temp_dir.path().join("workspace");
+    if extracted_clones.exists() && !extracted_workspace.exists() {
+        std::fs::rename(&extracted_clones, &extracted_workspace).with_context(|| {
+            format!(
+                "rename clones/ to workspace/ in extracted backup at {}",
+                temp_dir.path().display()
+            )
+        })?;
+    }
+
     // Move the verified extraction to the target directory. If the target
     // already exists, remove it first (we've already verified the new data).
     // Atomic restore: rename-aside pattern (similar to dpkg atomic upgrades).
