@@ -464,6 +464,9 @@ fn build_backup_manifest(
     let mut checksums = HashMap::new();
     checksums.insert(db_filename.clone(), db_hash);
 
+    // Checksum all sidecar files in the staging directory.
+    checksum_sidecars(staging, &db_filename, &mut checksums)?;
+
     // Compute sizes for known sidecars.
     let tantivy_size = dir_size(&staging.join({
         let mut s = std::ffi::OsString::from(&db_filename);
@@ -567,6 +570,42 @@ fn check_schema_compatibility(manifest: &BackupManifest) -> anyhow::Result<()> {
 }
 
 /// Recursively compute the total size of all files in a directory.
+/// Compute SHA-256 checksums for all sidecar files in the staging directory,
+/// skipping the main database file (already checksummed by the caller).
+fn checksum_sidecars(
+    staging: &Path,
+    db_filename: &str,
+    checksums: &mut HashMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in walkdir::WalkDir::new(staging)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let rel = entry
+            .path()
+            .strip_prefix(staging)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .to_string();
+
+        // Skip the db file — already checksummed.
+        if rel == db_filename {
+            continue;
+        }
+        // Skip the manifest itself if it's been written to staging.
+        if rel == "manifest.json" {
+            continue;
+        }
+
+        let bytes = std::fs::read(entry.path())
+            .with_context(|| format!("reading sidecar for checksum: {rel}"))?;
+        let hash = format!("sha256:{}", hex_encode(&Sha256::digest(&bytes)));
+        checksums.insert(rel, hash);
+    }
+    Ok(())
+}
+
 fn dir_size(path: &Path) -> u64 {
     if !path.exists() {
         return 0;
