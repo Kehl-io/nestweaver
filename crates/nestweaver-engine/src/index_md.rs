@@ -219,7 +219,7 @@ where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
     let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
-    index_into_store_with_write_gate(
+    let result = index_into_store_with_write_gate(
         reader,
         store,
         instance_id,
@@ -227,7 +227,32 @@ where
         &ignore_set,
         Some(indexed_sha),
         acquire_write_guard,
-    )
+    )?;
+
+    // Load taxonomy aliases from the reader (server-mode equivalent of the
+    // filesystem-based loading in index_markdown_directory_with_store).
+    let aliases = load_taxonomy_aliases_from_reader(reader);
+    if !aliases.is_empty() {
+        if let Some(db_path) = store.db_path() {
+            let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
+            match serde_json::to_string(&aliases) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&sidecar_path, json) {
+                        tracing::warn!("failed to write aliases sidecar: {e}");
+                    } else {
+                        tracing::info!(
+                            path = %sidecar_path.display(),
+                            count = aliases.len(),
+                            "wrote taxonomy alias sidecar (server-mode)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("failed to serialize aliases: {e}"),
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Upsert the `Repo` node for `repo_url` so its `indexed_sha` equals `sha`,
@@ -1784,6 +1809,29 @@ fn secs_to_ymd_hms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 /// Candidate taxonomy file locations within a vault root, in priority order.
 const TAXONOMY_FILES: &[&str] = &["_taxonomy.md", "taxonomy.md", "_brain/taxonomy.md"];
 
+/// Parse alias mappings from a vault's taxonomy file, reading via a
+/// [`ContentReader`]. This is the reader-agnostic version used by both
+/// local-mode and server-mode indexers — server mode has no on-disk working
+/// tree, so direct `fs::read_to_string` would fail.
+fn load_taxonomy_aliases_from_reader(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> HashMap<String, Vec<String>> {
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+
+    for name in TAXONOMY_FILES {
+        let Ok(content) = reader.read_file(Path::new(name)) else {
+            continue;
+        };
+
+        parse_taxonomy_content(&content, &mut aliases);
+
+        // Only process the first taxonomy file found.
+        break;
+    }
+
+    aliases
+}
+
 /// Parse alias mappings from a vault's taxonomy file.
 ///
 /// Returns a map of `canonical_name → [alias1, alias2, ...]`. Two formats
@@ -1817,49 +1865,55 @@ fn load_taxonomy_aliases(vault_root: &Path) -> HashMap<String, Vec<String>> {
             continue;
         };
 
-        // Parse YAML frontmatter for `aliases:` mapping.
-        if let Some(fm) = extract_frontmatter(&content)
-            && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
-            && let Some(mapping) = yaml.get("aliases").and_then(|v| v.as_mapping())
-        {
-            for (key, value) in mapping {
-                if let (Some(canonical), Some(alias_list)) = (key.as_str(), value.as_sequence()) {
-                    let alts: Vec<String> = alias_list
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !alts.is_empty() {
-                        aliases
-                            .entry(canonical.trim().to_string())
-                            .or_default()
-                            .extend(alts);
-                    }
-                }
-            }
-        }
-
-        // Parse inline `Alias -> CanonicalName` lines from the body.
-        let body = skip_frontmatter(&content);
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if let Some((alias_part, canonical_part)) = trimmed.split_once("->") {
-                let alias = alias_part.trim();
-                let canonical = canonical_part.trim();
-                if !alias.is_empty() && !canonical.is_empty() {
-                    aliases
-                        .entry(canonical.to_string())
-                        .or_default()
-                        .push(alias.to_string());
-                }
-            }
-        }
+        parse_taxonomy_content(&content, &mut aliases);
 
         // Only process the first taxonomy file found.
         break;
     }
 
     aliases
+}
+
+/// Parse taxonomy alias content from a string, appending to `aliases`.
+/// Shared by both the filesystem and reader-based taxonomy loaders.
+fn parse_taxonomy_content(content: &str, aliases: &mut HashMap<String, Vec<String>>) {
+    // Parse YAML frontmatter for `aliases:` mapping.
+    if let Some(fm) = extract_frontmatter(content)
+        && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
+        && let Some(mapping) = yaml.get("aliases").and_then(|v| v.as_mapping())
+    {
+        for (key, value) in mapping {
+            if let (Some(canonical), Some(alias_list)) = (key.as_str(), value.as_sequence()) {
+                let alts: Vec<String> = alias_list
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !alts.is_empty() {
+                    aliases
+                        .entry(canonical.trim().to_string())
+                        .or_default()
+                        .extend(alts);
+                }
+            }
+        }
+    }
+
+    // Parse inline `Alias -> CanonicalName` lines from the body.
+    let body = skip_frontmatter(content);
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some((alias_part, canonical_part)) = trimmed.split_once("->") {
+            let alias = alias_part.trim();
+            let canonical = canonical_part.trim();
+            if !alias.is_empty() && !canonical.is_empty() {
+                aliases
+                    .entry(canonical.to_string())
+                    .or_default()
+                    .push(alias.to_string());
+            }
+        }
+    }
 }
 
 /// Extract the YAML frontmatter string (between `---` delimiters) from a
