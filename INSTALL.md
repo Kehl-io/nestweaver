@@ -99,7 +99,7 @@ nestweaver connect <url> --token <bearer-token>
 
 Or set the environment variable:
 ```bash
-export NESTWEAVER_UPSTREAM=https://nestweaver.example.com
+export NESTWEAVER_UPSTREAM=grpcs://nestweaver.example.com:9378
 ```
 
 Local queries are automatically augmented with server-side results when an upstream is configured. See `AGENTS.md` for detailed routing behavior and configuration.

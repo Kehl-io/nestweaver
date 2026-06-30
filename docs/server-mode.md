@@ -61,7 +61,7 @@ max_poll = "8h"
 
 ## Network Architecture
 
-The server listens on three ports. Webhook and admin API endpoints are mounted as routes on the MCP HTTP server (:9379), not on separate ports.
+The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web UI (:9377) is a separate optional process (`nestweaver ui`). Webhook and admin API endpoints are mounted as routes on the MCP HTTP server (:9379), not on separate ports.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -489,7 +489,7 @@ When connected to a server, `blast_radius` returns two-tier results:
 
 ```bash
 # Save a snapshot of the current database
-nestweaver backup save --destination /backups
+nestweaver backup save /backups
 
 # Output: /backups/brain-2026-06-25T10-30-00.nwsnap.zst
 ```
@@ -506,7 +506,7 @@ The backup process:
 ```bash
 # Restore a snapshot
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
-  --db ./brain.lbug
+  --data-dir ./brain.lbug
 
 # All queries work immediately after restore
 # Bare clones are re-fetched in the background
@@ -596,7 +596,7 @@ services:
       NESTWEAVER_WEBHOOK_SECRET: "${NESTWEAVER_WEBHOOK_SECRET}"
       GH_TOKEN: "${GH_TOKEN}"
     command: >
-      daemon --db /data/brain.lbug
+      daemon --db /data/nestweaver/brain.lbug
       run --server --bind 0.0.0.0:9378
       --config /etc/nestweaver/instance.toml
 
@@ -612,7 +612,7 @@ docker compose up -d
 docker compose logs -f nestweaver
 
 # Backup
-docker compose exec nestweaver nestweaver backup save --destination /data/backups
+docker compose exec nestweaver nestweaver backup save /data/backups
 ```
 
 ### Resource requirements

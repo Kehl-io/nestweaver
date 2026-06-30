@@ -114,7 +114,7 @@ nestweaver setup
 nestweaver setup --force   # regenerate skill/guide files even if customized
 ```
 
-Run `nestweaver --help` for the full command list. All commands support `--json` for machine-readable output.
+Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
 
 ## Server Mode
 
@@ -123,10 +123,12 @@ NestWeaver can run as a centralized server, indexing repos for your entire team 
 ### Quick Start
 
 ```bash
-# Start the server
+# Start the server (TLS required for grpcs:// clients)
 nestweaver daemon --db ./brain.lbug run \
   --server \
   --bind 0.0.0.0:9378 \
+  --tls-cert ./tls/server.pem \
+  --tls-key ./tls/server-key.pem \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 
 # Connect from another machine
