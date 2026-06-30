@@ -14,10 +14,16 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// True if a V4 address is an internal/non-routable target we must never reach
-/// (loopback, RFC1918 private, link-local, or the unspecified `0.0.0.0`, which
-/// routes to loopback on some platforms).
+/// (loopback, RFC1918 private, link-local, CGNAT/RFC 6598 `100.64.0.0/10`, or
+/// the unspecified `0.0.0.0`, which routes to loopback on some platforms).
 pub fn v4_is_internal(v4: Ipv4Addr) -> bool {
-    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        // CGNAT / Shared Address Space (RFC 6598): 100.64.0.0/10
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
 /// Extract an embedded IPv4 from the IPv6 transition forms that can smuggle an
@@ -405,6 +411,8 @@ mod tests {
             "192.168.1.1",
             "169.254.1.1",
             "0.0.0.0",
+            "100.64.0.1",  // CGNAT (RFC 6598)
+            "100.127.255.254", // CGNAT upper bound
         ] {
             let url = format!("https://{host}/repo");
             assert!(
@@ -538,6 +546,8 @@ mod tests {
             "10.0.0.1",
             "169.254.1.1",
             "0.0.0.0",
+            "100.64.0.1",   // CGNAT (RFC 6598)
+            "100.100.100.1", // CGNAT mid-range
             "::1",
             "fe80::1",
             "fc00::1",
@@ -553,6 +563,8 @@ mod tests {
         for s in [
             "8.8.8.8",
             "1.1.1.1",
+            "100.128.0.1",              // 100.128.x.x is outside CGNAT /10, public
+            "100.63.255.255",           // just below CGNAT range, public
             "2001:4860:4860::8888", // Google public DNS, IPv6
             "64:ff9b::808:808",     // NAT64 -> 8.8.8.8 (public)
             "2002:0808:0808::",     // 6to4 -> 8.8.8.8 (public)

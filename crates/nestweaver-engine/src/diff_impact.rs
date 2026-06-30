@@ -51,21 +51,47 @@ pub fn compute_diff_changes(
         .next()
         .context("invalid diff spec: expected format 'base..head'")?;
 
-    // Get modified/added/copied/renamed files
+    // Use --name-status with -M to detect renames (status R). For renamed
+    // files, git only reports the new path with --name-only, so
+    // `git show base_ref:<new_path>` fails; we need the old path for the
+    // base content.
     let output = Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=ACMR", diff_spec])
+        .args(["diff", "-M", "--name-status", "--diff-filter=ACMR", diff_spec])
         .current_dir(repo_path)
         .output()
-        .context("git diff --name-only")?;
+        .context("git diff --name-status")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git diff failed: {}", stderr.trim());
     }
 
-    let changed_files: Vec<&str> = std::str::from_utf8(&output.stdout)?
+    // Each line is: <status>\t<path> or <status>\t<old_path>\t<new_path> for renames.
+    // Status R is followed by a similarity percentage (e.g. R100).
+    struct FileEntry {
+        /// Path to use for the new (HEAD) content and as the canonical name.
+        new_path: String,
+        /// Path to use when fetching base content. For renames this is the old path.
+        base_path: String,
+    }
+
+    let changed_files: Vec<FileEntry> = std::str::from_utf8(&output.stdout)?
         .lines()
         .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let status = cols.next()?;
+            if status.starts_with('R') {
+                // Rename: old_path \t new_path
+                let old = cols.next()?.to_string();
+                let new = cols.next()?.to_string();
+                Some(FileEntry { new_path: new, base_path: old })
+            } else {
+                // A/C/M: single path
+                let path = cols.next()?.to_string();
+                Some(FileEntry { new_path: path.clone(), base_path: path })
+            }
+        })
         .collect();
 
     // Get deleted files
@@ -82,16 +108,16 @@ pub fn compute_diff_changes(
 
     let mut all_changes = Vec::new();
 
-    // Process modified/added files
-    for file in &changed_files {
-        let path = Path::new(file);
+    // Process modified/added/renamed files
+    for entry in &changed_files {
+        let path = Path::new(&entry.new_path);
         if nestweaver_parser::detect_language(path).is_none() {
             continue;
         }
 
-        // Get old content from base ref
+        // Get old content from base ref using the base_path (handles renames).
         let old_output = Command::new("git")
-            .args(["show", &format!("{}:{}", base_ref, file)])
+            .args(["show", &format!("{}:{}", base_ref, entry.base_path)])
             .current_dir(repo_path)
             .output();
 
@@ -103,7 +129,7 @@ pub fn compute_diff_changes(
         // Get new content from HEAD (or working tree for the head side of the diff)
         let head_ref = diff_spec.split("..").nth(1).unwrap_or("HEAD");
         let new_output = Command::new("git")
-            .args(["show", &format!("{}:{}", head_ref, file)])
+            .args(["show", &format!("{}:{}", head_ref, entry.new_path)])
             .current_dir(repo_path)
             .output();
 
@@ -111,10 +137,10 @@ pub fn compute_diff_changes(
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => {
                 // Fall back to working tree
-                match std::fs::read_to_string(repo_path.join(file)) {
+                match std::fs::read_to_string(repo_path.join(&entry.new_path)) {
                     Ok(c) => c,
                     Err(_) => {
-                        tracing::warn!(file = %file, "diff impact: file not available via git show or working tree, skipping");
+                        tracing::warn!(file = %entry.new_path, "diff impact: file not available via git show or working tree, skipping");
                         continue;
                     }
                 }
@@ -125,10 +151,10 @@ pub fn compute_diff_changes(
             continue;
         }
 
-        match compute_file_changes(&old_content, &new_content, file, repo_url) {
+        match compute_file_changes(&old_content, &new_content, &entry.new_path, repo_url) {
             Ok(changes) => all_changes.extend(changes),
             Err(e) => {
-                tracing::warn!(file, error = %e, "failed to diff file, skipping");
+                tracing::warn!(file = %entry.new_path, error = %e, "failed to diff file, skipping");
             }
         }
     }

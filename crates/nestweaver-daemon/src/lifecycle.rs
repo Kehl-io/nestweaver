@@ -31,11 +31,14 @@ pub fn canonical_db_path(db_path: &Path) -> PathBuf {
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
     let canonical = canonical_db_path(db_path);
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
+    // Use SHA-256 for a stable hash that won't change across Rust versions.
+    // DefaultHasher (SipHash) is explicitly documented as not portable.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    // Take the first 4 bytes (8 hex chars) for a short, stable instance ID.
+    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
 }
 
 /// Human-readable label for logging: `<parent-dir>-<hash>`.
