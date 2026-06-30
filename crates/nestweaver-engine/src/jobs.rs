@@ -68,7 +68,6 @@ pub enum JobStatus {
     Pending,
     Running,
     Succeeded,
-    Failed,
     DeadLetter,
     Cancelled,
 }
@@ -80,7 +79,6 @@ impl JobStatus {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
             Self::DeadLetter => "dead_letter",
             Self::Cancelled => "cancelled",
         }
@@ -91,9 +89,10 @@ impl JobStatus {
             "pending" => Self::Pending,
             "running" => Self::Running,
             "succeeded" => Self::Succeeded,
-            "failed" => Self::Failed,
             "dead_letter" => Self::DeadLetter,
             "cancelled" => Self::Cancelled,
+            // "failed" in the DB maps to DeadLetter (the actual terminal failure state)
+            "failed" => Self::DeadLetter,
             _ => Self::Pending,
         }
     }
@@ -124,7 +123,6 @@ pub struct QueueDepth {
     pub pending: i64,
     pub running: i64,
     pub succeeded: i64,
-    pub failed: i64,
     pub dead_letter: i64,
 }
 
@@ -455,7 +453,6 @@ impl JobQueue {
                 "pending" => depth.pending = count,
                 "running" => depth.running = count,
                 "succeeded" => depth.succeeded = count,
-                "failed" => depth.failed = count,
                 "dead_letter" => depth.dead_letter = count,
                 _ => {}
             }

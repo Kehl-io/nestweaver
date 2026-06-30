@@ -5,7 +5,6 @@
 //! number — line numbers shift when code changes above a symbol, but scope chains
 //! are stable across versions.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// Identity key for deduplicating results across local and server.
@@ -147,10 +146,12 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
 
 /// Deduplicate results from local and server sources.
 /// Local wins on content when both have the same symbol.
+#[cfg(test)]
 pub fn deduplicate(
     local_results: Vec<serde_json::Value>,
     server_results: Vec<serde_json::Value>,
 ) -> Vec<MergedResult> {
+    use std::collections::HashMap;
     let mut seen: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
 

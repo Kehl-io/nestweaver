@@ -7700,6 +7700,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret_old,
                     config,
                 } => {
+                    if !server {
+                        if bind != "127.0.0.1:9378" {
+                            tracing::warn!("--bind is ignored when --server is false");
+                        }
+                        if tls_cert.is_some() {
+                            tracing::warn!("--tls-cert is ignored when --server is false");
+                        }
+                        if tls_key.is_some() {
+                            tracing::warn!("--tls-key is ignored when --server is false");
+                        }
+                        if auth_token.is_some() {
+                            tracing::warn!("--auth-token is ignored when --server is false");
+                        }
+                        if webhook_secret.is_some() {
+                            tracing::warn!("--webhook-secret is ignored when --server is false");
+                        }
+                        if admin_token.is_some() {
+                            tracing::warn!("--admin-token is ignored when --server is false");
+                        }
+                    }
                     let server_opts = if server {
                         Some(nestweaver_daemon::ServerOpts {
                             bind_addr: bind,

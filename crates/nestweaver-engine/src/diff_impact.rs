@@ -113,7 +113,10 @@ pub fn compute_diff_changes(
                 // Fall back to working tree
                 match std::fs::read_to_string(repo_path.join(file)) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(_) => {
+                        tracing::warn!(file = %file, "diff impact: file not available via git show or working tree, skipping");
+                        continue;
+                    }
                 }
             }
         };
