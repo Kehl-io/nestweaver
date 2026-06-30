@@ -77,6 +77,10 @@ const FALLBACK_MODE_CAP: Duration = Duration::from_millis(250);
 /// without paying a `RepoStates` round-trip on every query.
 const STALE_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum time to wait for a staleness refresh before falling back to the
+/// cached value. Prevents upstream gRPC latency from blocking the query path.
+const STALE_REFRESH_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Hybrid client that routes queries to a local daemon and optional upstream
 /// servers.
 ///
@@ -212,7 +216,7 @@ impl HybridClient {
         // already handle the "no healthy upstream" case with graceful fallback.
         if self.upstreams.is_empty() {
             let mut result = self.query_local(tool_name, params).await?;
-            inject_provenance(&mut result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut result, &["local"], &[]);
             return Ok(result);
         }
 
@@ -266,7 +270,7 @@ impl HybridClient {
         match routing {
             ToolRouting::LocalOnly => {
                 let mut result = self.query_local(tool_name, params).await?;
-                inject_provenance(&mut result, &["local"], &[]);
+                inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
             }
             ToolRouting::ServerPreferred => self.query_server_preferred(tool_name, params).await,
@@ -293,12 +297,12 @@ impl HybridClient {
                                 }
                             }
                         }
-                        inject_provenance(&mut result, &["local", "server"], &[]);
+                        inject_or_wrap_provenance(&mut result, &["local", "server"], &[]);
                     } else {
-                        inject_provenance(&mut result, &["local"], &[]);
+                        inject_or_wrap_provenance(&mut result, &["local"], &[]);
                     }
                 } else {
-                    inject_provenance(&mut result, &["local"], &[]);
+                    inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 }
                 Ok(result)
             }
@@ -327,13 +331,13 @@ impl HybridClient {
         let timeout = self.upstream_timeout(params);
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(mut r) => {
-                inject_provenance(&mut r, &["server"], &[]);
+                inject_or_wrap_provenance(&mut r, &["server"], &[]);
                 Ok(r)
             }
             Err(e) => {
                 debug!(error = %e, tool = tool_name, "server-preferred: upstream failed, falling back to local");
                 let mut r = self.query_local(tool_name, params).await?;
-                inject_provenance(&mut r, &["local"], &[]);
+                inject_or_wrap_provenance(&mut r, &["local"], &[]);
                 Ok(r)
             }
         }
@@ -380,7 +384,7 @@ impl HybridClient {
 
         // 2. If no upstreams are configured, return local as-is.
         if self.upstreams.is_empty() {
-            inject_provenance(&mut local_result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
 
@@ -392,7 +396,7 @@ impl HybridClient {
                 tool = tool_name,
                 local_count, "fallback: local results sufficient, skipping server"
             );
-            inject_provenance(&mut local_result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
 
@@ -411,7 +415,7 @@ impl HybridClient {
                 // responses keep their `connected` schema; it falls back to the
                 // flat envelope for non-structured tools internally.
                 let mut merged = merge_structured_results(&local_result, &server_result);
-                inject_provenance(&mut merged, &["local", "server"], &[]);
+                inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }
             Err(e) => {
@@ -421,7 +425,7 @@ impl HybridClient {
                     error = %e,
                     "fallback: upstream query failed, returning local-only results"
                 );
-                inject_provenance(&mut local_result, &["local"], &[]);
+                inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
                 Ok(local_result)
             }
         }
@@ -432,7 +436,7 @@ impl HybridClient {
     pub async fn query_merge(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
         if self.upstreams.is_empty() {
             let mut result = self.query_local(tool_name, params).await?;
-            inject_provenance(&mut result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut result, &["local"], &[]);
             return Ok(result);
         }
 
@@ -464,7 +468,7 @@ impl HybridClient {
 
         let Some(server_fut) = server_task else {
             let mut result = self.query_local(tool_name, params).await?;
-            inject_provenance(&mut result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut result, &["local"], &[]);
             return Ok(result);
         };
 
@@ -477,19 +481,19 @@ impl HybridClient {
         match server_result {
             Ok(Ok(server)) => {
                 let mut merged = merge_structured_results(&local, &server);
-                inject_provenance(&mut merged, &["local", "server"], &[]);
+                inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
                 let mut result = local;
-                inject_provenance(&mut result, &["local"], &[]);
+                inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
             }
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
                 let mut result = local;
-                inject_provenance(&mut result, &["local"], &[]);
+                inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
             }
         }
@@ -498,14 +502,27 @@ impl HybridClient {
     /// Return the current set of stale repos, refreshing the cache when it has
     /// expired (see [`STALE_TTL`]). Used to populate `_meta.stale_repos` on
     /// query responses without a `RepoStates` round-trip on every call.
+    ///
+    /// The refresh is bounded by [`STALE_REFRESH_TIMEOUT`] to avoid blocking
+    /// the query path when the upstream gRPC call is slow. If the refresh
+    /// does not complete in time, the previous cached value is returned and
+    /// the next query will retry.
     async fn current_stale_repos(&mut self) -> Vec<String> {
         let fresh = self
             .stale_checked_at
             .map(|t| t.elapsed() < STALE_TTL)
             .unwrap_or(false);
         if !fresh {
-            self.stale_cache = self.check_staleness().await;
-            self.stale_checked_at = Some(Instant::now());
+            match tokio::time::timeout(STALE_REFRESH_TIMEOUT, self.check_staleness()).await {
+                Ok(result) => {
+                    self.stale_cache = result;
+                    self.stale_checked_at = Some(Instant::now());
+                }
+                Err(_) => {
+                    debug!("stale repo refresh timed out, returning cached value");
+                    // Don't update stale_checked_at so we retry on the next query.
+                }
+            }
         }
         self.stale_cache.clone()
     }
@@ -1550,7 +1567,7 @@ fn merge_structured_results(local: &Value, server: &Value) -> Value {
                 result[key] = val.clone();
             }
         }
-        inject_provenance(&mut result, &["local", "server"], &[]);
+        inject_or_wrap_provenance(&mut result, &["local", "server"], &[]);
         result
     } else {
         merge_json_results(local, server)
@@ -1574,7 +1591,10 @@ fn wrap_merged_response(results: Vec<Value>, sources: &[&str]) -> Value {
     })
 }
 
-/// Inject `_meta` provenance into an existing JSON response.
+/// Inject `_meta` provenance into an existing JSON object response.
+///
+/// This is the inner helper; prefer [`inject_or_wrap_provenance`] which
+/// also handles bare-array responses.
 fn inject_provenance(result: &mut Value, sources: &[&str], stale_repos: &[String]) {
     let scope = if sources.len() > 1 {
         "hybrid"
@@ -1929,7 +1949,7 @@ pub async fn flow_trace_with_stitching(
     };
 
     if boundaries.is_empty() || !client.has_upstreams() {
-        inject_provenance(&mut local_result, &["local"], &[]);
+        inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
         return Ok(local_result);
     }
 
@@ -1959,7 +1979,7 @@ pub async fn flow_trace_with_stitching(
                     ),
                 );
             }
-            inject_provenance(&mut local_result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
     };
@@ -2016,7 +2036,7 @@ pub async fn flow_trace_with_stitching(
         }
     }
 
-    inject_provenance(&mut local_result, &["local", &server_name], &[]);
+    inject_or_wrap_provenance(&mut local_result, &["local", &server_name], &[]);
     Ok(local_result)
 }
 
@@ -2041,7 +2061,7 @@ fn trace_id() -> String {
 /// When an upstream server is available:
 /// 1. Run the tool locally (existing logic)
 /// 2. Query the server for the same tool
-/// 3. Combine into a response with `local_impact` and `org_impact` sections
+/// 3. Combine into a response with `local_impact` and `org_wide_impact` sections
 ///
 /// Used for blast_radius, brain_impact, and affected_tests.
 pub async fn two_tier_query(
@@ -2054,7 +2074,7 @@ pub async fn two_tier_query(
 
     // 2. If no upstream, return local-only with clear annotation.
     if !client.has_upstreams() {
-        inject_provenance(&mut local_result, &["local"], &[]);
+        inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
         if let Some(obj) = local_result.as_object_mut() {
             obj.insert("tier".to_string(), Value::String("local_only".into()));
         }
@@ -2065,7 +2085,7 @@ pub async fn two_tier_query(
     let upstream = match client.upstreams.iter().find(|u| u.is_healthy()) {
         Some(u) => u,
         None => {
-            inject_provenance(&mut local_result, &["local"], &[]);
+            inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
             if let Some(obj) = local_result.as_object_mut() {
                 obj.insert("tier".to_string(), Value::String("local_only".into()));
                 obj.insert(
@@ -2119,19 +2139,19 @@ pub async fn two_tier_query(
         let local_repos = extract_local_repos(&local_result);
         let filtered_server = filter_org_results(&server, &local_repos);
 
-        response["org_impact"] = serde_json::json!({
+        response["org_wide_impact"] = serde_json::json!({
             "source_server": server_name,
             "results": filtered_server,
         });
     } else {
-        response["org_impact"] = serde_json::json!({
+        response["org_wide_impact"] = serde_json::json!({
             "source_server": server_name,
             "status": "unavailable",
             "note": "upstream server query failed — showing local impact only",
         });
     }
 
-    inject_provenance(&mut response, &["local", &server_name], &[]);
+    inject_or_wrap_provenance(&mut response, &["local", &server_name], &[]);
 
     Ok(response)
 }
@@ -2644,7 +2664,7 @@ mod tests {
     #[test]
     fn inject_provenance_adds_meta() {
         let mut val = json!({"results": [1, 2, 3]});
-        inject_provenance(&mut val, &["local", "acme"], &["repo-a".to_string()]);
+        inject_or_wrap_provenance(&mut val, &["local", "acme"], &["repo-a".to_string()]);
         assert!(val["_meta"].is_object());
         assert_eq!(val["_meta"]["scope"], "hybrid");
         assert_eq!(val["_meta"]["stale_repos"][0], "repo-a");
@@ -2655,7 +2675,7 @@ mod tests {
     #[test]
     fn inject_provenance_local_only_scope() {
         let mut val = json!({"results": []});
-        inject_provenance(&mut val, &["local"], &[]);
+        inject_or_wrap_provenance(&mut val, &["local"], &[]);
         assert_eq!(val["_meta"]["scope"], "local");
         assert!(val["_meta"]["stale_repos"].as_array().unwrap().is_empty());
     }

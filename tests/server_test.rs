@@ -1766,7 +1766,7 @@ async fn hybrid_merge_combines_local_and_server_sources() {
 /// ATTEMPT: two-tier `blast_radius`. The local daemon indexes a file under
 /// `local/`, the server a file under `server/`. With both paths in
 /// `changed_files`, the two-tier response must carry a populated `local_impact`
-/// (local changed symbols) AND a server-sourced `org_impact` whose results
+/// (local changed symbols) AND a server-sourced `org_wide_impact` whose results
 /// survive the same-repo dedup (distinct path prefixes) — i.e. both tiers
 /// populated with real data, with the org tier genuinely reached over
 /// authenticated gRPC.
@@ -1828,29 +1828,29 @@ async fn hybrid_blast_radius_two_tier_populates_both_tiers() {
     // Org tier genuinely reached the authenticated server (not the
     // "unavailable" fallback) and carries the server repo's symbol.
     assert_eq!(
-        resp["org_impact"]["source_server"], "server",
-        "org_impact must be attributed to the 'server' upstream; got {}",
-        resp["org_impact"]
+        resp["org_wide_impact"]["source_server"], "server",
+        "org_wide_impact must be attributed to the 'server' upstream; got {}",
+        resp["org_wide_impact"]
     );
     assert!(
-        resp["org_impact"].get("status").is_none(),
-        "org_impact must NOT be the 'unavailable' fallback — the server tier \
+        resp["org_wide_impact"].get("status").is_none(),
+        "org_wide_impact must NOT be the 'unavailable' fallback — the server tier \
          must be reached; got {}",
-        resp["org_impact"]
+        resp["org_wide_impact"]
     );
-    let org_changed = resp["org_impact"]["results"]["changed_symbols"]
+    let org_changed = resp["org_wide_impact"]["results"]["changed_symbols"]
         .as_array()
-        .expect("org_impact.results.changed_symbols array");
+        .expect("org_wide_impact.results.changed_symbols array");
     assert!(
         !org_changed.is_empty(),
-        "org_impact.results must contain the server's changed symbol (survives \
+        "org_wide_impact.results must contain the server's changed symbol (survives \
          same-repo dedup via distinct path prefix); got {}",
-        resp["org_impact"]
+        resp["org_wide_impact"]
     );
     assert!(
-        resp["org_impact"].to_string().contains("serverimpactfn"),
-        "org_impact should reference the server-only 'serverimpactfn'; got {}",
-        resp["org_impact"]
+        resp["org_wide_impact"].to_string().contains("serverimpactfn"),
+        "org_wide_impact should reference the server-only 'serverimpactfn'; got {}",
+        resp["org_wide_impact"]
     );
 
     let sources = meta_sources(&resp);

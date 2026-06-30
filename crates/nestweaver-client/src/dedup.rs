@@ -97,7 +97,7 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
         })?;
 
     // Repo URL: try standard fields, then extract from `uid` if it encodes
-    // repo info (e.g. "repo:github.com/acme/api:src/lib.rs#symbol").
+    // repo info.
     let repo_url = result
         .get("repo_url")
         .or_else(|| result.get("repo"))
@@ -105,11 +105,15 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
         .map(|s| s.to_string())
         .or_else(|| {
             result.get("uid").and_then(|v| v.as_str()).and_then(|uid| {
-                // UID format: "repo:<url>:<path>#<name>" or "sym:<repo_uid>:<path>#<name>".
-                // Extract the repo segment if present.
-                uid.split_once(':')
-                    .and_then(|(_, rest)| rest.split_once(':'))
-                    .map(|(repo_part, _)| repo_part.to_string())
+                // UID format: "sym:repo:{instance}:{url_hash}:{file_hash}:{name_hash}:{line}".
+                // After splitting off "sym" and "repo", extract the next two
+                // colon-delimited segments ({instance}:{url_hash}) as the repo identity.
+                let (_, rest) = uid.split_once(':')?; // strip "sym"
+                let (_, rest) = rest.split_once(':')?; // strip "repo"
+                let mut parts = rest.splitn(3, ':');
+                let instance = parts.next()?;
+                let url_hash = parts.next()?;
+                Some(format!("{instance}:{url_hash}"))
             })
         })
         // If no repo could be extracted, use the file_path as a stand-in so
@@ -144,8 +148,18 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
     })
 }
 
+/// Weight multiplier for local results, matching production RRF merge.
+/// See `merge.rs::LOCAL_WEIGHT`.
+#[cfg(test)]
+const LOCAL_WEIGHT: f64 = 1.5;
+
+/// RRF smoothing constant, matching production. See `merge.rs::RRF_K`.
+#[cfg(test)]
+const RRF_K: f64 = 60.0;
+
 /// Deduplicate results from local and server sources.
 /// Local wins on content when both have the same symbol.
+/// Uses the same weighted RRF scoring as production (`LOCAL_WEIGHT=1.5`).
 #[cfg(test)]
 pub fn deduplicate(
     local_results: Vec<serde_json::Value>,
@@ -155,13 +169,14 @@ pub fn deduplicate(
     let mut seen: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
 
-    // Insert local results first (they win on content)
+    // Insert local results first (they win on content).
+    // Local results get LOCAL_WEIGHT multiplier, consistent with production merge.
     for (rank, val) in local_results.into_iter().enumerate() {
         let result = MergedResult {
             value: val.clone(),
             provenance: Provenance::Local,
             confidence: Confidence::Precise,
-            score: 1.0 / (rank as f64 + 61.0), // RRF with k=60
+            score: LOCAL_WEIGHT / (rank as f64 + RRF_K + 1.0),
         };
         match extract_identity(&val) {
             Some(id) => {
@@ -173,15 +188,16 @@ pub fn deduplicate(
         }
     }
 
-    // Insert server results, merging with existing local entries
+    // Insert server results, merging with existing local entries.
+    // Server results use baseline weight (1.0).
     for (rank, val) in server_results.into_iter().enumerate() {
         match extract_identity(&val) {
             Some(id) => {
                 if let Some(existing) = seen.get_mut(&id) {
                     // Both have it — local wins on content, mark as Both
                     existing.provenance = Provenance::Both;
-                    // Add server's RRF score
-                    existing.score += 1.0 / (rank as f64 + 61.0);
+                    // Add server's RRF score (unweighted)
+                    existing.score += 1.0 / (rank as f64 + RRF_K + 1.0);
                 } else {
                     // Server-only
                     seen.insert(
@@ -190,7 +206,7 @@ pub fn deduplicate(
                             value: val,
                             provenance: Provenance::Server,
                             confidence: Confidence::Precise,
-                            score: 1.0 / (rank as f64 + 61.0),
+                            score: 1.0 / (rank as f64 + RRF_K + 1.0),
                         },
                     );
                 }
@@ -201,7 +217,7 @@ pub fn deduplicate(
                     value: val,
                     provenance: Provenance::Server,
                     confidence: Confidence::Heuristic,
-                    score: 1.0 / (rank as f64 + 61.0),
+                    score: 1.0 / (rank as f64 + RRF_K + 1.0),
                 });
             }
         }
@@ -444,9 +460,10 @@ mod tests {
 
         let merged = deduplicate(local, server);
         assert_eq!(merged.len(), 1);
-        // Combined score should be higher than a single source
-        let single_score = 1.0 / 61.0;
-        assert!(merged[0].score > single_score);
+        // Combined score should be higher than a single source.
+        // Local alone: LOCAL_WEIGHT / (0 + RRF_K + 1) = 1.5 / 61.0
+        let single_local_score = LOCAL_WEIGHT / (RRF_K + 1.0);
+        assert!(merged[0].score > single_local_score);
     }
 
     #[test]
