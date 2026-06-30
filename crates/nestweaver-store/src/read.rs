@@ -856,6 +856,21 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Like [`lookup_symbols_by_repo`] but on an externally-provided connection
+    /// (for use inside an open transaction).
+    pub fn lookup_symbols_by_repo_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let safe_repo = repo_uid.replace('\'', "\\'");
+        let rows = conn
+            .query(&format!(
+                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo}' RETURN {SYMBOL_COLUMNS}"
+            ))
+            .map_err(|e| StoreError::Query(format!("lookup_symbols_by_repo_on: {e}")))?;
+        rows.map(|row| row_to_symbol(&row)).collect()
+    }
+
     /// Returns all Symbol nodes whose `file_path` property matches `file_path`.
     pub fn symbols_in_file(&self, file_path: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;

@@ -2483,11 +2483,11 @@ fn reresolve_affected_dependents(
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
 ) -> Result<usize, anyhow::Error> {
-    if rdeps.is_empty() {
+    if changed.is_empty() {
         return Ok(0);
     }
 
-    // S = changed ∪ rdeps.
+    // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
     scope.extend(rdeps.iter().cloned());
 
@@ -2518,6 +2518,57 @@ fn reresolve_affected_dependents(
 
     if file_data.is_empty() {
         return Ok(0);
+    }
+
+    // ── Include unchanged files' symbols as resolution targets ──────────
+    //
+    // The per-file `DETACH DELETE` destroys outgoing edges from changed
+    // files to unchanged files.  The single-file resolution pass in the
+    // mutation loop can only recreate intra-file edges because it has no
+    // visibility into other files' symbols.  To restore those
+    // changed→unchanged edges we must include the unchanged files' symbols
+    // in the resolver's symbol map so the resolver can find them as
+    // targets.  We add them to `file_data` with empty references (we
+    // don't need to resolve their references — those edges were never
+    // deleted) and populate `uid_to_file` so the edge filter can look up
+    // their file paths.
+    let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
+        .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
+
+    let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
+    for sym in &db_symbols {
+        if scope.contains(&sym.file_path) {
+            // Already in file_data from re-parsing above; just ensure
+            // uid_to_file has the DB uid (the re-parsed uid should match,
+            // but belt-and-suspenders).
+            uid_to_file
+                .entry(sym.uid.clone())
+                .or_insert_with(|| sym.file_path.clone());
+            continue;
+        }
+        uid_to_file.insert(sym.uid.clone(), sym.file_path.clone());
+        unchanged_by_file
+            .entry(sym.file_path.clone())
+            .or_default()
+            .push(RawSymbol {
+                name: sym.name.clone(),
+                kind: sym.kind,
+                start_line: sym.start_line,
+                end_line: sym.end_line,
+                signature: sym.signature.clone(),
+                content_hash: sym.content_hash.clone(),
+                is_entry_point: sym.is_entry_point,
+                entry_point_kind: sym.entry_point_kind,
+                visibility: sym.visibility,
+                type_info: None,
+                parent_name: None,
+                scope_chain: None,
+            });
+    }
+    for (file_path, symbols) in unchanged_by_file {
+        // Empty references: we only need these files as resolution
+        // targets, not as resolution sources.
+        file_data.push((file_path, symbols, Vec::new()));
     }
 
     // Resolve with the most-common language across S (matches the full-index
@@ -2555,21 +2606,31 @@ fn reresolve_affected_dependents(
         Some(&scope),
     );
 
+    // Keep only the cross-file edges that the `DETACH DELETE` destroyed:
+    //
+    //  • target in changed  — the target symbol was deleted and re-inserted
+    //    with new UIDs, so any edge pointing at it (from rdeps or other
+    //    changed files) must be recreated.
+    //  • source in changed  — the source symbol was deleted and re-inserted,
+    //    so its outgoing edges (to unchanged files, rdeps, or other changed
+    //    files) must be recreated.
+    //
+    // Edges where NEITHER endpoint is in a changed file (e.g. rdep→rdep or
+    // rdep→unchanged) were never deleted and must NOT be re-inserted
+    // (edge insert is CREATE, not MERGE — duplicates would result).
     let insertable: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| {
             if e.target_uid.starts_with("unresolved:") {
                 return false;
             }
-            // Both endpoints are within S (source is filtered by resolve_only =
-            // S; we only keep targets in `changed` ⊆ S), so both lookups hit.
             let (Some(tf), Some(sf)) = (
                 uid_to_file.get(&e.target_uid),
                 uid_to_file.get(&e.source_uid),
             ) else {
                 return false;
             };
-            changed.contains(tf) && sf != tf
+            sf != tf && (changed.contains(tf.as_str()) || changed.contains(sf.as_str()))
         })
         .collect();
 
