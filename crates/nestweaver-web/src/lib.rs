@@ -292,3 +292,44 @@ pub async fn start_server_with_router(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod frontend_assets_tests {
+    use super::*;
+
+    /// Every asset referenced by the embedded `index.html` must itself be
+    /// embedded. `rust_embed` pulls from `frontend/dist/` on disk at build time,
+    /// so on a clean git checkout this fails if a rebuilt, content-hashed bundle
+    /// was not git-tracked — the release-breaking "index.html points at a missing
+    /// /assets/* file" class. The `dist/` folder is gitignored and force-added,
+    /// so a forgotten `git add -f` after a `vite build` is the exact failure mode.
+    #[test]
+    fn embedded_index_references_only_embedded_assets() {
+        let index = FrontendAssets::get("index.html").expect("index.html must be embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index.html is utf8");
+
+        let mut checked = 0;
+        let mut rest = html;
+        while let Some(pos) = rest.find("/assets/") {
+            // Drop the leading '/', keep the embed-relative "assets/<file>".
+            let tail = &rest[pos + 1..];
+            let end = tail
+                .find(|c: char| {
+                    c == '"' || c == '\'' || c == ')' || c == '?' || c.is_whitespace()
+                })
+                .unwrap_or(tail.len());
+            let asset_path = &tail[..end];
+            assert!(
+                FrontendAssets::get(asset_path).is_some(),
+                "index.html references /{asset_path} but it is not embedded \
+                 (rebuilt frontend bundle not git-tracked?)"
+            );
+            checked += 1;
+            rest = &tail[end..];
+        }
+        assert!(
+            checked > 0,
+            "expected index.html to reference at least one /assets/* file"
+        );
+    }
+}

@@ -725,7 +725,18 @@ fn bare_reader_for_repo(
     if !bare_path.is_dir() {
         return None;
     }
-    nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()
+    // Read source at the repo's recorded indexed_sha — symbol spans come from the
+    // graph indexed at that commit, and the bare clone's HEAD may have been
+    // fetched past it. Fall back to HEAD only when no server sha is recorded
+    // (local repos store "local" or an empty sha).
+    if repo.indexed_sha.is_empty() || repo.indexed_sha == "local" {
+        nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()
+    } else {
+        Some(nestweaver_engine::content_reader::GitBareReader::new(
+            &bare_path,
+            &repo.indexed_sha,
+        ))
+    }
 }
 
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
@@ -6149,6 +6160,85 @@ fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Er
 #[cfg(test)]
 mod server_mode_tests {
     use super::*;
+
+    // read_symbols in server mode must read source at the repo's recorded
+    // indexed_sha, NOT the bare clone's HEAD — the daemon may have fetched past
+    // the indexed commit, so HEAD would return the wrong commit's source for
+    // symbol spans taken from the indexed graph. Build a bare repo whose HEAD
+    // (v2) differs from indexed_sha (v1) and assert the reader returns v1.
+    #[test]
+    fn bare_reader_reads_indexed_sha_not_head() {
+        use nestweaver_engine::content_reader::ContentReader;
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(src.join("a.txt"), "v1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "c1"]);
+        let sha1 = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&src)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(src.join("a.txt"), "v2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "c2"]);
+
+        // Bare clone at the URL-hashed path bare_reader_for_repo resolves to.
+        let url = "https://github.com/example/twocommit";
+        let workspace_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let clone_dir = nestweaver_engine::pull::clone_dir_name_from_url(url);
+        let bare = workspace_root.join(format!("{clone_dir}.git"));
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo-tc".to_string(),
+                url: url.to_string(),
+                indexed_sha: sha1.clone(),
+                staleness_commits_behind: 1,
+                instance_id: "inst".to_string(),
+                name: None,
+            })
+            .unwrap();
+
+        let reader = bare_reader_for_repo(&store, &workspace_root, "repo-tc")
+            .expect("reader for indexed repo");
+        let content = reader.read_file(std::path::Path::new("a.txt")).unwrap();
+        assert_eq!(
+            content, "v1",
+            "read_symbols must read source at indexed_sha (v1), not bare HEAD (v2)"
+        );
+    }
 
     // brain_status must report the ACTUAL server mode (the thread-local set by
     // the transport handler), not a hardcoded value. Regression guard for the
