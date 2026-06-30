@@ -3569,7 +3569,9 @@ pub async fn run_server(
             });
             mcp_router = mcp_router.route(
                 "/webhook",
-                axum::routing::post(crate::webhook::handle_webhook).with_state(webhook_state),
+                axum::routing::post(crate::webhook::handle_webhook)
+                    .with_state(webhook_state)
+                    .layer(axum::extract::DefaultBodyLimit::max(5_242_880)),
             );
             tracing::info!("webhook endpoint enabled at /webhook");
         }
@@ -3789,11 +3791,14 @@ pub async fn run_server(
 
             tokio::spawn(async move {
                 let mut builder = tonic::transport::Server::builder();
-                // Safe: cert/key validated in the TLS config block above.
                 if let Some((tonic_tls, _)) = tls_config {
-                    builder = builder
-                        .tls_config(tonic_tls)
-                        .expect("TLS configuration validated at startup");
+                    builder = match builder.tls_config(tonic_tls) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "TLS configuration failed at serve time");
+                            return;
+                        }
+                    };
                 }
                 let _ = builder
                     .add_service(tcp_svc)
