@@ -222,29 +222,70 @@ fn signatures_similar(a: &str, b: &str) -> bool {
     count_params(a) == count_params(b)
 }
 
+/// True if a trimmed parameter fragment is a receiver (`self`/`cls`), not a
+/// real parameter.
+fn is_self_param(p: &str) -> bool {
+    p.starts_with("self")
+        || p.starts_with("&self")
+        || p.starts_with("&mut self")
+        || p.starts_with("cls")
+}
+
+/// Extract the balanced parameter list from a signature: the text between the
+/// first `(` and its matching `)`. Depth-tracked so a closure/tuple param such
+/// as `cb: Fn(i32) -> bool` does not truncate the list at an inner `)`.
+fn extract_param_list(sig: &str) -> Option<&str> {
+    let start = sig.find('(')?;
+    let mut depth = 0i32;
+    for (i, c) in sig[start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&sig[start + 1..start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a parameter list on top-level commas, ignoring commas nested inside
+/// `<>`, `()`, or `[]` — e.g. generics like `Option<Map<K, V>>` and tuples.
+fn split_top_level_params(params: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in params.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&params[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&params[start..]);
+    out
+}
+
 /// Count the number of parameters in a function signature string.
 fn count_params(sig: &str) -> usize {
-    if let Some(start) = sig.find('(')
-        && let Some(end) = sig[start..].find(')')
-    {
-        let params = &sig[start + 1..start + end];
-        let trimmed = params.trim();
-        if trimmed.is_empty() {
-            return 0;
-        }
-        // Filter out self/&self/cls -- not real parameters
-        return trimmed
-            .split(',')
-            .filter(|p| {
-                let p = p.trim();
-                !p.starts_with("self")
-                    && !p.starts_with("&self")
-                    && !p.starts_with("&mut self")
-                    && !p.starts_with("cls")
-            })
-            .count();
+    let Some(params) = extract_param_list(sig) else {
+        return 0;
+    };
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return 0;
     }
-    0
+    split_top_level_params(trimmed)
+        .into_iter()
+        .filter(|p| !is_self_param(p.trim()))
+        .count()
 }
 
 /// Compute atomic changes for a single file by parsing old and new content.
@@ -446,25 +487,17 @@ fn is_dynamic_language_file(path: &str) -> bool {
 }
 
 fn has_default_params(sig: &str, old_count: usize) -> bool {
-    if let Some(start) = sig.find('(')
-        && let Some(end) = sig[start..].find(')')
-    {
-        let params_str = &sig[start + 1..start + end];
-        let params: Vec<&str> = params_str
-            .split(',')
-            .filter(|p| {
-                let p = p.trim();
-                !p.starts_with("self")
-                    && !p.starts_with("&self")
-                    && !p.starts_with("&mut self")
-                    && !p.starts_with("cls")
-            })
+    if let Some(params_str) = extract_param_list(sig) {
+        let params: Vec<&str> = split_top_level_params(params_str)
+            .into_iter()
+            .filter(|p| !is_self_param(p.trim()))
             .collect();
         if params.len() > old_count {
             let new_params = &params[old_count..];
-            return new_params
-                .iter()
-                .all(|p| p.contains('=') || p.contains("Option<"));
+            // Only an explicit default value (dynamic languages: `param = …`)
+            // makes a new parameter back-compatible. A Rust `Option<T>` param is
+            // still REQUIRED at the call site, so it is NOT treated as a default.
+            return new_params.iter().all(|p| p.contains('='));
         }
     }
     false
@@ -1263,6 +1296,33 @@ mod tests {
             new_file: "src/new.rs".into(),
         };
         assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn count_params_ignores_commas_inside_generics_and_tuples() {
+        // Commas inside <>, (), [] are not parameter separators.
+        assert_eq!(count_params("fn f(a: Option<Map<K, V>>, b: i32)"), 2);
+        assert_eq!(count_params("fn f(a: HashMap<String, Vec<u8>>)"), 1);
+        assert_eq!(count_params("fn f(a: (i32, i32), b: bool)"), 2);
+    }
+
+    #[test]
+    fn added_required_option_param_is_breaking_in_rust() {
+        // A new `Option<T>` param in Rust is REQUIRED at the call site (there is
+        // no language-level default), so it breaks every caller.
+        let sev = classify_signature_change(
+            "fn f(a: i32)",
+            "fn f(a: i32, b: Option<T>)",
+            "src/lib.rs",
+        );
+        assert_eq!(sev, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn added_python_keyword_default_param_stays_info() {
+        // Regression guard: a Python `=None` default is genuinely back-compatible.
+        let sev = classify_signature_change("def f(a)", "def f(a, b=None)", "app.py");
+        assert_eq!(sev, ImpactSeverity::Info);
     }
 
     #[test]
