@@ -164,10 +164,7 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
 
 /// Package a [`StagedBackup`] into the `.nwsnap.zst` archive. Runs lock-free,
 /// after the write lock has been released.
-pub fn package_staged(
-    config: &BackupConfig,
-    staged: StagedBackup,
-) -> anyhow::Result<BackupResult> {
+pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Result<BackupResult> {
     let StagedBackup {
         staging,
         repos,

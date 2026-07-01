@@ -1349,11 +1349,8 @@ mod tests {
     fn added_required_option_param_is_breaking_in_rust() {
         // A new `Option<T>` param in Rust is REQUIRED at the call site (there is
         // no language-level default), so it breaks every caller.
-        let sev = classify_signature_change(
-            "fn f(a: i32)",
-            "fn f(a: i32, b: Option<T>)",
-            "src/lib.rs",
-        );
+        let sev =
+            classify_signature_change("fn f(a: i32)", "fn f(a: i32, b: Option<T>)", "src/lib.rs");
         assert_eq!(sev, ImpactSeverity::Breaking);
     }
 

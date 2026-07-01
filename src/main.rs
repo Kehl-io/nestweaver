@@ -6259,9 +6259,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // never dangles even when there are no impacts.
             if let Some(cq_path) = codequality_out.as_ref() {
                 let cq = render_codequality_json(&report.impacts);
-                std::fs::write(cq_path, &cq).map_err(|e| {
-                    anyhow::anyhow!("failed to write code quality report: {}", e)
-                })?;
+                std::fs::write(cq_path, &cq)
+                    .map_err(|e| anyhow::anyhow!("failed to write code quality report: {}", e))?;
                 if !out.quiet {
                     println!(
                         "  Wrote {} code-quality entries to {}",

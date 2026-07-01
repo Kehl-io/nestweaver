@@ -671,12 +671,11 @@ impl NestWeaverDaemon for DaemonService {
         }; // write lock released here — writers resume while we package below
 
         let cfg = config.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            nestweaver_engine::package_staged(&cfg, staged)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("backup packaging panicked: {e}")))?
-        .map_err(|e| Status::internal(format!("backup packaging failed: {e}")))?;
+        let result =
+            tokio::task::spawn_blocking(move || nestweaver_engine::package_staged(&cfg, staged))
+                .await
+                .map_err(|e| Status::internal(format!("backup packaging panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("backup packaging failed: {e}")))?;
 
         let m = &result.manifest;
         tracing::info!(output = %result.output_path.display(), "backup complete");
@@ -1147,7 +1146,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let req = request.into_inner();
+        }
+        let req = request.into_inner();
         // Canonicalize so a relative or `.` repo path (which a detached daemon
         // resolves against CWD=/) is caught before it walks the whole filesystem,
         // then refuse a system root outright.
@@ -1389,7 +1389,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let req = request.into_inner();
+        }
+        let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
@@ -1494,7 +1495,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let req = request.into_inner();
+        }
+        let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
         let instance_id = if req.instance_id.is_empty() {
             self.state.instance_id.clone()
@@ -1586,7 +1588,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1628,7 +1631,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1683,7 +1687,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1728,7 +1733,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let _req = request.into_inner();
@@ -1817,7 +1823,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1859,7 +1866,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let req = request.into_inner();
+        }
+        let req = request.into_inner();
         let instance_id = req.instance_id.clone();
         let state = self.state.clone();
 
@@ -2952,7 +2960,8 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }        let _write_lock = self.state.write_mutex.lock().await;
+        }
+        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         #[cfg(not(feature = "embed"))]

@@ -314,9 +314,7 @@ mod frontend_assets_tests {
             // Drop the leading '/', keep the embed-relative "assets/<file>".
             let tail = &rest[pos + 1..];
             let end = tail
-                .find(|c: char| {
-                    c == '"' || c == '\'' || c == ')' || c == '?' || c.is_whitespace()
-                })
+                .find(|c: char| c == '"' || c == '\'' || c == ')' || c == '?' || c.is_whitespace())
                 .unwrap_or(tail.len());
             let asset_path = &tail[..end];
             assert!(

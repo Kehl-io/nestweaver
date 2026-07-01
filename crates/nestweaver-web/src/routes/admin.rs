@@ -471,7 +471,6 @@ pub async fn remove_repo(
         })?;
     }
 
-
     // Delete graph data under write mutex. An already-claimed worker will
     // also acquire this mutex before indexing; when it runs, it checks
     // whether the repo node still exists and skips if deleted.
@@ -636,25 +635,23 @@ pub async fn get_queue(_auth: AdminAuth, State(state): State<Arc<AdminState>>) -
     let db_path = state.db_path.clone();
     let job_queue = state.job_queue.clone();
     let (running_jobs, pending_count): (Option<Vec<serde_json::Value>>, Option<i64>) =
-        tokio::task::spawn_blocking(move || {
-            match acquire_job_queue(&job_queue, &db_path) {
-                Ok(q) => {
-                    let running = q.running_jobs().ok().map(|jobs| {
-                        jobs.into_iter()
-                            .map(|j| {
-                                serde_json::json!({
-                                    "repo": j.repo,
-                                    "started_at": j.started_at,
-                                    "duration_s": j.duration_s,
-                                })
+        tokio::task::spawn_blocking(move || match acquire_job_queue(&job_queue, &db_path) {
+            Ok(q) => {
+                let running = q.running_jobs().ok().map(|jobs| {
+                    jobs.into_iter()
+                        .map(|j| {
+                            serde_json::json!({
+                                "repo": j.repo,
+                                "started_at": j.started_at,
+                                "duration_s": j.duration_s,
                             })
-                            .collect()
-                    });
-                    let pending = q.queue_depth().ok().map(|d| d.pending);
-                    (running, pending)
-                }
-                Err(_) => (None, None),
+                        })
+                        .collect()
+                });
+                let pending = q.queue_depth().ok().map(|d| d.pending);
+                (running, pending)
             }
+            Err(_) => (None, None),
         })
         .await
         .unwrap_or((None, None));
