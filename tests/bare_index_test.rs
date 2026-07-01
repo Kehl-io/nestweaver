@@ -291,6 +291,16 @@ fn bare_repo_reindex_detects_changes() {
         result1.symbols_count
     );
 
+    // Capture the v1 content hash of `hello` for a before/after comparison.
+    let cfg = SeedResolutionConfig::default();
+    let hash_v1 = store
+        .search_symbols_by_name("hello", 10, &cfg)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "hello")
+        .expect("hello indexed at v1")
+        .content_hash;
+
     // v2: lib.js returns 'v2'
     let src_v2 = tmp.path().join("src-v2");
     let sha_v2 = create_test_repo(&src_v2, &[("lib.js", "function hello() { return 'v2'; }")]);
@@ -309,18 +319,19 @@ fn bare_repo_reindex_detects_changes() {
     )
     .unwrap();
 
-    // With file_meta returning None, re-index always reads + hashes content,
-    // so the changed file must be detected and re-parsed.
-    let cfg = SeedResolutionConfig::default();
-    let results = store.search_symbols_by_name("hello", 10, &cfg).unwrap();
-    assert!(
-        !results.is_empty(),
-        "symbol 'hello' should exist after re-index"
+    // Re-index must DETECT the body change (v1 -> v2): the stored `hello`
+    // symbol's content hash must now differ from its v1 hash. A no-op re-index
+    // (the failure this test guards against) would leave the v1 hash in place.
+    let hash_v2 = store
+        .search_symbols_by_name("hello", 10, &cfg)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "hello")
+        .expect("symbol 'hello' should exist after re-index")
+        .content_hash;
+    assert_ne!(
+        hash_v1, hash_v2,
+        "re-index should have detected the v1 -> v2 body change (content hash unchanged)"
     );
-
-    // The symbol count after re-index should remain consistent (1 function).
-    assert!(
-        result2.symbols_count > 0 || !results.is_empty(),
-        "re-index should have processed v2 content"
-    );
+    assert!(result2.symbols_count > 0, "re-index should produce symbols");
 }
