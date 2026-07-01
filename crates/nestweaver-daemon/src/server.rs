@@ -3174,19 +3174,42 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
     if path.as_os_str().is_empty() {
         return true;
     }
-    let dangerous = [
-        "/", "/Users", "/System", "/Library", "/private", "/var", "/etc", "/home",
-        "/opt", "/usr", "/bin", "/sbin", "/tmp", "/Volumes", "/dev",
-    ];
+    // Case-insensitive, exact-match denylist. macOS APFS is case-insensitive by
+    // default and `canonicalize` does NOT normalize case, so wrong-case roots
+    // (`/users`, `/SYSTEM`) would slip past a case-sensitive match.
+    // `/System/Volumes/Data` is the real data-volume firmlink root on modern
+    // macOS — indexing it (or `/System/Volumes`) walks the entire disk.
     let p = path.to_string_lossy();
-    let p = p.trim_end_matches('/');
-    if p.is_empty() || dangerous.iter().any(|d| p == d.trim_end_matches('/')) {
+    let p = p.trim_end_matches('/').to_ascii_lowercase();
+    if p.is_empty() {
+        return true; // "" and "/"
+    }
+    let dangerous = [
+        "/users",
+        "/system",
+        "/system/volumes",
+        "/system/volumes/data",
+        "/library",
+        "/private",
+        "/var",
+        "/etc",
+        "/home",
+        "/opt",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/tmp",
+        "/volumes",
+        "/dev",
+    ];
+    if dangerous.iter().any(|d| p == *d) {
         return true;
     }
-    if let Some(home) = std::env::var_os("HOME")
-        && path == std::path::Path::new(&home)
-    {
-        return true;
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if p == home.trim_end_matches('/').to_ascii_lowercase() {
+            return true;
+        }
     }
     false
 }
@@ -4851,6 +4874,41 @@ mod startup_helper_tests {
             "/tmp/ppi2/repo",
             "/private/tmp/abc/project",
             "/var/folders/xx/y/T/repo",
+        ] {
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} is a specific repo path and must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn is_unsafe_index_root_handles_macos_firmlink_and_case() {
+        use std::path::Path;
+        for bad in [
+            // The real data-volume root on modern macOS (a firmlink) — refuse.
+            "/System/Volumes",
+            "/System/Volumes/Data",
+            // APFS is case-insensitive but `canonicalize` does NOT normalize
+            // case, so wrong-case system roots must still be refused.
+            "/users",
+            "/USERS",
+            "/system",
+            "/Var",
+            "/VOLUMES",
+            "/System/Volumes/data",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} is a system root and must be refused"
+            );
+        }
+        // A real repo whose deep path merely CONTAINS a dangerous component
+        // name must still be allowed (exact-match only, not substring).
+        for ok in [
+            "/home/user/dev/System",
+            "/home/user/dev/Volumes/app",
+            "/private/tmp/x/Data",
         ] {
             assert!(
                 !is_unsafe_index_root(Path::new(ok)),
