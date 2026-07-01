@@ -17,7 +17,9 @@ use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
-use crate::safeguards::{ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard};
+use crate::safeguards::{
+    ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard_cancellable,
+};
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -129,10 +131,14 @@ impl DaemonService {
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
-        let handler = self.dispatch_json_tool_inner(tool_name, args_json);
+        // Cooperative cancellation: the flag is tripped by
+        // `with_safeguard_cancellable` on timeout and observed by the
+        // `spawn_blocking` dispatch (e.g. brain_context's vector fan-out).
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone());
 
         let response = if self.state.server_mode {
-            with_safeguard(&tool, safeguards, None, handler).await
+            with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
         } else {
             handler.await
         };
@@ -159,6 +165,7 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args_json: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
@@ -232,12 +239,13 @@ impl DaemonService {
             );
 
             let t_dispatch = std::time::Instant::now();
-            let mut value = nestweaver_mcp::tools::dispatch(
+            let mut value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
+                Some(&cancel),
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
             tracing::debug!(
@@ -303,10 +311,11 @@ impl DaemonService {
         let safeguards = &self.state.safeguards;
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
-        let handler = self.dispatch_tool_json_inner(tool_name, args);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = self.dispatch_tool_json_inner(tool_name, args, cancel.clone());
 
         let response = if self.state.server_mode {
-            with_safeguard(&tool, safeguards, None, handler).await
+            with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
         } else {
             handler.await
         };
@@ -332,6 +341,7 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args: serde_json::Value,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
@@ -358,12 +368,13 @@ impl DaemonService {
             let embed_ref = embed_arc.as_deref();
 
             let t_dispatch = std::time::Instant::now();
-            let value = nestweaver_mcp::tools::dispatch(
+            let value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
+                Some(&cancel),
             )
             .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
             tracing::debug!(

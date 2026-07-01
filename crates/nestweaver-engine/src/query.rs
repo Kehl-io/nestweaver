@@ -1039,6 +1039,7 @@ pub fn build_brain_context_hybrid(
         None,
         intent,
         embed_model,
+        None,
     )
 }
 
@@ -1063,6 +1064,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     db_path: Option<&std::path::Path>,
     intent: Option<QueryIntent>,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -1243,8 +1245,12 @@ pub fn build_brain_context_hybrid_with_aliases(
     {
         let query_text = inputs.join(" ");
         if let Ok(query_emb) = model.embed_query(&query_text)
-            && let Ok(hits) =
-                crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit)
+            && let Ok(hits) = crate::vector_search::vector_knn_all_cancellable(
+                store,
+                &query_emb,
+                config.semantic_limit,
+                cancel,
+            )
         {
             if config.always_blend_semantic {
                 for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {

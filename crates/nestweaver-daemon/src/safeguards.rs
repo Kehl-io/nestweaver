@@ -594,4 +594,37 @@ mod tests {
         let result = with_safeguard("brain_search", &sg, None, async { Ok(42) }).await;
         assert_eq!(result.unwrap(), 42);
     }
+
+    #[tokio::test]
+    async fn with_safeguard_cancellable_sets_flag_on_timeout() {
+        let sg = QuerySafeguards::default_server();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result: Result<(), Status> = with_safeguard_cancellable(
+            "brain_search",
+            &sg,
+            Some(Duration::from_millis(50)),
+            cancel.clone(),
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Acquire),
+            "a timeout must set the cancellation flag so the spawn_blocking work bails"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_safeguard_cancellable_success_leaves_flag_unset() {
+        let sg = QuerySafeguards::default_server();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result =
+            with_safeguard_cancellable("brain_search", &sg, None, cancel.clone(), async { Ok(42) })
+                .await;
+        assert_eq!(result.unwrap(), 42);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
 }

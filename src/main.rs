@@ -6819,6 +6819,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(&db_path),
                 Some(nestweaver_store::QueryIntent::ProjectContext),
                 None,
+                None,
             ) {
                 Ok(mut result) => {
                     // Surface the project's curated member notes into
@@ -10789,6 +10790,7 @@ fn run_brain(
                 &aliases,
                 Some(&db_path),
                 parsed_intent,
+                None,
                 None,
             ) {
                 Ok(mut result) => {

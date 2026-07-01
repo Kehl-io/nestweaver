@@ -256,6 +256,7 @@ pub fn investigate(
         db_path,
         None,
         embed_model,
+        None,
     );
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => ctx.connected,

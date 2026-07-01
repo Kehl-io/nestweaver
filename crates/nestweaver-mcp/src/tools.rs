@@ -259,6 +259,21 @@ pub fn dispatch(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
+    dispatch_cancellable(store, tantivy, name, args, embed_model, None)
+}
+
+/// Like [`dispatch`], but threads a cooperative cancellation flag into the
+/// heavy traversals (e.g. `brain_context`/`project_context` vector fan-out) so a
+/// query timeout or client disconnect can stop the work. `cancel = None` is the
+/// original behavior.
+pub fn dispatch_cancellable(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     // Enforce tool allowlist when configured.
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
     if let Some(ref names) = allowed
@@ -273,10 +288,10 @@ pub fn dispatch(
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
     if is_cacheable_tool(name) && !cache_bypassed(&args) {
-        return maybe_cached(store, tantivy, name, args, embed_model);
+        return maybe_cached(store, tantivy, name, args, embed_model, cancel);
     }
 
-    dispatch_uncached(store, tantivy, name, args, embed_model)
+    dispatch_uncached(store, tantivy, name, args, embed_model, cancel)
 }
 
 /// The actual tool dispatch table, after cache handling.
@@ -286,9 +301,10 @@ fn dispatch_uncached(
     name: &str,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     match name {
-        "brain_context" => tool_brain_context(store, tantivy, args, embed_model),
+        "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
         "brain_search" => tool_brain_search(store, tantivy, args),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -306,7 +322,7 @@ fn dispatch_uncached(
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
-        "project_context" => tool_project_context(store, tantivy, args, embed_model),
+        "project_context" => tool_project_context(store, tantivy, args, embed_model, cancel),
         "dead_code" => tool_dead_code(store, args),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
@@ -433,9 +449,10 @@ fn maybe_cached(
     name: &str,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     let Ok(db_path) = current_db_path(store) else {
-        return dispatch_uncached(store, tantivy, name, args, embed_model);
+        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel);
     };
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
@@ -461,7 +478,7 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args, embed_model)?;
+    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel)?;
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -1378,6 +1395,7 @@ fn tool_brain_context(
     tantivy: Option<&TantivyIndex>,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
@@ -1497,6 +1515,7 @@ fn tool_brain_context(
         Some(&db_path),
         intent,
         embed_model,
+        cancel,
     )?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
@@ -4594,6 +4613,7 @@ fn tool_project_context(
     tantivy: Option<&TantivyIndex>,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     let project_str = args
         .get("project")
@@ -4773,6 +4793,7 @@ fn tool_project_context(
         Some(&db_path),
         Some(intent),
         embed_model,
+        cancel,
     )?;
 
     // 4b. Surface the project's curated member notes into `connected`. They
@@ -6372,6 +6393,7 @@ mod project_context_bug12_tests {
             None,
             json!({ "project": "Parallel Paths", "token_budget": 5000 }),
             None,
+            None,
         )
         .unwrap();
 
@@ -6402,6 +6424,7 @@ mod project_context_bug12_tests {
             &store,
             None,
             json!({ "seeds": ["LeafOnlySymbol"], "token_budget": 5000 }),
+            None,
             None,
         )
         .unwrap();
@@ -6442,6 +6465,7 @@ mod project_context_bug12_tests {
             None,
             json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
             None,
+            None,
         )
         .unwrap();
         let any_body_off = off["connected"]
@@ -6462,6 +6486,7 @@ mod project_context_bug12_tests {
                 "include_bodies": true,
                 "root": root,
             }),
+            None,
             None,
         )
         .unwrap();
