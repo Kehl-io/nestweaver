@@ -190,11 +190,15 @@ pub fn diff_symbols(
         }
     }
 
-    // Phase 3: Remaining unmatched old = removed, unmatched new = added
-    for (cid, sym) in &old_map {
-        if !matched_old.contains(cid) {
+    // Phase 3: Remaining unmatched old = removed, unmatched new = added.
+    // Iterate the ORIGINAL slices (not the deduped maps) so that when two
+    // symbols collide on canonical_id, a removal/addition is not silently
+    // dropped — a missed removal would hide a breaking change.
+    for sym in old_symbols {
+        let cid = raw_symbol_canonical_id(sym, file_path, repo_url);
+        if !matched_old.contains(&cid) {
             changes.push(AtomicChange::SymbolRemoved {
-                canonical_id: cid.clone(),
+                canonical_id: cid,
                 name: sym.name.clone(),
                 kind: sym.kind,
                 file_path: file_path.to_string(),
@@ -202,8 +206,9 @@ pub fn diff_symbols(
         }
     }
 
-    for (cid, sym) in &new_map {
-        if !matched_new.contains(cid) {
+    for sym in new_symbols {
+        let cid = raw_symbol_canonical_id(sym, file_path, repo_url);
+        if !matched_new.contains(&cid) {
             changes.push(AtomicChange::SymbolAdded {
                 name: sym.name.clone(),
                 kind: sym.kind,
@@ -1296,6 +1301,40 @@ mod tests {
             new_file: "src/new.rs".into(),
         };
         assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn duplicate_canonical_id_reports_all_removals() {
+        fn raw(name: &str, sig: &str) -> RawSymbol {
+            RawSymbol {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                start_line: 1,
+                end_line: 2,
+                signature: sig.to_string(),
+                content_hash: String::new(),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Public,
+                type_info: None,
+                parent_name: None,
+                scope_chain: None,
+            }
+        }
+        // Two old symbols with the same name+scope collide on canonical_id, and
+        // both are gone in the new set. Both removals must be reported — a
+        // dropped removal is a missed breaking change.
+        let old = vec![raw("dup", "fn dup(a: i32)"), raw("dup", "fn dup(b: i32)")];
+        let new: Vec<RawSymbol> = vec![];
+        let changes = diff_symbols(&old, &new, "src/lib.rs", "repo");
+        let removed = changes
+            .iter()
+            .filter(|c| matches!(c, AtomicChange::SymbolRemoved { .. }))
+            .count();
+        assert_eq!(
+            removed, 2,
+            "both same-canonical_id removals must be reported, not deduped away"
+        );
     }
 
     #[test]
