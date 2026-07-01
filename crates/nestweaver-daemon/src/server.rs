@@ -4298,6 +4298,18 @@ pub async fn run_server(
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
+
+    // Await the worker pool so an in-flight index write finishes before we exit.
+    // The worker loop sees the same shutdown signal, breaks, and drains its
+    // per-job tasks; awaiting its handle blocks until that drain completes.
+    // `spawn_blocking` work cannot be aborted, so this is the only way to avoid
+    // tearing down the runtime mid-write.
+    let worker_handle = state.worker_handle.lock().ok().and_then(|mut g| g.take());
+    if let Some(handle) = worker_handle {
+        tracing::info!("draining worker pool before exit");
+        let _ = handle.await;
+    }
+
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
 

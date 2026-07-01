@@ -1617,6 +1617,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_drains_in_flight_job_on_shutdown() {
+        // On shutdown the worker must DRAIN: its loop task does not return until
+        // every spawned per-job task has finished, so no index write is left
+        // running/abandoned. After the handle joins, nothing is `running`.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("lib.rs", "pub fn f() -> i32 { 1 }")]);
+        let url = format!("file://{}", src.display());
+
+        let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        queue
+            .upsert("drain-repo", &url, JobTrigger::Unindexed, None)
+            .unwrap();
+        let queue = Arc::new(Mutex::new(queue));
+        let workspace = Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let pool = WorkerPool::new(1);
+        let q = queue.clone();
+        let s = store.clone();
+        let handle = tokio::spawn(async move {
+            pool.run_with_drain(
+                q,
+                workspace,
+                s,
+                "test".to_string(),
+                &mut shutdown_rx,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Let the worker claim and start the job, then signal shutdown mid-flight.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown_tx.send(true).unwrap();
+
+        // The loop task must not resolve until the in-flight job drains.
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("worker drained and exited within the timeout")
+            .unwrap();
+
+        let depth = {
+            let q = queue.lock().unwrap();
+            q.queue_depth().unwrap()
+        };
+        assert_eq!(depth.running, 0, "no job may be left running after a drain");
+    }
+
+    #[tokio::test]
     async fn worker_pool_updates_indexing_status() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("source");
