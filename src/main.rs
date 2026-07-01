@@ -4208,7 +4208,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let summaries = generate_summaries(&store, parsed_level)?;
 
             // Save to sidecar for later use.
-            save_summaries(&db_path, &summaries)?;
+            save_summaries(&db_path, store.graph_generation(), &summaries)?;
 
             // Optional target filter, then token budget truncation.
             let after_filter: Vec<Summary> = if let Some(ref t) = target {

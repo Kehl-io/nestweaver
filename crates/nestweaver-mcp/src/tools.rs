@@ -5387,7 +5387,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         }
     };
     let (summaries, from_cache) = if let Some(ref db) = db_path
-        && let Ok(Some(cached)) = load_summaries(db)
+        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
@@ -5409,7 +5409,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // Persist freshly generated summaries so subsequent calls hit the cache.
     if !from_cache && let Some(ref db) = db_path {
         // Merge with any existing cached summaries at other levels.
-        let mut all = if let Ok(Some(existing)) = load_summaries(db) {
+        let mut all = if let Ok(Some(existing)) = load_summaries(db, store.graph_generation()) {
             existing
                 .into_iter()
                 .filter(|s| s.level != level)
@@ -5419,7 +5419,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         };
         all.extend(summaries.iter().cloned());
         // Best-effort save; don't fail the tool call on I/O error.
-        if let Err(e) = save_summaries(db, &all) {
+        if let Err(e) = save_summaries(db, store.graph_generation(), &all) {
             tracing::warn!("failed to save summaries sidecar: {e}");
         }
     }

@@ -69,6 +69,12 @@ pub struct Summary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryStore {
     pub summaries: Vec<Summary>,
+    /// The graph generation these summaries were built from. Loading checks this
+    /// against the store's current generation and treats a mismatch as a miss,
+    /// so a reindex never serves stale summaries. Defaults to 0 for
+    /// pre-generation sidecars (which are then always treated as stale).
+    #[serde(default)]
+    pub graph_generation: u64,
 }
 
 // ── Generation ───────────────────────────────────────────────────────────────
@@ -345,19 +351,22 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 /// Save summaries to the sidecar file.
-pub fn save_summaries(db_path: &Path, summaries: &[Summary]) -> Result<()> {
+pub fn save_summaries(db_path: &Path, graph_generation: u64, summaries: &[Summary]) -> Result<()> {
     let path = sidecar_path(db_path);
     let store = SummaryStore {
         summaries: summaries.to_vec(),
+        graph_generation,
     };
     let json = serde_json::to_string_pretty(&store).context("failed to serialize summaries")?;
     fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
-/// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar
-/// does not exist.
-pub fn load_summaries(db_path: &Path) -> Result<Option<Vec<Summary>>> {
+/// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar is
+/// missing OR was built from a different graph generation than
+/// `expected_generation` — a mismatch is treated as a miss so a reindex never
+/// serves stale summaries (the caller regenerates).
+pub fn load_summaries(db_path: &Path, expected_generation: u64) -> Result<Option<Vec<Summary>>> {
     crate::migrate_sidecar(db_path, "summaries.json", ".summaries.json");
     let path = sidecar_path(db_path);
     if !path.exists() {
@@ -367,6 +376,9 @@ pub fn load_summaries(db_path: &Path) -> Result<Option<Vec<Summary>>> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let store: SummaryStore =
         serde_json::from_str(&json).context("failed to parse summaries sidecar")?;
+    if store.graph_generation != expected_generation {
+        return Ok(None);
+    }
     Ok(Some(store.summaries))
 }
 
@@ -633,18 +645,41 @@ mod tests {
             token_estimate: 17,
         }];
 
-        save_summaries(&db_path, &summaries).unwrap();
-        let loaded = load_summaries(&db_path).unwrap().unwrap();
+        save_summaries(&db_path, 1, &summaries).unwrap();
+        let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].target_uid, "src/main.rs");
         assert_eq!(loaded[0].content, summaries[0].content);
     }
 
     #[test]
+    fn stale_generation_is_treated_as_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let summaries = vec![Summary {
+            level: SummaryLevel::File,
+            target_uid: "f".to_string(),
+            target_name: "f".to_string(),
+            content: "c".to_string(),
+            token_estimate: 1,
+        }];
+
+        save_summaries(&db_path, 1, &summaries).unwrap();
+        // Same generation → hit.
+        assert!(load_summaries(&db_path, 1).unwrap().is_some());
+        // A newer generation (after a reindex) must be a MISS, never a
+        // stale-served hit — the caller regenerates.
+        assert!(
+            load_summaries(&db_path, 2).unwrap().is_none(),
+            "summaries from an older generation must not be served after a reindex"
+        );
+    }
+
+    #[test]
     fn load_summaries_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nonexistent.lbug");
-        let result = load_summaries(&db_path).unwrap();
+        let result = load_summaries(&db_path, 0).unwrap();
         assert!(result.is_none());
     }
 
@@ -682,20 +717,20 @@ mod tests {
         }];
 
         // Save file-level summaries.
-        save_summaries(&db_path, &file_summaries).unwrap();
+        save_summaries(&db_path, 1, &file_summaries).unwrap();
 
         // Merge with symbol-level summaries (as the MCP tool does).
-        let mut all = load_summaries(&db_path)
+        let mut all = load_summaries(&db_path, 1)
             .unwrap()
             .unwrap()
             .into_iter()
             .filter(|s| s.level != SummaryLevel::Symbol)
             .collect::<Vec<_>>();
         all.extend(symbol_summaries.iter().cloned());
-        save_summaries(&db_path, &all).unwrap();
+        save_summaries(&db_path, 1, &all).unwrap();
 
         // Load back and verify both levels are present.
-        let loaded = load_summaries(&db_path).unwrap().unwrap();
+        let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
         let file_count = loaded
             .iter()
             .filter(|s| s.level == SummaryLevel::File)
