@@ -3214,6 +3214,14 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
     false
 }
 
+/// The daemon is idle only when there is no active read/write AND no index job
+/// in flight. Index jobs bump `indexing_active` (not `active_writes`), so an
+/// idle-timeout check that ignores it could fire mid-index — the same footgun
+/// the shutdown drain already guards against.
+fn is_idle(active_readwrite: u32, indexing_active: bool) -> bool {
+    active_readwrite == 0 && !indexing_active
+}
+
 /// Enforce the bind-scope security invariants for a server-mode listener:
 /// a non-loopback bind must be both authenticated (`--auth-token`) and
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
@@ -3651,7 +3659,11 @@ pub async fn run_server(
                 tokio::select! {
                     _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
-                        if active.active_reads.load(Ordering::Relaxed) + active.active_writes.load(Ordering::Relaxed) == 0 {
+                        if is_idle(
+                            active.active_reads.load(Ordering::Relaxed)
+                                + active.active_writes.load(Ordering::Relaxed),
+                            active.indexing_active.load(Ordering::Relaxed),
+                        ) {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
@@ -4915,6 +4927,15 @@ mod startup_helper_tests {
                 "{ok:?} is a specific repo path and must be allowed"
             );
         }
+    }
+
+    #[test]
+    fn idle_requires_no_active_work_or_indexing() {
+        assert!(is_idle(0, false), "no active work and not indexing is idle");
+        assert!(!is_idle(1, false), "active read/write blocks idle");
+        // An in-flight index job bumps `indexing_active`, not `active_writes`,
+        // so it must independently block an idle shutdown.
+        assert!(!is_idle(0, true), "an in-flight index blocks idle shutdown");
     }
 
     #[test]
