@@ -313,7 +313,7 @@ fn dispatch_uncached(
         "blast_radius" => tool_blast_radius(store, args),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
-        "regex_search" => tool_regex_search(store, tantivy, args),
+        "regex_search" => tool_regex_search(store, args),
         "count_patterns" => tool_count_patterns(store, args),
         "brain_broken_links" => tool_brain_broken_links(store, args),
         "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
@@ -791,11 +791,7 @@ fn tool_schema_read_symbols() -> Value {
 /// F3: trigram-accelerated regex search over indexed text. Lets agents run a
 /// real regex against Section bodies, Note titles, and Symbol signatures
 /// without shelling out to rg/grep.
-fn tool_regex_search(
-    store: &GraphStore,
-    _tantivy: Option<&TantivyIndex>,
-    args: Value,
-) -> Result<Value, anyhow::Error> {
+fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let pattern = args
         .get("pattern")
         .or_else(|| args.get("query"))

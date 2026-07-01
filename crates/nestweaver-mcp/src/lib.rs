@@ -49,7 +49,7 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 When connected to a NestWeaver server (not a local daemon):
 - brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
 - read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
-- regex_search redirects to Tantivy FTS search on the server
+- regex_search runs trigram-accelerated exact regex over the graph store — identical locally and on the server (it does NOT use Tantivy)
 - blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available
 - Results include _meta.sources indicating which data sources contributed";
 
