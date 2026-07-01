@@ -157,6 +157,19 @@ impl EmbeddingIndex {
     /// Uses rayon for parallel iteration and assumes stored embeddings are
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
     pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
+        self.vector_search_cancellable(query_vec, limit, None)
+    }
+
+    /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
+    /// query timeout or client disconnect). Once tripped, per-embedding scoring
+    /// is skipped so the parallel scan drains cheaply, and the result is empty.
+    /// `cancel = None` is byte-for-byte the original behavior.
+    pub fn vector_search_cancellable(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Vec<(String, f64)> {
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
@@ -170,6 +183,9 @@ impl EmbeddingIndex {
             .embeddings
             .par_iter()
             .map(|(uid, emb)| {
+                if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
                 // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
                 let dot: f64 = emb
                     .iter()
@@ -180,6 +196,10 @@ impl EmbeddingIndex {
                 (uid.clone(), sim)
             })
             .collect();
+
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            return vec![];
+        }
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(limit);
@@ -308,12 +328,34 @@ impl GraphStore {
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        self.hybrid_search_cancellable(
+            text_query,
+            query_embedding,
+            embedding_index,
+            limit,
+            seed_resolution,
+            None,
+        )
+    }
+
+    /// Like [`hybrid_search`], but threads a cooperative cancellation flag into
+    /// the parallel vector scan. `cancel = None` is the original behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search_cancellable(
+        &self,
+        text_query: &str,
+        query_embedding: Option<&[f32]>,
+        embedding_index: Option<&EmbeddingIndex>,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<SearchResult>, StoreError> {
         // 1. Text search
         let text_results = self.search_symbols_by_name(text_query, limit * 2, seed_resolution)?;
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
-            (Some(qe), Some(idx)) => idx.vector_search(qe, limit * 2),
+            (Some(qe), Some(idx)) => idx.vector_search_cancellable(qe, limit * 2, cancel),
             _ => vec![],
         };
 
@@ -403,6 +445,30 @@ mod tests {
         let b = vec![1.0_f32, 0.0, 0.0];
         let s = cosine_similarity(&a, &b);
         assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn vector_search_cancellable_returns_empty_when_cancelled() {
+        let mut idx = EmbeddingIndex::new();
+        idx.add("a", vec![1.0, 0.0, 0.0]);
+        idx.add("b", vec![0.9, 0.1, 0.0]);
+        idx.add("c", vec![0.0, 0.0, 1.0]);
+
+        // Not cancelled → normal results.
+        let live = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, None);
+        assert!(
+            !live.is_empty(),
+            "an uncancelled vector search returns results"
+        );
+
+        // Pre-cancelled → empty (per-embedding scoring skipped; parallel scan
+        // drains cheaply and the result is empty).
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, Some(&cancel));
+        assert!(
+            cancelled.is_empty(),
+            "a cancelled vector search must return no results"
+        );
     }
 
     #[test]

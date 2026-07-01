@@ -428,11 +428,22 @@ impl GraphStore {
     /// Perform a vector similarity search over the embedding index.
     /// Returns `(uid, cosine_similarity)` pairs sorted descending.
     pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {
+        self.vector_search_cancellable(query_embedding, limit, None)
+    }
+
+    /// Like [`vector_search`], but threads a cooperative cancellation flag into
+    /// the parallel embedding scan. `cancel = None` is the original behavior.
+    pub fn vector_search_cancellable(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Vec<(String, f64)> {
         let idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        idx.vector_search(query_embedding, limit)
+        idx.vector_search_cancellable(query_embedding, limit, cancel)
     }
 
     /// Perform a filtered vector similarity search over the embedding index.
