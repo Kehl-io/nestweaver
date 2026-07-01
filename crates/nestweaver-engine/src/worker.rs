@@ -127,7 +127,7 @@ impl WorkerPool {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<IndexingStatus>,
     ) {
-        self.run_with_drain_and_quiesce(
+        self.run_with_drain(
             queue,
             workspace,
             store,
@@ -136,47 +136,19 @@ impl WorkerPool {
             status,
             None,
             None,
-            None,
         )
         .await;
     }
 
-    /// Run the worker loop with an optional drained flag.
+    /// Run the worker loop with an optional drained flag and write mutex.
     ///
-    /// When `drained` is `Some(flag)` and the flag is `true`, the worker
-    /// sleeps instead of claiming new jobs. In-flight jobs are unaffected
-    /// (they finish naturally).
+    /// When `drained` is `Some(flag)` and the flag is `true`, the worker sleeps
+    /// instead of claiming new jobs (in-flight jobs finish naturally). Each job's
+    /// write phase acquires `write_mutex`, so an in-progress backup — which holds
+    /// that lock while it copies — simply makes the worker WAIT for the lock.
+    /// Writes are never skipped or dropped; the job proceeds once the lock frees.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_with_drain(
-        &self,
-        queue: Arc<Mutex<JobQueue>>,
-        workspace: Arc<BareCloneWorkspace>,
-        store: Arc<nestweaver_store::GraphStore>,
-        instance_id: String,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-        status: Option<IndexingStatus>,
-        drained: Arc<AtomicBool>,
-        write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
-    ) {
-        self.run_with_drain_and_quiesce(
-            queue,
-            workspace,
-            store,
-            instance_id,
-            &mut shutdown,
-            status,
-            Some(drained),
-            write_mutex,
-            None,
-        )
-        .await;
-    }
-
-    /// Like [`run_with_drain`] but also accepts a `backup_quiesced` flag.
-    /// When the flag is `true`, worker jobs skip the write phase and re-queue
-    /// themselves so the backup file-copy can proceed without DB mutations.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_with_drain_and_quiesce(
         &self,
         queue: Arc<Mutex<JobQueue>>,
         workspace: Arc<BareCloneWorkspace>,
@@ -186,7 +158,6 @@ impl WorkerPool {
         status: Option<IndexingStatus>,
         drained: Option<Arc<AtomicBool>>,
         write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
-        backup_quiesced: Option<Arc<AtomicBool>>,
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
@@ -292,7 +263,6 @@ impl WorkerPool {
             let instance_id = instance_id.clone();
             let status_clone = status.clone();
             let write_mutex = write_mutex.clone();
-            let backup_quiesced = backup_quiesced.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
             let reindex_tracker = self.reindex_tracker.clone();
@@ -340,7 +310,6 @@ impl WorkerPool {
                             let queue_for_gate = queue_check.clone();
                             let job_for_gate = job_clone.clone();
                             let write_mutex_for_gate = write_mutex.clone();
-                            let backup_quiesced_for_gate = backup_quiesced.clone();
                             let force_full_reindex = if prepared.repo_type == RepoType::Code {
                                 let tracker = reindex_tracker
                                     .lock()
@@ -361,16 +330,9 @@ impl WorkerPool {
                                 &instance_id,
                                 force_full_reindex,
                                 move || {
-                                    // Block while a backup file-copy is in progress.
-                                    if let Some(ref q) = backup_quiesced_for_gate
-                                        && q.load(Ordering::Acquire)
-                                    {
-                                        tracing::info!(
-                                            repo = %job_for_gate.repo_id,
-                                            "backup quiesce active — deferring write"
-                                        );
-                                        return Err(anyhow::Error::new(JobCancelled));
-                                    }
+                                    // Acquire the write lock. A backup in progress holds this lock
+                                    // while it copies files, so this simply waits until the backup
+                                    // finishes — the write is deferred by contention, never dropped.
                                     let _write_guard = write_mutex_for_gate
                                         .as_ref()
                                         .map(|m| m.clone().blocking_lock_owned());

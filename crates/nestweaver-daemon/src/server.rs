@@ -88,8 +88,6 @@ pub struct DaemonState {
     pub rate_limiters: Option<Arc<ClientRateLimiters>>,
     /// Whether the server-side worker pool is drained (not picking new jobs).
     pub drained: Arc<AtomicBool>,
-    /// Set during backup: blocks write RPCs until `FinishBackup` is called.
-    pub backup_quiesced: Arc<AtomicBool>,
     /// Admin token for admin API authentication (separate from query token).
     pub admin_token: Option<String>,
     /// Shared admin state, set once after construction. Used by `serve_ui`
@@ -105,17 +103,6 @@ pub struct DaemonService {
 impl DaemonService {
     pub fn new(state: Arc<DaemonState>) -> Self {
         Self { state }
-    }
-
-    /// Returns `Err(Status::unavailable(...))` if a backup quiesce is active,
-    /// preventing write RPCs from proceeding while files are being copied.
-    fn check_backup_quiesce(&self) -> Result<(), Status> {
-        if self.state.backup_quiesced.load(Ordering::Acquire) {
-            return Err(Status::unavailable(
-                "backup in progress — writes are blocked until FinishBackup is called",
-            ));
-        }
-        Ok(())
     }
 
     /// Generic JSON pass-through dispatch. Maps every read RPC to the
@@ -709,8 +696,6 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
-        self.check_backup_quiesce()?;
-
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -843,8 +828,6 @@ impl NestWeaverDaemon for DaemonService {
                 "watchers are server-managed in server mode",
             ));
         }
-        self.check_backup_quiesce()?;
-
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -1157,9 +1140,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let req = request.into_inner();
+        }        let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let state = self.state.clone();
         let force = req.force;
@@ -1350,9 +1331,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let req = request.into_inner();
+        }        let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
@@ -1457,9 +1436,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let req = request.into_inner();
+        }        let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
         let instance_id = if req.instance_id.is_empty() {
             self.state.instance_id.clone()
@@ -1551,9 +1528,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1595,9 +1570,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1652,9 +1625,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1699,9 +1670,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let _req = request.into_inner();
@@ -1790,9 +1759,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         let req = request.into_inner();
@@ -1834,9 +1801,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let req = request.into_inner();
+        }        let req = request.into_inner();
         let instance_id = req.instance_id.clone();
         let state = self.state.clone();
 
@@ -2929,9 +2894,7 @@ impl NestWeaverDaemon for DaemonService {
             request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
-        }
-        self.check_backup_quiesce()?;
-        let _write_lock = self.state.write_mutex.lock().await;
+        }        let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
         #[cfg(not(feature = "embed"))]
@@ -3430,7 +3393,6 @@ pub async fn run_server(
         safeguards,
         rate_limiters: rate_limiters.clone(),
         drained: Arc::new(AtomicBool::new(false)),
-        backup_quiesced: Arc::new(AtomicBool::new(false)),
         admin_token,
         admin_state: std::sync::OnceLock::new(),
     });
@@ -3799,7 +3761,6 @@ pub async fn run_server(
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
                 write_mutex: Some(Arc::clone(&state.write_mutex)),
-                backup_quiesced: Some(Arc::clone(&state.backup_quiesced)),
                 // Share the daemon's single job-queue connection. Opening a
                 // second connection from admin routes races the worker's WAL
                 // checkpoint and crashes with SIGBUS on macOS.
@@ -4038,7 +3999,6 @@ pub async fn run_server(
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
             let worker_write_mutex = Arc::clone(&state.write_mutex);
-            let worker_backup_quiesced = Arc::clone(&state.backup_quiesced);
             let worker_count = state
                 .instance_cfg
                 .as_ref()
@@ -4080,7 +4040,7 @@ pub async fn run_server(
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_repo_types(worker_repo_types);
-                pool.run_with_drain_and_quiesce(
+                pool.run_with_drain(
                     worker_job_queue,
                     std::sync::Arc::new(workspace),
                     worker_store,
@@ -4089,7 +4049,6 @@ pub async fn run_server(
                     Some(indexing_status),
                     Some(worker_drained),
                     Some(worker_write_mutex),
-                    Some(worker_backup_quiesced),
                 )
                 .await;
             });

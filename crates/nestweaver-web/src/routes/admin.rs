@@ -471,15 +471,6 @@ pub async fn remove_repo(
         })?;
     }
 
-    // Block if a backup quiesce is active.
-    if let Some(ref q) = state.backup_quiesced
-        && q.load(std::sync::atomic::Ordering::Acquire)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backup in progress — writes are blocked".to_string(),
-        ));
-    }
 
     // Delete graph data under write mutex. An already-claimed worker will
     // also acquire this mutex before indexing; when it runs, it checks
@@ -1627,7 +1618,6 @@ mod tests {
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
             write_mutex: None,
-            backup_quiesced: None,
             job_queue: None,
         })
     }
@@ -1848,7 +1838,6 @@ url = "https://github.com/example/existing"
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
             write_mutex: None,
-            backup_quiesced: None,
             job_queue: None,
         });
 
