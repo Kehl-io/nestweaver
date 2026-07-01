@@ -35,7 +35,7 @@ impl Default for FormatConfig {
     }
 }
 
-/// Input structure matching the JSON output of `impact --diff`.
+/// Input structure matching the JSON output of `pre-push-impact --format json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactReport {
     pub changes: Option<usize>,

@@ -43,7 +43,7 @@ open target/release/NestWeaver.app
 # Or download NestWeaver.app from GitHub Releases
 ```
 
-The web UI runs on port 9377 (not 3000). The app is menubar-only (no Dock icon).
+The web UI defaults to port 3000 (`nestweaver ui`); the macOS .app uses 9377. The app is menubar-only (no Dock icon).
 
 When helping users install on macOS, recommend the `.app` bundle first. Fall back to `nestweaver daemon start` only for headless/CI environments.
 

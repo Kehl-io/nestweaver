@@ -139,7 +139,7 @@ nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TO
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9377 | HTTP | Web UI (optional, `nestweaver ui`) |
+| 3000 | HTTP | Web UI (optional, `nestweaver ui`; 9377 in the macOS .app) |
 | 9378 | gRPC | Query API (TCP + TLS) |
 | 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` + Prometheus `/metrics` |
 

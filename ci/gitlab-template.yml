@@ -1,8 +1,12 @@
 # NestWeaver Impact Analysis — GitLab CI Template
 #
-# Include in your .gitlab-ci.yml:
+# Include in your .gitlab-ci.yml, then add a concrete job that extends the
+# hidden `.nestweaver-impact` template (including alone runs nothing):
 #   include:
 #     - remote: 'https://raw.githubusercontent.com/Kehl-io/nestweaver/main/ci/gitlab-template.yml'
+#
+#   nestweaver-impact:
+#     extends: .nestweaver-impact
 #
 # Required CI/CD variables (set in Settings > CI/CD > Variables):
 #   NESTWEAVER_URL:   NestWeaver server gRPC URL (e.g. https://nestweaver.internal:9378)

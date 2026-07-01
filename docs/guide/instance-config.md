@@ -594,7 +594,7 @@ args = { pageId = "12345" }
 
 ## Scheduled wiki refresh
 
-`materialize-instance` only ingests wiki content when run explicitly. Wiki
+`materialize-projects` only ingests wiki content when run explicitly. Wiki
 pages edited by collaborators cause graph drift over time. To keep wiki
 content fresh, set up a periodic refresh using your platform's scheduler.
 
@@ -602,7 +602,7 @@ content fresh, set up a periodic refresh using your platform's scheduler.
 
 The `--refresh-wiki-hours` flag on `watch` and `brain watch` records the
 intended refresh cadence. Pair it with an external scheduler that runs
-`materialize-instance` on the same interval:
+`materialize-projects` on the same interval:
 
 ```sh
 nestweaver brain watch ~/notes --db ./brain.lbug \
@@ -613,7 +613,7 @@ nestweaver brain watch ~/notes --db ./brain.lbug \
 
 ```cron
 # Re-fetch wiki sources every 6 hours
-0 */6 * * * /usr/local/bin/nestweaver-materialize-instance \
+0 */6 * * * /usr/local/bin/nestweaver materialize-projects \
   --config /path/to/nestweaver-instance.toml \
   --db /path/to/main.lbug
 ```
@@ -632,7 +632,8 @@ Save as `~/Library/LaunchAgents/com.nestweaver.wiki-refresh.plist`:
     <string>com.nestweaver.wiki-refresh</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/nestweaver-materialize-instance</string>
+        <string>/usr/local/bin/nestweaver</string>
+        <string>materialize-projects</string>
         <string>--config</string>
         <string>/path/to/nestweaver-instance.toml</string>
         <string>--db</string>
@@ -664,7 +665,7 @@ Description=NestWeaver wiki source refresh
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/nestweaver-materialize-instance \
+ExecStart=/usr/local/bin/nestweaver materialize-projects \
   --config /path/to/nestweaver-instance.toml \
   --db /path/to/main.lbug
 ```

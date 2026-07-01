@@ -61,7 +61,7 @@ max_poll = "8h"
 
 ## Network Architecture
 
-The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web UI (:9377) is a separate optional process (`nestweaver ui`). Webhook and admin API endpoints are mounted as routes on the MCP HTTP server (:9379), not on separate ports.
+The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web UI (default :3000, :9377 in the macOS .app) is a separate optional process (`nestweaver ui`). Webhook and admin API endpoints are mounted as routes on the MCP HTTP server (:9379), not on separate ports.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -83,7 +83,7 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
   Dev A (local)   Dev B (local)   AI Agent (Claude/Cursor)
 ```
 
-`daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (:9377) is started separately via `nestweaver ui` and is not part of the server container default.
+`daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (default :3000, :9377 in the macOS .app) is started separately via `nestweaver ui` and is not part of the server container default.
 
 The MCP HTTP listener is always **gRPC port + 1** and inherits the `--bind` IP. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker.
 
@@ -488,10 +488,10 @@ When connected to a server, `blast_radius` returns two-tier results:
 ### Create a backup
 
 ```bash
-# Save a snapshot of the current database
-nestweaver backup save /backups
+# Save a snapshot of the current database (written to the exact path you pass)
+nestweaver backup save ./brain-backup.nwsnap.zst
 
-# Output: /backups/brain-2026-06-25T10-30-00.nwsnap.zst
+# Output: ./brain-backup.nwsnap.zst
 ```
 
 The backup process:
@@ -579,26 +579,30 @@ The output reports the instance ID, version, mode (`server`/`daemon`, plus `(dra
 ### docker-compose.yml
 
 ```yaml
-version: "3.8"
-
 services:
   nestweaver:
-    image: ghcr.io/kehl-io/nestweaver:latest
+    build: .
+    # image: ghcr.io/kehl-io/nestweaver:latest  # when published
     ports:
       - "9378:9378"   # gRPC
       - "9379:9379"   # MCP-over-HTTP + webhook + admin API
     volumes:
-      - nestweaver-data:/data
       - ./instance.toml:/etc/nestweaver/instance.toml:ro
+      - nestweaver-data:/data/nestweaver
     environment:
-      NESTWEAVER_AUTH_TOKEN: "${NESTWEAVER_AUTH_TOKEN}"
-      NESTWEAVER_ADMIN_TOKEN: "${NESTWEAVER_ADMIN_TOKEN}"
-      NESTWEAVER_WEBHOOK_SECRET: "${NESTWEAVER_WEBHOOK_SECRET}"
-      GH_TOKEN: "${GH_TOKEN}"
-    command: >
-      daemon --db /data/nestweaver/brain.lbug
-      run --server --bind 0.0.0.0:9378
-      --config /etc/nestweaver/instance.toml
+      - NESTWEAVER_AUTH_TOKEN=${NESTWEAVER_AUTH_TOKEN}
+      - NESTWEAVER_ADMIN_TOKEN=${NESTWEAVER_ADMIN_TOKEN}
+      - NESTWEAVER_WEBHOOK_SECRET=${NESTWEAVER_WEBHOOK_SECRET}
+    command:
+      [
+        "daemon", "run",
+        "--server",
+        "--bind", "0.0.0.0:9378",
+        "--db", "/data/nestweaver/brain.lbug",
+        "--config", "/etc/nestweaver/instance.toml"
+      ]
+    restart: unless-stopped
+    stop_grace_period: 30s
 
 volumes:
   nestweaver-data:
@@ -612,7 +616,7 @@ docker compose up -d
 docker compose logs -f nestweaver
 
 # Backup
-docker compose exec nestweaver nestweaver backup save /data/backups
+docker compose exec nestweaver nestweaver backup save /data/backups/brain-backup.nwsnap.zst
 ```
 
 ### Resource requirements

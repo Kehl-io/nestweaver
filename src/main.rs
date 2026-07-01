@@ -5139,7 +5139,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
-                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    "Wiki refresh scheduled every {}h (via materialize-projects)",
                     hours
                 );
             }
@@ -9692,7 +9692,7 @@ fn run_brain(
 
             if let Some(hours) = refresh_wiki_hours {
                 out.status(&format!(
-                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    "Wiki refresh scheduled every {}h (via materialize-projects)",
                     hours
                 ));
             }
