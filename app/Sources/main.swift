@@ -72,7 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             waitForDaemonSocket { [weak self] in
                 guard let self = self else { return }
                 self.startWebUI(dbPath: db)
-                self.restartCount = 0
+                self.scheduleHealthyReset(for: self.daemonProcess)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self.openWebUI()
                     self.updateStatus("Running")
@@ -120,6 +120,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenuItem?.title = "Status: \(status)"
     }
 
+    /// Reset the crash-restart counter only after the daemon has stayed up for a
+    /// sustained window. A crashing daemon binds its UDS socket *before* it dies,
+    /// so resetting the counter on mere socket appearance made `maxRestarts`
+    /// unreachable and turned any crash into an endless ~1s respawn loop — one
+    /// macOS "quit unexpectedly" notification per cycle. Guard on process identity
+    /// so a daemon that crashes again before the window elapses does NOT reset.
+    private func scheduleHealthyReset(for process: Process?) {
+        let tracked = process
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
+            guard let self = self else { return }
+            if self.daemonProcess === tracked, tracked?.isRunning == true {
+                self.restartCount = 0
+            }
+        }
+    }
+
     func startDaemon(dbPath: String) {
         let bundlePath = Bundle.main.bundlePath
         let binaryPath = bundlePath + "/Contents/MacOS/nestweaver-cli"
@@ -142,12 +158,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } else if (proc.terminationReason == .uncaughtSignal || proc.terminationStatus != 0) && self.restartCount < self.maxRestarts {
                     self.restartCount += 1
                     self.updateStatus("Restarting (\(self.restartCount)/\(self.maxRestarts))…")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    // Exponential backoff (1s, 2s, 4s, … capped at 30s) so a
+                    // crash-looping daemon can't respawn every second.
+                    let backoff = min(pow(2.0, Double(self.restartCount - 1)), 30.0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + backoff) {
                         self.startDaemon(dbPath: dbPath)
                         self.waitForDaemonSocket { [weak self] in
                             guard let self = self else { return }
                             self.startWebUI(dbPath: dbPath)
-                            self.restartCount = 0
+                            // Reset the crash counter only after SUSTAINED uptime,
+                            // never on mere socket appearance — see the helper.
+                            self.scheduleHealthyReset(for: self.daemonProcess)
                             self.updateStatus("Running")
                         }
                     }
