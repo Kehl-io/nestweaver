@@ -282,6 +282,45 @@ pub fn backup_list(dir: &Path) -> anyhow::Result<Vec<(PathBuf, BackupManifest)>>
     Ok(results)
 }
 
+/// Reconcile a leftover `<data>.restoring` directory from a previously
+/// interrupted restore, before starting a new one.
+///
+/// The restore uses a rename-aside dance: move `data_dir` -> `.restoring`, then
+/// move the new data into `data_dir`, then delete `.restoring`. If a prior
+/// restore crashed *between* those first two steps, `data_dir` is gone and
+/// `.restoring` holds the ONLY surviving copy of the old data. In that case we
+/// rename it back into place rather than destroying it. If `data_dir` is present,
+/// `.restoring` is a harmless orphan (crash after the new data landed) and is
+/// removed.
+fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<()> {
+    let restoring_dir = data_dir.with_extension("restoring");
+    if !restoring_dir.exists() {
+        return Ok(());
+    }
+    if dir_is_present(data_dir) {
+        // Data dir intact — `.restoring` is a harmless orphan.
+        let _ = std::fs::remove_dir_all(&restoring_dir);
+    } else {
+        // Data dir missing/empty — `.restoring` is the only surviving copy.
+        std::fs::rename(&restoring_dir, data_dir).with_context(|| {
+            format!(
+                "recover interrupted restore: rename {} back to {}",
+                restoring_dir.display(),
+                data_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// True if `dir` exists and contains at least one entry. A missing or empty
+/// data dir means a prior restore had already moved the real data aside.
+fn dir_is_present(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false)
+}
+
 /// Restore a backup archive into a target directory.
 ///
 /// Extracts to a temporary directory first, verifies integrity, then
@@ -338,10 +377,10 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // Atomic restore: rename-aside pattern (similar to dpkg atomic upgrades).
     let restoring_dir = config.data_dir.with_extension("restoring");
 
-    // Clean up any leftover .restoring dir from a previous interrupted restore.
-    if restoring_dir.exists() {
-        let _ = std::fs::remove_dir_all(&restoring_dir);
-    }
+    // Reconcile any leftover .restoring dir from a previously interrupted
+    // restore. If it holds the only surviving copy (data dir gone), recover it
+    // instead of deleting it.
+    recover_interrupted_restore(&config.data_dir)?;
 
     if config.data_dir.exists() {
         // Step 1: Move existing data aside (crash here = old data at .restoring, recoverable).
@@ -758,6 +797,51 @@ mod tests {
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "test");
         assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
+    }
+
+    #[test]
+    fn restore_recovers_from_leftover_restoring_dir() {
+        // Prior restore crashed after moving data aside but before the new data
+        // landed: data dir is gone, `.restoring` holds the only surviving copy.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = tmp.path().join("data.restoring");
+        std::fs::create_dir_all(&restoring).unwrap();
+        std::fs::write(restoring.join("brain.lbug"), b"RECOVERED").unwrap();
+
+        recover_interrupted_restore(&data).expect("recover");
+
+        assert_eq!(
+            std::fs::read(data.join("brain.lbug")).unwrap(),
+            b"RECOVERED",
+            "the only surviving copy must be recovered into place"
+        );
+        assert!(
+            !restoring.exists(),
+            ".restoring must be consumed by the recovery, not left behind"
+        );
+    }
+
+    #[test]
+    fn restore_removes_orphan_restoring_when_data_present() {
+        // Prior restore completed the swap but crashed before deleting
+        // `.restoring`: the data dir is intact, `.restoring` is a stale orphan.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("brain.lbug"), b"CURRENT").unwrap();
+        let restoring = tmp.path().join("data.restoring");
+        std::fs::create_dir_all(&restoring).unwrap();
+        std::fs::write(restoring.join("stale"), b"x").unwrap();
+
+        recover_interrupted_restore(&data).expect("recover");
+
+        assert!(!restoring.exists(), "orphan .restoring must be removed");
+        assert_eq!(
+            std::fs::read(data.join("brain.lbug")).unwrap(),
+            b"CURRENT",
+            "current data must be left untouched"
+        );
     }
 
     #[test]
