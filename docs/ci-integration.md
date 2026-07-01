@@ -139,6 +139,30 @@ issues.
 The GitLab template also accepts `NESTWEAVER_MIN_SEVERITY` to filter the
 report. Valid values: `breaking`, `warning`, `info` (default: `info`).
 
+### GitLab Code Quality report (MR widget)
+
+The GitLab template also emits a **Code Quality** report
+(`gl-code-quality-report.json`, in the CodeClimate format) and wires it via
+`artifacts.reports.codequality`, so impacted callers surface as inline
+annotations in the merge-request **Code Quality** widget — in addition to the
+posted comment. It is generated from `impact.json` and is **always** written
+(an empty `[]` when the server is unavailable or there are no impacts), so the
+report reference never dangles.
+
+- **Severity map:** Breaking → `critical`, Warning → `major`, Info → `info`.
+- **`check_name`:** `nestweaver/impact`.
+- **`fingerprint`:** a stable blake3 hash of the affected + change canonical IDs
+  and the affected file, so GitLab deduplicates and tracks the same finding
+  across commits.
+- **`location`:** the affected caller's repo-relative file and line
+  (`lines.begin` clamped to ≥ 1).
+
+To generate the report yourself:
+
+```sh
+nestweaver format-comment --input impact.json --codequality-out gl-code-quality-report.json
+```
+
 ## Example PR Comment Output
 
 When the action runs, it posts (or updates) a comment like this:

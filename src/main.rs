@@ -592,6 +592,11 @@ enum Commands {
         /// URL to link in truncation notice (e.g., CI artifact URL)
         #[arg(long)]
         artifact_url: Option<String>,
+        /// Also write a GitLab Code Quality (CodeClimate) report to this path,
+        /// for `artifacts.reports.codequality` (MR-widget annotations). Always
+        /// written when set — an empty `[]` when there are no impacts.
+        #[arg(long)]
+        codequality_out: Option<PathBuf>,
     },
     /// Generate a structural skeleton ranked by symbol importance
     ///
@@ -6239,14 +6244,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             gitlab_token,
             output,
             artifact_url,
+            codequality_out,
         } => {
             use nestweaver_engine::format_comment::{
                 FormatConfig, GitHubCommentConfig, GitLabCommentConfig, read_impact_report,
-                render_impact_report_markdown,
+                render_codequality_json, render_impact_report_markdown,
             };
 
             let report = read_impact_report(&input)
                 .map_err(|e| anyhow::anyhow!("failed to read impact report: {}", e))?;
+
+            // GitLab Code Quality report (MR-widget). Written whenever requested,
+            // including an empty `[]`, so the CI `reports:codequality` reference
+            // never dangles even when there are no impacts.
+            if let Some(cq_path) = codequality_out.as_ref() {
+                let cq = render_codequality_json(&report.impacts);
+                std::fs::write(cq_path, &cq).map_err(|e| {
+                    anyhow::anyhow!("failed to write code quality report: {}", e)
+                })?;
+                if !out.quiet {
+                    println!(
+                        "  Wrote {} code-quality entries to {}",
+                        report.impacts.len(),
+                        cq_path.display()
+                    );
+                }
+            }
 
             let config = FormatConfig {
                 marker: marker.clone(),

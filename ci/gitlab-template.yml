@@ -72,6 +72,14 @@
           --marker "nestweaver-impact" || true
       fi
     - |
+      # GitLab Code Quality report (MR-widget annotations). Generated from
+      # impact.json, which always exists here (even the empty error stub), so
+      # the reports:codequality reference below never dangles.
+      nestweaver format-comment \
+        --input impact.json \
+        --codequality-out gl-code-quality-report.json > /dev/null 2>&1 \
+        || echo '[]' > gl-code-quality-report.json
+    - |
       if [ "$NESTWEAVER_FAIL_ON_BREAKING" = "true" ]; then
         if jq -e '.impacts[] | select(.severity == "Breaking")' impact.json > /dev/null 2>&1; then
           echo "ERROR: Breaking changes detected across downstream repos — see MR comment for details"
@@ -82,4 +90,7 @@
     when: always
     paths:
       - impact.json
+      - gl-code-quality-report.json
+    reports:
+      codequality: gl-code-quality-report.json
     expire_in: 30 days

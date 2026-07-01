@@ -633,6 +633,72 @@ pub fn read_impact_report(path: &Path) -> Result<ImpactReport, anyhow::Error> {
     Ok(report)
 }
 
+/// A single GitLab Code Quality (CodeClimate-format) entry.
+#[derive(serde::Serialize)]
+struct CodeQualityEntry {
+    description: String,
+    check_name: String,
+    fingerprint: String,
+    severity: String,
+    location: CodeQualityLocation,
+}
+
+#[derive(serde::Serialize)]
+struct CodeQualityLocation {
+    path: String,
+    lines: CodeQualityLines,
+}
+
+#[derive(serde::Serialize)]
+struct CodeQualityLines {
+    begin: u64,
+}
+
+/// Render impact results as a GitLab Code Quality (CodeClimate) JSON array for
+/// `artifacts.reports.codequality` (MR-widget annotations). Severity maps
+/// Breaking→critical, Warning→major, Info→info. The `fingerprint` is a stable
+/// blake3 hash of `(affected_canonical_id, change_canonical_id, affected_file)`
+/// so GitLab dedups/tracks the same finding across commits. Paths are normalized
+/// repo-relative and `lines.begin` is clamped to ≥ 1 — GitLab silently drops
+/// entries with `./`/absolute paths or `begin < 1`. Output is deterministic
+/// (fixed struct field order, input order preserved) — byte-identical on re-run.
+pub fn render_codequality_json(impacts: &[ImpactResult]) -> String {
+    let entries: Vec<CodeQualityEntry> = impacts
+        .iter()
+        .map(|i| {
+            let severity = match i.severity {
+                ImpactSeverity::Breaking => "critical",
+                ImpactSeverity::Warning => "major",
+                ImpactSeverity::Info => "info",
+            }
+            .to_string();
+            let path = i
+                .affected_file
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+            let key = format!(
+                "{}\u{0}{}\u{0}{}",
+                i.affected_canonical_id, i.change_canonical_id, i.affected_file
+            );
+            let fingerprint = blake3::hash(key.as_bytes()).to_hex().to_string();
+            CodeQualityEntry {
+                description: format!("{}: {}", i.affected_name, i.reason),
+                check_name: "nestweaver/impact".to_string(),
+                fingerprint,
+                severity,
+                location: CodeQualityLocation {
+                    path,
+                    lines: CodeQualityLines {
+                        begin: (i.affected_line as u64).max(1),
+                    },
+                },
+            }
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +715,56 @@ mod tests {
             affected_signature: format!("fn {}()", name),
             severity,
             reason: format!("{}(): parameter count changed (2 -> 3)", name),
+        }
+    }
+
+    #[test]
+    fn render_codequality_json_schema_and_determinism() {
+        let impacts = vec![
+            make_impact(ImpactSeverity::Breaking, "alpha", "svc-a"),
+            make_impact(ImpactSeverity::Warning, "beta", "svc-b"),
+            make_impact(ImpactSeverity::Info, "gamma", "svc-c"),
+        ];
+        let out = render_codequality_json(&impacts);
+
+        assert!(!out.starts_with('\u{feff}'), "must not emit a BOM");
+        assert_eq!(
+            out,
+            render_codequality_json(&impacts),
+            "must be byte-identical on repeat"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let arr = v.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 3);
+
+        let sev: Vec<&str> = arr
+            .iter()
+            .map(|e| e["severity"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sev,
+            ["critical", "major", "info"],
+            "Breaking->critical, Warning->major, Info->info"
+        );
+
+        for e in arr {
+            assert_eq!(e["check_name"], "nestweaver/impact");
+            assert!(!e["description"].as_str().unwrap().is_empty());
+            let path = e["location"]["path"].as_str().unwrap();
+            assert!(
+                !path.starts_with("./") && !path.starts_with('/'),
+                "location.path must be repo-relative, got {path:?}"
+            );
+            assert!(
+                e["location"]["lines"]["begin"].as_u64().unwrap() >= 1,
+                "lines.begin must be >= 1"
+            );
+            let fp = e["fingerprint"].as_str().unwrap();
+            assert!(
+                !fp.is_empty() && fp.chars().all(|c| c.is_ascii_hexdigit()),
+                "fingerprint must be hex, got {fp:?}"
+            );
         }
     }
 
