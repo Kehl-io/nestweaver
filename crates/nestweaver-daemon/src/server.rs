@@ -1174,9 +1174,48 @@ impl NestWeaverDaemon for DaemonService {
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
+
+        // Cooperative cancellation for the otherwise-uncancelable spawn_blocking
+        // index. A watchdog trips this flag when the index exceeds an overall
+        // timeout OR when the requesting client disconnects; the engine observes
+        // it at the pre-write boundary and aborts without a partial write. The
+        // `done` oneshot lets the watchdog tear down as soon as the index
+        // finishes — otherwise its extra stream sender would keep the client's
+        // response stream open forever.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let index_timeout = std::time::Duration::from_secs(
+            std::env::var("NESTWEAVER_INDEX_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(1800),
+        );
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let cancel = cancel.clone();
+            let watch_tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(index_timeout) => {
+                        tracing::warn!(?index_timeout, "index exceeded timeout; cancelling");
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ = watch_tx.closed() => {
+                        // Client dropped the progress stream — stop wasting CPU.
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ = done_rx => { /* index finished on its own; nothing to cancel */ }
+                }
+            });
+        }
+        let cancel_for_index = cancel;
+
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
+            // Dropped when the index task ends → fires the watchdog's `done_rx`
+            // so it releases its stream sender and the response can terminate.
+            let _done = done_tx;
             let repo_url = format!("file://{}", repo_path.display());
 
             let indexed_sha = std::process::Command::new("git")
@@ -1203,7 +1242,7 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            match nestweaver_engine::index_directory_with_store(
+            match nestweaver_engine::index_directory_with_store_cancellable(
                 &state.store,
                 &repo_path,
                 &state.db_path,
@@ -1212,6 +1251,7 @@ impl NestWeaverDaemon for DaemonService {
                 &indexed_sha,
                 force,
                 name.as_deref(),
+                &cancel_for_index,
             ) {
                 Ok(result) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {

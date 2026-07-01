@@ -280,6 +280,77 @@ pub fn index_directory_with_store(
     force: bool,
     name: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_store_inner(
+        store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+        None,
+    )
+}
+
+/// Like [`index_directory_with_store`], but observes a cooperative cancellation
+/// flag. When `cancel` is set — by the daemon on an index timeout or when the
+/// requesting client disconnects — the index aborts at the pre-write boundary
+/// (after parse, before any graph mutation), leaving no partial write. The
+/// underlying index work runs in an uncancelable `spawn_blocking` task, so this
+/// flag is the only way to stop a long-running index cooperatively.
+#[allow(clippy::too_many_arguments)]
+pub fn index_directory_with_store_cancellable(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<IndexResult, anyhow::Error> {
+    index_directory_with_store_inner(
+        store,
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        force,
+        name,
+        Some(cancel),
+    )
+}
+
+/// Build the pre-write cancellation gate: an `acquire_write_guard` closure that
+/// aborts the index (before any graph mutation) when `cancel` is set. When
+/// `cancel` is `None` it is a no-op, matching the previous `index_into_store`
+/// behavior exactly.
+fn cancel_write_gate(
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> impl FnOnce() -> Result<(), anyhow::Error> + '_ {
+    move || {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            anyhow::bail!("index cancelled");
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_directory_with_store_inner(
+    store: &GraphStore,
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    force: bool,
+    name: Option<&str>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<IndexResult, anyhow::Error> {
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let mut new_filemeta = FileMetaCache::new();
@@ -292,7 +363,7 @@ pub fn index_directory_with_store(
 
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let result = if force {
-        index_into_store(
+        index_into_store_with_write_gate(
             &reader,
             store,
             instance_id,
@@ -303,10 +374,12 @@ pub fn index_directory_with_store(
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
             name,
+            false,
+            cancel_write_gate(cancel),
         )?
     } else {
         let filemeta_cache = load_filemeta_cache(&filemeta_path);
-        index_into_store(
+        index_into_store_with_write_gate(
             &reader,
             store,
             instance_id,
@@ -317,6 +390,8 @@ pub fn index_directory_with_store(
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
             name,
+            false,
+            cancel_write_gate(cancel),
         )?
     };
 
