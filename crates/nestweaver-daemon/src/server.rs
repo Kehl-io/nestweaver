@@ -634,65 +634,67 @@ impl NestWeaverDaemon for DaemonService {
 
     // ── Backup ──────────────────────────────────────────────────────
 
-    async fn prepare_backup(
+    async fn backup(
         &self,
-        _request: Request<PrepareBackupRequest>,
-    ) -> Result<Response<PrepareBackupResponse>, Status> {
+        request: Request<BackupRequest>,
+    ) -> Result<Response<BackupResponse>, Status> {
         if let Some(crate::auth::IsAdmin(false)) | None =
-            _request.extensions().get::<crate::auth::IsAdmin>()
+            request.extensions().get::<crate::auth::IsAdmin>()
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        tracing::info!("prepare_backup: acquiring write mutex");
-        let _write_lock = self.state.write_mutex.lock().await;
-        let _guard = ConnectionGuard::write(&self.state);
+        let req = request.into_inner();
+        if req.output_path.trim().is_empty() {
+            return Err(Status::invalid_argument("output_path is required"));
+        }
+        let config = nestweaver_engine::BackupConfig {
+            db_path: self.state.db_path.clone(),
+            output_path: std::path::PathBuf::from(&req.output_path),
+            include_clones: req.include_clones,
+            instance_id: self.state.instance_id.clone(),
+            workspace_path: if req.include_clones {
+                self.state.db_path.parent().map(|p| p.join("workspace"))
+            } else {
+                None
+            },
+        };
 
-        let store = self.state.store.clone();
-        tokio::task::spawn_blocking(move || {
-            // Flush in-memory embedding index to disk.
-            if let Err(e) = store.flush_embedding_index() {
-                tracing::warn!("prepare_backup: flush_embedding_index failed: {e}");
-            }
-            // Run CHECKPOINT to merge the WAL into the main database file.
-            if let Err(e) = store.checkpoint() {
-                tracing::warn!("prepare_backup: CHECKPOINT failed: {e}");
-            }
+        // Stage the backup while HOLDING the write lock. Quiesce == lock-held:
+        // no writer touches the files mid-copy, and the RAII guard releases the
+        // lock on drop/panic — there is no persistent quiesce flag to leak.
+        let staged = {
+            let _write_lock = self.state.write_mutex.lock().await;
+            let _guard = ConnectionGuard::write(&self.state);
+            let store = self.state.store.clone();
+            let cfg = config.clone();
+            tracing::info!("backup: staging under write lock");
+            tokio::task::spawn_blocking(move || {
+                nestweaver_engine::stage_backup_from_store(&store, &cfg)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("backup staging panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("backup staging failed: {e}")))?
+        }; // write lock released here — writers resume while we package below
+
+        let cfg = config.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            nestweaver_engine::package_staged(&cfg, staged)
         })
         .await
-        .map_err(|e| Status::internal(format!("prepare_backup task panicked: {e}")))?;
+        .map_err(|e| Status::internal(format!("backup packaging panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("backup packaging failed: {e}")))?;
 
-        // Block subsequent write RPCs until FinishBackup is called.
-        self.state.backup_quiesced.store(true, Ordering::Release);
-
-        tracing::info!("prepare_backup: database quiesced for backup");
-        Ok(Response::new(PrepareBackupResponse {
-            ok: true,
-            message: "database quiesced — safe to copy files".to_string(),
-        }))
-    }
-
-    async fn finish_backup(
-        &self,
-        _request: Request<FinishBackupRequest>,
-    ) -> Result<Response<FinishBackupResponse>, Status> {
-        if let Some(crate::auth::IsAdmin(false)) | None =
-            _request.extensions().get::<crate::auth::IsAdmin>()
-        {
-            return Err(Status::permission_denied("admin token required"));
-        }
-        let was_quiesced = self.state.backup_quiesced.swap(false, Ordering::AcqRel);
-        if was_quiesced {
-            tracing::info!("finish_backup: write quiesce released");
-        } else {
-            tracing::info!("finish_backup: no quiesce was active");
-        }
-        Ok(Response::new(FinishBackupResponse {
-            ok: true,
-            message: if was_quiesced {
-                "backup quiesce released — writes resumed".to_string()
-            } else {
-                "no quiesce was active".to_string()
-            },
+        let m = &result.manifest;
+        tracing::info!(output = %result.output_path.display(), "backup complete");
+        Ok(Response::new(BackupResponse {
+            output_path: result.output_path.to_string_lossy().into_owned(),
+            instance_id: m.instance_id.clone(),
+            tier: m.tier.clone(),
+            nestweaver_version: m.nestweaver_version.clone(),
+            repo_count: m.repo_count as u64,
+            symbol_count: m.symbol_count as u64,
+            db_size_bytes: m.sizes.db,
+            total_compressed: m.sizes.total_compressed,
         }))
     }
 

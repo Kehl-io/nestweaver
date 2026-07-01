@@ -13,7 +13,7 @@ use nestweaver_client::discovery::{RoutingMode, UpstreamConfig};
 use nestweaver_client::hybrid::{HybridClient, TraceBoundary, flow_trace_with_stitching};
 use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
-use nestweaver_proto::{BrainStatusRequest, JsonRequest, RepoStatesRequest};
+use nestweaver_proto::{BackupRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tonic::transport::{Certificate, ClientTlsConfig};
@@ -1949,4 +1949,62 @@ async fn hybrid_flow_trace_continue_stitches_server_spans() {
         sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
         "stitched flow_trace must report both 'local' and 'server' sources; got {sources:?}"
     );
+}
+
+#[tokio::test]
+async fn server_backup_rpc_produces_snapshot() {
+    // The daemon performs the whole backup in-process (holds its own write lock),
+    // so a single admin-authed Backup RPC yields a snapshot file on the server.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Backup is admin-gated; use distinct >=32-byte tokens (startup rejects
+    // short or equal tokens) and authenticate as admin.
+    let admin = "admin-token-aaaaaaaaaaaaaaaaaaaaaaaa";
+    let query = "query-token-bbbbbbbbbbbbbbbbbbbbbbbb";
+    let guard =
+        helpers::server_guard::ServerGuard::start_with_admin_and_auth(&db_path, query, admin);
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to daemon gRPC");
+    let mut client = NestWeaverDaemonClient::new(channel);
+
+    let out = dir.path().join("snap.nwsnap.zst");
+    let mut req = tonic::Request::new(BackupRequest {
+        output_path: out.to_string_lossy().into_owned(),
+        include_clones: false,
+    });
+    req.metadata_mut()
+        .insert("authorization", format!("Bearer {admin}").parse().unwrap());
+
+    let resp = client
+        .backup(req)
+        .await
+        .expect("Backup RPC failed")
+        .into_inner();
+
+    assert!(out.exists(), "daemon wrote the snapshot to output_path");
+    assert_eq!(resp.output_path, out.to_string_lossy());
+    assert_eq!(resp.tier, "standard");
 }
