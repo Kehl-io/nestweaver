@@ -411,18 +411,23 @@ message FlowTraceContinueResponse {
 
 // ─── Backup ─────────────────────────────────────────────────────────
 
-message PrepareBackupRequest {}
-
-message PrepareBackupResponse {
-  bool ok = 1;
-  string message = 2;
+// The daemon performs the entire backup in-process: it holds its own write
+// lock (quiesce == lock-held), checkpoints, copies the on-disk files, and
+// packages the snapshot to output_path. One RPC, no cross-call quiesce state.
+message BackupRequest {
+  string output_path = 1;   // daemon-local path (or s3://…) for the .nwsnap.zst
+  bool include_clones = 2;  // full tier (include workspace/*.git)
 }
 
-message FinishBackupRequest {}
-
-message FinishBackupResponse {
-  bool ok = 1;
-  string message = 2;
+message BackupResponse {
+  string output_path = 1;
+  string instance_id = 2;
+  string tier = 3;
+  string nestweaver_version = 4;
+  uint64 repo_count = 5;
+  uint64 symbol_count = 6;
+  uint64 db_size_bytes = 7;
+  uint64 total_compressed = 8;
 }
 
 // ─── Service ─────────────────────────────────────────────────────────
@@ -455,9 +460,9 @@ service NestWeaverDaemon {
   rpc WatchCode(WatchCodeRequest) returns (WatchCodeResponse);
   rpc StopWatch(StopWatchRequest) returns (StopWatchResponse);
 
-  // Backup
-  rpc PrepareBackup(PrepareBackupRequest) returns (PrepareBackupResponse);
-  rpc FinishBackup(FinishBackupRequest) returns (FinishBackupResponse);
+  // Backup — daemon quiesces itself (holds the write lock), checkpoints,
+  // copies, and packages the snapshot. One RPC, no cross-call quiesce state.
+  rpc Backup(BackupRequest) returns (BackupResponse);
 
   // Export
   rpc ExportGraph(JsonRequest) returns (JsonResponse);
