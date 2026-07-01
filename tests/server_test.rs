@@ -1163,6 +1163,23 @@ async fn server_webhook_enqueues_job() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "accepted");
+
+    // Stop the daemon first so the jobs sidecar can be opened from a SINGLE
+    // connection — opening a second JobQueue while the daemon runs risks the
+    // SIGBUS-on-WAL-checkpoint the shared-queue design exists to avoid.
+    drop(guard);
+
+    // The webhook must actually ENQUEUE a job, not merely return 200/"accepted".
+    let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+    let depth = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+        .expect("open jobs queue")
+        .queue_depth()
+        .expect("queue depth");
+    let total = depth.pending + depth.running + depth.succeeded + depth.dead_letter;
+    assert!(
+        total >= 1,
+        "webhook should have enqueued a job, got queue depth {depth:?}"
+    );
 }
 
 #[tokio::test]
@@ -1217,6 +1234,23 @@ async fn server_webhook_gitea_enqueues_job() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "accepted");
+
+    // Stop the daemon first so the jobs sidecar can be opened from a SINGLE
+    // connection — opening a second JobQueue while the daemon runs risks the
+    // SIGBUS-on-WAL-checkpoint the shared-queue design exists to avoid.
+    drop(guard);
+
+    // The webhook must actually ENQUEUE a job, not merely return 200/"accepted".
+    let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+    let depth = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+        .expect("open jobs queue")
+        .queue_depth()
+        .expect("queue depth");
+    let total = depth.pending + depth.running + depth.succeeded + depth.dead_letter;
+    assert!(
+        total >= 1,
+        "webhook should have enqueued a job, got queue depth {depth:?}"
+    );
 }
 
 #[tokio::test]
