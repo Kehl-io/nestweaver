@@ -7782,8 +7782,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         libc::kill(pid, libc::SIGTERM);
                     }
 
-                    // Poll for up to 5 seconds.
-                    for _ in 0..50 {
+                    // Poll for graceful exit. The daemon drains in-flight index
+                    // writes before exiting (a `spawn_blocking` write cannot be
+                    // aborted), which can take longer than a couple of seconds for
+                    // a large repo — so the grace window must exceed the max write
+                    // duration or `daemon stop` would SIGKILL mid-write. Override
+                    // with NESTWEAVER_STOP_GRACE_SECS.
+                    let grace_secs = std::env::var("NESTWEAVER_STOP_GRACE_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(60);
+                    for _ in 0..(grace_secs * 10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
@@ -7793,8 +7802,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
 
-                    // Force kill.
-                    eprintln!("Daemon did not exit; sending SIGKILL...");
+                    // Force kill only after the full grace window elapses — the
+                    // daemon was still draining and did not exit in time.
+                    eprintln!("Daemon did not exit within {grace_secs}s; sending SIGKILL...");
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
