@@ -1148,7 +1148,18 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }        let req = request.into_inner();
+        // Canonicalize so a relative or `.` repo path (which a detached daemon
+        // resolves against CWD=/) is caught before it walks the whole filesystem,
+        // then refuse a system root outright.
         let repo_path = PathBuf::from(&req.repo_path);
+        let repo_path = repo_path.canonicalize().unwrap_or(repo_path);
+        if is_unsafe_index_root(&repo_path) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to index '{}': a system root would walk the entire filesystem — \
+                 pass an absolute path to a specific repository",
+                repo_path.display()
+            )));
+        }
         let state = self.state.clone();
         let force = req.force;
         let with_trigrams = req.with_trigrams;
@@ -3113,6 +3124,33 @@ fn validate_token_lengths(
     Ok(())
 }
 
+/// Refuse to index a path that is almost certainly a mistake — a system root or
+/// the user's home directory — which would recursively walk the entire disk
+/// (pegging every core, hammering TCC-protected paths, and looping on symlinks
+/// like `/dev/fd` and Time Machine). A repository to index is always a specific
+/// project directory, never a top-level root. This guards the case where a
+/// detached daemon (whose CWD is `/`) receives a relative or `.` repo path.
+fn is_unsafe_index_root(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return true;
+    }
+    let dangerous = [
+        "/", "/Users", "/System", "/Library", "/private", "/var", "/etc", "/home",
+        "/opt", "/usr", "/bin", "/sbin", "/tmp", "/Volumes", "/dev",
+    ];
+    let p = path.to_string_lossy();
+    let p = p.trim_end_matches('/');
+    if p.is_empty() || dangerous.iter().any(|d| p == d.trim_end_matches('/')) {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && path == std::path::Path::new(&home)
+    {
+        return true;
+    }
+    false
+}
+
 /// Enforce the bind-scope security invariants for a server-mode listener:
 /// a non-loopback bind must be both authenticated (`--auth-token`) and
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
@@ -4754,6 +4792,31 @@ mod startup_helper_tests {
     #[test]
     fn validate_token_lengths_accepts_none() {
         assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn is_unsafe_index_root_rejects_system_roots_but_allows_real_repos() {
+        use std::path::Path;
+        for bad in [
+            "", "/", "/Users", "/System", "/Library", "/private", "/tmp", "/Volumes", "/dev",
+            "/usr", "/etc",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} is a system root and must be refused"
+            );
+        }
+        for ok in [
+            "/home/user/dev/myrepo",
+            "/tmp/ppi2/repo",
+            "/private/tmp/abc/project",
+            "/var/folders/xx/y/T/repo",
+        ] {
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} is a specific repo path and must be allowed"
+            );
+        }
     }
 
     #[test]
