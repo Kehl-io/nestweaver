@@ -399,7 +399,8 @@ pub fn classify_change(change: &AtomicChange) -> ImpactSeverity {
             ..
         } => classify_signature_change(old_signature, new_signature, file_path),
         AtomicChange::SymbolRenamed { .. } => ImpactSeverity::Breaking,
-        AtomicChange::SymbolMoved { .. } => ImpactSeverity::Warning,
+        // Moving a symbol to a different file breaks importers of the old path.
+        AtomicChange::SymbolMoved { .. } => ImpactSeverity::Breaking,
         AtomicChange::SymbolAdded { .. } => ImpactSeverity::Info,
         AtomicChange::ExportAdded { .. } => ImpactSeverity::Info,
     }
@@ -563,7 +564,7 @@ pub fn is_test_file(path: &str) -> bool {
 /// - SignatureChanged -> find all callers via depth-bounded traversal, classify
 /// - SymbolRemoved / ExportRemoved -> find all references, mark as BREAKING
 /// - SymbolRenamed -> find all importers, mark as BREAKING
-/// - SymbolMoved -> find all importers, mark as WARNING
+/// - SymbolMoved -> find all importers, mark as BREAKING
 /// - SymbolAdded / ExportAdded -> no impact (no existing dependents)
 pub fn analyze_impact(
     store: &nestweaver_store::GraphStore,
@@ -760,9 +761,9 @@ pub fn analyze_impact(
                             affected_file: importer.file_path.clone(),
                             affected_line: importer.start_line,
                             affected_signature: String::new(),
-                            severity: ImpactSeverity::Warning,
+                            severity: ImpactSeverity::Breaking,
                             reason: format!(
-                                "'{}' moved from {} to {} — import path may break",
+                                "'{}' moved from {} to {} — import path will break",
                                 name, old_file, new_file
                             ),
                         });
@@ -1252,14 +1253,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_moved_is_warning() {
+    fn classify_moved_is_breaking() {
+        // PRD rule: moving a symbol to a different file breaks importers of the
+        // old path, so it is Breaking (not Warning).
         let change = AtomicChange::SymbolMoved {
             canonical_id: "test:src/old.rs#foo:abc".into(),
             name: "foo".into(),
             old_file: "src/old.rs".into(),
             new_file: "src/new.rs".into(),
         };
-        assert_eq!(classify_change(&change), ImpactSeverity::Warning);
+        assert_eq!(classify_change(&change), ImpactSeverity::Breaking);
     }
 
     #[test]
