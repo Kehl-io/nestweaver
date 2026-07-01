@@ -158,14 +158,19 @@ fn impact_diff_produces_json() {
     let parsed: serde_json::Value =
         serde_json::from_str(trimmed).expect("entire stdout should be valid JSON");
 
-    // Verify expected top-level structure.
+    // The processOrder signature change must actually be DETECTED — the report's
+    // `changes` count must be non-zero. The old assertion only checked that the
+    // key existed, which is true even when zero changes are detected.
+    let change_count = parsed["changes"]
+        .as_u64()
+        .expect("'changes' should be a numeric count");
     assert!(
-        parsed.get("changes").is_some(),
-        "JSON should have 'changes' field, got: {parsed}"
+        change_count >= 1,
+        "the processOrder signature change should be detected (changes >= 1), got: {parsed}"
     );
     assert!(
         parsed.get("impacts").is_some(),
-        "JSON should have 'impacts' field, got: {parsed}"
+        "JSON should have an 'impacts' field, got: {parsed}"
     );
 }
 
