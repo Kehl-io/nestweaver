@@ -93,6 +93,9 @@ pub struct DaemonState {
     /// Shared admin state, set once after construction. Used by `serve_ui`
     /// to mount the admin API on the web UI server as well.
     pub admin_state: std::sync::OnceLock<Arc<nestweaver_web::state::AdminState>>,
+    /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
+    /// in-flight index write is allowed to finish rather than being abandoned.
+    pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -3395,6 +3398,7 @@ pub async fn run_server(
         drained: Arc::new(AtomicBool::new(false)),
         admin_token,
         admin_state: std::sync::OnceLock::new(),
+        worker_handle: std::sync::Mutex::new(None),
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
@@ -4018,7 +4022,7 @@ pub async fn run_server(
                 .map(|c| build_repo_types(&c.repos))
                 .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
-            tokio::spawn(async move {
+            let worker_handle = tokio::spawn(async move {
                 let workspace_dir = worker_db
                     .parent()
                     .unwrap_or(Path::new("."))
@@ -4052,6 +4056,10 @@ pub async fn run_server(
                 )
                 .await;
             });
+            *state
+                .worker_handle
+                .lock()
+                .expect("worker_handle mutex poisoned") = Some(worker_handle);
         }
     } // end if server_opts
 

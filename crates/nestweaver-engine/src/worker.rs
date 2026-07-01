@@ -183,7 +183,13 @@ impl WorkerPool {
             }
         }
 
+        // Track in-flight per-job tasks so a shutdown can drain them instead of
+        // abandoning an in-progress index write.
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
+            // Reap finished jobs so the set doesn't grow unbounded.
+            while tasks.try_join_next().is_some() {}
+
             // Check shutdown signal.
             if *shutdown.borrow() {
                 break;
@@ -267,7 +273,7 @@ impl WorkerPool {
             let repo_types = repo_types.clone();
             let reindex_tracker = self.reindex_tracker.clone();
 
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _permit = permit;
 
                 // process_job is CPU-bound (parsing + indexing), run on the
@@ -417,6 +423,11 @@ impl WorkerPool {
                 }
             });
         }
+
+        // Shutdown signalled: drain in-flight jobs so no index write is
+        // abandoned mid-flight. spawn_blocking work cannot be aborted, so each
+        // remaining task is awaited to completion before we return.
+        while tasks.join_next().await.is_some() {}
     }
 }
 
