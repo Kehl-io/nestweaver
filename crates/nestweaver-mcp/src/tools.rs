@@ -5349,8 +5349,8 @@ fn tool_schema_get_summary() -> Value {
             "properties": {
                 "level": {
                     "type": "string",
-                    "enum": ["symbol", "file", "cluster"],
-                    "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture.",
+                    "enum": ["symbol", "file", "cluster", "hub"],
+                    "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture, 'hub' = top hub nodes with call-graph shape + role (architectural orientation).",
                     "default": "file"
                 },
                 "target": {

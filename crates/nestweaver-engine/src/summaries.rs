@@ -27,6 +27,8 @@ pub enum SummaryLevel {
     Symbol,
     File,
     Cluster,
+    /// Top hub nodes with a concise structural (call-graph shape) summary.
+    Hub,
 }
 
 impl std::fmt::Display for SummaryLevel {
@@ -35,6 +37,7 @@ impl std::fmt::Display for SummaryLevel {
             SummaryLevel::Symbol => write!(f, "symbol"),
             SummaryLevel::File => write!(f, "file"),
             SummaryLevel::Cluster => write!(f, "cluster"),
+            SummaryLevel::Hub => write!(f, "hub"),
         }
     }
 }
@@ -46,8 +49,9 @@ impl std::str::FromStr for SummaryLevel {
             "symbol" => Ok(SummaryLevel::Symbol),
             "file" => Ok(SummaryLevel::File),
             "cluster" => Ok(SummaryLevel::Cluster),
+            "hub" => Ok(SummaryLevel::Hub),
             other => Err(format!(
-                "unknown summary level '{}': expected symbol, file, or cluster",
+                "unknown summary level '{}': expected symbol, file, cluster, or hub",
                 other
             )),
         }
@@ -85,7 +89,52 @@ pub fn generate_summaries(store: &GraphStore, level: SummaryLevel) -> Result<Vec
         SummaryLevel::Symbol => generate_symbol_summaries(store),
         SummaryLevel::File => generate_file_summaries(store),
         SummaryLevel::Cluster => generate_cluster_summaries(store),
+        SummaryLevel::Hub => generate_hub_summaries(store),
     }
+}
+
+/// Coarse architectural role for a hub from its caller/callee degree balance.
+fn hub_role(in_degree: usize, out_degree: usize) -> &'static str {
+    if in_degree + out_degree == 0 {
+        "isolated"
+    } else if in_degree >= out_degree.saturating_mul(3) {
+        // Heavily called, calls little → a shared sink/utility.
+        "sink/utility"
+    } else if out_degree >= in_degree.saturating_mul(3) {
+        // Calls widely, called little → an orchestrator/entry point.
+        "orchestrator"
+    } else {
+        // High degree both ways → a bridge/coordinator.
+        "bridge"
+    }
+}
+
+/// Hub-level: one concise structural summary per top hub node — its call-graph
+/// shape (in/out degree) plus a coarse architectural role. Precomputed and
+/// cached (generation-gated via the summary sidecar), so `get_summary --level
+/// hub` gives architectural orientation without the ~500ms live hub scan.
+fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
+    const HUB_COUNT: usize = 30;
+    let hubs = crate::hubs::find_hub_nodes(store, HUB_COUNT)?;
+    let summaries = hubs
+        .iter()
+        .map(|h| {
+            let role = hub_role(h.in_degree, h.out_degree);
+            let content = format!(
+                "{} ({}) — hub [{}]: {} callers, {} callees (total degree {})",
+                h.name, h.file_path, role, h.in_degree, h.out_degree, h.total_degree
+            );
+            let token_estimate = content.len() / 4;
+            Summary {
+                level: SummaryLevel::Hub,
+                target_uid: h.uid.clone(),
+                target_name: h.name.clone(),
+                content,
+                token_estimate,
+            }
+        })
+        .collect();
+    Ok(summaries)
 }
 
 /// Symbol-level: one-line summary per function/class.
@@ -673,6 +722,14 @@ mod tests {
             load_summaries(&db_path, 2).unwrap().is_none(),
             "summaries from an older generation must not be served after a reindex"
         );
+    }
+
+    #[test]
+    fn hub_role_classifies_by_degree_balance() {
+        assert_eq!(hub_role(0, 0), "isolated");
+        assert_eq!(hub_role(30, 2), "sink/utility"); // heavily called, calls little
+        assert_eq!(hub_role(2, 30), "orchestrator"); // calls widely, called little
+        assert_eq!(hub_role(10, 10), "bridge"); // balanced high degree
     }
 
     #[test]

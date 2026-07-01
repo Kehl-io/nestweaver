@@ -1002,7 +1002,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "file",
-            help = "Summary level: symbol, file, or cluster"
+            help = "Summary level: symbol, file, cluster, or hub"
         )]
         level: String,
         #[arg(long, help = "Output as JSON")]
