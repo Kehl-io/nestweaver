@@ -7879,18 +7879,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
                         if report.removed.is_empty() {
                             println!(
-                                "No orphaned launch agents found ({} kept).",
-                                report.kept.len()
+                                "No orphaned launch agents found ({} kept, {} spared).",
+                                report.kept.len(),
+                                report.spared.len()
                             );
                         } else {
                             println!(
-                                "Removed {} orphaned launch agent(s); kept {} live one(s).",
+                                "Removed {} orphaned launch agent(s); kept {} live, spared {}.",
                                 report.removed.len(),
-                                report.kept.len()
+                                report.kept.len(),
+                                report.spared.len()
                             );
                             for label in &report.removed {
                                 println!("  removed: {label}");
                             }
+                        }
+                        // A live daemon still holds the pidfile lock even though its
+                        // DB path is currently missing (e.g. an unmounted volume) —
+                        // reaping it would kill a healthy daemon, so it was spared.
+                        for label in &report.spared {
+                            println!("  spared (live daemon, DB path missing): {label}");
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
