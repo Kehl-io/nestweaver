@@ -1602,6 +1602,9 @@ enum DaemonAction {
     Stop,
     /// Show daemon status
     Status,
+    /// Remove orphaned launch agents (macOS) left by ephemeral/test daemons —
+    /// ones whose `--db` path no longer exists or lives under a temp dir.
+    Gc,
     /// Run daemon in foreground (used by launchd)
     Run {
         /// Enable server mode (TCP listener alongside UDS)
@@ -7502,11 +7505,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     // On macOS, use launchd to manage the daemon unless
                     // NESTWEAVER_DAEMON_FORK=1 is set (useful for tests and
-                    // environments where launchd is not available).
+                    // environments where launchd is not available). Also never
+                    // register a persistent launchd agent for a temp-DB daemon —
+                    // those are ephemeral (tests/repros) and leak crash-looping
+                    // plists; fall through to the fork path instead.
                     #[cfg(target_os = "macos")]
                     let use_launchd = std::env::var("NESTWEAVER_DAEMON_FORK")
                         .map(|v| v != "1")
-                        .unwrap_or(true);
+                        .unwrap_or(true)
+                        && !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
                     #[cfg(not(target_os = "macos"))]
                     let use_launchd = false;
 
@@ -7842,6 +7849,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_SUCCESS, None));
                     }
                     println!("Daemon is not running.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::Gc => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
+                        if report.removed.is_empty() {
+                            println!(
+                                "No orphaned launch agents found ({} kept).",
+                                report.kept.len()
+                            );
+                        } else {
+                            println!(
+                                "Removed {} orphaned launch agent(s); kept {} live one(s).",
+                                report.removed.len(),
+                                report.kept.len()
+                            );
+                            for label in &report.removed {
+                                println!("  removed: {label}");
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    println!("daemon gc is a no-op here (launchd is macOS-only).");
                     Ok((EXIT_SUCCESS, None))
                 }
 
