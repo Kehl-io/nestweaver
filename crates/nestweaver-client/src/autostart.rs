@@ -125,6 +125,13 @@ fn spawn_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<()> {
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }
+    // Auto-spawned daemons are ephemeral — one per DB a client happens to touch —
+    // so they must NOT install a persistent launchd agent. Doing so leaked
+    // hundreds of `io.kehl.nestweaver.<hash>.plist` files with
+    // KeepAlive{Crashed:true}, which then crash-looped. Force the fork-based
+    // daemonization path here; launchd registration is reserved for an explicit
+    // `nestweaver daemon start` invoked by the user (or the menubar app).
+    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
