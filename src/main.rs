@@ -12597,7 +12597,9 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             db,
             config,
             include_clones,
-            force,
+            // `--force` is obsolete: the daemon now backs up under its own write
+            // lock (there is no client-side quiesce that can fail).
+            force: _,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !db_path.exists() {
@@ -12633,84 +12635,40 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 rt.block_on(nestweaver_client::DaemonClient::connect_existing(&db_path));
             let daemon_running = launchd_running || existing_daemon.is_ok();
 
-            let result = if daemon_running {
-                // Route through the daemon: call PrepareBackup to quiesce,
-                // then copy files read-only (no lock contention).
-                eprintln!("Daemon is running — quiescing database via PrepareBackup RPC...");
-                let (prepare_ok, mut client) = match existing_daemon {
-                    Ok(mut client) => {
-                        let ok = rt.block_on(async {
-                            match client
-                                .inner_mut()
-                                .prepare_backup(nestweaver_proto::PrepareBackupRequest {})
-                                .await
-                            {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    eprintln!("PrepareBackup RPC failed: {e}");
-                                    false
-                                }
-                            }
-                        });
-                        (ok, Some(client))
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to daemon: {e}");
-                        (false, None)
-                    }
-                };
+            if daemon_running {
+                // The daemon owns the files and performs the whole backup
+                // in-process (holding its own write lock), so a single RPC does
+                // it — no client-side quiesce/copy, and it works even when the
+                // client does not share the daemon's filesystem.
+                eprintln!("Backing up via the running daemon...");
+                let mut client = existing_daemon
+                    .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
+                let resp = rt
+                    .block_on(async {
+                        client
+                            .inner_mut()
+                            .backup(nestweaver_proto::BackupRequest {
+                                output_path: config.output_path.to_string_lossy().into_owned(),
+                                include_clones,
+                            })
+                            .await
+                    })
+                    .map_err(|e| anyhow::anyhow!("Backup RPC failed: {e}"))?
+                    .into_inner();
 
-                // Helper closure to release the backup quiesce on the daemon.
-                let finish_backup =
-                    |client: &mut Option<nestweaver_client::DaemonClient>,
-                     rt: &tokio::runtime::Runtime| {
-                        if let Some(c) = client {
-                            rt.block_on(async {
-                                if let Err(e) = c
-                                    .inner_mut()
-                                    .finish_backup(nestweaver_proto::FinishBackupRequest {})
-                                    .await
-                                {
-                                    eprintln!("FinishBackup RPC failed: {e}");
-                                }
-                            });
-                        }
-                    };
+                eprintln!("Backup saved to {}", resp.output_path);
+                eprintln!("  Instance:     {}", resp.instance_id);
+                eprintln!("  Tier:         {}", resp.tier);
+                eprintln!("  Version:      {}", resp.nestweaver_version);
+                eprintln!("  Repos:        {}", resp.repo_count);
+                eprintln!("  Symbols:      {}", resp.symbol_count);
+                eprintln!("  DB size:      {}", format_bytes(resp.db_size_bytes));
+                eprintln!("  Compressed:   {}", format_bytes(resp.total_compressed));
+                return Ok(EXIT_SUCCESS);
+            }
 
-                if !prepare_ok && !force {
-                    eprintln!("Cannot quiesce database. Stop the daemon first, or use --force.");
-                    finish_backup(&mut client, &rt);
-                    return Ok(EXIT_ERROR);
-                }
-
-                if !prepare_ok && force {
-                    eprintln!(
-                        "WARNING: PrepareBackup failed — WAL may not be checkpointed. \
-                         The backup might not include recent uncommitted writes."
-                    );
-                    // Best-effort: try to checkpoint the WAL directly. This will
-                    // fail silently if the daemon holds the write lock.
-                    match nestweaver_engine::try_passive_checkpoint(&db_path) {
-                        Ok(true) => eprintln!("  Passive WAL checkpoint succeeded."),
-                        Ok(false) => eprintln!(
-                            "  Could not acquire write lock for WAL checkpoint — \
-                             backup will use whatever state is on disk."
-                        ),
-                        Err(e) => eprintln!("  WAL checkpoint attempt failed: {e}"),
-                    }
-                }
-
-                eprintln!("Creating backup (read-only)...");
-                let backup_result = nestweaver_engine::backup_save_read_only(&config);
-
-                // Always release the quiesce, even if the backup failed.
-                finish_backup(&mut client, &rt);
-
-                backup_result?
-            } else {
-                eprintln!("Creating backup...");
-                nestweaver_engine::backup_save(&config)?
-            };
+            eprintln!("Creating backup...");
+            let result = nestweaver_engine::backup_save(&config)?;
             let m = &result.manifest;
 
             eprintln!("Backup saved to {}", result.output_path.display());

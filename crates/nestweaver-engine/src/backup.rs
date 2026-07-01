@@ -87,23 +87,6 @@ pub struct RestoreResult {
     pub duration: Duration,
 }
 
-/// Attempt a best-effort WAL checkpoint on the database.
-///
-/// Opens the store in read-write mode and runs CHECKPOINT. Returns `Ok(true)`
-/// if the checkpoint succeeded, `Ok(false)` if the store could not be opened
-/// (e.g. another process holds the write lock), or `Err` on unexpected errors.
-pub fn try_passive_checkpoint(db_path: &Path) -> anyhow::Result<bool> {
-    match nestweaver_store::GraphStore::open(db_path) {
-        Ok(store) => {
-            store
-                .checkpoint()
-                .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
-            Ok(true)
-        }
-        Err(_) => Ok(false),
-    }
-}
-
 /// Create a backup of the NestWeaver database and all sidecar files.
 ///
 /// The caller is responsible for ensuring exclusive access to the database
@@ -177,56 +160,6 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
     let staged = stage_backup_from_store(&store, config)?;
     drop(store);
     package_staged(config, staged)
-}
-
-/// Create a backup using read-only database access.
-///
-/// Used when the daemon is running and has already quiesced the database
-/// via the PrepareBackup RPC. The caller does NOT need write access.
-pub fn backup_save_read_only(config: &BackupConfig) -> anyhow::Result<BackupResult> {
-    let start = Instant::now();
-    let staging = tempfile::tempdir()?;
-    let pause_start = Instant::now();
-
-    // Open read-only — no write lock contention with the daemon.
-    let store = nestweaver_store::GraphStore::open_read_only(&config.db_path)
-        .map_err(|e| anyhow::anyhow!("failed to open database (read-only): {e}"))?;
-
-    // Copy files to staging (quiescing already done by PrepareBackup RPC).
-    copy_db_files(
-        &config.db_path,
-        staging.path(),
-        config.include_clones,
-        config.workspace_path.as_deref(),
-    )?;
-
-    // Gather graph statistics for the manifest while the store is still open.
-    let symbol_count = store.count_symbols().unwrap_or(0);
-    let per_repo = store.count_symbols_by_repo().unwrap_or_default();
-    let repos: Vec<BackupRepoInfo> = store
-        .list_repos(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| BackupRepoInfo {
-            symbols: per_repo.get(&r.uid).copied().unwrap_or(0),
-            url: r.url,
-            indexed_sha: r.indexed_sha,
-        })
-        .collect();
-
-    let write_pause = pause_start.elapsed();
-    drop(store);
-
-    package_staged(
-        config,
-        StagedBackup {
-            staging,
-            repos,
-            symbol_count,
-            start,
-            write_pause,
-        },
-    )
 }
 
 /// Package a [`StagedBackup`] into the `.nwsnap.zst` archive. Runs lock-free,
