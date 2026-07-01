@@ -108,25 +108,38 @@ pub fn try_passive_checkpoint(db_path: &Path) -> anyhow::Result<bool> {
 ///
 /// The caller is responsible for ensuring exclusive access to the database
 /// (no concurrent writes) for the duration of this call.
-pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
+/// A backup staged (files copied, stats gathered) while the write lock was
+/// held, ready to package lock-free via [`package_staged`].
+pub struct StagedBackup {
+    staging: tempfile::TempDir,
+    repos: Vec<BackupRepoInfo>,
+    symbol_count: usize,
+    start: Instant,
+    write_pause: Duration,
+}
+
+/// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
+/// WAL into the main file, copy the on-disk files to a temp staging dir, and
+/// gather manifest stats. Reuses the caller's live connection — it never opens a
+/// second one — so the daemon can call this while holding its own write lock
+/// (quiesce == lock-held), guaranteeing no writer touches the files mid-copy.
+/// The returned [`StagedBackup`] is packaged lock-free by [`package_staged`].
+pub fn stage_backup_from_store(
+    store: &nestweaver_store::GraphStore,
+    config: &BackupConfig,
+) -> anyhow::Result<StagedBackup> {
     let start = Instant::now();
-    let staging = tempfile::tempdir()?;
-
-    // Phase 1: Quiesce — flush in-memory state and merge WAL.
     let pause_start = Instant::now();
-
-    let store = nestweaver_store::GraphStore::open(&config.db_path)
-        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+    let staging = tempfile::tempdir()?;
 
     store
         .flush_embedding_index()
         .map_err(|e| anyhow::anyhow!("failed to flush embedding index: {e}"))?;
-
     store
         .checkpoint()
         .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
 
-    // Copy files to staging while the store is still open (to keep the lock).
+    // Copy files while the caller holds the write lock (sidecars are non-atomic).
     copy_db_files(
         &config.db_path,
         staging.path(),
@@ -134,7 +147,7 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
         config.workspace_path.as_deref(),
     )?;
 
-    // Gather graph statistics for the manifest while the store is still open.
+    // Gather graph statistics for the manifest while the store is open.
     let symbol_count = store.count_symbols().unwrap_or(0);
     let per_repo = store.count_symbols_by_repo().unwrap_or_default();
     let repos: Vec<BackupRepoInfo> = store
@@ -149,9 +162,21 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
         .collect();
 
     let write_pause = pause_start.elapsed();
-    drop(store);
+    Ok(StagedBackup {
+        staging,
+        repos,
+        symbol_count,
+        start,
+        write_pause,
+    })
+}
 
-    finish_backup(config, staging, repos, symbol_count, start, write_pause)
+pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
+    let store = nestweaver_store::GraphStore::open(&config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+    let staged = stage_backup_from_store(&store, config)?;
+    drop(store);
+    package_staged(config, staged)
 }
 
 /// Create a backup using read-only database access.
@@ -192,18 +217,31 @@ pub fn backup_save_read_only(config: &BackupConfig) -> anyhow::Result<BackupResu
     let write_pause = pause_start.elapsed();
     drop(store);
 
-    finish_backup(config, staging, repos, symbol_count, start, write_pause)
+    package_staged(
+        config,
+        StagedBackup {
+            staging,
+            repos,
+            symbol_count,
+            start,
+            write_pause,
+        },
+    )
 }
 
-/// Common packaging step shared by `backup_save` and `backup_save_read_only`.
-fn finish_backup(
+/// Package a [`StagedBackup`] into the `.nwsnap.zst` archive. Runs lock-free,
+/// after the write lock has been released.
+pub fn package_staged(
     config: &BackupConfig,
-    staging: tempfile::TempDir,
-    repos: Vec<BackupRepoInfo>,
-    symbol_count: usize,
-    start: Instant,
-    write_pause: Duration,
+    staged: StagedBackup,
 ) -> anyhow::Result<BackupResult> {
+    let StagedBackup {
+        staging,
+        repos,
+        symbol_count,
+        start,
+        write_pause,
+    } = staged;
     let mut manifest = build_backup_manifest(config, staging.path(), repos, symbol_count)?;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
@@ -760,6 +798,33 @@ mod tests {
         let manifest = backup_inspect(&output).unwrap();
         assert_eq!(manifest.instance_id, "test");
         assert_eq!(manifest.version, 1);
+    }
+
+    #[test]
+    fn stage_and_package_from_open_store_produces_snapshot() {
+        // The daemon backs up while its write connection is OPEN. Staging must
+        // work against a live store (checkpoint + copy + stats) and packaging
+        // must run afterwards — without opening a second connection.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+
+        let output = dir.path().join("snap.nwsnap.zst");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+        };
+
+        let staged = stage_backup_from_store(&store, &config).expect("stage");
+        let result = package_staged(&config, staged).expect("package");
+        // Store is still open here — the daemon keeps serving.
+        assert!(store.count_symbols().is_ok());
+        assert!(output.exists());
+        assert_eq!(result.manifest.instance_id, "test");
+        assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
     }
 
     #[test]
