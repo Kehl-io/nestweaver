@@ -324,21 +324,6 @@ pub fn index_directory_with_store_cancellable(
     )
 }
 
-/// Build the pre-write cancellation gate: an `acquire_write_guard` closure that
-/// aborts the index (before any graph mutation) when `cancel` is set. When
-/// `cancel` is `None` it is a no-op, matching the previous `index_into_store`
-/// behavior exactly.
-fn cancel_write_gate(
-    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> impl FnOnce() -> Result<(), anyhow::Error> + '_ {
-    move || {
-        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-            anyhow::bail!("index cancelled");
-        }
-        Ok(())
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn index_directory_with_store_inner(
     store: &GraphStore,
@@ -375,7 +360,8 @@ fn index_directory_with_store_inner(
             Some(&mut resolution_deps),
             name,
             false,
-            cancel_write_gate(cancel),
+            cancel,
+            || Ok::<(), anyhow::Error>(()),
         )?
     } else {
         let filemeta_cache = load_filemeta_cache(&filemeta_path);
@@ -391,7 +377,8 @@ fn index_directory_with_store_inner(
             Some(&mut resolution_deps),
             name,
             false,
-            cancel_write_gate(cancel),
+            cancel,
+            || Ok::<(), anyhow::Error>(()),
         )?
     };
 
@@ -475,6 +462,7 @@ pub fn index_with_reader(
         repo_url,
         indexed_sha,
         name,
+        None,
         || Ok::<_, anyhow::Error>(()),
     )
 }
@@ -489,6 +477,7 @@ pub fn index_with_reader_and_write_gate<G, F>(
     repo_url: &str,
     indexed_sha: &str,
     name: Option<&str>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
 where
@@ -506,6 +495,7 @@ where
         None,
         name,
         true,
+        cancel,
         acquire_write_guard,
     )?;
     Ok(result)
@@ -621,6 +611,7 @@ fn index_into_store(
         resolution_deps,
         name,
         false,
+        None,
         || Ok::<_, anyhow::Error>(()),
     )
 }
@@ -638,6 +629,7 @@ fn index_into_store_with_write_gate<G, F>(
     mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
     bump_generation_after_write: bool,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
 where
@@ -768,6 +760,19 @@ where
                 .to_string_lossy()
                 .into_owned();
 
+            // Cooperative cancellation: once the daemon trips the flag (index
+            // timeout or client disconnect), skip the expensive read+parse for
+            // every remaining file so all cores are freed promptly. The index
+            // then bails before any graph mutation (checked right after the
+            // collect), so no partial/empty graph is ever persisted.
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                parse_pb.inc(1);
+                return ParseOutcome::Skipped(SkippedFile {
+                    path: display_name,
+                    reason: "index cancelled".to_string(),
+                });
+            }
+
             // Tiered change detection.
             let (source, content_hash, file_meta) =
                 match tiered_change_check(reader, &display_name, cache) {
@@ -846,6 +851,14 @@ where
 
     parse_pb.finish_and_clear();
     drop(_phase2_span);
+
+    // Cooperative cancellation: if the flag tripped during the parallel parse,
+    // bail now — BEFORE collection, resolution, and any graph mutation — so a
+    // cancelled index never persists a partial/empty graph. The `?` returns
+    // ahead of the write gate below, preserving the no-partial-write invariant.
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("index cancelled");
+    }
 
     // ── Sequential collection of parallel results ────────────────────────
     let _phase_collect_span = tracing::info_span!("index_phase_collect").entered();
@@ -3502,6 +3515,7 @@ function hello(name) { return "Hello " + name; }
             "test",
             "file://gate-order",
             "abc",
+            None,
             None,
             || {
                 assert!(

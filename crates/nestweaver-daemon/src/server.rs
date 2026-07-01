@@ -1271,6 +1271,16 @@ impl NestWeaverDaemon for DaemonService {
                     // Tantivy indexes notes/markdown only, not code symbols.
                     // No Tantivy update needed after code repo indexing.
 
+                    // If the request was cancelled after the index committed
+                    // (client disconnect or overall timeout), skip the expensive
+                    // post-index phases — git activity mines up to 500 commits
+                    // and the trigram rebuild scans the whole index — since
+                    // nobody is waiting on the result. The graph itself is
+                    // already indexed; these sidecars rebuild on the next index.
+                    if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+
                     // Git activity (churn sidecar + co-changes) — runs on
                     // the repo, writes sidecar files next to the DB.
                     if with_git_activity {

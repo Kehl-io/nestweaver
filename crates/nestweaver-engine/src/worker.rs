@@ -754,6 +754,7 @@ where
                     &prepared.repo_url,
                     &prepared.remote_sha,
                     None,
+                    None,
                     acquire_write_guard,
                 )?;
                 Ok(ReindexOutcome::Full)

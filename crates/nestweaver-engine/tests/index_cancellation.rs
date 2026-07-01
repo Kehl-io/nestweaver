@@ -5,10 +5,11 @@
 //! disconnected client abort the index at the pre-write boundary without
 //! leaving a partial write.
 
+use nestweaver_engine::content_reader::{ContentReader, FilesystemReader};
 use nestweaver_store::GraphStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn testdata_js() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,5 +73,98 @@ fn uncancelled_index_via_cancellable_path_succeeds() {
         Err(e) => panic!("an uncancelled index must succeed: {e}"),
     };
     assert!(files > 0, "should index at least one file");
+    assert!(!store.list_repos(None).unwrap().is_empty());
+}
+
+/// A ContentReader that counts `read_file` calls, wrapping a real
+/// FilesystemReader. Used to prove that a cancelled index stops BEFORE reading
+/// or parsing any file (not merely before the write).
+struct CountingReader {
+    inner: FilesystemReader,
+    reads: AtomicUsize,
+}
+
+impl CountingReader {
+    fn new(inner: FilesystemReader) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+        }
+    }
+    fn read_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl ContentReader for CountingReader {
+    fn read_file(&self, rel_path: &Path) -> anyhow::Result<String> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_file(rel_path)
+    }
+    fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        self.inner.list_files()
+    }
+    fn file_meta(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+        self.inner.file_meta(rel_path)
+    }
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn version_id(&self) -> &str {
+        self.inner.version_id()
+    }
+}
+
+#[test]
+fn cancelled_index_stops_before_reading_or_parsing_any_file() {
+    let store = GraphStore::in_memory().unwrap();
+    let spy = CountingReader::new(FilesystemReader::new(&testdata_js()));
+    let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
+
+    let result = nestweaver_engine::index_with_reader_and_write_gate(
+        &spy,
+        &store,
+        "default",
+        "file:///test/js",
+        "abc",
+        None,
+        Some(&cancel),
+        || Ok::<(), anyhow::Error>(()),
+    );
+
+    assert!(result.is_err(), "a pre-cancelled index must return Err");
+    assert_eq!(
+        spy.read_count(),
+        0,
+        "a cancelled index must not read/parse ANY file (not just skip the write)"
+    );
+    assert!(
+        store.list_repos(None).unwrap().is_empty(),
+        "a cancelled index must not write the repo into the store"
+    );
+}
+
+#[test]
+fn uncancelled_reader_index_still_reads_and_writes() {
+    let store = GraphStore::in_memory().unwrap();
+    let spy = CountingReader::new(FilesystemReader::new(&testdata_js()));
+    let cancel = Arc::new(AtomicBool::new(false)); // never cancelled
+
+    let result = nestweaver_engine::index_with_reader_and_write_gate(
+        &spy,
+        &store,
+        "default",
+        "file:///test/js",
+        "abc",
+        None,
+        Some(&cancel),
+        || Ok::<(), anyhow::Error>(()),
+    );
+
+    assert!(result.is_ok(), "an uncancelled index must succeed");
+    assert!(
+        spy.read_count() > 0,
+        "an uncancelled index must actually read files"
+    );
     assert!(!store.list_repos(None).unwrap().is_empty());
 }
