@@ -584,8 +584,12 @@ impl NestWeaverDaemon for DaemonService {
 
             loop {
                 let writes = state.active_writes.load(Ordering::Relaxed);
-                if writes == 0 {
-                    tracing::info!("no active writes — shutting down");
+                // Index jobs bump `indexing_active`, not `active_writes`, so the
+                // drain must wait on both — otherwise a shutdown could proceed
+                // while the worker is mid-write.
+                let indexing = state.indexing_active.load(Ordering::Relaxed);
+                if writes == 0 && !indexing {
+                    tracing::info!("no active writes or indexing — shutting down");
                     break;
                 }
 
