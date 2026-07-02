@@ -1244,22 +1244,36 @@ pub fn build_brain_context_hybrid_with_aliases(
         && config.weight_semantic > 0.0
     {
         let query_text = inputs.join(" ");
-        if let Ok(query_emb) = model.embed_query(&query_text)
-            && let Ok(hits) = crate::vector_search::vector_knn_all_cancellable(
+        if let Ok(query_emb) = model.embed_query(&query_text) {
+            match crate::vector_search::vector_knn_all_cancellable(
                 store,
                 &query_emb,
                 config.semantic_limit,
                 cancel,
-            )
-        {
-            if config.always_blend_semantic {
-                for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
-                    if !seed_uids.contains(uid) {
-                        seed_uids.push(uid.clone());
+            ) {
+                Ok(hits) => {
+                    if config.always_blend_semantic {
+                        for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                            if !seed_uids.contains(uid) {
+                                seed_uids.push(uid.clone());
+                            }
+                        }
                     }
+                    semantic_hits = hits;
                 }
+                // A cancelled query (timeout / disconnect) is incomplete, not a
+                // benign miss: propagate it so the caller returns an error the
+                // cache refuses to store — never a truncated-but-"complete" Ok.
+                // Other embedding/search failures still degrade gracefully to no
+                // semantic signal (the original tolerant behavior).
+                Err(e)
+                    if e.downcast_ref::<nestweaver_store::StoreError>()
+                        .is_some_and(|s| s.is_cancelled()) =>
+                {
+                    return Err(e);
+                }
+                Err(_) => {}
             }
-            semantic_hits = hits;
         }
     }
 

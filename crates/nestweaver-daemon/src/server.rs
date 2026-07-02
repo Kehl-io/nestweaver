@@ -23,6 +23,30 @@ use crate::safeguards::{
 
 // ── State ───────────────────────────────────────────────────────────
 
+/// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
+/// a cancelled query surfaces as `deadline_exceeded` (timeout) or `cancelled`
+/// (client disconnect) rather than an opaque `internal`. Non-cancel errors keep
+/// the `internal` mapping. This is defense-in-depth: on timeout the safeguard's
+/// `select!` already returns `deadline_exceeded` and drops this future, but a
+/// query that finishes with a cancel error just before that race is mapped
+/// consistently here too.
+fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
+    if let Some(reason) = e
+        .downcast_ref::<nestweaver_store::StoreError>()
+        .and_then(|s| s.cancel_reason())
+    {
+        return match reason {
+            nestweaver_store::CancelReason::Timeout => {
+                Status::deadline_exceeded(format!("{tool_name} query cancelled: timeout"))
+            }
+            nestweaver_store::CancelReason::ClientDisconnected => {
+                Status::cancelled(format!("{tool_name} query cancelled: client disconnected"))
+            }
+        };
+    }
+    Status::internal(format!("tool {tool_name} failed: {e}"))
+}
+
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
 /// the async task is cancelled, the counter is still decremented.
@@ -252,7 +276,7 @@ impl DaemonService {
                 embed_ref,
                 Some(&cancel),
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -381,7 +405,7 @@ impl DaemonService {
                 embed_ref,
                 Some(&cancel),
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),

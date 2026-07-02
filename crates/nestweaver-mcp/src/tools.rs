@@ -6688,6 +6688,67 @@ mod cache_dispatch_tests {
             "write tools must never populate the cache"
         );
     }
+
+    /// A deterministic embed model so `brain_context` runs its semantic (vector)
+    /// leg — the leg that observes the cancellation flag.
+    struct FixedEmbed(Vec<f32>);
+    impl EmbedQueryFn for FixedEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn cancelled_query_is_not_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        let embed = FixedEmbed(vec![1.0, 0.0, 0.0]);
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+
+        // Pre-cancelled: the vector leg trips the flag mid-flight, so the whole
+        // query must error rather than return a truncated "complete" Ok.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = dispatch_cancellable(
+            &store,
+            None,
+            "brain_context",
+            args.clone(),
+            Some(&embed),
+            Some(&cancel),
+        );
+        assert!(
+            cancelled.is_err(),
+            "a cancelled brain_context must return Err, not a truncated Ok"
+        );
+
+        // …and it must NOT have populated the response cache.
+        flush_response_cache();
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "a cancelled query must never populate the response cache"
+        );
+
+        // A subsequent uncancelled call must RECOMPUTE (a MISS), never serve a
+        // cached truncated/empty result.
+        reset_session();
+        let ok = dispatch_cancellable(&store, None, "brain_context", args, Some(&embed), None);
+        assert!(ok.is_ok(), "uncancelled recompute must succeed");
+        assert_eq!(
+            CACHE_MISSES.with(|c| c.get()),
+            1,
+            "recompute must be a MISS, not a cached-empty HIT"
+        );
+    }
 }
 
 #[cfg(test)]
