@@ -12867,6 +12867,11 @@ fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
         } => {
             eprintln!("Restoring backup from {}...", path.display());
 
+            // Refuse if a daemon is live on the target: restore renames the live
+            // dir aside and deletes it, so a running daemon would keep writing to
+            // unlinked inodes and the restored state would silently diverge.
+            ensure_no_live_daemon_for_restore(&data_dir)?;
+
             let config = nestweaver_engine::RestoreConfig {
                 snapshot_path: path,
                 data_dir: data_dir.clone(),
@@ -12968,6 +12973,35 @@ fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
                 None
             }
         })
+}
+
+/// Refuse a restore while a live daemon serves the target data directory.
+///
+/// Restore renames the live data dir aside and deletes it. If a daemon is
+/// actively serving that dir, it keeps writing to now-unlinked inodes and the
+/// restored state silently diverges. Mirror the snapshot-build quiesce guard
+/// (commit 9a1e6fa): derive the instance from the target's `.lbug`, probe the
+/// pidfile for a live daemon, and refuse if one holds it.
+///
+/// No `.lbug` in `data_dir` (fresh target, nothing to serve) → permit.
+fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
+    let Some(db) = find_lbug_in_dir(data_dir) else {
+        return Ok(());
+    };
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+    if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile)
+        && nestweaver_client::autostart::is_process_alive(pid)
+    {
+        anyhow::bail!(
+            "a daemon (pid {pid}) is running on the target data directory {} — restoring \
+             would rename its live files aside and delete them while it keeps writing to the \
+             unlinked inodes, silently diverging the restored state. Stop it with `nestweaver \
+             daemon stop` (or `nestweaver server stop`) and retry.",
+            data_dir.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Run the MCP stdio server using HybridClient for query routing.
@@ -13573,6 +13607,65 @@ fn impact_item_to_result(
         affected_signature: item.affected_signature,
         severity,
         reason: item.reason,
+    }
+}
+
+#[cfg(test)]
+mod restore_guard_tests {
+    use super::*;
+
+    /// A restore against a data dir that a live daemon is serving must be
+    /// refused before any filesystem mutation, so the live dir is never renamed
+    /// aside or deleted out from under the running daemon.
+    #[test]
+    fn backup_restore_refuses_live_daemon() {
+        // Isolate the runtime dir (where pidfiles live) to this test.
+        let rt = tempfile::tempdir().unwrap();
+        // SAFETY: this is the only main.rs unit test that touches
+        // XDG_RUNTIME_DIR, and it restores it before returning.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", rt.path());
+        }
+
+        // A target data dir with a db + sidecar, as a live daemon would serve.
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("graph.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let sidecar = data_dir.path().join("graph.lbug.filemeta.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+
+        // Simulate a live daemon: pidfile holds THIS process's pid (alive).
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let err = ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect_err("restore must refuse while a daemon is live on the target");
+        assert!(err.to_string().contains("daemon"), "err was: {err}");
+
+        // The guard must not have touched the live data dir.
+        assert!(db.exists(), "db must be untouched after refusal");
+        assert!(sidecar.exists(), "sidecar must be untouched after refusal");
+        assert!(
+            !data_dir.path().with_extension("restoring").exists(),
+            "no .restoring rename must have happened"
+        );
+
+        // A dead pid (no such process) must not block a restore.
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("a stale/dead pidfile must not block restore");
+
+        // No pidfile at all → permitted.
+        std::fs::remove_file(&pidfile).unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("restore permitted when no daemon is live");
+
+        // SAFETY: paired with the set_var above; test owns this env var.
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 }
 
