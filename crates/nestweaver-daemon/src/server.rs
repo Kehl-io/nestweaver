@@ -47,6 +47,26 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
     Status::internal(format!("tool {tool_name} failed: {e}"))
 }
 
+/// Trip `cancel` when the request future is dropped (client cancel /
+/// disconnect), reusing the same cooperative flag the timeout path sets.
+///
+/// Returns a `DropGuard` that MUST be held for the lifetime of the request
+/// future: when that future is dropped, the guard cancels a token, and a small
+/// listener task then stores `true` into the shared flag so the in-flight
+/// `spawn_blocking` dispatch bails cheaply instead of running to completion and
+/// caching a result no client is waiting for. On normal completion the guard
+/// still fires, but the dispatch has already returned, so the late store is a
+/// harmless no-op on a per-request flag.
+fn arm_disconnect_cancel(cancel: Arc<AtomicBool>) -> tokio_util::sync::DropGuard {
+    let token = tokio_util::sync::CancellationToken::new();
+    let child = token.clone();
+    tokio::spawn(async move {
+        child.cancelled().await;
+        cancel.store(true, Ordering::Relaxed);
+    });
+    token.drop_guard()
+}
+
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
 /// the async task is cancelled, the counter is still decremented.
@@ -198,6 +218,9 @@ impl DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
+        // Trip the cancel flag if this request future is dropped (client cancel
+        // / disconnect), the same flag the timeout path sets.
+        let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -374,6 +397,9 @@ impl DaemonService {
     ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
+        // Trip the cancel flag if this request future is dropped (client cancel
+        // / disconnect), the same flag the timeout path sets.
+        let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -5078,6 +5104,31 @@ fn proto_to_atomic_change(
 mod startup_helper_tests {
     use super::*;
     use nestweaver_engine::{RepoConfig, RepoType};
+
+    /// Dropping the request-future scope (client cancel / disconnect) must trip
+    /// the shared cooperative cancel flag, so in-flight `spawn_blocking` work
+    /// bails instead of running to completion for a caller that is gone.
+    #[tokio::test]
+    async fn cancelled_flag_trips_on_request_future_drop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
+            // Still armed: nothing has been dropped yet.
+            assert!(!cancel.load(Ordering::Relaxed), "flag must start unset");
+            // guard drops here → token cancelled → listener stores true
+        }
+        // The listener runs on a spawned task; poll briefly for it to observe.
+        for _ in 0..200 {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "dropping the request-future guard must trip the cancel flag"
+        );
+    }
 
     #[test]
     fn validate_token_lengths_rejects_short_token() {

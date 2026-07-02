@@ -18,6 +18,7 @@ axum = "0.8"
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tokio-stream = { workspace = true, features = ["net"] }
 tower = "0.5"
 anyhow = { workspace = true }
