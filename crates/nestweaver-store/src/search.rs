@@ -202,10 +202,10 @@ impl EmbeddingIndex {
             .collect();
 
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-            // The reason (timeout vs. disconnect) is owned by the daemon layer
-            // that trips the flag; the shared bool can't distinguish them, so
-            // the leaf reports the current-and-only trigger. The gRPC boundary
-            // re-maps by the reason it actually observed.
+            // The shared cancel flag is a bare bool and can't carry a reason, so
+            // the leaf always reports `Timeout` — the only reason the gRPC
+            // boundary ever observes. (A client disconnect drops the request
+            // future before any error is returned, so it never surfaces here.)
             return Err(StoreError::Cancelled(CancelReason::Timeout));
         }
 

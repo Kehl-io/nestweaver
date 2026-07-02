@@ -24,12 +24,16 @@ use crate::safeguards::{
 // ── State ───────────────────────────────────────────────────────────
 
 /// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
-/// a cancelled query surfaces as `deadline_exceeded` (timeout) or `cancelled`
-/// (client disconnect) rather than an opaque `internal`. Non-cancel errors keep
-/// the `internal` mapping. This is defense-in-depth: on timeout the safeguard's
-/// `select!` already returns `deadline_exceeded` and drops this future, but a
-/// query that finishes with a cancel error just before that race is mapped
-/// consistently here too.
+/// a cancelled query surfaces as `deadline_exceeded` rather than an opaque
+/// `internal`. Non-cancel errors keep the `internal` mapping. This is
+/// defense-in-depth: on timeout the safeguard's `select!` already returns
+/// `deadline_exceeded` and drops this future, but a query that finishes with a
+/// cancel error just before that race is mapped consistently here too.
+///
+/// The only cancel reason that can reach here is `Timeout`: the cooperative
+/// flag is a bare `AtomicBool` that cannot carry a reason, so the leaf always
+/// reports `Timeout`. On a client disconnect the request future is dropped
+/// before any `Status` is returned, so that path never surfaces here.
 fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
     if let Some(reason) = e
         .downcast_ref::<nestweaver_store::StoreError>()
@@ -38,9 +42,6 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         return match reason {
             nestweaver_store::CancelReason::Timeout => {
                 Status::deadline_exceeded(format!("{tool_name} query cancelled: timeout"))
-            }
-            nestweaver_store::CancelReason::ClientDisconnected => {
-                Status::cancelled(format!("{tool_name} query cancelled: client disconnected"))
             }
         };
     }
@@ -62,7 +63,10 @@ fn arm_disconnect_cancel(cancel: Arc<AtomicBool>) -> tokio_util::sync::DropGuard
     let child = token.clone();
     tokio::spawn(async move {
         child.cancelled().await;
-        cancel.store(true, Ordering::Relaxed);
+        // Release to pair with the Acquire load in the cooperative reader
+        // (nestweaver-store `vector_search_cancellable`), matching the timeout
+        // writer in `safeguards::with_safeguard_cancellable`.
+        cancel.store(true, Ordering::Release);
     });
     token.drop_guard()
 }

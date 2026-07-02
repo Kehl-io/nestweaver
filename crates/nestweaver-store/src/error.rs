@@ -4,19 +4,21 @@ use thiserror::Error;
 ///
 /// A cancelled computation is *incomplete*, not empty: it must propagate as a
 /// distinct error and must never be treated as a legitimate result (or cached).
+///
+/// Both cancel triggers (query timeout and client disconnect) share a single
+/// cooperative `AtomicBool`, which cannot carry a reason — so the leaf always
+/// reports `Timeout`. On a client disconnect the request future is dropped
+/// before any error is observed, so no distinct reason is needed there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
-    /// The per-tool query deadline fired.
+    /// The per-tool query deadline fired (or the shared flag was tripped).
     Timeout,
-    /// The request future was dropped (client cancel / disconnect).
-    ClientDisconnected,
 }
 
 impl std::fmt::Display for CancelReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CancelReason::Timeout => write!(f, "timeout"),
-            CancelReason::ClientDisconnected => write!(f, "client disconnected"),
         }
     }
 }
