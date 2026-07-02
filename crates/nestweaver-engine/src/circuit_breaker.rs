@@ -69,12 +69,12 @@ impl HostState {
             .retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
         self.failures.push(now);
 
-        // Any transition INTO open must (re)stamp `opened_at` unconditionally so
-        // the cooldown timer restarts. This covers two cases:
-        //   * a failed half-open probe (opened_at is already Some) — re-open and
-        //     re-arm, otherwise the breaker would stay half-open forever and a
-        //     dead host would be hammered on every attempt;
-        //   * a closed circuit crossing the failure threshold.
+        // Any failure while `opened_at` is already set re-arms the cooldown
+        // timer by re-stamping it unconditionally. This covers a failed
+        // half-open probe (opened_at is Some, cooldown elapsed) — re-open and
+        // re-arm, otherwise the breaker would stay half-open forever and a dead
+        // host would be hammered on every attempt. Otherwise, a closed circuit
+        // crossing the failure threshold opens for the first time.
         let reopening = self.opened_at.is_some();
         if reopening || self.failures.len() >= FAILURE_THRESHOLD {
             self.opened_at = Some(now);
@@ -201,15 +201,47 @@ impl RemoteCircuitBreakers {
             return Err(CircuitBreakerError::CircuitOpen(host.to_string()));
         }
 
+        // If `f()` unwinds (e.g. a panic inside the git fetch running under
+        // `spawn_blocking`), neither arm below runs. The guard releases the
+        // reserved probe permit on the unwind path by routing the panic through
+        // `record_failure` — matching the Err arm (re-open + re-arm cooldown) so
+        // the host can be probed again. It is disarmed before the normal
+        // Ok/Err arms so those paths are unaffected.
+        let mut guard = ProbeGuard {
+            cb: self,
+            host,
+            armed: true,
+        };
+
         match f() {
             Ok(val) => {
+                guard.armed = false;
                 self.record_success(host);
                 Ok(val)
             }
             Err(e) => {
+                guard.armed = false;
                 self.record_failure(host);
                 Err(CircuitBreakerError::Inner(e))
             }
+        }
+    }
+}
+
+/// Releases a reserved probe permit if the guarded closure unwinds. On the
+/// normal return paths it is disarmed, so only a panic triggers the release.
+struct ProbeGuard<'a> {
+    cb: &'a RemoteCircuitBreakers,
+    host: &'a str,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Treat the panic as a probe failure: re-open + re-arm the cooldown
+            // and release the `probe_in_flight` permit.
+            self.cb.record_failure(self.host);
         }
     }
 }
@@ -346,6 +378,46 @@ mod tests {
         assert_eq!(
             admitted, 1,
             "half-open must admit exactly one probe; the rest short-circuit"
+        );
+    }
+
+    #[test]
+    fn panicking_probe_does_not_jam_breaker() {
+        let cb = RemoteCircuitBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            cb.record_failure("github.com");
+        }
+
+        // Advance past the cooldown so the breaker is HALF_OPEN.
+        {
+            let mut map = cb.hosts.lock().unwrap();
+            let hs = map.get_mut("github.com").unwrap();
+            hs.opened_at = Some(Instant::now() - COOLDOWN - Duration::from_secs(1));
+        }
+        assert_eq!(cb.state("github.com"), CircuitState::HalfOpen);
+
+        // A probe that PANICS (not just returns Err) must still release the
+        // reserved permit — otherwise `probe_in_flight` stays true forever and
+        // the host can never be probed again.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cb.call::<_, (), &str>("github.com", || panic!("probe blew up"))
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the probe was expected to panic");
+
+        // The panicking probe should have re-opened + re-armed the breaker (like
+        // the Err path). Advancing past the fresh cooldown must then admit a new
+        // half-open probe — proving the permit was released, not jammed.
+        {
+            let mut map = cb.hosts.lock().unwrap();
+            let hs = map.get_mut("github.com").unwrap();
+            hs.opened_at = Some(Instant::now() - COOLDOWN - Duration::from_secs(1));
+        }
+        assert!(
+            cb.try_admit("github.com"),
+            "a fresh half-open probe must be admitted after a panicking probe"
         );
     }
 
