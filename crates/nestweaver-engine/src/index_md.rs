@@ -1163,35 +1163,16 @@ where
     // path's behaviour exactly.
     let _write_guard = acquire_write_guard()?;
 
-    // Upsert the Vault node. If the vault was already indexed, cascade-delete
-    // the old data first so re-indexing is idempotent. Done under the gate (and
-    // before the edge writes below, which MATCH the Vault node).
-    if store.lookup_vault(&v_uid).is_ok() {
-        store
-            .delete_vault_cascade(&v_uid)
-            .context("delete_vault_cascade (re-index)")?;
-    }
-    store
-        .insert_vault(&Vault {
-            uid: v_uid.clone(),
-            name: vault_name.to_string(),
-            root_path: root_str.clone(),
-            instance_id: instance_id.to_string(),
-        })
-        .context("insert_vault")?;
-
-    // Insert tag nodes outside the main transaction so that duplicate tags
-    // from earlier index runs are silently skipped rather than aborting the
-    // whole batch.
-    for tag in &all_tags {
-        if let Err(e) = store.insert_tag(tag) {
-            if e.is_duplicate() {
-                tracing::debug!("insert_tag {} skipped (already exists): {e}", tag.name);
-            } else {
-                return Err(e).context("insert_tag");
-            }
-        }
-    }
+    // Whether this vault was already indexed. If so, the atomic reindex write
+    // below cascade-deletes the old data and re-inserts the new data in a
+    // SINGLE transaction (via `bulk_vault_reindex_write`), so concurrent
+    // readers only ever observe the complete old vault or the complete new
+    // vault — never the empty intermediate that a separate delete transaction
+    // used to expose. Tag nodes are (re-)inserted inside that same transaction;
+    // the cascade delete removes this vault's old tags first, so no duplicate
+    // handling is needed (tags are vault-scoped by uid). Captured under the
+    // gate, before the write.
+    let vault_existed = store.lookup_vault(&v_uid).is_ok();
 
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
@@ -1309,7 +1290,14 @@ where
             .collect();
 
         store
-            .bulk_vault_write(
+            .bulk_vault_reindex_write(
+                &Vault {
+                    uid: v_uid.clone(),
+                    name: vault_name.to_string(),
+                    root_path: root_str.clone(),
+                    instance_id: instance_id.to_string(),
+                },
+                vault_existed,
                 &all_notes,
                 &all_headings,
                 &all_sections,
@@ -1318,13 +1306,13 @@ where
                 &note_section_refs,
                 &heading_section_refs,
                 &heading_parent_refs,
-                &[],
+                &all_tags,
                 &note_tag_refs,
                 &section_tag_refs,
                 &wl_note_refs,
                 &wl_head_refs,
             )
-            .context("bulk_vault_write")?;
+            .context("bulk_vault_reindex_write")?;
     }
 
     // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
@@ -2568,6 +2556,222 @@ sub b body
         assert!(
             store.lookup_repo(&r_uid).unwrap().is_none(),
             "no Repo SHA recorded when the gate fails"
+        );
+    }
+
+    /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a
+    /// caller can force a primary-key collision by pushing a duplicate.
+    #[cfg(test)]
+    fn atomic_test_note(v_uid: &str, i: usize) -> Note {
+        use nestweaver_schema::NoteKind;
+        Note {
+            uid: format!("note:{v_uid}:{i}"),
+            vault_uid: v_uid.to_string(),
+            file_path: format!("n{i}.md"),
+            title: format!("Note {i}"),
+            note_kind: NoteKind::General,
+            word_count: 3,
+            content_hash: format!("hash{i}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    /// T2.2: the vault reindex must fold the cascade delete and the re-insert
+    /// into ONE transaction, so a concurrent reader (a fresh connection, which
+    /// is exactly what `count_notes` opens) can never observe the empty
+    /// intermediate between the delete and the insert.
+    ///
+    /// This asserts the invariant deterministically via the transaction
+    /// boundary: a reindex whose insert phase fails midway must leave the OLD
+    /// vault fully intact — never 0 notes. With a separate-transaction delete
+    /// (the pre-fix behaviour) the delete commits before the insert runs, so a
+    /// failed insert leaves the vault empty (0 notes) → RED. With the delete
+    /// and insert sharing one transaction, the failed insert rolls the delete
+    /// back and the old vault survives → GREEN. The same single-transaction
+    /// boundary is precisely what stops a concurrent reader from ever seeing 0
+    /// during a normal (successful) reindex.
+    #[test]
+    fn vault_reindex_never_exposes_empty() {
+        let store = GraphStore::in_memory().unwrap();
+        let v_uid = "vlt:atomic";
+        let vault = Vault {
+            uid: v_uid.to_string(),
+            name: "atomic".to_string(),
+            root_path: "/tmp/atomic".to_string(),
+            instance_id: "test-instance".to_string(),
+        };
+
+        // Initial index: N notes, vault did not previously exist.
+        let n = 5usize;
+        let notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        let edges: Vec<(&str, &str)> = notes.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+        store
+            .bulk_vault_reindex_write(
+                &vault,
+                false,
+                &notes,
+                &[],
+                &[],
+                &edges,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "initial index should produce N notes"
+        );
+
+        // Reindex whose insert phase FAILS: two notes share a uid, so the second
+        // CREATE violates the Note primary key — after the cascade delete has
+        // already run inside the transaction.
+        let mut bad_notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        bad_notes.push(atomic_test_note(v_uid, 0)); // duplicate uid → PK violation
+        let bad_edges: Vec<(&str, &str)> = bad_notes
+            .iter()
+            .map(|nt| (v_uid, nt.uid.as_str()))
+            .collect();
+        let result = store.bulk_vault_reindex_write(
+            &vault,
+            true,
+            &bad_notes,
+            &[],
+            &[],
+            &bad_edges,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            result.is_err(),
+            "a duplicate note uid must fail the reindex write"
+        );
+
+        // The invariant: the failed reindex must NEVER have exposed an empty
+        // vault. The old vault must survive the aborted transaction intact.
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "failed reindex exposed an EMPTY vault: the cascade delete committed \
+             without the re-insert — delete and insert must share one transaction"
+        );
+    }
+
+    /// T2.2: a background reader polling the note count throughout a series of
+    /// full vault reindexes must never sample 0. This exercises the atomic
+    /// delete+insert under real concurrency (a separate reader connection racing
+    /// the writer's transaction), complementing the deterministic
+    /// transaction-boundary assertion above.
+    #[test]
+    fn vault_reindex_concurrent_reader_never_sees_empty() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let v_uid = "vlt:concurrent";
+        let vault = Vault {
+            uid: v_uid.to_string(),
+            name: "concurrent".to_string(),
+            root_path: "/tmp/concurrent".to_string(),
+            instance_id: "test-instance".to_string(),
+        };
+
+        let n = 8usize;
+        let seed: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        let seed_edges: Vec<(&str, &str)> =
+            seed.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+        store
+            .bulk_vault_reindex_write(
+                &vault,
+                false,
+                &seed,
+                &[],
+                &[],
+                &seed_edges,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        // Reader thread: poll the note count until told to stop, recording the
+        // minimum it ever observes.
+        let stop = Arc::new(AtomicBool::new(false));
+        let store_rd = Arc::clone(&store);
+        let stop_rd = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let mut min_seen = usize::MAX;
+            while !stop_rd.load(Ordering::Relaxed) {
+                let c = store_rd.count_notes().unwrap();
+                if c < min_seen {
+                    min_seen = c;
+                }
+            }
+            min_seen
+        });
+
+        // Writer: repeatedly reindex the whole vault (existing → cascade delete
+        // + re-insert in one transaction).
+        for _ in 0..40 {
+            let notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+            let edges: Vec<(&str, &str)> =
+                notes.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+            store
+                .bulk_vault_reindex_write(
+                    &vault,
+                    true,
+                    &notes,
+                    &[],
+                    &[],
+                    &edges,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let min_seen = reader.join().unwrap();
+        assert_ne!(
+            min_seen, 0,
+            "a concurrent reader observed an EMPTY vault mid-reindex; the cascade \
+             delete and re-insert must be atomic"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "final vault state must have all N notes"
         );
     }
 }

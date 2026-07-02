@@ -758,32 +758,146 @@ impl GraphStore {
         wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
+        Self::bulk_vault_write_on(
+            &conn,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+        )?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
 
+    /// Write all vault nodes and edges on an externally-provided transaction
+    /// connection, without opening or committing a transaction of its own.
+    /// This lets the caller fold the writes into a larger transaction (e.g.
+    /// [`Self::bulk_vault_reindex_write`], which pairs it with the cascade
+    /// delete so the two are atomic for concurrent readers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_write_on(
+        conn: &lbug::Connection<'_>,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         // Insert node tables first so edge MATCH clauses find their endpoints.
-        Self::batch_insert_notes_on(&conn, notes)?;
-        Self::batch_insert_headings_on(&conn, headings)?;
-        Self::batch_insert_sections_on(&conn, sections)?;
+        Self::batch_insert_notes_on(conn, notes)?;
+        Self::batch_insert_headings_on(conn, headings)?;
+        Self::batch_insert_sections_on(conn, sections)?;
 
         // Structural containment edges.
-        Self::batch_insert_vault_note_edges_on(&conn, vault_note_edges)?;
-        Self::batch_insert_note_heading_edges_on(&conn, note_heading_edges)?;
-        Self::batch_insert_note_section_edges_on(&conn, note_section_edges)?;
-        Self::batch_insert_heading_section_edges_on(&conn, heading_section_edges)?;
-        Self::batch_insert_heading_parent_edges_on(&conn, heading_parent_edges)?;
+        Self::batch_insert_vault_note_edges_on(conn, vault_note_edges)?;
+        Self::batch_insert_note_heading_edges_on(conn, note_heading_edges)?;
+        Self::batch_insert_note_section_edges_on(conn, note_section_edges)?;
+        Self::batch_insert_heading_section_edges_on(conn, heading_section_edges)?;
+        Self::batch_insert_heading_parent_edges_on(conn, heading_parent_edges)?;
 
         // Tags (nodes + edges). Tags may already exist from a previous index
         // run; the caller is responsible for deduplicating `tags` by uid before
         // passing them in.
-        Self::batch_insert_tags_on(&conn, tags)?;
-        Self::batch_insert_note_tag_edges_on(&conn, note_tag_edges)?;
-        Self::batch_insert_section_tag_edges_on(&conn, section_tag_edges)?;
+        Self::batch_insert_tags_on(conn, tags)?;
+        Self::batch_insert_note_tag_edges_on(conn, note_tag_edges)?;
+        Self::batch_insert_section_tag_edges_on(conn, section_tag_edges)?;
 
         // Cross-reference wikilink edges.
-        Self::batch_insert_wikilink_to_note_edges_on(&conn, wikilink_to_note_edges)?;
-        Self::batch_insert_wikilink_to_heading_edges_on(&conn, wikilink_to_heading_edges)?;
+        Self::batch_insert_wikilink_to_note_edges_on(conn, wikilink_to_note_edges)?;
+        Self::batch_insert_wikilink_to_heading_edges_on(conn, wikilink_to_heading_edges)?;
+
+        Ok(())
+    }
+
+    /// Atomically cascade-delete a vault's old data and insert the replacement
+    /// in a SINGLE transaction. This prevents concurrent readers from seeing an
+    /// empty vault between the delete and the insert — the vault-side analogue
+    /// of [`Self::bulk_reindex_write`] for code repos.
+    ///
+    /// When `vault_existed` is true the old vault is cascade-deleted first
+    /// (in the same transaction); otherwise the delete is skipped. The Vault
+    /// node is then (re-)created and all nodes/edges written. Because delete,
+    /// vault upsert, and inserts share one transaction, a reader always
+    /// observes either the complete old vault or the complete new vault — never
+    /// the empty intermediate — and any mid-write failure rolls the delete back
+    /// so the old vault survives intact. Returns the number of notes deleted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_reindex_write(
+        &self,
+        vault: &Vault,
+        vault_existed: bool,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Delete old vault data within the transaction (if it existed).
+        let deleted = if vault_existed {
+            Self::delete_vault_cascade_on(&conn, &vault.uid)?
+        } else {
+            0
+        };
+
+        // (Re-)create the Vault node before its edges MATCH it.
+        exec_params(
+            &conn,
+            "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+            vec![
+                ("uid", lbug::Value::String(vault.uid.clone())),
+                ("name", lbug::Value::String(vault.name.clone())),
+                ("rp", lbug::Value::String(vault.root_path.clone())),
+                ("iid", lbug::Value::String(vault.instance_id.clone())),
+            ],
+        )?;
+
+        // Insert replacement data in the same transaction.
+        Self::bulk_vault_write_on(
+            &conn,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+        )?;
 
         self.commit_transaction(&conn)?;
-        Ok(())
+        Ok(deleted)
     }
 
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
@@ -1784,9 +1898,25 @@ impl GraphStore {
     ///
     /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction()?;
+        let count = Self::delete_vault_cascade_on(&conn, vault_uid)?;
+        self.commit_transaction(&conn)?;
+        Ok(count)
+    }
+
+    /// Cascade-delete a vault's data using an externally-provided transaction
+    /// connection, without opening or committing a transaction of its own.
+    ///
+    /// This lets the caller fold the delete into the SAME transaction as the
+    /// re-insert (see [`Self::bulk_vault_reindex_write`]) so concurrent readers
+    /// never observe the empty intermediate between the delete and the insert.
+    /// Returns the number of notes that were present before the delete.
+    pub fn delete_vault_cascade_on(
+        conn: &lbug::Connection<'_>,
+        vault_uid: &str,
+    ) -> Result<usize, StoreError> {
         // Count notes before deletion so we can return the count.
         let count = {
-            let conn = self.conn()?;
             let mut stmt = conn
                 .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
                 .map_err(|e| StoreError::Query(format!("prepare count: {e}")))?;
@@ -1806,18 +1936,16 @@ impl GraphStore {
             .unwrap_or(0)
         };
 
-        let conn = self.begin_transaction()?;
-
         // 1. Delete all Sections under notes in this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 2. Delete all Headings under notes in this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
@@ -1849,26 +1977,25 @@ impl GraphStore {
         // 4. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
         //    PROJECT_INCLUDES_NOTE, and any incoming/outgoing wikilink edges).
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid}) DETACH DELETE n",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 5. Delete Tag nodes belonging to this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (t:Tag {vault_uid: $vid}) DETACH DELETE t",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 6. Delete the Vault node itself.
         exec_params(
-            &conn,
+            conn,
             "MATCH (v:Vault {uid: $vid}) DETACH DELETE v",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        self.commit_transaction(&conn)?;
         Ok(count)
     }
 
