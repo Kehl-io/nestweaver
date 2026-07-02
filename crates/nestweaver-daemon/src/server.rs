@@ -3589,6 +3589,21 @@ pub async fn run_server(
         )?;
     }
 
+    // A binary built WITHOUT the `acme` feature cannot provision certs. Reject
+    // --acme-domain rather than silently binding a non-loopback listener (the
+    // bind gate counts ACME as TLS) with no certificate behind it.
+    #[cfg(not(feature = "acme"))]
+    if server_opts
+        .as_ref()
+        .and_then(|o| o.acme_domain.as_ref())
+        .is_some()
+    {
+        anyhow::bail!(
+            "--acme-domain requires a binary built with `--features acme`; rebuild \
+             with that feature, or use --tls-cert/--tls-key for manual TLS instead"
+        );
+    }
+
     // Reject any present webhook secret that is too short to be safe.
     validate_webhook_secret_lengths(
         &server_opts

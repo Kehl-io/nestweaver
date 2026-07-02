@@ -1,3 +1,5 @@
+#[cfg(feature = "acme")]
+pub mod acme;
 pub mod auth;
 #[cfg(target_os = "macos")]
 pub mod launchd;
