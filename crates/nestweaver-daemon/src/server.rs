@@ -78,6 +78,11 @@ pub struct DaemonState {
     pub write_mutex: Arc<tokio::sync::Mutex<()>>,
     /// Whether this daemon is running in server mode (TCP, no local source files).
     pub server_mode: bool,
+    /// Whether this daemon serves a read-only snapshot replica. When true, all
+    /// write RPCs (index/add/remove/merge/watch) are rejected with
+    /// `FAILED_PRECONDITION` and the write machinery (worker, scheduler,
+    /// webhook) is never started.
+    pub read_only: bool,
     /// Whether the server-side worker pool is currently indexing a repo.
     pub indexing_active: Arc<AtomicBool>,
     /// The repo currently being indexed (empty string when idle).
@@ -708,6 +713,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchVaultRequest>,
     ) -> Result<Response<WatchVaultResponse>, Status> {
+        reject_if_read_only(self.state.read_only, "watch_vault")?;
         if self.state.server_mode {
             return Err(Status::unimplemented(
                 "watchers are server-managed in server mode",
@@ -840,6 +846,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchCodeRequest>,
     ) -> Result<Response<WatchCodeResponse>, Status> {
+        reject_if_read_only(self.state.read_only, "watch_code")?;
         if self.state.server_mode {
             return Err(Status::unimplemented(
                 "watchers are server-managed in server mode",
@@ -1153,6 +1160,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
+        reject_if_read_only(self.state.read_only, "index_repo")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1406,6 +1414,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
+        reject_if_read_only(self.state.read_only, "index_vault")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1648,6 +1657,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
+        reject_if_read_only(self.state.read_only, "remove_repo")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1840,6 +1850,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
+        reject_if_read_only(self.state.read_only, "merge_instance")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -3252,6 +3263,18 @@ fn is_idle(active_readwrite: u32, indexing_active: bool) -> bool {
     active_readwrite == 0 && !indexing_active
 }
 
+/// Reject a write operation when the daemon serves a read-only snapshot replica.
+/// Returns `FAILED_PRECONDITION` (a permanent condition for this daemon, not a
+/// transient error the client should retry).
+fn reject_if_read_only(read_only: bool, op: &str) -> Result<(), Status> {
+    if read_only {
+        return Err(Status::failed_precondition(format!(
+            "this daemon serves a read-only snapshot replica; {op} is not available"
+        )));
+    }
+    Ok(())
+}
+
 /// Enforce the bind-scope security invariants for a server-mode listener:
 /// a non-loopback bind must be both authenticated (`--auth-token`) and
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
@@ -3522,6 +3545,9 @@ pub async fn run_server(
 
         tantivy,
         db_path: db_path.clone(),
+        // run_server always opens read-write; snapshot replicas will use a
+        // dedicated read-only boot path that sets this true.
+        read_only: false,
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
@@ -4957,6 +4983,14 @@ mod startup_helper_tests {
                 "{ok:?} is a specific repo path and must be allowed"
             );
         }
+    }
+
+    #[test]
+    fn reject_if_read_only_blocks_writes() {
+        assert!(reject_if_read_only(false, "index_repo").is_ok());
+        let err = reject_if_read_only(true, "index_repo").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("read-only"));
     }
 
     #[test]
