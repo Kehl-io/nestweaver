@@ -1663,7 +1663,8 @@ enum DaemonAction {
 
         /// ACME (Let's Encrypt) domain — auto-provision a publicly-trusted TLS
         /// cert at runtime via TLS-ALPN-01 (opt-in; requires --server and the
-        /// `acme` build feature; the MCP listener must be reachable on :443).
+        /// `acme` build feature). TLS-ALPN-01 validates on port 443, so bind so
+        /// :443 reaches the daemon, e.g. `--bind 0.0.0.0:443`.
         #[arg(long)]
         acme_domain: Option<String>,
 
