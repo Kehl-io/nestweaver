@@ -20,7 +20,10 @@ pub fn vector_knn_all_cancellable(
     limit: usize,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<(String, f64)>, anyhow::Error> {
-    Ok(store.vector_search_cancellable(query_embedding, limit, cancel))
+    // A tripped `cancel` surfaces as `StoreError::Cancelled`, which `?` lifts
+    // into the returned `anyhow::Error` (downcastable at the cache/gRPC
+    // boundary) rather than a truncated `Ok(vec![])`.
+    Ok(store.vector_search_cancellable(query_embedding, limit, cancel)?)
 }
 
 /// Like `vector_knn_all`, but pre-filters to embeddings whose UID contains

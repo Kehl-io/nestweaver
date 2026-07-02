@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
-use crate::error::StoreError;
+use crate::error::{CancelReason, StoreError};
 use crate::ranking::SeedResolutionConfig;
 
 // ---------------------------------------------------------------------------
@@ -158,25 +158,29 @@ impl EmbeddingIndex {
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
     pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
         self.vector_search_cancellable(query_vec, limit, None)
+            .expect("vector_search with cancel=None cannot be cancelled")
     }
 
     /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
     /// query timeout or client disconnect). Once tripped, per-embedding scoring
-    /// is skipped so the parallel scan drains cheaply, and the result is empty.
-    /// `cancel = None` is byte-for-byte the original behavior.
+    /// is skipped so the parallel scan drains cheaply, then the whole call
+    /// returns `Err(StoreError::Cancelled(_))` — a cancelled computation is
+    /// *incomplete*, distinct from a legitimately empty result, so no caller
+    /// mistakes the truncated scan for a real answer (or caches it).
+    /// `cancel = None` never trips and is byte-for-byte the original behavior.
     pub fn vector_search_cancellable(
         &self,
         query_vec: &[f32],
         limit: usize,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> Vec<(String, f64)> {
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
             .sum::<f64>()
             .sqrt();
         if query_norm == 0.0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let mut scores: Vec<(String, f64)> = self
@@ -198,12 +202,16 @@ impl EmbeddingIndex {
             .collect();
 
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-            return vec![];
+            // The reason (timeout vs. disconnect) is owned by the daemon layer
+            // that trips the flag; the shared bool can't distinguish them, so
+            // the leaf reports the current-and-only trigger. The gRPC boundary
+            // re-maps by the reason it actually observed.
+            return Err(StoreError::Cancelled(CancelReason::Timeout));
         }
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(limit);
-        scores
+        Ok(scores)
     }
 
     pub fn len(&self) -> usize {
@@ -355,7 +363,7 @@ impl GraphStore {
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
-            (Some(qe), Some(idx)) => idx.vector_search_cancellable(qe, limit * 2, cancel),
+            (Some(qe), Some(idx)) => idx.vector_search_cancellable(qe, limit * 2, cancel)?,
             _ => vec![],
         };
 
@@ -448,26 +456,37 @@ mod tests {
     }
 
     #[test]
-    fn vector_search_cancellable_returns_empty_when_cancelled() {
+    fn vector_search_cancellable_uncancelled_returns_results() {
         let mut idx = EmbeddingIndex::new();
         idx.add("a", vec![1.0, 0.0, 0.0]);
         idx.add("b", vec![0.9, 0.1, 0.0]);
         idx.add("c", vec![0.0, 0.0, 1.0]);
 
         // Not cancelled → normal results.
-        let live = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, None);
+        let live = idx
+            .vector_search_cancellable(&[1.0, 0.0, 0.0], 3, None)
+            .expect("an uncancelled search cannot be cancelled");
         assert!(
             !live.is_empty(),
             "an uncancelled vector search returns results"
         );
+    }
 
-        // Pre-cancelled → empty (per-embedding scoring skipped; parallel scan
-        // drains cheaply and the result is empty).
+    #[test]
+    fn vector_search_cancellable_returns_err_not_empty_on_cancel() {
+        let mut idx = EmbeddingIndex::new();
+        idx.add("a", vec![1.0, 0.0, 0.0]);
+        idx.add("b", vec![0.9, 0.1, 0.0]);
+        idx.add("c", vec![0.0, 0.0, 1.0]);
+
+        // Pre-cancelled over a NON-empty candidate set: a cancelled computation
+        // is incomplete, not empty — it must surface as a distinct error so no
+        // caller mistakes the truncated scan for a legitimate empty result.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let cancelled = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, Some(&cancel));
+        let res = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, Some(&cancel));
         assert!(
-            cancelled.is_empty(),
-            "a cancelled vector search must return no results"
+            matches!(res, Err(StoreError::Cancelled(_))),
+            "a cancelled vector search must return Err(Cancelled), got {res:?}"
         );
     }
 

@@ -11,7 +11,7 @@ pub mod traverse;
 pub mod write;
 
 pub use db::GraphStore;
-pub use error::StoreError;
+pub use error::{CancelReason, StoreError};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
 /// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants
