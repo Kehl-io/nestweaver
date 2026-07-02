@@ -1660,6 +1660,22 @@ enum DaemonAction {
         /// (requires --server; write RPCs and background indexing are disabled).
         #[arg(long)]
         snapshot: Option<PathBuf>,
+
+        /// ACME (Let's Encrypt) domain — auto-provision a publicly-trusted TLS
+        /// cert at runtime via TLS-ALPN-01 (opt-in; requires --server and the
+        /// `acme` build feature; the MCP listener must be reachable on :443).
+        #[arg(long)]
+        acme_domain: Option<String>,
+
+        /// Contact email for the ACME account (recommended for expiry notices).
+        #[arg(long)]
+        acme_email: Option<String>,
+
+        /// Use the Let's Encrypt PRODUCTION directory. Default is STAGING
+        /// (untrusted certs, high rate limits) to avoid rate-limit bans during
+        /// setup; pass this only once issuance works end-to-end.
+        #[arg(long)]
+        acme_production: bool,
     },
     /// Stop and restart the daemon
     Restart {
@@ -7742,10 +7758,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret_old,
                     config,
                     snapshot,
+                    acme_domain,
+                    acme_email,
+                    acme_production,
                 } => {
                     if snapshot.is_some() && !server {
                         anyhow::bail!(
                             "--snapshot requires --server (a replica serves reads over TCP)"
+                        );
+                    }
+                    if acme_domain.is_some() && !server {
+                        anyhow::bail!(
+                            "--acme-domain requires --server (TLS is for the TCP listener)"
                         );
                     }
                     if !server {
@@ -7779,6 +7803,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             webhook_secret_old,
                             admin_token,
                             snapshot: snapshot.clone(),
+                            acme_domain: acme_domain.clone(),
+                            acme_email: acme_email.clone(),
+                            acme_staging: !acme_production,
                         })
                     } else {
                         None

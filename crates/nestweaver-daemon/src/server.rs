@@ -3166,6 +3166,17 @@ pub struct ServerOpts {
     /// directory into a private working copy, open it read-only, reject write
     /// RPCs, and never start the write machinery (flock/worker/scheduler/webhook).
     pub snapshot: Option<PathBuf>,
+    /// ACME (Let's Encrypt) domain. When set, TLS is auto-provisioned at runtime
+    /// via TLS-ALPN-01 (opt-in; default off). Counts as TLS for the non-loopback
+    /// bind gate. Requires the `acme` build feature to actually provision.
+    pub acme_domain: Option<String>,
+    /// Contact email for the ACME account (optional, recommended for expiry
+    /// notifications).
+    pub acme_email: Option<String>,
+    /// Use the Let's Encrypt STAGING directory (untrusted certs, high rate
+    /// limits). Defaults to true — production issuance is an explicit opt-in to
+    /// avoid rate-limit bans during setup / on a launchd respawn loop.
+    pub acme_staging: bool,
 }
 
 /// Minimum byte length for auth/admin tokens supplied via [`ServerOpts`].
@@ -3289,8 +3300,11 @@ fn validate_bind_security(
     auth_token: &Option<String>,
     tls_cert: &Option<PathBuf>,
     tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
 ) -> anyhow::Result<()> {
-    let tls_enabled = tls_cert.is_some() && tls_key.is_some();
+    // ACME (Let's Encrypt) provisions a publicly-trusted cert at runtime, so an
+    // ACME-enabled bind is encrypted even without a static --tls-cert/--tls-key.
+    let tls_enabled = (tls_cert.is_some() && tls_key.is_some()) || acme_enabled;
     match bind_addr.parse::<std::net::SocketAddr>() {
         Ok(addr) if addr.ip().is_loopback() => { /* safe — loopback is process-local */ }
         Ok(addr) => {
@@ -3571,6 +3585,7 @@ pub async fn run_server(
             &opts.auth_token,
             &opts.tls_cert,
             &opts.tls_key,
+            opts.acme_domain.is_some(),
         )?;
     }
 
@@ -5055,11 +5070,11 @@ mod startup_helper_tests {
 
         // Non-loopback bind with an auth token but NO TLS must be rejected:
         // bearer tokens and source would travel in cleartext.
-        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None).is_err());
-        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &None).is_err());
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None, false).is_err());
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &None, false).is_err());
 
         // Non-loopback bind with auth token AND TLS is acceptable.
-        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key).is_ok());
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key, false).is_ok());
     }
 
     #[test]
@@ -5067,14 +5082,24 @@ mod startup_helper_tests {
         let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
         let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
         // Preserves the pre-existing invariant: non-loopback requires auth even with TLS.
-        assert!(validate_bind_security("0.0.0.0:9378", &None, &cert, &key).is_err());
+        assert!(validate_bind_security("0.0.0.0:9378", &None, &cert, &key, false).is_err());
+    }
+
+    #[test]
+    fn validate_bind_security_treats_acme_as_tls() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        // ACME provisions a trusted cert at runtime, so a non-loopback bind with
+        // a token and ACME enabled — but no static --tls-cert/--tls-key — is OK.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None, true).is_ok());
+        // ...but ACME does not waive the auth requirement.
+        assert!(validate_bind_security("0.0.0.0:9378", &None, &None, &None, true).is_err());
     }
 
     #[test]
     fn validate_bind_security_allows_loopback_plaintext() {
         // Loopback is process-local; no auth/TLS required (the fast local path).
-        assert!(validate_bind_security("127.0.0.1:9378", &None, &None, &None).is_ok());
-        assert!(validate_bind_security("[::1]:9378", &None, &None, &None).is_ok());
+        assert!(validate_bind_security("127.0.0.1:9378", &None, &None, &None, false).is_ok());
+        assert!(validate_bind_security("[::1]:9378", &None, &None, &None, false).is_ok());
     }
 
     #[test]
