@@ -455,9 +455,29 @@ impl DaemonService {
         result
     }
 
-    /// Build an `on_change` callback that queues un-embedded nodes for
-    /// background embedding after every watcher batch.  Returns `None`
-    /// when the `embed` feature is disabled or the model is not yet loaded.
+    /// Build an `on_change` callback that embeds un-embedded nodes after every
+    /// watcher batch.  Returns `None` when the `embed` feature is disabled or
+    /// the model is not yet loaded.
+    ///
+    /// The embed writes run **inline** on the watcher thread. That thread holds
+    /// `write_mutex` + a `ConnectionGuard::write` for the watcher's whole run
+    /// (see `watch_vault`/`watch_code` wiring) and invokes this callback within
+    /// that hold, so executing the `add_embedding`/`flush_embedding_index`
+    /// writes here keeps them under the same write gate every other daemon
+    /// mutation uses:
+    ///  - **backup-safe:** the write runs while the watcher holds `write_mutex`,
+    ///    so a backup's `.embeddings` sidecar copy (which also takes
+    ///    `write_mutex` in `stage_backup_from_store`) cannot run concurrently,
+    ///    and no detached task outlives the lock to race the copy;
+    ///  - **drain-visible:** the write completes before the watcher thread drops
+    ///    its `ConnectionGuard::write`, so `active_writes` stays > 0 until the
+    ///    embed finishes and the shutdown drain waits for it.
+    ///
+    /// It must NOT be moved to a detached `spawn_blocking` task: that escapes
+    /// both guarantees. It also must NOT re-acquire `write_mutex` itself — the
+    /// watcher thread already holds it for the whole run, so a fresh
+    /// `blocking_lock()` here would deadlock. Inheriting the existing hold is
+    /// the correct single-writer discipline.
     #[cfg(feature = "embed")]
     fn make_embed_on_change(
         embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
@@ -465,96 +485,90 @@ impl DaemonService {
     ) -> Option<Box<dyn Fn() + Send>> {
         Some(Box::new(move || {
             // Peek at the model without blocking async code — we are already
-            // in a blocking thread (inside spawn_blocking).
+            // in a blocking thread (the watcher thread, inside spawn_blocking).
             let model = {
                 let guard = embed_model.blocking_read();
                 guard.clone()
             };
             let Some(model) = model else { return };
 
-            let store = store.clone();
-            // Fire-and-forget a new blocking task so the watcher callback
-            // returns quickly and the watcher loop is not stalled.
-            drop(tokio::task::spawn_blocking(move || {
-                let mut embedded = 0u32;
-                let limit: usize = 64; // Max nodes per watcher cycle
+            let mut embedded = 0u32;
+            let limit: usize = 64; // Max nodes per watcher cycle
 
-                // Symbols
-                if let Ok(symbols) = store.list_all_symbols() {
-                    for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
-                        let text = nestweaver_embed::preprocess::symbol_embed_text(
-                            &sym.kind.to_string(),
-                            &sym.name,
-                            None,
-                        );
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&sym.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
-                            }
+            // Symbols
+            if let Ok(symbols) = store.list_all_symbols() {
+                for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                    let text = nestweaver_embed::preprocess::symbol_embed_text(
+                        &sym.kind.to_string(),
+                        &sym.name,
+                        None,
+                    );
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&sym.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(embedded as usize);
 
-                // Notes
-                if remaining > 0
-                    && let Ok(notes) = store.list_notes(None)
+            // Notes
+            if remaining > 0
+                && let Ok(notes) = store.list_notes(None)
+            {
+                for note in notes
+                    .iter()
+                    .filter(|n| n.embedding.is_none())
+                    .take(remaining)
                 {
-                    for note in notes
-                        .iter()
-                        .filter(|n| n.embedding.is_none())
-                        .take(remaining)
-                    {
-                        let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&note.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %note.uid, "embedding failed: {e}");
-                            }
+                    let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&note.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %note.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(embedded as usize);
 
-                // Headings
-                if remaining > 0
-                    && let Ok(headings) = store.list_all_headings()
+            // Headings
+            if remaining > 0
+                && let Ok(headings) = store.list_all_headings()
+            {
+                for heading in headings
+                    .iter()
+                    .filter(|h| h.embedding.is_none())
+                    .take(remaining)
                 {
-                    for heading in headings
-                        .iter()
-                        .filter(|h| h.embedding.is_none())
-                        .take(remaining)
-                    {
-                        let text =
-                            nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&heading.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
-                            }
+                    let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&heading.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                if embedded > 0 {
-                    if let Err(e) = store.flush_embedding_index() {
-                        tracing::warn!("failed to flush embedding index: {e}");
-                    }
-                    tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            if embedded > 0 {
+                if let Err(e) = store.flush_embedding_index() {
+                    tracing::warn!("failed to flush embedding index: {e}");
                 }
-            }));
+                tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            }
         }))
     }
 
@@ -5331,5 +5345,130 @@ mod startup_helper_tests {
 
         let code_key = nestweaver_engine::jobs::canonical_repo_id(code_url);
         assert_eq!(map.get(&code_key), Some(&RepoType::Code));
+    }
+
+    /// A `nestweaver_engine::EmbedQueryFn` that probes the write gate from
+    /// *inside* `embed_query` — the moment the embed write actually executes.
+    /// It records whether `write_mutex` is held and the value of `active_writes`
+    /// at that instant, so a test can assert the embed write ran under the same
+    /// gate every other daemon mutation uses.
+    #[cfg(feature = "embed")]
+    struct GateProbeEmbed {
+        write_mutex: Arc<tokio::sync::Mutex<()>>,
+        active_writes: Arc<AtomicU32>,
+        observed_locked: Arc<AtomicBool>,
+        observed_writes: Arc<AtomicU32>,
+        done: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    #[cfg(feature = "embed")]
+    impl nestweaver_engine::EmbedQueryFn for GateProbeEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            // Capture the gate state at the exact point the embed write runs.
+            self.observed_locked
+                .store(self.write_mutex.try_lock().is_err(), Ordering::Relaxed);
+            self.observed_writes.store(
+                self.active_writes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            if let Some(tx) = self.done.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            Ok(vec![0.1_f32, 0.2, 0.3])
+        }
+    }
+
+    /// The watcher's embed-on-change callback must perform its `add_embedding`
+    /// writes under the write gate the watcher thread holds (`write_mutex` +
+    /// `ConnectionGuard::write`), not on a detached fire-and-forget task that
+    /// escapes it. Escaping the gate (a) races a backup's sidecar copy and
+    /// (b) is invisible to the shutdown drain (`active_writes`).
+    ///
+    /// This mirrors the `watch_vault`/`watch_code` wiring (server.rs ~863-872):
+    /// the watcher thread takes `write_mutex.blocking_lock()` + a write guard
+    /// for its whole run and calls the callback inline within that hold.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_holds_write_gate() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+
+        // One un-embedded symbol so the callback reaches exactly one embed_query.
+        let sym_uid = "sym-gate-probe".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: sym_uid.clone(),
+                name: "gate_probe".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo-1".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn gate_probe()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let active_writes = Arc::new(AtomicU32::new(0));
+        let observed_locked = Arc::new(AtomicBool::new(false));
+        let observed_writes = Arc::new(AtomicU32::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let probe = Arc::new(GateProbeEmbed {
+            write_mutex: write_mutex.clone(),
+            active_writes: active_writes.clone(),
+            observed_locked: observed_locked.clone(),
+            observed_writes: observed_writes.clone(),
+            done: std::sync::Mutex::new(Some(done_tx)),
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = DaemonService::make_embed_on_change(embed_model, store.clone())
+            .expect("embed callback should be present when a model is loaded");
+
+        // Mirror the watcher thread: hold write_mutex + bump active_writes for
+        // the callback's whole run, exactly as watch_vault/watch_code do.
+        let wm = write_mutex.clone();
+        let aw = active_writes.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _write_lock = wm.blocking_lock();
+            aw.fetch_add(1, Ordering::Relaxed); // == ConnectionGuard::write
+            cb();
+            aw.fetch_sub(1, Ordering::Relaxed); // == guard drop on watcher exit
+        });
+
+        // Wait for the embed write to run (or fail the test if it never does).
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("embed_query must run for the inserted symbol");
+        handle.await.unwrap();
+
+        // The whole point: while the embed write ran, the write gate was held.
+        assert!(
+            observed_locked.load(Ordering::Relaxed),
+            "embed write must run while write_mutex is held (backup-safe)"
+        );
+        assert!(
+            observed_writes.load(Ordering::Relaxed) > 0,
+            "embed write must run while active_writes > 0 (drain-visible)"
+        );
+        // And it actually wrote the embedding.
+        assert!(
+            store.has_embedding(&sym_uid),
+            "callback should have embedded the pending symbol"
+        );
     }
 }
