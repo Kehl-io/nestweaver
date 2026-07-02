@@ -4066,9 +4066,51 @@ pub async fn run_server(
             ))
         };
 
+        // ACME auto-TLS (opt-in via --acme-domain) takes precedence over manual
+        // --tls-cert. On success both listeners share the ACME acceptor; gRPC
+        // pre-terminates TLS below since tonic's ServerTlsConfig is
+        // static-Identity only and cannot pick up runtime-renewed certs.
+        // Bootstrap is NON-FATAL: any ACME error logs and falls through — a
+        // fatal exit under launchd KeepAlive would respawn straight into a
+        // Let's Encrypt validation-failure ban.
+        #[cfg(feature = "acme")]
+        let acme_acceptor: Option<tokio_rustls::TlsAcceptor> = match opts.acme_domain {
+            Some(ref domain) => match crate::acme::build_server_config(
+                domain,
+                opts.acme_email.as_deref(),
+                opts.acme_staging,
+                lifecycle::log_dir(&instance_id).join("acme"),
+            ) {
+                Ok((server_config, acme_state)) => {
+                    // Drive provisioning + renewal forever in the background.
+                    tokio::spawn(crate::acme::drive(acme_state));
+                    tracing::info!(
+                        domain,
+                        staging = opts.acme_staging,
+                        "ACME auto-TLS enabled (TLS-ALPN-01)"
+                    );
+                    eprintln!(
+                        "[daemon] ACME auto-TLS enabled for {domain} (staging={})",
+                        opts.acme_staging
+                    );
+                    Some(tokio_rustls::TlsAcceptor::from(server_config))
+                }
+                Err(e) => {
+                    tracing::error!("ACME setup failed; continuing without it: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        #[cfg(not(feature = "acme"))]
+        let acme_acceptor: Option<tokio_rustls::TlsAcceptor> = None;
+
         // Validate TLS config BEFORE binding any ports so we don't
-        // advertise addresses that will never serve traffic.
-        let tls_config = match (&opts.tls_cert, &opts.tls_key) {
+        // advertise addresses that will never serve traffic. Yields
+        // `(Option<tonic ServerTlsConfig>, TlsAcceptor)`: the tonic config is
+        // `Some` only for the manual-cert path (gRPC uses tonic's terminator);
+        // ACME leaves it `None` (gRPC pre-terminates with the shared acceptor).
+        let manual_tls_config = match (&opts.tls_cert, &opts.tls_key) {
             (Some(cert_path), Some(key_path)) => {
                 let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -4103,12 +4145,22 @@ pub async fn run_server(
                      reverse proxy that sets X-Forwarded-For for per-IP granularity."
                 );
                 eprintln!("[daemon] TLS enabled for TCP server and MCP HTTP");
-                Some((tonic_tls, tls_acceptor))
+                Some((Some(tonic_tls), tls_acceptor))
             }
             (Some(_), None) | (None, Some(_)) => {
                 anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
             }
             (None, None) => None,
+        };
+
+        // ACME wins when enabled; otherwise use the manual-cert result.
+        let tls_config: Option<(
+            Option<tonic::transport::ServerTlsConfig>,
+            tokio_rustls::TlsAcceptor,
+        )> = if let Some(acme_acceptor) = acme_acceptor {
+            Some((None, acme_acceptor))
+        } else {
+            manual_tls_config
         };
 
         let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
@@ -4222,21 +4274,55 @@ pub async fn run_server(
 
             tokio::spawn(async move {
                 let mut builder = tonic::transport::Server::builder();
-                if let Some((tonic_tls, _)) = tls_config {
-                    builder = match builder.tls_config(tonic_tls) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!(error = %e, "TLS configuration failed at serve time");
-                            return;
-                        }
-                    };
+                let shutdown = async move {
+                    let _ = tcp_shutdown_rx.changed().await;
+                };
+                match tls_config {
+                    // Manual TLS: tonic's built-in terminator over a static cert.
+                    Some((Some(tonic_tls), _)) => {
+                        let mut builder = match builder.tls_config(tonic_tls) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!(error = %e, "TLS configuration failed at serve time");
+                                return;
+                            }
+                        };
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tcp_stream, shutdown)
+                            .await;
+                    }
+                    // ACME: pre-terminate TLS with the shared acceptor so renewed
+                    // certs are used on new handshakes (tonic's ServerTlsConfig is
+                    // static-Identity only). The ACME resolver also serves the
+                    // acme-tls/1 challenge; those handshakes complete then close.
+                    Some((None, acme_acceptor)) => {
+                        use futures::StreamExt;
+                        let tls_incoming = async_stream::stream! {
+                            let mut tcp = tcp_stream;
+                            while let Some(conn) = tcp.next().await {
+                                match conn {
+                                    Ok(tcp_conn) => match acme_acceptor.accept(tcp_conn).await {
+                                        Ok(tls) => yield Ok::<_, std::io::Error>(tls),
+                                        Err(e) => tracing::debug!("gRPC TLS handshake failed: {e}"),
+                                    },
+                                    Err(e) => tracing::debug!("gRPC TCP accept failed: {e}"),
+                                }
+                            }
+                        };
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tls_incoming, shutdown)
+                            .await;
+                    }
+                    // Plain TCP (loopback / no TLS).
+                    None => {
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tcp_stream, shutdown)
+                            .await;
+                    }
                 }
-                let _ = builder
-                    .add_service(tcp_svc)
-                    .serve_with_incoming_shutdown(tcp_stream, async move {
-                        let _ = tcp_shutdown_rx.changed().await;
-                    })
-                    .await;
             });
         }
 
