@@ -1587,6 +1587,9 @@ fn format_server_status(url: &str, status: &ServerStatusResponse) -> String {
 }
 
 #[derive(Subcommand)]
+// A CLI command enum parsed once at startup — variant size is irrelevant here,
+// and boxing clap arg fields would complicate the derive for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 enum DaemonAction {
     /// Start the daemon (usually auto-started on first use)
     Start {
@@ -1651,6 +1654,12 @@ enum DaemonAction {
         /// Path to instance.toml for server config (repos, polling, etc.)
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Boot as a read-only snapshot replica: materialize this snapshot
+        /// directory into a private working copy and serve it read-only
+        /// (requires --server; write RPCs and background indexing are disabled).
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
     },
     /// Stop and restart the daemon
     Restart {
@@ -7732,7 +7741,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret,
                     webhook_secret_old,
                     config,
+                    snapshot,
                 } => {
+                    if snapshot.is_some() && !server {
+                        anyhow::bail!(
+                            "--snapshot requires --server (a replica serves reads over TCP)"
+                        );
+                    }
                     if !server {
                         if bind != "127.0.0.1:9378" {
                             tracing::warn!("--bind is ignored when --server is false");
@@ -7763,6 +7778,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             webhook_secret,
                             webhook_secret_old,
                             admin_token,
+                            snapshot: snapshot.clone(),
                         })
                     } else {
                         None

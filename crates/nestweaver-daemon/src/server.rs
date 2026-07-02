@@ -3162,6 +3162,10 @@ pub struct ServerOpts {
     pub webhook_secret_old: Option<String>,
     /// Admin token for admin API endpoints (separate from query auth token).
     pub admin_token: Option<String>,
+    /// When set, boot as a read-only snapshot replica: materialize this snapshot
+    /// directory into a private working copy, open it read-only, reject write
+    /// RPCs, and never start the write machinery (flock/worker/scheduler/webhook).
+    pub snapshot: Option<PathBuf>,
 }
 
 /// Minimum byte length for auth/admin tokens supplied via [`ServerOpts`].
@@ -3405,17 +3409,57 @@ pub async fn run_server(
         db_path.display()
     );
 
-    // Open the graph store with write access — the daemon is the sole DB owner.
-    let store = match GraphStore::open_or_create(&db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "failed to open database with write access at {}; \
-                     another process may hold the write lock",
-                    db_path.display()
-                )
-            });
+    // Snapshot replica: materialize the snapshot into a private working copy and
+    // serve it read-only. `read_only` gates out the write RPCs (via the guards
+    // in DaemonState) and the write machinery (flock/worker/scheduler/webhook)
+    // below. Default (`snapshot: None`) keeps the read-write path unchanged.
+    let read_only = server_opts
+        .as_ref()
+        .and_then(|o| o.snapshot.as_ref())
+        .is_some();
+    let db_path = if let Some(snapshot_dir) = server_opts.as_ref().and_then(|o| o.snapshot.clone())
+    {
+        let cfg = config_path.and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
+        let (_, _, schema_hash) = nestweaver_engine::schema_hashes(cfg.as_ref());
+        let embedding_model = cfg
+            .as_ref()
+            .map(|c| c.embedding.model_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let working_dir = db_path
+            .parent()
+            .map(|p| p.join("replica-work"))
+            .unwrap_or_else(|| std::path::PathBuf::from("replica-work"));
+        tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
+        nestweaver_engine::materialize_snapshot(
+            &snapshot_dir,
+            &working_dir,
+            env!("CARGO_PKG_VERSION"),
+            &schema_hash,
+            &embedding_model,
+        )
+        .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?
+    } else {
+        db_path
+    };
+
+    // Open the graph store: read-only for a snapshot replica, read-write
+    // otherwise (the daemon is the sole DB owner).
+    let store = if read_only {
+        GraphStore::open_read_only(&db_path).with_context(|| {
+            format!("failed to open snapshot read-only at {}", db_path.display())
+        })?
+    } else {
+        match GraphStore::open_or_create(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to open database with write access at {}; \
+                         another process may hold the write lock",
+                        db_path.display()
+                    )
+                });
+            }
         }
     };
 
@@ -3545,9 +3589,7 @@ pub async fn run_server(
 
         tantivy,
         db_path: db_path.clone(),
-        // run_server always opens read-write; snapshot replicas will use a
-        // dedicated read-only boot path that sets this true.
-        read_only: false,
+        read_only,
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
@@ -4169,7 +4211,9 @@ pub async fn run_server(
         }
 
         // Spawn the worker pool to consume index jobs from the SQLite queue.
-        {
+        // Skipped for a read-only snapshot replica — it serves reads only and
+        // must never write to (or re-clone against) the snapshot.
+        if !read_only {
             let worker_store = Arc::clone(&state.store);
             let worker_db = db_path.clone();
             let worker_instance = instance_id.clone();
@@ -4236,8 +4280,9 @@ pub async fn run_server(
         }
     } // end if server_opts
 
-    // Spawn adaptive poll scheduler in server mode.
-    if server_opts.is_some() {
+    // Spawn adaptive poll scheduler in server mode. Not for a read-only replica
+    // (it would poll git remotes and enqueue index jobs against the snapshot).
+    if server_opts.is_some() && !read_only {
         let poll_store = Arc::clone(&state.store);
         let poll_instance = instance_id.clone();
         let poll_job_queue = shared_job_queue_opt.clone();
