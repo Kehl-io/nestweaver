@@ -401,6 +401,39 @@ pub fn materialize_snapshot(
     Ok(db_path)
 }
 
+/// Compute `(core, extensions, effective)` schema hashes for `cfg`. This MUST
+/// match the values a snapshot's stamp is built with so a replica's compat gate
+/// agrees — both the `snapshot build` CLI and a replica boot call this.
+pub fn schema_hashes(cfg: Option<&crate::config::InstanceConfig>) -> (String, String, String) {
+    let core = nestweaver_schema::core_schema_hash();
+    let ext = match cfg.and_then(|c| c.schema_extensions.as_ref()) {
+        Some(ext) => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(ref props) = ext.extra_node_properties {
+                let mut labels: Vec<&String> = props.keys().collect();
+                labels.sort();
+                for label in labels {
+                    let inner = &props[label];
+                    let mut keys: Vec<&String> = inner.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        parts.push(format!("{label}.{key}={}", inner[key]));
+                    }
+                }
+            }
+            let joined = parts.join("\n");
+            use sha2::Digest;
+            sha2::Sha256::digest(joined.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        }
+        None => "none".to_string(),
+    };
+    let effective = nestweaver_schema::effective_schema_hash(&core, &ext);
+    (core, ext, effective)
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

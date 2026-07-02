@@ -13159,32 +13159,10 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 }
             };
 
-            // Schema hashes
-            let core_hash = nestweaver_schema::core_schema_hash();
-            let ext_hash = match cfg.as_ref().and_then(|c| c.schema_extensions.as_ref()) {
-                Some(ext) => {
-                    // Build a deterministic string from the extensions
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(ref props) = ext.extra_node_properties {
-                        let mut labels: Vec<&String> = props.keys().collect();
-                        labels.sort();
-                        for label in labels {
-                            let inner = &props[label];
-                            let mut keys: Vec<&String> = inner.keys().collect();
-                            keys.sort();
-                            for key in keys {
-                                parts.push(format!("{label}.{key}={}", inner[key]));
-                            }
-                        }
-                    }
-                    let joined = parts.join("\n");
-                    use sha2::Digest;
-                    let hash = sha2::Sha256::digest(joined.as_bytes());
-                    hex::encode(hash)
-                }
-                None => "none".to_string(),
-            };
-            let effective_hash = nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
+            // Schema hashes — shared with the replica compat gate (see
+            // nestweaver_engine::schema_hashes) so build and load agree exactly.
+            let (core_hash, ext_hash, effective_hash) =
+                nestweaver_engine::schema_hashes(cfg.as_ref());
 
             // Embedding info — use [embedding].model_id (local sentence-transformer),
             // not [inference].embedding_model (remote Ollama model name).
