@@ -13261,6 +13261,26 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                     .join(format!("snapshot-{instance_id}"))
             });
 
+            // Quiesce guard: a snapshot is a raw copy of the graph file. If a
+            // daemon is actively writing this DB, the copy can be torn — and a
+            // torn copy still passes verify/load. Refuse unless the DB is
+            // quiesced (no live daemon). For a consistent snapshot while the
+            // daemon runs, `nestweaver server backup` copies under the daemon's
+            // write lock in-process.
+            {
+                let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+                if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile)
+                    && nestweaver_client::autostart::is_process_alive(pid)
+                {
+                    anyhow::bail!(
+                        "a daemon (pid {pid}) is running on this database — a raw snapshot \
+                         could capture a torn, inconsistent copy. Stop it with `nestweaver \
+                         daemon stop` and retry, or use `nestweaver server backup` for a \
+                         consistent in-process snapshot."
+                    );
+                }
+            }
+
             nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
 
             println!("Snapshot built successfully in {}", output_dir.display());
