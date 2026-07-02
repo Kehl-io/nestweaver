@@ -735,18 +735,15 @@ where
                 }
             } else {
                 // Server full path: the bare reader passes no filemeta cache,
-                // so the core indexer's bulk-delete currently fires for us. That
-                // is an implicit invariant, not a guarantee — make pruning of
-                // removed files explicit here so a force-push that drops files
-                // can never leave stale File/Symbol or derived nodes behind.
-                // Purge the repo's files/symbols and derived nodes before the
-                // full re-index. Do NOT use `delete_repo_all_data`: it drops the
-                // Repo node, and the full path passes `name=None`, which would
-                // discard a display-name override on re-insert.
-                if !indexed_sha.is_empty() {
-                    let _ = store.bulk_delete_repo_files_and_symbols(&r_uid);
-                    let _ = store.clear_repo_derived_nodes(&r_uid);
-                }
+                // so every present file is (re)parsed and `files_unchanged == 0`.
+                // On a re-index of an existing repo that makes `force_reindex`
+                // true inside the core indexer, which routes the whole-repo
+                // delete+insert (including pruning files dropped by a force-push)
+                // through `bulk_reindex_write` — a single transaction acquired
+                // only after the write gate. Do NOT pre-delete here: an ungated,
+                // self-committing delete before the parse phase re-opens the
+                // empty-repo window (a concurrent reader or Backup RPC would see
+                // zero symbols for the whole scan+parse span).
                 crate::index_with_reader_and_write_gate(
                     &reader,
                     store,
@@ -1818,6 +1815,189 @@ mod tests {
         assert!(
             tracker.needs_full_reindex("repo-c", 100),
             "persisted old last_full should fire the time backstop after restart"
+        );
+    }
+
+    /// T1.1: a full (force) re-index must never expose an empty repo to a
+    /// concurrent reader. The old code ran an ungated, self-committing
+    /// `bulk_delete_repo_files_and_symbols` BEFORE the parse phase, so any
+    /// reader (e.g. the MCP server or a Backup RPC) that sampled the repo
+    /// during the scan+parse window saw zero symbols. The atomic delete+insert
+    /// now lives entirely inside `bulk_reindex_write`, which only runs after
+    /// the write gate is acquired.
+    ///
+    /// We make the race deterministic: the re-index runs on a background
+    /// thread whose write-gate closure parks at the gate until the main thread
+    /// has sampled the repo's symbol count. Under the old code the pre-delete
+    /// had already committed by the time the gate closure fires, so the sample
+    /// observed 0.
+    #[test]
+    fn full_reindex_never_exposes_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                (
+                    "a.rs",
+                    "pub fn a_one() -> i32 { 1 }\npub fn a_two() -> i32 { 2 }\n",
+                ),
+                ("b.rs", "pub fn b_one() -> i32 { 1 }\n"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        let instance_id = "test-instance";
+        let job = make_code_job(1, "atomic-repo", &url);
+
+        // Initial full index → N symbols.
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_decision(&first, &store, instance_id, false, || {
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+        let n_before = store.count_symbols().unwrap();
+        assert!(n_before > 0, "initial index should produce symbols");
+
+        // Advance the SHA so the forced re-index has real parse work to do.
+        commit_file(&src, "c.rs", "pub fn c_one() -> i32 { 3 }\n", "add c");
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated code repo should be prepared");
+
+        // Coordinate the reindex thread's write gate with the main thread's
+        // sample so the observation is deterministic, not timing-dependent.
+        let (at_gate_tx, at_gate_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store_bg = Arc::clone(&store);
+        let instance_bg = instance_id.to_string();
+        let handle = std::thread::spawn(move || {
+            commit_prepared_job_with_reindex_decision(
+                &second,
+                &store_bg,
+                &instance_bg,
+                true, // force full reindex
+                move || {
+                    // Reached the write gate: signal the main thread, then park
+                    // so it can read the repo mid-reindex before any delete.
+                    at_gate_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
+            .unwrap();
+        });
+
+        // Sample the repo the instant the reindex thread is parked at the gate.
+        at_gate_rx.recv().unwrap();
+        let mid = store.count_symbols().unwrap();
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        let n_after = store.count_symbols().unwrap();
+
+        assert_ne!(
+            mid, 0,
+            "full reindex exposed an EMPTY repo to a concurrent reader \
+             (before={n_before}, after={n_after})"
+        );
+        assert!(
+            mid == n_before || mid == n_after,
+            "concurrent reader saw {mid} symbols mid-reindex; must be the old \
+             count ({n_before}) or the new count ({n_after}), never a torn state"
+        );
+    }
+
+    /// T1.1: the forced full-reindex path must prune File/Symbol nodes for a
+    /// file that was removed since the last index (e.g. a force-push that drops
+    /// a file). This proves `bulk_reindex_write`'s whole-repo delete+insert
+    /// still covers the deletion the removed pre-delete block used to do.
+    #[test]
+    fn full_reindex_prunes_removed_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("keep_a.rs", "pub fn keep_a() -> i32 { 1 }\n"),
+                ("keep_b.rs", "pub fn keep_b() -> i32 { 2 }\n"),
+                ("gone.rs", "pub fn gone_fn() -> i32 { 3 }\n"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+        let job = make_code_job(1, "prune-repo", &url);
+
+        // Initial full index of all three files.
+        let first = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("initial code index should be prepared");
+        commit_prepared_job_with_reindex_decision(&first, &store, instance_id, false, || {
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+        assert!(
+            store
+                .find_symbol_by_name_and_file("gone_fn", "gone.rs")
+                .unwrap()
+                .is_some(),
+            "gone_fn should exist after the initial index"
+        );
+
+        // Remove gone.rs and commit the deletion so the SHA advances.
+        std::fs::remove_file(src.join("gone.rs")).unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "remove gone.rs"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        let second = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("updated code repo should be prepared");
+        commit_prepared_job_with_reindex_decision(
+            &second,
+            &store,
+            instance_id,
+            true, // force full reindex
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .find_symbol_by_name_and_file("gone_fn", "gone.rs")
+                .unwrap()
+                .is_none(),
+            "full reindex must prune symbols from a file removed since the last index"
+        );
+        // The surviving files must still be present.
+        assert!(
+            store
+                .find_symbol_by_name_and_file("keep_a", "keep_a.rs")
+                .unwrap()
+                .is_some(),
+            "keep_a should survive the full reindex"
+        );
+        assert!(
+            store
+                .find_symbol_by_name_and_file("keep_b", "keep_b.rs")
+                .unwrap()
+                .is_some(),
+            "keep_b should survive the full reindex"
         );
     }
 }
