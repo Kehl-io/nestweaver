@@ -444,13 +444,21 @@ impl ContentReader for GitBareReader {
     }
 
     fn list_files(&self) -> Result<Vec<PathBuf>> {
+        // `-z` yields NUL-terminated records with paths emitted verbatim (git's
+        // `core.quotePath` C-quoting is disabled for `-z`), so non-ASCII paths
+        // (`café.md`, CJK names) survive intact instead of arriving as
+        // `"caf\303\251.md"` — which would never match a later cat-file spec and
+        // silently drop the file. Dropping `--name-only` keeps the mode field so
+        // we can skip symlink (120000) and gitlink/submodule (160000) entries,
+        // mirroring `FilesystemReader`'s `follow_links(false)`; otherwise a
+        // symlink's target-path text would be indexed as file content.
         let output = Command::new("git")
             .args([
                 "-C",
                 &self.bare_path.display().to_string(),
                 "ls-tree",
                 "-r",
-                "--name-only",
+                "-z",
                 &self.sha,
             ])
             .output()
@@ -461,13 +469,29 @@ impl ContentReader for GitBareReader {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let text = String::from_utf8(output.stdout).context("non-utf8 ls-tree output")?;
-        let files: Vec<PathBuf> = text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| !crate::index::path_in_skip_dir(p))
-            .collect();
+        // Each NUL-terminated record is `<mode> <type> <object>\t<path>`.
+        let mut files = Vec::new();
+        for record in output.stdout.split(|&b| b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let meta = &record[..tab];
+            let path_bytes = &record[tab + 1..];
+            // Mode is the first space-delimited field of the metadata.
+            let mode = meta.split(|&b| b == b' ').next().unwrap_or(&[]);
+            if mode == b"120000" || mode == b"160000" {
+                // Skip symlinks and gitlinks/submodules — neither is file content.
+                continue;
+            }
+            let path = PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned());
+            if crate::index::path_in_skip_dir(&path) {
+                continue;
+            }
+            files.push(path);
+        }
         Ok(files)
     }
 
@@ -879,6 +903,129 @@ mod tests {
         );
         // A missing path must error rather than return empty content.
         assert!(reader.read_file_via_show(Path::new("absent.txt")).is_err());
+    }
+
+    // ---------- T6.1: non-ASCII paths, symlinks, gitlinks ----------
+
+    /// Files with accented / CJK names must be listed with their real paths and
+    /// be readable — not returned as git's C-quoted `"caf\303\251.md"` form,
+    /// which never matches a cat-file spec and silently drops the file.
+    #[test]
+    fn git_bare_reader_lists_non_ascii_paths() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("café.md", "accented content"),
+            ("日本語.md", "cjk content"),
+            ("plain.md", "ascii"),
+        ]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let files = reader.list_files().unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"café.md".to_string()),
+            "accented path missing/quoted: {names:?}"
+        );
+        assert!(
+            names.contains(&"日本語.md".to_string()),
+            "CJK path missing/quoted: {names:?}"
+        );
+        // The real (unquoted) path must be readable via cat-file.
+        assert_eq!(
+            reader.read_file(Path::new("café.md")).unwrap(),
+            "accented content"
+        );
+        assert_eq!(
+            reader.read_file(Path::new("日本語.md")).unwrap(),
+            "cjk content"
+        );
+    }
+
+    /// Symlink (mode 120000) and gitlink/submodule (mode 160000) tree entries
+    /// must be skipped by `list_files` — a symlink's target-path text is not file
+    /// content, and a gitlink has no blob to read. Mirrors `FilesystemReader`'s
+    /// `follow_links(false)`.
+    #[cfg(unix)]
+    #[test]
+    fn git_bare_reader_skips_symlinks_and_gitlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src_repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+
+        std::fs::write(src.join("real.txt"), "real content").unwrap();
+        symlink("real.txt", src.join("link.txt")).unwrap();
+        git(&["add", "real.txt", "link.txt"]);
+        git(&["commit", "-m", "init"]);
+
+        // Register a gitlink (mode 160000) pointing at the commit we just made.
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},submod"),
+        ]);
+        git(&["commit", "-m", "add gitlink"]);
+
+        let bare = tmp.path().join("repo.git");
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let reader = GitBareReader::new(&bare, &sha);
+        let names: Vec<String> = reader
+            .list_files()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"real.txt".to_string()),
+            "regular file must still be listed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"link.txt".to_string()),
+            "symlink must be skipped: {names:?}"
+        );
+        assert!(
+            !names.contains(&"submod".to_string()),
+            "gitlink/submodule must be skipped: {names:?}"
+        );
     }
 
     // ---------- FIX 2: oversized blob cap on bare clones ----------
