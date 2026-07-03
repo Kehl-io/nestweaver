@@ -4531,6 +4531,48 @@ pub async fn run_server(
                 .worker_handle
                 .lock()
                 .expect("worker_handle mutex poisoned") = Some(worker_handle);
+
+            // T4.2: continuous lease reaper. The once-at-startup recover_stale
+            // above only rescues jobs stale for >30min; a daemon crash seconds
+            // into an index leaves a `running` row that recover_stale never
+            // sees on restart, so the repo is never re-indexed. This periodic
+            // tick reclaims any job whose per-claim lease has expired, closing
+            // that gap. `reap_expired_leases` takes an explicit `now` so the
+            // SQL is unit-tested without sleeps.
+            const REAPER_INTERVAL_SECS: u64 = 60;
+            let reaper_queue = std::sync::Arc::clone(&shared_job_queue);
+            let mut reaper_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(REAPER_INTERVAL_SECS));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let reclaimed = match reaper_queue.lock() {
+                                Ok(guard) => guard.reap_expired_leases(now),
+                                Err(_) => {
+                                    tracing::error!("lease reaper: job queue mutex poisoned");
+                                    Ok(0)
+                                }
+                            };
+                            match reclaimed {
+                                Ok(n) if n > 0 => tracing::warn!(
+                                    reclaimed = n,
+                                    "lease reaper reclaimed expired in-flight jobs"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::error!("lease reaper: {e}"),
+                            }
+                        }
+                        _ = reaper_shutdown.changed() => break,
+                    }
+                }
+            });
         }
     } // end if server_opts
 

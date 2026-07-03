@@ -480,6 +480,55 @@ impl JobQueue {
         Ok(count)
     }
 
+    /// Continuous lease reaper (T4.2). Reclaims any `running` job whose lease
+    /// (`lease_expires_at`, stamped at claim) has elapsed as of `now` (Unix
+    /// epoch seconds). Unlike [`Self::recover_stale`] — which runs once at
+    /// startup against a fixed 30-min `started_at` threshold and therefore
+    /// misses a crash seconds into a job — this is meant to run on a periodic
+    /// tick, so a job orphaned by a crash is reclaimed within one reaper
+    /// interval regardless of how young it is.
+    ///
+    /// Retries are bounded: a job that has already burned its attempts
+    /// (`attempt >= max_attempts`) is dead-lettered instead of returned to
+    /// pending, so a repeatedly-crashing worker cannot loop forever.
+    ///
+    /// `now` is passed in explicitly so the reaper is unit-testable without
+    /// real sleeps. Only rows with a non-NULL `lease_expires_at` are eligible;
+    /// legacy migrated `running` rows (NULL lease) are left to `recover_stale`.
+    ///
+    /// Heartbeat vs. longer base timeout: the worker's index runs inside an
+    /// un-cancellable `spawn_blocking` with no natural progress point to extend
+    /// the lease from, so rather than thread a heartbeat through the index loop
+    /// we set the base lease ([`DEFAULT_LEASE_SECS`]) comfortably longer than a
+    /// normal index but still bounded, and rely on this reaper. The tradeoff: a
+    /// genuinely long (> lease) index could be falsely reclaimed and re-run;
+    /// the lease is sized so that is rare, and a re-run is idempotent (SHA
+    /// comparison short-circuits an unchanged repo).
+    pub fn reap_expired_leases(&self, now: i64) -> Result<usize, rusqlite::Error> {
+        let count = self.conn.execute(
+            "UPDATE index_jobs
+             SET status       = CASE WHEN attempt >= max_attempts
+                                     THEN 'dead_letter' ELSE 'pending' END,
+                 error_msg    = CASE WHEN attempt >= max_attempts
+                                     THEN 'lease expired: max attempts exceeded'
+                                     ELSE error_msg END,
+                 completed_at = CASE WHEN attempt >= max_attempts
+                                     THEN strftime('%s','now') ELSE completed_at END,
+                 -- Keep started_at for a dead-letter (preserves duration
+                 -- metrics); clear it for a pending re-claim.
+                 started_at   = CASE WHEN attempt >= max_attempts
+                                     THEN started_at ELSE NULL END,
+                 claimed_by       = NULL,
+                 lease_expires_at = NULL,
+                 updated_at   = strftime('%s','now')
+             WHERE status = 'running'
+               AND lease_expires_at IS NOT NULL
+               AND CAST(lease_expires_at AS INTEGER) < ?1",
+            params![now],
+        )?;
+        Ok(count)
+    }
+
     /// Return current queue depth by status.
     pub fn queue_depth(&self) -> Result<QueueDepth, rusqlite::Error> {
         let mut depth = QueueDepth::default();
@@ -929,6 +978,90 @@ mod tests {
             "poison should dead-letter immediately"
         );
         assert_eq!(depth.pending, 0);
+    }
+
+    /// Read the lease_expires_at stamped on a job by claim_next.
+    #[cfg(test)]
+    fn lease_of(q: &JobQueue, job_id: i64) -> i64 {
+        q.conn
+            .query_row(
+                "SELECT lease_expires_at FROM index_jobs WHERE id = ?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn crashed_job_under_stale_threshold_is_reclaimed() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        // Claim stamps a lease. This simulates a worker that grabbed the job
+        // moments ago (well under the 30-min recover_stale threshold) and then
+        // the daemon crashed.
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        let lease = lease_of(&q, job.id);
+
+        // A reaper tick BEFORE the lease expires must NOT reclaim the job —
+        // this proves the mechanism is lease-based, not a fixed 30-min path.
+        let reclaimed = q.reap_expired_leases(lease - 1).unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "a job with a still-valid lease is not reclaimed"
+        );
+        assert_eq!(q.queue_depth().unwrap().running, 1);
+
+        // A reaper tick AFTER the lease expires reclaims it to pending, even
+        // though started_at is far younger than recover_stale's threshold.
+        let reclaimed = q.reap_expired_leases(lease + 1).unwrap();
+        assert_eq!(reclaimed, 1, "an expired-lease job must be reclaimed");
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(depth.pending, 1, "reclaimed job returns to pending");
+        assert_eq!(depth.running, 0);
+
+        // It is re-claimable and the fencing token is freshly minted.
+        let reclaimed_job = q.claim_next(0).unwrap().unwrap();
+        assert_ne!(
+            reclaimed_job.claimed_by, job.claimed_by,
+            "re-claim must mint a new fencing token, invalidating the crashed worker"
+        );
+    }
+
+    #[test]
+    fn reaper_dead_letters_after_max_attempts() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        // Exhaust attempts: claim increments attempt each time; reap returns it
+        // to pending until attempt reaches max_attempts, then dead-letters it.
+        let mut last = q.claim_next(0).unwrap().unwrap();
+        loop {
+            let lease = lease_of(&q, last.id);
+            q.reap_expired_leases(lease + 1).unwrap();
+            let depth = q.queue_depth().unwrap();
+            if depth.dead_letter == 1 {
+                break;
+            }
+            assert_eq!(depth.pending, 1, "still retrying while attempts remain");
+            last = q.claim_next(0).unwrap().unwrap();
+            assert!(
+                last.attempt <= last.max_attempts,
+                "attempt must not exceed max before dead-lettering"
+            );
+        }
+        assert_eq!(q.queue_depth().unwrap().dead_letter, 1);
     }
 
     #[test]
