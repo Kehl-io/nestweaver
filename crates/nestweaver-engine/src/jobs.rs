@@ -18,6 +18,14 @@ const REINDEX_STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS reindex_state (
     last_full_unix INTEGER
 );";
 
+/// Default lease (visibility timeout) applied when a job is claimed, in
+/// seconds. A `running` job whose `lease_expires_at` falls before "now" is
+/// reclaimed by the continuous reaper ([`JobQueue::reap_expired_leases`]).
+///
+/// Chosen comfortably longer than a normal index but still bounded — see the
+/// heartbeat-vs-longer-timeout tradeoff documented on `reap_expired_leases`.
+const DEFAULT_LEASE_SECS: i64 = 1800;
+
 /// What triggered this indexing job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobTrigger {
@@ -100,6 +108,11 @@ pub struct IndexJob {
     pub max_attempts: i32,
     pub error_msg: Option<String>,
     pub branch: Option<String>,
+    /// Per-claim fencing token stamped by [`JobQueue::claim_next`]. `complete`
+    /// and `fail` are CAS-guarded on this value so a stale worker whose lease
+    /// was reclaimed cannot mutate a job that now belongs to someone else.
+    /// `None` for jobs that have never been claimed (or legacy migrated rows).
+    pub claimed_by: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub started_at: Option<i64>,
@@ -158,6 +171,8 @@ impl JobQueue {
                 error_msg    TEXT,
                 branch       TEXT,
                 requeue_needed INTEGER NOT NULL DEFAULT 0,
+                claimed_by   TEXT,
+                lease_expires_at INTEGER,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -170,6 +185,12 @@ impl JobQueue {
         let _ = conn.execute_batch(
             "ALTER TABLE index_jobs ADD COLUMN requeue_needed INTEGER NOT NULL DEFAULT 0;",
         );
+        // T4.1/T4.2: per-claim fencing token + lease visibility timeout. Both
+        // nullable so migrating an existing queue never loses in-flight rows —
+        // legacy `running` rows simply have NULL lease/owner and are handled by
+        // the once-at-startup `recover_stale` fallback until re-claimed.
+        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN claimed_by TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN lease_expires_at INTEGER;");
         // Persisted periodic-full reindex state (one row per repo). Lives in
         // the same DB as the job queue so it shares the daemon's lifecycle and
         // survives restarts — the in-memory `ReindexTracker` is only a cache.
@@ -199,6 +220,8 @@ impl JobQueue {
                 error_msg    TEXT,
                 branch       TEXT,
                 requeue_needed INTEGER NOT NULL DEFAULT 0,
+                claimed_by   TEXT,
+                lease_expires_at INTEGER,
                 created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 started_at   INTEGER,
@@ -274,6 +297,18 @@ impl JobQueue {
     /// Uses `BEGIN IMMEDIATE` so busy_timeout applies on contention.
     /// Only jobs whose `updated_at + debounce_secs <= now` are eligible.
     pub fn claim_next(&self, debounce_secs: i64) -> Result<Option<IndexJob>, rusqlite::Error> {
+        self.claim_next_with_lease(debounce_secs, DEFAULT_LEASE_SECS)
+    }
+
+    /// Claim the next pending job, stamping a lease that expires `lease_secs`
+    /// from now. On claim we also mint a fresh random fencing token into
+    /// `claimed_by`; the worker echoes it back to `complete`/`fail` so a stale
+    /// worker cannot mutate a job that has since been reclaimed and re-issued.
+    pub fn claim_next_with_lease(
+        &self,
+        debounce_secs: i64,
+        lease_secs: i64,
+    ) -> Result<Option<IndexJob>, rusqlite::Error> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
         let result = self.conn.query_row(
@@ -282,6 +317,8 @@ impl JobQueue {
                  started_at = strftime('%s','now'),
                  attempt    = attempt + 1,
                  requeue_needed = 0,
+                 claimed_by = lower(hex(randomblob(16))),
+                 lease_expires_at = CAST(strftime('%s','now') AS INTEGER) + ?2,
                  updated_at = strftime('%s','now')
              WHERE id = (
                  SELECT id FROM index_jobs
@@ -292,8 +329,8 @@ impl JobQueue {
              )
              RETURNING id, repo_id, repo_url, trigger, priority, status,
                        attempt, max_attempts, error_msg, branch,
-                       created_at, updated_at, started_at, completed_at",
-            params![debounce_secs],
+                       created_at, updated_at, started_at, completed_at, claimed_by",
+            params![debounce_secs, lease_secs],
             row_to_job,
         );
 
@@ -318,13 +355,19 @@ impl JobQueue {
     /// Does NOT update `updated_at` — that column is only set by external
     /// events (upsert). This ensures `requeue_if_stale` correctly detects
     /// "an event arrived while running" without false positives.
-    pub fn complete(&self, job_id: i64, repo_id: &str) -> Result<(), rusqlite::Error> {
+    pub fn complete(
+        &self,
+        job_id: i64,
+        repo_id: &str,
+        claimed_by: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "UPDATE index_jobs
              SET status       = 'succeeded',
                  completed_at = strftime('%s','now')
-             WHERE id = ?1 AND repo_id = ?2 AND status = 'running'",
-            params![job_id, repo_id],
+             WHERE id = ?1 AND repo_id = ?2 AND status = 'running'
+               AND claimed_by IS ?3",
+            params![job_id, repo_id, claimed_by],
         )?;
         Ok(())
     }
@@ -376,7 +419,13 @@ impl JobQueue {
     /// If `is_poison` is true or `attempt >= max_attempts`, the job moves
     /// directly to dead_letter. Otherwise it goes back to pending for retry
     /// with the `retry` trigger.
-    pub fn fail(&self, job_id: i64, error: &str, is_poison: bool) -> Result<(), rusqlite::Error> {
+    pub fn fail(
+        &self,
+        job_id: i64,
+        claimed_by: Option<&str>,
+        error: &str,
+        is_poison: bool,
+    ) -> Result<(), rusqlite::Error> {
         // Read current attempt/max_attempts to decide the outcome.
         let (attempt, max_attempts): (i32, i32) = self.conn.query_row(
             "SELECT attempt, max_attempts FROM index_jobs WHERE id = ?1",
@@ -384,6 +433,10 @@ impl JobQueue {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
+        // Both terminal transitions are CAS-guarded on the running status and
+        // the fencing token (#11/#12): a cancelled/reclaimed/already-finished
+        // job matches zero rows, so `fail` becomes a no-op instead of
+        // resurrecting the row (e.g. flipping `cancelled` -> `pending`).
         if is_poison || attempt >= max_attempts {
             self.conn.execute(
                 "UPDATE index_jobs
@@ -391,8 +444,8 @@ impl JobQueue {
                      error_msg    = ?2,
                      completed_at = strftime('%s','now'),
                      updated_at   = strftime('%s','now')
-                 WHERE id = ?1",
-                params![job_id, error],
+                 WHERE id = ?1 AND status = 'running' AND claimed_by IS ?3",
+                params![job_id, error, claimed_by],
             )?;
         } else {
             self.conn.execute(
@@ -402,8 +455,8 @@ impl JobQueue {
                      priority   = 4,
                      error_msg  = ?2,
                      updated_at = strftime('%s','now')
-                 WHERE id = ?1",
-                params![job_id, error],
+                 WHERE id = ?1 AND status = 'running' AND claimed_by IS ?3",
+                params![job_id, error, claimed_by],
             )?;
         }
         Ok(())
@@ -500,7 +553,7 @@ impl JobQueue {
         let mut stmt = self.conn.prepare(
             "SELECT id, repo_id, repo_url, trigger, priority, status,
                     attempt, max_attempts, error_msg, branch,
-                    created_at, updated_at, started_at, completed_at
+                    created_at, updated_at, started_at, completed_at, claimed_by
              FROM index_jobs
              WHERE status = 'dead_letter'
              ORDER BY updated_at DESC",
@@ -631,6 +684,7 @@ fn row_to_job(row: &rusqlite::Row) -> Result<IndexJob, rusqlite::Error> {
         updated_at: row.get(11)?,
         started_at: row.get(12)?,
         completed_at: row.get(13)?,
+        claimed_by: row.get(14)?,
     })
 }
 
@@ -798,7 +852,8 @@ mod tests {
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
 
-        q.complete(job.id, &job.repo_id).unwrap();
+        q.complete(job.id, &job.repo_id, job.claimed_by.as_deref())
+            .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.succeeded, 1);
@@ -819,7 +874,8 @@ mod tests {
         // Claim and fail — attempt becomes 1, max_attempts is 4, so it should retry
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 1);
-        q.fail(job.id, "network error", false).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "network error", false)
+            .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.pending, 1, "should be back to pending for retry");
@@ -829,17 +885,20 @@ mod tests {
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 2);
         assert_eq!(job.trigger, JobTrigger::Retry);
-        q.fail(job.id, "network error", false).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "network error", false)
+            .unwrap();
 
         // Claim again — attempt 3
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 3);
-        q.fail(job.id, "network error", false).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "network error", false)
+            .unwrap();
 
         // Claim again — attempt 4, should dead-letter now
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 4);
-        q.fail(job.id, "final failure", false).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "final failure", false)
+            .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(
@@ -861,7 +920,8 @@ mod tests {
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
 
-        q.fail(job.id, "auth failure 401", true).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "auth failure 401", true)
+            .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(
@@ -918,7 +978,8 @@ mod tests {
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
-        q.fail(job.id, "poison", true).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "poison", true)
+            .unwrap();
 
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.dead_letter, 1);
@@ -959,7 +1020,8 @@ mod tests {
 
         // Dead-letter repo-1
         let job = q.claim_next(0).unwrap().unwrap();
-        q.fail(job.id, "poison", true).unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "poison", true)
+            .unwrap();
 
         let dead = q.dead_letters().unwrap();
         assert_eq!(dead.len(), 1);
@@ -990,7 +1052,8 @@ mod tests {
 
         // Claim and complete repo-a
         let job_a = q.claim_next(0).unwrap().unwrap();
-        q.complete(job_a.id, &job_a.repo_id).unwrap();
+        q.complete(job_a.id, &job_a.repo_id, job_a.claimed_by.as_deref())
+            .unwrap();
 
         // Claim repo-b (leave running)
         let _job_b = q.claim_next(0).unwrap().unwrap();
@@ -1029,7 +1092,8 @@ mod tests {
         )
         .unwrap();
         let job = q.claim_next(0).unwrap().unwrap();
-        q.complete(job.id, &job.repo_id).unwrap();
+        q.complete(job.id, &job.repo_id, job.claimed_by.as_deref())
+            .unwrap();
         // No external event happened — should NOT requeue
         assert!(
             !q.requeue_if_stale("repo-1").unwrap(),
@@ -1060,7 +1124,8 @@ mod tests {
         );
 
         // complete() on a cancelled job should be a no-op (status != 'running')
-        q.complete(job.id, "repo-1").unwrap();
+        q.complete(job.id, "repo-1", job.claimed_by.as_deref())
+            .unwrap();
         // Job should still be cancelled, not succeeded
         let depth = q.queue_depth().unwrap();
         assert_eq!(depth.succeeded, 0);
@@ -1216,6 +1281,76 @@ mod tests {
             Some("develop"),
             "branch should be preserved when new upsert has None"
         );
+    }
+
+    #[test]
+    fn fail_does_not_resurrect_cancelled_job() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        // Claim (status -> running), then admin removes the repo -> cancelled.
+        let job = q.claim_next(0).unwrap().unwrap();
+        q.cancel_repo("repo-1").unwrap();
+
+        // An in-flight worker errors after cancellation and calls fail().
+        // Without a status guard this flips cancelled -> pending (retry),
+        // resurrecting a job for a removed repo. With the guard it is a no-op.
+        q.fail(job.id, job.claimed_by.as_deref(), "network error", false)
+            .unwrap();
+
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(
+            depth.pending, 0,
+            "fail() must NOT resurrect a cancelled job into pending"
+        );
+        // The row should remain cancelled (not pending, not dead_letter).
+        let status: String = q
+            .conn
+            .query_row(
+                "SELECT status FROM index_jobs WHERE id = ?1",
+                params![job.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled", "cancelled job must stay cancelled");
+    }
+
+    #[test]
+    fn fail_by_wrong_owner_is_noop() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert!(job.claimed_by.is_some(), "claim must stamp a fencing token");
+
+        // A stale worker whose lease was reclaimed holds an old token. fail()
+        // with the wrong token must not touch the row.
+        q.fail(job.id, Some("not-the-real-token"), "stale error", false)
+            .unwrap();
+
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(
+            depth.running, 1,
+            "fail() by a non-owner must be a no-op; job stays running"
+        );
+        assert_eq!(depth.pending, 0);
+        assert_eq!(depth.dead_letter, 0);
+
+        // The rightful owner can still fail it.
+        q.fail(job.id, job.claimed_by.as_deref(), "real error", false)
+            .unwrap();
+        let depth = q.queue_depth().unwrap();
+        assert_eq!(depth.pending, 1, "the real owner's fail() must take effect");
     }
 
     #[test]

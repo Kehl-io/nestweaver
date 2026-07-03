@@ -377,7 +377,7 @@ impl WorkerPool {
                 match result {
                     Ok(Ok(())) => {
                         let q = queue.lock().expect("job queue lock poisoned");
-                        let _ = q.complete(job.id, &job.repo_id);
+                        let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
                         if let Ok(true) = q.requeue_if_stale(&job.repo_id) {
                             tracing::info!(repo = %job.repo_id, "re-queued: push arrived during indexing");
                         }
@@ -385,19 +385,24 @@ impl WorkerPool {
                     }
                     Ok(Err(e)) if is_job_cancelled_error(&e) => {
                         let q = queue.lock().expect("job queue lock poisoned");
-                        let _ = q.complete(job.id, &job.repo_id);
+                        let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
                         tracing::info!(repo = job.repo_id, "index cancelled");
                     }
                     Ok(Err(e)) => {
                         let is_poison = is_poison_error(&e);
                         let q = queue.lock().expect("job queue lock poisoned");
-                        let _ = q.fail(job.id, &e.to_string(), is_poison);
+                        let _ = q.fail(job.id, job.claimed_by.as_deref(), &e.to_string(), is_poison);
                         tracing::error!(repo = job.repo_id, error = %e, "index failed");
                     }
                     Err(join_err) => {
                         // Task panicked or was cancelled.
                         let q = queue.lock().expect("job queue lock poisoned");
-                        let _ = q.fail(job.id, &format!("task panic: {join_err}"), false);
+                        let _ = q.fail(
+                            job.id,
+                            job.claimed_by.as_deref(),
+                            &format!("task panic: {join_err}"),
+                            false,
+                        );
                         tracing::error!(repo = job.repo_id, error = %join_err, "worker task panicked");
                     }
                 }
@@ -848,6 +853,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -923,6 +929,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -968,6 +975,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -1006,6 +1014,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -1270,6 +1279,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -1372,6 +1382,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -1469,6 +1480,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
@@ -1531,6 +1543,7 @@ mod tests {
             max_attempts: 4,
             error_msg: None,
             branch: None,
+            claimed_by: None,
             created_at: 0,
             updated_at: 0,
             started_at: Some(0),
