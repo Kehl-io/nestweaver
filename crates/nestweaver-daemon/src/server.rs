@@ -3574,6 +3574,31 @@ impl<S: tonic::server::NamedService> tonic::server::NamedService for ReadOnlyGua
     const NAME: &'static str = S::NAME;
 }
 
+/// Whether to mount the `/webhook` endpoint. A read-only replica must NEVER
+/// accept a webhook: its worker pool and poll scheduler are gated out, so an
+/// accepted push would enqueue an index job into a queue that no worker drains
+/// — a silent blackhole with unbounded growth. Only a read-write daemon with a
+/// configured secret mounts it.
+fn replica_mounts_webhook(read_only: bool, webhook_secret_configured: bool) -> bool {
+    !read_only && webhook_secret_configured
+}
+
+/// Whether to enqueue config-declared repos for initial indexing at startup.
+/// A read-only replica serves a pre-built snapshot and has no worker to index,
+/// so it must not enqueue anything (the same blackhole as the webhook path).
+fn replica_enqueues_config_repos(read_only: bool) -> bool {
+    !read_only
+}
+
+/// Whether to mount the admin write API (`/admin/api/*` + device-flow auth).
+/// A read-only replica exposes no mutating admin surface (add/remove repo,
+/// reindex, reload, drain/resume, dead-letter retry); it must not mount these.
+/// `/metrics` is mounted separately and stays available for replica
+/// monitoring.
+fn replica_mounts_admin_api(read_only: bool, admin_token_configured: bool) -> bool {
+    !read_only && admin_token_configured
+}
+
 /// Enforce the bind-scope security invariants for a server-mode listener:
 /// a non-loopback bind must be both authenticated (`--auth-token`) and
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
@@ -4338,7 +4363,8 @@ pub async fn run_server(
         };
         shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
 
-        if let Some(ref cfg) = state.instance_cfg
+        if replica_enqueues_config_repos(read_only)
+            && let Some(ref cfg) = state.instance_cfg
             && let Ok(queue) = shared_job_queue.lock()
         {
             for repo_cfg in &cfg.repos {
@@ -4384,8 +4410,11 @@ pub async fn run_server(
             }
         }
 
-        // Mount webhook endpoint when a secret is configured.
-        if let Some(ref secret) = opts.webhook_secret {
+        // Mount webhook endpoint when a secret is configured — but never on a
+        // read-only replica, which has no worker to drain enqueued jobs.
+        if replica_mounts_webhook(read_only, opts.webhook_secret.is_some())
+            && let Some(ref secret) = opts.webhook_secret
+        {
             let allowed_repos: Option<std::collections::HashSet<String>> =
                 state.instance_cfg.as_ref().map(|cfg| {
                     cfg.repos
@@ -4433,8 +4462,12 @@ pub async fn run_server(
             tracing::info!("webhook endpoint enabled at /webhook");
         }
 
-        // Mount admin API routes when an admin token is configured.
-        if let Some(ref admin_tok) = opts.admin_token {
+        // Mount admin API routes when an admin token is configured — but not on
+        // a read-only replica, which exposes no mutating admin surface.
+        // `/metrics` (mounted below) stays available for replica monitoring.
+        if replica_mounts_admin_api(read_only, opts.admin_token.is_some())
+            && let Some(ref admin_tok) = opts.admin_token
+        {
             let admin_state = std::sync::Arc::new(nestweaver_web::state::AdminState {
                 admin_token: admin_tok.clone(),
                 auth_token: opts.auth_token.clone(),
@@ -6681,5 +6714,39 @@ mod startup_helper_tests {
             1,
             "a read RPC must reach the handler on a read-only replica"
         );
+    }
+
+    // ── Read-only replica: write/webhook/admin route mounting ──────────
+
+    /// A read-only replica must NOT mount `/webhook`, even with a secret
+    /// configured: no worker drains the queue, so an accepted push is a silent
+    /// blackhole. A read-write daemon still mounts it when a secret is set.
+    #[test]
+    fn read_only_does_not_mount_webhook() {
+        // Read-only replica: never mount, regardless of secret.
+        assert!(!replica_mounts_webhook(true, true));
+        assert!(!replica_mounts_webhook(true, false));
+        // Read-write daemon: mount iff a secret is configured.
+        assert!(replica_mounts_webhook(false, true));
+        assert!(!replica_mounts_webhook(false, false));
+    }
+
+    /// A read-only replica must NOT enqueue config repos for initial indexing —
+    /// it has no worker to index them, so the jobs would accumulate forever.
+    #[test]
+    fn read_only_does_not_enqueue_config_repos() {
+        assert!(!replica_enqueues_config_repos(true));
+        assert!(replica_enqueues_config_repos(false));
+    }
+
+    /// A read-only replica must NOT mount the mutating admin API, even with an
+    /// admin token configured. A read-write daemon mounts it when a token is
+    /// present.
+    #[test]
+    fn read_only_does_not_mount_admin_api() {
+        assert!(!replica_mounts_admin_api(true, true));
+        assert!(!replica_mounts_admin_api(true, false));
+        assert!(replica_mounts_admin_api(false, true));
+        assert!(!replica_mounts_admin_api(false, false));
     }
 }
