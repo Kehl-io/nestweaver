@@ -4330,6 +4330,9 @@ pub async fn run_server(
             };
             // Share the daemon's embed model so HTTP dispatch has parity with gRPC.
             s.embed_model = state.embed_model.clone();
+            // A read-only replica must reject mutating MCP tools before dispatch,
+            // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
+            s.read_only = read_only;
             std::sync::Arc::new(s)
         };
         nestweaver_mcp::http::spawn_session_sweeper(
@@ -6561,6 +6564,18 @@ mod startup_helper_tests {
     /// the default-deny chokepoint can never silently miss a mutating path.
     #[test]
     fn read_only_method_partition_is_exhaustive() {
+        // MAINTENANCE — this MUST list every RPC method the proto service
+        // (`NestWeaverDaemon` in nestweaver.daemon.v1) exposes. It is hand-kept:
+        // there is no runtime proto method registry to derive it from, so when
+        // you add a proto RPC you MUST add it here AND classify it in
+        // `READ_ONLY_ALLOWED_METHODS` or `MUTATING_RPC_METHODS`. Both this
+        // partition test and the runtime default-deny chokepoint
+        // (`read_only_rejection`) depend on this list being complete — a missing
+        // entry means the new RPC is untested here (runtime still fails closed:
+        // an unknown method default-denies on a replica). Regenerate/verify with:
+        //   grep -oE '/nestweaver\.daemon\.v1\.NestWeaverDaemon/[A-Za-z]+' \
+        //     $(find target -name nestweaver.daemon.v1.rs -path '*out*' | head -1) \
+        //     | sed -E 's#.*/##' | sort -u
         const ALL_RPC_METHODS: &[&str] = &[
             "AffectedTests",
             "Backup",

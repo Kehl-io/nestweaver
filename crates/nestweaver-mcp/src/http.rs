@@ -167,6 +167,12 @@ pub struct McpHttpState {
     /// reading content via `git show` from blobless bare clones, `brain_status`
     /// reporting) behave correctly over HTTP, matching the gRPC handler.
     pub server_mode: bool,
+    /// Whether the daemon serves a read-only snapshot replica. When true, the
+    /// `tools/call` handler rejects every mutating tool before dispatch
+    /// (regardless of auth/admin) — the MCP-HTTP counterpart to the gRPC
+    /// `ReadOnlyGuard` chokepoint. A replica opens its store read-only, so a
+    /// mutating tool would otherwise fail mid-stream at the storage layer.
+    pub read_only: bool,
     /// Optional bearer token for MCP-over-HTTP authentication. When set,
     /// requests must include `Authorization: Bearer <token>` or receive 401.
     pub auth_token: Option<String>,
@@ -198,6 +204,7 @@ impl McpHttpState {
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
             server_mode,
+            read_only: false,
             auth_token: None,
             admin_token: None,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
@@ -225,6 +232,7 @@ impl McpHttpState {
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
             server_mode,
+            read_only: false,
             auth_token: Some(auth_token),
             admin_token,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
@@ -674,6 +682,32 @@ async fn handle_mcp(
                     })),
                 );
             };
+
+            // Read-only snapshot replica: reject EVERY mutating tool before
+            // dispatch, regardless of auth/admin. A replica opens its store
+            // read-only, so a mutating tool would otherwise dispatch and fail
+            // mid-stream at the storage layer (finding #10) on the very surface
+            // a replica exists to serve. An admin token must NOT bypass this —
+            // there is no writable store to mutate. Mirrors the gRPC
+            // `ReadOnlyGuard` chokepoint.
+            if state.read_only && MUTATING_TOOLS.contains(&name.as_str()) {
+                return (
+                    axum::http::StatusCode::OK,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": error_code::INVALID_REQUEST,
+                            "message": format!(
+                                "this daemon serves a read-only snapshot replica; \
+                                 tool '{}' is not available",
+                                name
+                            ),
+                        }
+                    })),
+                );
+            }
 
             // C3: Mutating tools require admin token when auth is configured.
             if MUTATING_TOOLS.contains(&name.as_str())
@@ -1179,6 +1213,66 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "rotating the session id must not mint a fresh bucket — the identity stays throttled"
         );
+    }
+
+    /// A read-only snapshot replica must reject every mutating MCP tool over
+    /// `tools/call` BEFORE dispatch — even when the caller presents the admin
+    /// token — so the mutation never reaches the read-only store. This is the
+    /// MCP-HTTP counterpart to the gRPC `ReadOnlyGuard`.
+    #[tokio::test]
+    async fn read_only_replica_rejects_mutating_mcp_tool_before_dispatch() {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true, // server_mode
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        );
+        state.read_only = true;
+        let app = router(Arc::new(state));
+
+        // Every mutating tool must be rejected, even with the admin token.
+        for tool in MUTATING_TOOLS {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": tool,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": {} },
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json["error"]["code"],
+                error_code::INVALID_REQUEST,
+                "mutating tool {tool} on a read-only replica must return a JSON-RPC error: {json}"
+            );
+            let msg = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("read-only snapshot replica"),
+                "mutating tool {tool} must be rejected as read-only (not dispatched): {json}"
+            );
+            // A dispatch would have produced a `result`, not an `error`.
+            assert!(
+                json.get("result").is_none(),
+                "mutating tool {tool} must not reach dispatch on a read-only replica: {json}"
+            );
+        }
     }
 
     #[tokio::test]
