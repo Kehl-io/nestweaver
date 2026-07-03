@@ -235,7 +235,8 @@ pub struct InstanceConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct EmbeddingConfig {
     /// HuggingFace model ID (or local path) for the sentence-transformer.
-    /// Default: `"thenlper/gte-base"` (768-dim BERT, mean-pooled).
+    /// Default: `"sentence-transformers/all-MiniLM-L6-v2"` (384-dim, fast). A DB's
+    /// recorded embedding model overrides this at daemon startup.
     #[serde(default = "default_model_id")]
     pub model_id: String,
     /// Directory where downloaded model weights are stored.
@@ -270,10 +271,12 @@ pub struct EmbeddingConfig {
 }
 
 fn default_model_id() -> String {
-    // gte-base: 768-dim BERT sentence-transformer, mean-pooled, no query prefix
-    // (matches this crate's embedding path) — stronger retrieval than the older
-    // 384-dim all-MiniLM-L6-v2 and runs well on Apple Silicon/Metal.
-    "thenlper/gte-base".to_string()
+    // all-MiniLM-L6-v2: 384-dim, ~22MB, mean-pooled, no prefix — fast and light, the best
+    // general default for most users (many run CPU-only servers). A DB embedded with a
+    // different model records it (set_embedding_metadata) and the daemon loads that instead,
+    // so this default only applies to fresh/un-embedded instances. Override per-instance via
+    // `[embedding] model_id` (e.g. thenlper/gte-base for higher-quality 768-dim retrieval).
+    "sentence-transformers/all-MiniLM-L6-v2".to_string()
 }
 fn default_embedding_cache_dir() -> String {
     "~/.cache/nestweaver/models".to_string()

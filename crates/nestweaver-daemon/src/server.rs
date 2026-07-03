@@ -4250,72 +4250,83 @@ pub async fn run_server(
         });
     }
 
-    // Spawn background embedding model loading when the `embed` feature is on.
+    // Load the embedding model. This MUST run synchronously on the process MAIN thread
+    // (the `block_on` driver), NOT on a tokio worker or `spawn_blocking` thread. On macOS,
+    // candle compiles its Metal shaders at runtime, which requires MTLCompilerService — an
+    // Aqua per-session XPC service that is reachable from the daemon's main thread but NOT
+    // from a tokio worker/blocking thread (there it's unreachable and candle silently falls
+    // back to CPU, and cold it can churn a panic→fallback). A plain `nestweaver embed`
+    // (main thread) gets `device=Metal` even as a launchd agent; the daemon only failed
+    // because it loaded off the main thread. This runs before the socket is bound below, so
+    // it blocks startup ~1s (Metal) but the daemon isn't serving yet — and it gets the GPU
+    // for query-time embedding, which is the required path (all embedding goes through the
+    // daemon). `EmbedModel::load` catches its own device panics internally, so it returns
+    // Err (never hangs) rather than needing an external timeout.
     tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
     #[cfg(feature = "embed")]
     {
-        let embed_state = state.embed_model.clone();
-        let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
-        let store_for_dim_check = state.store.clone();
-        tokio::spawn(async move {
-            let cfg = embedding_cfg.unwrap_or_default();
-            // Expand tilde in cache_dir using the home directory.
-            let cache_dir = if cfg.cache_dir.starts_with("~/") {
-                if let Some(home) = dirs::home_dir() {
-                    home.join(&cfg.cache_dir[2..])
-                } else {
-                    std::path::PathBuf::from(&cfg.cache_dir)
-                }
+        let mut cfg = state
+            .instance_cfg
+            .as_ref()
+            .map(|c| c.embedding.clone())
+            .unwrap_or_default();
+        // The DB records which model generated the stored embeddings (set on embed). Load
+        // THAT model regardless of the compiled default or config — it must match the
+        // stored vectors, or semantic search is disabled on a dimension mismatch. This is
+        // what lets the shipped default stay light (best for most users) while a given
+        // instance transparently uses whatever model it was actually embedded with.
+        if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
+            && !stored_model_id.is_empty()
+        {
+            if stored_model_id != cfg.model_id {
+                tracing::info!(
+                    stored = %stored_model_id,
+                    configured = %cfg.model_id,
+                    "Loading the embedding model recorded in the DB (matches stored embeddings)"
+                );
+            }
+            cfg.model_id = stored_model_id;
+        }
+        // Expand tilde in cache_dir using the home directory.
+        let cache_dir = if cfg.cache_dir.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&cfg.cache_dir[2..])
             } else {
                 std::path::PathBuf::from(&cfg.cache_dir)
-            };
-            let config = nestweaver_embed::EmbedConfig {
-                model_id: cfg.model_id.clone(),
-                cache_dir,
-                external_endpoint: cfg.external_endpoint.clone(),
-                external_model: cfg.external_model.clone(),
-            };
-            // Loading compiles Metal shaders (or reads the model on CPU) and can, in
-            // rare daemon contexts, block indefinitely inside native code. Cap it so a
-            // stuck load never leaves the model-load task hanging: on timeout the daemon
-            // stays healthy with semantic search disabled until the next restart/re-embed.
-            const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-            let load = tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config));
-            match tokio::time::timeout(LOAD_TIMEOUT, load).await {
-                Ok(Ok(Ok(model))) => {
-                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
-                    // Check dimension compatibility with existing embeddings
-                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension()
-                        && stored_dim != model.dimension()
-                    {
-                        tracing::warn!(
-                            model_dim = model.dimension(),
-                            stored_dim,
-                            "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                             Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                            model.dimension(),
-                            stored_dim
-                        );
-                        return;
-                    }
-                    *embed_state.write().await = Some(std::sync::Arc::new(model)
+            }
+        } else {
+            std::path::PathBuf::from(&cfg.cache_dir)
+        };
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: cfg.model_id.clone(),
+            cache_dir,
+            external_endpoint: cfg.external_endpoint.clone(),
+            external_model: cfg.external_model.clone(),
+        };
+        match nestweaver_embed::EmbedModel::load(&config) {
+            Ok(model) => {
+                tracing::info!(dim = model.dimension(), "Embedding model loaded");
+                // Check dimension compatibility with existing embeddings.
+                if let Some(stored_dim) = state.store.embedding_index_dimension()
+                    && stored_dim != model.dimension()
+                {
+                    tracing::warn!(
+                        model_dim = model.dimension(),
+                        stored_dim,
+                        "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                         Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                        model.dimension(),
+                        stored_dim
+                    );
+                } else {
+                    *state.embed_model.write().await = Some(std::sync::Arc::new(model)
                         as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
                 }
-                Ok(Ok(Err(e))) => {
-                    tracing::warn!("Failed to load embedding model: {e}");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Embedding model load task panicked: {e}");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_secs = LOAD_TIMEOUT.as_secs(),
-                        "Embedding model load timed out — semantic search disabled until restart. \
-                         Run `nestweaver embed` from a terminal for GPU-accelerated embedding."
-                    );
-                }
             }
-        });
+            Err(e) => {
+                tracing::warn!("Failed to load embedding model: {e}");
+            }
+        }
     }
 
     // Wrap the generated service in the single read-only chokepoint. On a

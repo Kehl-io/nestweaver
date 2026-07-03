@@ -1225,7 +1225,7 @@ enum Commands {
 
     /// Generate embeddings for symbols, notes, and headings in the database.
     ///
-    /// By default uses the bundled local model (thenlper/gte-base, 768-dim).
+    /// By default uses the bundled local model (sentence-transformers/all-MiniLM-L6-v2).
     /// Pass --endpoint to use an external OpenAI-compatible API instead.
     /// Only nodes that do not yet have an embedding are processed (incremental);
     /// use --force to re-embed everything.
@@ -1249,7 +1249,7 @@ enum Commands {
         model: Option<String>,
         #[arg(
             long,
-            default_value = "thenlper/gte-base",
+            default_value = "sentence-transformers/all-MiniLM-L6-v2",
             help = "HuggingFace model ID for local inference"
         )]
         model_id: String,
@@ -12478,6 +12478,23 @@ fn run_embed(
         && let Err(e) = store.flush_embedding_index()
     {
         eprintln!("Warning: failed to save embedding sidecar: {e}");
+    }
+
+    // Record which embedding model produced these vectors, so the daemon loads a matching
+    // model at startup regardless of the compiled default or the instance config (see
+    // run_server). This is what lets the shipped default stay light for most users while a
+    // given DB transparently uses whatever model it was embedded with.
+    if let Some(dim) = store.embedding_index_dimension() {
+        let effective_model = if endpoint.is_some() {
+            model.unwrap_or(model_id)
+        } else {
+            model_id
+        };
+        if !effective_model.is_empty()
+            && let Err(e) = store.set_embedding_metadata(effective_model, dim as u32)
+        {
+            eprintln!("Warning: failed to record embedding model metadata: {e}");
+        }
     }
 
     if stats {
