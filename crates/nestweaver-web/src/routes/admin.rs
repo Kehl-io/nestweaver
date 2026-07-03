@@ -91,6 +91,17 @@ where
     }
 }
 
+/// Admin-gated Prometheus `/metrics` handler for the `/admin/api` router.
+///
+/// The admin router is nested onto the network-facing MCP listener, so its
+/// `/metrics` (reachable at `/admin/api/metrics`) would otherwise leak
+/// operational counters unauthenticated — every other admin route requires the
+/// admin token, and this one now does too (S.5). The top-level `/metrics` on
+/// the MCP listener is separately gated behind the query/admin bearer.
+pub async fn metrics(_auth: AdminAuth) -> impl axum::response::IntoResponse {
+    crate::routes::metrics::metrics_handler().await
+}
+
 // ── Response types ─────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1664,7 +1675,43 @@ mod tests {
             .route("/admin/api/repos", get(list_repos))
             .route("/admin/api/queue", get(get_queue))
             .route("/admin/api/drain/status", get(drain_status))
+            .route("/admin/api/metrics", get(metrics))
             .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_admin_token() {
+        // The admin router is nested onto the network MCP listener, so
+        // /admin/api/metrics must not leak operational counters unauthenticated.
+        crate::routes::metrics::init_metrics();
+        let app = test_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_with_valid_admin_token() {
+        crate::routes::metrics::init_metrics();
+        let app = test_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/metrics")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

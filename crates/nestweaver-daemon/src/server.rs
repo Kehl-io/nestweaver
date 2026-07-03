@@ -4616,13 +4616,25 @@ pub async fn run_server(
             tracing::info!("admin API enabled at /admin/api/*");
         }
 
-        // Mount /metrics at the top level of the MCP HTTP router so
-        // Prometheus scrapers can use the standard path without knowing
-        // the /admin/api prefix. Works even without an admin token.
-        mcp_router = mcp_router.route(
-            "/metrics",
-            axum::routing::get(nestweaver_web::routes::metrics::metrics_handler),
-        );
+        // Mount /metrics at the top level of the MCP HTTP router so Prometheus
+        // scrapers can use the standard path without knowing the /admin/api
+        // prefix. S.5: on the network-facing listener the endpoint is gated
+        // behind a bearer token (query or admin) — operational counters are a
+        // metadata leak on a non-loopback deployment. When no auth is
+        // configured (loopback-only dev bind) it stays open for local scrape
+        // convenience; validate_bind_security forces --auth-token for any
+        // non-loopback bind, so on the network this route is always gated.
+        let metrics_auth = nestweaver_web::routes::metrics::MetricsAuthState {
+            auth_token: mcp_auth_token.clone(),
+            admin_token: opts.admin_token.clone(),
+        };
+        let metrics_route = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(nestweaver_web::routes::metrics::metrics_authenticated),
+            )
+            .with_state(metrics_auth);
+        mcp_router = mcp_router.merge(metrics_route);
 
         // Parse the bind address to determine the MCP port.  When the gRPC
         // bind uses port 0 (OS-assigned), the MCP server also binds to port 0

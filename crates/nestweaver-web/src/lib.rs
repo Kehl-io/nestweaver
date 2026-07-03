@@ -211,8 +211,11 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
         .route("/reload", post(admin::reload_config))
         .route("/status", get(admin::get_status))
         // Expose /metrics on the admin port as well so Prometheus can scrape
-        // a single endpoint regardless of which port it targets.
-        .route("/metrics", get(routes::metrics::metrics_handler))
+        // a single endpoint regardless of which port it targets. Gated behind
+        // the admin token (S.5) — the admin router is nested onto the
+        // network-facing MCP listener, so an unauthenticated /admin/api/metrics
+        // would leak operational counters.
+        .route("/metrics", get(admin::metrics))
         .with_state(state)
 }
 

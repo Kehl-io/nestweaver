@@ -225,9 +225,8 @@ pub fn init_metrics() {
     GRPC_REQUESTS.with_label_values(&["unknown"]);
 }
 
-/// Prometheus text-format endpoint. No auth required (standard practice —
-/// use network-level access control to restrict scraper access).
-pub async fn metrics_handler() -> impl IntoResponse {
+/// Render the Prometheus text-format body from the shared registry.
+fn render_metrics() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = String::new();
@@ -239,4 +238,131 @@ pub async fn metrics_handler() -> impl IntoResponse {
         )],
         buffer,
     )
+}
+
+/// Prometheus text-format endpoint. No auth. Mount this ONLY on a loopback /
+/// admin-port listener where network-level access control restricts scrapers
+/// (e.g. the local UI server); the network-facing MCP listener must use
+/// [`metrics_authenticated`] instead — see S.5.
+pub async fn metrics_handler() -> impl IntoResponse {
+    render_metrics()
+}
+
+/// Bearer tokens accepted by the authenticated `/metrics` route. `None`
+/// `auth_token` means auth is not configured (loopback dev) and the endpoint
+/// stays open for local scrape convenience.
+#[derive(Clone)]
+pub struct MetricsAuthState {
+    pub auth_token: Option<String>,
+    pub admin_token: Option<String>,
+}
+
+/// Authenticated Prometheus `/metrics` endpoint for the network-facing MCP
+/// listener (S.5). Operational counters (repo counts, queue depth, success /
+/// failure rates) are a metadata leak on a non-loopback deployment, so this
+/// route requires a valid bearer token — either the query `auth_token` or the
+/// `admin_token`, matching how the MCP `/mcp` handler validates bearers.
+///
+/// When `auth_token` is `None` (no auth configured, i.e. a loopback-only dev
+/// bind) the endpoint stays open, preserving the existing local-scrape
+/// convenience. `validate_bind_security` forces `--auth-token` for any
+/// non-loopback bind, so on the network this route is always gated.
+pub async fn metrics_authenticated(
+    axum::extract::State(auth): axum::extract::State<MetricsAuthState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use subtle::ConstantTimeEq;
+
+    if let Some(ref expected) = auth.auth_token {
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let ok = match provided {
+            Some(t) => {
+                let query_match = bool::from(t.as_bytes().ct_eq(expected.as_bytes()));
+                let admin_match = auth
+                    .admin_token
+                    .as_ref()
+                    .map(|a| bool::from(t.as_bytes().ct_eq(a.as_bytes())))
+                    .unwrap_or(false);
+                query_match || admin_match
+            }
+            None => false,
+        };
+        if !ok {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "unauthorized: valid Bearer token required",
+            )
+                .into_response();
+        }
+    }
+
+    render_metrics().into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn app(auth_token: Option<&str>, admin_token: Option<&str>) -> Router {
+        init_metrics();
+        Router::new()
+            .route("/metrics", get(metrics_authenticated))
+            .with_state(MetricsAuthState {
+                auth_token: auth_token.map(String::from),
+                admin_token: admin_token.map(String::from),
+            })
+    }
+
+    async fn get_metrics(app: Router, bearer: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method("GET").uri("/metrics");
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// On the network listener (auth configured) an unauthenticated scrape is
+    /// rejected; a valid query or admin bearer is accepted.
+    #[tokio::test]
+    async fn metrics_requires_auth_on_network_listener() {
+        // No bearer → 401.
+        assert_eq!(
+            get_metrics(app(Some("query-tok"), Some("admin-tok")), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Wrong bearer → 401.
+        assert_eq!(
+            get_metrics(app(Some("query-tok"), Some("admin-tok")), Some("nope")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Valid query token → 200.
+        assert_eq!(
+            get_metrics(app(Some("query-tok"), Some("admin-tok")), Some("query-tok")).await,
+            StatusCode::OK
+        );
+        // Valid admin token → 200.
+        assert_eq!(
+            get_metrics(app(Some("query-tok"), Some("admin-tok")), Some("admin-tok")).await,
+            StatusCode::OK
+        );
+    }
+
+    /// With no auth configured (loopback-only dev bind) the endpoint stays open
+    /// so local Prometheus scrapes keep working without a token.
+    #[tokio::test]
+    async fn metrics_open_without_auth_token() {
+        assert_eq!(get_metrics(app(None, None), None).await, StatusCode::OK);
+    }
 }
