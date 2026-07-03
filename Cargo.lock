@@ -3899,6 +3899,7 @@ dependencies = [
  "libc",
  "nestweaver-daemon",
  "nestweaver-proto",
+ "nestweaver-schema",
  "open",
  "reqwest 0.13.4",
  "serde",

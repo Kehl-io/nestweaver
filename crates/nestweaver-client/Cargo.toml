@@ -6,6 +6,7 @@ license.workspace = true
 description = "Client for NestWeaver daemon — auto-start, connect, call RPCs"
 
 [dependencies]
+nestweaver-schema = { workspace = true }
 nestweaver-proto = { workspace = true }
 nestweaver-daemon = { workspace = true }
 tonic = { workspace = true }

@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 
+use crate::repo_url::normalized_repo_key;
+
 /// Returns the first 6 bytes (12 hex chars) of the SHA-256 hash of the input.
 pub fn truncated_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -9,9 +11,16 @@ pub fn truncated_hash(input: &str) -> String {
 }
 
 /// "repo:{instance}:{url_hash}"
+///
+/// The URL is collapsed to a scheme/credential/suffix/case-invariant identity
+/// key via [`normalized_repo_key`] BEFORE hashing, so equivalent clone-URL
+/// forms of the same repo (ssh vs https, `.git` suffix, trailing slash,
+/// embedded credentials, host/path casing) mint the same `url_hash`. This lets
+/// a repo indexed by a LOCAL daemon (ssh remote) and a SERVER (https URL)
+/// reconcile at the root during merged-result dedup.
 pub fn repo_uid(instance: &str, url: &str) -> String {
-    let normalized = url.trim_end_matches('/');
-    format!("repo:{}:{}", instance, truncated_hash(normalized))
+    let normalized = normalized_repo_key(url);
+    format!("repo:{}:{}", instance, truncated_hash(&normalized))
 }
 
 /// "file:{repo_uid}:{path_hash}"
@@ -90,7 +99,7 @@ pub fn canonical_symbol_id(
     name: &str,
     scope_chain: &str,
 ) -> String {
-    let repo_hash = truncated_hash(repo_url.trim_end_matches('/'));
+    let repo_hash = truncated_hash(&normalized_repo_key(repo_url));
     let scope_hash = scope_hash(scope_chain, name);
     format!("{}:{}#{}:{}", repo_hash, file_path, name, scope_hash)
 }
@@ -199,6 +208,56 @@ mod tests {
         let a = truncated_hash("input one");
         let b = truncated_hash("input two");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn repo_uid_reconciles_equivalent_url_forms() {
+        // The SAME repo indexed under different clone-URL forms must mint the
+        // same url_hash (and thus the same repo_uid, modulo instance) so that
+        // local (ssh) and server (https) results dedup at the root. Before
+        // mint-time normalization, only a trailing slash was stripped, so these
+        // forms hashed differently and never reconciled.
+        let canonical = repo_uid("prod", "https://github.com/acme/api");
+        for form in [
+            "https://github.com/acme/api",
+            "https://github.com/acme/api.git",
+            "https://github.com/acme/api/",
+            "https://GitHub.com/Acme/API",
+            "https://user:token@github.com/acme/api",
+            "git@github.com:acme/api.git",
+            "git@github.com:acme/api",
+            "ssh://git@github.com/acme/api",
+            "https://github.com/acme/api?ref=main",
+        ] {
+            assert_eq!(
+                repo_uid("prod", form),
+                canonical,
+                "URL form `{form}` must mint the same repo_uid as the canonical https form"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_uid_reconciles_across_instances_modulo_instance() {
+        // Same repo, two instances, two URL forms: the url_hash suffix must
+        // match so instance-stripping dedup collapses them.
+        let local = repo_uid("local", "git@github.com:acme/api.git");
+        let server = repo_uid("server", "https://github.com/acme/api");
+        let local_hash = local.rsplit(':').next().unwrap();
+        let server_hash = server.rsplit(':').next().unwrap();
+        assert_eq!(
+            local_hash, server_hash,
+            "url_hash must match across equivalent forms; {local} vs {server}"
+        );
+    }
+
+    #[test]
+    fn canonical_id_reconciles_equivalent_url_forms() {
+        // canonical_symbol_id's repo_hash must also normalize so cross-boundary
+        // flow-trace/impact stitching reconciles ssh vs https forms.
+        let a = canonical_symbol_id("git@github.com:acme/api.git", "src/lib.rs", "foo", "foo");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "foo", "foo");
+        assert_eq!(a, b, "equivalent URL forms must mint the same canonical_id");
     }
 
     #[test]
