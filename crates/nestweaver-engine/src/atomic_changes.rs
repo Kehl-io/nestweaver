@@ -452,60 +452,195 @@ pub fn classify_change(change: &AtomicChange) -> ImpactSeverity {
     }
 }
 
+/// Language class for breaking-change classification.
+///
+/// - `Static`: statically-typed, no default arguments (Rust, Go, Java, C/C++,
+///   TypeScript at the type level). Positional arity and exact parameter types
+///   are load-bearing at compile time, so any arity change or param type change
+///   breaks every caller.
+/// - `Dynamic`: dynamic / defaulted-args + keyword calls (Python, Ruby, JS/TS
+///   runtime, PHP, Lua). A *trailing* defaulted param can be purely additive,
+///   but middle insertions, required additions, removals and reorders still
+///   break positional callers.
+///
+/// Governing principle (SemVer 2.0, Rust RFC 1105 "any change in arity is a
+/// breaking change", Cargo SemVer reference `fn-change-arity` / `fn-generalize-
+/// mismatch` = MAJOR, apidiff, Revapi, japicmp): **default any arity change or
+/// param-type change to BREAKING unless there is positive, language-specific
+/// evidence it is safe.** An unknown language is therefore treated as `Static`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LangClass {
+    Static,
+    Dynamic,
+}
+
+/// Classify a file path into a language class. Unknown extensions fall back to
+/// `Static` so we fail toward BREAKING.
+fn lang_class_of(path: &str) -> LangClass {
+    if is_dynamic_language_file(path) {
+        LangClass::Dynamic
+    } else {
+        LangClass::Static
+    }
+}
+
 /// Classify a signature change by comparing old and new signatures.
 /// Takes the affected file path to determine static vs dynamic language.
+///
+/// See the classification table on [`LangClass`]. The rule of thumb is: only a
+/// Class D signature that gains a *purely trailing, defaulted* parameter (no
+/// positional shift, no required add) is safe (INFO). Everything else that
+/// touches arity, order, or a static param type is BREAKING; a same-arity param
+/// type change in a dynamic language is WARNING.
 pub fn classify_signature_change(
     old_sig: &str,
     new_sig: &str,
     affected_file_path: &str,
 ) -> ImpactSeverity {
-    let old_params = count_params(old_sig);
-    let new_params = count_params(new_sig);
-    let is_dynamic = is_dynamic_language_file(affected_file_path);
+    let class = lang_class_of(affected_file_path);
+    let old_params = params_of(old_sig);
+    let new_params = params_of(new_sig);
 
-    if new_params > old_params {
-        if has_default_params(new_sig, old_params) {
-            ImpactSeverity::Info
-        } else if is_dynamic {
-            ImpactSeverity::Warning
-        } else {
+    use std::cmp::Ordering;
+    match new_params.len().cmp(&old_params.len()) {
+        Ordering::Greater => {
+            // Params were added. The ONLY back-compatible case is a Class D
+            // signature where the added params are all appended at the END and
+            // all carry defaults (no positional shift, no required add). Any
+            // middle insertion, any required add, and every Class S add is a
+            // breaking arity change (RFC 1105).
+            if class == LangClass::Dynamic && is_trailing_defaulted_add(&old_params, &new_params) {
+                ImpactSeverity::Info
+            } else {
+                ImpactSeverity::Breaking
+            }
+        }
+        Ordering::Less => {
+            // Removing a param breaks positional callers passing the old arity
+            // in every language, static or dynamic.
             ImpactSeverity::Breaking
         }
-    } else if new_params < old_params {
-        if is_dynamic {
-            ImpactSeverity::Warning
-        } else {
-            ImpactSeverity::Breaking
+        Ordering::Equal => {
+            // Same arity. Distinguish reorder (breaking everywhere) from a
+            // param type/annotation change.
+            if is_reorder(&old_params, &new_params) {
+                ImpactSeverity::Breaking
+            } else if params_differ(&old_params, &new_params) {
+                // A param's type/annotation changed. Load-bearing at compile
+                // time for Class S (BREAKING); advisory for Class D (WARNING).
+                match class {
+                    LangClass::Static => ImpactSeverity::Breaking,
+                    LangClass::Dynamic => ImpactSeverity::Warning,
+                }
+            } else {
+                // Params are positionally identical — the change is elsewhere
+                // (return type, attributes, body). Advisory.
+                ImpactSeverity::Warning
+            }
         }
-    } else {
-        // Same param count — could be type change or return type change
-        ImpactSeverity::Warning
     }
 }
 
 fn is_dynamic_language_file(path: &str) -> bool {
     path.ends_with(".py")
         || path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
+        || path.ends_with(".jsx")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
         || path.ends_with(".rb")
         || path.ends_with(".lua")
         || path.ends_with(".php")
 }
 
-fn has_default_params(sig: &str, old_count: usize) -> bool {
-    if let Some(params_str) = extract_param_list(sig) {
-        let params: Vec<&str> = split_top_level_params(params_str)
-            .into_iter()
-            .filter(|p| !is_self_param(p.trim()))
-            .collect();
-        if params.len() > old_count {
-            let new_params = &params[old_count..];
-            // Only an explicit default value (dynamic languages: `param = …`)
-            // makes a new parameter back-compatible. A Rust `Option<T>` param is
-            // still REQUIRED at the call site, so it is NOT treated as a default.
-            return new_params.iter().all(|p| p.contains('='));
-        }
+/// Split a signature into its real parameters (receivers like `self`/`cls`
+/// filtered out), each trimmed.
+fn params_of(sig: &str) -> Vec<&str> {
+    let Some(params) = extract_param_list(sig) else {
+        return Vec::new();
+    };
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
     }
-    false
+    split_top_level_params(trimmed)
+        .into_iter()
+        .map(|p| p.trim())
+        .filter(|p| !is_self_param(p))
+        .collect()
+}
+
+/// The leading identifier of a parameter fragment (the name), e.g. `a` from
+/// `a: i32`, `b` from `b=None`, `mut x` -> `x`. Used to detect positional
+/// shifts and reorders.
+fn param_name(p: &str) -> &str {
+    let p = p.trim();
+    // Strip a leading `mut ` binding modifier (Rust).
+    let p = p.strip_prefix("mut ").unwrap_or(p);
+    let end = p
+        .find(|c: char| c == ':' || c == '=' || c.is_whitespace())
+        .unwrap_or(p.len());
+    p[..end].trim()
+}
+
+/// True if a parameter fragment carries an explicit default value (`= …`).
+/// Only dynamic languages have call-site defaults; a Rust `Option<T>` param has
+/// no `=` and is still required, so it is correctly not treated as a default.
+fn param_has_default(p: &str) -> bool {
+    p.contains('=')
+}
+
+/// True if `new` is `old` with one or more *trailing* defaulted params appended:
+/// the first `old.len()` parameter names match positionally, and every added
+/// trailing param carries a default. This is the only additive (safe) shape.
+fn is_trailing_defaulted_add(old: &[&str], new: &[&str]) -> bool {
+    if new.len() <= old.len() {
+        return false;
+    }
+    // The existing params must remain a positional prefix (no middle insertion).
+    if old
+        .iter()
+        .zip(new.iter())
+        .any(|(o, n)| param_name(o) != param_name(n))
+    {
+        return false;
+    }
+    // Every newly-appended trailing param must have a default.
+    new[old.len()..].iter().all(|p| param_has_default(p))
+}
+
+/// True if `old` and `new` have the same set of parameter names but in a
+/// different positional order (a breaking reorder).
+fn is_reorder(old: &[&str], new: &[&str]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    let old_names: Vec<&str> = old.iter().map(|p| param_name(p)).collect();
+    let new_names: Vec<&str> = new.iter().map(|p| param_name(p)).collect();
+    if old_names == new_names {
+        return false; // same order — not a reorder
+    }
+    let mut a = old_names.clone();
+    let mut b = new_names.clone();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b // same multiset, different order
+}
+
+/// True if any positional parameter fragment differs (after whitespace
+/// normalization) between `old` and `new` of equal length — e.g. a type change.
+fn params_differ(old: &[&str], new: &[&str]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new.iter())
+            .any(|(o, n)| normalize_ws(o) != normalize_ws(n))
+}
+
+/// Collapse internal whitespace runs to a single space and trim.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Format a human-readable reason string for an impact result.
@@ -1379,9 +1514,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_sig_add_param_dynamic_is_warning() {
+    fn classify_sig_add_required_param_dynamic_is_breaking() {
+        // Adding a REQUIRED (non-defaulted) parameter breaks positional callers
+        // even in a dynamic language: `foo(x)` now raises "missing argument".
+        // Per the classification table (RFC 1105 / Cargo SemVer `fn-change-arity`),
+        // "Add REQUIRED param (any position)" is BREAKING in BOTH classes. The old
+        // test asserted WARNING, which under-classified a genuine break.
         let severity = classify_signature_change("def foo(a)", "def foo(a, b)", "src/caller.py");
-        assert_eq!(severity, ImpactSeverity::Warning);
+        assert_eq!(severity, ImpactSeverity::Breaking);
     }
 
     #[test]
@@ -1419,13 +1559,111 @@ mod tests {
     }
 
     #[test]
-    fn classify_sig_same_count_is_warning() {
+    fn classify_sig_same_count_type_change_static_is_breaking() {
+        // Same arity, but a parameter's TYPE changed in a statically-typed
+        // language. Every caller passing the old type now fails to compile.
+        // Per the classification table (Cargo SemVer `fn-generalize-mismatch`
+        // = MAJOR, apidiff, Revapi), a param type change is BREAKING in Class S.
+        // The old test asserted WARNING, which under-classified the break.
         let severity = classify_signature_change(
             "fn foo(a: i32) -> bool",
             "fn foo(a: String) -> bool",
             "src/caller.rs",
         );
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn classify_sig_same_count_type_change_dynamic_is_warning() {
+        // In a dynamic language a param type is not enforced at the call site,
+        // so a same-arity "type" (annotation) change is WARNING, not BREAKING.
+        let severity =
+            classify_signature_change("def foo(a: int)", "def foo(a: str)", "src/caller.py");
         assert_eq!(severity, ImpactSeverity::Warning);
+    }
+
+    #[test]
+    fn mid_list_insert_is_breaking() {
+        // A parameter inserted in the MIDDLE of the signature shifts every
+        // positional argument, so it breaks all callers — even when the LAST
+        // param carries a default. The old classifier inspected only the params
+        // AFTER the old arity (which happened to be the defaulted trailing one)
+        // and mis-labeled this INFO. Middle insertion is BREAKING (positional
+        // shift) in every language, static or dynamic.
+        let severity =
+            classify_signature_change("def f(a, b=None)", "def f(a, x, b=None)", "src/caller.py");
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn same_arity_type_change_is_breaking_in_static_lang() {
+        // Rust: `fn f(x: i32)` -> `fn f(x: String)`. Same arity, incompatible
+        // type. Every caller fails to compile => BREAKING (was WARNING).
+        let severity = classify_signature_change("fn f(x: i32)", "fn f(x: String)", "src/lib.rs");
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn trailing_optional_add_is_info_in_dynamic() {
+        // Class D + a purely trailing, defaulted param is genuinely additive.
+        let severity = classify_signature_change("def f(a)", "def f(a, b=None)", "src/caller.py");
+        assert_eq!(severity, ImpactSeverity::Info);
+    }
+
+    #[test]
+    fn trailing_optional_add_is_breaking_in_static() {
+        // Class S has no default arguments, so ANY arity increase — even a param
+        // that "looks" defaulted — is a breaking arity change (RFC 1105).
+        let severity =
+            classify_signature_change("fn f(a: i32)", "fn f(a: i32, b: i32)", "src/lib.rs");
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn required_add_is_breaking_in_both_classes() {
+        // Dynamic, required (non-defaulted) add.
+        assert_eq!(
+            classify_signature_change("def f(a)", "def f(a, b)", "src/caller.py"),
+            ImpactSeverity::Breaking
+        );
+        // Static, required add.
+        assert_eq!(
+            classify_signature_change("fn f(a: i32)", "fn f(a: i32, b: i32)", "src/lib.rs"),
+            ImpactSeverity::Breaking
+        );
+    }
+
+    #[test]
+    fn unknown_language_defaults_to_breaking() {
+        // Unknown extension => treat as Class S => fail toward BREAKING, even for
+        // an add that syntactically carries a default value.
+        let severity = classify_signature_change("f(a)", "f(a, b=1)", "src/thing.unknownlang");
+        assert_eq!(severity, ImpactSeverity::Breaking);
+    }
+
+    #[test]
+    fn reorder_params_is_breaking() {
+        // Reordering positional params breaks all callers in both classes.
+        assert_eq!(
+            classify_signature_change(
+                "fn f(a: i32, b: bool)",
+                "fn f(b: bool, a: i32)",
+                "src/lib.rs"
+            ),
+            ImpactSeverity::Breaking
+        );
+        assert_eq!(
+            classify_signature_change("def f(a, b)", "def f(b, a)", "src/caller.py"),
+            ImpactSeverity::Breaking
+        );
+    }
+
+    #[test]
+    fn remove_param_is_breaking_in_dynamic() {
+        // Removing a param breaks positional callers passing the old arity, in
+        // dynamic languages too (`f(1, 2)` now raises "too many arguments").
+        let severity = classify_signature_change("def f(a, b)", "def f(a)", "src/caller.py");
+        assert_eq!(severity, ImpactSeverity::Breaking);
     }
 
     #[test]
