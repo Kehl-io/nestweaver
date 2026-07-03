@@ -18,57 +18,75 @@ pub enum FileChange {
     Renamed { from: PathBuf, to: PathBuf },
 }
 
-/// Parses the tab-delimited output of `git diff --name-status`.
+/// Convert a raw path token from `git diff -z` into a `PathBuf`. The bytes are
+/// emitted verbatim (no `core.quotePath` C-quoting under `-z`), so non-ASCII
+/// UTF-8 names like `café.md` survive intact.
+fn bytes_to_pathbuf(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Parses the NUL-delimited output of `git diff --name-status -z`.
 ///
-/// Each line has one of the following formats:
-/// - `A\t<path>` — file added
-/// - `M\t<path>` — file modified
-/// - `D\t<path>` — file deleted
-/// - `R###\t<old_path>\t<new_path>` — file renamed (### is similarity score)
+/// `-z` emits records as NUL-terminated tokens with paths quoted verbatim
+/// (unlike the default, which C-quotes any path containing non-ASCII bytes and
+/// would break incremental adds/deletes for accented/CJK filenames):
+/// - `A\0<path>\0` — file added
+/// - `M\0<path>\0` — file modified
+/// - `D\0<path>\0` — file deleted
+/// - `R###\0<old_path>\0<new_path>\0` — renamed (### is the similarity score)
+/// - `C###\0<old_path>\0<new_path>\0` — copied (only with `--find-copies`)
 ///
-/// Lines with unknown status codes are skipped with a debug log.
-fn parse_diff_output(output: &str) -> Vec<FileChange> {
+/// Renames and copies consume two path tokens; every other change consumes one.
+/// Unknown status codes are skipped with a debug log.
+fn parse_diff_output(output: &[u8]) -> Vec<FileChange> {
     let mut changes = Vec::new();
 
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    // Split on NUL; drop the trailing empty token after the final terminator.
+    let tokens: Vec<&[u8]> = output
+        .split(|&b| b == 0)
+        .filter(|t| !t.is_empty())
+        .collect();
 
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        let status = parts[0];
-
-        if status == "A" {
-            if let Some(path) = parts.get(1) {
-                changes.push(FileChange::Added(PathBuf::from(path)));
+    let mut i = 0;
+    while i < tokens.len() {
+        let status = String::from_utf8_lossy(tokens[i]);
+        i += 1;
+        match status.chars().next().unwrap_or(' ') {
+            'A' => {
+                if let Some(path) = tokens.get(i) {
+                    changes.push(FileChange::Added(bytes_to_pathbuf(path)));
+                    i += 1;
+                }
             }
-        } else if status == "M" {
-            if let Some(path) = parts.get(1) {
-                changes.push(FileChange::Modified(PathBuf::from(path)));
+            'M' => {
+                if let Some(path) = tokens.get(i) {
+                    changes.push(FileChange::Modified(bytes_to_pathbuf(path)));
+                    i += 1;
+                }
             }
-        } else if status == "D" {
-            if let Some(path) = parts.get(1) {
-                changes.push(FileChange::Deleted(PathBuf::from(path)));
+            'D' => {
+                if let Some(path) = tokens.get(i) {
+                    changes.push(FileChange::Deleted(bytes_to_pathbuf(path)));
+                    i += 1;
+                }
             }
-        } else if status.starts_with('R') {
-            match (parts.get(1), parts.get(2)) {
+            // Renames and copies both carry two path tokens; consume both so the
+            // token stream stays framed regardless.
+            'R' | 'C' => match (tokens.get(i), tokens.get(i + 1)) {
                 (Some(from), Some(to)) => {
                     changes.push(FileChange::Renamed {
-                        from: PathBuf::from(from),
-                        to: PathBuf::from(to),
+                        from: bytes_to_pathbuf(from),
+                        to: bytes_to_pathbuf(to),
                     });
+                    i += 2;
                 }
                 _ => {
-                    tracing::debug!(status, line, "rename entry missing paths, skipping");
+                    tracing::debug!(%status, "rename/copy entry missing paths, skipping");
                 }
+            },
+            _ => {
+                tracing::debug!(%status, "unknown git diff status code, skipping");
             }
-        } else {
-            tracing::debug!(status, line, "unknown git diff status code, skipping");
         }
     }
 
@@ -87,6 +105,7 @@ pub fn detect_changes(
     let output = Command::new("git")
         .arg("diff")
         .arg("--name-status")
+        .arg("-z")
         .arg(old_sha)
         .arg(new_sha)
         .current_dir(repo_path)
@@ -102,8 +121,7 @@ pub fn detect_changes(
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_diff_output(&stdout))
+    Ok(parse_diff_output(&output.stdout))
 }
 
 /// Returns the SHA of the current HEAD commit in a git repository.
@@ -159,10 +177,11 @@ mod tests {
 
     #[test]
     fn parse_diff_output_handles_all_statuses() {
-        let input = "A\tsrc/new_file.rs\n\
-                     M\tsrc/modified.rs\n\
-                     D\tsrc/deleted.rs\n\
-                     R100\tsrc/old_name.rs\tsrc/new_name.rs\n";
+        // `-z` output: NUL-terminated tokens (status, then 1 or 2 paths).
+        let input: &[u8] = b"A\0src/new_file.rs\0\
+                             M\0src/modified.rs\0\
+                             D\0src/deleted.rs\0\
+                             R100\0src/old_name.rs\0src/new_name.rs\0";
 
         let changes = parse_diff_output(input);
 
@@ -190,14 +209,58 @@ mod tests {
 
     #[test]
     fn parse_diff_output_skips_unknown_status() {
-        let input = "X\tunknown.txt\n";
+        let input: &[u8] = b"X\0unknown.txt\0";
         let changes = parse_diff_output(input);
         assert!(changes.is_empty());
     }
 
     #[test]
     fn parse_diff_output_handles_empty_input() {
-        let changes = parse_diff_output("");
+        let changes = parse_diff_output(b"");
         assert!(changes.is_empty());
+    }
+
+    /// Non-ASCII (accented / CJK) paths must round-trip through the real
+    /// `git diff --name-status -z` invocation as their true names — not git's
+    /// C-quoted `"caf\303\251.md"` form, which would make incremental
+    /// adds/deletes for such files silently miss.
+    #[test]
+    fn detect_changes_handles_non_ascii_paths() {
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let old = current_head_sha(repo).unwrap();
+
+        std::fs::write(repo.join("café.md"), "accented").unwrap();
+        std::fs::write(repo.join("日本語.md"), "cjk").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "add non-ascii"]);
+        let new = current_head_sha(repo).unwrap();
+
+        let changes = detect_changes(repo, &old, &new).unwrap();
+        assert!(
+            changes.contains(&FileChange::Added(PathBuf::from("café.md"))),
+            "accented path missing/quoted: {changes:?}"
+        );
+        assert!(
+            changes.contains(&FileChange::Added(PathBuf::from("日本語.md"))),
+            "CJK path missing/quoted: {changes:?}"
+        );
     }
 }
