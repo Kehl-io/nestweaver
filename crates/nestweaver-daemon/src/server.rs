@@ -14,6 +14,7 @@ use nestweaver_proto::nest_weaver_daemon_server::{NestWeaverDaemon, NestWeaverDa
 use nestweaver_proto::*;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use tokio::sync::Notify;
+use tonic::codegen::http;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
@@ -3428,6 +3429,151 @@ fn reject_if_read_only(read_only: bool, op: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// gRPC methods that only READ graph/store state. On a read-only snapshot
+/// replica every method NOT in this set is rejected at the single
+/// [`ReadOnlyGuard`] chokepoint (default-deny) — mirroring how PostgreSQL hot
+/// standby, Datasette `--immutable`, and LiteFS reject the entire write class
+/// at one node-level gate instead of a per-operation allowlist that silently
+/// misses a newly-added mutating path (the exact bug this replaces).
+///
+/// Keep this in sync with the proto service definition: the
+/// `read_only_method_partition_is_exhaustive` test fails if a new RPC is added
+/// without classifying it here or as mutating, forcing a deliberate
+/// (fail-closed) read/write decision.
+const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
+    "AffectedTests",
+    "BlastRadius",
+    "BrainBrokenLinks",
+    "BrainDiff",
+    "BrainDocStats",
+    "BrainGuide",
+    "BrainMemoryLint",
+    "BrainMemoryRelated",
+    "BrainOrphanDocuments",
+    "BrainStatus",
+    "BrainStatusJson",
+    "BrainTagGraph",
+    "BrainTopicClusters",
+    "BridgeNodes",
+    "Clusters",
+    "ContractDrift",
+    "CountPatterns",
+    "CrossRepoContracts",
+    "DeadCode",
+    "DetectChanges",
+    "DetectImplicitProjectsJson",
+    "EmbeddingDimension",
+    "ExportGraph",
+    "FlowTrace",
+    "FlowTraceContinue",
+    "GetBacklinks",
+    "GetContext",
+    "GetNote",
+    "GetProjectContext",
+    "GetSummary",
+    "HealthCheck",
+    "HubNodes",
+    "Impact",
+    "ImpactAnalysis",
+    "Investigate",
+    "InvestigateExpand",
+    "InvestigateHydrate",
+    "ListProjectsJson",
+    "ListReposJson",
+    "ListServicesJson",
+    "ListVaultsJson",
+    "PrImpactJson",
+    "QueryExtensions",
+    "ReadSymbols",
+    "RegexSearch",
+    "RepoMapJson",
+    "RepoStates",
+    "Search",
+    "SearchSymbols",
+    "ServeUi",
+    "ServiceSummaryJson",
+    "Shutdown",
+    "StaleCheck",
+    "StopWatch",
+    "SuggestLinksJson",
+    "SymbolLookup",
+];
+
+/// Decide whether a gRPC request must be rejected because this daemon serves a
+/// read-only snapshot replica. `path` is the full gRPC path
+/// (`/package.Service/Method`). Default-deny: any method not known to be a pure
+/// read is rejected with `FAILED_PRECONDITION` (a permanent condition for this
+/// daemon, not a transient error the client should retry).
+fn read_only_rejection(read_only: bool, path: &str) -> Option<Status> {
+    if !read_only {
+        return None;
+    }
+    let method = path.rsplit('/').next().unwrap_or(path);
+    if READ_ONLY_ALLOWED_METHODS.contains(&method) {
+        None
+    } else {
+        Some(Status::failed_precondition(format!(
+            "this daemon serves a read-only snapshot replica; {method} is not available"
+        )))
+    }
+}
+
+/// Single read-only enforcement chokepoint for the whole gRPC surface. Wraps
+/// the generated `NestWeaverDaemonServer` and, on a read-only replica, rejects
+/// every mutating RPC (typed hot-path handlers AND `json_rpc!`-dispatched ones
+/// alike) at the transport layer BEFORE it reaches a handler — so no mutating
+/// handler can do partial work and surface a mid-stream `internal` error, and
+/// the "replica rejects writes with FAILED_PRECONDITION" contract holds for
+/// ALL mutating methods rather than the ~6 that had scattered
+/// `reject_if_read_only` calls. On a read-write daemon it is a transparent
+/// pass-through. Applied once to the shared service so BOTH the TCP and UDS
+/// transports inherit the same gate.
+#[derive(Clone)]
+struct ReadOnlyGuard<S> {
+    inner: S,
+    read_only: bool,
+}
+
+impl<S> ReadOnlyGuard<S> {
+    fn new(read_only: bool, inner: S) -> Self {
+        Self { inner, read_only }
+    }
+}
+
+impl<S, ReqBody> tower::Service<http::Request<ReqBody>> for ReadOnlyGuard<S>
+where
+    S: tower::Service<http::Request<ReqBody>, Response = http::Response<tonic::body::Body>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        if let Some(status) = read_only_rejection(self.read_only, req.uri().path()) {
+            // Trailers-only gRPC error response carrying grpc-status =
+            // FAILED_PRECONDITION; identical shape to what tonic emits for an
+            // interceptor-level rejection.
+            let resp = status.into_http::<tonic::body::Body>();
+            return Box::pin(std::future::ready(Ok(resp)));
+        }
+        Box::pin(self.inner.call(req))
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for ReadOnlyGuard<S> {
+    const NAME: &'static str = S::NAME;
+}
+
 /// Enforce the bind-scope security invariants for a server-mode listener:
 /// a non-loopback bind must be both authenticated (`--auth-token`) and
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
@@ -4016,9 +4162,17 @@ pub async fn run_server(
         });
     }
 
-    let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
-        .max_decoding_message_size(256 * 1024 * 1024)
-        .max_encoding_message_size(256 * 1024 * 1024);
+    // Wrap the generated service in the single read-only chokepoint. On a
+    // read-only snapshot replica this rejects EVERY mutating RPC (typed + JSON)
+    // with FAILED_PRECONDITION before it reaches a handler; on a read-write
+    // daemon it is a transparent pass-through. Applied once here so both the
+    // TCP and UDS transports below inherit the same gate.
+    let svc = ReadOnlyGuard::new(
+        read_only,
+        NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024),
+    );
 
     // Prepare the socket path.
     let sock_dir = lifecycle::runtime_dir(&instance_id);
@@ -6300,5 +6454,232 @@ mod startup_helper_tests {
         );
 
         drop(gate);
+    }
+
+    // ── Read-only replica: single-chokepoint mutating-RPC rejection ─────
+
+    /// The FULL set of gRPC RPCs that mutate daemon/graph state. Includes the
+    /// six that had scattered `reject_if_read_only` guards AND the nine the
+    /// snapshot/replica review flagged as unguarded (they used to reach their
+    /// handlers on a replica and fail mid-stream at the read-only storage
+    /// layer as opaque `internal` errors, or do partial work first).
+    const MUTATING_RPC_METHODS: &[&str] = &[
+        // Previously guarded by reject_if_read_only.
+        "WatchVault",
+        "WatchCode",
+        "IndexRepo",
+        "IndexVault",
+        "RemoveRepo",
+        "MergeInstance",
+        // Previously UNGUARDED — the core of finding #10.
+        "MaterializeProjects",
+        "RemoveVault",
+        "RemoveProject",
+        "PruneStale",
+        "PurgeInstance",
+        "ReindexSearch",
+        "Embed",
+        "SetExtension",
+        "Backup",
+        "BrainMemoryConsolidate",
+        "RefreshBrain",
+    ];
+
+    /// Parametrized over the FULL mutating-RPC set: on a read-only replica the
+    /// single chokepoint must reject every one with FAILED_PRECONDITION, and a
+    /// read-write daemon must reject none of them.
+    #[test]
+    fn read_only_rejects_all_mutating_rpcs() {
+        for m in MUTATING_RPC_METHODS {
+            let path = format!("/nestweaver.daemon.v1.NestWeaverDaemon/{m}");
+            let rej = read_only_rejection(true, &path);
+            assert!(
+                rej.is_some(),
+                "read-only replica must reject mutating RPC {m} at the chokepoint"
+            );
+            assert_eq!(
+                rej.unwrap().code(),
+                tonic::Code::FailedPrecondition,
+                "{m} must be rejected with FAILED_PRECONDITION, not another code"
+            );
+            assert!(
+                read_only_rejection(false, &path).is_none(),
+                "a read-write daemon must NOT reject mutating RPC {m}"
+            );
+        }
+    }
+
+    /// The replica must still serve every pure-read RPC — the chokepoint must
+    /// not over-reject and break the replica's reason for existing.
+    #[test]
+    fn read_only_allows_all_pure_read_rpcs() {
+        for m in READ_ONLY_ALLOWED_METHODS {
+            let path = format!("/nestweaver.daemon.v1.NestWeaverDaemon/{m}");
+            assert!(
+                read_only_rejection(true, &path).is_none(),
+                "read-only replica must still serve read RPC {m}"
+            );
+        }
+    }
+
+    /// Every RPC the proto service exposes is classified as EXACTLY ONE of
+    /// read-allowed or mutating — no overlap, no gaps. A new RPC that is
+    /// neither trips this test, forcing a deliberate fail-closed decision so
+    /// the default-deny chokepoint can never silently miss a mutating path.
+    #[test]
+    fn read_only_method_partition_is_exhaustive() {
+        const ALL_RPC_METHODS: &[&str] = &[
+            "AffectedTests",
+            "Backup",
+            "BlastRadius",
+            "BrainBrokenLinks",
+            "BrainDiff",
+            "BrainDocStats",
+            "BrainGuide",
+            "BrainMemoryConsolidate",
+            "BrainMemoryLint",
+            "BrainMemoryRelated",
+            "BrainOrphanDocuments",
+            "BrainStatus",
+            "BrainStatusJson",
+            "BrainTagGraph",
+            "BrainTopicClusters",
+            "BridgeNodes",
+            "Clusters",
+            "ContractDrift",
+            "CountPatterns",
+            "CrossRepoContracts",
+            "DeadCode",
+            "DetectChanges",
+            "DetectImplicitProjectsJson",
+            "Embed",
+            "EmbeddingDimension",
+            "ExportGraph",
+            "FlowTrace",
+            "FlowTraceContinue",
+            "GetBacklinks",
+            "GetContext",
+            "GetNote",
+            "GetProjectContext",
+            "GetSummary",
+            "HealthCheck",
+            "HubNodes",
+            "Impact",
+            "ImpactAnalysis",
+            "IndexRepo",
+            "IndexVault",
+            "Investigate",
+            "InvestigateExpand",
+            "InvestigateHydrate",
+            "ListProjectsJson",
+            "ListReposJson",
+            "ListServicesJson",
+            "ListVaultsJson",
+            "MaterializeProjects",
+            "MergeInstance",
+            "PrImpactJson",
+            "PruneStale",
+            "PurgeInstance",
+            "QueryExtensions",
+            "ReadSymbols",
+            "RefreshBrain",
+            "RegexSearch",
+            "ReindexSearch",
+            "RemoveProject",
+            "RemoveRepo",
+            "RemoveVault",
+            "RepoMapJson",
+            "RepoStates",
+            "Search",
+            "SearchSymbols",
+            "ServeUi",
+            "ServiceSummaryJson",
+            "SetExtension",
+            "Shutdown",
+            "StaleCheck",
+            "StopWatch",
+            "SuggestLinksJson",
+            "SymbolLookup",
+            "WatchCode",
+            "WatchVault",
+        ];
+        for m in ALL_RPC_METHODS {
+            let is_read = READ_ONLY_ALLOWED_METHODS.contains(m);
+            let is_mut = MUTATING_RPC_METHODS.contains(m);
+            assert!(
+                is_read ^ is_mut,
+                "RPC {m} must be classified as exactly one of read/mutating \
+                 (read={is_read}, mutating={is_mut})"
+            );
+        }
+        assert_eq!(
+            ALL_RPC_METHODS.len(),
+            READ_ONLY_ALLOWED_METHODS.len() + MUTATING_RPC_METHODS.len(),
+            "read + mutating classifications must partition the full RPC set"
+        );
+    }
+
+    /// A minimal inner service that counts how many requests reach it, so we
+    /// can prove the guard rejects a mutating RPC BEFORE the handler runs.
+    #[derive(Clone)]
+    struct CountingService(Arc<AtomicU32>);
+
+    impl tower::Service<http::Request<tonic::body::Body>> for CountingService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: http::Request<tonic::body::Body>) -> Self::Future {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(http::Response::new(tonic::body::Body::default())) })
+        }
+    }
+
+    /// End-to-end at the actual chokepoint the server installs: a mutating RPC
+    /// is rejected with FAILED_PRECONDITION and NEVER reaches the inner
+    /// handler, while a read RPC passes straight through.
+    #[tokio::test]
+    async fn read_only_guard_service_rejects_mutating_and_passes_reads() {
+        use tower::Service as _;
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut guard = ReadOnlyGuard::new(true, CountingService(calls.clone()));
+
+        // Mutating RPC → rejected, inner handler must not run.
+        let req = http::Request::builder()
+            .uri("/nestweaver.daemon.v1.NestWeaverDaemon/PruneStale")
+            .body(tonic::body::Body::default())
+            .unwrap();
+        let resp = guard.call(req).await.unwrap();
+        let status = resp
+            .extensions()
+            .get::<Status>()
+            .expect("rejected response must carry a gRPC Status");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a mutating RPC must be rejected before reaching the handler"
+        );
+
+        // Read RPC → passes through to the inner handler.
+        let req = http::Request::builder()
+            .uri("/nestweaver.daemon.v1.NestWeaverDaemon/Search")
+            .body(tonic::body::Body::default())
+            .unwrap();
+        let _ = guard.call(req).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a read RPC must reach the handler on a read-only replica"
+        );
     }
 }
