@@ -4703,38 +4703,57 @@ pub async fn run_server(
                                     continue;
                                 }
                             };
-                            let mut ls_cmd = std::process::Command::new("git");
-                            ls_cmd.args(&ls_guard.config_args);
-                            ls_cmd.args(["ls-remote", &url, &ref_spec]);
-                            if let Ok(output) = ls_cmd.output() {
-                                let remote_sha = String::from_utf8_lossy(&output.stdout)
-                                    .split_whitespace().next().unwrap_or("").to_string();
-                                let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
-                                let indexed_sha = poll_store.lookup_repo(&r_uid)
-                                    .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
-                                if !remote_sha.is_empty()
-                                    && remote_sha != indexed_sha
-                                    && let Some(ref jq) = poll_job_queue
-                                    && let Ok(queue) = jq.lock()
-                                {
-                                    let canonical_id =
-                                        nestweaver_engine::jobs::canonical_repo_id(&url);
-                                    let _ = queue.upsert(
-                                        &canonical_id,
-                                        &url,
-                                        nestweaver_engine::jobs::JobTrigger::Poll,
-                                        branch.as_deref(),
-                                    );
-                                    // A new commit was just observed — record it so
-                                    // the scheduler's adaptive interval shortens for
-                                    // active repos. Only on new-commit detection;
-                                    // calling this every poll would peg the interval
-                                    // at the min_poll floor.
-                                    scheduler.update_commit_time(
-                                        &repo_id,
-                                        std::time::Instant::now(),
-                                    );
+                            // Run the ls-remote probe OFF the async runtime via
+                            // spawn_blocking, and bounded by GIT_TIMEOUT (which
+                            // kills+reaps the child): a hung remote no longer
+                            // stalls this scheduler task's runtime, and can never
+                            // block past the timeout. The status check inside
+                            // `probe_remote_sha` distinguishes a genuine failure
+                            // (Err → log+skip) from an unadvertised ref
+                            // (Ok(None) → nothing to enqueue).
+                            let probe_args = ls_guard.config_args.clone();
+                            let probe_url = url.clone();
+                            let probe_ref = ref_spec.clone();
+                            let probe = tokio::task::spawn_blocking(move || {
+                                probe_remote_sha(&probe_args, &probe_url, &probe_ref)
+                            })
+                            .await;
+                            let remote_sha = match probe {
+                                Ok(Ok(Some(sha))) => sha,
+                                Ok(Ok(None)) => continue,
+                                Ok(Err(e)) => {
+                                    tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
+                                    continue;
                                 }
+                                Err(e) => {
+                                    tracing::warn!(url = %url, error = %e, "poll ls-remote task panicked");
+                                    continue;
+                                }
+                            };
+                            let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
+                            let indexed_sha = poll_store.lookup_repo(&r_uid)
+                                .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
+                            if remote_sha != indexed_sha
+                                && let Some(ref jq) = poll_job_queue
+                                && let Ok(queue) = jq.lock()
+                            {
+                                let canonical_id =
+                                    nestweaver_engine::jobs::canonical_repo_id(&url);
+                                let _ = queue.upsert(
+                                    &canonical_id,
+                                    &url,
+                                    nestweaver_engine::jobs::JobTrigger::Poll,
+                                    branch.as_deref(),
+                                );
+                                // A new commit was just observed — record it so
+                                // the scheduler's adaptive interval shortens for
+                                // active repos. Only on new-commit detection;
+                                // calling this every poll would peg the interval
+                                // at the min_poll floor.
+                                scheduler.update_commit_time(
+                                    &repo_id,
+                                    std::time::Instant::now(),
+                                );
                             }
                         }
                     }
@@ -5251,10 +5270,121 @@ fn proto_to_atomic_change(
     }
 }
 
+/// Probe a remote's ref SHA via `git ls-remote`, with a hard timeout.
+///
+/// This is the blocking body run off the async runtime by the poll scheduler.
+/// It distinguishes three outcomes so a genuine failure is never mistaken for
+/// "no new commit":
+/// - `Ok(Some(sha))` — the remote advertises the ref.
+/// - `Ok(None)` — ls-remote succeeded but advertised nothing for `ref_spec`
+///   (e.g. an unknown branch); there is simply nothing to enqueue.
+/// - `Err(_)` — git exited non-zero or timed out (unreachable/blackholed remote,
+///   auth failure, bad URL). The caller logs and skips rather than treating the
+///   empty stdout as an up-to-date signal.
+fn probe_remote_sha(
+    config_args: &[String],
+    url: &str,
+    ref_spec: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(config_args);
+    cmd.args(["ls-remote", url, ref_spec]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+        cmd,
+        nestweaver_engine::git_cmd::GIT_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-remote failed for {url} ({ref_spec}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Ok(if sha.is_empty() { None } else { Some(sha) })
+}
+
 #[cfg(test)]
 mod startup_helper_tests {
     use super::*;
     use nestweaver_engine::{RepoConfig, RepoType};
+
+    /// Helper: init a git repo with one commit and return its path.
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "hi").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
+    }
+
+    /// A reachable ref resolves to a 40-char SHA.
+    #[test]
+    fn probe_remote_sha_returns_sha_for_existing_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let url = format!("file://{}", repo.display());
+
+        let sha = probe_remote_sha(&[], &url, "HEAD")
+            .expect("ls-remote against a valid repo should succeed")
+            .expect("HEAD should advertise a SHA");
+        assert_eq!(sha.len(), 40, "should be a full SHA, got {sha:?}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A ref the remote doesn't advertise is `Ok(None)` — successful probe,
+    /// nothing to enqueue — NOT an error.
+    #[test]
+    fn probe_remote_sha_returns_none_for_missing_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let url = format!("file://{}", repo.display());
+
+        let result = probe_remote_sha(&[], &url, "refs/heads/does-not-exist")
+            .expect("ls-remote itself should still succeed for an unknown ref");
+        assert!(
+            result.is_none(),
+            "an unadvertised ref must be None, not a SHA"
+        );
+    }
+
+    /// A failing ls-remote (non-zero exit — e.g. an unreachable repo) must be an
+    /// `Err`, NOT `Ok(None)`. This is the bug: without a status check, git's
+    /// empty stdout on failure is indistinguishable from "no new commit".
+    #[test]
+    fn probe_remote_sha_errors_on_git_failure() {
+        // A path that isn't a git repo → `git ls-remote` exits non-zero with
+        // empty stdout.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bogus = format!("file://{}/not-a-repo", tmp.path().display());
+
+        let result = probe_remote_sha(&[], &bogus, "HEAD");
+        assert!(
+            result.is_err(),
+            "a non-zero git exit must be an error, not Ok(None): {result:?}"
+        );
+    }
 
     /// Dropping the request-future scope (client cancel / disconnect) must trip
     /// the shared cooperative cancel flag, so in-flight `spawn_blocking` work
