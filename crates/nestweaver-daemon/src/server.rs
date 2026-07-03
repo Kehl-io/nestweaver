@@ -3682,15 +3682,76 @@ fn bind_addr_is_loopback(bind_addr: &str) -> bool {
 /// data dir, Litestream) gives each replica private local state; the only
 /// shared artifact is the immutable snapshot.
 ///
-/// Two replicas sharing the *same* `--db` on one host are already rejected
-/// upstream by the pidfile flock (also keyed on `instance_id`), so they never
-/// reach this path — horizontal scale is separate hosts/containers.
+/// Two replicas sharing the *same* `--db` on one host collapse to the same
+/// `instance_id` and thus the same `replica-work-<id>`; that duplicate is
+/// rejected by [`claim_instance_lock`], which is acquired **before**
+/// materialization — so the second boot never truncates a live sibling's copy.
+/// (Horizontal scale is still separate hosts/containers.)
 fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
     let name = format!("replica-work-{instance_id}");
     db_path
         .parent()
         .map(|p| p.join(&name))
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Claim the exclusive per-instance lock — the pidfile flock that makes an
+/// `instance_id` single-owner on this host — and return the pidfile handle
+/// whose lifetime holds the lock (dropping it releases the lock). `None` in
+/// fork mode, where `daemonize2` already holds the flock (acquired pre-fork).
+///
+/// Acquired **before** snapshot materialization so a duplicate replica started
+/// with the identical `--db` (hence identical `instance_id` and
+/// `replica-work-<id>`) is rejected here, before its `materialize_snapshot`
+/// `fs::copy` can truncate a live sibling's open working copy. Two opens of the
+/// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
+/// from a second process fails even though the first holder is also us-shaped.
+fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
+    // Fork mode: the flock is already held by daemonize2 (acquired pre-fork).
+    if std::env::var("NESTWEAVER_DAEMON_FORK").is_ok() {
+        return Ok(None);
+    }
+    // The pidfile lives in the per-instance runtime dir (created on demand).
+    Ok(Some(claim_pidfile_lock(&lifecycle::pidfile_path(
+        instance_id,
+    ))?))
+}
+
+/// Create `pid_path` (and its parent dir), write our pid, and take an exclusive
+/// non-blocking `flock`, returning the handle whose lifetime holds the lock.
+/// Fails if another open file description already holds the lock. Split out from
+/// [`claim_instance_lock`] so the flock semantics are unit-testable against a
+/// plain temp path, without touching the per-instance runtime dir or env.
+fn claim_pidfile_lock(pid_path: &Path) -> Result<std::fs::File, anyhow::Error> {
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create runtime dir: {}", parent.display()))?;
+    }
+
+    let pid_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(pid_path)
+        .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
+
+    {
+        use std::io::Write;
+        write!(&pid_file, "{}", std::process::id())
+            .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = pid_file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            anyhow::bail!("Another daemon instance is already running (pidfile locked)");
+        }
+    }
+
+    Ok(pid_file)
 }
 
 /// Build a rustls TLS acceptor backed by an in-memory self-signed certificate
@@ -3902,10 +3963,17 @@ pub async fn run_server(
         db_path.display()
     );
 
+    // Claim the single-owner instance lock BEFORE materializing a snapshot. A
+    // duplicate replica on the identical `--db` shares this instance id (and its
+    // `replica-work-<id>` dir), so rejecting it here stops its materialize copy
+    // from truncating a live sibling's working copy. Held for the process
+    // lifetime; released on drop. (In fork mode daemonize2 already holds it.)
+    let _pid_guard = claim_instance_lock(&instance_id)?;
+
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the guards
-    // in DaemonState) and the write machinery (flock/worker/scheduler/webhook)
-    // below. Default (`snapshot: None`) keeps the read-write path unchanged.
+    // in DaemonState) and the write machinery (worker/scheduler/webhook) below.
+    // Default (`snapshot: None`) keeps the read-write path unchanged.
     let read_only = server_opts
         .as_ref()
         .and_then(|o| o.snapshot.as_ref())
@@ -4254,38 +4322,8 @@ pub async fn run_server(
     let sock_path = lifecycle::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
 
-    // Write PID file and optionally acquire flock.
-    // In fork mode (daemonize2), the flock is already held by daemonize2.
-    // In foreground mode (launchd / daemon run), we acquire it ourselves.
-    let pid_path = lifecycle::pidfile_path(&instance_id);
-    let _pid_guard: Option<std::fs::File> = if std::env::var("NESTWEAVER_DAEMON_FORK").is_err() {
-        let pid_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&pid_path)
-            .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
-
-        {
-            use std::io::Write;
-            write!(&pid_file, "{}", std::process::id())
-                .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = pid_file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                anyhow::bail!("Another daemon instance is already running (pidfile locked)");
-            }
-        }
-
-        Some(pid_file)
-    } else {
-        None
-    };
+    // The single-owner instance lock (pidfile flock) was already claimed above,
+    // before snapshot materialization — see `claim_instance_lock`.
 
     tracing::info!(
         socket = %sock_path.display(),
@@ -5359,7 +5397,9 @@ pub async fn run_server(
     }
 
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
+    // Drop the instance lock's pidfile on clean shutdown (the flock itself is
+    // released when `_pid_guard` drops at end of scope).
+    let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));
 
     Ok(())
 }
@@ -5862,6 +5902,32 @@ mod startup_helper_tests {
         // … but neither is the old collision-prone shared path.
         assert_ne!(work_a, parent.join("replica-work"));
         assert_ne!(work_b, parent.join("replica-work"));
+    }
+
+    /// The instance lock is exclusive: while one holder keeps the pidfile flock,
+    /// a second claim on the SAME pidfile is refused — this is what stops a
+    /// duplicate same-`--db` replica from proceeding to materialize (and
+    /// truncate a live sibling's working copy). Releasing the first holder frees
+    /// the lock for a fresh claim.
+    #[cfg(unix)]
+    #[test]
+    fn claim_pidfile_lock_is_exclusive_until_released() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_path = tmp.path().join("rt").join("daemon.pid");
+
+        let first = claim_pidfile_lock(&pid_path).expect("first claim should acquire the lock");
+
+        // A second claim on the same pidfile — a duplicate instance — is refused.
+        let err = claim_pidfile_lock(&pid_path)
+            .expect_err("a second claim must be refused while the lock is held");
+        assert!(
+            err.to_string().contains("already running"),
+            "err was: {err}"
+        );
+
+        // Release the first holder; the lock is now free to claim again.
+        drop(first);
+        claim_pidfile_lock(&pid_path).expect("claim should succeed once the lock is released");
     }
 
     /// A reachable ref resolves to a 40-char SHA.
