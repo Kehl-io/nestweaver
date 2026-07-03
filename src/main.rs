@@ -13032,6 +13032,52 @@ fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Quiesce guard for `snapshot build`. A snapshot is a raw copy of the graph
+/// file; if a daemon is actively writing this DB the copy can be torn — and a
+/// torn copy still passes verify/load — so refuse unless the DB is quiesced.
+///
+/// The guarded instance id is derived from the **DB path**, never from a
+/// `--instance` flag: `snapshot build --instance <other>` would otherwise check
+/// the wrong pidfile, miss the daemon actually writing this DB, and capture a
+/// torn hot-copy. Fail CLOSED on a present-but-unreadable/garbage pidfile — we
+/// cannot confirm the daemon is stopped, so refuse rather than risk a torn
+/// snapshot. Mirrors [`ensure_no_live_daemon_for_restore`].
+fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()> {
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+
+    match std::fs::read_to_string(&pidfile) {
+        // No pidfile → nothing claims this DB → quiesced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
+        Err(e) => anyhow::bail!(
+            "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
+             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon (`nestweaver \
+             daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+            pidfile.display(),
+        ),
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            // Present but garbage (non-numeric) → cannot confirm → fail closed.
+            Err(_) => anyhow::bail!(
+                "a pidfile exists at {} but could not be parsed to confirm the daemon is \
+                 stopped — refusing to build a possibly-torn snapshot. Stop the daemon \
+                 (`nestweaver daemon stop` / `nestweaver server stop`) or remove the stale \
+                 pidfile, then retry.",
+                pidfile.display(),
+            ),
+            // Live pid → daemon is writing this DB → refuse.
+            Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
+                "a daemon (pid {pid}) is running on this database {} — a raw snapshot could \
+                 capture a torn, inconsistent copy. Stop it with `nestweaver daemon stop` and \
+                 retry, or use `nestweaver server backup` for a consistent in-process snapshot.",
+                db_path.display(),
+            ),
+            // Dead/stale pid → daemon is gone → quiesced.
+            Ok(_) => Ok(()),
+        },
+    }
+}
+
 /// Run the MCP stdio server using HybridClient for query routing.
 ///
 /// Read-only queries are dispatched through `HybridClient::query()` which
@@ -13210,7 +13256,10 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i32> {
+// `snapshot build` never routes through a daemon: it guards for a quiesced DB
+// and reads the store directly (autospawning a RW daemon would trip that
+// guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
+fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         SnapshotCommands::Build {
             instance,
@@ -13228,6 +13277,13 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 );
             }
 
+            // Quiesce guard FIRST — before touching the store — and derived from
+            // the DB path (not `--instance`) so a mismatched `--instance` can't
+            // bypass detection of a live daemon and yield a torn hot-copy. A
+            // consistent snapshot while the daemon runs is `nestweaver server
+            // backup` (copies under the daemon's write lock).
+            ensure_no_live_daemon_for_snapshot_build(&db_path)?;
+
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
@@ -13237,12 +13293,16 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
             });
 
-            // Fetch repos via daemon RPC (preferred) or direct store open (fallback).
+            // Fetch repos by reading the store directly. The quiesce guard above
+            // guarantees no daemon is writing this DB, so a raw read is safe —
+            // and we must NOT autospawn a RW daemon here (that would itself trip
+            // the quiesce guard on retry). Passing `false` skips the daemon and
+            // takes the read-only store path.
             let repos: Vec<nestweaver_schema::Repo> = {
                 let mut args = serde_json::json!({});
                 args["instance"] = serde_json::json!(&instance_id);
                 if let Some(value) =
-                    try_hybrid_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
+                    try_hybrid_json_rpc(false, &db_path, config.as_deref(), "list_repos", args)
                 {
                     serde_json::from_value(unwrap_hybrid_payload(value))
                         .context("failed to deserialize repos from daemon response")?
@@ -13260,7 +13320,7 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             let embedding_dim: u32 = {
                 let args = serde_json::json!({});
                 if let Some(value) = try_hybrid_json_rpc(
-                    use_daemon,
+                    false,
                     &db_path,
                     config.as_deref(),
                     "embedding_dimension",
@@ -13353,26 +13413,6 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .join(format!("snapshot-{instance_id}"))
             });
-
-            // Quiesce guard: a snapshot is a raw copy of the graph file. If a
-            // daemon is actively writing this DB, the copy can be torn — and a
-            // torn copy still passes verify/load. Refuse unless the DB is
-            // quiesced (no live daemon). For a consistent snapshot while the
-            // daemon runs, `nestweaver server backup` copies under the daemon's
-            // write lock in-process.
-            {
-                let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
-                if let Some(pid) = nestweaver_client::autostart::read_pid(&pidfile)
-                    && nestweaver_client::autostart::is_process_alive(pid)
-                {
-                    anyhow::bail!(
-                        "a daemon (pid {pid}) is running on this database — a raw snapshot \
-                         could capture a torn, inconsistent copy. Stop it with `nestweaver \
-                         daemon stop` and retry, or use `nestweaver server backup` for a \
-                         consistent in-process snapshot."
-                    );
-                }
-            }
 
             nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
 
@@ -13753,6 +13793,94 @@ mod restore_guard_tests {
         assert!(data_dir.path().join("graph.lbug").exists(), "db untouched");
         assert!(sidecar.exists(), "sidecar untouched");
         assert!(!data_dir.path().with_extension("restoring").exists());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_build_guard_tests {
+    use super::*;
+
+    /// Sets `XDG_RUNTIME_DIR` for the lifetime of the guard and restores it on
+    /// drop so a failing test never leaks the var to sibling tests.
+    struct RuntimeDirGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl RuntimeDirGuard {
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var_os("XDG_RUNTIME_DIR");
+            // SAFETY: each guard-touching test holds its own guard; restored on drop.
+            unsafe {
+                std::env::set_var("XDG_RUNTIME_DIR", path);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for RuntimeDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with the set_var in `set`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+    }
+
+    /// A db file plus the pidfile path derived from it (in the isolated runtime dir).
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("graph.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        (data_dir, db, pidfile)
+    }
+
+    /// The guard is keyed on the DB path, so a live daemon on that DB is refused
+    /// regardless of any `--instance` a caller might pass — the `--instance`
+    /// bypass is structurally impossible because the helper never sees it. A
+    /// dead/absent pidfile permits the build.
+    #[test]
+    fn snapshot_build_refuses_live_daemon_by_db_path() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        // Live daemon: pidfile holds THIS process's pid (alive) → refuse.
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let err = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse while a daemon is live on the DB");
+        assert!(err.to_string().contains("daemon"), "err was: {err}");
+
+        // Dead/stale pid → permitted.
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a stale/dead pidfile must not block a build");
+
+        // No pidfile at all → permitted.
+        std::fs::remove_file(&pidfile).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("build permitted when no daemon is live");
+    }
+
+    /// A present-but-garbage pidfile must FAIL CLOSED: we can't confirm the
+    /// daemon is stopped, so refuse rather than capture a torn snapshot. (The
+    /// prior guard used `read_pid`, which returns None on garbage and would have
+    /// permitted the build — a torn-copy hole this closes.)
+    #[test]
+    fn snapshot_build_fails_closed_on_unparseable_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        let err = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse when the pidfile cannot be parsed");
+        assert!(err.to_string().contains("pidfile"), "err was: {err}");
     }
 }
 
