@@ -20,6 +20,49 @@ const LOCAL_WEIGHT: f64 = 1.5;
 /// Weight for server results (baseline).
 const SERVER_WEIGHT: f64 = 1.0;
 
+/// Canonical, instance-independent string form of a [`SymbolIdentity`], used as
+/// the stable secondary sort key so equal-score ties break deterministically
+/// (Elasticsearch #101232 — score ties must not fall back to hash-map order).
+///
+/// Every component is instance-invariant: `repo_url` is the normalized repo key
+/// (`extract_identity`), and `scope_hash` is a fixed-key `DefaultHasher` digest,
+/// so this key is identical across processes and runs.
+fn identity_tiebreaker(id: &SymbolIdentity) -> String {
+    // \u{1f} (unit separator) can't appear in the components, so this is an
+    // injective encoding — distinct identities never collide.
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        id.repo_url, id.file_path, id.symbol_name, id.scope_hash
+    )
+}
+
+/// Sort merged results by `(score desc, tiebreaker asc)` for total determinism.
+/// `keyed` carries each result's identity tiebreaker; `unkeyed` results (no
+/// identity) fall back to their serialized value and sort after keyed ties.
+fn finalize_ordering(
+    keyed: HashMap<SymbolIdentity, MergedResult>,
+    unkeyed: Vec<MergedResult>,
+) -> Vec<MergedResult> {
+    let mut all: Vec<(String, MergedResult)> = keyed
+        .into_iter()
+        .map(|(id, r)| (identity_tiebreaker(&id), r))
+        .collect();
+    // Prefix unkeyed keys with a high separator so keyed results win ties
+    // against unkeyed ones deterministically; the value string keeps unkeyed
+    // ordering stable among themselves.
+    for r in unkeyed {
+        let tb = format!("\u{7f}{}", r.value);
+        all.push((tb, r));
+    }
+    all.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    all.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Merge local and server results using weighted RRF (k=60).
 ///
 /// Local results get a 1.5x multiplier to compensate for asymmetric
@@ -46,22 +89,26 @@ pub fn rrf_merge_weighted(
     let mut scored: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
 
-    // Score local results with weighted RRF
+    // Score local results with weighted RRF. First source to key an identity
+    // owns its content; a repeated identity accumulates its RRF contribution.
     for (rank, val) in local_results.into_iter().enumerate() {
         let rrf_score = local_weight / (rank as f64 + k + 1.0);
         let confidence = infer_confidence(&val);
         match extract_identity(&val) {
-            Some(id) => {
-                scored.insert(
-                    id,
-                    MergedResult {
-                        value: val,
-                        provenance: Provenance::Local,
-                        confidence,
-                        score: rrf_score,
-                    },
-                );
-            }
+            Some(id) => match scored.get_mut(&id) {
+                Some(existing) => existing.score += rrf_score,
+                None => {
+                    scored.insert(
+                        id,
+                        MergedResult {
+                            value: val,
+                            provenance: Provenance::Local,
+                            confidence,
+                            score: rrf_score,
+                        },
+                    );
+                }
+            },
             None => {
                 unkeyed.push(MergedResult {
                     value: val,
@@ -73,17 +120,22 @@ pub fn rrf_merge_weighted(
         }
     }
 
-    // Score server results with baseline weight, merge with local
+    // Score server results with baseline weight, accumulating into local.
     for (rank, val) in server_results.into_iter().enumerate() {
         let rrf_score = SERVER_WEIGHT / (rank as f64 + k + 1.0);
         let confidence = infer_confidence(&val);
         match extract_identity(&val) {
-            Some(id) => {
-                if let Some(existing) = scored.get_mut(&id) {
-                    // Duplicate: local wins on content, accumulate score
-                    existing.provenance = Provenance::Both;
+            Some(id) => match scored.get_mut(&id) {
+                Some(existing) => {
+                    // Duplicate: local wins on content, accumulate score.
+                    // Only escalate to Both when the row came from local — a
+                    // server-internal repeat stays Server.
+                    if existing.provenance == Provenance::Local {
+                        existing.provenance = Provenance::Both;
+                    }
                     existing.score += rrf_score;
-                } else {
+                }
+                None => {
                     scored.insert(
                         id,
                         MergedResult {
@@ -94,7 +146,7 @@ pub fn rrf_merge_weighted(
                         },
                     );
                 }
-            }
+            },
             None => {
                 unkeyed.push(MergedResult {
                     value: val,
@@ -106,13 +158,7 @@ pub fn rrf_merge_weighted(
         }
     }
 
-    let mut results: Vec<_> = scored.into_values().chain(unkeyed).collect();
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results
+    finalize_ordering(scored, unkeyed)
 }
 
 /// Merge with awareness of locally modified files for staleness labeling.
@@ -131,17 +177,20 @@ pub fn rrf_merge_with_modified(
         let rrf_score = LOCAL_WEIGHT / (rank as f64 + RRF_K + 1.0);
         let confidence = assign_confidence(&val, Provenance::Local, locally_modified_files);
         match extract_identity(&val) {
-            Some(id) => {
-                scored.insert(
-                    id,
-                    MergedResult {
-                        value: val,
-                        provenance: Provenance::Local,
-                        confidence,
-                        score: rrf_score,
-                    },
-                );
-            }
+            Some(id) => match scored.get_mut(&id) {
+                Some(existing) => existing.score += rrf_score,
+                None => {
+                    scored.insert(
+                        id,
+                        MergedResult {
+                            value: val,
+                            provenance: Provenance::Local,
+                            confidence,
+                            score: rrf_score,
+                        },
+                    );
+                }
+            },
             None => {
                 unkeyed.push(MergedResult {
                     value: val,
@@ -157,15 +206,18 @@ pub fn rrf_merge_with_modified(
         let rrf_score = SERVER_WEIGHT / (rank as f64 + RRF_K + 1.0);
         let confidence = assign_confidence(&val, Provenance::Server, locally_modified_files);
         match extract_identity(&val) {
-            Some(id) => {
-                if let Some(existing) = scored.get_mut(&id) {
-                    existing.provenance = Provenance::Both;
+            Some(id) => match scored.get_mut(&id) {
+                Some(existing) => {
+                    if existing.provenance == Provenance::Local {
+                        existing.provenance = Provenance::Both;
+                    }
                     existing.score += rrf_score;
                     // If server version is stale, downgrade confidence.
                     if confidence == Confidence::Stale {
                         existing.confidence = Confidence::Stale;
                     }
-                } else {
+                }
+                None => {
                     scored.insert(
                         id,
                         MergedResult {
@@ -176,7 +228,7 @@ pub fn rrf_merge_with_modified(
                         },
                     );
                 }
-            }
+            },
             None => {
                 unkeyed.push(MergedResult {
                     value: val,
@@ -188,13 +240,7 @@ pub fn rrf_merge_with_modified(
         }
     }
 
-    let mut results: Vec<_> = scored.into_values().chain(unkeyed).collect();
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results
+    finalize_ordering(scored, unkeyed)
 }
 
 /// Infer confidence from a result's structural markers.
@@ -238,6 +284,63 @@ mod tests {
         // Local sym_a should rank above server sym_b because of 1.5x weight
         assert_eq!(merged[0].value["symbol_name"], "sym_a");
         assert_eq!(merged[0].provenance, Provenance::Local);
+    }
+
+    #[test]
+    fn rrf_accumulates_duplicate_across_lists() {
+        // Canonical RRF (Cormack et al. 2009): score(d) = Σ_i 1/(k + rank_i(d)).
+        // A doc that appears MULTIPLE times must accumulate every contribution,
+        // never overwrite. Here sym_a appears twice in the local list (ranks 0,1)
+        // and once in the server list (rank 0), so its score must be the SUM of
+        // all three contributions.
+        let local = vec![
+            make_result("repo", "sym_a", "mod::a"),
+            make_result("repo", "sym_a", "mod::a"),
+        ];
+        let server = vec![make_result("repo", "sym_a", "mod::a")];
+
+        let merged = rrf_merge(local, server);
+        assert_eq!(merged.len(), 1, "same identity must collapse to one row");
+        assert_eq!(merged[0].provenance, Provenance::Both);
+
+        let expected = LOCAL_WEIGHT / (0.0 + RRF_K + 1.0)   // local rank 0
+            + LOCAL_WEIGHT / (1.0 + RRF_K + 1.0)            // local rank 1
+            + SERVER_WEIGHT / (0.0 + RRF_K + 1.0); // server rank 0
+        assert!(
+            (merged[0].score - expected).abs() < 1e-12,
+            "score must accumulate all contributions: got {}, want {}",
+            merged[0].score,
+            expected
+        );
+    }
+
+    #[test]
+    fn rrf_merge_is_deterministic() {
+        // Two distinct symbols with EQUAL RRF scores (weight 1.0, both at rank 0).
+        // With only a score-based sort, HashMap iteration order breaks the tie
+        // differently across runs. A stable identity tiebreaker must pin the
+        // order so every run is byte-identical.
+        let local = vec![make_result("repo", "sym_zzz", "mod::z")];
+        let server = vec![make_result("repo", "sym_aaa", "mod::a")];
+
+        let mut orderings = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let merged = rrf_merge_weighted(local.clone(), server.clone(), 60.0, 1.0);
+            assert_eq!(merged.len(), 2);
+            // Scores must be exactly equal for this to test tie determinism.
+            assert!((merged[0].score - merged[1].score).abs() < 1e-12);
+            let order: Vec<String> = merged
+                .iter()
+                .map(|r| r.value["symbol_name"].as_str().unwrap().to_string())
+                .collect();
+            orderings.insert(order);
+        }
+        assert_eq!(
+            orderings.len(),
+            1,
+            "tie ordering must be stable across runs, saw {} distinct orderings",
+            orderings.len()
+        );
     }
 
     #[test]
@@ -356,8 +459,8 @@ mod tests {
         let merged_high = rrf_merge_weighted(local.clone(), server.clone(), 60.0, 10.0);
         assert_eq!(merged_high[0].value["symbol_name"], "local_sym");
 
-        // With weight 1.0 (equal), both are at rank 0 so equal score — order is
-        // nondeterministic, but both should be present
+        // With weight 1.0 (equal), both are at rank 0 so equal score — the tie
+        // is now broken deterministically by identity, and both are present.
         let merged_equal = rrf_merge_weighted(local, server, 60.0, 1.0);
         assert_eq!(merged_equal.len(), 2);
     }
