@@ -3476,6 +3476,84 @@ fn validate_bind_security(
     Ok(())
 }
 
+/// Whether `bind_addr` resolves to a loopback socket address. A string we
+/// cannot parse as a `SocketAddr` (e.g. `localhost:9378`) is treated as
+/// NON-loopback — the safe default, so an ambiguous bind is never assumed to be
+/// process-local when deciding whether cleartext is acceptable.
+///
+/// Only wired into the live path under the `acme` feature; always exercised by
+/// tests, so `dead_code` is allowed only when ACME is compiled out.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn bind_addr_is_loopback(bind_addr: &str) -> bool {
+    matches!(bind_addr.parse::<std::net::SocketAddr>(), Ok(addr) if addr.ip().is_loopback())
+}
+
+/// Build a rustls TLS acceptor backed by an in-memory self-signed certificate
+/// for the given SANs. Used both as the ACME provisioning-failure fallback
+/// (encryption preserved even though the cert is untrusted) and as a hermetic
+/// acceptor in tests. Advertises `h2` + `http/1.1` so gRPC and MCP HTTP both
+/// negotiate over it. Does NO network I/O.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn build_self_signed_acceptor(
+    server_names: &[String],
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    // ACME's directory client and rustls both need an installed default crypto
+    // provider; installing ring here is idempotent with the manual/ACME paths.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Short-lived (self-signed, interim only); ACME's `drive()` swaps in a
+    // trusted cert on the next successful renewal without a restart.
+    let bundle = nestweaver_engine::tls::generate_tls_bundle(server_names, 397, false)
+        .context("generate interim self-signed certificate")?;
+
+    let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse interim self-signed certificate PEM")?;
+    let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
+        .context("parse interim self-signed key PEM")?
+        .context("no private key in generated self-signed bundle")?;
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("configure rustls protocol versions for self-signed fallback")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build rustls ServerConfig for self-signed fallback")?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+        server_config,
+    )))
+}
+
+/// Decide the TLS acceptor after ACME bootstrap has FAILED. This is the
+/// security-critical fallback: a public (non-loopback) listener must NEVER be
+/// downgraded to cleartext because provisioning failed.
+///
+/// - **Loopback bind** → `Ok(None)`: plaintext is acceptable (process-local),
+///   matching the pre-existing loopback fast path.
+/// - **Non-loopback bind** → `Ok(Some(acceptor))`: an interim self-signed TLS
+///   acceptor so bearer tokens and source stay encrypted (the client sees a
+///   trust error, but nothing travels in the clear). ACME keeps retrying in the
+///   background via `drive()` and swaps in a trusted cert without a restart.
+/// - If even the self-signed acceptor cannot be built on a non-loopback bind,
+///   the error propagates so the caller **fails closed** (refuses to bind)
+///   rather than serving plaintext.
+///
+/// No mature ACME server downgrades to plaintext on failure; this mirrors
+/// CertMagic/Caddy and cert-manager behaviour.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn acme_failure_fallback_acceptor(
+    domain: &str,
+    bind_is_loopback: bool,
+) -> anyhow::Result<Option<tokio_rustls::TlsAcceptor>> {
+    if bind_is_loopback {
+        return Ok(None);
+    }
+    Ok(Some(build_self_signed_acceptor(&[domain.to_string()])?))
+}
+
 /// Reject any present webhook secret shorter than [`MIN_WEBHOOK_SECRET_LEN`]
 /// bytes. Both the active secret and the rotation fallback are checked. `None`
 /// secrets (webhook signature verification disabled) are accepted. The error
@@ -4234,8 +4312,46 @@ pub async fn run_server(
                     Some(tokio_rustls::TlsAcceptor::from(server_config))
                 }
                 Err(e) => {
-                    tracing::error!("ACME setup failed; continuing without it: {e:#}");
-                    None
+                    // SECURITY (B1): bootstrap failed. Never downgrade a public
+                    // listener to cleartext. `build_server_config` does NO network
+                    // I/O, so a failure here is a config/filesystem error, not a
+                    // transient network blip (those surface later in `drive()`,
+                    // which already retries with backoff and never crashes). On a
+                    // non-loopback bind we serve an interim self-signed cert
+                    // (encrypted; untrusted) so tokens/source stay off the wire; on
+                    // loopback we may fall through to plaintext.
+                    tracing::error!("ACME setup failed: {e:#}");
+                    let is_loopback = bind_addr_is_loopback(&opts.bind_addr);
+                    match acme_failure_fallback_acceptor(domain, is_loopback) {
+                        Ok(Some(acceptor)) => {
+                            tracing::warn!(
+                                domain,
+                                "serving an INTERIM SELF-SIGNED certificate (clients \
+                                 will see a trust warning) so traffic stays encrypted; \
+                                 fix the ACME error and restart to provision a trusted \
+                                 cert. Traffic is NOT in cleartext."
+                            );
+                            eprintln!(
+                                "[daemon] ACME provisioning failed; serving interim \
+                                 self-signed TLS for {domain} (untrusted, encrypted). \
+                                 Fix the cause and restart for a trusted cert."
+                            );
+                            Some(acceptor)
+                        }
+                        Ok(None) => {
+                            // Loopback: plaintext is acceptable (process-local).
+                            None
+                        }
+                        Err(fe) => {
+                            // Fail closed: refuse to bind rather than serve cleartext.
+                            anyhow::bail!(
+                                "ACME provisioning failed and the self-signed TLS \
+                                 fallback could not be built for a non-loopback bind \
+                                 ({}); refusing to bind in cleartext: {fe:#}",
+                                opts.bind_addr
+                            );
+                        }
+                    }
                 }
             },
             None => None,
@@ -5550,6 +5666,39 @@ mod startup_helper_tests {
         assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None, true).is_ok());
         // ...but ACME does not waive the auth requirement.
         assert!(validate_bind_security("0.0.0.0:9378", &None, &None, &None, true).is_err());
+    }
+
+    #[test]
+    fn acme_bootstrap_failure_never_serves_plaintext() {
+        // SECURITY (B1): when ACME provisioning fails on a NON-loopback bind, the
+        // fallback decision must be a TLS acceptor (self-signed interim) — never a
+        // `None` "serve plaintext" state. Encryption is preserved even though the
+        // interim cert is untrusted.
+        let non_loopback = acme_failure_fallback_acceptor("example.com", false)
+            .expect("non-loopback ACME failure must produce a TLS acceptor, not error");
+        assert!(
+            non_loopback.is_some(),
+            "non-loopback ACME failure must fall back to TLS, never cleartext"
+        );
+
+        // Loopback is process-local, so plaintext is acceptable there (matches the
+        // pre-existing loopback fast path): the decision is `None`.
+        let loopback = acme_failure_fallback_acceptor("example.com", true)
+            .expect("loopback fallback decision must not error");
+        assert!(
+            loopback.is_none(),
+            "loopback ACME failure may serve plaintext (process-local)"
+        );
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_classifies_safely() {
+        assert!(bind_addr_is_loopback("127.0.0.1:9378"));
+        assert!(bind_addr_is_loopback("[::1]:9378"));
+        assert!(!bind_addr_is_loopback("0.0.0.0:9378"));
+        assert!(!bind_addr_is_loopback("10.0.0.5:9378"));
+        // Unparseable → treated as non-loopback (safe default).
+        assert!(!bind_addr_is_loopback("localhost:9378"));
     }
 
     #[test]
