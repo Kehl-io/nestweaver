@@ -5291,7 +5291,7 @@ fn probe_remote_sha(
     cmd.args(["ls-remote", url, ref_spec]);
     let output = nestweaver_engine::git_cmd::run_git_with_timeout(
         cmd,
-        nestweaver_engine::git_cmd::GIT_TIMEOUT,
+        nestweaver_engine::git_cmd::git_net_timeout(),
     )?;
     if !output.status.success() {
         anyhow::bail!(

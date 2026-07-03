@@ -9,6 +9,18 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+/// Git config that makes an HTTP(S) transfer self-abort when it stalls: if the
+/// transfer rate stays below 1000 bytes/s for 60 continuous seconds, git errors
+/// out on its own. This lets a slow-but-progressing clone/fetch survive the
+/// generous wall-clock timeout while a truly-stalled transfer dies early. No
+/// effect on `file://` or `ssh://` remotes (they ignore `http.*`).
+const HTTP_LOW_SPEED_ARGS: [&str; 4] = [
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=60",
+];
+
 /// A single blobless bare clone of a remote git repository.
 #[derive(Debug, Clone)]
 pub struct BareClone {
@@ -43,13 +55,14 @@ impl BareClone {
         let guard = crate::ssrf::guard_git_url(&self.url)?;
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
+        cmd.args(HTTP_LOW_SPEED_ARGS);
         cmd.arg("-C").arg(&self.path).args(["fetch", "origin"]);
         if let Some(b) = branch {
             cmd.arg(format!("{b}:refs/heads/{b}"));
         }
         // Hard timeout so a blackholed remote can't wedge the worker (and its
-        // semaphore permit) forever — it kills+reaps the child on timeout.
-        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+        // semaphore permit) forever — it kills+reaps the process group on timeout.
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
             .context("failed to run git fetch")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -65,7 +78,7 @@ impl BareClone {
     pub fn sha_for_ref(&self, reference: &str) -> Result<String> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.path).args(["rev-parse", reference]);
-        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
             .with_context(|| format!("failed to run git rev-parse {reference}"))?;
         if !output.status.success() {
             anyhow::bail!(
@@ -81,7 +94,7 @@ impl BareClone {
     pub fn head_sha(&self) -> Result<String> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.path).args(["rev-parse", "HEAD"]);
-        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
             .context("failed to run git rev-parse HEAD")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -115,7 +128,7 @@ impl BareClone {
         cmd.arg("-C")
             .arg(&self.path)
             .args(["ls-remote", "origin", "HEAD"]);
-        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
             .context("failed to run git ls-remote")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -196,6 +209,7 @@ impl BareCloneWorkspace {
 
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
+        cmd.args(HTTP_LOW_SPEED_ARGS);
         cmd.args([
             "clone",
             "--filter=blob:none",
@@ -204,9 +218,12 @@ impl BareCloneWorkspace {
             url,
             &dest.display().to_string(),
         ]);
-        // Hard timeout so a hung clone against an unreachable remote can't wedge
-        // the worker task and leak its semaphore permit.
-        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+        // A blobless bare clone still transfers full commit+tree history, so it
+        // gets the generous clone timeout (not the short net timeout) — a
+        // slow-but-progressing clone must survive. The `http.lowSpeed*` guards let
+        // git self-abort a truly stalled transfer well before the wall-clock cap;
+        // on timeout the process group is killed so no hung clone leaks a permit.
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_clone_timeout())
             .with_context(|| {
                 format!("failed to run git clone --filter=blob:none --bare for {url}")
             })?;
@@ -282,7 +299,7 @@ fn read_origin_url(bare_path: &Path) -> Result<String> {
     cmd.arg("-C")
         .arg(bare_path)
         .args(["config", "--get", "remote.origin.url"]);
-    let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+    let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
         .context("failed to run git config")?;
     if !output.status.success() {
         anyhow::bail!("no origin URL configured");
