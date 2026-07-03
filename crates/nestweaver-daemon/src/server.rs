@@ -3589,6 +3589,39 @@ async fn accept_tls_with_timeout(
     }
 }
 
+/// Ceiling on TLS handshakes in flight at once per public listener. The
+/// per-connection handshake tasks (B3) each hold a `TcpStream` + acceptor Arc
+/// for up to [`TLS_HANDSHAKE_TIMEOUT`]; without a cap, a flood of
+/// connecting-but-silent clients would spawn unbounded tasks and exhaust
+/// memory/FDs. A semaphore with this many permits backpressures the accept
+/// loop instead.
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+
+/// Run one TLS handshake while holding `permit` for its whole duration, so the
+/// caller's semaphore bounds how many handshakes run concurrently (the permit
+/// is released when this future completes — on success, timeout, or error). A
+/// completed stream is forwarded to `tx`; a timeout/error drops the connection.
+async fn drive_capped_handshake(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    timeout: Duration,
+    tx: tokio::sync::mpsc::Sender<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    label: &'static str,
+) {
+    // Held until this future returns, then dropped → permit returned to the pool.
+    let _permit = permit;
+    match accept_tls_with_timeout(&acceptor, stream, timeout).await {
+        Ok(Some(tls)) => {
+            let _ = tx.send(tls).await;
+        }
+        Ok(None) => {
+            tracing::debug!("{label} TLS handshake timed out; dropping connection")
+        }
+        Err(e) => tracing::debug!("{label} TLS handshake failed: {e}"),
+    }
+}
+
 /// Reject any present webhook secret shorter than [`MIN_WEBHOOK_SECRET_LEN`]
 /// bytes. Both the active secret and the rotation fallback are checked. `None`
 /// secrets (webhook signature verification disabled) are accepted. The error
@@ -4471,43 +4504,51 @@ pub async fn run_server(
 
         let mcp_tls_acceptor = tls_config.as_ref().map(|(_, a)| a.clone());
         let mut mcp_shutdown_rx = shutdown_tx.subscribe();
+        let mut mcp_accept_shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             if let Some(acceptor) = mcp_tls_acceptor {
                 // B3: run each TLS handshake in its OWN task under a timeout and
                 // funnel only completed handshakes through a channel, so a peer
                 // that connects and never sends a ClientHello can't stall accepts
-                // for every other client on this public listener.
+                // for every other client on this public listener. A semaphore caps
+                // in-flight handshakes so a silent-client flood can't exhaust
+                // resources, and the accept task exits on shutdown so it doesn't
+                // leak the listener / spawn doomed handshakes.
                 let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::channel::<
                     tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
                 >(256);
+                let handshake_sem =
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
                 tokio::spawn(async move {
                     loop {
-                        match mcp_listener.accept().await {
-                            Ok((stream, _addr)) => {
-                                let acceptor = acceptor.clone();
-                                let handshake_tx = handshake_tx.clone();
-                                tokio::spawn(async move {
-                                    match accept_tls_with_timeout(
-                                        &acceptor,
-                                        stream,
-                                        TLS_HANDSHAKE_TIMEOUT,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(tls_stream)) => {
-                                            let _ = handshake_tx.send(tls_stream).await;
-                                        }
-                                        Ok(None) => tracing::debug!(
-                                            "MCP TLS handshake timed out; dropping connection"
-                                        ),
-                                        Err(e) => {
-                                            tracing::debug!("MCP TLS handshake failed: {e}")
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => tracing::debug!("MCP TCP accept failed: {e}"),
-                        }
+                        let (stream, _addr) = tokio::select! {
+                            _ = mcp_accept_shutdown_rx.changed() => break,
+                            res = mcp_listener.accept() => match res {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::debug!("MCP TCP accept failed: {e}");
+                                    continue;
+                                }
+                            },
+                        };
+                        // Backpressure: wait for a handshake permit before spawning.
+                        let permit = tokio::select! {
+                            _ = mcp_accept_shutdown_rx.changed() => break,
+                            res = handshake_sem.clone().acquire_owned() => match res {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                        };
+                        let acceptor = acceptor.clone();
+                        let handshake_tx = handshake_tx.clone();
+                        tokio::spawn(drive_capped_handshake(
+                            permit,
+                            acceptor,
+                            stream,
+                            TLS_HANDSHAKE_TIMEOUT,
+                            handshake_tx,
+                            "MCP",
+                        ));
                     }
                 });
                 let mut shutdown = Box::pin(mcp_shutdown_rx.changed());
@@ -4575,6 +4616,7 @@ pub async fn run_server(
 
             let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
             let mut tcp_shutdown_rx = shutdown_tx.subscribe();
+            let mut grpc_accept_shutdown_rx = shutdown_tx.subscribe();
 
             // When an auth token is configured, wrap the TCP service with a
             // bearer-token interceptor + rate limiting. UDS stays unauthenticated.
@@ -4611,48 +4653,58 @@ pub async fn run_server(
                     // static-Identity only). The ACME resolver also serves the
                     // acme-tls/1 challenge; those handshakes complete then close.
                     Some((None, acme_acceptor)) => {
+                        use futures::StreamExt;
                         // B3: spawn each handshake in its own task under a timeout
                         // and feed completed TLS conns to tonic via a channel, so a
-                        // stalled peer can't block new gRPC connections.
+                        // stalled peer can't block new gRPC connections. A semaphore
+                        // caps in-flight handshakes (silent-client flood), and the
+                        // accept task exits on shutdown rather than leaking.
                         let (tls_tx, tls_rx) = tokio::sync::mpsc::channel::<
-                            Result<
-                                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-                                std::io::Error,
-                            >,
+                            tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
                         >(256);
+                        let handshake_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                            MAX_INFLIGHT_HANDSHAKES,
+                        ));
                         tokio::spawn(async move {
-                            use futures::StreamExt;
                             let mut tcp = tcp_stream;
-                            while let Some(conn) = tcp.next().await {
-                                match conn {
-                                    Ok(tcp_conn) => {
-                                        let acme_acceptor = acme_acceptor.clone();
-                                        let tls_tx = tls_tx.clone();
-                                        tokio::spawn(async move {
-                                            match accept_tls_with_timeout(
-                                                &acme_acceptor,
-                                                tcp_conn,
-                                                TLS_HANDSHAKE_TIMEOUT,
-                                            )
-                                            .await
-                                            {
-                                                Ok(Some(tls)) => {
-                                                    let _ = tls_tx.send(Ok(tls)).await;
-                                                }
-                                                Ok(None) => tracing::debug!(
-                                                    "gRPC TLS handshake timed out; dropping connection"
-                                                ),
-                                                Err(e) => tracing::debug!(
-                                                    "gRPC TLS handshake failed: {e}"
-                                                ),
-                                            }
-                                        });
+                            loop {
+                                let conn = tokio::select! {
+                                    _ = grpc_accept_shutdown_rx.changed() => break,
+                                    c = tcp.next() => match c {
+                                        Some(c) => c,
+                                        None => break,
+                                    },
+                                };
+                                let tcp_conn = match conn {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::debug!("gRPC TCP accept failed: {e}");
+                                        continue;
                                     }
-                                    Err(e) => tracing::debug!("gRPC TCP accept failed: {e}"),
-                                }
+                                };
+                                let permit = tokio::select! {
+                                    _ = grpc_accept_shutdown_rx.changed() => break,
+                                    res = handshake_sem.clone().acquire_owned() => match res {
+                                        Ok(p) => p,
+                                        Err(_) => break,
+                                    },
+                                };
+                                let acme_acceptor = acme_acceptor.clone();
+                                let tls_tx = tls_tx.clone();
+                                tokio::spawn(drive_capped_handshake(
+                                    permit,
+                                    acme_acceptor,
+                                    tcp_conn,
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    tls_tx,
+                                    "gRPC",
+                                ));
                             }
                         });
-                        let tls_incoming = tokio_stream::wrappers::ReceiverStream::new(tls_rx);
+                        // tonic wants a stream of `Result<conn, E>`; our channel
+                        // carries only successfully-handshaked streams.
+                        let tls_incoming = tokio_stream::wrappers::ReceiverStream::new(tls_rx)
+                            .map(Ok::<_, std::io::Error>);
                         let _ = builder
                             .add_service(tcp_svc)
                             .serve_with_incoming_shutdown(tls_incoming, shutdown)
@@ -5835,6 +5887,58 @@ mod startup_helper_tests {
             "a silent client must time out (Ok(None)), got {result:?}"
         );
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn handshake_concurrency_is_capped() {
+        // B3 follow-up: each in-flight handshake holds a semaphore permit for its
+        // whole duration, so N stalled (silent) handshakes exhaust an N-permit
+        // pool — the accept loop cannot spawn an (N+1)th until one releases. This
+        // caps the self-inflicted DoS of unbounded per-connection tasks.
+        use std::sync::Arc;
+        use tokio::sync::{Semaphore, mpsc};
+
+        let acceptor = build_self_signed_acceptor(&["localhost".to_string()]).unwrap();
+        let sem = Arc::new(Semaphore::new(2));
+        let (tx, _rx) = mpsc::channel(8);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Occupy both permits with silent clients (never send a ClientHello).
+        let mut handles = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            clients.push(client);
+            let (server_stream, _) = listener.accept().await.unwrap();
+            handles.push(tokio::spawn(drive_capped_handshake(
+                permit,
+                acceptor.clone(),
+                server_stream,
+                Duration::from_millis(300),
+                tx.clone(),
+                "test",
+            )));
+        }
+
+        // Both permits are held while the handshakes are in flight: the cap is
+        // reached, so no further permit is available right now.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "in-flight handshakes must hold the permits (cap reached)"
+        );
+
+        // Once the handshakes time out, their permits are returned to the pool.
+        for h in handles {
+            let _ = h.await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "permits must be released after handshakes finish"
+        );
+        drop(clients);
     }
 
     #[tokio::test]
