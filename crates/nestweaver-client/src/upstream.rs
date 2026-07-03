@@ -292,20 +292,9 @@ impl UpstreamHandle {
         self.health.mark_down(now_ms());
     }
 
-    /// Administrative/manual restore to rotation. The background recovery path
-    /// uses [`HealthState::apply_probe_result`] instead.
-    pub fn mark_healthy(&self) {
-        self.health.mark_up();
-    }
-
     /// Get a clone of the shared health state for use in background tasks.
     pub fn health_ref(&self) -> Arc<HealthState> {
         Arc::clone(&self.health)
-    }
-
-    /// Get the token (if any) for use in background health checks.
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
     }
 
     /// Fold an observed *successful* RPC duration into the latency EWMA.

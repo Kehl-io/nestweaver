@@ -105,6 +105,11 @@ pub struct HybridClient {
     /// ZERO upstream I/O — so upstream RTT can never inflate query latency or
     /// blank out `_meta.stale_repos` via a timed-out per-query probe.
     stale_verdict: Arc<Mutex<Vec<String>>>,
+    /// Serializes the recount→eject decision in [`eject_with_cap`] so two
+    /// concurrent failing queries can't both observe "under cap" and both
+    /// eject, breaching [`MAX_EJECTION_PERCENT`]. The correctness of the
+    /// blast-radius guard must not rest on callers being single-threaded.
+    ejection_guard: Arc<Mutex<()>>,
     /// Handle to the background maintenance task (active health recovery +
     /// staleness refresh). `None` until [`HybridClient::start_maintenance`] is
     /// called (only the long-lived MCP session needs it; one-shot CLI commands
@@ -160,6 +165,7 @@ impl HybridClient {
             local,
             upstreams,
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
+            ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
         })
     }
@@ -170,6 +176,7 @@ impl HybridClient {
             local: client,
             upstreams: vec![],
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
+            ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
         }
     }
@@ -181,6 +188,7 @@ impl HybridClient {
             local,
             upstreams,
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
+            ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
         }
     }
@@ -465,8 +473,15 @@ impl HybridClient {
 
         // Prepare the server future before borrowing self.local mutably.
         // Pick the first healthy upstream and clone its client (cheap channel clone).
+        // Capture its *index* so that, on failure, we eject exactly the handle
+        // this task queried — not whatever `find_upstream_for_repo` happens to
+        // resolve to later (which can differ when several upstreams match the
+        // repo or health state changes concurrently).
         let repo_hint = extract_repo_hint(params);
-        let server_task = find_upstream_for_repo(&self.upstreams, repo_hint).map(|u| {
+        let selected_idx = find_upstream_for_repo(&self.upstreams, repo_hint)
+            .and_then(|u| self.upstreams.iter().position(|x| std::ptr::eq(x, u)));
+        let server_task = selected_idx.map(|idx| {
+            let u = &self.upstreams[idx];
             let timeout = effective_timeout(u.mode, u);
             let mut client = u.client();
             let token = u.auth_token().map(|t| t.to_string());
@@ -511,9 +526,15 @@ impl HybridClient {
                 debug!(error = %e, "merge: server query failed, using local only");
                 // Consistent with the primary/fallback path: a failed live
                 // query passively ejects the upstream (subject to the cap) so
-                // the background task can re-probe and recover it.
-                if let Some(u) = find_upstream_for_repo(&self.upstreams, repo_hint) {
-                    eject_with_cap(u, &self.upstreams, "merge query failed");
+                // the background task can re-probe and recover it. Eject the
+                // exact handle this task queried.
+                if let Some(idx) = selected_idx {
+                    eject_with_cap(
+                        &self.upstreams[idx],
+                        &self.upstreams,
+                        &self.ejection_guard,
+                        "merge query failed",
+                    );
                 }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
@@ -521,8 +542,13 @@ impl HybridClient {
             }
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
-                if let Some(u) = find_upstream_for_repo(&self.upstreams, repo_hint) {
-                    eject_with_cap(u, &self.upstreams, "merge query timed out");
+                if let Some(idx) = selected_idx {
+                    eject_with_cap(
+                        &self.upstreams[idx],
+                        &self.upstreams,
+                        &self.ejection_guard,
+                        "merge query timed out",
+                    );
                 }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
@@ -537,6 +563,10 @@ impl HybridClient {
     /// the query hot path (RFC 5861 stale-while-revalidate). Replaces the old
     /// per-query `RepoStates` probe that was bounded by a hostile 50ms timeout
     /// and so silently disabled staleness detection on any WAN upstream.
+    ///
+    /// The verdict is empty until the maintenance task's first background
+    /// refresh completes (a few ms after `start_maintenance`), so an early
+    /// query may report no stale repos — the next refresh corrects it.
     fn current_stale_repos(&self) -> Vec<String> {
         read_stale_verdict(&self.stale_verdict)
     }
@@ -671,7 +701,12 @@ impl HybridClient {
             }
             Ok(Err(e)) => {
                 debug!(upstream = %upstream.name, error = %e, "upstream query failed");
-                eject_with_cap(upstream, &self.upstreams, "query failed");
+                eject_with_cap(
+                    upstream,
+                    &self.upstreams,
+                    &self.ejection_guard,
+                    "query failed",
+                );
                 Err(e)
             }
             Err(_) => {
@@ -680,7 +715,12 @@ impl HybridClient {
                     timeout_ms = timeout.as_millis() as u64,
                     "upstream query timed out"
                 );
-                eject_with_cap(upstream, &self.upstreams, "query timed out");
+                eject_with_cap(
+                    upstream,
+                    &self.upstreams,
+                    &self.ejection_guard,
+                    "query timed out",
+                );
                 anyhow::bail!("upstream query timed out after {}ms", timeout.as_millis())
             }
         }
@@ -738,7 +778,23 @@ fn read_stale_verdict(verdict: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 /// [`MAX_EJECTION_PERCENT`] of upstreams local-only at once (Envoy
 /// `max_ejection_percent`). Recovery is the background task's job — this only
 /// ever marks *down*, never permanently.
-fn eject_with_cap(upstream: &UpstreamHandle, all: &[UpstreamHandle], reason: &str) {
+///
+/// The recount→decide→eject sequence runs under `guard` so two concurrent
+/// failing queries can't both read "under cap" and both eject, exceeding the
+/// cap during exactly the correlated-blip scenario it exists for. Recovery
+/// (`mark_up`) only ever *frees* a slot, so it needs no lock — serializing
+/// the increment side alone upholds the invariant. `guard` synchronizes the
+/// Relaxed health loads/stores (mutex acquire/release = happens-before), so
+/// each ejection observes all prior ones.
+fn eject_with_cap(
+    upstream: &UpstreamHandle,
+    all: &[UpstreamHandle],
+    guard: &Mutex<()>,
+    reason: &str,
+) {
+    // Poison-tolerant: the guard protects only the decision, so a panicked
+    // prior holder must not brick ejection.
+    let _decision = guard.lock().unwrap_or_else(|e| e.into_inner());
     let total = all.len();
     let currently_ejected = all.iter().filter(|u| !u.is_healthy()).count();
     if can_eject(total, currently_ejected, MAX_EJECTION_PERCENT) {
@@ -2866,17 +2922,50 @@ mod tests {
             UpstreamHandle::from_config(&cfg("a")).unwrap(),
             UpstreamHandle::from_config(&cfg("b")).unwrap(),
         ];
+        let guard = Mutex::new(());
 
         // First failure ejects one (0 ejected < cap of 1).
-        eject_with_cap(&all[0], &all, "query failed");
+        eject_with_cap(&all[0], &all, &guard, "query failed");
         assert!(!all[0].is_healthy());
 
         // Second failure would exceed the cap → the upstream stays healthy.
-        eject_with_cap(&all[1], &all, "query failed");
+        eject_with_cap(&all[1], &all, &guard, "query failed");
         assert!(
             all[1].is_healthy(),
             "blast-radius guard must keep the last upstream in rotation"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ejection_respects_cap() {
+        // Two upstreams, 50% cap → at most one may be ejected. Two threads
+        // each try to eject a *different* upstream at the same instant; the
+        // shared guard must serialize the recount→eject decision so exactly
+        // one wins. Without the guard both could read "0 ejected" and eject,
+        // breaching the cap during the correlated-blip scenario it guards.
+        let cfg = |name: &str| crate::discovery::UpstreamConfig {
+            name: Some(name.to_string()),
+            url: "http://127.0.0.1:19990".to_string(),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Merge,
+            timeout: "1s".to_string(),
+            ca_cert: None,
+        };
+        let all = vec![
+            UpstreamHandle::from_config(&cfg("a")).unwrap(),
+            UpstreamHandle::from_config(&cfg("b")).unwrap(),
+        ];
+        let guard = Mutex::new(());
+
+        std::thread::scope(|s| {
+            for u in &all {
+                s.spawn(|| eject_with_cap(u, &all, &guard, "race"));
+            }
+        });
+
+        let ejected = all.iter().filter(|u| !u.is_healthy()).count();
+        assert_eq!(ejected, 1, "cap must hold under concurrent ejection");
     }
 
     #[tokio::test]
