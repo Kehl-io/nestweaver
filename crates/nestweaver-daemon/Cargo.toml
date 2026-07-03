@@ -43,10 +43,13 @@ hyper-util = { workspace = true }
 # rustls ^0.23 + tokio-rustls ^0.26 (the exact stack tonic 0.14 uses). Optional
 # and gated behind the `acme` feature so the default build pulls nothing extra.
 tokio-rustls-acme = { version = "0.9.1", optional = true }
+# Needed to implement the ACME `Cache` traits for AtomicDirCache. Gated behind
+# `acme` so the default build pulls nothing extra.
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
 embed = ["dep:nestweaver-embed", "nestweaver-engine/embed", "nestweaver-mcp/embed"]
-acme = ["dep:tokio-rustls-acme"]
+acme = ["dep:tokio-rustls-acme", "dep:async-trait"]

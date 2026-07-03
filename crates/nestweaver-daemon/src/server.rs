@@ -3564,6 +3564,31 @@ fn acme_failure_fallback_acceptor(
     Ok(Some(build_self_signed_acceptor(&[domain.to_string()])?))
 }
 
+/// Per-connection TLS handshake budget. A client that opens a TCP connection
+/// but never sends a ClientHello must not stall the accept loop, so each
+/// handshake runs in its own task under this timeout (B3 — serial-handshake DoS).
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run a single TLS handshake under [`TLS_HANDSHAKE_TIMEOUT`].
+///
+/// - `Ok(Some(tls))` — handshake completed.
+/// - `Ok(None)` — the handshake timed out; the caller drops the connection.
+/// - `Err(e)` — the handshake failed (bad ClientHello, etc.).
+///
+/// This isolates a slow/stalled peer to its own task+timeout so it cannot block
+/// new connections on a public listener.
+async fn accept_tls_with_timeout(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    timeout: Duration,
+) -> std::io::Result<Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
+    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => Ok(Some(tls)),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Ok(None),
+    }
+}
+
 /// Reject any present webhook secret shorter than [`MIN_WEBHOOK_SECRET_LEN`]
 /// bytes. Both the active secret and the rotation fallback are checked. `None`
 /// secrets (webhook signature verification disabled) are accepted. The error
@@ -4448,28 +4473,47 @@ pub async fn run_server(
         let mut mcp_shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             if let Some(acceptor) = mcp_tls_acceptor {
-                let incoming = async_stream::stream! {
+                // B3: run each TLS handshake in its OWN task under a timeout and
+                // funnel only completed handshakes through a channel, so a peer
+                // that connects and never sends a ClientHello can't stall accepts
+                // for every other client on this public listener.
+                let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::channel::<
+                    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                >(256);
+                tokio::spawn(async move {
                     loop {
                         match mcp_listener.accept().await {
                             Ok((stream, _addr)) => {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        let result: Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error> = Ok(tls_stream);
-                                        yield result;
+                                let acceptor = acceptor.clone();
+                                let handshake_tx = handshake_tx.clone();
+                                tokio::spawn(async move {
+                                    match accept_tls_with_timeout(
+                                        &acceptor,
+                                        stream,
+                                        TLS_HANDSHAKE_TIMEOUT,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(tls_stream)) => {
+                                            let _ = handshake_tx.send(tls_stream).await;
+                                        }
+                                        Ok(None) => tracing::debug!(
+                                            "MCP TLS handshake timed out; dropping connection"
+                                        ),
+                                        Err(e) => {
+                                            tracing::debug!("MCP TLS handshake failed: {e}")
+                                        }
                                     }
-                                    Err(e) => tracing::debug!("MCP TLS handshake failed: {e}"),
-                                }
+                                });
                             }
                             Err(e) => tracing::debug!("MCP TCP accept failed: {e}"),
                         }
                     }
-                };
-                use futures::StreamExt;
-                tokio::pin!(incoming);
+                });
                 let mut shutdown = Box::pin(mcp_shutdown_rx.changed());
                 loop {
                     tokio::select! {
-                        Some(Ok(stream)) = incoming.next() => {
+                        Some(stream) = handshake_rx.recv() => {
                             // Serving the router directly via hyper here does not
                             // populate `ConnectInfo<SocketAddr>`, so the nested
                             // device-flow `/auth` rate limiter (`auth_rate_limit_key`)
@@ -4567,19 +4611,48 @@ pub async fn run_server(
                     // static-Identity only). The ACME resolver also serves the
                     // acme-tls/1 challenge; those handshakes complete then close.
                     Some((None, acme_acceptor)) => {
-                        use futures::StreamExt;
-                        let tls_incoming = async_stream::stream! {
+                        // B3: spawn each handshake in its own task under a timeout
+                        // and feed completed TLS conns to tonic via a channel, so a
+                        // stalled peer can't block new gRPC connections.
+                        let (tls_tx, tls_rx) = tokio::sync::mpsc::channel::<
+                            Result<
+                                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                                std::io::Error,
+                            >,
+                        >(256);
+                        tokio::spawn(async move {
+                            use futures::StreamExt;
                             let mut tcp = tcp_stream;
                             while let Some(conn) = tcp.next().await {
                                 match conn {
-                                    Ok(tcp_conn) => match acme_acceptor.accept(tcp_conn).await {
-                                        Ok(tls) => yield Ok::<_, std::io::Error>(tls),
-                                        Err(e) => tracing::debug!("gRPC TLS handshake failed: {e}"),
-                                    },
+                                    Ok(tcp_conn) => {
+                                        let acme_acceptor = acme_acceptor.clone();
+                                        let tls_tx = tls_tx.clone();
+                                        tokio::spawn(async move {
+                                            match accept_tls_with_timeout(
+                                                &acme_acceptor,
+                                                tcp_conn,
+                                                TLS_HANDSHAKE_TIMEOUT,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(tls)) => {
+                                                    let _ = tls_tx.send(Ok(tls)).await;
+                                                }
+                                                Ok(None) => tracing::debug!(
+                                                    "gRPC TLS handshake timed out; dropping connection"
+                                                ),
+                                                Err(e) => tracing::debug!(
+                                                    "gRPC TLS handshake failed: {e}"
+                                                ),
+                                            }
+                                        });
+                                    }
                                     Err(e) => tracing::debug!("gRPC TCP accept failed: {e}"),
                                 }
                             }
-                        };
+                        });
+                        let tls_incoming = tokio_stream::wrappers::ReceiverStream::new(tls_rx);
                         let _ = builder
                             .add_service(tcp_svc)
                             .serve_with_incoming_shutdown(tls_incoming, shutdown)
@@ -5736,6 +5809,88 @@ mod startup_helper_tests {
             loopback.is_none(),
             "loopback ACME failure may serve plaintext (process-local)"
         );
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_silent_client() {
+        // B3: a client that opens a TCP connection but never sends a ClientHello
+        // must NOT block the accept loop — the handshake times out (Ok(None)) so
+        // the connection is dropped and new connections keep flowing.
+        let acceptor = build_self_signed_acceptor(&["localhost".to_string()])
+            .expect("build self-signed acceptor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(&acceptor, stream, Duration::from_millis(200)).await
+        });
+
+        // Connect but send nothing — no TLS ClientHello ever arrives.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(None)),
+            "a silent client must time out (Ok(None)), got {result:?}"
+        );
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_completes_for_valid_client() {
+        // Sanity: a real TLS client completes the handshake well within the
+        // timeout, so the timeout does not reject legitimate connections.
+        use tokio_rustls::TlsConnector;
+
+        let bundle =
+            nestweaver_engine::tls::generate_tls_bundle(&["localhost".to_string()], 30, false)
+                .unwrap();
+        // Build the acceptor from the SAME bundle the client trusts so cert
+        // verification succeeds (build_self_signed_acceptor mints its own CA).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(&acceptor, stream, Duration::from_secs(5)).await
+        });
+
+        // Client trusts the generated CA and connects to `localhost`.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut bundle.ca_cert_pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let client_handshake = tokio::spawn(async move { connector.connect(domain, tcp).await });
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "a valid TLS client must complete the handshake, got {result:?}"
+        );
+        assert!(client_handshake.await.unwrap().is_ok());
     }
 
     #[test]

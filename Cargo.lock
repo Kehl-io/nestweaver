@@ -3920,6 +3920,7 @@ version = "2.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "dirs",
  "futures",
@@ -3985,6 +3986,7 @@ dependencies = [
  "html2md",
  "ignore",
  "indicatif 0.17.11",
+ "libc",
  "nestweaver-algorithms",
  "nestweaver-embed",
  "nestweaver-parser",
