@@ -12,8 +12,12 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
@@ -25,7 +29,7 @@ use crate::discovery::{RoutingMode, discover_upstreams_with_config};
 use crate::merge::rrf_merge;
 use crate::repo_identity::{normalized_repo_key, repo_name};
 use crate::routing::{ToolRouting, tool_routing};
-use crate::upstream::UpstreamHandle;
+use crate::upstream::{HealthState, ProbeOutcome, UpstreamHandle, now_ms};
 
 /// Provenance metadata injected into every hybrid response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,6 +86,16 @@ const STALE_TTL: Duration = Duration::from_secs(30);
 /// cached value. Prevents upstream gRPC latency from blocking the query path.
 const STALE_REFRESH_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// How often the background maintenance task wakes to re-probe ejected
+/// upstreams (active recovery) and refresh the staleness verdict. LAN default;
+/// runs entirely off the query hot path, so a generous interval is fine.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Timeout for a single background health-probe RPC. Generous on purpose: the
+/// probe is off the query hot path, so a slow probe only delays the next
+/// verdict update, never a user query.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Hybrid client that routes queries to a local daemon and optional upstream
 /// servers.
 ///
@@ -96,6 +110,19 @@ pub struct HybridClient {
     /// still populating `_meta.stale_repos` on responses.
     stale_cache: Vec<String>,
     stale_checked_at: Option<Instant>,
+    /// Handle to the background maintenance task (active health recovery +
+    /// staleness refresh). `None` until [`HybridClient::start_maintenance`] is
+    /// called (only the long-lived MCP session needs it; one-shot CLI commands
+    /// don't). Dropping it cancels the task.
+    maintenance: Option<MaintenanceHandle>,
+}
+
+/// Owns the background maintenance task and cancels it on drop, tying the
+/// task's lifetime to the `HybridClient` (and thus the MCP session).
+struct MaintenanceHandle {
+    /// Cancels the task's `CancellationToken` when dropped.
+    _cancel: tokio_util::sync::DropGuard,
+    _task: tokio::task::JoinHandle<()>,
 }
 
 impl HybridClient {
@@ -139,6 +166,7 @@ impl HybridClient {
             upstreams,
             stale_cache: Vec::new(),
             stale_checked_at: None,
+            maintenance: None,
         })
     }
 
@@ -149,6 +177,7 @@ impl HybridClient {
             upstreams: vec![],
             stale_cache: Vec::new(),
             stale_checked_at: None,
+            maintenance: None,
         }
     }
 
@@ -160,6 +189,7 @@ impl HybridClient {
             upstreams,
             stale_cache: Vec::new(),
             stale_checked_at: None,
+            maintenance: None,
         }
     }
 
@@ -700,64 +730,109 @@ impl HybridClient {
         }
     }
 
-    /// Start background health checks for all upstreams.
+    /// Start the background maintenance task (active health recovery of
+    /// ejected upstreams). Idempotent and a no-op when no upstreams are
+    /// configured. Must be called from within a Tokio runtime context; the
+    /// task is cancelled when this `HybridClient` is dropped.
     ///
-    /// Every 30 seconds, unhealthy upstreams are probed with a HealthCheck
-    /// RPC (2s timeout). If the probe succeeds, the upstream is marked
-    /// healthy again. Healthy upstreams are not probed (they'll be marked
-    /// unhealthy on the next failed query).
-    ///
-    /// Returns a `JoinHandle` that runs until dropped.
-    pub fn start_health_checks(&self) -> tokio::task::JoinHandle<()> {
-        use std::sync::atomic::Ordering;
+    /// Passive mark-down (on a failed live query) is only half of a correct
+    /// health scheme — HAProxy's rule is that passive checks MUST be paired
+    /// with active re-probing, or a downed upstream latches out forever. This
+    /// task is that active half: it periodically re-probes ejected upstreams
+    /// and restores them to rotation after `rise` consecutive successes.
+    pub fn start_maintenance(&mut self) {
+        if self.upstreams.is_empty() || self.maintenance.is_some() {
+            return;
+        }
 
-        let upstream_data: Vec<_> = self
+        let probes: Vec<MaintenanceProbe> = self
             .upstreams
             .iter()
-            .map(|u| {
-                (
-                    u.name.clone(),
-                    u.client(),
-                    u.token().map(String::from),
-                    u.healthy_ref(),
-                )
+            .map(|u| MaintenanceProbe {
+                name: u.name.clone(),
+                client: u.client(),
+                token: u.auth_token().map(String::from),
+                health: u.health_ref(),
             })
             .collect();
 
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-
-                for (name, client, token, healthy) in &upstream_data {
-                    let was_healthy = healthy.load(Ordering::Relaxed);
-                    if was_healthy {
-                        // Don't probe healthy upstreams — they'll be marked
-                        // unhealthy on the next failed query.
-                        continue;
-                    }
-
-                    let mut c = client.clone();
-                    let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
-                    if let Some(t) = token
-                        && let Ok(val) =
-                            format!("Bearer {}", t).parse::<tonic::metadata::MetadataValue<_>>()
-                    {
-                        req.metadata_mut().insert("authorization", val);
-                    }
-
-                    match tokio::time::timeout(Duration::from_secs(2), c.health_check(req)).await {
-                        Ok(Ok(_)) => {
-                            info!(upstream = %name, "upstream recovered, marking healthy");
-                            healthy.store(true, Ordering::Relaxed);
-                        }
-                        _ => {
-                            debug!(upstream = %name, "upstream still unhealthy");
-                        }
-                    }
-                }
-            }
-        })
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        let task = tokio::spawn(maintenance_loop(probes, child));
+        self.maintenance = Some(MaintenanceHandle {
+            _cancel: cancel.drop_guard(),
+            _task: task,
+        });
     }
+}
+
+/// Per-upstream data the background maintenance task needs. Holds cloned
+/// handles (cheap channel clone + shared `Arc<HealthState>`) so the task is
+/// decoupled from the `HybridClient`'s mutable borrow on the query path.
+struct MaintenanceProbe {
+    name: String,
+    client: NestWeaverDaemonClient<Channel>,
+    token: Option<String>,
+    health: Arc<HealthState>,
+}
+
+/// Background maintenance loop: wakes every [`MAINTENANCE_INTERVAL`] and runs
+/// one recovery tick, until cancelled.
+async fn maintenance_loop(probes: Vec<MaintenanceProbe>, cancel: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+        }
+        run_recovery_tick(&probes).await;
+    }
+}
+
+/// Re-probe every ejected upstream whose backoff window has elapsed and fold
+/// the result into its health state. Healthy upstreams are left alone — they
+/// are marked down passively by failed live queries, not actively.
+///
+/// The tick decision (`probe_due`) and the result fold (`apply_probe_result`)
+/// are pure functions on [`HealthState`], so the recovery behavior is unit
+/// tested deterministically without any real sleeps (see `upstream.rs`).
+async fn run_recovery_tick(probes: &[MaintenanceProbe]) {
+    let now = now_ms();
+    for p in probes {
+        if !p.health.probe_due(now) {
+            continue;
+        }
+        let ok = probe_upstream_health(&p.client, p.token.as_deref()).await;
+        match p.health.apply_probe_result(now_ms(), ok) {
+            ProbeOutcome::Recovered => {
+                info!(upstream = %p.name, "upstream recovered — restored to rotation");
+            }
+            ProbeOutcome::Improving => {
+                debug!(upstream = %p.name, "upstream probe succeeded — awaiting rise threshold");
+            }
+            ProbeOutcome::StillDown => {
+                debug!(upstream = %p.name, "upstream probe failed — still ejected");
+            }
+        }
+    }
+}
+
+/// Issue one `HealthCheck` RPC against an upstream, bounded by
+/// [`HEALTH_PROBE_TIMEOUT`]. Returns whether the upstream answered healthily.
+async fn probe_upstream_health(
+    client: &NestWeaverDaemonClient<Channel>,
+    token: Option<&str>,
+) -> bool {
+    let mut c = client.clone();
+    let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
+    if let Some(t) = token
+        && let Ok(val) = format!("Bearer {t}").parse::<MetadataValue<_>>()
+    {
+        req.metadata_mut().insert("authorization", val);
+    }
+    matches!(
+        tokio::time::timeout(HEALTH_PROBE_TIMEOUT, c.health_check(req)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Query a configured upstream directly when the local daemon is unavailable.
@@ -2688,8 +2763,6 @@ mod tests {
 
     #[tokio::test]
     async fn health_recovery_marks_upstream_healthy() {
-        use std::sync::atomic::Ordering;
-
         let cfg = crate::discovery::UpstreamConfig {
             name: Some("recoverable".to_string()),
             url: "http://127.0.0.1:19990".to_string(),
@@ -2700,14 +2773,17 @@ mod tests {
             ca_cert: None,
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
-        let healthy_ref = handle.healthy_ref();
+        let health = handle.health_ref();
 
-        // Simulate unhealthy state.
+        // A failed live query ejects the upstream (passive mark-down).
         handle.mark_unhealthy();
-        assert!(!healthy_ref.load(Ordering::Relaxed));
+        assert!(!health.is_healthy());
 
-        // Simulate recovery (background task would do this).
-        healthy_ref.store(true, Ordering::Relaxed);
+        // The background recovery task drives probe ticks; two successes
+        // (rise) restore it to rotation. No permanent latch.
+        let now = health.ejected_until_ms();
+        health.apply_probe_result(now, true);
+        health.apply_probe_result(now, true);
         assert!(handle.is_healthy());
     }
 

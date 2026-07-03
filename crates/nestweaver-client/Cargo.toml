@@ -12,6 +12,7 @@ nestweaver-daemon = { workspace = true }
 tonic = { workspace = true }
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
+tokio-util = "0.7"
 tower = "0.5"
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -13049,6 +13049,15 @@ fn run_mcp_hybrid(
 
     nestweaver_mcp::tools::set_lite_mode(lite);
 
+    // Start the background maintenance task (active upstream health recovery +
+    // off-hot-path staleness refresh). Tied to `hybrid`'s lifetime: it is
+    // cancelled when `hybrid` drops at the end of this function. Must run
+    // inside the runtime context, hence `enter()`.
+    {
+        let _guard = rt.enter();
+        hybrid.start_maintenance();
+    }
+
     // Interaction tracking uses the MCP crate's private record_interaction
     // helper. In hybrid mode, the HybridClient dispatches queries itself so
     // we skip interaction tracking here. Standard MCP tools/call still tracks
