@@ -24,6 +24,10 @@ pub type DaemonAcmeState = AcmeState<std::io::Error, std::io::Error>;
 /// The RFC 8737 challenge ALPN protocol.
 const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
+/// Process-global counter giving each atomic write a unique temp-file suffix so
+/// concurrent writers of the same cache key never share a temp path.
+static TMP_WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Directory-backed ACME cache with ATOMIC, private key writes (B4).
 ///
 /// The upstream [`DirCache`](tokio_rustls_acme::caches::DirCache) writes cached
@@ -79,8 +83,11 @@ impl AtomicDirCache {
             use std::io::Write;
             std::fs::create_dir_all(&dir)?;
             let final_path = dir.join(&name);
-            // Unique temp name (pid-scoped) so concurrent writers don't clash.
-            let tmp_path = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+            // Unique temp name: pid + a process-global counter so two threads
+            // writing the SAME cache key concurrently get distinct temp files
+            // (pid alone is identical within a process and would collide).
+            let seq = TMP_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_path = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
 
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
