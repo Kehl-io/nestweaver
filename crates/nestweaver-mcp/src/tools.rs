@@ -2630,8 +2630,12 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     };
 
     // Load all headings and sections (needed for both outline and section filter).
-    let headings_raw = store.headings_in_note(&note.uid).unwrap_or_default();
-    let sections_raw = store.sections_in_note(&note.uid).unwrap_or_default();
+    let headings_raw = store
+        .headings_in_note(&note.uid)
+        .map_err(|e| anyhow!("headings_in_note: {e}"))?;
+    let sections_raw = store
+        .sections_in_note(&note.uid)
+        .map_err(|e| anyhow!("sections_in_note: {e}"))?;
 
     // Resolve body: either filtered sections or full file contents.
     let body = if let Some(ref names) = section_filter {
@@ -3824,10 +3828,14 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     // Classes don't have CALLS edges — only their methods do. When the root
     // symbol is a class, expand to its methods and return a flow tree per method.
     if root.kind == SymbolKind::Class {
-        let direct_callees = store.callees_of(&root.uid).unwrap_or_default();
+        let direct_callees = store
+            .callees_of(&root.uid)
+            .map_err(|e| anyhow!("callees_of: {e}"))?;
         if direct_callees.is_empty() {
             // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
-            let members = store.members_of(&root.uid).unwrap_or_default();
+            let members = store
+                .members_of(&root.uid)
+                .map_err(|e| anyhow!("members_of: {e}"))?;
 
             let is_method = |s: &nestweaver_schema::Symbol| {
                 s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
@@ -3847,7 +3855,9 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                     .collect()
             } else {
                 // Fallback: line-range heuristic excluding methods inside nested classes.
-                let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
+                let file_symbols = store
+                    .symbols_in_file(&root.file_path)
+                    .map_err(|e| anyhow!("symbols_in_file: {e}"))?;
                 let nested_class_ranges: Vec<(u32, u32)> = file_symbols
                     .iter()
                     .filter(|s| {
@@ -4112,7 +4122,12 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 
 /// Return the filesystem path of the first locally-indexed repo (file:// URL).
 fn first_local_repo_path(store: &GraphStore) -> Option<String> {
-    let repos = store.list_repos(None).unwrap_or_default();
+    // Option return can't propagate; surface a DB error in the log rather than
+    // silently reporting "no local repo".
+    let repos = store.list_repos(None).unwrap_or_else(|e| {
+        tracing::warn!("first_local_repo_path: list_repos failed: {e}");
+        Vec::new()
+    });
     repos
         .iter()
         .find_map(|r| r.url.strip_prefix("file://").map(|p| p.to_string()))
@@ -4198,7 +4213,9 @@ fn tool_schema_stale_check() -> Value {
 }
 
 fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
-    let repos = store.list_repos(None).unwrap_or_default();
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow!("list_repos: {e}"))?;
 
     let mut results = Vec::new();
     let mut any_stale = false;
@@ -4778,10 +4795,14 @@ fn tool_project_context(
         vec![]
     };
     for comp_uid in &component_uids {
-        let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+        let comp_notes = store
+            .list_project_note_uids(comp_uid)
+            .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
         member_note_uids.extend(comp_notes.iter().cloned());
         member_uids.extend(comp_notes);
-        let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
+        let comp_syms = store
+            .list_project_symbol_uids(comp_uid)
+            .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
         member_uids.extend(comp_syms);
     }
 

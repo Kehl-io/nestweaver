@@ -1069,7 +1069,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let format = args
@@ -2797,7 +2798,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2822,7 +2824,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2847,7 +2850,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let dim = state
@@ -2871,7 +2875,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2896,7 +2901,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2926,7 +2932,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let projects = state
@@ -2950,7 +2957,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -2974,7 +2982,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name_or_uid = args
@@ -3014,7 +3023,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let token_budget = args
@@ -3044,7 +3054,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let cache_path = state.db_path.with_extension("manifests.json");
@@ -3068,7 +3079,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let vault_path = args
@@ -3103,7 +3115,8 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&r.into_inner().args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
@@ -5593,7 +5606,16 @@ fn flow_trace_continue_impl(
         let mut callee_span_ids = Vec::new();
 
         if depth < max_depth {
-            let callees = ctx.store.callees_of(uid).unwrap_or_default();
+            // On a DB read error, mark the trace truncated (incomplete) rather than
+            // silently pruning this branch as if it had no callees.
+            let callees = match ctx.store.callees_of(uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("walk_trace: callees_of failed: {e}");
+                    ctx.truncated = true;
+                    Vec::new()
+                }
+            };
             for callee in &callees {
                 let callee_cid = callee.canonical_id.as_deref().unwrap_or("");
 
@@ -5631,7 +5653,16 @@ fn flow_trace_continue_impl(
             }
         } else if depth >= max_depth {
             // Check if there are callees we didn't follow due to depth limit.
-            let callees = ctx.store.callees_of(uid).unwrap_or_default();
+            // On a DB read error, mark the trace truncated (incomplete) rather than
+            // silently pruning this branch as if it had no callees.
+            let callees = match ctx.store.callees_of(uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("walk_trace: callees_of failed: {e}");
+                    ctx.truncated = true;
+                    Vec::new()
+                }
+            };
             if !callees.is_empty() {
                 ctx.truncated = true;
             }
