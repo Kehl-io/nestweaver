@@ -3669,6 +3669,30 @@ fn bind_addr_is_loopback(bind_addr: &str) -> bool {
     matches!(bind_addr.parse::<std::net::SocketAddr>(), Ok(addr) if addr.ip().is_loopback())
 }
 
+/// Private per-replica working directory for a materialized snapshot.
+///
+/// Keyed on `instance_id` (the SHA-256-derived id of the canonical `--db`
+/// path — see [`lifecycle::instance_id_from_db_path`]) rather than only on the
+/// parent directory. Two co-located replicas started with distinct `--db`
+/// paths under a shared parent (`/data/a.lbug` + `/data/b.lbug`) get distinct
+/// instance ids and therefore distinct working dirs, so one replica's
+/// `materialize_snapshot` (an in-place `fs::copy` that truncates the target)
+/// can never clobber a sibling's open, running working copy. This mirrors how
+/// every read-replica system (LiteFS per-node dir, a PostgreSQL standby's own
+/// data dir, Litestream) gives each replica private local state; the only
+/// shared artifact is the immutable snapshot.
+///
+/// Two replicas sharing the *same* `--db` on one host are already rejected
+/// upstream by the pidfile flock (also keyed on `instance_id`), so they never
+/// reach this path — horizontal scale is separate hosts/containers.
+fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
+    let name = format!("replica-work-{instance_id}");
+    db_path
+        .parent()
+        .map(|p| p.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 /// Build a rustls TLS acceptor backed by an in-memory self-signed certificate
 /// for the given SANs. Used both as the ACME provisioning-failure fallback
 /// (encryption preserved even though the cert is untrusted) and as a hermetic
@@ -3894,10 +3918,10 @@ pub async fn run_server(
             .as_ref()
             .map(|c| c.embedding.model_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        let working_dir = db_path
-            .parent()
-            .map(|p| p.join("replica-work"))
-            .unwrap_or_else(|| std::path::PathBuf::from("replica-work"));
+        // Private per-replica working dir keyed on the instance id so two
+        // co-located replicas (distinct `--db` under one parent) never share a
+        // mutable path and clobber each other's materialized copy.
+        let working_dir = replica_working_dir(&db_path, &instance_id);
         tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
         nestweaver_engine::materialize_snapshot(
             &snapshot_dir,
@@ -3941,38 +3965,61 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
 
-    // Open Tantivy index with a writer so the daemon can update the
-    // search index after indexing operations (vault/repo).  Fall back to
-    // reader-only when the writer lock is held by another process (e.g. a
-    // running brain watcher), and finally to None when the index doesn't
-    // exist at all.
+    // Open the Tantivy index. A read-only snapshot replica never mutates its
+    // index, so it opens reader-only and never acquires a writer lock — this
+    // matches the read-only store open and keeps a replica from holding a
+    // writer on its (private) materialized copy. The read-write daemon opens
+    // with a writer so it can update the index after indexing operations
+    // (vault/repo), falling back to reader-only when the writer lock is held by
+    // another process (e.g. a running brain watcher), and finally to None when
+    // the index doesn't exist at all.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-    let tantivy = match TantivyIndex::open_or_create(&tantivy_path) {
-        Ok(idx) => {
-            tracing::info!(
-                docs = idx.doc_count(),
-                path = %tantivy_path.display(),
-                "Tantivy index open (read-write)"
-            );
-            Some(Arc::new(idx))
-        }
-        Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
+    let tantivy = if read_only {
+        match TantivyIndex::open_reader_only(&tantivy_path) {
             Ok(idx) => {
                 tracing::info!(
                     docs = idx.doc_count(),
                     path = %tantivy_path.display(),
-                    "Tantivy index open (reader-only fallback)"
+                    "Tantivy index open (replica, reader-only)"
                 );
                 Some(Arc::new(idx))
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "could not open Tantivy index — search will use substring fallback"
+                    "could not open Tantivy index reader — search will use substring fallback"
                 );
                 None
             }
-        },
+        }
+    } else {
+        match TantivyIndex::open_or_create(&tantivy_path) {
+            Ok(idx) => {
+                tracing::info!(
+                    docs = idx.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (read-write)"
+                );
+                Some(Arc::new(idx))
+            }
+            Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
+                Ok(idx) => {
+                    tracing::info!(
+                        docs = idx.doc_count(),
+                        path = %tantivy_path.display(),
+                        "Tantivy index open (reader-only fallback)"
+                    );
+                    Some(Arc::new(idx))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not open Tantivy index — search will use substring fallback"
+                    );
+                    None
+                }
+            },
+        }
     };
 
     let idle_notify = Arc::new(Notify::new());
@@ -5782,6 +5829,39 @@ mod startup_helper_tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    /// Two co-located replicas — distinct `--db` files under a shared parent
+    /// dir — must get DISTINCT private working directories. Before the fix the
+    /// working dir was `<parent>/replica-work` (keyed only on the parent), so
+    /// both replicas shared one mutable path and the second boot's in-place
+    /// `fs::copy` truncated the first replica's open working copy.
+    #[test]
+    fn co_located_replicas_use_distinct_working_dirs() {
+        let parent = Path::new("/data");
+        let db_a = parent.join("a.lbug");
+        let db_b = parent.join("b.lbug");
+
+        let id_a = lifecycle::instance_id_from_db_path(&db_a);
+        let id_b = lifecycle::instance_id_from_db_path(&db_b);
+        assert_ne!(
+            id_a, id_b,
+            "distinct --db paths must yield distinct instance ids"
+        );
+
+        let work_a = replica_working_dir(&db_a, &id_a);
+        let work_b = replica_working_dir(&db_b, &id_b);
+
+        assert_ne!(
+            work_a, work_b,
+            "co-located replicas with distinct --db must not share a working dir"
+        );
+        // Both stay under the shared parent (the snapshot/db live there) …
+        assert_eq!(work_a.parent(), Some(parent));
+        assert_eq!(work_b.parent(), Some(parent));
+        // … but neither is the old collision-prone shared path.
+        assert_ne!(work_a, parent.join("replica-work"));
+        assert_ne!(work_b, parent.join("replica-work"));
     }
 
     /// A reachable ref resolves to a 40-char SHA.
