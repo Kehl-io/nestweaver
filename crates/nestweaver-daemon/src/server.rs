@@ -646,6 +646,13 @@ impl NestWeaverDaemon for DaemonService {
         }
         tracing::info!("shutdown requested via gRPC — draining active writes");
 
+        // T6.2: mark the pool drained BEFORE the drain wait loop so the worker
+        // stops claiming NEW jobs immediately and only finishes in-flight work.
+        // Without this the worker keeps claiming new jobs during the drain, so
+        // under continuous webhook enqueue `indexing_active` never clears and
+        // shutdown burns the full drain ceiling doing work it will abandon.
+        self.state.drained.store(true, Ordering::Relaxed);
+
         if let Ok(mut guard) = self.state.watcher_stop.lock()
             && let Some(handle) = guard.take()
         {
@@ -4362,11 +4369,16 @@ pub async fn run_server(
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
     {
         let tx = shutdown_tx.clone();
+        let drained = Arc::clone(&state.drained);
         tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("register SIGTERM handler");
             sig.recv().await;
             tracing::info!("received SIGTERM — shutting down");
+            // T6.2: stop the worker claiming new jobs BEFORE broadcasting
+            // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
+            // still drain via the worker loop's JoinSet; only NEW claims stop.
+            drained.store(true, Ordering::Relaxed);
             let _ = tx.send(true);
         });
     }
@@ -6636,6 +6648,44 @@ mod startup_helper_tests {
         );
 
         drop(gate);
+    }
+
+    /// T6.2: the Shutdown RPC MUST set `state.drained` synchronously — before
+    /// it spawns the drain wait loop — so the worker pool STOPS CLAIMING new
+    /// jobs the instant shutdown begins. Otherwise, under continuous webhook
+    /// enqueue, the worker keeps claiming brand-new work during the entire
+    /// drain, `indexing_active` never clears, and shutdown burns the full
+    /// drain ceiling doing work it will then abandon-signal.
+    ///
+    /// Probed by holding the drain loop open (in-flight indexing) so it cannot
+    /// complete within the test, then asserting `drained` flipped by the time
+    /// the RPC returns. The pre-fix handler never touches `drained` — the RED
+    /// failure this guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_sets_drained_before_draining() {
+        let state = test_state_with_writer();
+        // Stand in for an in-flight index: the drain wait loop waits on
+        // `!indexing_active`, so with this set it never completes during the
+        // test — proving `drained` is set by the handler itself, not by the
+        // loop's completion.
+        state.indexing_active.store(true, Ordering::Relaxed);
+        assert!(
+            !state.drained.load(Ordering::Relaxed),
+            "precondition: drained starts clear"
+        );
+
+        let service = DaemonService::new(state.clone());
+        let mut req = Request::new(ShutdownRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let resp = service.shutdown(req).await.expect("shutdown ok");
+        assert!(resp.into_inner().ok);
+
+        assert!(
+            state.drained.load(Ordering::Relaxed),
+            "shutdown must set drained immediately (before the drain wait loop) \
+             so the worker pool stops claiming new jobs the moment shutdown begins"
+        );
     }
 
     // ── Read-only replica: single-chokepoint mutating-RPC rejection ─────
