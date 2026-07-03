@@ -756,6 +756,31 @@ fn bare_reader_for_repo(
     }
 }
 
+/// Build an inline-body reader resolver for the current mode.
+///
+/// In server mode this yields a `GitBareReader` per `repo_uid` (mirroring how
+/// `read_symbols` selects a reader per repo), so opt-in inline symbol bodies are
+/// read from the bare clone instead of a non-existent working tree. In local
+/// mode it returns `None`, so `populate_inline_bodies` falls back to a
+/// `FilesystemReader` and behavior is unchanged.
+type BoxedInlineBodyResolver<'a> =
+    Box<dyn Fn(&str) -> Option<Box<dyn nestweaver_engine::content_reader::ContentReader>> + 'a>;
+
+fn inline_body_reader_resolver(store: &GraphStore) -> Option<BoxedInlineBodyResolver<'_>> {
+    if !is_server_mode() {
+        return None;
+    }
+    let db_path = current_db_path(store).ok()?;
+    let workspace_root = db_path.parent()?.join("workspace");
+    if !workspace_root.is_dir() {
+        return None;
+    }
+    Some(Box::new(move |repo_uid: &str| {
+        bare_reader_for_repo(store, &workspace_root, repo_uid)
+            .map(|r| Box::new(r) as Box<dyn nestweaver_engine::content_reader::ContentReader>)
+    }))
+}
+
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
 fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
     if spec.starts_with("sym:") {
@@ -1752,6 +1777,7 @@ fn tool_brain_context(
             .unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
+        let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
             &mut result.connected,
@@ -1759,6 +1785,7 @@ fn tool_brain_context(
             response_config.inline_body_threshold,
             response_config.inline_max_body_tokens,
             Some(token_budget),
+            reader_resolver.as_deref(),
         );
     }
 
@@ -2371,6 +2398,7 @@ fn tool_brain_search(
                 })
             })
             .collect();
+        let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
             &mut nodes,
@@ -2378,6 +2406,7 @@ fn tool_brain_search(
             response_config.inline_body_threshold,
             response_config.inline_max_body_tokens,
             None,
+            reader_resolver.as_deref(),
         );
         let bodies: std::collections::HashMap<String, String> = nodes
             .into_iter()

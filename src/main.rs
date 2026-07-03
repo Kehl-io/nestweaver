@@ -11037,6 +11037,9 @@ fn run_brain(
                             response_config.inline_body_threshold,
                             response_config.inline_max_body_tokens,
                             token_budget,
+                            // Local CLI reads from the working tree; no bare-clone
+                            // resolver, so bodies come from the FilesystemReader.
+                            None,
                         );
                     }
 

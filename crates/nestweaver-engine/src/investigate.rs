@@ -278,6 +278,7 @@ pub fn investigate(
         INLINE_THRESHOLD,
         INLINE_MAX_BODY_TOKENS,
         Some(budget),
+        None,
     );
     // Cap the number of inlined bodies (populate_inline_bodies has no count cap).
     let mut inlined = 0usize;
