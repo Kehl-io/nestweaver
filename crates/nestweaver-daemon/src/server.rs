@@ -4275,10 +4275,14 @@ pub async fn run_server(
                 external_endpoint: cfg.external_endpoint.clone(),
                 external_model: cfg.external_model.clone(),
             };
-            match tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config))
-                .await
-            {
-                Ok(Ok(model)) => {
+            // Loading compiles Metal shaders (or reads the model on CPU) and can, in
+            // rare daemon contexts, block indefinitely inside native code. Cap it so a
+            // stuck load never leaves the model-load task hanging: on timeout the daemon
+            // stays healthy with semantic search disabled until the next restart/re-embed.
+            const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            let load = tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config));
+            match tokio::time::timeout(LOAD_TIMEOUT, load).await {
+                Ok(Ok(Ok(model))) => {
                     tracing::info!(dim = model.dimension(), "Embedding model loaded");
                     // Check dimension compatibility with existing embeddings
                     if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension()
@@ -4297,11 +4301,18 @@ pub async fn run_server(
                     *embed_state.write().await = Some(std::sync::Arc::new(model)
                         as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
                 }
-                Ok(Err(e)) => {
+                Ok(Ok(Err(e))) => {
                     tracing::warn!("Failed to load embedding model: {e}");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("Embedding model load task panicked: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = LOAD_TIMEOUT.as_secs(),
+                        "Embedding model load timed out — semantic search disabled until restart. \
+                         Run `nestweaver embed` from a terminal for GPU-accelerated embedding."
+                    );
                 }
             }
         });

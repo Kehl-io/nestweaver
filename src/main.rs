@@ -2861,15 +2861,29 @@ fn main() {
     }))
     .ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // The daemon `run` process installs its own INFO-level, file-based tracing
+    // subscriber in run_server. Installing a global stderr subscriber here first
+    // makes that set_global_default fail silently, dropping every daemon log
+    // (including the embed model's device line). Skip early init for that one
+    // path and let run_server own logging.
+    let is_daemon_run = matches!(
+        &cli.command,
+        Commands::Daemon {
+            action: DaemonAction::Run { .. },
+            ..
+        }
+    );
+    if !is_daemon_run {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::WARN.into()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
 
