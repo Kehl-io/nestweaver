@@ -164,7 +164,7 @@ cd app && bash build.sh
 open target/release/NestWeaver.app
 ```
 
-The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings), automatic daemon lifecycle, web UI on port 9377, and crash recovery. See [macOS App](#macos-app) below.
+The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings via a launchd-managed daemon), a persistent daemon shared with the CLI/MCP, web UI on port 9377, and launchd-managed restart. See [macOS App](#macos-app) below.
 
 ### All platforms (CLI)
 
