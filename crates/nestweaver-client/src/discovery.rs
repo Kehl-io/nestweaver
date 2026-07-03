@@ -184,7 +184,17 @@ pub fn discover_upstreams_with_config(
 pub fn save_upstream(config: &UpstreamConfig) -> Result<PathBuf> {
     let config_dir = dirs::config_dir().context("could not determine config directory")?;
     let nw_dir = config_dir.join("nestweaver");
-    std::fs::create_dir_all(&nw_dir)?;
+    save_upstream_in(&nw_dir, config)
+}
+
+/// Save a single upstream into `nw_dir/upstreams.toml`.
+///
+/// The file holds a plaintext bearer token, so it is written owner-only (0600)
+/// on Unix — like an SSH key or `~/.netrc` — rather than with the process's
+/// default umask, which can leave it group/world-readable. The mode is set both
+/// on create and on an existing file we rewrite here.
+pub fn save_upstream_in(nw_dir: &Path, config: &UpstreamConfig) -> Result<PathBuf> {
+    std::fs::create_dir_all(nw_dir)?;
     let path = nw_dir.join("upstreams.toml");
 
     let mut upstreams = if path.exists() {
@@ -206,8 +216,37 @@ pub fn save_upstream(config: &UpstreamConfig) -> Result<PathBuf> {
     let toml_str = toml::to_string_pretty(&UpstreamsToml {
         upstream: upstreams,
     })?;
-    std::fs::write(&path, toml_str)?;
+    write_owner_only(&path, &toml_str)?;
     Ok(path)
+}
+
+/// Write `contents` to `path`, forcing owner-only (0600) permissions on Unix.
+///
+/// Opens with `mode(0o600)` so the file is never briefly world-readable on
+/// create, then calls `set_permissions(0o600)` to also tighten an existing
+/// file that predates this hardening. On non-Unix platforms it falls back to a
+/// plain write (permission model differs).
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // `mode()` only applies on create; tighten an existing looser file too.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +372,36 @@ mod tests {
 
     // Serialize tests that touch env vars to avoid races.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The upstream token file holds a plaintext bearer token, so it must be
+    /// written owner-only (0600) like an SSH/credentials file — never
+    /// world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn upstreams_toml_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = UpstreamConfig {
+            name: Some("upstream".to_string()),
+            url: "grpc://host:9378".to_string(),
+            token: Some("super-secret-token".to_string()),
+            repos: vec![],
+            mode: RoutingMode::Fallback,
+            timeout: "1s".to_string(),
+            ca_cert: None,
+        };
+
+        let path = save_upstream_in(dir.path(), &config).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "upstreams.toml must be owner-only (0600)");
+
+        // A rewrite over an already-created file keeps it 0600.
+        let path2 = save_upstream_in(dir.path(), &config).unwrap();
+        let mode2 = fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "rewrite must preserve 0600");
+    }
 
     #[test]
     fn discover_from_env_var() {
