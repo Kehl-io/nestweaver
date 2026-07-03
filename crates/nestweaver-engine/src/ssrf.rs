@@ -284,7 +284,7 @@ impl std::fmt::Display for SsrfError {
             SsrfError::InvalidUrl(m) => write!(f, "invalid repo URL: {m}"),
             SsrfError::UnsupportedScheme(s) => write!(
                 f,
-                "unsupported URL scheme '{s}': only https/http/ssh (and local file://) may be cloned"
+                "unsupported URL scheme '{s}': only https/http/ssh remotes may be cloned"
             ),
             SsrfError::Rejected(m) => write!(f, "{m}"),
             SsrfError::ResolvesInternal(h) => write!(
@@ -334,31 +334,30 @@ fn pick_pin_ip(addrs: &[IpAddr]) -> Option<IpAddr> {
 /// config args to pin the connection (DNS-rebinding defense).
 ///
 /// Behavior by scheme:
-/// - `file://` — passes through with **no** args (local path; add-time still
-///   blocks it). Keeps hermetic `file://` clone/fetch tests green.
 /// - `https`/`http` — runs [`validate_repo_url`], resolves the host, rejects if
 ///   any resolved address is internal, then pins the validated public IP via
 ///   `-c http.curloptResolve=host:port:ip` **and** `-c http.followRedirects=false`
 ///   (block redirect-based rebinding).
 /// - `ssh` — runs the same validate + resolve-and-reject, but cannot pin via the
 ///   CLI, so `config_args` is empty (residual sub-second TOCTOU; documented).
-/// - `git://` and any other scheme — **rejected** (plaintext/un-pinnable).
+/// - `file://`, `git://`, and any other scheme — **rejected**. `file://` is a
+///   local clone source (arbitrary-repo disclosure) and `git://` is
+///   plaintext/un-pinnable; neither may be reached over the clone/fetch path.
+///   This guard is the *last* line of defense — it must reject non-remote
+///   schemes itself, not rely on the entry-point allowlist having run first.
+///   (Hermetic tests that clone on-disk `file://` fixtures opt in via a
+///   `cfg(test)`-only allowance in `bare_clone`, never in production.)
 ///
-/// Fails open on DNS resolution error (empty resolve set is treated as
-/// non-internal), matching the add-time gate.
+/// Fails **closed** on DNS resolution error: an unresolvable host is rejected
+/// (treated as potentially internal), matching the add-time gate.
 pub fn guard_git_url(url: &str) -> Result<GitNetGuard, SsrfError> {
     let parsed =
         url::Url::parse(url).map_err(|e| SsrfError::InvalidUrl(format!("'{url}': {e}")))?;
     let scheme = parsed.scheme();
 
-    // CRITICAL: file:// is a local clone source (hermetic tests, on-disk repos).
-    // It never touches the network, so pass it through with no guard args.
-    if scheme == "file" {
-        return Ok(GitNetGuard::default());
-    }
-
     // Only schemes we can either pin (http/https) or validate-immediately (ssh)
-    // are allowed over the network. git:// is plaintext and un-pinnable.
+    // are allowed over the network. file:// (local-repo disclosure) and git://
+    // (plaintext, un-pinnable) are rejected here as the last line of defense.
     if !matches!(scheme, "https" | "http" | "ssh") {
         return Err(SsrfError::UnsupportedScheme(scheme.to_string()));
     }
@@ -651,13 +650,15 @@ mod tests {
     // ── guard_git_url (offline, IP-literal hosts only — no live DNS) ─────────
 
     #[test]
-    fn guard_git_url_passes_file_scheme_through() {
-        // file:// is a local clone source — no network, no guard args.
-        let guard = guard_git_url("file:///tmp/some/repo").expect("file:// passes through");
-        assert!(
-            guard.config_args.is_empty(),
-            "file:// must carry no guard args"
-        );
+    fn guard_git_url_rejects_file_scheme() {
+        // Defense-in-depth: the last-line-of-defense guard must itself reject
+        // file:// (arbitrary local-repo disclosure), not fail open and rely on
+        // the entry-point scheme allowlist. Any future caller reaching the guard
+        // without the entry-point check must still be stopped here.
+        match guard_git_url("file:///tmp/some/repo") {
+            Err(SsrfError::UnsupportedScheme(s)) => assert_eq!(s, "file"),
+            other => panic!("expected UnsupportedScheme(\"file\"), got {other:?}"),
+        }
     }
 
     #[test]

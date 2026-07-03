@@ -21,6 +21,23 @@ const HTTP_LOW_SPEED_ARGS: [&str; 4] = [
     "http.lowSpeedTime=60",
 ];
 
+/// SSRF guard for a clone/fetch URL.
+///
+/// Delegates to [`crate::ssrf::guard_git_url`], which rejects `file://` and
+/// every other non-remote scheme as the last line of defense. In `cfg(test)`
+/// builds ONLY, an on-disk `file://` source is allowed through with no guard
+/// args so the hermetic clone/fetch unit tests (which serve fixtures over
+/// `file://`, no network) keep working. Production builds never compile this
+/// branch: a `file://` clone source is rejected here exactly as it is at the
+/// add-repo / webhook / config entry points.
+fn guard_clone_url(url: &str) -> Result<crate::ssrf::GitNetGuard, crate::ssrf::SsrfError> {
+    #[cfg(test)]
+    if url.starts_with("file://") {
+        return Ok(crate::ssrf::GitNetGuard::default());
+    }
+    crate::ssrf::guard_git_url(url)
+}
+
 /// A single blobless bare clone of a remote git repository.
 #[derive(Debug, Clone)]
 pub struct BareClone {
@@ -50,9 +67,9 @@ impl BareClone {
     /// only updates FETCH_HEAD, and `rev-parse origin/<branch>` fails.
     pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
         // SSRF guard: validate + resolve the remote immediately before fetching,
-        // pinning the connect IP for http(s) (DNS-rebinding defense). file://
-        // passes through with no args.
-        let guard = crate::ssrf::guard_git_url(&self.url)?;
+        // pinning the connect IP for http(s) (DNS-rebinding defense). Non-remote
+        // schemes (file://, git://) are rejected here (see `guard_clone_url`).
+        let guard = guard_clone_url(&self.url)?;
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
         cmd.args(HTTP_LOW_SPEED_ARGS);
@@ -122,7 +139,7 @@ impl BareClone {
     /// Check remote HEAD via `git ls-remote` (lightweight, no object transfer).
     pub fn ls_remote_head(&self) -> Result<String> {
         // SSRF guard before contacting the remote (see `fetch_branch`).
-        let guard = crate::ssrf::guard_git_url(&self.url)?;
+        let guard = guard_clone_url(&self.url)?;
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
         cmd.arg("-C")
@@ -200,7 +217,7 @@ impl BareCloneWorkspace {
         // filesystem mutation or git spawn. Rejects internal targets and
         // un-pinnable schemes (git://) up front so no clone dir is created.
         // file:// passes through with no args.
-        let guard = crate::ssrf::guard_git_url(url)?;
+        let guard = guard_clone_url(url)?;
 
         // Remove any invalid remnant (or origin-mismatched clone) before cloning.
         if dest.exists() {
