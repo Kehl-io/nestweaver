@@ -27,7 +27,12 @@ use crate::tools;
 /// Tools that mutate server state and therefore require admin-level auth.
 /// Query tokens may only invoke read-only tools; mutating operations require
 /// the admin token when auth is configured.
-const MUTATING_TOOLS: &[&str] = &[
+///
+/// This is the SINGLE canonical list of mutating MCP tool names. Both the
+/// HTTP/MCP gate (this module) and the daemon's gRPC gate
+/// (`nestweaver-daemon`) reference this const, so a new mutating tool cannot be
+/// added to one surface's gate while silently leaving the other open.
+pub const MUTATING_TOOLS: &[&str] = &[
     "brain_add_source",
     "brain_remove_source",
     "brain_memory_consolidate",
@@ -855,6 +860,30 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    /// Regression guard for the single shared mutating-tool list. Pins the
+    /// known set (adding/removing a mutating tool is a deliberate edit) and
+    /// asserts entries are unique — a duplicate would mask a typo. Both the
+    /// HTTP gate here and the daemon's gRPC gate read this exact const.
+    #[test]
+    fn mutating_tools_list_is_the_known_set() {
+        assert_eq!(
+            MUTATING_TOOLS,
+            &[
+                "brain_add_source",
+                "brain_remove_source",
+                "brain_memory_consolidate",
+                "set_extension",
+                "prune_stale",
+            ]
+        );
+        let unique: std::collections::HashSet<_> = MUTATING_TOOLS.iter().collect();
+        assert_eq!(
+            unique.len(),
+            MUTATING_TOOLS.len(),
+            "MUTATING_TOOLS must not contain duplicates"
+        );
+    }
 
     fn test_app() -> Router {
         let store = Arc::new(GraphStore::in_memory().unwrap());

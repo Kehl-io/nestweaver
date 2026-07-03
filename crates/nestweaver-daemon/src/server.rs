@@ -585,14 +585,12 @@ impl DaemonService {
 // ── Trait impl ──────────────────────────────────────────────────────
 
 /// Tools that mutate server state and require admin-level auth via gRPC.
-/// Mirrors the `MUTATING_TOOLS` list in the HTTP/MCP layer (`http.rs`).
-const MUTATING_TOOLS: &[&str] = &[
-    "brain_add_source",
-    "brain_remove_source",
-    "brain_memory_consolidate",
-    "set_extension",
-    "prune_stale",
-];
+///
+/// The gRPC gate and the HTTP/MCP gate share ONE list — the canonical
+/// [`nestweaver_mcp::http::MUTATING_TOOLS`] — so the two surfaces can never
+/// drift (a new mutating tool guarded on one gate but not the other). Re-export
+/// it under the module-local name the `json_rpc!` gate reads.
+use nestweaver_mcp::http::MUTATING_TOOLS;
 
 /// Maps each gRPC RPC name to the MCP tool name it dispatches to.
 macro_rules! json_rpc {
@@ -4440,6 +4438,10 @@ pub async fn run_server(
             mcp_state.client_rate_limiter.clone(),
             shutdown_tx.subscribe(),
         );
+        // Captured before `mcp_state` is moved into `router()` — used for the
+        // T5.1 bind-time auth assertion below and to decide whether the network
+        // `/metrics` route is gated (S.5).
+        let mcp_auth_token = mcp_state.auth_token.clone();
         let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
 
         // Shared webhook state Arcs — populated inside the webhook block,
@@ -4629,6 +4631,21 @@ pub async fn run_server(
             .bind_addr
             .parse()
             .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        // T5.1 defense-in-depth: a non-loopback MCP HTTP listener MUST be
+        // authenticated. `validate_bind_security` already forces `--auth-token`
+        // for a non-loopback bind (so `mcp_state` is built via `with_auth`),
+        // but that guarantee is indirect. Assert it directly at bind time so a
+        // future refactor that weakens the upstream check fails loudly here
+        // rather than silently exposing an unauthenticated network surface.
+        if !mcp_bind_addr.ip().is_loopback() && mcp_auth_token.is_none() {
+            anyhow::bail!(
+                "refusing to bind MCP HTTP listener to non-loopback {} without \
+                 authentication — validate_bind_security should have required \
+                 --auth-token; this is a bug, not a config error",
+                mcp_bind_addr
+            );
+        }
         let mcp_bind = if mcp_bind_addr.port() == 0 {
             std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
         } else {
@@ -5881,6 +5898,30 @@ mod startup_helper_tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    /// The gRPC mutating-tool gate MUST reference the single shared
+    /// `MUTATING_TOOLS` list defined in `nestweaver-mcp`, not a private copy
+    /// that can drift from the HTTP/MCP gate. This asserts the daemon reads the
+    /// shared const (it won't compile if the daemon reintroduces a private one)
+    /// and pins the known set so adding a mutating tool is a deliberate edit.
+    #[test]
+    fn mutating_tools_gate_uses_shared_const() {
+        assert_eq!(
+            nestweaver_mcp::http::MUTATING_TOOLS,
+            &[
+                "brain_add_source",
+                "brain_remove_source",
+                "brain_memory_consolidate",
+                "set_extension",
+                "prune_stale",
+            ]
+        );
+        // The daemon's gate is this exact const, not a copy.
+        assert!(std::ptr::eq(
+            MUTATING_TOOLS.as_ptr(),
+            nestweaver_mcp::http::MUTATING_TOOLS.as_ptr(),
+        ));
     }
 
     /// Two co-located replicas — distinct `--db` files under a shared parent
