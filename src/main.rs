@@ -2851,6 +2851,19 @@ fn parse_iso8601_to_system_time(s: &str) -> Result<std::time::SystemTime, anyhow
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs as u64))
 }
 
+/// Resolve `p` to an ABSOLUTE path before sending it in an RPC to the daemon, which runs with
+/// CWD=`/` (launchd) and would resolve a relative path against the wrong directory. Prefer
+/// canonicalization; if that fails (e.g. a valid but uncanonicalizable path), fall back to
+/// joining the current dir — never return the original relative path, which would silently
+/// index/watch the wrong (or no) location.
+fn abs_for_daemon(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -7316,7 +7329,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory.
-                let vault_abs = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+                let vault_abs = abs_for_daemon(&vault);
                 let args = serde_json::json!({
                     "vault": vault_abs.to_string_lossy(),
                 });
@@ -7340,7 +7353,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // Resolve vault UID the same way the indexer does.
-            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+            let canonical = abs_for_daemon(&vault);
             let instance_id = "default";
             let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
 
@@ -9081,7 +9094,7 @@ fn run_brain(
                     rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory (indexing 0).
-                let vault_abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let vault_abs = abs_for_daemon(&path);
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
@@ -9913,7 +9926,7 @@ fn run_brain(
                     config.as_deref(),
                 ))?;
                 // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
-                let vault_abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let vault_abs = abs_for_daemon(&path);
                 let req = nestweaver_proto::WatchVaultRequest {
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
@@ -10113,7 +10126,7 @@ fn run_brain(
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical = abs_for_daemon(&path);
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
             if use_daemon && since.is_none() {
@@ -10245,7 +10258,7 @@ fn run_brain(
             let instance_specified = instance.is_some();
             let instance_id = instance.as_deref().unwrap_or("default");
 
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical = abs_for_daemon(&path);
             let canon_str = canonical.to_string_lossy();
             let raw_str = path.to_string_lossy();
             let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);

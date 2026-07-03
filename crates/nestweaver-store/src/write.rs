@@ -3079,8 +3079,10 @@ impl GraphStore {
         let conn = self.conn()?;
 
         // Encode both fields into a single JSON string so we can use the
-        // two-column Meta table without widening it.
-        let value = format!(r#"{{"model_id":"{model_id}","dimension":{dimension}}}"#);
+        // two-column Meta table without widening it. Serialize via serde so a
+        // model_id containing quotes/backslashes/newlines (e.g. a local model
+        // path) can't produce invalid JSON that fails to parse on read.
+        let value = serde_json::json!({ "model_id": model_id, "dimension": dimension }).to_string();
 
         // Delete the existing singleton, if any. Best-effort: silently
         // ignore errors from tables that were never created (old DBs).
@@ -3312,6 +3314,33 @@ mod copy_from_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_metadata_round_trips_including_special_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("emb_meta.lbug")).unwrap();
+
+        // Absent by default.
+        assert_eq!(store.get_embedding_metadata().unwrap(), None);
+
+        // Normal HuggingFace id round-trips, and the singleton is replaced on re-set.
+        store.set_embedding_metadata("thenlper/gte-base", 768).unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("thenlper/gte-base".to_string(), 768))
+        );
+
+        // A model_id containing quotes/backslashes (e.g. a local model path) must still
+        // round-trip. Naive JSON string interpolation would produce invalid JSON here, which
+        // get_embedding_metadata would fail to parse → the daemon would fall back to the
+        // default model and silently disable semantic search on a dimension mismatch.
+        let weird = r#"/models/my "local"\model"#;
+        store.set_embedding_metadata(weird, 384).unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some((weird.to_string(), 384))
+        );
+    }
 
     #[test]
     fn test_update_repo_sha_is_atomic() {

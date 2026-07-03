@@ -5492,8 +5492,19 @@ pub async fn run_server(
             }),
     );
 
+    // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
+    // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
+    // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
     #[cfg(feature = "embed")]
-    load_embedding_model(&state).await;
+    {
+        let mut load_shutdown = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = load_embedding_model(&state) => {}
+            _ = load_shutdown.changed() => {
+                tracing::info!("shutdown requested during embedding model load — abandoning load");
+            }
+        }
+    }
 
     uds_serve
         .await
