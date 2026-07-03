@@ -2574,6 +2574,39 @@ enum InteractionCommands {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Default drain ceiling the daemon uses to bound its shutdown drain
+/// (`NESTWEAVER_DRAIN_TIMEOUT_SECS` in `server.rs`). Kept in sync so the CLI
+/// `daemon stop` grace can be derived from it.
+const DEFAULT_DRAIN_CEILING_SECS: u64 = 660;
+
+/// Safety buffer added on top of the drain ceiling so the daemon has room to
+/// flush WAL and unwind after a drain that ran to the full ceiling, before the
+/// CLI escalates to SIGKILL.
+const STOP_GRACE_BUFFER_SECS: u64 = 30;
+
+/// Resolve how long `daemon stop` waits after SIGTERM before escalating to
+/// SIGKILL.
+///
+/// T6.2 reconciliation: a legitimate large in-flight index can run far longer
+/// than the old fixed 60s default, and the daemon's own shutdown drain is
+/// bounded by `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) — so a 60s grace
+/// could SIGKILL mid-write of a non-atomic sidecar. When `NESTWEAVER_STOP_GRACE_SECS`
+/// is unset we derive the grace from that same drain ceiling (plus a small
+/// buffer) so the two can't drift and stop never kills a daemon that is still
+/// legitimately draining. An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
+///
+/// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
+/// unit-testable without touching process env).
+fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u64 {
+    if let Some(v) = stop_env.and_then(|s| s.trim().parse::<u64>().ok()) {
+        return v;
+    }
+    let ceiling = drain_env
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
+    ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
+}
+
 fn default_db_path() -> PathBuf {
     if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
         PathBuf::from(env_db)
@@ -7860,12 +7893,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // writes before exiting (a `spawn_blocking` write cannot be
                     // aborted), which can take longer than a couple of seconds for
                     // a large repo — so the grace window must exceed the max write
-                    // duration or `daemon stop` would SIGKILL mid-write. Override
-                    // with NESTWEAVER_STOP_GRACE_SECS.
-                    let grace_secs = std::env::var("NESTWEAVER_STOP_GRACE_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(60);
+                    // duration or `daemon stop` would SIGKILL mid-write. The
+                    // daemon's own drain is bounded by NESTWEAVER_DRAIN_TIMEOUT_SECS
+                    // (default 660s), so by default we derive the grace from that
+                    // ceiling rather than a fixed 60s that a real index blows past.
+                    // Override explicitly with NESTWEAVER_STOP_GRACE_SECS.
+                    let grace_secs = resolve_stop_grace_secs(
+                        std::env::var("NESTWEAVER_STOP_GRACE_SECS").ok().as_deref(),
+                        std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
+                            .ok()
+                            .as_deref(),
+                    );
                     for _ in 0..(grace_secs * 10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -14050,5 +14088,47 @@ mod server_status_tests {
         assert_eq!(mirror.queue_depth, 4);
         assert!(!mirror.drained);
         assert_eq!(mirror.symbols.total, 8192);
+    }
+}
+
+#[cfg(test)]
+mod stop_grace_tests {
+    use super::*;
+
+    /// An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins, regardless of the
+    /// drain ceiling — operators keep a hard override.
+    #[test]
+    fn explicit_override_wins() {
+        assert_eq!(resolve_stop_grace_secs(Some("15"), Some("660")), 15);
+        assert_eq!(resolve_stop_grace_secs(Some("900"), None), 900);
+    }
+
+    /// With no override, the grace is derived from the drain ceiling plus a
+    /// buffer — NOT the old fixed 60s that a legitimate large index blows past
+    /// (the T6.2 SIGKILL-mid-write bug).
+    #[test]
+    fn defaults_track_drain_ceiling() {
+        // Unset both: default ceiling (660) + buffer (30).
+        assert_eq!(
+            resolve_stop_grace_secs(None, None),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
+        // Ceiling raised via env: grace follows it so they can't drift.
+        assert_eq!(
+            resolve_stop_grace_secs(None, Some("1200")),
+            1200 + STOP_GRACE_BUFFER_SECS
+        );
+        // Guard the actual regression: default grace must exceed the old 60s.
+        assert!(resolve_stop_grace_secs(None, None) > 60);
+    }
+
+    /// Garbage env values fall back to the derived default rather than
+    /// panicking or collapsing to an unsafe tiny grace.
+    #[test]
+    fn garbage_env_falls_back() {
+        assert_eq!(
+            resolve_stop_grace_secs(Some("notanumber"), Some("also-bad")),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
     }
 }
