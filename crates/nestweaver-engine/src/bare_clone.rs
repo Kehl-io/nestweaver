@@ -229,8 +229,9 @@ impl BareCloneWorkspace {
 
         // SSRF guard: validate the URL and resolve+pin the remote IP BEFORE any
         // filesystem mutation or git spawn. Rejects internal targets and
-        // un-pinnable schemes (git://) up front so no clone dir is created.
-        // file:// passes through with no args.
+        // un-pinnable schemes (file://, git://) up front so no clone dir is
+        // created. In production `file://` is rejected here (see
+        // `guard_clone_url`); it passes through only under `#[cfg(test)]`.
         let guard = guard_clone_url(url)?;
 
         // Remove any invalid remnant (or origin-mismatched clone) before cloning.

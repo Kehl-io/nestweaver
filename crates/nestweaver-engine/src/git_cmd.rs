@@ -84,6 +84,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// This does NOT touch the caller's `-c` args (the SSRF `http.curloptResolve` /
 /// `http.followRedirects` pins and the `http.lowSpeed*` guards): those are
 /// command-line args on the `Command` and take precedence over config anyway.
+///
+/// CALLER CONTRACT: callers must NOT set their own `GIT_CONFIG_*` env on the
+/// `Command`. This sets `GIT_CONFIG_COUNT=1` (plus `KEY_0`/`VALUE_0`)
+/// unconditionally, so a caller-supplied entry would either be clobbered or
+/// silently ignored — pass config via `-c` args instead.
 pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
