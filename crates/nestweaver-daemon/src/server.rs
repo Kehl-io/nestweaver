@@ -2704,7 +2704,62 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "set_extension")
+        // set_extension is a mutating tool — require admin, matching json_rpc!.
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            r.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied(
+                "tool 'set_extension' is mutating and requires the admin token",
+            ));
+        }
+        // Read-modify-write of the `.extensions.json` sidecar, which is part of
+        // the backup sidecar set. It must run under the write gate — write_mutex
+        // + ConnectionGuard::write — so it serializes against a `backup`'s
+        // sidecar staging (which copies under the same lock), is visible to the
+        // shutdown drain / idle timeout, and two concurrent callers cannot lose
+        // updates (last-writer-wins). This is the single gated write path: the
+        // MCP `tool_set_extension` routes here rather than mutating directly.
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::write(&self.state);
+
+        let req = r.into_inner();
+        let db_path = self.state.db_path.clone();
+
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let args: serde_json::Value = serde_json::from_str(&req.args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
+            let uid = args
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("'uid' must be a string"))?;
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("'key' must be a string"))?;
+            let value = args
+                .get("value")
+                .cloned()
+                .ok_or_else(|| Status::invalid_argument("'value' is required"))?;
+
+            let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
+            nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
+            nestweaver_engine::extensions::save_extensions(&db_path, &store)
+                .map_err(|e| Status::internal(format!("save_extensions failed: {e:#}")))?;
+
+            let result_json = serde_json::json!({
+                "uid": uid,
+                "key": key,
+                "value": value,
+                "status": "saved",
+            })
+            .to_string();
+            Ok::<_, Status>(JsonResponse { result_json })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        result.map(Response::new)
     }
 
     async fn query_extensions(
@@ -5556,6 +5611,43 @@ mod startup_helper_tests {
         assert!(
             res.is_err(),
             "reindex_search must block on the write gate while it is held \
+             (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
+    }
+
+    /// The admin `set_extension` RPC does a read-modify-write of the
+    /// `.extensions.json` sidecar, which is part of the backup sidecar set.
+    /// Like every other daemon mutation it MUST run under the write gate
+    /// (`write_mutex` + `ConnectionGuard::write`) so two concurrent writers
+    /// cannot lose updates and a `backup`'s sidecar staging cannot race it.
+    ///
+    /// Probed the same way as `reindex_search_holds_write_gate`: while the
+    /// test holds `write_mutex`, a gated `set_extension` must block until the
+    /// gate is released. The `json_rpc!`-dispatched implementation runs under
+    /// a *read* guard and returns immediately — the RED failure this guards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_mutex.clone().lock_owned().await;
+
+        let args =
+            serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" }).to_string();
+        let mut req = Request::new(JsonRequest { args_json: args });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.set_extension(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "set_extension must block on the write gate while it is held \
              (drain-visible + backup-safe); it returned without waiting"
         );
 

@@ -20,16 +20,16 @@ use nestweaver_engine::{
     find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
-    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
-    truncate_to_budget,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, search_symbols,
+    tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
-// In non-daemon builds, brain_add_source writes directly using these primitives.
+// In non-daemon builds, brain_add_source and set_extension write directly using
+// these primitives; in daemon builds those writes route through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_directory, index_markdown_directory};
+use nestweaver_engine::{index_directory, index_markdown_directory, save_extensions, set_property};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -4299,33 +4299,75 @@ fn tool_schema_set_extension() -> Value {
 }
 
 fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
-    let uid = args
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'uid' must be a string"))?;
-    let key = args
-        .get("key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'key' must be a string"))?;
-    let value = args
-        .get("value")
-        .cloned()
-        .ok_or_else(|| anyhow!("'value' is required"))?;
-
     let db_path = CURRENT_DB_PATH
         .with(|c| c.borrow().clone())
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
-    let mut store = load_extensions(&db_path);
-    set_property(&mut store, uid, key, value.clone());
-    save_extensions(&db_path, &store)?;
+    // Always route through the daemon (starting it if needed) so the sidecar
+    // read-modify-write runs under the daemon write gate — serialized against a
+    // backup's sidecar staging, visible to the shutdown drain, and safe from
+    // two concurrent callers losing updates (last-writer-wins). Mirrors
+    // `tool_brain_add_source`. The daemon's gRPC `set_extension` handler
+    // validates and performs the actual mutation directly (never back through
+    // this function), so there is no routing recursion.
+    #[cfg(feature = "daemon")]
+    {
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        dispatch_set_extension_via_daemon(&mut client, &rt, args)
+    }
 
-    Ok(json!({
-        "uid": uid,
-        "key": key,
-        "value": value,
-        "status": "saved",
-    }))
+    // Non-daemon fallback (daemon feature not compiled in): single-process, so
+    // a direct write is the only writer and needs no cross-process gate.
+    #[cfg(not(feature = "daemon"))]
+    {
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'uid' must be a string"))?;
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'key' must be a string"))?;
+        let value = args
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow!("'value' is required"))?;
+
+        let mut store = load_extensions(&db_path);
+        set_property(&mut store, uid, key, value.clone());
+        save_extensions(&db_path, &store)?;
+
+        Ok(json!({
+            "uid": uid,
+            "key": key,
+            "value": value,
+            "status": "saved",
+        }))
+    }
+}
+
+/// Route a `set_extension` call to the daemon's gated gRPC handler so the
+/// `.extensions.json` write holds the daemon write gate. Mirrors
+/// `dispatch_add_source_via_daemon`.
+#[cfg(feature = "daemon")]
+fn dispatch_set_extension_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    use nestweaver_proto::JsonRequest;
+
+    let args_json = serde_json::to_string(&args)?;
+    let resp = rt
+        .block_on(client.set_extension(JsonRequest { args_json }))
+        .map_err(|e| anyhow::anyhow!("set_extension RPC failed: {}", e.message()))?;
+    let result_json = resp.into_inner().result_json;
+    serde_json::from_str(&result_json).map_err(Into::into)
 }
 
 // ── 15. query_extensions ───────────────────────────────────────────────────
