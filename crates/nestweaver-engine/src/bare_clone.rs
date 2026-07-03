@@ -47,7 +47,10 @@ impl BareClone {
         if let Some(b) = branch {
             cmd.arg(format!("{b}:refs/heads/{b}"));
         }
-        let output = cmd.output().context("failed to run git fetch")?;
+        // Hard timeout so a blackholed remote can't wedge the worker (and its
+        // semaphore permit) forever — it kills+reaps the child on timeout.
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
+            .context("failed to run git fetch")?;
         if !output.status.success() {
             anyhow::bail!(
                 "git fetch failed for {}: {}",
@@ -60,11 +63,9 @@ impl BareClone {
 
     /// Resolve the SHA for an arbitrary ref (e.g. `origin/develop`).
     pub fn sha_for_ref(&self, reference: &str) -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.path)
-            .args(["rev-parse", reference])
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.path).args(["rev-parse", reference]);
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
             .with_context(|| format!("failed to run git rev-parse {reference}"))?;
         if !output.status.success() {
             anyhow::bail!(
@@ -78,11 +79,9 @@ impl BareClone {
 
     /// Get the SHA of HEAD (the default branch tip).
     pub fn head_sha(&self) -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.path)
-            .args(["rev-parse", "HEAD"])
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.path).args(["rev-parse", "HEAD"]);
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
             .context("failed to run git rev-parse HEAD")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -113,11 +112,10 @@ impl BareClone {
         let guard = crate::ssrf::guard_git_url(&self.url)?;
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
-        let output = cmd
-            .arg("-C")
+        cmd.arg("-C")
             .arg(&self.path)
-            .args(["ls-remote", "origin", "HEAD"])
-            .output()
+            .args(["ls-remote", "origin", "HEAD"]);
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
             .context("failed to run git ls-remote")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -198,16 +196,17 @@ impl BareCloneWorkspace {
 
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
-        let output = cmd
-            .args([
-                "clone",
-                "--filter=blob:none",
-                "--bare",
-                "--",
-                url,
-                &dest.display().to_string(),
-            ])
-            .output()
+        cmd.args([
+            "clone",
+            "--filter=blob:none",
+            "--bare",
+            "--",
+            url,
+            &dest.display().to_string(),
+        ]);
+        // Hard timeout so a hung clone against an unreachable remote can't wedge
+        // the worker task and leak its semaphore permit.
+        let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
             .with_context(|| {
                 format!("failed to run git clone --filter=blob:none --bare for {url}")
             })?;
@@ -279,11 +278,11 @@ impl BareCloneWorkspace {
 
 /// Read the origin remote URL from a bare repo's git config.
 fn read_origin_url(bare_path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(bare_path)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
+        .args(["config", "--get", "remote.origin.url"]);
+    let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::GIT_TIMEOUT)
         .context("failed to run git config")?;
     if !output.status.success() {
         anyhow::bail!("no origin URL configured");

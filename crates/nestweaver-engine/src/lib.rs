@@ -67,6 +67,7 @@ pub mod export_graph;
 pub mod extensions;
 pub mod format_comment;
 pub mod git_activity;
+pub mod git_cmd;
 pub mod git_diff;
 pub mod guide_rules;
 pub mod hash;
