@@ -24,7 +24,15 @@ const REINDEX_STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS reindex_state (
 ///
 /// Chosen comfortably longer than a normal index but still bounded — see the
 /// heartbeat-vs-longer-timeout tradeoff documented on `reap_expired_leases`.
-const DEFAULT_LEASE_SECS: i64 = 1800;
+pub const DEFAULT_LEASE_SECS: i64 = 1800;
+
+/// Age (seconds since `started_at`) at which [`JobQueue::recover_stale`]
+/// reclaims a `running` job. Deliberately tied to [`DEFAULT_LEASE_SECS`] so the
+/// lease and the stale-threshold cannot drift apart: `recover_stale` is the
+/// fallback for legacy `running` rows that predate the lease columns (NULL
+/// lease, invisible to the reaper), and it should fire on the same horizon a
+/// leased job would have expired on.
+pub const STALE_RECOVERY_SECS: i64 = DEFAULT_LEASE_SECS;
 
 /// What triggered this indexing job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +196,8 @@ impl JobQueue {
         // T4.1/T4.2: per-claim fencing token + lease visibility timeout. Both
         // nullable so migrating an existing queue never loses in-flight rows —
         // legacy `running` rows simply have NULL lease/owner and are handled by
-        // the once-at-startup `recover_stale` fallback until re-claimed.
+        // the `recover_stale` fallback (run at startup AND on every reaper tick)
+        // until re-claimed with a lease.
         let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN claimed_by TEXT;");
         let _ = conn.execute_batch("ALTER TABLE index_jobs ADD COLUMN lease_expires_at INTEGER;");
         // Persisted periodic-full reindex state (one row per repo). Lives in
@@ -497,13 +506,25 @@ impl JobQueue {
     /// legacy migrated `running` rows (NULL lease) are left to `recover_stale`.
     ///
     /// Heartbeat vs. longer base timeout: the worker's index runs inside an
-    /// un-cancellable `spawn_blocking` with no natural progress point to extend
-    /// the lease from, so rather than thread a heartbeat through the index loop
-    /// we set the base lease ([`DEFAULT_LEASE_SECS`]) comfortably longer than a
-    /// normal index but still bounded, and rely on this reaper. The tradeoff: a
-    /// genuinely long (> lease) index could be falsely reclaimed and re-run;
-    /// the lease is sized so that is rare, and a re-run is idempotent (SHA
-    /// comparison short-circuits an unchanged repo).
+    /// un-cancellable `spawn_blocking` with no per-job timeout and no natural
+    /// progress point to extend the lease from, so rather than thread a
+    /// heartbeat through the index loop we set the base lease
+    /// ([`DEFAULT_LEASE_SECS`]) comfortably longer than a normal index but still
+    /// bounded, and rely on this reaper.
+    ///
+    /// The failure mode when the base lease is set too short (relevant to
+    /// anyone tuning [`DEFAULT_LEASE_SECS`]): a genuinely long (> lease) index
+    /// is still running when its lease expires, so the reaper flips the row to
+    /// `pending` and a second worker claims and indexes the SAME repo
+    /// concurrently. The SHA short-circuit does NOT save us here — the first
+    /// run has not committed its new `indexed_sha` yet, so both runs see the
+    /// old SHA and both do full work. What keeps state consistent is NOT
+    /// idempotency but (a) the per-claim fencing token — when the original slow
+    /// worker finally finishes, its `complete`/`fail` no-op because its token no
+    /// longer matches the reclaimed row — and (b) the write mutex, which
+    /// serialises the two indexers' write phases so neither tears the graph.
+    /// The real cost is therefore fully duplicated indexing work (wasted CPU
+    /// and git I/O), not corrupted state. Size the lease so this is rare.
     pub fn reap_expired_leases(&self, now: i64) -> Result<usize, rusqlite::Error> {
         let count = self.conn.execute(
             "UPDATE index_jobs
@@ -1032,6 +1053,51 @@ mod tests {
             reclaimed_job.claimed_by, job.claimed_by,
             "re-claim must mint a new fencing token, invalidating the crashed worker"
         );
+    }
+
+    #[test]
+    fn legacy_null_lease_running_row_is_reclaimed_by_recover_stale() {
+        // A row left `running` by a pre-migration daemon has a NULL lease, so
+        // the reaper's `lease_expires_at IS NOT NULL` filter skips it. The
+        // periodic `recover_stale(STALE_RECOVERY_SECS)` tick is what rescues it
+        // — closing finding #12 for pre-migration in-flight rows too.
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+
+        // Simulate a legacy row: clear the lease and backdate started_at past
+        // the recovery threshold.
+        q.conn
+            .execute(
+                "UPDATE index_jobs
+                 SET lease_expires_at = NULL,
+                     started_at = CAST(strftime('%s','now') AS INTEGER) - ?2
+                 WHERE id = ?1",
+                params![job.id, STALE_RECOVERY_SECS + 60],
+            )
+            .unwrap();
+
+        // The reaper cannot see it (NULL lease), even far in the future.
+        let reaped = q
+            .reap_expired_leases(i64::MAX / 2)
+            .expect("reap should succeed");
+        assert_eq!(
+            reaped, 0,
+            "NULL-lease legacy row is invisible to the reaper"
+        );
+        assert_eq!(q.queue_depth().unwrap().running, 1, "still stuck running");
+
+        // The periodic recover_stale path reclaims it.
+        let recovered = q.recover_stale(STALE_RECOVERY_SECS).unwrap();
+        assert_eq!(recovered, 1, "recover_stale must rescue the legacy row");
+        assert_eq!(q.queue_depth().unwrap().pending, 1);
+        assert_eq!(q.queue_depth().unwrap().running, 0);
     }
 
     #[test]

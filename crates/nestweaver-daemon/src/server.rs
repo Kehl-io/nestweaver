@@ -4500,7 +4500,8 @@ pub async fn run_server(
                     .join("workspace");
                 // Recover any stale running jobs from a previous crash.
                 if let Ok(guard) = worker_job_queue.lock()
-                    && let Ok(recovered) = guard.recover_stale(1800)
+                    && let Ok(recovered) =
+                        guard.recover_stale(nestweaver_engine::jobs::STALE_RECOVERY_SECS)
                     && recovered > 0
                 {
                     tracing::info!(recovered, "recovered stale running jobs");
@@ -4553,11 +4554,23 @@ pub async fn run_server(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
-                            let reclaimed = match reaper_queue.lock() {
-                                Ok(guard) => guard.reap_expired_leases(now),
+                            // Two reclaim paths on the same tick: the reaper for
+                            // leased rows, and recover_stale for legacy rows that
+                            // predate the lease columns (NULL lease → invisible
+                            // to the reaper). Running recover_stale periodically
+                            // (not just once at startup) closes finding #12 for a
+                            // legacy row that was younger than the threshold at
+                            // startup but crosses it while the daemon runs.
+                            let (reclaimed, recovered) = match reaper_queue.lock() {
+                                Ok(guard) => (
+                                    guard.reap_expired_leases(now),
+                                    guard.recover_stale(
+                                        nestweaver_engine::jobs::STALE_RECOVERY_SECS,
+                                    ),
+                                ),
                                 Err(_) => {
                                     tracing::error!("lease reaper: job queue mutex poisoned");
-                                    Ok(0)
+                                    (Ok(0), Ok(0))
                                 }
                             };
                             match reclaimed {
@@ -4567,6 +4580,14 @@ pub async fn run_server(
                                 ),
                                 Ok(_) => {}
                                 Err(e) => tracing::error!("lease reaper: {e}"),
+                            }
+                            match recovered {
+                                Ok(n) if n > 0 => tracing::warn!(
+                                    recovered = n,
+                                    "lease reaper recovered stale legacy running jobs"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::error!("stale recovery: {e}"),
                             }
                         }
                         _ = reaper_shutdown.changed() => break,
