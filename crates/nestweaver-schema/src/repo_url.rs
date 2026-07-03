@@ -17,14 +17,13 @@
 //! hashing, so equivalent URL forms mint identical UIDs.
 //!
 //! Note on `file://` URLs: a local, path-only repo (`file:///Users/me/api`)
-//! normalizes to just its directory *leaf* (`api`) because there is no host or
-//! owner to key on. It therefore does NOT reconcile with a remote
-//! `host/owner/name` key — which is the correct behaviour: a working copy with
-//! no matching remote is a distinct identity. Reconciling a `file://` repo with
-//! its server counterpart requires resolving the local checkout's `origin`
-//! remote, which is not available at this layer.
-
-use std::path::Path;
+//! keys on its FULL lowercased path because there is no host or owner to key
+//! on. It therefore does NOT reconcile with a remote `host/owner/name` key —
+//! which is the correct behaviour: a working copy with no matching remote is a
+//! distinct identity. Keying on the full path (rather than the directory leaf)
+//! keeps two unrelated local checkouts that share a basename distinct.
+//! Reconciling a `file://` repo with its server counterpart requires resolving
+//! the local checkout's `origin` remote, which is not available at this layer.
 
 /// Collapse a repo clone URL to a normalized identity key that is invariant to
 /// scheme, embedded credentials, a trailing `.git`, a trailing slash, and host/
@@ -38,12 +37,21 @@ use std::path::Path;
 /// - `ssh://git@github.com/acme/api`
 /// - `https://user:token@github.com/acme/api`
 ///
-/// A bare local path or `file://` URL maps to its lowercased directory leaf.
+/// A bare local path or `file://` URL keys on its FULL lowercased path (NOT the
+/// directory leaf): the local daemon indexes repos as `file://<absolute-path>`,
+/// and two unrelated checkouts that share a basename (`.../work/api` vs
+/// `.../personal/api`) are distinct repos — collapsing them to the leaf would
+/// merge them in the store. A local path still never reconciles with a remote
+/// `host/owner/name` key (correct: a checkout with no matching remote is a
+/// distinct identity).
+///
+/// ⚠ Changing this normalization changes every stored hash (`repo_uid`,
+/// `file_uid`, `symbol_uid`, `canonical_symbol_id`) — requires a full reindex.
 pub fn normalized_repo_key(repo_url: &str) -> String {
     let repo = strip_git_suffix(strip_url_suffix(repo_url.trim()).trim_end_matches('/'));
 
     if let Some(path) = repo.strip_prefix("file://") {
-        return path_leaf(path);
+        return path.trim_end_matches('/').to_ascii_lowercase();
     }
 
     if let Some((_, rest)) = repo.split_once("://") {
@@ -59,7 +67,7 @@ pub fn normalized_repo_key(repo_url: &str) -> String {
     }
 
     if repo.starts_with('/') || repo.starts_with("./") || repo.starts_with("../") {
-        return path_leaf(repo);
+        return repo.trim_end_matches('/').to_ascii_lowercase();
     }
 
     repo.trim_matches('/').to_ascii_lowercase()
@@ -84,15 +92,6 @@ fn normalize_remote_path(remote: &str) -> String {
         })
         .unwrap_or_else(|| remote.to_string());
     without_auth.trim_matches('/').to_ascii_lowercase()
-}
-
-fn path_leaf(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .trim_matches('/')
-        .to_ascii_lowercase()
 }
 
 fn strip_url_suffix(repo_url: &str) -> &str {
@@ -144,11 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn file_url_normalizes_to_leaf_and_stays_distinct_from_remote() {
+    fn file_url_keys_on_full_path_and_stays_distinct_from_remote() {
         // Documents the file://-origin gap: a path-only checkout keys on its
-        // directory leaf, which does NOT match the remote host/owner/name key.
+        // FULL path, which does NOT match the remote host/owner/name key.
         let file_key = normalized_repo_key("file:///Users/me/dev/api");
-        assert_eq!(file_key, "api");
+        assert_eq!(file_key, "/users/me/dev/api");
         assert_ne!(
             file_key,
             normalized_repo_key("https://github.com/acme/api"),
@@ -157,9 +156,63 @@ mod tests {
     }
 
     #[test]
-    fn bare_local_path_normalizes_to_leaf() {
-        assert_eq!(normalized_repo_key("/Users/me/dev/api"), "api");
-        assert_eq!(normalized_repo_key("/Users/me/dev/api/"), "api");
+    fn two_distinct_local_paths_same_basename_stay_distinct() {
+        // The local daemon indexes repos as `file://<absolute-path>`. Two
+        // unrelated local checkouts that happen to share a basename (`api`)
+        // MUST NOT collide — collapsing them to the leaf would merge two
+        // distinct repos in the store (silent graph corruption).
+        let a = normalized_repo_key("file:///Users/me/work/api");
+        let b = normalized_repo_key("file:///Users/me/personal/api");
+        assert_ne!(
+            a, b,
+            "distinct local paths must not collapse to the basename"
+        );
+        assert_ne!(
+            crate::uid::repo_uid("local", "file:///Users/me/work/api"),
+            crate::uid::repo_uid("local", "file:///Users/me/personal/api"),
+            "distinct local paths must mint distinct repo_uids"
+        );
+        // A local path still does not reconcile with a remote (correct: a
+        // checkout with no matching remote is a distinct identity).
+        assert_ne!(a, normalized_repo_key("https://github.com/acme/api"));
+    }
+
+    #[test]
+    fn nested_subgroup_scp_and_https_reconcile() {
+        assert_eq!(
+            normalized_repo_key("git@gitlab.com:group/subgroup/repo.git"),
+            normalized_repo_key("https://gitlab.com/group/subgroup/repo"),
+        );
+    }
+
+    #[test]
+    fn git_and_http_schemes_reconcile() {
+        let canonical = normalized_repo_key("https://github.com/acme/api");
+        assert_eq!(
+            normalized_repo_key("git://github.com/acme/api.git"),
+            canonical
+        );
+        assert_eq!(normalized_repo_key("http://github.com/acme/api"), canonical);
+    }
+
+    #[test]
+    fn malformed_and_empty_inputs_do_not_panic() {
+        for input in ["", "   ", "user@host", "file://", "https://", "://x", "@:"] {
+            let _ = normalized_repo_key(input);
+            let _ = repo_name(input);
+        }
+    }
+
+    #[test]
+    fn bare_local_path_normalizes_to_full_path() {
+        assert_eq!(
+            normalized_repo_key("/Users/me/dev/api"),
+            "/users/me/dev/api"
+        );
+        assert_eq!(
+            normalized_repo_key("/Users/me/dev/api/"),
+            "/users/me/dev/api"
+        );
     }
 
     #[test]

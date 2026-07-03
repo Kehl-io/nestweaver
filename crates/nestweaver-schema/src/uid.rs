@@ -18,6 +18,9 @@ pub fn truncated_hash(input: &str) -> String {
 /// embedded credentials, host/path casing) mint the same `url_hash`. This lets
 /// a repo indexed by a LOCAL daemon (ssh remote) and a SERVER (https URL)
 /// reconcile at the root during merged-result dedup.
+///
+/// ⚠ Changing `normalized_repo_key` (or this derivation) changes every stored
+/// hash — requires a full reindex.
 pub fn repo_uid(instance: &str, url: &str) -> String {
     let normalized = normalized_repo_key(url);
     format!("repo:{}:{}", instance, truncated_hash(&normalized))
@@ -93,6 +96,10 @@ pub fn project_uid(instance: &str, name: &str) -> String {
 /// the symbol name alone — never the line number — so that inserting blank
 /// lines above a symbol does not change its identity. This stability is relied
 /// on by cross-boundary flow-trace stitching and atomic-change matching.
+///
+/// The `repo_url` is collapsed via [`normalized_repo_key`] before hashing so
+/// equivalent URL forms mint the same `repo_hash`. ⚠ Changing that
+/// normalization changes every stored canonical_id — requires a full reindex.
 pub fn canonical_symbol_id(
     repo_url: &str,
     file_path: &str,
