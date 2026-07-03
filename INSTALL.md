@@ -18,6 +18,16 @@ nestweaver --version
 # Expected: nestweaver X.Y.Z
 ```
 
+Semantic embeddings are included by default (`embed` feature). On **macOS**, add
+`--features metal` for GPU-accelerated embeddings from the CLI:
+
+```bash
+cargo install nestweaver --features metal   # macOS: Metal GPU embeddings
+```
+
+> The macOS `.app` bundle (below) is already built with Metal and is the
+> recommended way to run on a Mac.
+
 > **Building from source?** If you previously installed via `cargo install` and
 > are now building from a local checkout, run `cargo install --path .` after
 > each build to update `~/.cargo/bin/nestweaver`. Otherwise the installed binary

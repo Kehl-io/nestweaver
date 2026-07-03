@@ -96,9 +96,17 @@ Controls the local embedding model and hybrid retrieval weights. The embedding
 layer enables natural language queries by finding semantically similar symbols,
 notes, and headings as seeds for the graph walk.
 
+`model_id` here is the default for a *fresh* database. When you run `nestweaver
+embed`, NestWeaver records the model actually used, and the daemon loads that
+recorded model at startup regardless of this setting — so a database always uses
+a model matching its stored vectors. Pick a model per-database with
+`nestweaver embed --model-id <id>`: the default `all-MiniLM-L6-v2` is 384-dim,
+fast, and CPU-friendly (best for most users); `thenlper/gte-base` is 768-dim for
+higher-quality retrieval. Any mean-pooled BERT-compatible HuggingFace model works.
+
 ```toml
 [embedding]
-model_id = "sentence-transformers/all-MiniLM-L6-v2"  # any BERT-compatible HuggingFace model
+model_id = "sentence-transformers/all-MiniLM-L6-v2"  # default for fresh DBs; the embedded model is recorded & auto-loaded
 cache_dir = "~/.cache/nestweaver/models"
 
 # Optional: use an external API instead of the local model (falls back to local on failure)
@@ -118,7 +126,7 @@ semantic_search_limit = 200    # top-k semantic hits fed into fusion
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID for local embeddings |
+| `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | Default local model for fresh DBs (any mean-pooled BERT-compatible HF model). The model a DB was embedded with is recorded and auto-loaded, overriding this. |
 | `cache_dir` | `"~/.cache/nestweaver/models"` | Directory to cache downloaded model weights |
 | `external_endpoint` | — | Optional external embedding API endpoint (falls back to local on failure) |
 | `external_model` | — | Model name for the external endpoint |

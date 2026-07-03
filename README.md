@@ -338,13 +338,17 @@ nestweaver context "BLE bluetooth connection handling"
 nestweaver context "where does the upload pipeline start"
 ```
 
-Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use (~80MB).
+Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use.
 
-**Performance:** 7ms query embedding (Metal), 37ms (CPU). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+**Model selection.** The default is the light, fast `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most repos and CPU-only servers. For higher-quality retrieval, embed with a stronger model, e.g. `nestweaver embed --model-id thenlper/gte-base` (768-dim). NestWeaver **records which model a database was embedded with**, and the daemon automatically loads that same model at startup — so you can pick a model per-database (or override the default in `instance.toml`) without dimension mismatches.
 
-Configure weights in `instance.toml`:
+**Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM; heavier models trade speed for quality. Query-time embedding runs on the GPU in the daemon (the model is loaded on the daemon's main thread so Metal is reachable). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+
+Configure the model and fusion weights in `instance.toml`:
 ```toml
 [embedding]
+# Shipped default; the model a DB was actually embedded with is recorded and
+# auto-loaded by the daemon. Set this to override the default for fresh instances.
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
 weight_ppr = 0.40
 weight_bm25 = 0.25
@@ -359,9 +363,8 @@ weight_semantic = 0.35
 NestWeaver includes a native macOS `.app` bundle — the recommended way to run on Mac. It provides:
 
 - **Menubar status icon** with quick access to the web UI and daemon status
-- **Metal GPU acceleration** — the app provides GUI session context so the daemon gets full Metal access (~5x faster embeddings: 7ms vs 37ms)
-- **Automatic daemon lifecycle** — starts the daemon on launch, terminates on quit, no orphaned processes
-- **Crash recovery** — auto-restarts the daemon up to 3 times on unexpected crashes
+- **Metal GPU acceleration** — the app launches the daemon as a launchd Aqua agent so it runs in the GUI session and can reach the Metal shader compiler for GPU embeddings (~5x faster: 7ms vs 37ms). The daemon loads the embedding model on its main thread, which is what lets a background process reach Metal.
+- **Managed daemon lifecycle** — launches the daemon via launchd (which owns crash-restart); the daemon is a shared service (MCP/CLI/UI all use it) and persists across app quits, so the app re-attaches to it on next launch
 - **Daemon coexistence** — detects if a daemon is already running (via CLI or launchd) and connects to it instead of starting a second instance
 - **Web UI** at `http://127.0.0.1:9377` — opens automatically on launch
 
