@@ -38,6 +38,23 @@ fn guard_clone_url(url: &str) -> Result<crate::ssrf::GitNetGuard, crate::ssrf::S
     crate::ssrf::guard_git_url(url)
 }
 
+/// Build the `git fetch` operands (subcommand + `origin` + optional refspec).
+///
+/// For a branch-specific fetch the `<branch>:refs/heads/<branch>` refspec is
+/// placed AFTER a `--` end-of-options separator so a branch value that begins
+/// with `-` (e.g. `--upload-pack=…`) can never be parsed by git as an option —
+/// argument-injection defense-in-depth. `branch` is operator/config-controlled
+/// today (not attacker-reachable), but the separator keeps it safe if an
+/// untrusted branch source is ever introduced.
+fn fetch_operands(branch: Option<&str>) -> Vec<String> {
+    let mut args = vec!["fetch".to_string(), "origin".to_string()];
+    if let Some(b) = branch {
+        args.push("--".to_string());
+        args.push(format!("{b}:refs/heads/{b}"));
+    }
+    args
+}
+
 /// A single blobless bare clone of a remote git repository.
 #[derive(Debug, Clone)]
 pub struct BareClone {
@@ -73,10 +90,7 @@ impl BareClone {
         let mut cmd = Command::new("git");
         cmd.args(&guard.config_args);
         cmd.args(HTTP_LOW_SPEED_ARGS);
-        cmd.arg("-C").arg(&self.path).args(["fetch", "origin"]);
-        if let Some(b) = branch {
-            cmd.arg(format!("{b}:refs/heads/{b}"));
-        }
+        cmd.arg("-C").arg(&self.path).args(fetch_operands(branch));
         // Hard timeout so a blackholed remote can't wedge the worker (and its
         // semaphore permit) forever — it kills+reaps the process group on timeout.
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
@@ -385,6 +399,36 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn fetch_operands_separate_refspec_with_double_dash() {
+        // No branch → just the subcommand + remote, no refspec, no separator.
+        assert_eq!(fetch_operands(None), vec!["fetch", "origin"]);
+
+        // A branch value that begins with `-` must land AFTER a `--`
+        // end-of-options separator so git parses it as a refspec operand, never
+        // as a flag (argument-injection defense-in-depth).
+        let hostile = "--upload-pack=touch /tmp/pwned";
+        let args = fetch_operands(Some(hostile));
+        assert_eq!(
+            args,
+            vec![
+                "fetch".to_string(),
+                "origin".to_string(),
+                "--".to_string(),
+                format!("{hostile}:refs/heads/{hostile}"),
+            ]
+        );
+        let sep = args.iter().position(|a| a == "--").expect("`--` present");
+        let refspec = args
+            .iter()
+            .position(|a| a.starts_with(hostile))
+            .expect("refspec present");
+        assert!(
+            sep < refspec,
+            "the `--` separator must precede the refspec operand"
+        );
     }
 
     #[test]
