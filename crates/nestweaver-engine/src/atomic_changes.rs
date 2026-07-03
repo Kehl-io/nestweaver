@@ -526,11 +526,22 @@ pub fn classify_signature_change(
             if is_reorder(&old_params, &new_params) {
                 ImpactSeverity::Breaking
             } else if params_differ(&old_params, &new_params) {
-                // A param's type/annotation changed. Load-bearing at compile
-                // time for Class S (BREAKING); advisory for Class D (WARNING).
                 match class {
+                    // Static: any positional param difference (name or type) is
+                    // load-bearing at compile time => BREAKING.
                     LangClass::Static => ImpactSeverity::Breaking,
-                    LangClass::Dynamic => ImpactSeverity::Warning,
+                    LangClass::Dynamic => {
+                        if positional_names_differ(&old_params, &new_params) {
+                            // A param RENAME breaks keyword-argument callers
+                            // (`foo(a=1)`) in a dynamic language => BREAKING.
+                            ImpactSeverity::Breaking
+                        } else {
+                            // Names match positionally; only a type annotation
+                            // changed, which is not enforced at the call site
+                            // in a dynamic language => advisory WARNING.
+                            ImpactSeverity::Warning
+                        }
+                    }
                 }
             } else {
                 // Params are positionally identical — the change is elsewhere
@@ -626,6 +637,18 @@ fn is_reorder(old: &[&str], new: &[&str]) -> bool {
     a.sort_unstable();
     b.sort_unstable();
     a == b // same multiset, different order
+}
+
+/// True if any positional parameter NAME differs between `old` and `new` of
+/// equal length — i.e. a rename (as opposed to a type/annotation-only change).
+/// Keys on `param_name` so a Dynamic annotation change (`a: int` -> `a: str`,
+/// name unchanged) is NOT flagged as a rename.
+fn positional_names_differ(old: &[&str], new: &[&str]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new.iter())
+            .any(|(o, n)| param_name(o) != param_name(n))
 }
 
 /// True if any positional parameter fragment differs (after whitespace
@@ -1580,6 +1603,15 @@ mod tests {
         let severity =
             classify_signature_change("def foo(a: int)", "def foo(a: str)", "src/caller.py");
         assert_eq!(severity, ImpactSeverity::Warning);
+    }
+
+    #[test]
+    fn dynamic_param_rename_is_breaking() {
+        // In a keyword-argument language, renaming a param breaks callers that
+        // pass it by name (`foo(a=1)`). Table row "Rename param -> BREAKING in
+        // Class D". Same arity, so this must not fall into the WARNING branch.
+        let severity = classify_signature_change("def foo(a)", "def foo(b)", "src/caller.py");
+        assert_eq!(severity, ImpactSeverity::Breaking);
     }
 
     #[test]
