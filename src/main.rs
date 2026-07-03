@@ -4803,7 +4803,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 let mut args = serde_json::json!({ "format": format, "top": top });
                 if let Some(ref p) = output {
-                    args["output"] = serde_json::Value::String(p.display().to_string());
+                    // The DAEMON writes the file and runs with CWD=/, so a client-relative
+                    // --output would land in / (or fail), not the user's directory. Resolve
+                    // against the client's CWD here.
+                    let abs = if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(p))
+                            .unwrap_or_else(|_| p.clone())
+                    };
+                    args["output"] = serde_json::Value::String(abs.display().to_string());
                 }
 
                 let req = tonic::Request::new(nestweaver_proto::JsonRequest {
@@ -5232,8 +5242,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &db_path,
                     config.as_deref(),
                 ))
-                && let Ok(resp) =
-                    rt.block_on(client.watch_code(&repo_path.display().to_string(), &instance_id))
+                && let Ok(resp) = rt.block_on(client.watch_code(
+                    // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                    &std::fs::canonicalize(&repo_path)
+                        .unwrap_or_else(|_| repo_path.clone())
+                        .to_string_lossy(),
+                    &instance_id,
+                ))
             {
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
@@ -6618,8 +6633,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
                     .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
                     .unwrap_or_else(|| {
-                        let store = open_store(db.as_deref()).expect("open_store");
-                        store.list_projects().unwrap_or_default()
+                        // Daemon unreachable / RPC failed — fall back to a direct read, but
+                        // never panic on a bad --db path; warn and return empty on error.
+                        match open_store(db.as_deref()) {
+                            Ok(store) => store.list_projects().unwrap_or_default(),
+                            Err(e) => {
+                                eprintln!("Warning: could not open store: {e}");
+                                Vec::new()
+                            }
+                        }
                     })
             } else {
                 let store = open_store(db.as_deref())?;
@@ -7292,8 +7314,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
+                // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
+                // a client-relative vault path against the wrong directory.
+                let vault_abs = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
                 let args = serde_json::json!({
-                    "vault": vault.to_string_lossy(),
+                    "vault": vault_abs.to_string_lossy(),
                 });
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
@@ -7347,6 +7372,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(p) => p,
                 None => detect_repo_root(),
             };
+            // Canonicalize to an absolute path in the CLIENT's working directory before
+            // anything else. The daemon runs detached (CWD=`/`), so a relative `--repo`
+            // path would resolve against the wrong directory and silently index 0 files.
+            // Failing fast here also turns a typo'd/nonexistent path into a clear error
+            // instead of a confusing no-op.
+            let repo_path = std::fs::canonicalize(&repo_path).with_context(|| {
+                format!(
+                    "repository path does not exist: {} — pass an existing path \
+                     (absolute, or run from within the repo)",
+                    repo_path.display()
+                )
+            })?;
             let db_path = resolve_index_db_path(db, &repo_path);
 
             if use_daemon {
@@ -9042,8 +9079,11 @@ fn run_brain(
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
+                // a client-relative vault path against the wrong directory (indexing 0).
+                let vault_abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 let req = nestweaver_proto::IndexVaultRequest {
-                    vault_path: path.display().to_string(),
+                    vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
@@ -9872,8 +9912,10 @@ fn run_brain(
                     &db_path,
                     config.as_deref(),
                 ))?;
+                // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                let vault_abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 let req = nestweaver_proto::WatchVaultRequest {
-                    vault_path: path.display().to_string(),
+                    vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     instance_id: instance_id.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
@@ -10080,7 +10122,9 @@ fn run_brain(
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
-                    vault_path: path.display().to_string(),
+                    // Absolute path: the daemon runs with CWD=/ and would otherwise
+                    // resolve a client-relative vault path against the wrong directory.
+                    vault_path: canonical.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),

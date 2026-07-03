@@ -259,6 +259,18 @@ impl DaemonService {
             // In server mode, clamp depth and result limits per safeguard config
             // before passing to the tool handler.
             let mut args = args;
+            // Hard-cap traversal depth in ALL modes (local + server): a huge
+            // client-supplied depth can overflow the stack in recursive traces
+            // (build_flow_tree / walk_trace) or run the graph away in impact BFS.
+            // Server mode further tightens this via the safeguard config below.
+            const HARD_MAX_DEPTH: u64 = 64;
+            for key in ["depth", "max_depth"] {
+                if let Some(n) = args.get(key).and_then(|v| v.as_u64())
+                    && n > HARD_MAX_DEPTH
+                {
+                    args[key] = serde_json::json!(HARD_MAX_DEPTH);
+                }
+            }
             let depth_result = if state.server_mode {
                 // Clamp depth parameter.
                 let client_depth = args
@@ -4260,8 +4272,9 @@ pub async fn run_server(
     // because it loaded off the main thread. This runs before the socket is bound below, so
     // it blocks startup ~1s (Metal) but the daemon isn't serving yet — and it gets the GPU
     // for query-time embedding, which is the required path (all embedding goes through the
-    // daemon). `EmbedModel::load` catches its own device panics internally, so it returns
-    // Err (never hangs) rather than needing an external timeout.
+    // daemon). `EmbedModel::load` catches its own device panics internally (returns Err);
+    // the only hang risk is the cold-cache HuggingFace download, which is bounded by the
+    // prefetch timeout below so a slow/unreachable network can't block the socket bind.
     tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
     #[cfg(feature = "embed")]
     {
@@ -4303,8 +4316,32 @@ pub async fn run_server(
             external_endpoint: cfg.external_endpoint.clone(),
             external_model: cfg.external_model.clone(),
         };
-        match nestweaver_embed::EmbedModel::load(&config) {
-            Ok(model) => {
+        // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't
+        // hang the daemon before it binds its socket below. On a warm cache this is
+        // instant; only the local-model path downloads. If it fails/times out, skip the
+        // load — the daemon still binds and serves (semantic search disabled until a
+        // restart with the model available). The Metal init itself is fast and runs here
+        // on the main thread so it can reach the GPU.
+        let loaded = if config.external_endpoint.is_some() {
+            Some(nestweaver_embed::EmbedModel::load(&config))
+        } else {
+            let model_id = config.model_id.clone();
+            let prefetch = tokio::task::spawn_blocking(move || {
+                nestweaver_embed::local::prefetch_model(&model_id)
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
+                Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
+                _ => {
+                    tracing::warn!(
+                        "embedding model download timed out or failed — semantic search \
+                         disabled until the daemon restarts with the model available"
+                    );
+                    None
+                }
+            }
+        };
+        match loaded {
+            Some(Ok(model)) => {
                 tracing::info!(dim = model.dimension(), "Embedding model loaded");
                 // Check dimension compatibility with existing embeddings.
                 if let Some(stored_dim) = state.store.embedding_index_dimension()
@@ -4323,9 +4360,10 @@ pub async fn run_server(
                         as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!("Failed to load embedding model: {e}");
             }
+            None => {} // prefetch failed/timed out — already warned above
         }
     }
 
@@ -5487,7 +5525,10 @@ fn flow_trace_continue_impl(
         format!("srv-{:016x}", n)
     };
 
-    let max_depth = req.remaining_depth.max(0) as usize;
+    // Hard-cap depth: a peer daemon could send a huge remaining_depth, and the recursive
+    // walk_trace below would otherwise overflow the stack. This typed RPC bypasses the
+    // JSON-dispatch depth clamp, so it needs its own bound.
+    let max_depth = (req.remaining_depth.max(0) as usize).min(64);
     let trace_id = req.trace_id.clone();
 
     // Build the visited set from the request.
