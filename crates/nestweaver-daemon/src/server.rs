@@ -3476,6 +3476,16 @@ fn validate_bind_security(
     Ok(())
 }
 
+/// Whether an `--acme-domain` request can ACTUALLY provide TLS in THIS build.
+/// ACME is feature-gated; a binary compiled without `acme` cannot provision a
+/// certificate, so an ACME request must NOT count as TLS for the bind-security
+/// gate — otherwise a non-loopback bind would pass the gate and then serve
+/// cleartext. Returns `true` only when a domain was requested AND the `acme`
+/// feature is compiled in.
+fn acme_provides_tls(acme_domain_present: bool) -> bool {
+    acme_domain_present && cfg!(feature = "acme")
+}
+
 /// Whether `bind_addr` resolves to a loopback socket address. A string we
 /// cannot parse as a `SocketAddr` (e.g. `localhost:9378`) is treated as
 /// NON-loopback — the safe default, so an ambiguous bind is never assumed to be
@@ -3791,23 +3801,12 @@ pub async fn run_server(
         &admin_token,
     )?;
 
-    // Enforce bind-scope security invariants in one place: a non-loopback bind
-    // must be authenticated (--auth-token) AND TLS-encrypted (--tls-cert/--tls-key).
-    // Without auth the interceptor passes all requests; without TLS the bearer
-    // token and source travel in cleartext. See `validate_bind_security`.
-    if let Some(ref opts) = server_opts {
-        validate_bind_security(
-            &opts.bind_addr,
-            &opts.auth_token,
-            &opts.tls_cert,
-            &opts.tls_key,
-            opts.acme_domain.is_some(),
-        )?;
-    }
-
     // A binary built WITHOUT the `acme` feature cannot provision certs. Reject
-    // --acme-domain rather than silently binding a non-loopback listener (the
-    // bind gate counts ACME as TLS) with no certificate behind it.
+    // --acme-domain up front rather than binding a non-loopback listener with no
+    // certificate behind it. Checked BEFORE the bind gate so the operator gets
+    // this actionable message. The passthrough in the root Cargo.toml makes
+    // `--features acme` a valid build of the top-level binary, so the
+    // instruction is now correct (B2).
     #[cfg(not(feature = "acme"))]
     if server_opts
         .as_ref()
@@ -3815,9 +3814,26 @@ pub async fn run_server(
         .is_some()
     {
         anyhow::bail!(
-            "--acme-domain requires a binary built with `--features acme`; rebuild \
-             with that feature, or use --tls-cert/--tls-key for manual TLS instead"
+            "--acme-domain requires a binary built with `--features acme`, but this \
+             binary was compiled without it. Rebuild with `cargo build --release \
+             --features acme` (or `cargo install --features acme`), or use \
+             --tls-cert/--tls-key for manual TLS instead."
         );
+    }
+
+    // Enforce bind-scope security. ACME only counts as TLS when the feature is
+    // actually compiled in (`acme_provides_tls`); on a no-feature build the
+    // guard above has already bailed, so here a non-loopback ACME-only bind
+    // would fail closed rather than being waved through as "TLS" and then
+    // serving cleartext.
+    if let Some(ref opts) = server_opts {
+        validate_bind_security(
+            &opts.bind_addr,
+            &opts.auth_token,
+            &opts.tls_cert,
+            &opts.tls_key,
+            acme_provides_tls(opts.acme_domain.is_some()),
+        )?;
     }
 
     // Reject any present webhook secret that is too short to be safe.
@@ -5656,6 +5672,37 @@ mod startup_helper_tests {
         let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
         // Preserves the pre-existing invariant: non-loopback requires auth even with TLS.
         assert!(validate_bind_security("0.0.0.0:9378", &None, &cert, &key, false).is_err());
+    }
+
+    #[test]
+    fn acme_provides_tls_reflects_build_feature() {
+        // A domain request only counts as TLS when the `acme` feature is compiled
+        // in; without it, ACME cannot provision a cert.
+        assert_eq!(acme_provides_tls(true), cfg!(feature = "acme"));
+        // No domain requested is never TLS regardless of the build.
+        assert!(!acme_provides_tls(false));
+    }
+
+    #[test]
+    fn acme_bind_gate_fails_closed_without_feature() {
+        // B2: a non-loopback bind that relies on ACME for TLS must be REFUSED when
+        // the binary was compiled without the `acme` feature (fail closed), and
+        // ACCEPTED when the feature is present (ACME provides TLS). Drive the gate
+        // with the effective, build-aware ACME flag exactly as the call site does.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let effective_acme = acme_provides_tls(/* domain present */ true);
+        let result = validate_bind_security("0.0.0.0:9378", &tok, &None, &None, effective_acme);
+        if cfg!(feature = "acme") {
+            assert!(
+                result.is_ok(),
+                "with the acme feature, ACME counts as TLS for a non-loopback bind"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "without the acme feature, an ACME-only non-loopback bind must fail closed"
+            );
+        }
     }
 
     #[test]

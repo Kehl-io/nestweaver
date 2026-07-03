@@ -118,6 +118,11 @@ nestweaver-embed = { workspace = true, optional = true }
 default = ["embed"]
 embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
 metal = ["nestweaver-embed?/metal"]
+# ACME (Let's Encrypt) auto-TLS. Forwards to the daemon crate so the top-level
+# binary can be built with `--features acme` — without this passthrough the
+# runtime instruction to rebuild with that feature would fail (the binary would
+# not have it), and `--acme-domain` would be a dead runtime error.
+acme = ["nestweaver-daemon/acme"]
 
 [dev-dependencies]
 assert_cmd = "2"
