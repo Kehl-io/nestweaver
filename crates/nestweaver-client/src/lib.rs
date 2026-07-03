@@ -6,6 +6,7 @@ pub mod dedup;
 pub mod discovery;
 pub mod hybrid;
 pub mod merge;
+pub mod repo_identity;
 pub mod routing;
 pub mod upstream;
 

@@ -98,11 +98,18 @@ pub fn extract_identity(result: &serde_json::Value) -> Option<SymbolIdentity> {
 
     // Repo URL: try standard fields, then extract from `uid` if it encodes
     // repo info.
+    //
+    // When a raw clone URL is present, key on its NORMALIZED identity
+    // (`host/owner/name`, invariant to scheme, credentials, `.git` suffix,
+    // trailing slash, and case) rather than the raw string. Otherwise the same
+    // repo indexed by a LOCAL daemon under one URL form and by a SERVER under
+    // another never coalesces, and shared symbols appear twice in merged
+    // results instead of once with `both` provenance.
     let repo_url = result
         .get("repo_url")
         .or_else(|| result.get("repo"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(crate::repo_identity::normalized_repo_key)
         .or_else(|| {
             result.get("uid").and_then(|v| v.as_str()).and_then(|uid| {
                 // UID format: "sym:repo:{instance}:{url_hash}:{file_hash}:{name_hash}:{line}".
@@ -424,6 +431,83 @@ mod tests {
         let merged = deduplicate(local, server);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].provenance, Provenance::Server);
+    }
+
+    #[test]
+    fn cross_instance_dedup_reconciles_ssh_and_https_url_forms() {
+        // Cross-instance fixture (T3.0 RED anchor): the LOCAL daemon indexed the
+        // repo from an ssh clone URL while the SERVER indexed the *same* repo
+        // from its canonical https URL. Same symbol, same file, same scope —
+        // only the repo URL *form* differs (scheme, credentials, `.git` suffix).
+        // Result identity must key on the NORMALIZED repo identity so the two
+        // rows coalesce into a single `both` row instead of appearing twice as
+        // separate local + server rows.
+        let local = vec![json!({
+            "repo_url": "git@github.com:acme/api.git",
+            "file_path": "src/billing.rs",
+            "symbol_name": "process_payment",
+            "scope_chain": "billing::process_payment",
+        })];
+        let server = vec![json!({
+            "repo_url": "https://github.com/acme/api",
+            "file_path": "src/billing.rs",
+            "symbol_name": "process_payment",
+            "scope_chain": "billing::process_payment",
+        })];
+
+        let merged = deduplicate(local, server);
+        assert_eq!(
+            merged.len(),
+            1,
+            "same symbol under two URL forms must dedup to a single row"
+        );
+        assert_eq!(
+            merged[0].provenance,
+            Provenance::Both,
+            "reconciled symbol must be attributed to both sources"
+        );
+    }
+
+    #[test]
+    fn cross_instance_dedup_trailing_slash_and_case_reconcile() {
+        // Trailing slash + host/owner casing differences must not split identity.
+        let local = vec![json!({
+            "repo_url": "https://GitHub.com/Acme/API/",
+            "file_path": "src/lib.rs",
+            "symbol_name": "handler",
+            "scope_chain": "api::handler",
+        })];
+        let server = vec![json!({
+            "repo_url": "https://github.com/acme/api",
+            "file_path": "src/lib.rs",
+            "symbol_name": "handler",
+            "scope_chain": "api::handler",
+        })];
+
+        let merged = deduplicate(local, server);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].provenance, Provenance::Both);
+    }
+
+    #[test]
+    fn cross_instance_distinct_repos_do_not_merge() {
+        // Two genuinely different repos that happen to share a symbol/file must
+        // NOT be merged — normalization must not over-collapse distinct owners.
+        let local = vec![json!({
+            "repo_url": "https://github.com/acme/api",
+            "file_path": "src/lib.rs",
+            "symbol_name": "handler",
+            "scope_chain": "api::handler",
+        })];
+        let server = vec![json!({
+            "repo_url": "https://github.com/other/api",
+            "file_path": "src/lib.rs",
+            "symbol_name": "handler",
+            "scope_chain": "api::handler",
+        })];
+
+        let merged = deduplicate(local, server);
+        assert_eq!(merged.len(), 2, "distinct owners must remain distinct");
     }
 
     #[test]

@@ -23,6 +23,7 @@ use nestweaver_proto::{JsonRequest, JsonResponse};
 use crate::DaemonClient;
 use crate::discovery::{RoutingMode, discover_upstreams_with_config};
 use crate::merge::rrf_merge;
+use crate::repo_identity::{normalized_repo_key, repo_name};
 use crate::routing::{ToolRouting, tool_routing};
 use crate::upstream::UpstreamHandle;
 
@@ -1356,68 +1357,6 @@ fn local_sha_for_server_repo<'a>(
         }
     }
     match_sha
-}
-
-fn normalized_repo_key(repo_url: &str) -> String {
-    let repo = strip_git_suffix(strip_url_suffix(repo_url.trim()).trim_end_matches('/'));
-
-    if let Some(path) = repo.strip_prefix("file://") {
-        return path_leaf(path);
-    }
-
-    if let Some((_, rest)) = repo.split_once("://") {
-        return normalize_remote_path(rest);
-    }
-
-    if let Some((_, rest)) = repo.split_once('@')
-        && let Some((host, path)) = rest.split_once(':')
-    {
-        return format!("{host}/{path}")
-            .trim_matches('/')
-            .to_ascii_lowercase();
-    }
-
-    if repo.starts_with('/') || repo.starts_with("./") || repo.starts_with("../") {
-        return path_leaf(repo);
-    }
-
-    repo.trim_matches('/').to_ascii_lowercase()
-}
-
-fn repo_name(repo_url: &str) -> Option<String> {
-    let key = normalized_repo_key(repo_url);
-    key.rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(ToString::to_string)
-}
-
-fn normalize_remote_path(remote: &str) -> String {
-    let without_auth = remote
-        .split_once('/')
-        .map(|(host, path)| {
-            let host = host.rsplit('@').next().unwrap_or(host);
-            format!("{host}/{path}")
-        })
-        .unwrap_or_else(|| remote.to_string());
-    without_auth.trim_matches('/').to_ascii_lowercase()
-}
-
-fn path_leaf(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .trim_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn strip_url_suffix(repo_url: &str) -> &str {
-    repo_url.split(['?', '#']).next().unwrap_or(repo_url)
-}
-
-fn strip_git_suffix(repo_url: &str) -> &str {
-    repo_url.strip_suffix(".git").unwrap_or(repo_url)
 }
 
 // ── Result helpers ────────────────────────────────────────────────────
