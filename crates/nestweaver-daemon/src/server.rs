@@ -3940,6 +3940,97 @@ fn build_repo_types(
         .collect()
 }
 
+/// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
+/// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
+/// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
+/// thread (there it silently falls back to CPU). Called AFTER the UDS server is spawned so a
+/// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
+/// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
+/// semantic search returns "model not loaded" until it completes.
+#[cfg(feature = "embed")]
+async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    let mut cfg = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.embedding.clone())
+        .unwrap_or_default();
+    // The DB records which model generated the stored embeddings (set on embed). Load THAT
+    // model regardless of the compiled default or config — it must match the stored vectors,
+    // or semantic search is disabled on a dimension mismatch. This lets the shipped default
+    // stay light while a given instance uses whatever it was actually embedded with.
+    if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
+        && !stored_model_id.is_empty()
+    {
+        if stored_model_id != cfg.model_id {
+            tracing::info!(
+                stored = %stored_model_id,
+                configured = %cfg.model_id,
+                "Loading the embedding model recorded in the DB (matches stored embeddings)"
+            );
+        }
+        cfg.model_id = stored_model_id;
+    }
+    // Expand tilde in cache_dir using the home directory.
+    let cache_dir = if cfg.cache_dir.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&cfg.cache_dir[2..])
+        } else {
+            std::path::PathBuf::from(&cfg.cache_dir)
+        }
+    } else {
+        std::path::PathBuf::from(&cfg.cache_dir)
+    };
+    let config = nestweaver_embed::EmbedConfig {
+        model_id: cfg.model_id.clone(),
+        cache_dir,
+        external_endpoint: cfg.external_endpoint.clone(),
+        external_model: cfg.external_model.clone(),
+    };
+    // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
+    // load. On a warm cache this is instant; only the local-model path downloads.
+    let loaded = if config.external_endpoint.is_some() {
+        Some(nestweaver_embed::EmbedModel::load(&config))
+    } else {
+        let model_id = config.model_id.clone();
+        let prefetch =
+            tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
+        match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
+            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
+            _ => {
+                tracing::warn!(
+                    "embedding model download timed out or failed — semantic search disabled \
+                     until the daemon restarts with the model available"
+                );
+                None
+            }
+        }
+    };
+    match loaded {
+        Some(Ok(model)) => {
+            tracing::info!(dim = model.dimension(), "Embedding model loaded");
+            if let Some(stored_dim) = state.store.embedding_index_dimension()
+                && stored_dim != model.dimension()
+            {
+                tracing::warn!(
+                    model_dim = model.dimension(),
+                    stored_dim,
+                    "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                     Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                    model.dimension(),
+                    stored_dim
+                );
+            } else {
+                *state.embed_model.write().await = Some(std::sync::Arc::new(model)
+                    as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
+            }
+        }
+        Some(Err(e)) => {
+            tracing::warn!("Failed to load embedding model: {e}");
+        }
+        None => {}
+    }
+}
+
 pub async fn run_server(
     db_path: &Path,
     idle_timeout: Option<Duration>,
@@ -4262,110 +4353,11 @@ pub async fn run_server(
         });
     }
 
-    // Load the embedding model. This MUST run synchronously on the process MAIN thread
-    // (the `block_on` driver), NOT on a tokio worker or `spawn_blocking` thread. On macOS,
-    // candle compiles its Metal shaders at runtime, which requires MTLCompilerService — an
-    // Aqua per-session XPC service that is reachable from the daemon's main thread but NOT
-    // from a tokio worker/blocking thread (there it's unreachable and candle silently falls
-    // back to CPU, and cold it can churn a panic→fallback). A plain `nestweaver embed`
-    // (main thread) gets `device=Metal` even as a launchd agent; the daemon only failed
-    // because it loaded off the main thread. This runs before the socket is bound below, so
-    // it blocks startup ~1s (Metal) but the daemon isn't serving yet — and it gets the GPU
-    // for query-time embedding, which is the required path (all embedding goes through the
-    // daemon). `EmbedModel::load` catches its own device panics internally (returns Err);
-    // the only hang risk is the cold-cache HuggingFace download, which is bounded by the
-    // prefetch timeout below so a slow/unreachable network can't block the socket bind.
+    // The embedding model is loaded on the MAIN thread near the end of run_server — AFTER the
+    // UDS server is spawned and the socket is bound + serving. candle needs the main thread to
+    // reach Metal, but the socket must not wait on a cold-cache model download. See the serve
+    // spawn + `load_embedding_model(&state)` below.
     tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
-    #[cfg(feature = "embed")]
-    {
-        let mut cfg = state
-            .instance_cfg
-            .as_ref()
-            .map(|c| c.embedding.clone())
-            .unwrap_or_default();
-        // The DB records which model generated the stored embeddings (set on embed). Load
-        // THAT model regardless of the compiled default or config — it must match the
-        // stored vectors, or semantic search is disabled on a dimension mismatch. This is
-        // what lets the shipped default stay light (best for most users) while a given
-        // instance transparently uses whatever model it was actually embedded with.
-        if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
-            && !stored_model_id.is_empty()
-        {
-            if stored_model_id != cfg.model_id {
-                tracing::info!(
-                    stored = %stored_model_id,
-                    configured = %cfg.model_id,
-                    "Loading the embedding model recorded in the DB (matches stored embeddings)"
-                );
-            }
-            cfg.model_id = stored_model_id;
-        }
-        // Expand tilde in cache_dir using the home directory.
-        let cache_dir = if cfg.cache_dir.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(&cfg.cache_dir[2..])
-            } else {
-                std::path::PathBuf::from(&cfg.cache_dir)
-            }
-        } else {
-            std::path::PathBuf::from(&cfg.cache_dir)
-        };
-        let config = nestweaver_embed::EmbedConfig {
-            model_id: cfg.model_id.clone(),
-            cache_dir,
-            external_endpoint: cfg.external_endpoint.clone(),
-            external_model: cfg.external_model.clone(),
-        };
-        // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't
-        // hang the daemon before it binds its socket below. On a warm cache this is
-        // instant; only the local-model path downloads. If it fails/times out, skip the
-        // load — the daemon still binds and serves (semantic search disabled until a
-        // restart with the model available). The Metal init itself is fast and runs here
-        // on the main thread so it can reach the GPU.
-        let loaded = if config.external_endpoint.is_some() {
-            Some(nestweaver_embed::EmbedModel::load(&config))
-        } else {
-            let model_id = config.model_id.clone();
-            let prefetch = tokio::task::spawn_blocking(move || {
-                nestweaver_embed::local::prefetch_model(&model_id)
-            });
-            match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
-                Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
-                _ => {
-                    tracing::warn!(
-                        "embedding model download timed out or failed — semantic search \
-                         disabled until the daemon restarts with the model available"
-                    );
-                    None
-                }
-            }
-        };
-        match loaded {
-            Some(Ok(model)) => {
-                tracing::info!(dim = model.dimension(), "Embedding model loaded");
-                // Check dimension compatibility with existing embeddings.
-                if let Some(stored_dim) = state.store.embedding_index_dimension()
-                    && stored_dim != model.dimension()
-                {
-                    tracing::warn!(
-                        model_dim = model.dimension(),
-                        stored_dim,
-                        "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                         Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                        model.dimension(),
-                        stored_dim
-                    );
-                } else {
-                    *state.embed_model.write().await = Some(std::sync::Arc::new(model)
-                        as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
-                }
-            }
-            Some(Err(e)) => {
-                tracing::warn!("Failed to load embedding model: {e}");
-            }
-            None => {} // prefetch failed/timed out — already warned above
-        }
-    }
 
     // Wrap the generated service in the single read-only chokepoint. On a
     // read-only snapshot replica this rejects EVERY mutating RPC (typed + JSON)
@@ -5475,12 +5467,24 @@ pub async fn run_server(
         crate::auth::uds_admin_interceptor,
     );
 
-    tonic::transport::Server::builder()
-        .add_service(uds_svc)
-        .serve_with_incoming_shutdown(uds_stream, async move {
-            let _ = shutdown_rx.changed().await;
-        })
+    // Spawn the UDS gRPC server so the socket binds and accepts immediately, THEN load the
+    // embedding model on this (main) thread concurrently — non-semantic RPCs are served during
+    // the load, and semantic search returns "model not loaded" until it completes. candle needs
+    // the main thread for Metal, and this keeps a cold-cache download from delaying the bind.
+    let uds_serve = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(uds_svc)
+            .serve_with_incoming_shutdown(uds_stream, async move {
+                let _ = shutdown_rx.changed().await;
+            }),
+    );
+
+    #[cfg(feature = "embed")]
+    load_embedding_model(&state).await;
+
+    uds_serve
         .await
+        .context("UDS serve task panicked")?
         .context("gRPC server error")?;
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
