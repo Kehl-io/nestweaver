@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -77,15 +77,6 @@ const TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 /// (~1s) because the richer upstream answer is the entire point of those modes.
 const FALLBACK_MODE_CAP: Duration = Duration::from_millis(250);
 
-/// How long a cached staleness check stays fresh before the next query
-/// triggers a background-style refresh. Keeps `_meta.stale_repos` populated
-/// without paying a `RepoStates` round-trip on every query.
-const STALE_TTL: Duration = Duration::from_secs(30);
-
-/// Maximum time to wait for a staleness refresh before falling back to the
-/// cached value. Prevents upstream gRPC latency from blocking the query path.
-const STALE_REFRESH_TIMEOUT: Duration = Duration::from_millis(50);
-
 /// How often the background maintenance task wakes to re-probe ejected
 /// upstreams (active recovery) and refresh the staleness verdict. LAN default;
 /// runs entirely off the query hot path, so a generous interval is fine.
@@ -106,10 +97,12 @@ pub struct HybridClient {
     local: DaemonClient,
     upstreams: Vec<UpstreamHandle>,
     /// Cached list of repo URLs where the local index is behind an upstream.
-    /// Refreshed lazily (see [`STALE_TTL`]) to keep per-query latency low while
-    /// still populating `_meta.stale_repos` on responses.
-    stale_cache: Vec<String>,
-    stale_checked_at: Option<Instant>,
+    /// Written by the background maintenance task (RFC 5861
+    /// stale-while-revalidate: the freshness check lives OFF the query hot
+    /// path). The query path only ever reads this — a non-blocking clone with
+    /// ZERO upstream I/O — so upstream RTT can never inflate query latency or
+    /// blank out `_meta.stale_repos` via a timed-out per-query probe.
+    stale_verdict: Arc<Mutex<Vec<String>>>,
     /// Handle to the background maintenance task (active health recovery +
     /// staleness refresh). `None` until [`HybridClient::start_maintenance`] is
     /// called (only the long-lived MCP session needs it; one-shot CLI commands
@@ -164,8 +157,7 @@ impl HybridClient {
         Ok(Self {
             local,
             upstreams,
-            stale_cache: Vec::new(),
-            stale_checked_at: None,
+            stale_verdict: Arc::new(Mutex::new(Vec::new())),
             maintenance: None,
         })
     }
@@ -175,8 +167,7 @@ impl HybridClient {
         Self {
             local: client,
             upstreams: vec![],
-            stale_cache: Vec::new(),
-            stale_checked_at: None,
+            stale_verdict: Arc::new(Mutex::new(Vec::new())),
             maintenance: None,
         }
     }
@@ -187,8 +178,7 @@ impl HybridClient {
         Self {
             local,
             upstreams,
-            stale_cache: Vec::new(),
-            stale_checked_at: None,
+            stale_verdict: Arc::new(Mutex::new(Vec::new())),
             maintenance: None,
         }
     }
@@ -273,10 +263,10 @@ impl HybridClient {
             }
         }
 
-        // Populate `_meta.stale_repos` provenance (TTL-cached) so callers know
-        // which repos the local index is behind on. Without this the field was
+        // Populate `_meta.stale_repos` provenance from the background-computed
+        // verdict (non-blocking, zero upstream I/O). Without this the field was
         // always empty even when the local graph was stale.
-        let stale = self.current_stale_repos().await;
+        let stale = self.current_stale_repos();
         let force_fallback_server = fallback_mode && query_targets_stale_repo(repo_hint, &stale);
 
         let mut result = self
@@ -530,75 +520,34 @@ impl HybridClient {
         }
     }
 
-    /// Return the current set of stale repos, refreshing the cache when it has
-    /// expired (see [`STALE_TTL`]). Used to populate `_meta.stale_repos` on
-    /// query responses without a `RepoStates` round-trip on every call.
-    ///
-    /// The refresh is bounded by [`STALE_REFRESH_TIMEOUT`] to avoid blocking
-    /// the query path when the upstream gRPC call is slow. If the refresh
-    /// does not complete in time, the previous cached value is returned and
-    /// the next query will retry.
-    async fn current_stale_repos(&mut self) -> Vec<String> {
-        let fresh = self
-            .stale_checked_at
-            .map(|t| t.elapsed() < STALE_TTL)
-            .unwrap_or(false);
-        if !fresh {
-            match tokio::time::timeout(STALE_REFRESH_TIMEOUT, self.check_staleness()).await {
-                Ok(result) => {
-                    self.stale_cache = result;
-                    self.stale_checked_at = Some(Instant::now());
-                }
-                Err(_) => {
-                    debug!("stale repo refresh timed out, returning cached value");
-                    // Don't update stale_checked_at so we retry on the next query.
-                }
-            }
-        }
-        self.stale_cache.clone()
+    /// Return the current set of stale repos as computed by the background
+    /// maintenance task. This is a NON-BLOCKING read of the shared verdict
+    /// with ZERO upstream I/O — the freshness round-trip lives entirely off
+    /// the query hot path (RFC 5861 stale-while-revalidate). Replaces the old
+    /// per-query `RepoStates` probe that was bounded by a hostile 50ms timeout
+    /// and so silently disabled staleness detection on any WAN upstream.
+    fn current_stale_repos(&self) -> Vec<String> {
+        read_stale_verdict(&self.stale_verdict)
     }
 
     /// Compare local repo SHAs against each upstream's `RepoStates`.
     /// Returns repo URLs where the local index is behind the server.
     pub async fn check_staleness(&mut self) -> Vec<String> {
-        let mut stale = Vec::new();
-
-        // Get local repo states.
-        let local_states: std::collections::HashMap<String, String> = {
-            let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
-            match self.local.inner_mut().repo_states(req).await {
-                Ok(resp) => resp
-                    .into_inner()
-                    .repos
-                    .into_iter()
-                    .map(|r| (r.repo_url.clone(), r.indexed_sha))
-                    .collect(),
-                Err(_) => return stale,
-            }
-        };
-
-        for upstream in &self.upstreams {
-            if !upstream.is_healthy() {
-                continue;
-            }
-            let mut client = upstream.client();
-            let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
-            upstream.inject_auth(&mut req);
-
-            if let Ok(resp) = client.repo_states(req).await {
-                for server_repo in resp.into_inner().repos {
-                    if let Some(local_sha) =
-                        local_sha_for_server_repo(&local_states, &server_repo.repo_url)
-                        && local_sha != server_repo.indexed_sha.as_str()
-                        && !server_repo.indexed_sha.is_empty()
-                    {
-                        stale.push(server_repo.repo_url.clone());
-                    }
-                }
-            }
-        }
-
-        stale
+        // Delegates to the same off-hot-path comparison the background
+        // maintenance task uses, so there is one implementation of the
+        // local-vs-upstream SHA diff.
+        let probes: Vec<MaintenanceProbe> = self
+            .upstreams
+            .iter()
+            .map(|u| MaintenanceProbe {
+                name: u.name.clone(),
+                client: u.client(),
+                token: u.auth_token().map(String::from),
+                health: u.health_ref(),
+            })
+            .collect();
+        let local = self.local.inner_mut();
+        compute_stale_repos(local, &probes).await
     }
 
     /// Collect status information for all configured upstreams.
@@ -756,14 +705,25 @@ impl HybridClient {
             })
             .collect();
 
+        // The task computes the staleness verdict off the hot path and
+        // publishes it into the shared cell the query path reads.
+        let local = self.local.inner().clone();
+        let stale_verdict = Arc::clone(&self.stale_verdict);
+
         let cancel = CancellationToken::new();
         let child = cancel.child_token();
-        let task = tokio::spawn(maintenance_loop(probes, child));
+        let task = tokio::spawn(maintenance_loop(probes, local, stale_verdict, child));
         self.maintenance = Some(MaintenanceHandle {
             _cancel: cancel.drop_guard(),
             _task: task,
         });
     }
+}
+
+/// Non-blocking read of the shared staleness verdict. Zero upstream I/O — this
+/// is the only thing the query hot path does for staleness.
+fn read_stale_verdict(verdict: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    verdict.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Per-upstream data the background maintenance task needs. Holds cloned
@@ -776,16 +736,91 @@ struct MaintenanceProbe {
     health: Arc<HealthState>,
 }
 
-/// Background maintenance loop: wakes every [`MAINTENANCE_INTERVAL`] and runs
-/// one recovery tick, until cancelled.
-async fn maintenance_loop(probes: Vec<MaintenanceProbe>, cancel: CancellationToken) {
+/// Background maintenance loop: wakes every [`MAINTENANCE_INTERVAL`] and, in a
+/// single pass, (1) re-probes ejected upstreams for active recovery and
+/// (2) refreshes the staleness verdict — both entirely off the query hot path.
+/// Runs until cancelled.
+async fn maintenance_loop(
+    probes: Vec<MaintenanceProbe>,
+    mut local: NestWeaverDaemonClient<Channel>,
+    stale_verdict: Arc<Mutex<Vec<String>>>,
+    cancel: CancellationToken,
+) {
+    // Populate the verdict once up front so `_meta.stale_repos` is meaningful
+    // without waiting a full interval after startup.
+    refresh_stale_verdict(&mut local, &probes, &stale_verdict).await;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
         }
         run_recovery_tick(&probes).await;
+        refresh_stale_verdict(&mut local, &probes, &stale_verdict).await;
     }
+}
+
+/// Recompute the staleness verdict and publish it into the shared cell the
+/// query path reads. Bounded only by the upstreams' own RPC timeouts — this is
+/// background work, so a slow WAN upstream delays the next verdict update but
+/// never a user query.
+async fn refresh_stale_verdict(
+    local: &mut NestWeaverDaemonClient<Channel>,
+    probes: &[MaintenanceProbe],
+    stale_verdict: &Arc<Mutex<Vec<String>>>,
+) {
+    let stale = compute_stale_repos(local, probes).await;
+    if let Ok(mut guard) = stale_verdict.lock() {
+        *guard = stale;
+    }
+}
+
+/// Compare the local daemon's indexed SHAs against each healthy upstream's
+/// `RepoStates` and return the repo URLs where the local index is behind. On
+/// any RPC failure the affected source is skipped (staleness degrades to a
+/// false-negative rather than blocking).
+async fn compute_stale_repos(
+    local: &mut NestWeaverDaemonClient<Channel>,
+    probes: &[MaintenanceProbe],
+) -> Vec<String> {
+    let local_states: std::collections::HashMap<String, String> = {
+        let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+        match local.repo_states(req).await {
+            Ok(resp) => resp
+                .into_inner()
+                .repos
+                .into_iter()
+                .map(|r| (r.repo_url.clone(), r.indexed_sha))
+                .collect(),
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    let mut stale = Vec::new();
+    for p in probes {
+        if !p.health.is_healthy() {
+            continue;
+        }
+        let mut client = p.client.clone();
+        let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+        if let Some(ref t) = p.token
+            && let Ok(val) = format!("Bearer {t}").parse::<MetadataValue<_>>()
+        {
+            req.metadata_mut().insert("authorization", val);
+        }
+        if let Ok(resp) = client.repo_states(req).await {
+            for server_repo in resp.into_inner().repos {
+                if let Some(local_sha) =
+                    local_sha_for_server_repo(&local_states, &server_repo.repo_url)
+                    && local_sha != server_repo.indexed_sha.as_str()
+                    && !server_repo.indexed_sha.is_empty()
+                {
+                    stale.push(server_repo.repo_url.clone());
+                }
+            }
+        }
+    }
+    stale
 }
 
 /// Re-probe every ejected upstream whose backoff window has elapsed and fold
@@ -2531,6 +2566,29 @@ mod tests {
         );
         assert_eq!(merged["_meta"]["sources"][0], "local");
         assert_eq!(merged["_meta"]["sources"][1], "server");
+    }
+
+    #[test]
+    fn staleness_verdict_read_without_per_query_network() {
+        // The query path must read the staleness verdict from a shared cache
+        // with ZERO upstream I/O — the freshness check belongs off the hot
+        // path (RFC 5861 stale-while-revalidate). The background maintenance
+        // task writes the verdict; the query path only reads it.
+        let verdict = Arc::new(Mutex::new(vec!["github.com/acme/api".to_string()]));
+
+        // Reading the verdict does no network work at all: even an upstream
+        // with RTT far above the old 50ms per-query budget yields the
+        // background-computed verdict, never an empty timed-out one.
+        let read = read_stale_verdict(&verdict);
+        assert_eq!(read, vec!["github.com/acme/api".to_string()]);
+
+        // A background refresh replaces the verdict in place; the next read
+        // sees it immediately without any per-query probe.
+        *verdict.lock().unwrap() = vec!["github.com/acme/web".to_string()];
+        assert_eq!(
+            read_stale_verdict(&verdict),
+            vec!["github.com/acme/web".to_string()]
+        );
     }
 
     #[test]
