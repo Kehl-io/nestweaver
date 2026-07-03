@@ -2054,20 +2054,35 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
-        let tantivy = self
-            .state
-            .tantivy
-            .as_ref()
-            .filter(|t| t.has_writer())
-            .ok_or_else(|| {
-                Status::failed_precondition("daemon has no writer-mode Tantivy index")
-            })?;
-        let count = tantivy
-            .reindex_from_store(&self.state.store)
-            .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
-        Ok(Response::new(ReindexSearchResponse {
-            document_count: count as i32,
-        }))
+        // Rebuilding the Tantivy index is a mutation: it must run under the
+        // write gate so it serializes against a `backup`'s sidecar staging
+        // (which copies under the same lock) and is visible to the shutdown
+        // drain / idle timeout via `active_writes` — mirroring `prune_stale`
+        // and `purge_instance`.
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::write(&self.state);
+
+        let state = self.state.clone();
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let tantivy = state
+                .tantivy
+                .as_ref()
+                .filter(|t| t.has_writer())
+                .ok_or_else(|| {
+                    Status::failed_precondition("daemon has no writer-mode Tantivy index")
+                })?;
+            let count = tantivy
+                .reindex_from_store(&state.store)
+                .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
+            Ok::<_, Status>(ReindexSearchResponse {
+                document_count: count as i32,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        result.map(Response::new)
     }
 
     // ── Read RPCs — typed hot-path ─────────────────────────────────
@@ -5470,5 +5485,80 @@ mod startup_helper_tests {
             store.has_embedding(&sym_uid),
             "callback should have embedded the pending symbol"
         );
+    }
+
+    /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
+    /// exercising admin mutation RPCs in isolation.
+    fn test_state_with_writer() -> Arc<DaemonState> {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        // Keep the temp dir alive for the duration of the test process.
+        std::mem::forget(dir);
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        Arc::new(DaemonState {
+            store,
+            tantivy: Some(tantivy),
+            db_path,
+            instance_id: "default".to_string(),
+            start_time: Instant::now(),
+            active_reads: Arc::new(AtomicU32::new(0)),
+            active_writes: Arc::new(AtomicU32::new(0)),
+            idle_notify: Arc::new(Notify::new()),
+            shutdown_tx,
+            watcher_stop: std::sync::Mutex::new(None),
+            instance_cfg: None,
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            server_mode: false,
+            read_only: false,
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+            indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            safeguards: QuerySafeguards::default_server(),
+            rate_limiters: None,
+            drained: Arc::new(AtomicBool::new(false)),
+            admin_token: None,
+            admin_state: std::sync::OnceLock::new(),
+            worker_handle: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The admin `reindex_search` RPC rebuilds the whole Tantivy index. Like
+    /// every other daemon mutation (`prune_stale`, `purge_instance`, the
+    /// watcher embed write) it MUST run under the write gate — `write_mutex`
+    /// plus a `ConnectionGuard::write` — so it (a) serializes against a
+    /// `backup`'s sidecar staging (which copies under the same lock) and
+    /// (b) is visible to the shutdown drain / idle timeout via `active_writes`.
+    ///
+    /// The gate is probed behaviorally: while the test holds `write_mutex`
+    /// (exactly as a concurrent backup staging would), a gated `reindex_search`
+    /// must block until the gate is released. An ungated implementation returns
+    /// immediately — the RED failure this test guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_search_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        // Hold the write gate, standing in for a backup's sidecar staging.
+        let gate = state.write_mutex.clone().lock_owned().await;
+
+        let mut req = Request::new(ReindexSearchRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.reindex_search(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "reindex_search must block on the write gate while it is held \
+             (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
     }
 }

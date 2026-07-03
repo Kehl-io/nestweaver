@@ -186,6 +186,12 @@ impl TantivyIndex {
     /// Drop every document and rebuild from the current state of `store`.
     /// Use after a fresh `index_markdown_directory` or as a manual escape
     /// hatch (`nestweaver brain reindex-search`).
+    ///
+    /// Atomicity invariant: the `delete_all_documents` and the re-adds MUST
+    /// land in a SINGLE commit. Tantivy commits are atomic per generation, so
+    /// a concurrent reader then sees the old-or-new full corpus and never an
+    /// empty window. Do NOT add an intermediate `commit()` after the delete —
+    /// see `reindex_from_store_is_atomic_for_readers`.
     pub fn reindex_from_store(&self, store: &GraphStore) -> Result<usize, TantivyError> {
         let writer_mutex = self
             .writer
@@ -948,6 +954,57 @@ mod tests {
         assert!(
             titles.contains(&"Auth Service Design") || hits.iter().any(|h| h.kind == "tag"),
             "expected an auth hit; got {titles:?}"
+        );
+    }
+
+    /// A `reindex_from_store` must rebuild the Tantivy index atomically: the
+    /// `delete_all_documents` and the re-adds land in ONE commit, so a
+    /// concurrent reader querying a non-empty corpus always sees the old-or-new
+    /// full corpus and NEVER an empty window. A delete-commit-then-add sequence
+    /// (two commits) would expose an empty index between the two commits.
+    #[test]
+    fn reindex_from_store_is_atomic_for_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempdir().unwrap();
+        let idx = Arc::new(TantivyIndex::open_or_create(dir.path()).unwrap());
+        let store = make_store_with_notes();
+
+        // Prime a non-empty corpus and confirm it is searchable.
+        idx.reindex_from_store(&store).unwrap();
+        assert!(
+            !idx.search("auth", 10).unwrap().is_empty(),
+            "corpus should be non-empty after the priming reindex"
+        );
+
+        // A reader hammers the index while the writer reindexes repeatedly.
+        // With a single atomic commit the reader can only observe the old or
+        // the new full corpus — never the empty window a two-commit rebuild
+        // would expose.
+        let reader_idx = Arc::clone(&idx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let saw_empty = Arc::new(AtomicBool::new(false));
+        let saw_empty_reader = Arc::clone(&saw_empty);
+        let reader = std::thread::spawn(move || {
+            while !stop_reader.load(Ordering::Relaxed) {
+                if reader_idx.search("auth", 10).unwrap().is_empty() {
+                    saw_empty_reader.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            idx.reindex_from_store(&store).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(
+            !saw_empty.load(Ordering::Relaxed),
+            "a concurrent reader must never see an empty index during reindex"
         );
     }
 
