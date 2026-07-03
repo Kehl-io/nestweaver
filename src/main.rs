@@ -1225,7 +1225,7 @@ enum Commands {
 
     /// Generate embeddings for symbols, notes, and headings in the database.
     ///
-    /// By default uses the bundled local model (sentence-transformers/all-MiniLM-L6-v2).
+    /// By default uses the bundled local model (thenlper/gte-base, 768-dim).
     /// Pass --endpoint to use an external OpenAI-compatible API instead.
     /// Only nodes that do not yet have an embedding are processed (incremental);
     /// use --force to re-embed everything.
@@ -1249,7 +1249,7 @@ enum Commands {
         model: Option<String>,
         #[arg(
             long,
-            default_value = "sentence-transformers/all-MiniLM-L6-v2",
+            default_value = "thenlper/gte-base",
             help = "HuggingFace model ID for local inference"
         )]
         model_id: String,

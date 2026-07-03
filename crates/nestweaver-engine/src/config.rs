@@ -235,7 +235,7 @@ pub struct InstanceConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct EmbeddingConfig {
     /// HuggingFace model ID (or local path) for the sentence-transformer.
-    /// Default: `"sentence-transformers/all-MiniLM-L6-v2"`.
+    /// Default: `"thenlper/gte-base"` (768-dim BERT, mean-pooled).
     #[serde(default = "default_model_id")]
     pub model_id: String,
     /// Directory where downloaded model weights are stored.
@@ -270,7 +270,10 @@ pub struct EmbeddingConfig {
 }
 
 fn default_model_id() -> String {
-    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+    // gte-base: 768-dim BERT sentence-transformer, mean-pooled, no query prefix
+    // (matches this crate's embedding path) — stronger retrieval than the older
+    // 384-dim all-MiniLM-L6-v2 and runs well on Apple Silicon/Metal.
+    "thenlper/gte-base".to_string()
 }
 fn default_embedding_cache_dir() -> String {
     "~/.cache/nestweaver/models".to_string()

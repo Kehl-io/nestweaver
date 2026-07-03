@@ -38,7 +38,7 @@ pub struct EmbedConfig {
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            model_id: "thenlper/gte-base".to_string(),
             cache_dir: default_cache_dir(),
             external_endpoint: None,
             external_model: None,
