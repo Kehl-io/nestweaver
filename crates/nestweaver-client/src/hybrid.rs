@@ -29,7 +29,9 @@ use crate::discovery::{RoutingMode, discover_upstreams_with_config};
 use crate::merge::rrf_merge;
 use crate::repo_identity::{normalized_repo_key, repo_name};
 use crate::routing::{ToolRouting, tool_routing};
-use crate::upstream::{HealthState, ProbeOutcome, UpstreamHandle, now_ms};
+use crate::upstream::{
+    HealthState, MAX_EJECTION_PERCENT, ProbeOutcome, UpstreamHandle, can_eject, now_ms,
+};
 
 /// Provenance metadata injected into every hybrid response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -507,12 +509,21 @@ impl HybridClient {
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
+                // Consistent with the primary/fallback path: a failed live
+                // query passively ejects the upstream (subject to the cap) so
+                // the background task can re-probe and recover it.
+                if let Some(u) = find_upstream_for_repo(&self.upstreams, repo_hint) {
+                    eject_with_cap(u, &self.upstreams, "merge query failed");
+                }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
             }
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
+                if let Some(u) = find_upstream_for_repo(&self.upstreams, repo_hint) {
+                    eject_with_cap(u, &self.upstreams, "merge query timed out");
+                }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
@@ -659,21 +670,17 @@ impl HybridClient {
                 Ok(result)
             }
             Ok(Err(e)) => {
-                warn!(
-                    upstream = %upstream.name,
-                    error = %e,
-                    "upstream query failed, marking unhealthy"
-                );
-                upstream.mark_unhealthy();
+                debug!(upstream = %upstream.name, error = %e, "upstream query failed");
+                eject_with_cap(upstream, &self.upstreams, "query failed");
                 Err(e)
             }
             Err(_) => {
-                warn!(
+                debug!(
                     upstream = %upstream.name,
                     timeout_ms = timeout.as_millis() as u64,
-                    "upstream query timed out, marking unhealthy"
+                    "upstream query timed out"
                 );
-                upstream.mark_unhealthy();
+                eject_with_cap(upstream, &self.upstreams, "query timed out");
                 anyhow::bail!("upstream query timed out after {}ms", timeout.as_millis())
             }
         }
@@ -724,6 +731,28 @@ impl HybridClient {
 /// is the only thing the query hot path does for staleness.
 fn read_stale_verdict(verdict: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     verdict.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Passively eject `upstream` after a failed live query, honoring the
+/// blast-radius cap: never let one correlated network blip force MORE than
+/// [`MAX_EJECTION_PERCENT`] of upstreams local-only at once (Envoy
+/// `max_ejection_percent`). Recovery is the background task's job — this only
+/// ever marks *down*, never permanently.
+fn eject_with_cap(upstream: &UpstreamHandle, all: &[UpstreamHandle], reason: &str) {
+    let total = all.len();
+    let currently_ejected = all.iter().filter(|u| !u.is_healthy()).count();
+    if can_eject(total, currently_ejected, MAX_EJECTION_PERCENT) {
+        warn!(upstream = %upstream.name, reason, "upstream ejected (passive mark-down)");
+        upstream.mark_unhealthy();
+    } else {
+        warn!(
+            upstream = %upstream.name,
+            reason,
+            ejected = currently_ejected,
+            total,
+            "ejection capped (blast-radius guard) — keeping upstream in rotation"
+        );
+    }
 }
 
 /// Per-upstream data the background maintenance task needs. Holds cloned
@@ -2817,6 +2846,37 @@ mod tests {
         let upstreams = [handle];
         let has_healthy = upstreams.iter().any(|u| u.is_healthy());
         assert!(!has_healthy);
+    }
+
+    #[tokio::test]
+    async fn mass_ejection_capped_keeps_last_upstream() {
+        // Two upstreams, 50% cap → at most one may be ejected at a time. A
+        // correlated blip that fails both must not force the whole session
+        // local-only; the blast-radius guard keeps the last one in rotation.
+        let cfg = |name: &str| crate::discovery::UpstreamConfig {
+            name: Some(name.to_string()),
+            url: "http://127.0.0.1:19990".to_string(),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Merge,
+            timeout: "1s".to_string(),
+            ca_cert: None,
+        };
+        let all = vec![
+            UpstreamHandle::from_config(&cfg("a")).unwrap(),
+            UpstreamHandle::from_config(&cfg("b")).unwrap(),
+        ];
+
+        // First failure ejects one (0 ejected < cap of 1).
+        eject_with_cap(&all[0], &all, "query failed");
+        assert!(!all[0].is_healthy());
+
+        // Second failure would exceed the cap → the upstream stays healthy.
+        eject_with_cap(&all[1], &all, "query failed");
+        assert!(
+            all[1].is_healthy(),
+            "blast-radius guard must keep the last upstream in rotation"
+        );
     }
 
     #[tokio::test]

@@ -139,8 +139,10 @@ impl HealthState {
         self.healthy.store(false, Ordering::Relaxed);
         self.rise.store(0, Ordering::Relaxed);
         let count = self.ejection_count.fetch_add(1, Ordering::Relaxed) + 1;
-        self.ejected_until_ms
-            .store(now_ms.saturating_add(ejection_backoff_ms(count)), Ordering::Relaxed);
+        self.ejected_until_ms.store(
+            now_ms.saturating_add(ejection_backoff_ms(count)),
+            Ordering::Relaxed,
+        );
     }
 
     /// Force the upstream healthy and reset all ejection accounting. Used on
@@ -173,8 +175,10 @@ impl HealthState {
         } else {
             self.rise.store(0, Ordering::Relaxed);
             let count = self.ejection_count.fetch_add(1, Ordering::Relaxed) + 1;
-            self.ejected_until_ms
-                .store(now_ms.saturating_add(ejection_backoff_ms(count)), Ordering::Relaxed);
+            self.ejected_until_ms.store(
+                now_ms.saturating_add(ejection_backoff_ms(count)),
+                Ordering::Relaxed,
+            );
             ProbeOutcome::StillDown
         }
     }
@@ -560,7 +564,10 @@ mod tests {
             state.apply_probe_result(backoff, true),
             ProbeOutcome::Improving
         );
-        assert!(!state.is_healthy(), "one success not enough (rise hysteresis)");
+        assert!(
+            !state.is_healthy(),
+            "one success not enough (rise hysteresis)"
+        );
         assert_eq!(
             state.apply_probe_result(backoff + 1, true),
             ProbeOutcome::Recovered
@@ -616,6 +623,48 @@ mod tests {
         assert!(state.is_healthy());
         assert_eq!(state.ejection_count(), 0);
         assert_eq!(state.ejected_until_ms(), 0);
+    }
+
+    // ── Ejection backoff + blast-radius cap (Seam C) ──────────────────
+
+    #[test]
+    fn ejection_backoff_escalates_and_caps() {
+        // base(30s) * consecutive-ejection-count, capped at 300s.
+        assert_eq!(ejection_backoff_ms(1), 30_000);
+        assert_eq!(ejection_backoff_ms(2), 60_000);
+        assert_eq!(ejection_backoff_ms(3), 90_000);
+        assert_eq!(ejection_backoff_ms(10), 300_000); // 30*10 == cap
+        assert_eq!(ejection_backoff_ms(11), 300_000); // capped
+        assert_eq!(ejection_backoff_ms(1000), 300_000);
+        // count 0 is treated as 1 (never a zero-length window).
+        assert_eq!(ejection_backoff_ms(0), 30_000);
+
+        // Repeated ejections escalate the scheduled deadline.
+        let state = HealthState::new();
+        state.mark_down(0);
+        let d1 = state.ejected_until_ms();
+        state.mark_down(0);
+        let d2 = state.ejected_until_ms();
+        assert!(d2 > d1, "second ejection escalates backoff ({d1} -> {d2})");
+    }
+
+    #[test]
+    fn mass_ejection_is_capped() {
+        // Envoy max_ejection_percent = 50%.
+        assert_eq!(ejection_cap(4, 50), 2);
+        assert_eq!(ejection_cap(2, 50), 1);
+        assert_eq!(ejection_cap(1, 50), 1); // always at least one
+        assert_eq!(ejection_cap(0, 50), 1);
+
+        // A single upstream may always be ejected.
+        assert!(can_eject(1, 0, 50));
+        // Half already ejected → can't take the last one down.
+        assert!(!can_eject(2, 1, 50));
+        // Room remains below the cap.
+        assert!(can_eject(4, 0, 50));
+        assert!(can_eject(4, 1, 50));
+        assert!(!can_eject(4, 2, 50)); // at the cap, no more
+        assert!(!can_eject(4, 3, 50));
     }
 
     #[test]
