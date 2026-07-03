@@ -58,6 +58,41 @@ fn env_secs(var: &str, default: u64) -> Duration {
 /// to stay responsive, large enough not to busy-spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Harden a `git` invocation against the host's system/global configuration.
+///
+/// Every server-mode git call clones/fetches *validated* remote URLs, but the
+/// host's own git config can subvert that validation AFTER it runs:
+/// - a `url.<x>.insteadOf` rewrite could redirect a validated URL to an internal
+///   host — and the SSRF IP-pin is keyed to the *original* host:port, so it would
+///   not cover the rewrite;
+/// - a configured `credential.helper` would be invoked when cloning an
+///   attacker-supplied https URL, leaking stored credentials;
+/// - an interactive auth prompt could hang the (timeout-bounded, but wasteful)
+///   subprocess.
+///
+/// So we neutralize all of that on every invocation:
+/// - `GIT_CONFIG_NOSYSTEM=1` — ignore `/etc/gitconfig`.
+/// - `GIT_CONFIG_GLOBAL=/dev/null` — ignore `~/.gitconfig` / XDG global config.
+/// - `GIT_TERMINAL_PROMPT=0` — never prompt on the terminal (fail fast instead).
+/// - `GIT_CONFIG_COUNT=1` + `GIT_CONFIG_KEY_0=credential.helper` +
+///   `GIT_CONFIG_VALUE_0=` — inject `credential.helper=` (empty), the env-based
+///   equivalent of `-c credential.helper=`, which resets/disables any helper the
+///   repo-local config might still add. (We use the env form because callers pass
+///   a fully-built `Command` whose args already include the git subcommand, so a
+///   trailing `-c` arg would land *after* the subcommand and be misparsed.)
+///
+/// This does NOT touch the caller's `-c` args (the SSRF `http.curloptResolve` /
+/// `http.followRedirects` pins and the `http.lowSpeed*` guards): those are
+/// command-line args on the `Command` and take precedence over config anyway.
+pub fn apply_git_isolation(cmd: &mut Command) {
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+    cmd.env("GIT_CONFIG_VALUE_0", "");
+}
+
 /// SIGKILL the whole process group, reap the direct child, and join both reader
 /// threads. Killing the *group* (not just the direct pid) takes down git's
 /// network-helper subprocesses too, so their write-end of the pipes closes,
@@ -90,6 +125,10 @@ pub fn run_git_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Outpu
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Isolate every git invocation from the host's system/global config and
+    // credential helpers (url.insteadOf rewrites, credential leakage, auth
+    // prompts) — the one central place all server-mode git calls route through.
+    apply_git_isolation(&mut cmd);
     // Put the child in its own process group (pgid == child pid) so that on
     // timeout we can signal git AND every helper subprocess it forked. Safe:
     // `setpgid(0, 0)` is async-signal-safe and touches no shared state.
@@ -215,6 +254,79 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("git version"),
             "stdout should carry the version banner"
         );
+    }
+
+    /// Every git invocation must be isolated from the host's system/global
+    /// config and credential helpers. Assert the hardening env is present on the
+    /// built command (inspecting `get_envs`), including the `GIT_CONFIG_*` trio
+    /// that injects an empty `credential.helper` (disables helpers).
+    #[test]
+    fn git_isolation_env_is_applied() {
+        use std::collections::HashMap;
+        use std::ffi::OsStr;
+
+        let mut cmd = Command::new("git");
+        apply_git_isolation(&mut cmd);
+
+        let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        let get = |k: &str| {
+            envs.get(OsStr::new(k))
+                .copied()
+                .flatten()
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+
+        assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        assert_eq!(get("GIT_CONFIG_GLOBAL").as_deref(), Some("/dev/null"));
+        assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
+        // credential.helper= (empty) injected via the GIT_CONFIG_* env form —
+        // the equivalent of `-c credential.helper=`, disabling all helpers.
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0").as_deref(),
+            Some("credential.helper")
+        );
+        assert_eq!(
+            get("GIT_CONFIG_VALUE_0").as_deref(),
+            Some(""),
+            "credential.helper must be reset to empty to disable helpers"
+        );
+    }
+
+    /// The isolation must not clobber a caller's own `-c` args (the SSRF pins and
+    /// http.lowSpeed guards): those live as command-line args, separate from the
+    /// env hardening. Assert both coexist on the built command.
+    #[test]
+    fn isolation_preserves_caller_config_args() {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "-c",
+            "http.curloptResolve=example.com:443:93.184.216.34",
+            "-c",
+            "http.followRedirects=false",
+        ]);
+        cmd.args(["ls-remote", "origin", "HEAD"]);
+        apply_git_isolation(&mut cmd);
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2).any(
+                |w| w[0] == "-c" && w[1] == "http.curloptResolve=example.com:443:93.184.216.34"
+            ),
+            "SSRF curloptResolve pin arg must be preserved: {args:?}"
+        );
+        assert!(
+            args.contains(&"http.followRedirects=false".to_string()),
+            "SSRF followRedirects arg must be preserved: {args:?}"
+        );
+        // And the hardening env is still applied alongside the args.
+        let has_nosystem = cmd
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM") && v.is_some());
+        assert!(has_nosystem, "isolation env must coexist with -c args");
     }
 
     /// Env overrides are honoured; unset falls back to the documented defaults.
