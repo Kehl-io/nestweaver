@@ -227,9 +227,20 @@ impl CatFileBatch {
     /// `Err` for I/O failures or a read timeout (the batch process has died or
     /// hung), so the caller can fall back to a one-shot `git show`.
     fn request(&mut self, sha: &str, rel_path: &Path) -> Result<BatchObject> {
+        // `cat-file --batch` is line-delimited: a path containing a newline (git
+        // permits it) would split into two request lines, so git emits two framed
+        // responses and every subsequent read on this pooled process returns the
+        // prior read's content (permanent desync). Refuse such a path — the file
+        // is skipped (Err → caller's skip branch) but the stream stays framed.
+        let spec = format!("{}:{}", sha, rel_path.display());
+        if spec.contains('\n') || spec.contains('\r') {
+            anyhow::bail!(
+                "skipping path with embedded newline (unsupported by cat-file --batch): {}",
+                rel_path.display()
+            );
+        }
         // Send the request line: "<sha>:<path>\n".
-        writeln!(self.stdin, "{}:{}", sha, rel_path.display())
-            .context("write request to cat-file --batch")?;
+        writeln!(self.stdin, "{spec}").context("write request to cat-file --batch")?;
         self.stdin.flush().context("flush cat-file --batch stdin")?;
 
         // Wait for the reader thread's parsed response, but never longer than
