@@ -4096,10 +4096,24 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
 
 pub async fn run_server(
     db_path: &Path,
-    idle_timeout: Option<Duration>,
+    mut idle_timeout: Option<Duration>,
     config_path: Option<&Path>,
     server_opts: Option<ServerOpts>,
 ) -> Result<(), anyhow::Error> {
+    // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
+    // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
+    // so an idle timer would treat an actively-querying MCP client as idle and
+    // shut the server down mid-use. Force it off in server mode. Today the two are
+    // already mutually exclusive (the idle-enabled Start path is UDS-only), so this
+    // is a guard against a future regression, not a live bug.
+    if server_opts.is_some() && idle_timeout.is_some() {
+        tracing::warn!(
+            "idle_timeout is ignored in server mode (MCP-HTTP activity is not \
+             counted); forcing it off"
+        );
+        idle_timeout = None;
+    }
+
     // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
     // The DB will be created by GraphStore::open_or_create below.
     if let Some(parent) = db_path.parent() {
@@ -5447,9 +5461,15 @@ pub async fn run_server(
                                     continue;
                                 }
                             };
+                            // A completed ls-remote probe.
+                            nestweaver_web::routes::metrics::POLL_CHECKS.inc();
                             let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
                             let indexed_sha = poll_store.lookup_repo(&r_uid)
                                 .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
+                            if remote_sha != indexed_sha {
+                                // A new commit was observed on the remote.
+                                nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                            }
                             if remote_sha != indexed_sha
                                 && let Some(ref jq) = poll_job_queue
                                 && let Ok(queue) = jq.lock()
