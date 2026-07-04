@@ -6655,7 +6655,9 @@ mod project_context_bug12_tests {
         let resp = tool_project_context(
             &store,
             None,
-            json!({ "project": "Parallel Paths", "token_budget": 5000 }),
+            // response_format "detailed" so `connected` nodes carry `uid` (concise, the new
+            // default, returns only kind/title/location); this test identifies notes by uid.
+            json!({ "project": "Parallel Paths", "token_budget": 5000, "response_format": "detailed" }),
             None,
             None,
         )
