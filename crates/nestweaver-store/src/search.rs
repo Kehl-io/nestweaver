@@ -45,6 +45,25 @@ impl EmbeddingIndex {
     }
 
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>) {
+        // Keep the index homogeneous. A mixed-dimension index breaks the binary
+        // sidecar (`save_binary` writes one header dim but per-vector bytes;
+        // `load_binary` reads a fixed stride) → misaligned garbage or a load
+        // failure that silently kills semantic search. A dimension mismatch here
+        // means a vector from a different model — e.g. the daemon's local-fallback
+        // (384) leaking into a remote-embedded (768/1536) index on a transient
+        // remote outage, or a model switch without `--force`. Reject it rather
+        // than corrupt the index; the caller should re-embed with `--force`.
+        if let Some(existing) = self.embeddings.values().next()
+            && embedding.len() != existing.len()
+        {
+            tracing::warn!(
+                uid,
+                got = embedding.len(),
+                expected = existing.len(),
+                "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
+            );
+            return;
+        }
         self.embeddings.insert(uid.to_string(), embedding);
     }
 
@@ -461,12 +480,25 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_dimension_mismatched_vector() {
+        // The index must stay homogeneous so the binary sidecar can't misalign.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0]); // establishes dim 3
+        idx.add("sym:b", vec![1.0_f32, 0.0]); // dim 2 — must be rejected
+        assert_eq!(idx.len(), 1, "mismatched-dim vector must not be added");
+        assert_eq!(idx.dimension(), Some(3));
+    }
+
+    #[test]
     fn vector_search_excludes_dimension_mismatched_vectors() {
-        // Index built with a different model (dim 3); query is dim 2. Before the
-        // guard, `.zip()` truncated and returned a plausible-but-wrong score.
+        // Defense-in-depth for the query path: simulate a legacy/loaded index that
+        // somehow holds a mismatched vector (insert directly, bypassing the add
+        // guard). Before the query guard, `.zip()` truncated and returned a
+        // plausible-but-wrong score.
         let mut idx = EmbeddingIndex::new();
         idx.add("sym:right", vec![1.0_f32, 0.0, 0.0]);
-        idx.add("sym:wrongdim", vec![1.0_f32, 0.0]); // dim 2, mismatched vs a dim-3 query
+        idx.embeddings
+            .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
         let query = vec![1.0_f32, 0.0, 0.0];
         let results = idx.vector_search(&query, 10);
         // The matching-dim vector scores ~1.0; the mismatched one is excluded
