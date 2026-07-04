@@ -6803,6 +6803,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             recency_weight,
             recency_half_life_days,
         } => {
+            // An empty name would fall through to the UID-substring match and silently resolve
+            // to the first project — reject it up front (guards both the daemon and direct paths).
+            if name.trim().is_empty() {
+                anyhow::bail!("project name must be non-empty");
+            }
             // Concise orientation by default (research-backed — see ADR
             // server-mode-remainder-decisions); --detailed opts into the full record.
             let response_format = if detailed { "detailed" } else { "concise" };
@@ -7114,6 +7119,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             used_tokens,
                             token_budget,
                             &external_refs,
+                            !detailed,
                         )?;
                     } else {
                         println!("Project: {}  ({})", project.name, project.uid);
@@ -12151,8 +12157,11 @@ fn render_project_context_daemon_response(
         let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let location = n.get("location").and_then(|v| v.as_str()).unwrap_or("");
-        let rel = n.get("relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        println!("  [{rel:.4}] {kind}  {title}  @{location}");
+        // concise responses omit `relevance` — don't print a fake [0.0000] for them.
+        match n.get("relevance").and_then(|v| v.as_f64()) {
+            Some(rel) => println!("  [{rel:.4}] {kind}  {title}  @{location}"),
+            None => println!("  {kind}  {title}  @{location}"),
+        }
     }
     println!();
     println!("Tokens used: {used} / budget: {token_budget}");
@@ -12182,6 +12191,7 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
 /// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
 /// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
 /// depend on these fields, so the local and daemon paths must stay aligned.
+#[allow(clippy::too_many_arguments)]
 fn print_project_context_json(
     project: &nestweaver_schema::Project,
     result: &BrainContextResult,
@@ -12189,12 +12199,31 @@ fn print_project_context_json(
     tokens_used: usize,
     token_budget: usize,
     external_refs: &serde_json::Value,
+    concise: bool,
 ) -> anyhow::Result<()> {
+    // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
+    // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
+    // emitted full nodes regardless of response_format, diverging from the daemon path.
+    let render = |n: &nestweaver_engine::BrainNode| -> serde_json::Value {
+        if concise {
+            serde_json::json!({ "kind": n.kind, "title": n.title, "location": n.location })
+        } else {
+            serde_json::json!({
+                "uid": n.uid,
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+                "relevance": n.relevance,
+            })
+        }
+    };
+    let connected: Vec<serde_json::Value> =
+        result.connected.iter().take(limit).map(render).collect();
     let mut resp = serde_json::json!({
         "project": project.name,
         "project_uid": project.uid,
         "seeds_expanded": result.seeds.len(),
-        "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "connected": connected,
         "tokens_used": tokens_used,
         "token_budget": token_budget,
     });

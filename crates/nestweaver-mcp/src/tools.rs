@@ -4767,10 +4767,15 @@ fn tool_project_context(
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
+    // Reject an empty/whitespace project — otherwise the UID-substring fallback below
+    // (`uid.contains(project_str)`) matches EVERY project on "" and silently resolves to the
+    // first one. Reachable via the daemon path, where the proto `project` field defaults to "".
     let project_str = args
         .get("project")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'project' must be a string"))?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("'project' must be a non-empty string"))?;
     // response_format: "concise" (default) trims per-node fields and uses a smaller default
     // token budget; "detailed" returns full metadata at the larger budget. A session-opener
     // wants orientation, not payload — the agent then narrows. See ADR
