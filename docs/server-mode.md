@@ -666,11 +666,16 @@ Disk is primarily blobless bare clones (~90% smaller than full clones) plus the 
 lsof -i :9378
 
 # Check daemon logs
-cat ~/.local/share/nestweaver/*/logs/daemon.log
+cat ~/.local/state/nestweaver/*/daemon.log
 
 # Start with verbose logging
 RUST_LOG=nestweaver_daemon=debug nestweaver daemon --db ./brain.lbug run --server
 ```
+
+> In server mode a **malformed `--config`** is fatal: the daemon prints the TOML
+> parse error to stderr and exits rather than silently starting with no repos
+> and no webhook secret. A *missing* config file is non-fatal (built-in defaults).
+> If the server exits immediately after "failed to parse --config", fix the TOML.
 
 ### Client can't connect
 

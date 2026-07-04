@@ -436,7 +436,7 @@ NestWeaver exposes 40 tools via the [Model Context Protocol](https://modelcontex
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
-nestweaver mcp --no-daemon --db ./nestweaver.lbug                     # read-only direct mode (CI/testing)
+NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug   # read-only direct mode (CI/testing)
 ```
 
 The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.
@@ -538,7 +538,7 @@ federation          (leaf: schema + proto — upstream routing/merge/staleness)
        <- engine <- (parser, resolver, store, storage, algorithms)
             <- daemon <- (engine, store, mcp, proto)
             <- client <- (proto, daemon, federation)
-            <- mcp    <- (client, proto; federation under the `daemon` feature)  [daemon proxy mode]
+            <- mcp    <- (engine, store, schema; proto + federation under the `daemon` feature)
             <- web
 ```
 
