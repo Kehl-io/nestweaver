@@ -5545,7 +5545,7 @@ pub async fn run_server(
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use nestweaver_web::routes::metrics;
-            let mut last_metric_job_id = 0_i64;
+            let mut last_metric_completed_at = 0_i64;
             loop {
                 // Update repo gauge.
                 if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
@@ -5578,10 +5578,10 @@ pub async fn run_server(
 
                 if let Some(queue) = &metrics_job_queue
                     && let Ok(guard) = queue.lock()
-                    && let Ok(completed) = guard.completed_job_metrics_after(last_metric_job_id)
+                    && let Ok(completed) = guard.completed_job_metrics_after(last_metric_completed_at)
                 {
                     for job in completed {
-                        last_metric_job_id = last_metric_job_id.max(job.id);
+                        last_metric_completed_at = last_metric_completed_at.max(job.completed_at);
                         let result = match job.status {
                             nestweaver_engine::jobs::JobStatus::Succeeded => "succeeded",
                             nestweaver_engine::jobs::JobStatus::DeadLetter => "dead_letter",

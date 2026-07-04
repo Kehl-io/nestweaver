@@ -150,6 +150,12 @@ pub struct CompletedJobMetric {
     pub id: i64,
     pub status: JobStatus,
     pub duration_s: f64,
+    /// Unix-seconds completion time. The metrics cursor advances on THIS, not on
+    /// `id`: `index_jobs` has `UNIQUE(repo_id)` so a repo's row id is stable
+    /// across every re-index, and an `id`-based cursor would count each repo at
+    /// most once ever. `completed_at` is set to "now" on each completion, so it
+    /// advances per completion.
+    pub completed_at: i64,
 }
 
 /// SQLite-backed job queue. One instance per server process.
@@ -593,26 +599,37 @@ impl JobQueue {
         rows.collect()
     }
 
-    /// Return completed jobs after `last_id`, with elapsed duration where available.
+    /// Return jobs that completed strictly after `since_completed_at` (Unix
+    /// seconds), with elapsed duration where available.
+    ///
+    /// The cursor is `completed_at`, not `id`: `index_jobs` has `UNIQUE(repo_id)`,
+    /// so a repo's row `id` never changes across re-indexes and an `id > last`
+    /// cursor would count each repo at most once ever (the counters would flatline
+    /// while the server kept re-indexing). `completed_at` is stamped "now" on each
+    /// completion, so it advances per completion. Residual: a completion whose
+    /// `completed_at` equals the previous batch's max and that commits after this
+    /// read is skipped — a small boundary undercount at second granularity, vs.
+    /// the total undercount an `id` cursor produced.
     pub fn completed_job_metrics_after(
         &self,
-        last_id: i64,
+        since_completed_at: i64,
     ) -> Result<Vec<CompletedJobMetric>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, status,
+            "SELECT id, status, completed_at,
                     MAX(0.0, CAST(completed_at AS REAL) - CAST(started_at AS REAL)) AS dur
              FROM index_jobs
-             WHERE id > ?1
+             WHERE completed_at > ?1
                AND completed_at IS NOT NULL
                AND started_at IS NOT NULL
-             ORDER BY id ASC",
+             ORDER BY completed_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![last_id], |row| {
+        let rows = stmt.query_map(params![since_completed_at], |row| {
             let status: String = row.get(1)?;
             Ok(CompletedJobMetric {
                 id: row.get(0)?,
                 status: JobStatus::from_str(&status),
-                duration_s: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                completed_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                duration_s: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
             })
         })?;
         rows.collect()
