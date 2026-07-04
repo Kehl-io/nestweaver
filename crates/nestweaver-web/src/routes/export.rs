@@ -133,22 +133,41 @@ pub(crate) fn json_for_html_script(json: &str) -> String {
 }
 
 /// Whitelist a user-supplied CSS color for embedding into a `<style>` block.
-/// HTML entities do NOT apply inside `<style>`, so a value like
-/// `white;}</style><script>…` would break out of the style element — escaping is
-/// not enough, the value must be constrained to a safe color grammar. Anything
-/// outside `[#a-z0-9(),.%\s-]` (hex / rgb() / named colors) falls back to a safe
-/// default.
+/// HTML entities do NOT apply inside `<style>`, so escaping isn't enough — the
+/// value must match a strict color grammar. Critically we must NOT allow
+/// arbitrary parenthesized functions: a lax char-whitelist that permits `(`/`)`
+/// lets `expression(alert(1))` (CSS-expression XSS in legacy IE) and `url(...)`
+/// (fires a request → SSRF / info leak) through. Only hex, the numeric color
+/// functions, and letters-only named colors are accepted; anything else falls
+/// back to a safe default.
 fn safe_css_color(s: &str) -> String {
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '#' | '(' | ')' | ',' | '.' | '%' | '-' | ' ')
-        });
-    if ok {
-        s.to_string()
+    if is_safe_css_color(s.trim()) {
+        s.trim().to_string()
     } else {
         "#ffffff".to_string()
     }
+}
+
+fn is_safe_css_color(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    // #rgb / #rgba / #rrggbb / #rrggbbaa
+    if let Some(hex) = s.strip_prefix('#') {
+        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    // Only the numeric color functions — NOT arbitrary `name(...)`. Args are
+    // digits / `.` / `,` / `%` / spaces only (no `:`, letters, quotes, etc.).
+    for prefix in ["rgb(", "rgba(", "hsl(", "hsla("] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest.strip_suffix(')').is_some_and(|args| {
+                args.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '%' | ' '))
+            });
+        }
+    }
+    // Named color: letters only. No `(` → no expression()/url().
+    s.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 pub async fn export_svg(
@@ -324,15 +343,25 @@ mod tests {
 
     #[test]
     fn safe_css_color_rejects_style_breakout() {
+        // Legit colors pass.
         assert_eq!(safe_css_color("#1a1a2e"), "#1a1a2e");
+        assert_eq!(safe_css_color("#abcd"), "#abcd");
         assert_eq!(safe_css_color("rgb(10, 20, 30)"), "rgb(10, 20, 30)");
+        assert_eq!(safe_css_color("rgba(0,0,0,0.5)"), "rgba(0,0,0,0.5)");
         assert_eq!(safe_css_color("white"), "white");
-        // Breakout attempts fall back to the safe default.
+        // Style breakout falls back to the safe default.
         assert_eq!(
             safe_css_color("white;}</style><script>alert(1)</script>"),
             "#ffffff"
         );
         assert_eq!(safe_css_color("<script>"), "#ffffff");
+        // CRITICAL: arbitrary CSS functions must NOT pass — expression() is XSS in
+        // legacy IE and url() fires a request. A lax char-whitelist allowed these.
+        assert_eq!(safe_css_color("expression(alert(1))"), "#ffffff");
+        assert_eq!(safe_css_color("url(x)"), "#ffffff");
+        assert_eq!(safe_css_color("url(//evil/x)"), "#ffffff");
+        assert_eq!(safe_css_color("#12"), "#ffffff"); // bad hex length
+        assert_eq!(safe_css_color("#xyz"), "#ffffff"); // non-hex
     }
 
     #[test]
