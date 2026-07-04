@@ -168,7 +168,7 @@ impl WorkerPool {
         // cross-restart source of truth.
         {
             let rows = {
-                let q = queue.lock().expect("job queue lock poisoned");
+                let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.load_reindex_state()
             };
             match rows {
@@ -176,7 +176,7 @@ impl WorkerPool {
                     let mut tracker = self
                         .reindex_tracker
                         .lock()
-                        .expect("reindex tracker lock poisoned");
+                        .unwrap_or_else(|e| e.into_inner());
                     tracker.load_persisted(rows);
                 }
                 Err(e) => tracing::error!("load reindex state: {e}"),
@@ -209,7 +209,7 @@ impl WorkerPool {
             // Try to claim the next job (behind a std::sync::Mutex since
             // rusqlite::Connection is !Sync).
             let job = {
-                let q = queue.lock().expect("job queue lock poisoned");
+                let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                 // Update queue depth while we hold the lock.
                 if let Some(ref st) = status
                     && let Ok(depth) = q.queue_depth()
@@ -300,7 +300,7 @@ impl WorkerPool {
                         // before indexing. Verifies both ID and repo_id to
                         // guard against SQLite ID reuse.
                         {
-                            let q = queue_check.lock().expect("job queue lock");
+                            let q = queue_check.lock().unwrap_or_else(|e| e.into_inner());
                             if !q
                                 .job_is_active(job_clone.id, &job_clone.repo_id)
                                 .unwrap_or(false)
@@ -319,7 +319,7 @@ impl WorkerPool {
                             let force_full_reindex = if prepared.repo_type == RepoType::Code {
                                 let tracker = reindex_tracker
                                     .lock()
-                                    .expect("reindex tracker lock poisoned");
+                                    .unwrap_or_else(|e| e.into_inner());
                                 should_force_full_reindex(
                                     Some(&tracker),
                                     &prepared.repo_id,
@@ -342,7 +342,7 @@ impl WorkerPool {
                                     let _write_guard = write_mutex_for_gate
                                         .as_ref()
                                         .map(|m| m.clone().blocking_lock_owned());
-                                    let q = queue_for_gate.lock().expect("job queue lock");
+                                    let q = queue_for_gate.lock().unwrap_or_else(|e| e.into_inner());
                                     if !q
                                         .job_is_active(job_for_gate.id, &job_for_gate.repo_id)
                                         .unwrap_or(false)
@@ -376,7 +376,7 @@ impl WorkerPool {
 
                 match result {
                     Ok(Ok(())) => {
-                        let q = queue.lock().expect("job queue lock poisoned");
+                        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
                         if let Ok(true) = q.requeue_if_stale(&job.repo_id) {
                             tracing::info!(repo = %job.repo_id, "re-queued: push arrived during indexing");
@@ -384,7 +384,7 @@ impl WorkerPool {
                         tracing::info!(repo = job.repo_id, "index complete");
                     }
                     Ok(Err(e)) if is_job_cancelled_error(&e) => {
-                        let q = queue.lock().expect("job queue lock poisoned");
+                        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
                         tracing::info!(repo = job.repo_id, "index cancelled");
                     }
@@ -394,19 +394,19 @@ impl WorkerPool {
                         // WITHOUT counting the attempt so a transient outage
                         // doesn't dead-letter every repo on that host; it retries
                         // once the breaker cools down.
-                        let q = queue.lock().expect("job queue lock poisoned");
+                        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.defer(job.id, job.claimed_by.as_deref());
                         tracing::debug!(repo = job.repo_id, error = %e, "deferred: remote circuit open");
                     }
                     Ok(Err(e)) => {
                         let is_poison = is_poison_error(&e);
-                        let q = queue.lock().expect("job queue lock poisoned");
+                        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.fail(job.id, job.claimed_by.as_deref(), &e.to_string(), is_poison);
                         tracing::error!(repo = job.repo_id, error = %e, "index failed");
                     }
                     Err(join_err) => {
                         // Task panicked or was cancelled.
-                        let q = queue.lock().expect("job queue lock poisoned");
+                        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.fail(
                             job.id,
                             job.claimed_by.as_deref(),
@@ -420,7 +420,7 @@ impl WorkerPool {
                 // Update queue depth and in-flight count after job completion.
                 if let Some(ref st) = status_clone {
                     let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
-                    let q = queue.lock().expect("job queue lock poisoned");
+                    let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                     if let Ok(depth) = q.queue_depth() {
                         let total = (depth.pending + depth.running) as u32;
                         st.queue_depth
@@ -644,13 +644,11 @@ fn persist_reindex_outcome(
         return;
     }
     let (count, last_full) = {
-        let mut tracker = reindex_tracker
-            .lock()
-            .expect("reindex tracker lock poisoned");
+        let mut tracker = reindex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         record_reindex_outcome(&mut tracker, repo_id, outcome);
         (tracker.count(repo_id), tracker.last_full_unix(repo_id))
     };
-    let q = queue.lock().expect("job queue lock");
+    let q = queue.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = q.upsert_reindex_state(repo_id, count, last_full) {
         tracing::error!(repo = %repo_id, "persist reindex state: {e}");
     }
