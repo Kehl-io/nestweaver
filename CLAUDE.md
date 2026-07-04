@@ -142,8 +142,13 @@ nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlis
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
 nestweaver ui --watch                    # live re-indexing via filesystem watcher
-# Append ?engine=wasm to run graph algorithms client-side via WASM
-# Requires: wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm
+# Append ?engine=wasm to run graph algorithms client-side via WASM.
+# Build with --remap-path-prefix so the build machine's home path (and the
+# username in .cargo/registry panic-location strings) is NOT baked into the
+# committed .wasm artifact:
+#   RUSTFLAGS="--remap-path-prefix=$HOME=/build" \
+#     wasm-pack build crates/nestweaver-wasm --target web \
+#       --out-dir ../../crates/nestweaver-web/frontend/src/wasm
 
 # Web API endpoints (when ui is running)
 # GET  /api/v1/version          → {"graph_generation": N, "pagerank_generation": N}

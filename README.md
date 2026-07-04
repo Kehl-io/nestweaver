@@ -494,7 +494,9 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 - Glassmorphism panels with cursor-responsive lighting
 - Dark/light/system theme with kehl.io-inspired dark palette
 
-**WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires `wasm-pack build crates/nestweaver-wasm` first.
+**WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires building the wasm first (use `--remap-path-prefix` so the build
+machine's home path isn't baked into the artifact):
+`RUSTFLAGS="--remap-path-prefix=$HOME=/build" wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm`.
 
 **Keyboard shortcuts:**
 - `Tab` / `Shift+Tab` — cycle forward/backward through nodes
