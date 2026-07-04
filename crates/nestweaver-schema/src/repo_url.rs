@@ -24,6 +24,17 @@
 //! keeps two unrelated local checkouts that share a basename distinct.
 //! Reconciling a `file://` repo with its server counterpart requires resolving
 //! the local checkout's `origin` remote, which is not available at this layer.
+//!
+//! Consequence for cross-boundary queries: because an origin-less local repo's
+//! `canonical_symbol_id`s embed a path hash that can never equal a server's
+//! `host/owner/name`-derived ids, `flow_trace` continuation — which resolves a
+//! boundary strictly by `canonical_id` (`symbol_by_canonical_id`) — returns an
+//! EMPTY continuation for such a boundary (no error, no stub). `ImpactAnalysis`
+//! degrades more gracefully via a name+file fallback, but flow_trace has none.
+//! This matches SCIP's treatment of package-less code (no cross-repo moniker →
+//! no cross-repo navigation). A local repo WITH an `origin` remote reconciles
+//! correctly and stitches as expected; give an indexed repo a remote to enable
+//! cross-boundary flow_trace.
 
 /// Collapse a repo clone URL to a normalized identity key that is invariant to
 /// scheme, embedded credentials, a trailing `.git`, a trailing slash, and host/
