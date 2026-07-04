@@ -4281,10 +4281,16 @@ pub async fn run_server(
 
     // Load the InstanceConfig once at start if `--config` was supplied so
     // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
-    // it without re-parsing the file per RPC. A missing/unreadable file is
-    // logged but non-fatal — the daemon still serves with built-in defaults.
-    let instance_cfg =
-        config_path.and_then(|p| match nestweaver_engine::InstanceConfig::from_file(p) {
+    // it without re-parsing the file per RPC.
+    //
+    // Distinguish a MISSING file (non-fatal — the daemon serves with built-in
+    // defaults) from a file that is PRESENT but unparseable. In server mode a
+    // malformed config means the server would silently index nothing and have no
+    // webhook secret; that failure must be loud (stderr) and fatal rather than a
+    // warning buried in the rotating log file.
+    let instance_cfg = match config_path {
+        None => None,
+        Some(p) => match nestweaver_engine::InstanceConfig::from_file(p) {
             Ok(c) => {
                 tracing::info!(
                     config = %p.display(),
@@ -4292,15 +4298,30 @@ pub async fn run_server(
                 );
                 Some(Arc::new(c))
             }
+            Err(e) if p.exists() => {
+                // Present but broken. Surface to the console (docker/foreground
+                // operators never see the rotating log) and fail fast in server
+                // mode so a typo can't masquerade as a healthy-but-empty server.
+                eprintln!("[daemon] failed to parse --config {}: {e}", p.display());
+                tracing::error!(config = %p.display(), error = %e, "failed to parse --config");
+                if server_opts.is_some() {
+                    anyhow::bail!(
+                        "invalid --config {}: {e} (server mode requires a parseable config)",
+                        p.display()
+                    );
+                }
+                None
+            }
             Err(e) => {
                 tracing::warn!(
                     config = %p.display(),
                     error = %e,
-                    "failed to load instance config — ranking/response settings will use defaults"
+                    "instance config not found — using built-in defaults"
                 );
                 None
             }
-        });
+        },
+    };
 
     let is_server_mode = server_opts.is_some();
 

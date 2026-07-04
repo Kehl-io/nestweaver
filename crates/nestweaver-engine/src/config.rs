@@ -181,6 +181,11 @@ pub struct InstanceConfig {
     pub workspace: WorkspaceConfig,
     pub inference: InferenceConfig,
     pub git: GitConfig,
+    /// Repos this instance indexes. Optional so an empty server needs no `repos`
+    /// line at all — avoids the shipped-template `repos = []` footgun where a
+    /// later `[[repos]]` append would collide into a duplicate key. Populated
+    /// configs use `[[repos]]` table-array blocks.
+    #[serde(default)]
     pub repos: Vec<RepoConfig>,
     pub schema_extensions: Option<SchemaExtensions>,
     pub links: Option<Vec<LinkConfig>>,
@@ -709,6 +714,35 @@ impl InstanceConfig {
 
 /// Append a `[[repos]]` entry to an instance config file if it is not already
 /// present. Returns `true` when the file was changed.
+/// Remove a top-level `repos = []` (empty inline array) line so a subsequent
+/// `[[repos]]` append doesn't collide with it into a duplicate `repos` key.
+/// Only the EMPTY inline form is stripped (whitespace-insensitive: `repos=[]`,
+/// `repos = [ ]`); non-empty inline arrays and `[[repos]]` blocks are preserved.
+fn strip_empty_inline_repos(contents: &str) -> String {
+    let is_empty_repos_line = |line: &str| {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("repos") else {
+            return false;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            return false;
+        };
+        rest.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            == "[]"
+    };
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|l| !is_empty_repos_line(l))
+        .collect();
+    let mut out = kept.join("\n");
+    if contents.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn append_repo_to_config_file(
     path: &std::path::Path,
     url: &str,
@@ -724,6 +758,13 @@ pub fn append_repo_to_config_file(
     {
         return Ok(false);
     }
+
+    // A config may declare an empty repo set as an inline `repos = []` (the
+    // shipped template's form). Appending a `[[repos]]` table-array on top of
+    // that inline key produces a DUPLICATE `repos` key and corrupts the file, so
+    // strip the empty inline line first. `[[repos]]` blocks and non-empty inline
+    // arrays are left untouched (multiple `[[repos]]` blocks coexist fine).
+    contents = strip_empty_inline_repos(&contents);
 
     if !contents.ends_with('\n') {
         contents.push('\n');
@@ -1477,6 +1518,72 @@ path_deboost = []
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn append_repo_to_config_file_replaces_inline_empty_repos() {
+        // The shipped template declares an empty repo set as inline `repos = []`.
+        // Appending a `[[repos]]` block on top of it must NOT produce a duplicate
+        // `repos` key — the file must stay parseable across repeated adds.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let template = r#"instance_id = "t"
+repos = []
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        std::fs::write(&path, template).unwrap();
+
+        // First add: must succeed AND keep the file parseable.
+        assert!(append_repo_to_config_file(&path, "https://github.com/example/one", None).unwrap());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("repos = []"),
+            "inline empty repos must be stripped, got:\n{after}"
+        );
+        let cfg = InstanceConfig::from_file(&path).expect("file must still parse after first add");
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|r| r.url == "https://github.com/example/one")
+        );
+
+        // Second add: previously failed with "duplicate key"; must now work.
+        assert!(append_repo_to_config_file(&path, "https://github.com/example/two", None).unwrap());
+        let cfg = InstanceConfig::from_file(&path).expect("file must still parse after second add");
+        assert_eq!(cfg.repos.len(), 2, "both repos should be present");
+    }
+
+    #[test]
+    fn config_parses_without_any_repos_field() {
+        // `repos` is now optional (serde default) so an empty server needs no
+        // `repos` line at all — the clean way to avoid the inline-array footgun.
+        let no_repos = r#"instance_id = "t"
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        let cfg = InstanceConfig::from_toml_str(no_repos).expect("config without repos must parse");
+        assert!(cfg.repos.is_empty());
     }
 
     #[test]

@@ -7,12 +7,12 @@
 
 instance_id = "nestweaver-server"
 
-# Repos this server indexes. Start empty and add one [[repos]] block per repo,
-# e.g.:
+# Repos this server indexes. Leave this out entirely to start empty, then add
+# one [[repos]] block per repo (or add them at runtime via the admin API /
+# webhooks), e.g.:
 #   [[repos]]
 #   url = "https://github.com/your-org/your-repo"
 #   branch = "main"
-repos = []
 
 [snapshot_storage]
 backend = "local"
