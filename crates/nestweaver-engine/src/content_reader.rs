@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::git_cmd::{apply_git_isolation, git_net_timeout, run_git_with_timeout};
 use crate::index_md::MAX_FILE_SIZE_BYTES;
 
 /// Maximum time to wait for a single `git cat-file --batch` response.
@@ -174,18 +175,23 @@ impl CatFileBatch {
     /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout, plus
     /// a dedicated reader thread that owns stdout and parses framed responses.
     fn spawn(bare_path: &Path) -> Result<Self> {
-        let mut child = Command::new("git")
-            .args([
-                "-C",
-                &bare_path.display().to_string(),
-                "cat-file",
-                "--batch",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn git cat-file --batch")?;
+        // The pooled batch process is long-lived with an interactive stdin/stdout
+        // protocol, so it can't go through `run_git_with_timeout` (which nulls
+        // stdin and drains stdout to EOF). Its read deadline is enforced per
+        // request via `CAT_FILE_READ_TIMEOUT`. Still isolate it from the host's
+        // system/global git config and credential helpers, like every other call.
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "-C",
+            &bare_path.display().to_string(),
+            "cat-file",
+            "--batch",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        apply_git_isolation(&mut cmd);
+        let mut child = cmd.spawn().context("failed to spawn git cat-file --batch")?;
         let stdin = child
             .stdin
             .take()
@@ -350,9 +356,9 @@ impl GitBareReader {
 
     /// Resolve HEAD of the bare repo to a full SHA.
     pub fn from_head(bare_path: &Path) -> Result<Self> {
-        let output = Command::new("git")
-            .args(["-C", &bare_path.display().to_string(), "rev-parse", "HEAD"])
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", &bare_path.display().to_string(), "rev-parse", "HEAD"]);
+        let output = run_git_with_timeout(cmd, git_net_timeout())
             .context("failed to run git rev-parse HEAD")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -371,9 +377,9 @@ impl GitBareReader {
     /// unavailable (failed to spawn, or died mid-stream).
     fn read_file_via_show(&self, rel_path: &Path) -> Result<String> {
         let spec = format!("{}:{}", self.sha, rel_path.display());
-        let output = Command::new("git")
-            .args(["-C", &self.bare_path.display().to_string(), "show", &spec])
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", &self.bare_path.display().to_string(), "show", &spec]);
+        let output = run_git_with_timeout(cmd, git_net_timeout())
             .with_context(|| format!("failed to run git show {spec}"))?;
         if !output.status.success() {
             anyhow::bail!(
@@ -452,17 +458,17 @@ impl ContentReader for GitBareReader {
         // we can skip symlink (120000) and gitlink/submodule (160000) entries,
         // mirroring `FilesystemReader`'s `follow_links(false)`; otherwise a
         // symlink's target-path text would be indexed as file content.
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &self.bare_path.display().to_string(),
-                "ls-tree",
-                "-r",
-                "-z",
-                &self.sha,
-            ])
-            .output()
-            .context("failed to run git ls-tree")?;
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "-C",
+            &self.bare_path.display().to_string(),
+            "ls-tree",
+            "-r",
+            "-z",
+            &self.sha,
+        ]);
+        let output =
+            run_git_with_timeout(cmd, git_net_timeout()).context("failed to run git ls-tree")?;
         if !output.status.success() {
             anyhow::bail!(
                 "git ls-tree failed: {}",

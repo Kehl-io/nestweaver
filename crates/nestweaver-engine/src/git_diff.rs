@@ -9,6 +9,8 @@ use std::process::Command;
 
 use anyhow::Context;
 
+use crate::git_cmd::{git_net_timeout, run_git_with_timeout};
+
 /// Represents a file-level change between two git commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChange {
@@ -102,14 +104,14 @@ pub fn detect_changes(
     old_sha: &str,
     new_sha: &str,
 ) -> Result<Vec<FileChange>, anyhow::Error> {
-    let output = Command::new("git")
-        .arg("diff")
+    let mut cmd = Command::new("git");
+    cmd.arg("diff")
         .arg("--name-status")
         .arg("-z")
         .arg(old_sha)
         .arg(new_sha)
-        .current_dir(repo_path)
-        .output()
+        .current_dir(repo_path);
+    let output = run_git_with_timeout(cmd, git_net_timeout())
         .with_context(|| format!("failed to run git diff in {}", repo_path.display()))?;
 
     if !output.status.success() {
@@ -129,17 +131,14 @@ pub fn detect_changes(
 /// Runs `git rev-parse HEAD` in `repo_path` and returns the trimmed SHA string.
 /// Returns an error if `repo_path` is not a git repository or git is not available.
 pub fn current_head_sha(repo_path: &Path) -> Result<String, anyhow::Error> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(repo_path)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to run git rev-parse HEAD in {}",
-                repo_path.display()
-            )
-        })?;
+    let mut cmd = Command::new("git");
+    cmd.arg("rev-parse").arg("HEAD").current_dir(repo_path);
+    let output = run_git_with_timeout(cmd, git_net_timeout()).with_context(|| {
+        format!(
+            "failed to run git rev-parse HEAD in {}",
+            repo_path.display()
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -160,14 +159,14 @@ pub fn current_head_sha(repo_path: &Path) -> Result<String, anyhow::Error> {
 /// on any error (not a git repo, unknown SHA, etc.) so callers can treat the
 /// result as a non-fatal check.
 pub fn is_ancestor(repo_path: &Path, old_sha: &str, new_sha: &str) -> bool {
-    Command::new("git")
-        .arg("merge-base")
+    let mut cmd = Command::new("git");
+    cmd.arg("merge-base")
         .arg("--is-ancestor")
         .arg(old_sha)
         .arg(new_sha)
-        .current_dir(repo_path)
-        .status()
-        .map(|s| s.success())
+        .current_dir(repo_path);
+    run_git_with_timeout(cmd, git_net_timeout())
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
