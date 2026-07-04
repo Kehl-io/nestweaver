@@ -6059,8 +6059,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else {
                 // Identity string only (never fetched); read via the
                 // SSRF-safe, timeout-guarded git wrapper.
-                nestweaver_engine::read_origin_url(&repo_path)
-                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
+                nestweaver_engine::mint_repo_identity(&repo_path)
             };
 
             // Compute atomic changes — either from local working tree or from a diff range
@@ -7539,14 +7538,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // root: `git config` walks up to an enclosing repo, and a
             // subdirectory index must not capture (and collide with) its
             // parent repo's identity.
-            let repo_url = if repo_path.join(".git").exists() {
-                nestweaver_engine::read_origin_url(&repo_path)
-                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
-            } else {
-                format!("file://{}", repo_path.display())
-            }
-            .trim_end_matches('/')
-            .to_string();
+            let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));

@@ -3221,8 +3221,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             // only as an identity string — never fetched); fall back to a
             // file:// URL. The engine persists the disk location as
             // `root_path` on the Repo node.
-            let url = nestweaver_engine::read_origin_url(path)
-                .unwrap_or_else(|_| format!("file://{}", path.display()));
+            let url = nestweaver_engine::mint_repo_identity(path);
             let result =
                 index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
             return Ok(json!({

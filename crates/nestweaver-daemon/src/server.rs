@@ -1358,12 +1358,7 @@ impl NestWeaverDaemon for DaemonService {
             // Guard on `.git` at the indexed root: `git config` walks up to
             // an enclosing repo, and a subdirectory index must not capture
             // (and collide with) its parent repo's identity.
-            let repo_url = if repo_path.join(".git").exists() {
-                nestweaver_engine::read_origin_url(&repo_path)
-                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
-            } else {
-                format!("file://{}", repo_path.display())
-            };
+            let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             let indexed_sha = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])

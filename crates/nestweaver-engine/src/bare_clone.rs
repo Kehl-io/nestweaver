@@ -349,6 +349,25 @@ pub fn read_origin_url(bare_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Mint a repo's IDENTITY url for indexing: prefer the git origin remote when
+/// the path is a git repo ROOT, else a `file://` URL of the path. The result is
+/// used only as an identity string (repo_uid is derived from it) — never fetched.
+///
+/// Guard on `.git` AT THE GIVEN ROOT: `git config` walks up to an enclosing
+/// repo, so a non-git SUBDIRECTORY must NOT capture (and collide with) its
+/// parent repo's origin identity — it gets a `file://` identity instead. The
+/// trailing slash is trimmed so equivalent paths mint one canonical form
+/// (repo_uid normalizes this anyway; trimming keeps the stored display url tidy).
+pub fn mint_repo_identity(path: &Path) -> String {
+    let file_url = format!("file://{}", path.display());
+    let url = if path.join(".git").exists() {
+        read_origin_url(path).unwrap_or(file_url)
+    } else {
+        file_url
+    };
+    url.trim_end_matches('/').to_string()
+}
+
 /// Recursively compute directory size in bytes.
 fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -445,6 +464,94 @@ mod tests {
         create_source_repo(&src, &[("a.txt", "hi")]);
 
         assert!(read_origin_url(&src).is_err());
+    }
+
+    /// A git repo ROOT with an origin remote mints that origin url.
+    #[test]
+    fn mint_repo_identity_prefers_origin_at_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        create_source_repo(&src, &[("a.txt", "hi")]);
+        let added = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/acme/demo.git",
+            ])
+            .current_dir(&src)
+            .status();
+
+        // Only assert the origin path when git actually configured the remote
+        // (keeps the test hermetic if git is unavailable in the environment).
+        if matches!(added, Ok(s) if s.success()) {
+            assert_eq!(
+                mint_repo_identity(&src),
+                "https://example.com/acme/demo.git"
+            );
+        }
+    }
+
+    /// A git repo ROOT with no origin remote falls back to a `file://` identity.
+    #[test]
+    fn mint_repo_identity_falls_back_to_file_url_without_origin() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        create_source_repo(&src, &[("a.txt", "hi")]);
+
+        assert_eq!(
+            mint_repo_identity(&src),
+            format!("file://{}", src.display())
+        );
+    }
+
+    /// A NON-git subdirectory of a git repo must NOT capture the parent repo's
+    /// origin identity — the `.git`-at-root guard gives it a `file://` identity
+    /// instead (this is the guard `atomic_changes` now gains via the helper).
+    #[test]
+    fn mint_repo_identity_subdir_does_not_capture_parent_origin() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        create_source_repo(&src, &[("pkg/a.txt", "hi")]);
+        let added = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/acme/demo.git",
+            ])
+            .current_dir(&src)
+            .status();
+
+        let subdir = src.join("pkg");
+        assert!(!subdir.join(".git").exists());
+        // Regardless of git availability, a non-git subdir gets a file:// identity.
+        assert_eq!(
+            mint_repo_identity(&subdir),
+            format!("file://{}", subdir.display())
+        );
+        // And it must never equal the parent's configured origin.
+        if matches!(added, Ok(s) if s.success()) {
+            assert_ne!(
+                mint_repo_identity(&subdir),
+                "https://example.com/acme/demo.git"
+            );
+        }
+    }
+
+    /// Equivalent paths differing only by a trailing slash mint one canonical
+    /// (trimmed) identity string.
+    #[test]
+    fn mint_repo_identity_trims_trailing_slash() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let plain = mint_repo_identity(&src);
+        let slashed = mint_repo_identity(&PathBuf::from(format!("{}/", src.display())));
+        assert_eq!(plain, slashed);
+        // Sanity: the non-git dir mints a file:// identity, trailing slash trimmed.
+        assert_eq!(plain, format!("file://{}", src.display()));
     }
 
     #[test]
