@@ -12,7 +12,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use rust_embed::RustEmbed;
-use tower_http::cors::CorsLayer;
 
 use crate::state::{AdminState, AppState};
 
@@ -188,7 +187,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
-        .layer(CorsLayer::permissive())
+        // No CORS layer: the SPA is served same-origin (serve_ui) in production
+        // and via Vite's same-origin dev proxy in development, so no
+        // cross-origin access is needed. Sending `Access-Control-Allow-Origin: *`
+        // here would let any website `fetch()` these UNAUTHENTICATED `/api/v1/*`
+        // read endpoints on the victim's loopback daemon and exfiltrate their
+        // indexed code cross-origin (localhost-CORS leak). Same-origin policy
+        // blocks that when no ACAO header is present.
         .with_state(state)
 }
 
