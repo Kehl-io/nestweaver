@@ -32,7 +32,7 @@ const TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 /// results are sparse, so the upstream must never block the local answer past
 /// the product's <200ms budget. Merge/Primary keep the configured ceiling
 /// (~1s) because the richer upstream answer is the entire point of those modes.
-const FALLBACK_MODE_CAP: Duration = Duration::from_millis(250);
+const FALLBACK_MODE_CAP: Duration = Duration::from_millis(200);
 
 /// Upper bound on a single `repo_states` RPC during the background staleness
 /// refresh. This runs off the hot path (never a user query), but without a
@@ -131,7 +131,7 @@ pub struct MaintenanceProbe {
 /// Scale", Dean & Barroso, 2013) and `FLOOR = 50ms` avoids deadlines so tight
 /// that scheduling jitter alone trips them. The per-upstream *configured*
 /// timeout is the hard ceiling; `mode_ceiling = min(configured, mode_cap)`
-/// where the Fallback cap is 250ms (keep the local fast path unblocked —
+/// where the Fallback cap is 200ms (keep the local fast path unblocked —
 /// honors the <200ms budget) and Merge/Primary keep the full configured
 /// ceiling (the richer upstream answer is the point). On a cold start (no
 /// EWMA samples yet) we use `mode_ceiling`.
@@ -255,11 +255,11 @@ mod tests {
 
     #[tokio::test]
     async fn effective_timeout_cold_start_uses_mode_ceiling() {
-        // Fallback with the default 1s config: ceiling is capped at 250ms.
+        // Fallback with the default 1s config: ceiling is capped at 200ms.
         let h = handle_with(RoutingMode::Fallback, "1s");
         assert_eq!(
             effective_timeout(RoutingMode::Fallback, &h),
-            Duration::from_millis(250)
+            Duration::from_millis(200)
         );
         // Merge with default 1s config: ceiling is the full configured 1s.
         let h = handle_with(RoutingMode::Merge, "1s");
@@ -281,13 +281,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effective_timeout_fallback_capped_at_250ms() {
-        // Even with a 1s config and a high EWMA, Fallback never exceeds 250ms.
+    async fn effective_timeout_fallback_capped_at_200ms() {
+        // Even with a 1s config and a high EWMA, Fallback never exceeds 200ms.
         let h = handle_with(RoutingMode::Fallback, "1s");
         h.record_latency(Duration::from_millis(400)); // K*400 = 700ms
         assert_eq!(
             effective_timeout(RoutingMode::Fallback, &h),
-            Duration::from_millis(250)
+            Duration::from_millis(200)
         );
     }
 
