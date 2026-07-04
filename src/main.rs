@@ -14330,7 +14330,9 @@ mod server_status_tests {
     /// server's actual type.
     #[test]
     fn admin_status_round_trips_into_cli_mirror() {
-        use nestweaver_web::routes::admin::{AdminStatus, QueueStats, RepoStats, SymbolStats};
+        use nestweaver_web::routes::admin::{
+            AdminStatus, Connections, QueueStats, RepoStats, SymbolStats,
+        };
 
         let server = AdminStatus {
             instance_id: "my-brain".to_string(),
@@ -14355,6 +14357,7 @@ mod server_status_tests {
                 running: 2,
                 dead_letter: 0,
             },
+            connections: Connections { grpc: 7, mcp: 3 },
         };
 
         // Serialize the server's struct, then deserialize into the CLI mirror.
