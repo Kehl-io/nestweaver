@@ -480,14 +480,23 @@ fn dispatch_method_daemon(
                 ));
             };
 
-            match tools::dispatch_via_daemon(client, rt, &name, arguments.clone()) {
-                Ok(result) => {
+            // Isolate a panicking tool so one bad call can't unwind the stdio
+            // read loop and kill the session (mirrors the HTTP path).
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools::dispatch_via_daemon(client, rt, &name, arguments.clone())
+            }));
+            match dispatched {
+                Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
                         record_interaction(tracker, &name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Err(e) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
+                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
+                Err(_) => Frame::Success(success(
+                    id,
+                    tools::wrap_tool_error(&format!("tool '{name}' panicked")),
+                )),
             }
         }
 
@@ -574,20 +583,32 @@ fn dispatch_method(
             // The stdio MCP server runs outside daemon context and has no
             // access to the lazily-loaded embedding model. Semantic search
             // falls back to keyword-only when embed_model is None.
-            match tools::dispatch(store, tantivy, &name, arguments.clone(), None) {
-                Ok(result) => {
+            //
+            // Isolate a panicking tool: catch_unwind so one bad call returns an
+            // error result for THIS request instead of unwinding the stdio read
+            // loop and killing the whole session (mirrors the HTTP path, which
+            // maps a dispatch panic to an isError result via spawn_blocking).
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools::dispatch(store, tantivy, &name, arguments.clone(), None)
+            }));
+            match dispatched {
+                Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
                         record_interaction(tracker, &name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Tool errors come back inside the result envelope with
                     // isError=true — not as JSON-RPC errors — so the client
                     // can surface them to Claude rather than aborting the
                     // call sequence.
                     Frame::Success(success(id, tools::wrap_tool_error(&e.to_string())))
                 }
+                Err(_) => Frame::Success(success(
+                    id,
+                    tools::wrap_tool_error(&format!("tool '{name}' panicked")),
+                )),
             }
         }
 

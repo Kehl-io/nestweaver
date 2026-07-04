@@ -3233,22 +3233,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        let s: nestweaver_schema::Service = serde_json::from_value(value)
-                            .unwrap_or_else(|_| nestweaver_schema::Service {
-                                uid: String::new(),
-                                name: name.clone(),
-                                repo_uid: String::new(),
-                                summary: None,
-                                summary_hash: None,
-                                embedding: None,
-                            });
-                        println!("Service: {}", s.name);
-                        if let Some(ref summary) = s.summary {
-                            println!("Summary: {summary}");
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // A real service deserializes with a non-empty uid. Do NOT fabricate an
+                    // empty Service on a not-found/error response — that would print a fake
+                    // "Service: <name>" header and exit 0. Report not found with the right code.
+                    match serde_json::from_value::<nestweaver_schema::Service>(value) {
+                        Ok(s) if !s.uid.is_empty() => {
+                            println!("Service: {}", s.name);
+                            if let Some(ref summary) = s.summary {
+                                println!("Summary: {summary}");
+                            }
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        _ => {
+                            if !out.quiet {
+                                println!("Service not found: {name}");
+                            }
+                            return Ok((EXIT_NOT_FOUND, None));
                         }
                     }
-                    return Ok((EXIT_SUCCESS, None));
                 }
             }
 
@@ -6470,7 +6474,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ..
         } => {
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
+            // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
+            // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
+            // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
+            if use_daemon && repo_filter.is_none() {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 if let Some(value) = try_hybrid_json_rpc(
                     true,
