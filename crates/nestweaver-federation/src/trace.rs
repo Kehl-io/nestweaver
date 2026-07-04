@@ -7,6 +7,11 @@
 use serde_json::Value;
 use tracing::debug;
 
+/// Hard cap on client-side stitch recursion depth. Mirrors the server's own
+/// `.min(64)` trace-walk bound; a defensive ceiling against a hostile upstream
+/// returning a pathologically deep (or cyclic) span graph.
+const MAX_STITCH_DEPTH: usize = 64;
+
 /// A boundary symbol detected in a local flow_trace result.
 ///
 /// The local trace knows the symbol name and canonical_id but cannot
@@ -198,17 +203,39 @@ pub fn stitch_server_spans(
     }
 
     // Build JSON subtree(s) from server spans.
+    //
+    // `server_spans` is an untrusted RPC response: a buggy or malicious upstream
+    // could return `callee_span_ids` that form a cycle (or a span listing
+    // itself), which would drive unbounded recursion and overflow the client
+    // stack. Guard with a visited-set (skip any span already on the path) plus a
+    // hard depth cap mirroring the server's own `.min(64)`. A well-behaved server
+    // emits an acyclic tree with unique span_ids, so neither guard ever trips on
+    // legitimate output.
     fn build_subtree(
         span: &nestweaver_proto::TraceSpanProto,
         span_map: &std::collections::HashMap<&str, &nestweaver_proto::TraceSpanProto>,
         server_name: &str,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
     ) -> Value {
-        let children: Vec<Value> = span
-            .callee_span_ids
-            .iter()
-            .filter_map(|cid| span_map.get(cid.as_str()))
-            .map(|child| build_subtree(child, span_map, server_name))
-            .collect();
+        visited.insert(span.span_id.clone());
+        let mut children: Vec<Value> = Vec::new();
+        if depth < MAX_STITCH_DEPTH {
+            for cid in &span.callee_span_ids {
+                if visited.contains(cid) {
+                    continue; // cycle or diamond — don't recurse again
+                }
+                if let Some(child) = span_map.get(cid.as_str()) {
+                    children.push(build_subtree(
+                        child,
+                        span_map,
+                        server_name,
+                        visited,
+                        depth + 1,
+                    ));
+                }
+            }
+        }
 
         serde_json::json!({
             "name": span.name,
@@ -219,10 +246,11 @@ pub fn stitch_server_spans(
         })
     }
 
-    let subtrees: Vec<Value> = root_spans
-        .iter()
-        .map(|s| build_subtree(s, &span_map, server_name))
-        .collect();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut subtrees: Vec<Value> = Vec::new();
+    for s in &root_spans {
+        subtrees.push(build_subtree(s, &span_map, server_name, &mut visited, 0));
+    }
 
     // Find the boundary node in the local tree and inject server subtrees.
     // The boundary node is a leaf with matching canonical_id.
@@ -390,6 +418,67 @@ mod tests {
         stitch_server_spans(&mut local_result, &[], "some-cid", "server");
 
         assert_eq!(local_result, original);
+    }
+
+    /// A hostile/buggy upstream returning cyclic `callee_span_ids` (B -> C -> B)
+    /// must not overflow the client stack: the visited-set guard terminates the
+    /// stitch instead of recursing forever.
+    #[test]
+    fn stitch_cyclic_spans_terminates() {
+        use nestweaver_proto::TraceSpanProto;
+        let mut local_result = json!({
+            "tree": {
+                "name": "funcA",
+                "canonical_id": "root:src/a.rs#funcA:s0",
+                "children": [{
+                    "name": "funcB",
+                    "canonical_id": "abc:src/b.rs#funcB:s1",
+                    "children": []
+                }]
+            }
+        });
+
+        // B <-> C cycle: B calls C, C calls back into B.
+        let spans = vec![
+            TraceSpanProto {
+                trace_id: "t1".into(),
+                span_id: "span-b".into(),
+                parent_span_id: None,
+                canonical_id: "abc:src/b.rs#funcB:s1".into(),
+                name: "funcB".into(),
+                repo_url: "https://github.com/acme/api".into(),
+                file_path: "src/b.rs".into(),
+                start_line: 10,
+                callee_span_ids: vec!["span-c".into()],
+                source: "server".into(),
+            },
+            TraceSpanProto {
+                trace_id: "t1".into(),
+                span_id: "span-c".into(),
+                parent_span_id: Some("span-b".into()),
+                canonical_id: "abc:src/c.rs#funcC:s2".into(),
+                name: "funcC".into(),
+                repo_url: "https://github.com/acme/api".into(),
+                file_path: "src/c.rs".into(),
+                start_line: 20,
+                callee_span_ids: vec!["span-b".into()], // cycle back to B
+                source: "server".into(),
+            },
+        ];
+
+        // Must return (not stack-overflow) and graft a bounded subtree.
+        stitch_server_spans(
+            &mut local_result,
+            &spans,
+            "abc:src/b.rs#funcB:s1",
+            "acme-server",
+        );
+        let boundary = &local_result["tree"]["children"][0];
+        assert_eq!(boundary["name"], "funcB");
+        assert!(
+            !boundary["children"].as_array().unwrap().is_empty(),
+            "cycle should still stitch the reachable prefix"
+        );
     }
 
     /// Empty local-repo set: the common single-repo case where every
