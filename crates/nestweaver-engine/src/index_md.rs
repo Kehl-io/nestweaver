@@ -658,6 +658,9 @@ fn reinsert_single_note(
     };
     let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
     let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
+    // Unresolved links collected for a single batched insert — a per-row insert
+    // here made a single note with many missing-target links hang the watcher.
+    let mut unresolved: Vec<(String, String, String, String, String)> = Vec::new();
 
     for wl in &parsed.wikilinks {
         if wl.section_idx >= section_uids.len() {
@@ -673,15 +676,13 @@ fn reinsert_single_note(
                 source_section,
                 crate::hash::blake3_hex_short(&wl.target)
             );
-            if let Err(e) = store.insert_unresolved_wikilink(
-                &uw_uid,
-                n_uid,
-                rel_path,
-                &parsed.title,
-                &wl.target,
-            ) {
-                tracing::warn!("failed to record unresolved wikilink '{}': {e}", wl.target);
-            }
+            unresolved.push((
+                uw_uid,
+                n_uid.to_string(),
+                rel_path.to_string(),
+                parsed.title.clone(),
+                wl.target.clone(),
+            ));
             continue;
         };
         let n = candidates.len() as f32;
@@ -710,6 +711,13 @@ fn reinsert_single_note(
         }
     }
     let wl_resolved = wl_note_edges.len() + wl_head_edges.len();
+    {
+        let mut seen = std::collections::HashSet::new();
+        unresolved.retain(|(uid, ..)| seen.insert(uid.clone()));
+        if let Err(e) = store.batch_insert_unresolved_wikilinks(&unresolved) {
+            tracing::warn!("failed to record unresolved wikilinks: {e}");
+        }
+    }
     let wl_note_refs: Vec<(&str, &str, f32, &str)> = wl_note_edges
         .iter()
         .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
