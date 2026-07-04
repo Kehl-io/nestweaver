@@ -212,6 +212,18 @@ pub fn host_to_resolve(url: &str) -> Option<String> {
 /// (see `add_repo`) and at clone/fetch-time (see [`guard_git_url`]). The
 /// returned `Err` is the user-facing message.
 pub fn validate_repo_url(url: &str) -> Result<(), String> {
+    // A legitimate git remote URL never contains raw whitespace or control
+    // characters. Reject them at the boundary so a malformed URL (e.g. one with
+    // an embedded shell fragment like `.../y; rm -rf /`) can't be accepted and
+    // persisted into the config as a permanently-failing repo. Defense-in-depth
+    // only: the clone runs via argv with a `--` separator (no shell), so such a
+    // URL is inert regardless — this just keeps garbage out of the config.
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "invalid URL '{url}': contains whitespace or control characters"
+        ));
+    }
+
     // Validate URL scheme to prevent SSRF via file:// or other unexpected schemes.
     let allowed_schemes = ["https", "http", "ssh"];
     let parsed = match url::Url::parse(url) {
@@ -450,6 +462,23 @@ mod tests {
                 validate_repo_url(url)
             );
         }
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_whitespace_and_control_chars() {
+        for url in [
+            "https://github.com/x/y; rm -rf /", // embedded space
+            "https://github.com/a b/c",         // space in path
+            "https://github.com/x/y\n",         // trailing newline
+            "https://github.com/x/y\ttab",      // tab
+        ] {
+            assert!(
+                validate_repo_url(url).is_err(),
+                "expected {url:?} to be rejected for whitespace/control chars"
+            );
+        }
+        // A well-formed URL is still accepted.
+        assert!(validate_repo_url("https://github.com/acme/api").is_ok());
     }
 
     #[test]
