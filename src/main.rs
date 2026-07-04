@@ -24,7 +24,7 @@ use nestweaver_engine::{
     render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
     suggest_links, truncate_to_budget,
 };
-use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
+use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -2600,8 +2600,10 @@ fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u
     if let Some(v) = stop_env.and_then(|s| s.trim().parse::<u64>().ok()) {
         return v;
     }
+    // Share the drain-ceiling parse semantics with the daemon/client so a
+    // whitespace/format change can't make the CLI derive a different ceiling.
     let ceiling = drain_env
-        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(parse_drain_ceiling)
         .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
     ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
 }
