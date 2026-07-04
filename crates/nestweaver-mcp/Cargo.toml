@@ -12,6 +12,7 @@ nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
 nestweaver-proto = { workspace = true, optional = true }
+nestweaver-federation = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tokio-stream = { workspace = true, optional = true }
@@ -30,10 +31,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-daemon = ["dep:dirs", "dep:nestweaver-proto", "dep:tonic", "dep:tokio-stream", "dep:tower", "dep:hyper-util", "dep:libc", "dep:sha2"]
+daemon = ["dep:dirs", "dep:nestweaver-proto", "dep:nestweaver-federation", "dep:tonic", "dep:tokio-stream", "dep:tower", "dep:hyper-util", "dep:libc", "dep:sha2"]
 embed = ["nestweaver-engine/embed"]
 
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5"
 tokio = { version = "1", features = ["macros"] }
+toml = "0.8"

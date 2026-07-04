@@ -13,6 +13,8 @@ use anyhow::Context;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 
+#[cfg(feature = "daemon")]
+pub mod federation;
 pub mod http;
 pub mod protocol;
 pub mod tools;

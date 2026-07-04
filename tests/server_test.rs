@@ -2215,3 +2215,217 @@ async fn server_backup_rpc_produces_snapshot() {
     assert_eq!(resp.output_path, out.to_string_lossy());
     assert_eq!(resp.tier, "standard");
 }
+
+// ── nw-017 Phase B: daemon-side federation at the /mcp boundary ───────────────
+
+/// Write a minimal valid `instance.toml` with a single `[[upstream]]` block
+/// pointing at `upstream_grpc_addr`. Mirrors the engine's `MINIMAL_TOML` fixture
+/// (required `snapshot_storage`/`workspace`/`inference`/`git`/`repos` sections)
+/// with `repos = []` so the fronting daemon indexes nothing of its own — its DB
+/// is pre-built by `index_repo`.
+fn write_upstream_config(
+    path: &std::path::Path,
+    upstream_name: &str,
+    upstream_grpc_addr: &str,
+    token: &str,
+) {
+    // Root-level scalar keys (`instance_id`, `repos`) MUST precede every table
+    // header — in TOML any bare key after a `[table]` belongs to that table.
+    let toml = format!(
+        r#"
+instance_id = "fronting-daemon"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nw-fed-snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nw-fed-workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[upstream]]
+name = "{upstream_name}"
+url = "{upstream_grpc_addr}"
+token = "{token}"
+mode = "merge"
+"#
+    );
+    std::fs::write(path, toml).expect("write instance.toml");
+}
+
+/// The daemon IS the federated coordinator at its `/mcp` boundary (ADR
+/// Decision 2): a raw MCP client POSTing a two-tier-routed tool to a daemon
+/// configured with an `[[upstream]]` gets a `{ local_impact, org_wide_impact }`
+/// envelope plus federated provenance — no client-side `HybridClient` involved.
+#[tokio::test]
+async fn daemon_mcp_boundary_federates_two_tier() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Upstream ("org") server: indexes a repo whose symbol lives under server/.
+    let server_repo = dir.path().join("repo_a");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &server_repo,
+        &[("server/main.js", "function serverimpactfn(x) { return x; }")],
+    );
+    index_repo(&server_repo, &db_server);
+    let upstream = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+
+    // Fronting daemon: indexes a DISTINCT local repo, then serves it with an
+    // instance.toml that points its federation coordinator at the upstream.
+    let local_repo = dir.path().join("repo_b");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("local/main.js", "function localimpactfn(x) { return x; }")],
+    );
+    index_repo(&local_repo, &db_local);
+
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "orgserver", &upstream.grpc_addr(), HYBRID_TOKEN);
+
+    let fronting = helpers::server_guard::ServerGuard::start_with_config(&db_local, &cfg_path);
+    let mcp_addr = fronting.mcp_addr();
+
+    // Raw MCP client → fronting daemon /mcp. blast_radius is TwoTier-routed.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": {
+                    "changed_files": ["local/main.js", "server/main.js"],
+                    "max_depth": 3
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP tools/call request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 42);
+    assert_eq!(body["result"]["isError"], false, "got: {body}");
+
+    // The tool value is the two-tier envelope the coordinator assembled.
+    let structured = &body["result"]["structuredContent"];
+    assert_eq!(
+        structured["tier"], "two_tier",
+        "daemon /mcp boundary must federate blast_radius into a two-tier envelope; got {structured}"
+    );
+    assert!(
+        structured["local_impact"].is_object(),
+        "local_impact tier must be populated; got {structured}"
+    );
+    assert!(
+        structured["local_impact"]
+            .to_string()
+            .contains("localimpactfn"),
+        "local_impact should reference the local symbol; got {}",
+        structured["local_impact"]
+    );
+    assert_eq!(
+        structured["org_wide_impact"]["source_server"], "orgserver",
+        "org_wide_impact must be attributed to the configured upstream; got {}",
+        structured["org_wide_impact"]
+    );
+    assert!(
+        structured["org_wide_impact"].get("results").is_some(),
+        "org_wide_impact must carry real server results (not the unavailable \
+         fallback) — the upstream was reached; got {}",
+        structured["org_wide_impact"]
+    );
+    assert!(
+        structured["org_wide_impact"]
+            .to_string()
+            .contains("serverimpactfn"),
+        "org_wide_impact should reference the server-only symbol; got {}",
+        structured["org_wide_impact"]
+    );
+
+    // In-band provenance: federated scope, both daemon + upstream sourced.
+    let meta = &body["result"]["_meta"];
+    assert_eq!(
+        meta["nestweaver.io/sources"],
+        json!(["daemon", "orgserver"]),
+        "federated result must list daemon + upstream as sources; got {meta}"
+    );
+    assert_eq!(
+        meta["nestweaver.io/scope"], "federated",
+        "federated result must stamp scope=federated; got {meta}"
+    );
+    assert!(
+        meta["nestweaver.io/stale_repos"].is_array(),
+        "stale_repos must be present as an array; got {meta}"
+    );
+}
+
+/// A daemon with NO upstream configured is ONE node: its `/mcp` boundary must
+/// keep the honest single-node stamp (`sources=["daemon"]`, `scope=single-node`)
+/// AND now also carry `stale_repos` as an (empty) array — the staleness key is
+/// stamped uniformly on every result, and its addition must not regress the
+/// existing single-node provenance contract.
+#[tokio::test]
+async fn daemon_mcp_boundary_single_node_without_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_repo_files(
+        &repo_dir,
+        &[("local/main.js", "function solofn(x) { return x; }")],
+    );
+    index_repo(&repo_dir, &db_path);
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let mcp_addr = guard.mcp_addr();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": { "changed_files": ["local/main.js"], "max_depth": 3 }
+            }
+        }))
+        .send()
+        .await
+        .expect("MCP HTTP tools/call request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "got: {body}");
+
+    let meta = &body["result"]["_meta"];
+    assert_eq!(
+        meta["nestweaver.io/sources"],
+        json!(["daemon"]),
+        "single-node daemon must report only itself as a source; got {meta}"
+    );
+    assert_eq!(
+        meta["nestweaver.io/scope"], "single-node",
+        "no upstream configured => scope must stay single-node; got {meta}"
+    );
+    assert_eq!(
+        meta["nestweaver.io/stale_repos"],
+        json!([]),
+        "stale_repos must be an empty array when no upstream is configured; got {meta}"
+    );
+}

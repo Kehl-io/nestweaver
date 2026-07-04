@@ -27,7 +27,16 @@ impl ServerGuard {
 
     /// Spawn the server with a bearer auth token.
     pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
-        Self::spawn_inner(db_path, Some(token), None, None, None, None)
+        Self::spawn_inner(db_path, Some(token), None, None, None, None, None)
+    }
+
+    /// Spawn the server with an instance config (`--config <instance.toml>`).
+    ///
+    /// Used by the federation tests: the config's `[[upstream]]` block makes the
+    /// daemon build a federation coordinator at its `/mcp` boundary, so a raw
+    /// MCP client gets two-tier results for two-tier-routed tools.
+    pub fn start_with_config(db_path: &Path, config_path: &Path) -> Self {
+        Self::spawn_inner(db_path, None, None, None, None, None, Some(config_path))
     }
 
     /// Spawn the server with both a query auth token and an admin token.
@@ -42,17 +51,18 @@ impl ServerGuard {
             None,
             None,
             Some(admin_token),
+            None,
         )
     }
 
     /// Spawn the server with TLS enabled.
     pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
-        Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None)
+        Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None, None)
     }
 
     /// Spawn the server with a webhook secret configured.
     pub fn start_with_webhook(db_path: &Path, secret: &str) -> Self {
-        Self::spawn_inner(db_path, None, None, None, Some(secret), None)
+        Self::spawn_inner(db_path, None, None, None, Some(secret), None, None)
     }
 
     /// Return the TCP port the server bound to (read from the port file, line 1).
@@ -94,9 +104,10 @@ impl ServerGuard {
     // ── internal ──────────────────────────────────────────────────────
 
     fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
-        Self::spawn_inner(db_path, auth_token, None, None, None, None)
+        Self::spawn_inner(db_path, auth_token, None, None, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_inner(
         db_path: &Path,
         auth_token: Option<&str>,
@@ -104,6 +115,7 @@ impl ServerGuard {
         tls_key: Option<&Path>,
         webhook_secret: Option<&str>,
         admin_token: Option<&str>,
+        config_path: Option<&Path>,
     ) -> Self {
         let port_file = db_path
             .parent()
@@ -145,6 +157,10 @@ impl ServerGuard {
 
         if let Some(token) = admin_token {
             cmd.args(["--admin-token", token]);
+        }
+
+        if let Some(config) = config_path {
+            cmd.args(["--config", &config.display().to_string()]);
         }
 
         // Run in foreground — launchd-style daemonisation doesn't work in tests.

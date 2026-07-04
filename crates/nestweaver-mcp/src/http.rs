@@ -189,6 +189,12 @@ pub struct McpHttpState {
     /// daemon's gRPC path. Populated by a background task when the `embed`
     /// feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+    /// Daemon-side federation coordinator, built once from the instance
+    /// config's `[[upstream]]` entries. `None` for the common single-node case
+    /// (no upstreams configured) — the `/mcp` boundary then stamps the honest
+    /// single-node provenance. Present only under the `daemon` feature.
+    #[cfg(feature = "daemon")]
+    pub federation: Option<Arc<crate::federation::FederationState>>,
 }
 
 impl McpHttpState {
@@ -214,6 +220,8 @@ impl McpHttpState {
             admin_token: None,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(feature = "daemon")]
+            federation: None,
         }
     }
 
@@ -242,6 +250,8 @@ impl McpHttpState {
             admin_token,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(feature = "daemon")]
+            federation: None,
         }
     }
 }
@@ -369,19 +379,41 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
     result
 }
 
-/// Inject single-node provenance into the MCP result envelope so a raw client hitting this
+/// Inject provenance into the MCP result envelope so a raw client hitting this
 /// daemon's `/mcp` endpoint gets in-band source metadata — the fan-out boundary should emit the
 /// contract (federated-search norm: Elasticsearch `_clusters`, Trino coordinator; MCP `_meta` is
-/// server-produced). A standalone daemon is ONE node: it reports itself as the sole source and a
-/// `single-node` scope. The hybrid client (which fronts local + an upstream over gRPC) is what
-/// produces a federated two-tier envelope; a raw client therefore learns, in-band, that this
-/// response was not federated. Keys are domain-namespaced per the MCP `_meta` prefix rule.
-fn add_provenance_metadata(mut result: Value) -> Value {
+/// server-produced). Keys are domain-namespaced per the MCP `_meta` prefix rule.
+///
+/// When `upstream_source` is `Some(name)` the daemon federated a two-tier tool
+/// against that upstream: scope is `"federated"` and the sources list carries
+/// both the daemon and the contributing upstream. When `None` — no upstream
+/// configured, an upstream that could not answer, or a non-two-tier tool — the
+/// honest single-node stamp is used: a standalone daemon is ONE node and says
+/// so, so a raw client learns in-band that the response was not federated.
+///
+/// `stale_repos` is stamped on EVERY result (empty when no upstream is
+/// configured) so staleness reporting is uniform across all tools, not just the
+/// federated ones — a caller can always read which repos the local index is
+/// behind an upstream on.
+fn add_provenance_metadata(
+    mut result: Value,
+    upstream_source: Option<&str>,
+    stale_repos: &[String],
+) -> Value {
     if let Some(obj) = result.as_object_mut() {
         let meta = obj.entry("_meta").or_insert_with(|| json!({}));
         if let Some(meta_obj) = meta.as_object_mut() {
-            meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon"]));
-            meta_obj.insert("nestweaver.io/scope".to_string(), json!("single-node"));
+            match upstream_source {
+                Some(name) => {
+                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon", name]));
+                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("federated"));
+                }
+                None => {
+                    meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon"]));
+                    meta_obj.insert("nestweaver.io/scope".to_string(), json!("single-node"));
+                }
+            }
+            meta_obj.insert("nestweaver.io/stale_repos".to_string(), json!(stale_repos));
         }
     }
     result
@@ -760,6 +792,8 @@ async fn handle_mcp(
             let instance_cfg = state.instance_cfg.clone();
             let lite = state.lite;
             let server_mode = state.server_mode;
+            #[cfg(feature = "daemon")]
+            let federation = state.federation.clone();
 
             // Read the embed model Arc outside the blocking thread (matches the
             // gRPC handler pattern in server.rs), then drop the RwLock guard.
@@ -791,6 +825,16 @@ async fn handle_mcp(
                     }
                 }
             }
+
+            // The federation coordinator (below, after local dispatch) queries
+            // the upstream with the SAME (post-safeguard) arguments the local
+            // tier saw. Capture them now, before `arguments` is moved into the
+            // blocking dispatch closure — but only when an upstream is actually
+            // configured, so the common single-node daemon pays no clone.
+            #[cfg(feature = "daemon")]
+            let fed_capture = federation
+                .as_ref()
+                .map(|_| (name.clone(), arguments.clone()));
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
@@ -828,10 +872,36 @@ async fn handle_mcp(
 
             match result {
                 Ok(Ok(Ok(value))) => {
-                    let result = add_provenance_metadata(add_limit_metadata(
-                        tools::wrap_tool_result(value),
-                        &applied_limits,
-                    ));
+                    // Federation coordinator step: run AFTER the local dispatch
+                    // and BEFORE envelope assembly. For a `TwoTier`-routed tool
+                    // with a healthy upstream configured, this fans the local
+                    // result out into a `{ local_impact, org_wide_impact }`
+                    // envelope; otherwise the local value passes through
+                    // untouched. `stale_repos` is the cached staleness verdict,
+                    // stamped on every result (empty without an upstream).
+                    #[cfg(feature = "daemon")]
+                    let (value, upstream_source, stale_repos) = match (&federation, fed_capture) {
+                        (Some(fed), Some((fed_tool, fed_args))) => {
+                            let (v, src) = crate::federation::federate_two_tier(
+                                fed, &fed_tool, &fed_args, value,
+                            )
+                            .await;
+                            (v, src, fed.stale_repos())
+                        }
+                        _ => (value, None, Vec::new()),
+                    };
+                    #[cfg(not(feature = "daemon"))]
+                    let (value, upstream_source, stale_repos): (
+                        Value,
+                        Option<String>,
+                        Vec<String>,
+                    ) = (value, None, Vec::new());
+
+                    let result = add_provenance_metadata(
+                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits),
+                        upstream_source.as_deref(),
+                        &stale_repos,
+                    );
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -895,16 +965,34 @@ mod tests {
     fn provenance_metadata_injects_namespaced_single_node_scope() {
         // A raw /mcp client must get in-band provenance so the schema (which mentions _meta)
         // is honest: a standalone daemon reports itself as the sole source + single-node scope.
-        let out = add_provenance_metadata(json!({ "content": [], "isError": false }));
+        let out = add_provenance_metadata(json!({ "content": [], "isError": false }), None, &[]);
         let meta = &out["_meta"];
         assert_eq!(meta["nestweaver.io/scope"], json!("single-node"));
         assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+        // Staleness is stamped uniformly — empty when no upstream is configured.
+        assert_eq!(meta["nestweaver.io/stale_repos"], json!([]));
 
         // Merges with pre-existing _meta (e.g. limits) rather than clobbering it.
         let with_limits = json!({ "content": [], "_meta": { "limits": [{"param": "depth"}] } });
-        let out = add_provenance_metadata(with_limits);
+        let out = add_provenance_metadata(with_limits, None, &[]);
         assert_eq!(out["_meta"]["nestweaver.io/scope"], json!("single-node"));
         assert!(out["_meta"]["limits"].is_array());
+
+        // A federated result names the contributing upstream and flips scope.
+        let fed = add_provenance_metadata(
+            json!({ "content": [] }),
+            Some("acme"),
+            &["https://github.com/acme/api.git".to_string()],
+        );
+        assert_eq!(fed["_meta"]["nestweaver.io/scope"], json!("federated"));
+        assert_eq!(
+            fed["_meta"]["nestweaver.io/sources"],
+            json!(["daemon", "acme"])
+        );
+        assert_eq!(
+            fed["_meta"]["nestweaver.io/stale_repos"],
+            json!(["https://github.com/acme/api.git"])
+        );
     }
 
     /// Regression guard for the single shared mutating-tool list. Pins the

@@ -4549,8 +4549,31 @@ pub async fn run_server(
             // A read-only replica must reject mutating MCP tools before dispatch,
             // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
             s.read_only = read_only;
+            // Build the daemon-side federation coordinator from the instance
+            // config's `[[upstream]]` entries. `None` for the common
+            // single-node case (no upstreams) — the `/mcp` boundary then stamps
+            // the honest single-node provenance.
+            s.federation = state.instance_cfg.as_ref().and_then(|cfg| {
+                nestweaver_mcp::federation::FederationState::from_instance_config(cfg)
+            });
+            if let Some(ref fed) = s.federation {
+                tracing::info!(
+                    upstreams = fed.upstream_count(),
+                    "MCP /mcp boundary: federation coordinator active"
+                );
+            }
             std::sync::Arc::new(s)
         };
+        // Spawn the background staleness/health-recovery task, mirroring the
+        // hybrid client's maintenance loop. Only when an upstream is configured;
+        // aborts on shutdown via the same watch channel as the other sweepers.
+        if let Some(ref fed) = mcp_state.federation {
+            nestweaver_mcp::federation::spawn_staleness_refresher(
+                state.store.clone(),
+                fed.clone(),
+                shutdown_tx.subscribe(),
+            );
+        }
         nestweaver_mcp::http::spawn_session_sweeper(
             mcp_state.sessions.clone(),
             shutdown_tx.subscribe(),
