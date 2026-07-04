@@ -171,8 +171,10 @@ pub async fn export_html(
     let data = std::fs::read_to_string(&path)
         .map_err(|e| ApiError::internal(format!("failed to read presentation: {e}")))?;
     let presentation: Presentation = serde_json::from_str(&data)?;
-    let slides_json = serde_json::to_string(&presentation.slides)
-        .map_err(|e| ApiError::internal(format!("failed to serialize slides: {e}")))?;
+    let slides_json = crate::routes::export::json_for_html_script(
+        &serde_json::to_string(&presentation.slides)
+            .map_err(|e| ApiError::internal(format!("failed to serialize slides: {e}")))?,
+    );
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -201,7 +203,9 @@ const counter = document.getElementById('counter');
 slides.forEach((s, i) => {{
   const div = document.createElement('div');
   div.className = 'slide' + (i === 0 ? ' active' : '');
-  div.innerHTML = '<pre>' + JSON.stringify(s, null, 2) + '</pre>';
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(s, null, 2);
+  div.appendChild(pre);
   container.appendChild(div);
 }});
 function show(n) {{
@@ -219,7 +223,7 @@ document.addEventListener('keydown', e => {{
 </script>
 </body>
 </html>"#,
-        title = presentation.name,
+        title = crate::routes::export::html_escape(&presentation.name),
         slides_json = slides_json,
     );
 

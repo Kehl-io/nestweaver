@@ -66,8 +66,13 @@ pub async fn source(
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
 
-        let start = line.saturating_sub(context + 1);
-        let end = (line + context).min(total_lines);
+        // Clamp defensively: a large `line` (or `line + context` overflow) must
+        // not produce start > end or an out-of-range slice — that would panic the
+        // request task. `checked_add` guards the overflow; `start.min(end)` keeps
+        // the range valid even when `line` is far past EOF.
+        let start = line.saturating_sub(context + 1).min(total_lines);
+        let end = line.saturating_add(context).min(total_lines);
+        let start = start.min(end);
 
         let extracted: Vec<&str> = all_lines[start..end].to_vec();
 

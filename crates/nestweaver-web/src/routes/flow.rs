@@ -21,7 +21,10 @@ pub async fn flow(
     Path(uid): Path<String>,
     Query(params): Query<FlowParams>,
 ) -> Result<Response, ApiError> {
-    let max_depth = params.max_depth.unwrap_or(10);
+    // Clamp: build_flow_tree recurses per level, so an unbounded client-supplied
+    // depth on a deep call graph could overflow the stack — an uncatchable abort
+    // that takes down the whole daemon. Mirror the impact endpoint's cap.
+    let max_depth = params.max_depth.unwrap_or(10).min(25);
 
     // Verify root symbol exists
     let root = state
