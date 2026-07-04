@@ -99,7 +99,10 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         .open(&spawn_lock_path)
         .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
     if unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        bail!("flock on spawn lock failed: {}", std::io::Error::last_os_error());
+        bail!(
+            "flock on spawn lock failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     // Re-check: another client may have started the daemon while we waited for the spawn-lock.

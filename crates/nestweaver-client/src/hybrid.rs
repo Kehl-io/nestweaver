@@ -840,7 +840,10 @@ fn is_upstream_down(err: &anyhow::Error) -> bool {
 /// Whether a raw gRPC status code means the upstream is down (vs a rejection from a live
 /// server). Shared by [`is_upstream_down`] and the paths that hold a `tonic::Status` directly.
 fn code_is_down(code: tonic::Code) -> bool {
-    matches!(code, tonic::Code::Unavailable | tonic::Code::DeadlineExceeded)
+    matches!(
+        code,
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
 }
 
 /// Passively eject `upstream` after a failed live query, honoring the
@@ -2576,7 +2579,10 @@ mod tests {
         assert_eq!(m["patterns"].as_array().unwrap().len(), 2);
 
         // A field only on the server side is carried over.
-        let m2 = concat_fanout(&json!({ "results": [] }), &json!({ "results": [], "extra": 7 }));
+        let m2 = concat_fanout(
+            &json!({ "results": [] }),
+            &json!({ "results": [], "extra": 7 }),
+        );
         assert_eq!(m2["extra"], json!(7));
     }
 

@@ -3324,7 +3324,9 @@ mod tests {
         assert_eq!(store.get_embedding_metadata().unwrap(), None);
 
         // Normal HuggingFace id round-trips, and the singleton is replaced on re-set.
-        store.set_embedding_metadata("thenlper/gte-base", 768).unwrap();
+        store
+            .set_embedding_metadata("thenlper/gte-base", 768)
+            .unwrap();
         assert_eq!(
             store.get_embedding_metadata().unwrap(),
             Some(("thenlper/gte-base".to_string(), 768))
