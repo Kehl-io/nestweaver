@@ -27,6 +27,9 @@ path = "~/.local/share/nestweaver/acme/workspace"
 endpoint = "http://localhost:11434"
 embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
+# For a keyed embedding gateway (OpenAI, Azure, etc.), set the API key via the
+# NESTWEAVER_EMBED_API_KEY environment variable — it is sent as a bearer token and
+# is NEVER written to config, the graph, or a snapshot. Omit it for local Ollama.
 
 [git]
 credential_method = "gh"

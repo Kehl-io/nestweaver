@@ -61,17 +61,18 @@ pub async fn generate_embeddings_batch(
         index: usize,
     }
 
-    let resp: Resp = client
-        .post(&url)
-        .json(&Req {
-            model,
-            input: texts.to_vec(),
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut builder = client.post(&url).json(&Req {
+        model,
+        input: texts.to_vec(),
+    });
+    // Optional bearer auth (keyed gateways like OpenAI). From an env var only, so
+    // the key is never persisted to config/graph/snapshot.
+    if let Ok(key) = std::env::var("NESTWEAVER_EMBED_API_KEY")
+        && !key.is_empty()
+    {
+        builder = builder.bearer_auth(key);
+    }
+    let resp: Resp = builder.send().await?.error_for_status()?.json().await?;
 
     // A short/long response would silently misalign every embedding with the
     // wrong input (or drop some), corrupting the index. Fail loudly instead.
