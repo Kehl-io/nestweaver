@@ -106,7 +106,9 @@ fn tiered_change_check(
     let (mtime_secs, size_bytes) = match reader.file_meta(rel)? {
         Some((m, s)) => (m, s),
         None => {
-            // No filesystem metadata (e.g. GitBareReader) — read and hash.
+            // No filesystem metadata (e.g. GitBareReader) — read and hash. The
+            // bare-clone reader enforces the size cap inside its own read_file
+            // (oversized blobs return Err), so a huge file is skipped there.
             let source = reader
                 .read_file(rel)
                 .with_context(|| format!("read {rel_path}"))?;
@@ -127,6 +129,19 @@ fn tiered_change_check(
             });
         }
     };
+
+    // Enforce the oversized-file ceiling on the FILESYSTEM path too. Markdown
+    // (index_md) and the bare-clone reader already skip oversized files, but the
+    // local code path did not — so a single large source file (e.g. a 200 MB
+    // generated bundle that minified-detection misses) was read whole and handed
+    // to tree-sitter, exhausting memory. `size_bytes` is already in hand from
+    // file_meta, so the guard is free; the caller turns this Err into a skip.
+    if size_bytes > crate::index_md::MAX_FILE_SIZE_BYTES {
+        anyhow::bail!(
+            "file exceeds size limit ({size_bytes} > {} bytes), skipping",
+            crate::index_md::MAX_FILE_SIZE_BYTES
+        );
+    }
 
     if let Some(cached) = cache.get(rel_path) {
         // Tier 1: mtime unchanged → skip.
