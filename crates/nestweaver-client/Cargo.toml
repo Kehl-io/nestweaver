@@ -9,6 +9,7 @@ description = "Client for NestWeaver daemon — auto-start, connect, call RPCs"
 nestweaver-schema = { workspace = true }
 nestweaver-proto = { workspace = true }
 nestweaver-daemon = { workspace = true }
+nestweaver-federation = { workspace = true }
 tonic = { workspace = true }
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
@@ -19,9 +20,6 @@ tracing = { workspace = true }
 hyper-util = "0.1"
 libc = "0.2"
 serde = { workspace = true }
-toml = "0.8"
-dirs = { workspace = true }
-glob = "0.3"
 serde_json = { workspace = true }
 # HTTP client for the device-flow (RFC 8628) /auth endpoints. Pinned to the
 # same major already built by nestweaver-engine to avoid a second resolution.

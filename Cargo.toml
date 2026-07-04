@@ -12,6 +12,7 @@ members = [
     "crates/nestweaver-web",
     "crates/nestweaver-wasm",
     "crates/nestweaver-proto",
+    "crates/nestweaver-federation",
     "crates/nestweaver-daemon",
     "crates/nestweaver-client",
     "crates/nestweaver-embed",
@@ -38,6 +39,7 @@ nestweaver-engine = { path = "crates/nestweaver-engine" }
 nestweaver-mcp = { path = "crates/nestweaver-mcp" }
 nestweaver-web = { path = "crates/nestweaver-web" }
 nestweaver-proto = { path = "crates/nestweaver-proto" }
+nestweaver-federation = { path = "crates/nestweaver-federation" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }
 nestweaver-embed = { path = "crates/nestweaver-embed" }

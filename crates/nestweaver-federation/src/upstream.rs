@@ -39,29 +39,29 @@ const LATENCY_EWMA_ALPHA: f64 = 0.2;
 static CLOCK_BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Current monotonic milliseconds since the process clock base.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     CLOCK_BASE.elapsed().as_millis() as u64
 }
 
 /// Base ejection window (Envoy `base_ejection_time`). Multiplied by the
 /// consecutive-ejection count and capped at [`EJECTION_CAP_MS`].
-pub(crate) const EJECTION_BASE_MS: u64 = 30_000;
+pub const EJECTION_BASE_MS: u64 = 30_000;
 
 /// Upper bound on the ejection window so a chronically-dead upstream is still
 /// re-probed every few minutes rather than never.
-pub(crate) const EJECTION_CAP_MS: u64 = 300_000;
+pub const EJECTION_CAP_MS: u64 = 300_000;
 
 /// Consecutive successful probes required to return an ejected upstream to
 /// rotation (HAProxy `rise` — hysteresis against flapping).
-pub(crate) const RISE_THRESHOLD: u32 = 2;
+pub const RISE_THRESHOLD: u32 = 2;
 
 /// Never eject more than this percentage of upstreams at once (Envoy
 /// `max_ejection_percent`). One correlated network blip must not force the
 /// whole session local-only; at least one upstream may always be ejected.
-pub(crate) const MAX_EJECTION_PERCENT: u32 = 50;
+pub const MAX_EJECTION_PERCENT: u32 = 50;
 
 /// Ejection window for the `n`th consecutive ejection: `base * n`, capped.
-pub(crate) fn ejection_backoff_ms(ejection_count: u32) -> u64 {
+pub fn ejection_backoff_ms(ejection_count: u32) -> u64 {
     let count = ejection_count.max(1) as u64;
     EJECTION_BASE_MS.saturating_mul(count).min(EJECTION_CAP_MS)
 }
@@ -69,12 +69,12 @@ pub(crate) fn ejection_backoff_ms(ejection_count: u32) -> u64 {
 /// Maximum number of upstreams that may be ejected simultaneously given
 /// `total` upstreams and a `max_percent` cap. Always at least 1 so a single
 /// genuinely-dead upstream can still be removed.
-pub(crate) fn ejection_cap(total: usize, max_percent: u32) -> usize {
+pub fn ejection_cap(total: usize, max_percent: u32) -> usize {
     ((total.saturating_mul(max_percent as usize)) / 100).max(1)
 }
 
 /// Whether ejecting one more upstream stays within the blast-radius cap.
-pub(crate) fn can_eject(total: usize, currently_ejected: usize, max_percent: u32) -> bool {
+pub fn can_eject(total: usize, currently_ejected: usize, max_percent: u32) -> bool {
     currently_ejected < ejection_cap(total, max_percent)
 }
 
@@ -197,7 +197,7 @@ pub struct UpstreamHandle {
     /// encoded as `f64` bits inside an `AtomicU64` for lock-free interior
     /// mutability. A stored value of `0.0` (bits `0`) is the cold-start
     /// sentinel meaning "no samples yet". Feeds the mode-aware adaptive
-    /// timeout (see `hybrid::effective_timeout`).
+    /// timeout (see [`crate::health::effective_timeout`]).
     latency_ewma: Arc<AtomicU64>,
 }
 
@@ -326,7 +326,7 @@ impl UpstreamHandle {
 /// estimate directly; thereafter it is smoothed by [`LATENCY_EWMA_ALPHA`].
 /// Lossy under concurrent writers (a race just drops a sample), which is fine
 /// for a latency estimate.
-pub(crate) fn record_latency_into(slot: &AtomicU64, observed: Duration) {
+pub fn record_latency_into(slot: &AtomicU64, observed: Duration) {
     let sample_ms = observed.as_secs_f64() * 1000.0;
     let prev_bits = slot.load(Ordering::Relaxed);
     let next = if prev_bits == 0 {

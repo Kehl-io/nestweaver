@@ -2,13 +2,14 @@
 
 pub mod autostart;
 pub mod connect;
-pub mod dedup;
-pub mod discovery;
 pub mod hybrid;
-pub mod merge;
 pub mod repo_identity;
-pub mod routing;
-pub mod upstream;
+
+// These modules moved to the `nestweaver-federation` crate (nw-017 Phase B,
+// 5a). Re-export them at their old paths so `nestweaver_client::discovery`,
+// `::upstream`, `::routing`, `::merge`, and `::dedup` keep working for
+// existing callers (main binary, e2e tests).
+pub use nestweaver_federation::{dedup, discovery, merge, routing, upstream};
 
 use std::path::{Path, PathBuf};
 
