@@ -64,7 +64,7 @@ nestweaver context src/main.js           # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
-nestweaver impact "fetchRegions" --repo acme  # filter impact to a specific repo
+nestweaver impact "fetchRegions" --repo my-service  # filter impact to a specific repo
 nestweaver repo-map --token-budget 2000
 nestweaver summary --level symbol        # hierarchical code summaries (symbol/file/cluster)
 

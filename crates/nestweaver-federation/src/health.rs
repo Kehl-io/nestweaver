@@ -353,11 +353,11 @@ mod tests {
     fn repo_state_lookup_matches_file_checkout_to_remote_url() {
         let local_states = std::collections::HashMap::from([
             (
-                "file:///home/user/dev/workspaces/api".to_string(),
+                "file:///home/dev/checkouts/api".to_string(),
                 "local-sha".to_string(),
             ),
             (
-                "file:///home/user/dev/workspaces/billing".to_string(),
+                "file:///home/dev/checkouts/billing".to_string(),
                 "billing-sha".to_string(),
             ),
         ]);
