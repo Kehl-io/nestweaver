@@ -204,7 +204,8 @@ impl GraphStore {
         exec_params(
             &conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+             root_path: $root_path})",
             vec![
                 ("uid", lbug::Value::String(repo.uid.clone())),
                 ("url", lbug::Value::String(repo.url.clone())),
@@ -217,6 +218,10 @@ impl GraphStore {
                 (
                     "name",
                     lbug::Value::String(repo.name.clone().unwrap_or_default()),
+                ),
+                (
+                    "root_path",
+                    lbug::Value::String(repo.root_path.clone().unwrap_or_default()),
                 ),
             ],
         )
@@ -2317,7 +2322,8 @@ impl GraphStore {
         repo_uid: &str,
         new_sha: &str,
     ) -> Result<(), StoreError> {
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, \
+                    r.name, r.root_path";
         let rows: Vec<_> = conn
             .query(&format!(
                 "MATCH (r:Repo {{uid: '{}'}}) RETURN {cols}",
@@ -2348,6 +2354,10 @@ impl GraphStore {
             Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
             _ => String::new(),
         };
+        let root_path = match row.get(6) {
+            Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => String::new(),
+        };
 
         exec_params(
             conn,
@@ -2358,7 +2368,8 @@ impl GraphStore {
         exec_params(
             conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+             root_path: $root_path})",
             vec![
                 ("uid", lbug::Value::String(uid)),
                 ("url", lbug::Value::String(url)),
@@ -2366,9 +2377,83 @@ impl GraphStore {
                 ("scb", lbug::Value::Int64(staleness)),
                 ("iid", lbug::Value::String(instance_id)),
                 ("name", lbug::Value::String(name)),
+                ("root_path", lbug::Value::String(root_path)),
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Update the `root_path` field of a Repo node, leaving every other
+    /// field (including the identity `url`) untouched. Used at index time
+    /// to keep the on-disk location current for pre-existing rows.
+    ///
+    /// Follows the established read → DETACH DELETE → CREATE pattern
+    /// (see `update_repo_sha`).
+    pub fn update_repo_root_path(&self, repo_uid: &str, root_path: &str) -> Result<(), StoreError> {
+        let txn = self.begin_transaction()?;
+        {
+            let conn = &txn;
+            let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, \
+                        r.instance_id, r.name";
+            let rows: Vec<_> = conn
+                .query(&format!(
+                    "MATCH (r:Repo {{uid: '{}'}}) RETURN {cols}",
+                    repo_uid.replace('\'', "''"),
+                ))
+                .map_err(|e| StoreError::Query(format!("query repo: {e}")))?
+                .collect();
+
+            let row = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+
+            let uid = match row.first() {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo uid missing".to_string())),
+            };
+            let url = match row.get(1) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo url missing".to_string())),
+            };
+            let sha = match row.get(2) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let staleness = match row.get(3) {
+                Some(lbug::Value::Int64(n)) => *n,
+                _ => 0,
+            };
+            let instance_id = match row.get(4) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo instance_id missing".to_string())),
+            };
+            let name = match row.get(5) {
+                Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
+                _ => String::new(),
+            };
+
+            exec_params(
+                conn,
+                "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
+                vec![("uid", lbug::Value::String(uid.clone()))],
+            )?;
+
+            exec_params(
+                conn,
+                "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
+                 staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+                 root_path: $root_path})",
+                vec![
+                    ("uid", lbug::Value::String(uid)),
+                    ("url", lbug::Value::String(url)),
+                    ("sha", lbug::Value::String(sha)),
+                    ("scb", lbug::Value::Int64(staleness)),
+                    ("iid", lbug::Value::String(instance_id)),
+                    ("name", lbug::Value::String(name)),
+                    ("root_path", lbug::Value::String(root_path.to_string())),
+                ],
+            )?;
+        }
+        self.commit_transaction(&txn)?;
         Ok(())
     }
 
@@ -3357,6 +3442,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "default".to_string(),
             name: Some("test-repo".to_string()),
+            root_path: None,
         };
         store.insert_repo(&repo).unwrap();
 

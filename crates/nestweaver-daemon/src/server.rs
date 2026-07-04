@@ -618,6 +618,48 @@ macro_rules! json_rpc {
 
 type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgress, Status>>;
 
+/// Delete every repo whose KNOWN local working tree no longer exists on disk.
+///
+/// Safety contract (data-loss guard): a repo is prunable only when
+/// [`nestweaver_schema::Repo::local_root`] yields a path — i.e. it has a
+/// recorded `root_path`, or a legacy `file://` identity url. Repos with a
+/// remote identity and no working tree (server-side bare-clone repos,
+/// `root_path: None`) are skipped entirely: a disk-existence check cannot
+/// apply to them, and bulk-deleting them here would destroy server data.
+///
+/// Returns the display names of the removed repos.
+fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>, anyhow::Error> {
+    let mut removed_repos = Vec::new();
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow::anyhow!("list_repos failed: {e:#}"))?;
+
+    for repo in &repos {
+        let Some(path) = repo.local_root() else {
+            continue;
+        };
+        if !Path::new(path).exists() {
+            tracing::info!(
+                uid = %repo.uid,
+                url = %repo.url,
+                root = path,
+                "pruning stale repo: local working tree no longer exists"
+            );
+            store
+                .bulk_delete_repo_files_and_symbols(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
+            store
+                .clear_repo_derived_nodes(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
+            store
+                .delete_repo_node(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
+            removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
+        }
+    }
+    Ok(removed_repos)
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -1308,7 +1350,20 @@ impl NestWeaverDaemon for DaemonService {
             // Dropped when the index task ends → fires the watchdog's `done_rx`
             // so it releases its stream sender and the response can terminate.
             let _done = done_tx;
-            let repo_url = format!("file://{}", repo_path.display());
+            // Identity: prefer the git origin remote when configured (the
+            // returned URL is only an identity string — never fetched);
+            // fall back to a file:// URL. The engine records the on-disk
+            // location separately as `root_path` and prunes a prior
+            // file://-identified node for the same working tree by uid.
+            // Guard on `.git` at the indexed root: `git config` walks up to
+            // an enclosing repo, and a subdirectory index must not capture
+            // (and collide with) its parent repo's identity.
+            let repo_url = if repo_path.join(".git").exists() {
+                nestweaver_engine::read_origin_url(&repo_path)
+                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
+            } else {
+                format!("file://{}", repo_path.display())
+            };
 
             let indexed_sha = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -1844,39 +1899,11 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let mut removed_repos = Vec::new();
             let mut removed_vaults = Vec::new();
 
-            // Prune stale repos (path no longer exists on disk).
-            let repos = state
-                .store
-                .list_repos(None)
-                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
-
-            for repo in &repos {
-                let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
-                if !Path::new(path).exists() {
-                    state
-                        .store
-                        .bulk_delete_repo_files_and_symbols(&repo.uid)
-                        .map_err(|e| {
-                            Status::internal(format!(
-                                "bulk_delete_repo_files_and_symbols failed: {e:#}"
-                            ))
-                        })?;
-                    state
-                        .store
-                        .clear_repo_derived_nodes(&repo.uid)
-                        .map_err(|e| {
-                            Status::internal(format!("clear_repo_derived_nodes failed: {e:#}"))
-                        })?;
-                    state
-                        .store
-                        .delete_repo_node(&repo.uid)
-                        .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
-                    removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
-                }
-            }
+            // Prune stale repos (local working tree no longer exists on disk).
+            let removed_repos = prune_stale_repos(&state.store)
+                .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
 
             // Prune stale vaults (root_path no longer exists on disk).
             let vaults = state
@@ -2483,14 +2510,8 @@ impl NestWeaverDaemon for DaemonService {
                     RepoState {
                         repo_uid: r.uid,
                         repo_url: r.url.clone(),
-                        repo_name: r.name.unwrap_or_else(|| {
-                            r.url
-                                .strip_prefix("file://")
-                                .unwrap_or(&r.url)
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&r.url)
-                                .to_string()
+                        repo_name: r.name.clone().unwrap_or_else(|| {
+                            nestweaver_schema::repo_name(&r.url).unwrap_or_else(|| r.url.clone())
                         }),
                         indexed_sha: r.indexed_sha,
                         symbol_count,
@@ -6054,6 +6075,91 @@ mod startup_helper_tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    fn test_repo(uid: &str, url: &str, root_path: Option<&str>) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: root_path.map(String::from),
+        }
+    }
+
+    /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
+    /// repo with a remote identity url and no local working tree
+    /// (`root_path: None`) — e.g. a server-side bare-clone repo. The old
+    /// implementation derived a disk path from `url.strip_prefix("file://")`,
+    /// which fell back to the raw https URL, never exists on disk, and
+    /// bulk-deleted the repo's entire graph.
+    #[test]
+    fn prune_stale_repos_never_deletes_remote_identity_repos() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&test_repo(
+                "repo:server",
+                "https://github.com/acme/server-only.git",
+                None,
+            ))
+            .unwrap();
+
+        let removed = prune_stale_repos(&store).unwrap();
+
+        assert!(
+            removed.is_empty(),
+            "remote-identity repo without a working tree must be skipped, got {removed:?}"
+        );
+        assert!(
+            store.lookup_repo("repo:server").unwrap().is_some(),
+            "server-side repo must survive prune_stale"
+        );
+    }
+
+    /// Repos with a recorded root_path (or a legacy file:// identity) whose
+    /// working tree vanished ARE pruned; ones that still exist are kept.
+    #[test]
+    fn prune_stale_repos_prunes_missing_local_trees_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let existing = tmp.path().join("still-here");
+        std::fs::create_dir_all(&existing).unwrap();
+        let gone = tmp.path().join("gone");
+
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        // Origin identity + existing working tree → kept.
+        store
+            .insert_repo(&test_repo(
+                "repo:kept",
+                "https://github.com/acme/kept.git",
+                Some(existing.to_str().unwrap()),
+            ))
+            .unwrap();
+        // Origin identity + vanished working tree → pruned.
+        store
+            .insert_repo(&test_repo(
+                "repo:moved",
+                "https://github.com/acme/moved.git",
+                Some(gone.to_str().unwrap()),
+            ))
+            .unwrap();
+        // Legacy row: file:// identity, no root_path, tree vanished → pruned
+        // via the local_root() compat fallback.
+        store
+            .insert_repo(&test_repo(
+                "repo:legacy",
+                &format!("file://{}/legacy-gone", tmp.path().display()),
+                None,
+            ))
+            .unwrap();
+
+        let removed = prune_stale_repos(&store).unwrap();
+
+        assert_eq!(removed.len(), 2, "got {removed:?}");
+        assert!(store.lookup_repo("repo:kept").unwrap().is_some());
+        assert!(store.lookup_repo("repo:moved").unwrap().is_none());
+        assert!(store.lookup_repo("repo:legacy").unwrap().is_none());
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared

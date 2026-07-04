@@ -274,6 +274,7 @@ fn record_repo_indexed_sha(
                 staleness_commits_behind: 0,
                 instance_id: instance_id.to_string(),
                 name: None,
+                root_path: None,
             })
             .context("insert_repo")?;
     } else {

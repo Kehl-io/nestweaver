@@ -89,8 +89,39 @@ impl CodeWatcher {
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
-        let repo_url = format!("file://{}", self.repo_root.display());
+        // Identity: prefer the git origin remote when configured; fall back
+        // to a file:// URL of the working tree. The disk location is always
+        // recorded separately in `root_path`. Guard on `.git` at the watched
+        // root: `git config` walks up to an enclosing repo, and watching a
+        // subdirectory must not capture its parent repo's identity.
+        let repo_url = if self.repo_root.join(".git").exists() {
+            crate::bare_clone::read_origin_url(&self.repo_root)
+                .unwrap_or_else(|_| format!("file://{}", self.repo_root.display()))
+        } else {
+            format!("file://{}", self.repo_root.display())
+        };
         let r_uid = nestweaver_schema::repo_uid(&self.instance_id, &repo_url);
+
+        // Re-identify prune (shared with the indexer via
+        // `reidentified_legacy_uid` so the two sites cannot drift): on a
+        // legacy DB this working tree's graph rows may still live under the
+        // old `file://` uid. Without the prune, the insert below would add a
+        // SECOND minimal Repo row under the new uid while the stale full
+        // graph lingers under the old one — duplicate symbols. Strictly
+        // uid-keyed, never by disk path.
+        let root_path = self.repo_root.display().to_string();
+        if let Some(old_uid) =
+            crate::index::reidentified_legacy_uid(&store, &self.instance_id, &root_path, &r_uid)?
+        {
+            tracing::info!(
+                old_uid,
+                new_uid = %r_uid,
+                root_path = %root_path,
+                url = %repo_url,
+                "watched repo re-identified under its origin remote; pruning old file:// node by uid"
+            );
+            crate::index::delete_repo_all_data(&store, &old_uid)?;
+        }
 
         // Ensure the Repo node exists so incremental updates can attach
         // File and Symbol nodes. If there's no prior index we create a
@@ -104,6 +135,7 @@ impl CodeWatcher {
                     staleness_commits_behind: 0,
                     instance_id: self.instance_id.clone(),
                     name: None,
+                    root_path: Some(root_path.clone()),
                 })
                 .context("insert initial Repo node")?;
         }

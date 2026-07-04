@@ -405,7 +405,8 @@ impl GraphStore {
 
     pub fn list_repos(&self, instance_id: Option<&str>) -> Result<Vec<Repo>, StoreError> {
         let conn = self.conn()?;
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, \
+                    r.name, r.root_path";
         let result = if let Some(iid) = instance_id {
             let q = format!("MATCH (r:Repo) WHERE r.instance_id = $iid RETURN {cols}");
             let mut stmt = conn
@@ -426,6 +427,8 @@ impl GraphStore {
                 let staleness = u32::try_from(extract_i64(&row, 3)?).unwrap_or(0);
                 let instance_id = extract_string(&row, 4)?;
                 let name = extract_opt_string(&row, 5).unwrap_or(None);
+                // Rows predating the migration hold '' — mapped to None.
+                let root_path = extract_opt_string(&row, 6).unwrap_or(None);
                 Ok(Repo {
                     uid,
                     url,
@@ -433,6 +436,7 @@ impl GraphStore {
                     staleness_commits_behind: staleness,
                     instance_id,
                     name,
+                    root_path,
                 })
             })
             .collect()

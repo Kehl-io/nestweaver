@@ -325,8 +325,18 @@ impl BareCloneWorkspace {
     }
 }
 
-/// Read the origin remote URL from a bare repo's git config.
-fn read_origin_url(bare_path: &Path) -> Result<String> {
+/// Read the `remote.origin.url` from a repo's git config.
+///
+/// Works on both bare clones and normal working trees (`git -C <path>
+/// config --get remote.origin.url`). Runs through the SSRF-safe
+/// [`run_git_with_timeout`](crate::git_cmd::run_git_with_timeout) wrapper;
+/// the returned URL is used only as an *identity string* for the repo —
+/// it is never fetched — so an attacker-controlled origin cannot trigger
+/// a network request from this path.
+///
+/// Errors when the repo has no configured origin remote (or git fails),
+/// in which case callers fall back to a `file://<path>` identity.
+pub fn read_origin_url(bare_path: &Path) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(bare_path)
@@ -400,6 +410,41 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
+    }
+
+    /// `read_origin_url` works on a normal (non-bare) working tree with a
+    /// configured origin remote — it only reads git config, no network.
+    #[test]
+    fn read_origin_url_reads_configured_origin_from_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        create_source_repo(&src, &[("a.txt", "hi")]);
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/acme/demo.git",
+            ])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            read_origin_url(&src).unwrap(),
+            "https://example.com/acme/demo.git"
+        );
+    }
+
+    /// Without an origin remote, `read_origin_url` errors so callers fall
+    /// back to a file:// identity.
+    #[test]
+    fn read_origin_url_errors_without_origin() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("worktree");
+        create_source_repo(&src, &[("a.txt", "hi")]);
+
+        assert!(read_origin_url(&src).is_err());
     }
 
     #[test]

@@ -347,6 +347,10 @@ fn index_directory_with_store_inner(
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    // Local filesystem index: the working tree location is `repo_path`.
+    // Persisted as `root_path` on the Repo node so consumers never derive
+    // a disk path from the identity `url`.
+    let local_root = repo_path.display().to_string();
     let result = if force {
         index_into_store_with_write_gate(
             &reader,
@@ -359,6 +363,7 @@ fn index_directory_with_store_inner(
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
             name,
+            Some(&local_root),
             false,
             cancel,
             || Ok::<(), anyhow::Error>(()),
@@ -376,6 +381,7 @@ fn index_directory_with_store_inner(
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
             name,
+            Some(&local_root),
             false,
             cancel,
             || Ok::<(), anyhow::Error>(()),
@@ -428,6 +434,7 @@ pub fn index_directory_in_memory(
 ) -> Result<(IndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("failed to create in-memory GraphStore")?;
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    let local_root = repo_path.display().to_string();
     let result = index_into_store(
         &reader,
         &store,
@@ -439,6 +446,7 @@ pub fn index_directory_in_memory(
         None,
         None,
         None,
+        Some(&local_root),
     )?;
     Ok((result, store))
 }
@@ -494,6 +502,9 @@ where
         None,
         None,
         name,
+        // Server-mode: the reader is backed by a bare clone with no local
+        // working tree, so the Repo node carries no root_path.
+        None,
         true,
         cancel,
         acquire_write_guard,
@@ -598,6 +609,7 @@ fn index_into_store(
     parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
+    root_path: Option<&str>,
 ) -> Result<IndexResult, anyhow::Error> {
     index_into_store_with_write_gate(
         reader,
@@ -610,6 +622,7 @@ fn index_into_store(
         parsed_cache,
         resolution_deps,
         name,
+        root_path,
         false,
         None,
         || Ok::<_, anyhow::Error>(()),
@@ -628,6 +641,7 @@ fn index_into_store_with_write_gate<G, F>(
     mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
     name: Option<&str>,
+    root_path: Option<&str>,
     bump_generation_after_write: bool,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     acquire_write_guard: F,
@@ -641,6 +655,24 @@ where
     // scan/parse/collection so worker threads can fan out expensive parsing and
     // only serialize LadybugDB writes.
     let r_uid = repo_uid(instance_id, repo_url);
+
+    // Re-identify detection MUST happen before the scan/parse phases: the
+    // filemeta sidecar was recorded when this working tree's graph rows
+    // lived under the legacy file:// uid. Trusting it now would classify
+    // every file as Unchanged and skip its writes under the NEW uid, while
+    // the prune below deletes the only copy of that data under the old uid
+    // — silently emptying the repo graph. A re-identified index is a true
+    // cold index for the new uid, so the tiered-change cache is bypassed
+    // for this pass (the fresh sidecar is still written afterwards).
+    let reidentify_old_uid: Option<String> = match root_path {
+        Some(rp) => reidentified_legacy_uid(store, instance_id, rp, &r_uid)?,
+        None => None,
+    };
+    let filemeta_cache = if reidentify_old_uid.is_some() {
+        None
+    } else {
+        filemeta_cache
+    };
 
     // ── Phase 1: Scan files ───────────────────────────────────────────────
     let _phase1_span = tracing::info_span!("index_phase_scan").entered();
@@ -1108,6 +1140,24 @@ where
 
     let _write_guard = acquire_write_guard()?;
 
+    // Re-identify prune: when a local repo previously indexed under a
+    // `file://<root_path>` identity is now indexed under a different
+    // identity (its git origin remote), the old file:// node is a stale
+    // duplicate of the same working tree. Prune it STRICTLY by uid — never
+    // by disk path — so unrelated repos can never be caught by this delete.
+    // Detected before the parse phase (see above) so the filemeta cache was
+    // already bypassed for this pass.
+    if let Some(old_uid) = &reidentify_old_uid {
+        tracing::info!(
+            old_uid,
+            new_uid = %r_uid,
+            root_path = root_path.unwrap_or(""),
+            url = repo_url,
+            "repo re-identified under its origin remote; pruning old file:// node by uid"
+        );
+        delete_repo_all_data(store, old_uid).context("delete_repo_all_data (re-identify prune)")?;
+    }
+
     // Insert the Repo node if it doesn't exist yet. The target SHA is recorded
     // only after every required graph write succeeds, so a later write failure
     // cannot make retry preparation think this commit is already indexed.
@@ -1120,8 +1170,17 @@ where
             staleness_commits_behind: 0,
             instance_id: instance_id.to_string(),
             name: name.map(String::from),
+            root_path: root_path.map(String::from),
         };
         store.insert_repo(&repo).context("insert_repo")?;
+    } else if let (Some(rp), Some(existing)) = (root_path, existing_repo.as_ref())
+        && existing.root_path.as_deref() != Some(rp)
+    {
+        // Keep the on-disk location current for pre-existing rows (old DBs
+        // that predate root_path, or a working tree that moved).
+        store
+            .update_repo_root_path(&r_uid, rp)
+            .context("update_repo_root_path")?;
     }
 
     // 2b. When re-indexing over an existing store (tiered detection is active
@@ -2752,10 +2811,36 @@ fn reresolve_affected_dependents(
 
 /// Delete all File nodes (and their symbols) that belong to a repo,
 /// then delete the Repo node itself.  Used before a forced full re-index.
+/// Re-identify detection, shared by the indexer and the code watcher so the
+/// two sites cannot drift: when a working tree at `root_path` is now being
+/// indexed under `new_uid` but a Repo row still exists under its legacy
+/// `file://<root_path>` identity, returns that old uid (the caller prunes it
+/// via [`delete_repo_all_data`] — strictly uid-keyed, never by disk path).
+/// Returns `None` when the identities coincide or no legacy row exists.
+pub(crate) fn reidentified_legacy_uid(
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    root_path: &str,
+    new_uid: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    let old_uid = repo_uid(instance_id, &format!("file://{root_path}"));
+    if old_uid != new_uid
+        && store
+            .lookup_repo(&old_uid)
+            .context("lookup_repo (re-identify detection)")?
+            .is_some()
+    {
+        Ok(Some(old_uid))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Delete every graph row belonging to `r_uid`.
 ///
 /// Uses two bulk DETACH DELETE queries (one for Symbol, one for File)
 /// instead of the previous per-file loop that issued O(2N) queries.
-fn delete_repo_all_data(
+pub(crate) fn delete_repo_all_data(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
 ) -> Result<(), anyhow::Error> {
@@ -2804,6 +2889,7 @@ fn full_index_fallback(
     let mut resolution_deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
 
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
+    let local_root = repo_path.display().to_string();
     let result = index_into_store(
         &reader,
         store,
@@ -2815,6 +2901,7 @@ fn full_index_fallback(
         Some(&mut parsed_cache),
         Some(&mut resolution_deps),
         name,
+        Some(&local_root),
     )?;
 
     // Evict stale cache entries for deleted/renamed files before saving.
@@ -2897,6 +2984,188 @@ function hello(name) { return "Hello " + name; }
         assert!(result.skipped_files.is_empty());
     }
 
+    /// A plain local index persists the working-tree location as
+    /// `root_path` on the Repo node, independent of the identity url.
+    #[test]
+    fn index_persists_root_path_on_repo_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/acme/demo", "abc123")
+                .unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].url, "https://example.com/acme/demo");
+        assert_eq!(
+            repos[0].root_path.as_deref(),
+            Some(src.display().to_string().as_str()),
+            "root_path must record the on-disk working tree"
+        );
+    }
+
+    /// Re-identify prune: a repo first indexed under its `file://` identity
+    /// and later re-indexed under its git-origin identity must end up as a
+    /// single Repo node — the old file:// node (same working tree, same
+    /// instance) is pruned strictly by uid.
+    #[test]
+    fn reindex_under_origin_identity_prunes_old_file_url_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&src);
+        let local_root = src.display().to_string();
+        let file_url = format!("file://{local_root}");
+
+        // 1. First index under the file:// identity (pre-origin behavior),
+        //    capturing the filemeta sidecar exactly like the CLI does.
+        let mut first_filemeta = FileMetaCache::new();
+        index_into_store(
+            &reader,
+            &store,
+            "test",
+            &file_url,
+            "sha-1",
+            None,
+            Some(&mut first_filemeta),
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .unwrap();
+        let old_uid = repo_uid("test", &file_url);
+        assert!(store.lookup_repo(&old_uid).unwrap().is_some());
+        assert!(
+            !first_filemeta.is_empty(),
+            "first pass must record filemeta entries"
+        );
+
+        // 2. Re-index the same working tree under its origin identity,
+        //    passing the sidecar from the first pass — the regression path:
+        //    files are unchanged on disk, so a trusted cache would skip all
+        //    writes under the new uid while the prune deletes the old copy.
+        let origin_url = "https://example.com/acme/demo.git";
+        index_into_store(
+            &reader,
+            &store,
+            "test",
+            origin_url,
+            "sha-1",
+            Some(&first_filemeta),
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .unwrap();
+
+        let new_uid = repo_uid("test", origin_url);
+        assert_ne!(new_uid, old_uid);
+        assert!(
+            store.lookup_repo(&old_uid).unwrap().is_none(),
+            "old file:// node must be pruned by uid"
+        );
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1, "exactly one Repo node must remain");
+        assert_eq!(repos[0].uid, new_uid);
+        assert_eq!(repos[0].url, origin_url);
+        assert_eq!(repos[0].root_path.as_deref(), Some(local_root.as_str()));
+
+        // The re-identified index is a cold index for the new uid: files and
+        // symbols MUST exist under it (the filemeta cache is bypassed).
+        let files = store.list_files_by_repo(&new_uid).unwrap();
+        assert!(
+            !files.is_empty(),
+            "files must be re-inserted under the new uid"
+        );
+        let symbols = store.symbol_names_by_repo(&new_uid).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "a"),
+            "symbol `a` must exist under the new uid, got {symbols:?}"
+        );
+    }
+
+    /// An unrelated repo (different working tree) must never be caught by
+    /// the re-identify prune, and a pre-existing row without `root_path`
+    /// gets it backfilled on the next index.
+    #[test]
+    fn reidentify_prune_leaves_unrelated_repos_and_backfills_root_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+
+        // Unrelated remote repo with no working tree.
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid("test", "https://example.com/other/unrelated"),
+                url: "https://example.com/other/unrelated".to_string(),
+                indexed_sha: "zzz".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        // Pre-migration row for THIS repo: origin identity, no root_path.
+        let origin_url = "https://example.com/acme/demo";
+        let r_uid = repo_uid("test", origin_url);
+        store
+            .insert_repo(&Repo {
+                uid: r_uid.clone(),
+                url: origin_url.to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let reader = crate::content_reader::FilesystemReader::new(&src);
+        let local_root = src.display().to_string();
+        index_into_store(
+            &reader,
+            &store,
+            "test",
+            origin_url,
+            "sha-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 2, "unrelated repo must survive the prune");
+        let this = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert_eq!(
+            this.root_path.as_deref(),
+            Some(local_root.as_str()),
+            "root_path must be backfilled on an existing row"
+        );
+        assert!(
+            store
+                .lookup_repo(&repo_uid("test", "https://example.com/other/unrelated"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn index_creates_call_edges_for_same_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2948,6 +3217,7 @@ function hello(name) { return "Hello " + name; }
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         index_into_store(
@@ -2956,6 +3226,7 @@ function hello(name) { return "Hello " + name; }
             "test",
             "https://example.com/web",
             "web-sha",
+            None,
             None,
             None,
             None,

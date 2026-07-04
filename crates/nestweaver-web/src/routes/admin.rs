@@ -217,14 +217,8 @@ pub async fn list_repos(
                     .symbol_names_by_repo(&r.uid)
                     .map(|v| v.len() as i64)
                     .unwrap_or(0);
-                let name = r.name.unwrap_or_else(|| {
-                    r.url
-                        .strip_prefix("file://")
-                        .unwrap_or(&r.url)
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&r.url)
-                        .to_string()
+                let name = r.name.clone().unwrap_or_else(|| {
+                    nestweaver_schema::repo_name(&r.url).unwrap_or_else(|| r.url.clone())
                 });
                 RepoInfo {
                     id: r.uid,

@@ -116,6 +116,7 @@ pub use backup::{
     RestoreResult, StagedBackup, backup_inspect, backup_list, backup_restore, backup_save,
     package_staged, stage_backup_from_store,
 };
+pub use bare_clone::read_origin_url;
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,

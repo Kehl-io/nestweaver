@@ -416,6 +416,7 @@ mod tests {
                 staleness_commits_behind: 0,
                 instance_id: "default".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
 

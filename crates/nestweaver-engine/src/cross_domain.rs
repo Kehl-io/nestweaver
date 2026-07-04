@@ -647,6 +647,7 @@ mod tests {
                 staleness_commits_behind: 0,
                 instance_id: "default".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
         let s_uid = symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1);
@@ -760,6 +761,7 @@ mod tests {
                 staleness_commits_behind: 0,
                 instance_id: "default".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
         let s_uid = symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1);

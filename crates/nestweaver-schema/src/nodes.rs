@@ -122,6 +122,35 @@ pub struct Repo {
     /// (e.g. `client`, `server`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Absolute filesystem path of the local working tree this repo was
+    /// indexed from, when one exists. Decoupled from `url`: `url` is the
+    /// repo's *identity* (git origin remote when available, else a
+    /// `file://` URL), while `root_path` is its on-disk *location*.
+    /// `None` for server-side repos indexed from bare clones (no local
+    /// working tree) and for rows written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+}
+
+impl Repo {
+    /// Best-effort local working-tree root for this repo.
+    ///
+    /// Compat shim for the identity/location decoupling: rows written
+    /// before `root_path` existed store `None` there but still carry a
+    /// `file://<path>` identity `url`, so falling back to stripping the
+    /// `file://` prefix keeps those rows behaving as local repos until
+    /// they are re-indexed. Remote-identity repos without a working tree
+    /// (`https://…` + `root_path: None`) correctly return `None` — the
+    /// prefix strip fails — so locality checks skip them.
+    ///
+    /// Consumers that need a disk path MUST use this helper instead of
+    /// stripping `file://` from `url` themselves.
+    pub fn local_root(&self) -> Option<&str> {
+        match self.root_path.as_deref() {
+            Some(p) if !p.is_empty() => Some(p),
+            _ => self.url.strip_prefix("file://"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,4 +364,49 @@ pub struct Contract {
     /// contracts are 1.0; code-derived contracts inherit the handler
     /// match confidence.
     pub confidence: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Repo;
+
+    fn repo(url: &str, root_path: Option<&str>) -> Repo {
+        Repo {
+            uid: "repo:test".to_string(),
+            url: url.to_string(),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: root_path.map(String::from),
+        }
+    }
+
+    #[test]
+    fn local_root_prefers_root_path_over_url() {
+        let r = repo("https://github.com/acme/demo.git", Some("/home/u/demo"));
+        assert_eq!(r.local_root(), Some("/home/u/demo"));
+        // root_path wins even when the url is also a file:// URL.
+        let r = repo("file:///elsewhere/demo", Some("/home/u/demo"));
+        assert_eq!(r.local_root(), Some("/home/u/demo"));
+    }
+
+    #[test]
+    fn local_root_falls_back_to_file_url_for_pre_migration_rows() {
+        // Old rows: file:// identity, root_path never written (None).
+        let r = repo("file:///home/u/demo", None);
+        assert_eq!(r.local_root(), Some("/home/u/demo"));
+        // '' from the column default behaves like None.
+        let r = repo("file:///home/u/demo", Some(""));
+        assert_eq!(r.local_root(), Some("/home/u/demo"));
+    }
+
+    #[test]
+    fn local_root_is_none_for_remote_identity_without_working_tree() {
+        // The data-loss guard: a server-side repo must never look local.
+        let r = repo("https://github.com/acme/demo.git", None);
+        assert_eq!(r.local_root(), None);
+        let r = repo("git@github.com:acme/demo.git", None);
+        assert_eq!(r.local_root(), None);
+    }
 }

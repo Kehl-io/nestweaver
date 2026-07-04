@@ -2996,7 +2996,11 @@ fn tool_brain_status(
             }));
             continue;
         }
-        let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+        // Disk checks only apply to repos with a known local working tree;
+        // remote-identity repos without one (root_path: None) are skipped.
+        let Some(path) = repo.local_root() else {
+            continue;
+        };
         let repo_path = std::path::Path::new(path);
         if !repo_path.exists() {
             staleness_warnings.push(json!({
@@ -3165,7 +3169,9 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         }
 
         let has_obsidian = path.join(".obsidian").is_dir();
-        let has_git = path.join(".git").is_dir();
+        // `.exists()`, not `.is_dir()`: in a git worktree `.git` is a FILE
+        // pointing at the real gitdir — consistent with every other guard.
+        let has_git = path.join(".git").exists();
         let has_any_md = walk_has_markdown(path);
 
         // Detection priority: Obsidian vault > markdown folder > git repo.
@@ -3211,7 +3217,12 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
 
         if has_git {
             let db_path = current_db_path(store)?;
-            let url = format!("file://{}", path.display());
+            // Identity: prefer the git origin remote when configured (used
+            // only as an identity string — never fetched); fall back to a
+            // file:// URL. The engine persists the disk location as
+            // `root_path` on the Repo node.
+            let url = nestweaver_engine::read_origin_url(path)
+                .unwrap_or_else(|_| format!("file://{}", path.display()));
             let result =
                 index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
             return Ok(json!({
@@ -3284,6 +3295,19 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         String::new()
     };
 
+    // When the target is a filesystem path, the repo it refers to may be
+    // identified by its git origin remote rather than a file:// URL — try
+    // that identity too (read from git config; never fetched).
+    let origin_target = std::fs::canonicalize(expand(&target))
+        .ok()
+        .filter(|p| p.join(".git").exists())
+        .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
+        .unwrap_or_default();
+    let canonical_path = canonical_target
+        .strip_prefix("file://")
+        .unwrap_or_default()
+        .to_string();
+
     let target_trimmed = target.trim_end_matches('/');
     let matched_repo: Vec<&nestweaver_schema::Repo> = repos
         .iter()
@@ -3293,6 +3317,10 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                 || r.name.as_deref() == Some(target_trimmed)
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
+                || (!origin_target.is_empty() && r_url == origin_target.trim_end_matches('/'))
+                || (!canonical_path.is_empty()
+                    && r.local_root().map(|p| p.trim_end_matches('/'))
+                        == Some(canonical_path.trim_end_matches('/')))
                 || r_url.ends_with(&format!("/{target_trimmed}"))
         })
         .collect();
@@ -4187,7 +4215,8 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     Ok(serde_json::to_value(&result)?)
 }
 
-/// Return the filesystem path of the first locally-indexed repo (file:// URL).
+/// Return the filesystem path of the first locally-indexed repo (a repo
+/// with a known local working tree — see [`nestweaver_schema::Repo::local_root`]).
 fn first_local_repo_path(store: &GraphStore) -> Option<String> {
     // Option return can't propagate; surface a DB error in the log rather than
     // silently reporting "no local repo".
@@ -4195,9 +4224,7 @@ fn first_local_repo_path(store: &GraphStore) -> Option<String> {
         tracing::warn!("first_local_repo_path: list_repos failed: {e}");
         Vec::new()
     });
-    repos
-        .iter()
-        .find_map(|r| r.url.strip_prefix("file://").map(|p| p.to_string()))
+    repos.iter().find_map(|r| r.local_root().map(String::from))
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
@@ -4288,8 +4315,8 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let mut any_stale = false;
 
     for repo in &repos {
-        // Try to determine current HEAD from the repo's URL.
-        let current_head = if let Some(path) = repo.url.strip_prefix("file://") {
+        // Local working tree → read HEAD from disk; otherwise ask the remote.
+        let current_head = if let Some(path) = repo.local_root() {
             get_git_head(path)
         } else {
             get_remote_head(&repo.url)
@@ -4298,7 +4325,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
         let is_valid_sha =
             repo.indexed_sha.len() == 40 && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-        let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+        let commits_behind = match (&current_head, repo.local_root()) {
             (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                 count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
             }
@@ -4609,14 +4636,13 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         })
         .ok_or_else(|| anyhow!("repo '{}' not found in graph", repo_name))?;
 
-    if !repo.url.starts_with("file://") {
+    let Some(repo_path) = repo.local_root() else {
         anyhow::bail!(
-            "brain_diff only works with locally-indexed repositories (file:// URLs); \
-             '{}' is not a local repo",
+            "brain_diff only works with locally-indexed repositories \
+             (repos with a local working tree); '{}' is not a local repo",
             repo.url
         );
-    }
-    let repo_path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+    };
 
     let base_sha = since_sha_arg.unwrap_or(&repo.indexed_sha);
 
@@ -6545,6 +6571,7 @@ mod server_mode_tests {
                 staleness_commits_behind: 1,
                 instance_id: "inst".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
 

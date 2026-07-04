@@ -150,4 +150,21 @@ mod tests {
         let b = effective_schema_hash(&core, "ext");
         assert_eq!(a, b);
     }
+
+    /// `root_path` predates the `Repo.root_path` field (it belongs to
+    /// `Vault`), so adding the field to `Repo` must NOT change the core
+    /// schema hash — no re-index is required.
+    #[test]
+    fn root_path_is_a_known_property_and_hash_is_stable() {
+        assert!(
+            NODE_PROPERTIES.contains(&"root_path"),
+            "root_path must be a member of NODE_PROPERTIES"
+        );
+        assert_eq!(
+            core_schema_hash(),
+            "6646465ab73216946bf3c5acd7e418e7ffeb4562d69631864acb8c5c4499a8de",
+            "core schema hash drifted — adding Repo.root_path must not change it; \
+             if the schema intentionally changed, update this pinned hash"
+        );
+    }
 }

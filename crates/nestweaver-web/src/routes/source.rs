@@ -36,8 +36,11 @@ pub async fn source(
     let repos = nestweaver_engine::list_repos(&state.store, None)?;
 
     for repo in &repos {
-        // Strip file:// prefix if present
-        let repo_root = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+        // Only repos with a known local working tree can serve source from
+        // disk; remote-identity repos without one are skipped.
+        let Some(repo_root) = repo.local_root() else {
+            continue;
+        };
 
         let full_path = std::path::Path::new(repo_root).join(&file);
 

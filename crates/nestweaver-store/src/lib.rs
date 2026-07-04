@@ -52,6 +52,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "inst-1".to_string(),
             name: None,
+            root_path: None,
         }
     }
 
@@ -112,6 +113,69 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].uid, "repo-1");
         assert_eq!(repos[0].url, "https://github.com/example/repo-1");
+    }
+
+    /// `root_path` round-trips through insert → list_repos/lookup_repo:
+    /// `Some(path)` survives, `None` stays `None` (stored as '' and mapped
+    /// back on read).
+    #[test]
+    fn repo_root_path_round_trips_some_and_none() {
+        let store = test_store();
+
+        let with_root = Repo {
+            root_path: Some("/home/u/demo".to_string()),
+            url: "https://github.com/acme/demo.git".to_string(),
+            ..make_repo("repo-local")
+        };
+        let without_root = make_repo("repo-remote");
+        store.insert_repo(&with_root).unwrap();
+        store.insert_repo(&without_root).unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        let local = repos.iter().find(|r| r.uid == "repo-local").unwrap();
+        let remote = repos.iter().find(|r| r.uid == "repo-remote").unwrap();
+        assert_eq!(local.root_path.as_deref(), Some("/home/u/demo"));
+        assert_eq!(remote.root_path, None);
+
+        let looked_up = store.lookup_repo("repo-local").unwrap().unwrap();
+        assert_eq!(looked_up.root_path.as_deref(), Some("/home/u/demo"));
+        let looked_up = store.lookup_repo("repo-remote").unwrap().unwrap();
+        assert_eq!(looked_up.root_path, None);
+    }
+
+    /// `update_repo_sha` re-creates the Repo node — it must carry
+    /// `root_path` over, not silently drop it.
+    #[test]
+    fn update_repo_sha_preserves_root_path() {
+        let store = test_store();
+        let repo = Repo {
+            root_path: Some("/home/u/demo".to_string()),
+            ..make_repo("repo-1")
+        };
+        store.insert_repo(&repo).unwrap();
+
+        store.update_repo_sha("repo-1", "def456").unwrap();
+
+        let r = store.lookup_repo("repo-1").unwrap().unwrap();
+        assert_eq!(r.indexed_sha, "def456");
+        assert_eq!(r.root_path.as_deref(), Some("/home/u/demo"));
+    }
+
+    /// `update_repo_root_path` sets only the disk location, leaving the
+    /// identity url and every other field untouched.
+    #[test]
+    fn update_repo_root_path_sets_location_only() {
+        let store = test_store();
+        store.insert_repo(&make_repo("repo-1")).unwrap();
+
+        store
+            .update_repo_root_path("repo-1", "/moved/here")
+            .unwrap();
+
+        let r = store.lookup_repo("repo-1").unwrap().unwrap();
+        assert_eq!(r.root_path.as_deref(), Some("/moved/here"));
+        assert_eq!(r.url, "https://github.com/example/repo-1");
+        assert_eq!(r.indexed_sha, "abc123");
     }
 
     #[test]
@@ -1675,6 +1739,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "ghost".to_string(),
             name: Some("ghost-a".to_string()),
+            root_path: None,
         };
         let ghost_repo_b = Repo {
             uid: "repo:ghost:bbbb".to_string(),
@@ -1683,6 +1748,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "ghost".to_string(),
             name: Some("ghost-b".to_string()),
+            root_path: None,
         };
         store.insert_repo(&ghost_repo_a).unwrap();
         store.insert_repo(&ghost_repo_b).unwrap();
@@ -1695,6 +1761,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "keep".to_string(),
             name: Some("keep-c".to_string()),
+            root_path: None,
         };
         store.insert_repo(&keep_repo).unwrap();
 

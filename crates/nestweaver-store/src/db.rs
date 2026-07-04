@@ -540,12 +540,16 @@ impl GraphStore {
                 staleness_commits_behind INT64, \
                 instance_id STRING, \
                 name STRING, \
+                root_path STRING, \
                 PRIMARY KEY(uid))",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
         // Migration: add `name` column to pre-existing Repo tables that lack it.
         let _ = conn.query("ALTER TABLE Repo ADD name STRING DEFAULT ''");
+        // Migration: add `root_path` column to pre-existing Repo tables that
+        // lack it. Empty string maps to `None` on read (see read.rs).
+        let _ = conn.query("ALTER TABLE Repo ADD root_path STRING DEFAULT ''");
 
         conn.query(
             "CREATE NODE TABLE IF NOT EXISTS File(\

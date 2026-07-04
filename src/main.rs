@@ -3026,6 +3026,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 String::new()
             };
 
+            // A path target may refer to a repo identified by its git origin
+            // remote rather than a file:// URL — try that identity and the
+            // stored root_path too (the origin URL is read from git config,
+            // never fetched).
+            let origin_target = std::fs::canonicalize(target_trimmed)
+                .ok()
+                .filter(|p| p.join(".git").exists())
+                .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
+                .unwrap_or_default();
+            let canonical_path = canonical_target
+                .strip_prefix("file://")
+                .unwrap_or_default()
+                .to_string();
+
             let matched: Vec<&nestweaver_schema::Repo> = repos
                 .iter()
                 .filter(|r| {
@@ -3034,6 +3048,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         || r.name.as_deref() == Some(target_trimmed)
                         || r_url == url_target
                         || r_url == canonical_target
+                        || (!origin_target.is_empty()
+                            && r_url == origin_target.trim_end_matches('/'))
+                        || (!canonical_path.is_empty()
+                            && r.local_root().map(|p| p.trim_end_matches('/'))
+                                == Some(canonical_path.trim_end_matches('/')))
                         || r_url.ends_with(&format!("/{target_trimmed}"))
                 })
                 .collect();
@@ -6036,16 +6055,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let repo_url = if let Some(url) = repo_url_override {
                 url
             } else {
-                let output = std::process::Command::new("git")
-                    .args(["remote", "get-url", "origin"])
-                    .current_dir(&repo_path)
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        String::from_utf8_lossy(&o.stdout).trim().to_string()
-                    }
-                    _ => format!("file://{}", repo_path.display()),
-                }
+                // Identity string only (never fetched); read via the
+                // SSRF-safe, timeout-guarded git wrapper.
+                nestweaver_engine::read_origin_url(&repo_path)
+                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
             };
 
             // Compute atomic changes — either from local working tree or from a diff range
@@ -7516,9 +7529,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let instance_id = instance.as_deref().unwrap_or("default");
 
-            let repo_url = format!("file://{}", repo_path.display())
-                .trim_end_matches('/')
-                .to_string();
+            // Identity: prefer the git origin remote when configured (used
+            // only as an identity string — never fetched); fall back to a
+            // file:// URL. The engine persists the disk location separately
+            // as root_path and prunes a prior file://-identified node for
+            // the same working tree by uid. Guard on `.git` at the indexed
+            // root: `git config` walks up to an enclosing repo, and a
+            // subdirectory index must not capture (and collide with) its
+            // parent repo's identity.
+            let repo_url = if repo_path.join(".git").exists() {
+                nestweaver_engine::read_origin_url(&repo_path)
+                    .unwrap_or_else(|_| format!("file://{}", repo_path.display()))
+            } else {
+                format!("file://{}", repo_path.display())
+            }
+            .trim_end_matches('/')
+            .to_string();
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));
@@ -9850,7 +9876,7 @@ fn run_brain(
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
-                let current_head = if let Some(path) = repo.url.strip_prefix("file://") {
+                let current_head = if let Some(path) = repo.local_root() {
                     std::process::Command::new("git")
                         .args(["-C", path, "rev-parse", "HEAD"])
                         .output()
@@ -9863,7 +9889,7 @@ fn run_brain(
 
                 let is_valid_sha = repo.indexed_sha.len() == 40
                     && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-                let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+                let commits_behind = match (&current_head, repo.local_root()) {
                     (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                         std::process::Command::new("git")
                             .args([
