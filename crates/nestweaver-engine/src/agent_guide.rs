@@ -777,6 +777,68 @@ fn render_legacy_tool_tables(out: &mut String) {
     );
 }
 
+/// One rendered Architecture bullet for a hub summary. Uses the structured
+/// `file_path` when present; older sidecar entries without one fall back to
+/// the bare name.
+fn hub_summary_line(s: &crate::summaries::Summary) -> String {
+    match &s.file_path {
+        Some(fp) => format!("- `{}` — {}", fp, s.target_name),
+        None => format!("- {}", s.target_name),
+    }
+}
+
+/// The Architecture hub bullets for the agent guide, served from the
+/// generation-gated summary sidecar when it is warm (avoiding the live hub
+/// scan), otherwise computed live and written back (best-effort) to warm the
+/// cache for the next caller. Returns an empty list when nothing is indexed.
+fn architecture_hub_lines(store: &GraphStore) -> Vec<String> {
+    use crate::summaries::{SummaryLevel, generate_summaries, load_summaries, save_summaries};
+
+    // Warm cache: generation gating in `load_summaries` guarantees these are
+    // never stale relative to the graph.
+    if let Some(db) = store.db_path()
+        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
+    {
+        let lines: Vec<String> = cached
+            .iter()
+            .filter(|s| s.level == SummaryLevel::Hub)
+            .take(10)
+            .map(hub_summary_line)
+            .collect();
+        if !lines.is_empty() {
+            return lines;
+        }
+    }
+
+    // Cold cache (missing sidecar, stale generation, or no hub entries):
+    // compute live, then best-effort warm the sidecar for subsequent callers
+    // (merging with entries at other levels, mirroring `get_summary`).
+    match generate_summaries(store, SummaryLevel::Hub) {
+        Ok(hub_summaries) if !hub_summaries.is_empty() => {
+            if let Some(db) = store.db_path() {
+                let generation = store.graph_generation();
+                let mut all: Vec<crate::summaries::Summary> = match load_summaries(db, generation) {
+                    Ok(Some(existing)) => existing
+                        .into_iter()
+                        .filter(|s| s.level != SummaryLevel::Hub)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                all.extend(hub_summaries.iter().cloned());
+                if let Err(e) = save_summaries(db, generation, &all) {
+                    tracing::warn!("agent guide: failed to warm summaries sidecar: {e}");
+                }
+            }
+            hub_summaries
+                .iter()
+                .take(10)
+                .map(hub_summary_line)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Generate CLAUDE.md content from the indexed graph.
 ///
 /// Returns a markdown string suitable for writing to `CLAUDE.md` at the
@@ -804,18 +866,19 @@ pub fn generate_claude_md_with_rules(
     out.push_str(&render_rules(rules));
 
     // ── Architecture section: top hub nodes by centrality ─────────────────
+    // Served from the generation-gated summary cache when warm; live scan
+    // (which also warms the cache) otherwise.
     out.push_str("## Architecture\n\n");
-    match crate::hubs::find_hub_nodes(store, 10) {
-        Ok(hubs) if !hubs.is_empty() => {
-            out.push_str("Key modules (by centrality):\n\n");
-            for hub in &hubs {
-                out.push_str(&format!("- `{}` — {}\n", hub.file_path, hub.name));
-            }
+    let hub_lines = architecture_hub_lines(store);
+    if hub_lines.is_empty() {
+        out.push_str("No symbols indexed yet.\n\n");
+    } else {
+        out.push_str("Key modules (by centrality):\n\n");
+        for line in &hub_lines {
+            out.push_str(line);
             out.push('\n');
         }
-        _ => {
-            out.push_str("No symbols indexed yet.\n\n");
-        }
+        out.push('\n');
     }
 
     // ── Code Intelligence section ─────────────────────────────────────────
@@ -1088,5 +1151,103 @@ mod tests {
         assert!(output.contains("brain_search"));
         assert!(output.contains("project_context"));
         assert!(output.contains("detect_changes"));
+    }
+
+    fn make_symbol(uid: &str, name: &str, file_path: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo-1".to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn make_edge(src: &str, tgt: &str) -> nestweaver_schema::ResolvedEdge {
+        nestweaver_schema::ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: tgt.to_string(),
+            edge_type: nestweaver_schema::EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn claude_md_architecture_served_from_warm_summary_cache() {
+        // Seed the sidecar with a hub whose name/file_path CANNOT come from a
+        // live scan (the store's graph is empty), then assert the seeded entry
+        // is rendered — proving the cache short-circuits the live scan.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("guide.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+
+        let seeded = crate::summaries::Summary {
+            level: crate::summaries::SummaryLevel::Hub,
+            target_uid: "sym:seeded".to_string(),
+            target_name: "seeded_hub_fn".to_string(),
+            content: "seeded_hub_fn (src/seeded.rs) — hub [bridge]: 5 callers, 5 callees (total degree 10)".to_string(),
+            token_estimate: 20,
+            file_path: Some("src/seeded.rs".to_string()),
+        };
+        crate::summaries::save_summaries(&db_path, store.graph_generation(), &[seeded]).unwrap();
+
+        let output = generate_claude_md(&store, None).unwrap();
+        assert!(
+            output.contains("- `src/seeded.rs` — seeded_hub_fn"),
+            "seeded cache entry must be rendered without a live scan:\n{output}"
+        );
+        assert!(!output.contains("No symbols indexed yet."));
+    }
+
+    #[test]
+    fn claude_md_architecture_cold_cache_scans_live_and_warms_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("guide.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+
+        // Star topology: hub calls A..D, so "hub_fn" is the top hub.
+        store
+            .insert_symbol(&make_symbol("hub", "hub_fn", "src/hub.rs"))
+            .unwrap();
+        for name in ["A", "B", "C", "D"] {
+            store
+                .insert_symbol(&make_symbol(name, &format!("fn_{name}"), "src/leaf.rs"))
+                .unwrap();
+            store.insert_edge(&make_edge("hub", name)).unwrap();
+        }
+
+        // No sidecar exists yet → live scan path.
+        let output = generate_claude_md(&store, None).unwrap();
+        assert!(
+            output.contains("- `src/hub.rs` — hub_fn"),
+            "cold cache must still render live hubs:\n{output}"
+        );
+
+        // The live path must have warmed the sidecar with hub-level entries.
+        let cached = crate::summaries::load_summaries(&db_path, store.graph_generation())
+            .unwrap()
+            .expect("sidecar should be warmed after a cold-cache guide render");
+        assert!(
+            cached.iter().any(|s| {
+                s.level == crate::summaries::SummaryLevel::Hub
+                    && s.file_path.as_deref() == Some("src/hub.rs")
+            }),
+            "warmed sidecar must contain the hub with its structured file_path"
+        );
     }
 }

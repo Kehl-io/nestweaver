@@ -67,6 +67,12 @@ pub struct Summary {
     pub content: String,
     /// Estimated token count (chars / 4).
     pub token_estimate: usize,
+    /// Source file path of the summarized target. Currently populated only
+    /// for `Hub` summaries (so consumers like the agent guide can render the
+    /// path without re-parsing `content`); `None` for other levels and for
+    /// sidecars written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 /// Persisted collection of summaries.
@@ -131,6 +137,7 @@ fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
                 target_name: h.name.clone(),
                 content,
                 token_estimate,
+                file_path: Some(h.file_path.clone()),
             }
         })
         .collect();
@@ -172,6 +179,7 @@ fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: sym.name.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -259,6 +267,7 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: file_path.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -383,6 +392,7 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: community.name.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -502,6 +512,7 @@ mod tests {
                 target_name: "fn_a".to_string(),
                 content: "x".repeat(40), // 10 tokens
                 token_estimate: 10,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -509,6 +520,7 @@ mod tests {
                 target_name: "fn_b".to_string(),
                 content: "y".repeat(40),
                 token_estimate: 10,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -516,6 +528,7 @@ mod tests {
                 target_name: "fn_c".to_string(),
                 content: "z".repeat(40),
                 token_estimate: 10,
+                file_path: None,
             },
         ];
 
@@ -533,6 +546,7 @@ mod tests {
             target_name: "fn_a".to_string(),
             content: "x".repeat(40),
             token_estimate: 10,
+            file_path: None,
         }];
 
         let result = truncate_to_budget(&summaries, 0);
@@ -548,6 +562,7 @@ mod tests {
                 target_name: "src/auth.rs".to_string(),
                 content: "auth stuff".to_string(),
                 token_estimate: 3,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::File,
@@ -555,6 +570,7 @@ mod tests {
                 target_name: "src/main.rs".to_string(),
                 content: "main stuff".to_string(),
                 token_estimate: 3,
+                file_path: None,
             },
         ];
 
@@ -572,6 +588,7 @@ mod tests {
                 target_name: "a".to_string(),
                 content: "line one".to_string(),
                 token_estimate: 2,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -579,6 +596,7 @@ mod tests {
                 target_name: "b".to_string(),
                 content: "line two".to_string(),
                 token_estimate: 2,
+                file_path: None,
             },
         ];
 
@@ -692,6 +710,7 @@ mod tests {
             content: "src/main.rs: exports 1 symbols: main (Function) | imports from: []"
                 .to_string(),
             token_estimate: 17,
+            file_path: None,
         }];
 
         save_summaries(&db_path, 1, &summaries).unwrap();
@@ -711,6 +730,7 @@ mod tests {
             target_name: "f".to_string(),
             content: "c".to_string(),
             token_estimate: 1,
+            file_path: None,
         }];
 
         save_summaries(&db_path, 1, &summaries).unwrap();
@@ -764,6 +784,7 @@ mod tests {
             target_name: "src/main.rs".to_string(),
             content: "file summary".to_string(),
             token_estimate: 5,
+            file_path: None,
         }];
         let symbol_summaries = [Summary {
             level: SummaryLevel::Symbol,
@@ -771,6 +792,7 @@ mod tests {
             target_name: "main".to_string(),
             content: "symbol summary".to_string(),
             token_estimate: 5,
+            file_path: None,
         }];
 
         // Save file-level summaries.
