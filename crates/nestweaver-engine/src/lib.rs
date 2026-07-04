@@ -151,7 +151,9 @@ pub use cross_domain::{
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
-    detect_dead_code_with_confidence, detect_dead_code_with_manifests,
+    detect_dead_code_cancellable, detect_dead_code_with_confidence,
+    detect_dead_code_with_confidence_cancellable, detect_dead_code_with_manifests,
+    detect_dead_code_with_manifests_cancellable,
 };
 pub use eval::{
     EvalComparison, EvalReport, JudgedQuery, PerQueryRow, compare_reports, load_judged_queries,

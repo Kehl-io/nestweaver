@@ -794,9 +794,14 @@ async fn handle_mcp(
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
-            // Wrap in a timeout to match the gRPC safeguard behaviour.
+            // Wrap in a timeout to match the gRPC safeguard behaviour. The
+            // cancel flag is shared with the blocking dispatch so a timeout
+            // doesn't just abandon the await — cancellable walks (impact,
+            // dead_code, flow_trace, vector search) observe the flag and stop.
             let timeout = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
             let tool_name = name.clone();
+            let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dispatch_cancel = std::sync::Arc::clone(&cancel_flag);
             let result = tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
@@ -809,12 +814,13 @@ async fn handle_mcp(
                     // return empty bodies.
                     tools::set_server_mode(server_mode);
 
-                    tools::dispatch(
+                    tools::dispatch_cancellable(
                         &store,
                         tantivy.as_deref(),
                         &tool_name,
                         arguments,
                         embed_arc.as_deref(),
+                        Some(&dispatch_cancel),
                     )
                 }),
             )
@@ -843,6 +849,10 @@ async fn handle_mcp(
                     "result": tools::wrap_tool_error(&format!("dispatch panicked: {e}")),
                 }),
                 Err(_elapsed) => {
+                    // Trip the shared flag so the still-running blocking walk
+                    // stops cooperatively instead of burning a blocking thread
+                    // to completion after the response has already been sent.
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
                     tracing::warn!(tool = %name, timeout_secs = DEFAULT_TOOL_TIMEOUT_SECS, "MCP tool dispatch timed out");
                     json!({
                         "jsonrpc": "2.0",

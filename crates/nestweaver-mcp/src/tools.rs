@@ -16,12 +16,12 @@ use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
     build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
-    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
-    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, search_symbols,
-    tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
+    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries, get_all_properties,
+    get_last_indexed_at, investigate, investigate_expand, investigate_hydrate, load_alias_sidecar,
+    load_clusters, load_extensions, memory_consolidate, memory_lint, memory_related,
+    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
+    render_text, search_symbols, tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::{GraphStore, TantivyIndex};
@@ -313,9 +313,9 @@ fn dispatch_uncached(
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
-        "brain_impact" => tool_brain_impact(store, args),
+        "brain_impact" => tool_brain_impact(store, args, cancel),
         "brain_guide" => tool_brain_guide(store, args),
-        "flow_trace" => tool_flow_trace(store, args),
+        "flow_trace" => tool_flow_trace(store, args, cancel),
         "detect_changes" => tool_detect_changes(store, args),
         "clusters" => tool_clusters(store, args),
         "stale_check" => tool_stale_check(store),
@@ -323,7 +323,7 @@ fn dispatch_uncached(
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
         "project_context" => tool_project_context(store, tantivy, args, embed_model, cancel),
-        "dead_code" => tool_dead_code(store, args),
+        "dead_code" => tool_dead_code(store, args, cancel),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
@@ -3704,7 +3704,11 @@ fn tool_schema_brain_impact() -> Value {
     })
 }
 
-fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_brain_impact(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
         .and_then(|v| v.as_str())
@@ -3758,7 +3762,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         }
     };
 
-    let nodes = store.impact(&uid, depth, 0.0)?;
+    let nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
     let total = nodes.len();
 
     let rows: Vec<Value> = nodes
@@ -3842,7 +3846,11 @@ fn tool_schema_flow_trace() -> Value {
     })
 }
 
-fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_flow_trace(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
         .and_then(|v| v.as_str())
@@ -3863,7 +3871,11 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     let mut visited = HashSet::new();
     visited.insert(root.uid.clone());
 
-    let opts = FlowTraceOpts { max_depth, concise };
+    let opts = FlowTraceOpts {
+        max_depth,
+        concise,
+        cancel,
+    };
 
     // Classes don't have CALLS edges — only their methods do. When the root
     // symbol is a class, expand to its methods and return a flow tree per method.
@@ -3892,7 +3904,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                         v.insert(s.uid.clone());
                         build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
                     })
-                    .collect()
+                    .collect::<Result<Vec<Value>, _>>()?
             } else {
                 // Fallback: line-range heuristic excluding methods inside nested classes.
                 let file_symbols = store
@@ -3925,7 +3937,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                         v.insert(s.uid.clone());
                         build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
                     })
-                    .collect()
+                    .collect::<Result<Vec<Value>, _>>()?
             };
 
             return Ok(json!({
@@ -3947,7 +3959,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         0,
         &mut visited,
         &opts,
-    );
+    )?;
 
     Ok(json!({
         "root_uid": root.uid,
@@ -3959,9 +3971,12 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 
 /// Configuration for `build_flow_tree` to keep the argument count under
 /// the clippy `too_many_arguments` threshold.
-struct FlowTraceOpts {
+struct FlowTraceOpts<'a> {
     max_depth: usize,
     concise: bool,
+    /// Cooperative cancellation flag, checked once per recursion level. See
+    /// [`nestweaver_store::StoreError::Cancelled`] for the contract.
+    cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn build_flow_tree(
@@ -3971,8 +3986,20 @@ fn build_flow_tree(
     file_path: &str,
     depth: usize,
     visited: &mut HashSet<String>,
-    opts: &FlowTraceOpts,
-) -> Value {
+    opts: &FlowTraceOpts<'_>,
+) -> Result<Value, anyhow::Error> {
+    if opts
+        .cancel
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        // A cancelled trace is incomplete — propagate the store's typed
+        // cancellation error so the boundary never serves (or caches) a
+        // truncated tree as a real answer.
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+
     let mut children = Vec::new();
 
     if depth < opts.max_depth
@@ -3991,16 +4018,16 @@ fn build_flow_tree(
                 depth + 1,
                 visited,
                 opts,
-            );
+            )?;
             children.push(child);
         }
     }
 
     if opts.concise {
-        json!({
+        Ok(json!({
             "name": name,
             "children": children,
-        })
+        }))
     } else {
         // Look up repo_uid and canonical_id for boundary detection.
         let (repo_uid, canonical_id) = store
@@ -4013,7 +4040,7 @@ fn build_flow_tree(
                 )
             })
             .unwrap_or_default();
-        json!({
+        Ok(json!({
             "uid": uid,
             "name": name,
             "file_path": file_path,
@@ -4021,7 +4048,7 @@ fn build_flow_tree(
             "repo_uid": repo_uid,
             "canonical_id": canonical_id,
             "children": children,
-        })
+        }))
     }
 }
 
@@ -5295,7 +5322,11 @@ fn tool_schema_dead_code() -> Value {
     })
 }
 
-fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_dead_code(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let min_conf_str = args
         .get("min_confidence")
         .and_then(|v| v.as_str())
@@ -5304,7 +5335,7 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
         DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
     let concise = is_concise(&args);
 
-    let result = detect_dead_code(store).context("detect_dead_code")?;
+    let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
     let filtered: Vec<Value> = result
         .unreachable_symbols
@@ -7019,6 +7050,39 @@ mod cache_dispatch_tests {
             1,
             "recompute must be a MISS, not a cached-empty HIT"
         );
+    }
+
+    /// A pre-tripped cancel flag must make the flow_trace recursion return
+    /// `Cancelled` at its first level — never a truncated Ok tree.
+    #[test]
+    fn flow_trace_cancellable_bails_when_flag_is_set() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "symbol": "greet" });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = dispatch_cancellable(
+            &store,
+            None,
+            "flow_trace",
+            args.clone(),
+            None,
+            Some(&cancel),
+        );
+        let err =
+            cancelled.expect_err("a cancelled flow_trace must return Err, not a truncated tree");
+        assert!(
+            err.downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "the error must be StoreError::Cancelled, got: {err:#}"
+        );
+
+        // Untripped flag: the trace completes as before.
+        let untripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ok = dispatch_cancellable(&store, None, "flow_trace", args, None, Some(&untripped));
+        assert!(ok.is_ok(), "uncancelled flow_trace must succeed");
     }
 }
 
