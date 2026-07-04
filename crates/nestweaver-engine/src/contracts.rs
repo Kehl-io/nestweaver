@@ -654,11 +654,39 @@ pub fn compute_drift(
 /// the rest are **code-derived**. A declared contract with no incident
 /// `IMPLEMENTS_CONTRACT` edge is *declared-not-implemented*; a code-derived
 /// contract is *implemented-not-declared*.
+/// Resolve a repo filter (an exact repo UID **or** a case-insensitive display
+/// name) to its repo UID. `list_contracts` filters by exact UID, and repo UIDs
+/// are hashed — so an MCP client passing the natural human name (`payments-svc`)
+/// would match nothing and get a false "clean" report. Resolve names here so the
+/// MCP and CLI front-ends agree. An unmatched value is passed through unchanged
+/// (an explicit unknown UID still yields an empty result, as before).
+fn resolve_repo_uid(
+    store: &nestweaver_store::GraphStore,
+    filter: Option<&str>,
+) -> Result<Option<String>, nestweaver_store::StoreError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let repos = store.list_repos(None)?;
+    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
+        return Ok(Some(r.uid.clone()));
+    }
+    let needle = filter.to_lowercase();
+    if let Some(r) = repos
+        .iter()
+        .find(|r| crate::repo_display_name(r).to_lowercase() == needle)
+    {
+        return Ok(Some(r.uid.clone()));
+    }
+    Ok(Some(filter.to_string()))
+}
+
 pub fn drift_for_store(
     store: &nestweaver_store::GraphStore,
     repo_uid: Option<&str>,
 ) -> Result<DriftReport, nestweaver_store::StoreError> {
-    let all = store.list_contracts(repo_uid)?;
+    let repo_uid = resolve_repo_uid(store, repo_uid)?;
+    let all = store.list_contracts(repo_uid.as_deref())?;
     let implemented: std::collections::HashSet<String> = store
         .list_implemented_contract_uids()?
         .into_iter()

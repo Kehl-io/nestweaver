@@ -190,6 +190,14 @@ impl EmbeddingIndex {
                 if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                     return (uid.clone(), f64::NEG_INFINITY);
                 }
+                // Exclude any stored vector whose dimension differs from the
+                // query's. `.zip()` would otherwise truncate to the shorter and
+                // return a plausible-but-wrong similarity (dot over a prefix,
+                // divided by the full query norm) — silently corrupting rankings
+                // when the index was built with a different embedding model.
+                if emb.len() != query_vec.len() {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
                 // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
                 let dot: f64 = emb
                     .iter()
@@ -253,6 +261,11 @@ impl EmbeddingIndex {
                 None => true,
             })
             .map(|(uid, emb)| {
+                // See vector_search_cancellable: a dimension mismatch must be
+                // excluded, not silently truncated by `.zip()`.
+                if emb.len() != query_vec.len() {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
                 let dot: f64 = emb
                     .iter()
                     .zip(query_vec.iter())
@@ -445,6 +458,27 @@ mod tests {
     fn cosine_similarity_empty_returns_zero() {
         let s = cosine_similarity(&[], &[]);
         assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn vector_search_excludes_dimension_mismatched_vectors() {
+        // Index built with a different model (dim 3); query is dim 2. Before the
+        // guard, `.zip()` truncated and returned a plausible-but-wrong score.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:right", vec![1.0_f32, 0.0, 0.0]);
+        idx.add("sym:wrongdim", vec![1.0_f32, 0.0]); // dim 2, mismatched vs a dim-3 query
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let results = idx.vector_search(&query, 10);
+        // The matching-dim vector scores ~1.0; the mismatched one is excluded
+        // (NEG_INFINITY), so it never ranks above a real result.
+        let right = results.iter().find(|(u, _)| u == "sym:right").unwrap();
+        assert!((right.1 - 1.0).abs() < 1e-6, "got {}", right.1);
+        let wrong = results.iter().find(|(u, _)| u == "sym:wrongdim").unwrap();
+        assert!(
+            wrong.1 == f64::NEG_INFINITY,
+            "mismatched-dim vector must be excluded, got {}",
+            wrong.1
+        );
     }
 
     #[test]
