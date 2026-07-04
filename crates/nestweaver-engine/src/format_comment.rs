@@ -473,6 +473,65 @@ pub async fn post_github_comment(
     Ok(())
 }
 
+/// Max attempts for a transient-failure retry when listing comments.
+const LIST_MAX_ATTEMPTS: u32 = 3;
+/// Generous page ceiling. Hitting it is treated as an error (not "no marker
+/// found") so we never post a duplicate comment merely because we gave up
+/// scanning a very active PR/MR.
+const LIST_MAX_PAGES: u32 = 100;
+
+/// Whether an HTTP status warrants a retry. GitHub signals secondary rate
+/// limits with 403 (and 429); GitLab uses 429. 5xx are transient server errors.
+fn is_transient_list_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status.is_server_error()
+}
+
+/// Parse a `Retry-After` header in delta-seconds form.
+fn retry_after_delay(resp: &reqwest::Response) -> Option<std::time::Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+}
+
+/// Send a comment-list GET with bounded retry on transient failures.
+///
+/// Returns the successful response, or an `Err` if the request keeps failing.
+/// Callers MUST propagate that error rather than treating it as "no existing
+/// comment" — otherwise a transient outage produces a duplicate comment on
+/// every retry of the CI job.
+async fn send_list_request<F>(build: F) -> Result<reqwest::Response, anyhow::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 1u32;
+    loop {
+        let resp = build().send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        if is_transient_list_status(status) && attempt < LIST_MAX_ATTEMPTS {
+            let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1))
+            });
+            tracing::warn!(%status, attempt, ?delay, "listing comments failed; retrying");
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            continue;
+        }
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "listing comments failed ({}): {}; refusing to create a possibly-duplicate comment",
+            status,
+            text.trim()
+        );
+    }
+}
+
 /// Search GitHub PR comments for one containing the marker string.
 async fn find_github_comment(
     client: &reqwest::Client,
@@ -483,19 +542,15 @@ async fn find_github_comment(
     let mut page = 1u32;
     loop {
         let paged_url = format!("{}?per_page=100&page={}", url, page);
-        let resp = client
-            .get(&paged_url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "nestweaver-cli")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            // If we can't list comments, just create a new one
-            return Ok(None);
-        }
+        let resp = send_list_request(|| {
+            client
+                .get(&paged_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "nestweaver-cli")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        })
+        .await?;
 
         let comments: Vec<serde_json::Value> = resp.json().await?;
         if comments.is_empty() {
@@ -512,8 +567,12 @@ async fn find_github_comment(
         }
 
         page += 1;
-        if page > 10 {
-            break; // Safety limit
+        if page > LIST_MAX_PAGES {
+            anyhow::bail!(
+                "scanned {} GitHub comment pages without a definitive result; \
+                 refusing to create a possibly-duplicate comment",
+                LIST_MAX_PAGES
+            );
         }
     }
 
@@ -585,15 +644,7 @@ async fn find_gitlab_note(
     let mut page = 1u32;
     loop {
         let paged_url = format!("{}?per_page=100&page={}", url, page);
-        let resp = client
-            .get(&paged_url)
-            .header("PRIVATE-TOKEN", token)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
+        let resp = send_list_request(|| client.get(&paged_url).header("PRIVATE-TOKEN", token)).await?;
 
         let notes: Vec<serde_json::Value> = resp.json().await?;
         if notes.is_empty() {
@@ -610,8 +661,12 @@ async fn find_gitlab_note(
         }
 
         page += 1;
-        if page > 10 {
-            break;
+        if page > LIST_MAX_PAGES {
+            anyhow::bail!(
+                "scanned {} GitLab note pages without a definitive result; \
+                 refusing to create a possibly-duplicate comment",
+                LIST_MAX_PAGES
+            );
         }
     }
 
@@ -982,5 +1037,90 @@ mod tests {
         assert!(md.contains("Impact analysis did not complete"));
         assert!(md.contains("server_unavailable"));
         assert!(!md.contains("No cross-repo impact detected"));
+    }
+
+    // --- comment dedup: list-failure handling ------------------------------
+    //
+    // A transient list failure must surface as `Err`, never `Ok(None)` — the
+    // latter drives the "create a new comment" path and duplicates the sticky
+    // comment on every CI retry.
+
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn find_github_comment_errors_on_transient_list_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/comments", server.uri());
+        let res = find_github_comment(&client, &url, "tok", "<!-- marker -->").await;
+        assert!(
+            res.is_err(),
+            "a 500 while listing must be an error, not Ok(None): {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_gitlab_note_errors_on_transient_list_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/notes"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/notes", server.uri());
+        let res = find_gitlab_note(&client, &url, "tok", "<!-- marker -->").await;
+        assert!(res.is_err(), "a 429 while listing must be an error: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn find_github_comment_none_on_empty_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/comments", server.uri());
+        let res = find_github_comment(&client, &url, "tok", "<!-- marker -->")
+            .await
+            .unwrap();
+        assert_eq!(res, None, "empty list is safe to create against");
+    }
+
+    #[tokio::test]
+    async fn find_github_comment_finds_marker_on_second_page() {
+        let server = MockServer::start().await;
+        // Page 1: one non-matching comment (non-empty → paginate to page 2).
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([{ "id": 1, "body": "unrelated" }]),
+            ))
+            .mount(&server)
+            .await;
+        // Page 2: the marked comment.
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([{ "id": 42, "body": "<!-- marker -->\nhi" }]),
+            ))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/comments", server.uri());
+        let res = find_github_comment(&client, &url, "tok", "<!-- marker -->")
+            .await
+            .unwrap();
+        assert_eq!(res, Some(42), "must scan beyond page 1 to find the marker");
     }
 }
