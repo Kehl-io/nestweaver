@@ -762,6 +762,14 @@ pub fn drift_for_store(
 // (depth-capped for cycles). Non-object / composed (oneOf/allOf) schemas are
 // treated opaquely (empty field set), a conservative choice that avoids false
 // breakage.
+//
+// Known limitations (top-level fields only, by design — keeps verdicts trustworthy
+// rather than clever): nested-object and array-item field changes are NOT recursed
+// (a false negative — conservative), and a property's type is a coarse name (a
+// `$ref` is named by its target), so refactoring an inline object into a named
+// `$ref` of the same shape reads as a type change (a benign false positive a human
+// reviews). It is not a full OpenAPI diff engine — it catches the common,
+// high-value top-level breaks.
 
 /// Severity of a spec change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
