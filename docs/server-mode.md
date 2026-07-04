@@ -578,11 +578,35 @@ The output reports the instance ID, version, mode (`server`/`daemon`, plus `(dra
 
 ### docker-compose.yml
 
+A non-loopback bind (`0.0.0.0`) is rejected at startup without TLS
+(`validate_bind_security`), so the compose file provisions self-signed certs via
+a one-shot `init-tls` service before the server starts. For production, swap this
+for your own PKI or terminate TLS at a reverse proxy and bind the daemon to
+`127.0.0.1`.
+
 ```yaml
 services:
+  # One-shot: generate self-signed TLS certs into the shared volume. Idempotent —
+  # only generates when absent, so restarts reuse the same cert.
+  init-tls:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /data/nestweaver/tls/server.pem ]; then
+          nestweaver server init-tls \
+            --output-dir /data/nestweaver/tls \
+            --san localhost --san nestweaver --san 127.0.0.1
+        fi
+    volumes:
+      - nestweaver-data:/data/nestweaver
+
   nestweaver:
     build: .
     # image: ghcr.io/kehl-io/nestweaver:latest  # when published
+    depends_on:
+      init-tls:
+        condition: service_completed_successfully
     ports:
       - "9378:9378"   # gRPC
       - "9379:9379"   # MCP-over-HTTP + webhook + admin API
@@ -598,6 +622,8 @@ services:
         "daemon", "run",
         "--server",
         "--bind", "0.0.0.0:9378",
+        "--tls-cert", "/data/nestweaver/tls/server.pem",
+        "--tls-key", "/data/nestweaver/tls/server-key.pem",
         "--db", "/data/nestweaver/brain.lbug",
         "--config", "/etc/nestweaver/instance.toml"
       ]

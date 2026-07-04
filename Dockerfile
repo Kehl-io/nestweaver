@@ -13,6 +13,9 @@ VOLUME /data
 # 9377 web UI, 9378 gRPC, 9379 MCP-over-HTTP + webhook + admin + Prometheus metrics
 EXPOSE 9377 9378 9379
 ENTRYPOINT ["nestweaver"]
-# Argument order matches docker-compose.yml. (`--db` is a global flag on the
-# daemon command, so it is accepted before or after `run`.)
-CMD ["daemon", "run", "--server", "--bind", "0.0.0.0:9378", "--db", "/data/nestweaver/brain.lbug", "--config", "/etc/nestweaver/instance.toml"]
+# Default CMD binds loopback so a bare `docker run` boots. A non-loopback bind
+# (0.0.0.0) is rejected at startup without TLS (validate_bind_security), so for a
+# network-reachable server use docker-compose.yml — it provisions certs via the
+# init-tls service and passes --tls-cert/--tls-key — or override this CMD with
+# your own --bind 0.0.0.0 + --tls-cert/--tls-key.
+CMD ["daemon", "run", "--server", "--bind", "127.0.0.1:9378", "--db", "/data/nestweaver/brain.lbug", "--config", "/etc/nestweaver/instance.toml"]
