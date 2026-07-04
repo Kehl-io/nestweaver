@@ -10,7 +10,9 @@ use std::process::Command as StdCommand;
 use hmac::{Hmac, KeyInit, Mac};
 use nestweaver_client::DaemonClient;
 use nestweaver_client::discovery::{RoutingMode, UpstreamConfig};
-use nestweaver_client::hybrid::{HybridClient, TraceBoundary, flow_trace_with_stitching};
+use nestweaver_client::hybrid::{
+    HybridClient, TraceBoundary, detect_boundaries_in_trace, flow_trace_with_stitching,
+};
 use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{BackupRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest};
@@ -1982,6 +1984,177 @@ async fn hybrid_flow_trace_continue_stitches_server_spans() {
     assert!(
         sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
         "stitched flow_trace must report both 'local' and 'server' sources; got {sources:?}"
+    );
+}
+
+/// Stronger sibling of `hybrid_flow_trace_continue_stitches_server_spans`:
+/// two GENUINELY DISTINCT repos and EMPTY explicit boundaries, so the
+/// cross-repo boundary must be AUTO-detected by `detect_boundaries_in_trace`.
+///
+/// Setup: the `caller` repo (entryfn -> midfn) is indexed only into the local
+/// DB; the `callee` repo (remotefn -> remotehelper) is indexed only into the
+/// server DB. The cross-repo linker's output is simulated by copying the
+/// callee's `remotefn` Symbol verbatim into the local DB (preserving its
+/// foreign `repo_uid` and real `canonical_id` byte-for-byte — canonical_ids
+/// embed a repo-URL hash, so recomputing would break cross-boundary matching)
+/// with NO outgoing CALLS edges, plus a `CROSS_REPO_LINK` midfn -> stub.
+/// That makes the stub satisfy every auto-detection condition: a leaf, a
+/// non-empty `repo_uid` different from the trace root's, a non-empty
+/// `canonical_id`, and a `repo_uid` absent from the local daemon's repo set.
+///
+/// `flow_trace_with_stitching` is called with `&[]` boundaries; the stitched
+/// result must contain a `server:server` span AND `remotehelper` — the server
+/// resolved the boundary via `symbol_by_canonical_id` and continued into the
+/// callee's REAL call graph, which the local index has never seen.
+#[tokio::test]
+async fn hybrid_flow_trace_auto_detects_cross_repo_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Two distinct repos => distinct repo URLs => distinct repo_uids and
+    // distinct canonical_id repo-hashes.
+    let caller = dir.path().join("caller");
+    write_repo_files(
+        &caller,
+        &[(
+            "main.js",
+            "function entryfn(x) { return midfn(x); }\n\
+             function midfn(y) { return y; }",
+        )],
+    );
+    let callee = dir.path().join("callee");
+    write_repo_files(
+        &callee,
+        &[(
+            "lib.js",
+            "function remotefn(x) { return remotehelper(x); }\n\
+             function remotehelper(y) { return y + 1; }",
+        )],
+    );
+
+    let db_server = dir.path().join("server").join("server.lbug");
+    let db_local = dir.path().join("local").join("local.lbug");
+    index_repo(&callee, &db_server);
+    index_repo(&caller, &db_local);
+
+    // All direct GraphStore access happens strictly BEFORE any daemon serves
+    // these DBs (the daemon is the sole writer once running). The block scopes
+    // the store handles so they drop before the ServerGuards start.
+    let local_repo_uids: std::collections::HashSet<String> = {
+        // Read the REAL callee Symbol from the server DB — its canonical_id
+        // and repo_uid must cross the boundary byte-for-byte.
+        let server_store =
+            nestweaver_store::GraphStore::open_read_only(&db_server).expect("open db_server");
+        let remotefn = server_store
+            .lookup_symbols_by_name("remotefn")
+            .expect("lookup remotefn")
+            .into_iter()
+            .next()
+            .expect("server DB must contain remotefn");
+        assert!(
+            remotefn
+                .canonical_id
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "indexed remotefn must carry a non-empty canonical_id; got {remotefn:?}"
+        );
+        drop(server_store);
+
+        let local_store = nestweaver_store::GraphStore::open(&db_local).expect("open db_local");
+        let midfn = local_store
+            .lookup_symbols_by_name("midfn")
+            .expect("lookup midfn")
+            .into_iter()
+            .next()
+            .expect("local DB must contain midfn");
+        assert_ne!(
+            midfn.repo_uid, remotefn.repo_uid,
+            "the two fixture repos must be genuinely distinct"
+        );
+
+        // Inject the unresolved cross-repo stub: the callee Symbol copied
+        // verbatim (foreign repo_uid + real canonical_id, no outgoing CALLS
+        // edges => a leaf in the local trace), linked from midfn.
+        local_store.insert_symbol(&remotefn).expect("insert stub");
+        local_store
+            .insert_cross_repo_link(&midfn.uid, &remotefn.uid, 0.9, "shared-symbol")
+            .expect("insert CROSS_REPO_LINK");
+
+        let uids: std::collections::HashSet<String> = local_store
+            .list_repos(None)
+            .expect("list local repos")
+            .into_iter()
+            .map(|r| r.uid)
+            .collect();
+        assert!(
+            !uids.contains(&remotefn.repo_uid),
+            "the stub's repo_uid must be foreign to the local index (uids: {uids:?})"
+        );
+        uids
+    };
+
+    let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+
+    let mut local = connect_local(&db_local).await;
+
+    // Detailed (non-concise) format: auto-detection needs the repo_uid +
+    // canonical_id annotations that concise traces omit.
+    let params = json!({
+        "symbol": "entryfn",
+        "max_depth": 5,
+        "response_format": "detailed",
+    });
+
+    // Direct check that auto-detection fires on the raw local trace: the stub
+    // leaf must be flagged as a boundary against the local repo set.
+    let ft_args = serde_json::to_string(&params).unwrap();
+    let ft_resp = local
+        .inner_mut()
+        .flow_trace(JsonRequest { args_json: ft_args })
+        .await
+        .expect("local flow_trace RPC")
+        .into_inner();
+    let ft: Value = serde_json::from_str(&ft_resp.result_json).expect("flow_trace JSON");
+    let detected = detect_boundaries_in_trace(&ft, &local_repo_uids);
+    assert!(
+        !detected.is_empty(),
+        "detect_boundaries_in_trace must auto-detect >= 1 cross-repo boundary; got trace {ft}"
+    );
+    assert!(
+        detected.iter().any(|b| b.name == "remotefn"),
+        "the auto-detected boundary should be the remotefn stub; got {detected:?}"
+    );
+
+    let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
+    let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    // EMPTY explicit boundaries — stitching must auto-detect the boundary
+    // itself (explicit boundaries would skip detect_boundaries_in_trace).
+    let stitched = flow_trace_with_stitching(&mut hybrid, &params, &[])
+        .await
+        .expect("flow_trace_with_stitching");
+
+    let serialized = stitched.to_string();
+    assert!(
+        serialized.contains("server:server"),
+        "stitched trace must contain server-sourced nodes (source = \"server:server\"), \
+         proving the auto-detected boundary triggered a FlowTraceContinue; got {stitched}"
+    );
+    // remotehelper exists ONLY in the server's index: its presence proves the
+    // server resolved the boundary canonical_id and walked the callee repo's
+    // real call graph (remotefn -> remotehelper), not just echoed the stub.
+    assert!(
+        serialized.contains("remotehelper"),
+        "server continuation must traverse remotefn -> remotehelper in the callee repo \
+         (remotehelper is unknown to the local index); got {stitched}"
+    );
+
+    let sources = meta_sources(&stitched);
+    assert!(
+        sources.iter().any(|s| s == "local") && sources.iter().any(|s| s == "server"),
+        "stitched flow_trace must report both 'local' and 'server' sources (the 'server' \
+         entry appears when a boundary was detected and a healthy upstream was consulted; \
+         the server:server assertion above is what proves the continuation); got {sources:?}"
     );
 }
 
