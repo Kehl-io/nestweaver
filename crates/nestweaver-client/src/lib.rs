@@ -124,10 +124,7 @@ impl DaemonClient {
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
-        let ceiling = std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(660);
+        let ceiling = nestweaver_schema::drain_ceiling_from_env();
 
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(ceiling + 5);

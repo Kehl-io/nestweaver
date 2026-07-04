@@ -665,10 +665,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         tokio::spawn(async move {
-            let ceiling = std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(660);
+            let ceiling = nestweaver_schema::drain_ceiling_from_env();
 
             let timeout = std::time::Duration::from_secs(ceiling);
             let half = std::time::Duration::from_secs(ceiling / 2);
@@ -1061,9 +1058,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let format = args
@@ -2805,9 +2801,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2831,9 +2826,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2857,9 +2851,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let dim = state
@@ -2882,9 +2875,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2908,9 +2900,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2939,9 +2930,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let projects = state
@@ -2964,9 +2954,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -2989,9 +2978,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name_or_uid = args
@@ -3032,9 +3020,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let token_budget = args
@@ -3063,9 +3050,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let cache_path = state.db_path.with_extension("manifests.json");
@@ -3088,9 +3074,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let vault_path = args
@@ -3124,9 +3109,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;

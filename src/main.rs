@@ -24,7 +24,7 @@ use nestweaver_engine::{
     render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
     suggest_links, truncate_to_budget,
 };
-use nestweaver_schema::Symbol;
+use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -2577,11 +2577,6 @@ enum InteractionCommands {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Default drain ceiling the daemon uses to bound its shutdown drain
-/// (`NESTWEAVER_DRAIN_TIMEOUT_SECS` in `server.rs`). Kept in sync so the CLI
-/// `daemon stop` grace can be derived from it.
-const DEFAULT_DRAIN_CEILING_SECS: u64 = 660;
 
 /// Safety buffer added on top of the drain ceiling so the daemon has room to
 /// flush WAL and unwind after a drain that ran to the full ceiling, before the
@@ -5272,13 +5267,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &db_path,
                     config.as_deref(),
                 ))
-                && let Ok(resp) = rt.block_on(client.watch_code(
-                    // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
-                    &std::fs::canonicalize(&repo_path)
-                        .unwrap_or_else(|_| repo_path.clone())
-                        .to_string_lossy(),
-                    &instance_id,
-                ))
+                && let Ok(resp) = rt.block_on(
+                    client.watch_code(
+                        // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                        &std::fs::canonicalize(&repo_path)
+                            .unwrap_or_else(|_| repo_path.clone())
+                            .to_string_lossy(),
+                        &instance_id,
+                    ),
+                )
             {
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
