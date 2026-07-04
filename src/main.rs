@@ -13991,6 +13991,14 @@ mod abs_for_daemon_tests {
     }
 }
 
+/// Serializes tests that mutate the process-global `XDG_RUNTIME_DIR`. The
+/// `restore_guard_tests` and `snapshot_build_guard_tests` modules both set it
+/// via their `RuntimeDirGuard`, so without a shared lock they race under
+/// parallel test execution (the flake that intermittently reddened the suite).
+/// Poison-tolerant so a panicking holder can't wedge the rest.
+#[cfg(test)]
+static XDG_RUNTIME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod restore_guard_tests {
     use super::*;
@@ -13998,19 +14006,26 @@ mod restore_guard_tests {
     /// Sets `XDG_RUNTIME_DIR` for the lifetime of the guard and restores the
     /// prior value (or unsets it) on drop — even if an assert panics — so a
     /// failing test never leaks a dangling var to sibling tests in this binary.
+    /// Holds [`XDG_RUNTIME_ENV_LOCK`] so guard-holding tests across all modules
+    /// serialize on the shared env var; the lock releases only after the Drop
+    /// restores the var (fields drop after the Drop impl runs).
     struct RuntimeDirGuard {
         prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl RuntimeDirGuard {
         fn set(path: &Path) -> Self {
+            let _lock = crate::XDG_RUNTIME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("XDG_RUNTIME_DIR");
-            // SAFETY: restore_guard tests that touch XDG_RUNTIME_DIR each hold
-            // their own guard; this binary's tests otherwise never touch it.
+            // SAFETY: the shared lock guarantees no sibling test mutates
+            // XDG_RUNTIME_DIR concurrently; restored on drop.
             unsafe {
                 std::env::set_var("XDG_RUNTIME_DIR", path);
             }
-            Self { prev }
+            Self { prev, _lock }
         }
     }
 
@@ -14105,19 +14120,25 @@ mod snapshot_build_guard_tests {
     use super::*;
 
     /// Sets `XDG_RUNTIME_DIR` for the lifetime of the guard and restores it on
-    /// drop so a failing test never leaks the var to sibling tests.
+    /// drop so a failing test never leaks the var to sibling tests. Holds
+    /// [`XDG_RUNTIME_ENV_LOCK`] so it serializes with the other guard module.
     struct RuntimeDirGuard {
         prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl RuntimeDirGuard {
         fn set(path: &Path) -> Self {
+            let _lock = crate::XDG_RUNTIME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("XDG_RUNTIME_DIR");
-            // SAFETY: each guard-touching test holds its own guard; restored on drop.
+            // SAFETY: the shared lock guarantees no sibling test mutates
+            // XDG_RUNTIME_DIR concurrently; restored on drop.
             unsafe {
                 std::env::set_var("XDG_RUNTIME_DIR", path);
             }
-            Self { prev }
+            Self { prev, _lock }
         }
     }
 
