@@ -2299,6 +2299,21 @@ impl NestWeaverDaemon for DaemonService {
         if req.recency_half_life_days > 0.0 {
             args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
         }
+        if !req.response_format.is_empty() {
+            args["response_format"] = serde_json::json!(req.response_format);
+        }
+        if !req.repos.is_empty() {
+            args["repos"] = serde_json::json!(req.repos);
+        }
+        if !req.path_prefix.is_empty() {
+            args["path_prefix"] = serde_json::json!(req.path_prefix);
+        }
+        if !req.tags.is_empty() {
+            args["tags"] = serde_json::json!(req.tags);
+        }
+        if !req.exclude_tags.is_empty() {
+            args["exclude_tags"] = serde_json::json!(req.exclude_tags);
+        }
 
         let value = self.dispatch_tool_json("project_context", args).await?;
         let result_json = serde_json::to_string(&value)

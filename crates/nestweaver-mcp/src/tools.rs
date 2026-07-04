@@ -4683,7 +4683,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve all context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Filter with kinds (e.g. ['Symbol'] for code only), since, and recency_weight\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4729,6 +4729,30 @@ fn tool_schema_project_context() -> Value {
                     "type": "string",
                     "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
                     "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "description": "'concise' (default) returns kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds uid + relevance and uses a ~3000-token budget."
+                },
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Scope results to these repos (display name, uid, or path substring). Use on a returning session to skip the broad load."
+                },
+                "path_prefix": {
+                    "type": "string",
+                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\")."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept."
+                },
+                "exclude_tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Drop note/section nodes tagged with any of these tags."
                 }
             },
             "required": ["project"]
@@ -4747,15 +4771,36 @@ fn tool_project_context(
         .get("project")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'project' must be a string"))?;
+    // response_format: "concise" (default) trims per-node fields and uses a smaller default
+    // token budget; "detailed" returns full metadata at the larger budget. A session-opener
+    // wants orientation, not payload — the agent then narrows. See ADR
+    // server-mode-remainder-decisions (evidence: Anthropic response_format, Aider 1k map,
+    // Lost-in-the-Middle / Context Rot). Anything but "detailed" (incl. empty) → concise.
+    let concise = args
+        .get("response_format")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.eq_ignore_ascii_case("detailed"))
+        .unwrap_or(true);
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(3000);
+        .unwrap_or(if concise { 1000 } else { 3000 });
     let include_components = args
         .get("include_components")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let filter_repos: Option<Vec<String>> =
+        args.get("repos").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+    let path_prefix: Option<String> = args
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let filter_kinds: Option<Vec<String>> =
         args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
@@ -4970,6 +5015,94 @@ fn tool_project_context(
         apply_kinds(&mut result.connected);
     }
 
+    // 5b. repos + path_prefix scope filters (mirror brain_context so the two tools scope
+    //     identically — the "load project_context, then narrow" handoff keeps the same params).
+    let repo_names = if filter_repos.is_some() {
+        build_repo_name_map(store)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let apply_scope = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+        if let Some(ref repos) = filter_repos {
+            let filter_lower: Vec<String> = repos.iter().map(|r| r.to_lowercase()).collect();
+            nodes.retain(|n| {
+                let node_repo_uid = if n.uid.starts_with("sym:") {
+                    let parts: Vec<&str> = n.uid[4..].splitn(4, ':').collect();
+                    if parts.len() >= 3 {
+                        Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                filter_lower.iter().any(|r| {
+                    if let Some(ref repo_uid) = node_repo_uid
+                        && let Some(name) = repo_names.get(repo_uid)
+                        && name.to_lowercase().contains(r)
+                    {
+                        return true;
+                    }
+                    n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)
+                })
+            });
+        }
+        if let Some(ref prefix) = path_prefix {
+            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+        }
+    };
+    apply_scope(&mut result.seeds);
+    apply_scope(&mut result.connected);
+
+    // 5c. tags filter: keep only note/section nodes tagged with any of these (symbols kept).
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let tagged_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let tagged_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    if item.kind.to_lowercase().contains("symbol") {
+                        return true;
+                    }
+                    tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
+                });
+            };
+            filter_tagged(&mut result.seeds);
+            filter_tagged(&mut result.connected);
+        }
+    }
+
+    // 5d. exclude_tags filter: drop note/section nodes tagged with any of these.
+    if let Some(exclude_tags) = args.get("exclude_tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = exclude_tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let excluded_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let excluded_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_excluded = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    !excluded_notes.contains(&item.uid) && !excluded_sections.contains(&item.uid)
+                });
+            };
+            filter_excluded(&mut result.seeds);
+            filter_excluded(&mut result.connected);
+        }
+    }
+
     // 6a. since filter: hard filter Note/Section nodes by modified_at.
     if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
         let recent_notes = store
@@ -5037,11 +5170,16 @@ fn tool_project_context(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let mut connected_json: Vec<Value> = result
-        .connected
-        .iter()
-        .take(cut)
-        .map(|n| {
+    // concise drops the machine id (uid) and the relevance score in favor of the semantic
+    // fields an agent orients with (kind/title/location); detailed keeps the full record.
+    let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
+        if concise {
+            json!({
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+            })
+        } else {
             json!({
                 "uid": n.uid,
                 "kind": n.kind,
@@ -5049,8 +5187,11 @@ fn tool_project_context(
                 "location": n.location,
                 "relevance": n.relevance,
             })
-        })
-        .collect();
+        }
+    };
+
+    let mut connected_json: Vec<Value> =
+        result.connected.iter().take(cut).map(render_node).collect();
 
     let include_seeds = args
         .get("include_seeds")
@@ -5058,21 +5199,7 @@ fn tool_project_context(
         .unwrap_or(false);
 
     let seeds_json: Option<Vec<Value>> = if include_seeds {
-        Some(
-            result
-                .seeds
-                .iter()
-                .map(|n| {
-                    json!({
-                        "uid": n.uid,
-                        "kind": n.kind,
-                        "title": n.title,
-                        "location": n.location,
-                        "relevance": n.relevance,
-                    })
-                })
-                .collect(),
-        )
+        Some(result.seeds.iter().map(render_node).collect())
     } else {
         None
     };
@@ -5961,6 +6088,11 @@ pub fn dispatch_via_daemon(
                     since: str_field("since"),
                     recency_weight: f64_field("recency_weight"),
                     recency_half_life_days: f64_field("recency_half_life_days"),
+                    response_format: str_field("response_format"),
+                    repos: str_array("repos"),
+                    path_prefix: str_field("path_prefix"),
+                    tags: str_array("tags"),
+                    exclude_tags: str_array("exclude_tags"),
                 });
                 let resp = client
                     .get_project_context(req)

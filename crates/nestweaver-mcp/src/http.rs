@@ -369,6 +369,24 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
     result
 }
 
+/// Inject single-node provenance into the MCP result envelope so a raw client hitting this
+/// daemon's `/mcp` endpoint gets in-band source metadata — the fan-out boundary should emit the
+/// contract (federated-search norm: Elasticsearch `_clusters`, Trino coordinator; MCP `_meta` is
+/// server-produced). A standalone daemon is ONE node: it reports itself as the sole source and a
+/// `single-node` scope. The hybrid client (which fronts local + an upstream over gRPC) is what
+/// produces a federated two-tier envelope; a raw client therefore learns, in-band, that this
+/// response was not federated. Keys are domain-namespaced per the MCP `_meta` prefix rule.
+fn add_provenance_metadata(mut result: Value) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert("nestweaver.io/sources".to_string(), json!(["daemon"]));
+            meta_obj.insert("nestweaver.io/scope".to_string(), json!("single-node"));
+        }
+    }
+    result
+}
+
 /// Check per-session rate limit. Returns `true` if the request is allowed.
 fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: &str) -> bool {
     if let Some(mut entry) = sessions.get_mut(session_id) {
@@ -804,8 +822,10 @@ async fn handle_mcp(
 
             match result {
                 Ok(Ok(Ok(value))) => {
-                    let result =
-                        add_limit_metadata(tools::wrap_tool_result(value), &applied_limits);
+                    let result = add_provenance_metadata(add_limit_metadata(
+                        tools::wrap_tool_result(value),
+                        &applied_limits,
+                    ));
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -860,6 +880,22 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[test]
+    fn provenance_metadata_injects_namespaced_single_node_scope() {
+        // A raw /mcp client must get in-band provenance so the schema (which mentions _meta)
+        // is honest: a standalone daemon reports itself as the sole source + single-node scope.
+        let out = add_provenance_metadata(json!({ "content": [], "isError": false }));
+        let meta = &out["_meta"];
+        assert_eq!(meta["nestweaver.io/scope"], json!("single-node"));
+        assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+
+        // Merges with pre-existing _meta (e.g. limits) rather than clobbering it.
+        let with_limits = json!({ "content": [], "_meta": { "limits": [{"param": "depth"}] } });
+        let out = add_provenance_metadata(with_limits);
+        assert_eq!(out["_meta"]["nestweaver.io/scope"], json!("single-node"));
+        assert!(out["_meta"]["limits"].is_array());
+    }
 
     /// Regression guard for the single shared mutating-tool list. Pins the
     /// known set (adding/removing a mutating tool is a deliberate edit) and

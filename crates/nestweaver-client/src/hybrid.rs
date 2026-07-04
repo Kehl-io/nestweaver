@@ -1411,6 +1411,19 @@ async fn dispatch_typed_project_context(
             .get("recency_half_life_days")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0),
+        response_format: params
+            .get("response_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        repos: json_str_array(params, "repos"),
+        path_prefix: params
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tags: json_str_array(params, "tags"),
+        exclude_tags: json_str_array(params, "exclude_tags"),
     };
     let mut request = tonic::Request::new(req);
     inject_bearer_token(&mut request, auth_token);

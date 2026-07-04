@@ -1078,10 +1078,14 @@ enum Commands {
         name: String,
         #[arg(
             long,
-            default_value = "3000",
-            help = "Approximate token budget for the output"
+            help = "Approximate token budget for the output [default: 1000 concise / 3000 detailed]"
         )]
-        token_budget: usize,
+        token_budget: Option<usize>,
+        #[arg(
+            long,
+            help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
+        )]
+        detailed: bool,
         #[arg(long, help = "Also include notes/symbols from component sub-projects")]
         include_components: bool,
         #[arg(long, help = "Output as JSON")]
@@ -6790,6 +6794,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::ProjectContext {
             name,
             token_budget,
+            detailed,
             include_components,
             json,
             db,
@@ -6798,6 +6803,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             recency_weight,
             recency_half_life_days,
         } => {
+            // Concise orientation by default (research-backed — see ADR
+            // server-mode-remainder-decisions); --detailed opts into the full record.
+            let response_format = if detailed { "detailed" } else { "concise" };
+            let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = db.unwrap_or_else(default_db_path);
 
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
@@ -6814,6 +6823,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         &serde_json::json!({
                             "project": name,
                             "token_budget": token_budget,
+                            "response_format": response_format,
                             "include_components": include_components,
                             "since": since.clone().unwrap_or_default(),
                             "recency_weight": recency_weight,

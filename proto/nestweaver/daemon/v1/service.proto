@@ -278,6 +278,17 @@ message ProjectContextRequest {
   double recency_weight = 8;
   // Half-life (days) for the recency boost decay. Ignored when weight=0.
   double recency_half_life_days = 9;
+  // "concise" (default) trims per-node fields and uses a smaller default token
+  // budget; "detailed" returns full metadata at the larger budget. Empty = concise.
+  string response_format = 10;
+  // Filter connected/seed nodes to these repos (display name / uid / path substring).
+  repeated string repos = 11;
+  // Keep only nodes whose location starts with this path prefix. Empty = no filter.
+  string path_prefix = 12;
+  // Keep only note/section nodes tagged with any of these tags (symbols always kept).
+  repeated string tags = 13;
+  // Drop note/section nodes tagged with any of these tags.
+  repeated string exclude_tags = 14;
 }
 message ProjectContextResponse { string result_json = 1; }
 
