@@ -172,7 +172,7 @@ Sidecar files written alongside the database:
 
 ## Architecture
 
-Cargo workspace with 13 crates + root binary:
+Cargo workspace with 15 crates + root binary:
 
 ```
 nestweaver/                     # CLI entry point (src/main.rs)
@@ -184,7 +184,9 @@ crates/
   nestweaver-storage/           # pluggable snapshot storage backends (local, S3, GitLab)
   nestweaver-engine/            # indexing pipeline, query dispatch, config, registry, snapshots, LLM pipelines
   nestweaver-algorithms/        # pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible
+  nestweaver-embed/             # local embedding models (candle; Metal GPU on macOS) for vector search
   nestweaver-proto/             # gRPC protobuf definitions and generated Rust types
+  nestweaver-federation/        # federation coordinator: upstream routing, health/ejection, two-tier merge, staleness (leaf; used by client + daemon-mode mcp)
   nestweaver-daemon/            # background daemon process for persistent graph serving
   nestweaver-client/            # gRPC client for daemon communication
   nestweaver-mcp/               # optional MCP wrapper (feature-gated, delegates to engine)
@@ -212,8 +214,11 @@ algorithms          (zero internal deps — WASM target)
   <- wasm
 storage             (zero internal deps)
        <- engine <- (parser, resolver, store, storage, algorithms)
-            <- mcp
+            <- mcp   <- (federation, under the `daemon` feature)
             <- web
+federation          (leaf: schema + proto only)
+  <- client
+  <- mcp (daemon feature) <- daemon
 ```
 
 ## Conventions

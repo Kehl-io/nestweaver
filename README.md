@@ -505,7 +505,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ## Architecture
 
 <details>
-<summary>Cargo workspace with 13 crates compiling to a single static binary + optional WASM module</summary>
+<summary>Cargo workspace with 15 crates compiling to a single static binary + optional WASM module</summary>
 
 | Crate | Description |
 |-------|-------------|
@@ -516,7 +516,9 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
 | `nestweaver-engine` | Indexing pipeline, query dispatch, config, snapshots, LLM integration |
 | `nestweaver-algorithms` | Pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible, no I/O |
+| `nestweaver-embed` | Local embedding models (candle; Metal GPU on macOS) for vector search |
 | `nestweaver-proto` | gRPC service definition (protobuf) for daemon IPC |
+| `nestweaver-federation` | Federation coordinator — upstream routing, health/ejection, two-tier merge, staleness (leaf; used by client + daemon-mode mcp) |
 | `nestweaver-daemon` | Background daemon — owns the database, serves gRPC over Unix socket |
 | `nestweaver-client` | Daemon client with auto-start, flock-based race prevention, version check |
 | `nestweaver-mcp` | MCP server — proxies tool calls through the daemon |
@@ -532,10 +534,11 @@ algorithms          (zero internal deps — WASM target)
   <- wasm
 storage             (zero internal deps)
 proto               (generated gRPC types)
+federation          (leaf: schema + proto — upstream routing/merge/staleness)
        <- engine <- (parser, resolver, store, storage, algorithms)
             <- daemon <- (engine, store, mcp, proto)
-            <- client <- (proto, daemon)
-            <- mcp    <- (client, proto)  [daemon proxy mode]
+            <- client <- (proto, daemon, federation)
+            <- mcp    <- (client, proto; federation under the `daemon` feature)  [daemon proxy mode]
             <- web
 ```
 
