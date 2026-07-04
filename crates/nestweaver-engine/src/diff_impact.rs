@@ -54,12 +54,16 @@ pub fn compute_diff_changes(
     // Use --name-status with -M to detect renames (status R). For renamed
     // files, git only reports the new path with --name-only, so
     // `git show base_ref:<new_path>` fails; we need the old path for the
-    // base content.
+    // base content. `-z` emits NUL-delimited records with paths verbatim
+    // (no `core.quotePath` C-quoting), so accented/CJK filenames survive
+    // instead of being emitted as `"caf\303\251.js"` and silently dropped
+    // when handed to `git show`.
     let output = Command::new("git")
         .args([
             "diff",
             "-M",
             "--name-status",
+            "-z",
             "--diff-filter=ACMR",
             diff_spec,
         ])
@@ -72,8 +76,6 @@ pub fn compute_diff_changes(
         anyhow::bail!("git diff failed: {}", stderr.trim());
     }
 
-    // Each line is: <status>\t<path> or <status>\t<old_path>\t<new_path> for renames.
-    // Status R is followed by a similarity percentage (e.g. R100).
     struct FileEntry {
         /// Path to use for the new (HEAD) content and as the canonical name.
         new_path: String,
@@ -81,41 +83,68 @@ pub fn compute_diff_changes(
         base_path: String,
     }
 
-    let changed_files: Vec<FileEntry> = std::str::from_utf8(&output.stdout)?
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|line| {
-            let mut cols = line.split('\t');
-            let status = cols.next()?;
-            if status.starts_with('R') {
-                // Rename: old_path \t new_path
-                let old = cols.next()?.to_string();
-                let new = cols.next()?.to_string();
-                Some(FileEntry {
-                    new_path: new,
-                    base_path: old,
-                })
-            } else {
-                // A/C/M: single path
-                let path = cols.next()?.to_string();
-                Some(FileEntry {
-                    new_path: path.clone(),
-                    base_path: path,
-                })
-            }
-        })
+    // Under `-z` the record layout is NUL-separated tokens: `<status>\0<path>\0`
+    // for A/C/M, and `R###\0<old>\0<new>\0` / `C###\0<old>\0<new>\0` for
+    // renames/copies (two path tokens). Parse the token stream directly so
+    // paths are never split on tab or newline embedded in a filename.
+    let tokens: Vec<&[u8]> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|t| !t.is_empty())
         .collect();
+    let to_str = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
 
-    // Get deleted files
+    let mut changed_files: Vec<FileEntry> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let status = String::from_utf8_lossy(tokens[i]);
+        i += 1;
+        match status.chars().next().unwrap_or(' ') {
+            // Rename/copy: two path tokens (old, new).
+            'R' | 'C' => match (tokens.get(i), tokens.get(i + 1)) {
+                (Some(old), Some(new)) => {
+                    changed_files.push(FileEntry {
+                        new_path: to_str(new),
+                        base_path: to_str(old),
+                    });
+                    i += 2;
+                }
+                _ => break, // truncated stream; nothing more to consume
+            },
+            // Added/modified: single path token, same path for base and new.
+            'A' | 'M' => {
+                if let Some(path) = tokens.get(i) {
+                    let p = to_str(path);
+                    changed_files.push(FileEntry {
+                        new_path: p.clone(),
+                        base_path: p,
+                    });
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // Unknown status: skip its (assumed single) path token to stay framed.
+            _ => {
+                if tokens.get(i).is_some() {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Get deleted files. `--name-only -z` emits just NUL-separated paths.
     let del_output = Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=D", diff_spec])
+        .args(["diff", "--name-only", "-z", "--diff-filter=D", diff_spec])
         .current_dir(repo_path)
         .output()
         .context("git diff --name-only --diff-filter=D")?;
 
-    let deleted_files: Vec<&str> = std::str::from_utf8(&del_output.stdout)?
-        .lines()
-        .filter(|l| !l.is_empty())
+    let deleted_files: Vec<String> = del_output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|t| !t.is_empty())
+        .map(|b| String::from_utf8_lossy(b).into_owned())
         .collect();
 
     let mut all_changes = Vec::new();
@@ -368,5 +397,86 @@ mod tests {
 
         let filtered = filter_by_severity(impacts, ImpactSeverity::Info);
         assert_eq!(filtered.len(), 3);
+    }
+
+    /// A source file with a non-ASCII (accented) name must survive diff parsing
+    /// and produce atomic changes. Before the `-z` fix, `git diff --name-status`
+    /// C-quoted the path (`"caf\303\251.rs"`), `git show` failed on that literal,
+    /// and the file was silently dropped from impact analysis.
+    #[test]
+    fn compute_diff_changes_handles_non_ascii_paths() {
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+
+        // Base commit: an accented-name Rust file with one function.
+        std::fs::write(repo.join("café.rs"), "fn greet() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        // Change the signature so a non-empty atomic change is produced.
+        std::fs::write(repo.join("café.rs"), "fn greet(name: &str) {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "sig change"]);
+
+        let changes =
+            compute_diff_changes(repo, "HEAD~1..HEAD", "https://github.com/test/repo").unwrap();
+        assert!(
+            !changes.is_empty(),
+            "accented-path file was dropped from diff impact: {changes:?}"
+        );
+    }
+
+    /// A rename to a non-ASCII path must be parsed via the two-token `R` record
+    /// under `-z` (old path + new path) rather than tab-split.
+    #[test]
+    fn compute_diff_changes_handles_non_ascii_rename() {
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+
+        std::fs::write(repo.join("old.rs"), "fn greet() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        git(&["mv", "old.rs", "café.rs"]);
+        git(&["commit", "-m", "rename to accented"]);
+
+        // Must not panic and must consume the two-token rename record cleanly.
+        let changes =
+            compute_diff_changes(repo, "HEAD~1..HEAD", "https://github.com/test/repo").unwrap();
+        // A pure rename with no body change yields SymbolMoved for the function.
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, AtomicChange::SymbolMoved { new_file, .. } if new_file.contains("café"))),
+            "expected a SymbolMoved into the accented path: {changes:?}"
+        );
     }
 }
