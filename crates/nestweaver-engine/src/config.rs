@@ -800,8 +800,11 @@ pub fn remove_repo_from_config_file(
             let start = i;
             i += 1;
             while i < lines.len() {
-                let trimmed = lines[i].trim();
-                if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+                // Terminate the block at the NEXT table/table-array header of any
+                // kind. Breaking only on `[[...]]` would absorb a following
+                // `[git]` / `[inference]` / etc. into the repo block and delete
+                // those sections too when the repo is removed (config corruption).
+                if lines[i].trim_start().starts_with('[') {
                     break;
                 }
                 i += 1;
@@ -1562,6 +1565,57 @@ credential_method = "ssh"
         assert!(append_repo_to_config_file(&path, "https://github.com/example/two", None).unwrap());
         let cfg = InstanceConfig::from_file(&path).expect("file must still parse after second add");
         assert_eq!(cfg.repos.len(), 2, "both repos should be present");
+    }
+
+    #[test]
+    fn remove_repo_preserves_following_sections() {
+        // The shipped template puts `[[repos]]` BEFORE [snapshot_storage]/[git]/etc.
+        // Removing that repo must not swallow the following single-bracket sections.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let cfg = r#"instance_id = "t"
+
+[[repos]]
+url = "https://github.com/acme/remove-me"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        std::fs::write(&path, cfg).unwrap();
+
+        let removed =
+            remove_repo_from_config_file(&path, "https://github.com/acme/remove-me").unwrap();
+        assert!(removed);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // The repo is gone...
+        assert!(!after.contains("remove-me"), "repo not removed:\n{after}");
+        // ...but every following section survives.
+        for section in [
+            "[snapshot_storage]",
+            "[workspace]",
+            "[inference]",
+            "[git]",
+        ] {
+            assert!(
+                after.contains(section),
+                "section {section} was swallowed by repo removal:\n{after}"
+            );
+        }
+        // And the file still parses into a valid config.
+        let parsed = InstanceConfig::from_file(&path).expect("file must parse after removal");
+        assert!(parsed.repos.is_empty());
+        assert_eq!(parsed.git.credential_method, "ssh");
     }
 
     #[test]
