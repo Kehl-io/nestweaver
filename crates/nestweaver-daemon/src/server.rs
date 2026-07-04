@@ -4532,6 +4532,11 @@ pub async fn run_server(
         std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>>,
     > = None;
 
+    // Live MCP session-count handle, shared from the MCP HTTP state into the
+    // admin API (dashboard "connected clients") and the metrics task
+    // (`MCP_SESSIONS` gauge). `None` outside server mode.
+    let mut mcp_session_gauge_opt: Option<std::sync::Arc<std::sync::atomic::AtomicU32>> = None;
+
     // MCP-over-HTTP server — spawned alongside the gRPC servers.
     // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
     // port when grpc_port is 0.
@@ -4588,8 +4593,11 @@ pub async fn run_server(
                 shutdown_tx.subscribe(),
             );
         }
+        // Share the live session-count handle with the admin API and metrics.
+        mcp_session_gauge_opt = Some(mcp_state.mcp_session_gauge.clone());
         nestweaver_mcp::http::spawn_session_sweeper(
             mcp_state.sessions.clone(),
+            mcp_state.mcp_session_gauge.clone(),
             shutdown_tx.subscribe(),
         );
         nestweaver_mcp::http::spawn_bucket_sweeper(
@@ -4739,6 +4747,9 @@ pub async fn run_server(
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
                 active_writes: state.active_writes.clone(),
+                mcp_sessions: mcp_session_gauge_opt.clone().unwrap_or_else(|| {
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))
+                }),
                 drained: state.drained.clone(),
                 indexing_queue_depth: state.indexing_queue_depth.clone(),
                 db_path: db_path.clone(),
@@ -5509,6 +5520,7 @@ pub async fn run_server(
         let metrics_active_writes = Arc::clone(&state.active_writes);
         let metrics_job_queue = shared_job_queue_opt.clone();
         let metrics_instance = instance_id.clone();
+        let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use nestweaver_web::routes::metrics;
@@ -5539,6 +5551,9 @@ pub async fn run_server(
                     (metrics_active_reads.load(Ordering::Relaxed)
                         + metrics_active_writes.load(Ordering::Relaxed)) as i64,
                 );
+                if let Some(ref sessions) = metrics_mcp_sessions {
+                    metrics::MCP_SESSIONS.set(sessions.load(Ordering::Relaxed) as i64);
+                }
 
                 if let Some(queue) = &metrics_job_queue
                     && let Ok(guard) = queue.lock()

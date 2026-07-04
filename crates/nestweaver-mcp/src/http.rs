@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -167,6 +168,11 @@ pub struct McpHttpState {
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
     pub sessions: Arc<DashMap<String, McpSession>>,
+    /// Live count of active MCP sessions, republished from `sessions.len()` on
+    /// each insert and after each sweep. Shared with the daemon so the admin
+    /// dashboard and the `MCP_SESSIONS` Prometheus gauge can read a connection
+    /// count without depending on this crate's `DashMap`/`McpSession` types.
+    pub mcp_session_gauge: Arc<AtomicU32>,
     /// Whether the daemon is running in server mode. Threaded into the tool
     /// dispatch thread-local so server-only code paths (e.g. `read_symbols`
     /// reading content via `git show` from blobless bare clones, `brain_status`
@@ -214,6 +220,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
             read_only: false,
             auth_token: None,
@@ -244,6 +251,7 @@ impl McpHttpState {
             db_path,
             instance_cfg,
             sessions: Arc::new(DashMap::new()),
+            mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
             read_only: false,
             auth_token: Some(auth_token),
@@ -260,6 +268,7 @@ impl McpHttpState {
 /// Accepts a shutdown receiver; the loop exits when the shutdown signal fires.
 pub fn spawn_session_sweeper(
     sessions: Arc<DashMap<String, McpSession>>,
+    gauge: Arc<AtomicU32>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -270,6 +279,8 @@ pub fn spawn_session_sweeper(
                 _ = tokio::time::sleep(interval) => {
                     let now = Instant::now();
                     sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
+                    // Republish the live count so an expiry is reflected too.
+                    gauge.store(sessions.len() as u32, Ordering::Relaxed);
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -674,6 +685,9 @@ async fn handle_mcp(
                     rate_window_start: now,
                 },
             );
+            state
+                .mcp_session_gauge
+                .store(state.sessions.len() as u32, Ordering::Relaxed);
 
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert("mcp-session-id", new_id.parse().unwrap());

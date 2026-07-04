@@ -159,6 +159,15 @@ pub struct QueueStats {
     pub dead_letter: usize,
 }
 
+/// Live client-connection counts shown on the admin dashboard. `grpc` is the
+/// in-flight gRPC read+write count (a proxy for active clients); `mcp` is the
+/// number of live MCP-over-HTTP sessions.
+#[derive(Serialize)]
+pub struct Connections {
+    pub grpc: u32,
+    pub mcp: u32,
+}
+
 #[derive(Serialize)]
 pub struct AdminStatus {
     pub instance_id: String,
@@ -177,6 +186,8 @@ pub struct AdminStatus {
     pub repos: RepoStats,
     pub symbols: SymbolStats,
     pub queue: QueueStats,
+    /// Live gRPC/MCP client-connection counts for the Overview dashboard.
+    pub connections: Connections,
 }
 
 #[derive(Serialize)]
@@ -1122,6 +1133,11 @@ pub async fn get_status(
             running: running_count,
             dead_letter: dead_letter_count,
         },
+        connections: Connections {
+            grpc: state.active_reads.load(Ordering::Relaxed)
+                + state.active_writes.load(Ordering::Relaxed),
+            mcp: state.mcp_sessions.load(Ordering::Relaxed),
+        },
     })
 }
 
@@ -1612,6 +1628,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             db_path: db_path_clone,
@@ -1868,6 +1885,7 @@ url = "https://github.com/example/existing"
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             db_path,

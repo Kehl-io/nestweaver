@@ -93,6 +93,10 @@ pub struct AdminState {
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
     pub active_writes: Arc<AtomicU32>,
+    /// Live count of active MCP-over-HTTP sessions, shared with the MCP handler
+    /// (which republishes `sessions.len()` on insert/expiry). Surfaced as the
+    /// dashboard's "connected MCP clients". Zero when server mode is off.
+    pub mcp_sessions: Arc<AtomicU32>,
     pub drained: Arc<AtomicBool>,
     pub indexing_queue_depth: Arc<AtomicU32>,
     /// Path to the brain database, used to derive the jobs database path.
