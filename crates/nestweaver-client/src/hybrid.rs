@@ -337,7 +337,8 @@ impl HybridClient {
                 }
                 Ok(result)
             }
-            ToolRouting::Merge | ToolRouting::FanOut => self.query_merge(tool_name, params).await,
+            ToolRouting::Merge => self.query_merge(tool_name, params).await,
+            ToolRouting::FanOut => self.query_fanout(tool_name, params).await,
             ToolRouting::LocalFirst => {
                 self.query_fallback_with_staleness(tool_name, params, force_fallback_server)
                     .await
@@ -557,6 +558,32 @@ impl HybridClient {
                         "merge query timed out",
                     );
                 }
+                let mut result = local;
+                inject_or_wrap_provenance(&mut result, &["local"], &[]);
+                Ok(result)
+            }
+        }
+    }
+
+    /// FanOut routing (regex_search, count_patterns): query local + server and CONCATENATE
+    /// the result rows. These are aggregate rows — regex matches / per-pattern counts, not
+    /// symbols — so the symbol scope-hash RRF dedup used by Merge would wrongly drop or
+    /// reorder them. Server failure degrades to local (query_upstream ejects on a real outage).
+    async fn query_fanout(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
+        if self.upstreams.is_empty() {
+            let mut result = self.query_local(tool_name, params).await?;
+            inject_or_wrap_provenance(&mut result, &["local"], &[]);
+            return Ok(result);
+        }
+        let timeout = self.upstream_timeout(params);
+        let local = self.query_local(tool_name, params).await?;
+        match self.query_upstream(tool_name, params, timeout).await {
+            Ok(server) => {
+                let mut merged = concat_fanout(&local, &server);
+                inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
+                Ok(merged)
+            }
+            Err(_) => {
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
                 Ok(result)
@@ -1665,6 +1692,29 @@ fn merge_json_results(local: &Value, server: &Value) -> Value {
     wrap_merged_response(values, &["local", "server"])
 }
 
+/// Merge two FanOut tool responses (regex_search, count_patterns) by CONCATENATING their row
+/// arrays instead of symbol-deduping. Any top-level array field present in `server` is appended
+/// to the same field in `local`; scalar fields and provenance/meta (`_`-prefixed) keep the local
+/// value. This preserves every aggregate row — the whole point of FanOut vs Merge.
+fn concat_fanout(local: &Value, server: &Value) -> Value {
+    let mut out = local.clone();
+    if let (Some(lo), Some(so)) = (out.as_object_mut(), server.as_object()) {
+        for (k, sv) in so {
+            if k.starts_with('_') {
+                continue;
+            }
+            match (lo.get_mut(k), sv) {
+                (Some(Value::Array(la)), Value::Array(sa)) => la.extend(sa.iter().cloned()),
+                (None, _) => {
+                    lo.insert(k.clone(), sv.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Merge two JSON responses, preserving structured schemas (e.g. brain_context's
 /// `{ seeds, connected, unresolved_seeds, expansion_terms }`) when detected.
 /// Falls back to flat `{ results: [...] }` envelope for non-structured responses.
@@ -2493,6 +2543,29 @@ fn filter_org_results(server: &Value, local_repos: &std::collections::HashSet<St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn concat_fanout_appends_rows_without_dropping() {
+        // regex_search-shaped: rows must concatenate, not symbol-dedupe (which would drop rows
+        // that share a scope hash). Same-uid rows from both sides are preserved.
+        let local = json!({ "results": [{ "uid": "a", "line": 1 }, { "uid": "b", "line": 2 }], "truncated": false });
+        let server = json!({ "results": [{ "uid": "a", "line": 9 }, { "uid": "c", "line": 3 }] });
+        let merged = concat_fanout(&local, &server);
+        let rows = merged["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 4, "all rows preserved, none deduped");
+        // Scalar field keeps local value.
+        assert_eq!(merged["truncated"], json!(false));
+
+        // count_patterns-shaped: per-pattern rows from both sides are kept.
+        let l = json!({ "patterns": [{ "pattern": "foo", "total_matches": 2 }] });
+        let s = json!({ "patterns": [{ "pattern": "foo", "total_matches": 5 }] });
+        let m = concat_fanout(&l, &s);
+        assert_eq!(m["patterns"].as_array().unwrap().len(), 2);
+
+        // A field only on the server side is carried over.
+        let m2 = concat_fanout(&json!({ "results": [] }), &json!({ "results": [], "extra": 7 }));
+        assert_eq!(m2["extra"], json!(7));
+    }
 
     #[test]
     fn local_only_has_no_upstreams() {
