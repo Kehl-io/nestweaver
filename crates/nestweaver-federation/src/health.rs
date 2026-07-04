@@ -34,6 +34,13 @@ const TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 /// (~1s) because the richer upstream answer is the entire point of those modes.
 const FALLBACK_MODE_CAP: Duration = Duration::from_millis(250);
 
+/// Upper bound on a single `repo_states` RPC during the background staleness
+/// refresh. This runs off the hot path (never a user query), but without a
+/// bound a wedged upstream would stall the refresh loop indefinitely and freeze
+/// the staleness verdict. Generous — staleness is not latency-sensitive — but
+/// finite.
+const STALENESS_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Classify whether an upstream query error means the server is DOWN (unreachable / timed out /
 /// connection reset) versus a rejection from a HEALTHY server (auth failed, bad request,
 /// server-side error). Only the former should passively eject the upstream: ejecting a healthy
@@ -202,7 +209,12 @@ pub async fn compute_stale_repos(
         {
             req.metadata_mut().insert("authorization", val);
         }
-        if let Ok(resp) = client.repo_states(req).await {
+        // Bound the background RPC: a wedged upstream must not stall the
+        // refresh loop. Timeout OR transport error → skip this probe (its
+        // last-known verdict simply isn't refreshed this tick).
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(STALENESS_RPC_TIMEOUT, client.repo_states(req)).await
+        {
             for server_repo in resp.into_inner().repos {
                 if let Some(local_sha) =
                     local_sha_for_server_repo(local_states, &server_repo.repo_url)
