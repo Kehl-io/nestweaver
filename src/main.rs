@@ -2518,6 +2518,19 @@ enum ContractCommands {
         )]
         db: Option<PathBuf>,
     },
+    /// Diff two OpenAPI spec files (base vs head) at the endpoint AND
+    /// request/response field/type level, classifying each change as
+    /// BREAKING or INFO. The "did this PR break the API?" check.
+    Diff {
+        #[arg(long, help = "Base (old) OpenAPI spec file")]
+        base: PathBuf,
+        #[arg(long, help = "Head (new) OpenAPI spec file")]
+        head: PathBuf,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(long, help = "Exit non-zero if any BREAKING change is found")]
+        fail_on_breaking: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -12854,6 +12867,52 @@ fn run_contracts(
                 }
             }
             Ok((EXIT_SUCCESS, None))
+        }
+        ContractCommands::Diff {
+            base,
+            head,
+            json,
+            fail_on_breaking,
+        } => {
+            let base_src = std::fs::read_to_string(&base)
+                .with_context(|| format!("read base spec {}", base.display()))?;
+            let head_src = std::fs::read_to_string(&head)
+                .with_context(|| format!("read head spec {}", head.display()))?;
+            let changes = nestweaver_engine::contracts::diff_openapi(
+                &base.to_string_lossy(),
+                &base_src,
+                &head.to_string_lossy(),
+                &head_src,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("both files must be parseable OpenAPI specs (yaml/json)")
+            })?;
+            let breaking = changes
+                .iter()
+                .filter(|c| {
+                    c.severity == nestweaver_engine::contracts::SpecChangeSeverity::Breaking
+                })
+                .count();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&changes)?);
+            } else if changes.is_empty() {
+                println!("No API changes detected.");
+            } else {
+                for c in &changes {
+                    let sev = match c.severity {
+                        nestweaver_engine::contracts::SpecChangeSeverity::Breaking => "BREAKING",
+                        nestweaver_engine::contracts::SpecChangeSeverity::Info => "INFO",
+                    };
+                    println!("  [{sev}] {} {} — {}", c.verb, c.path, c.detail);
+                }
+                println!("\n{breaking} breaking, {} info", changes.len() - breaking);
+            }
+            let exit = if fail_on_breaking && breaking > 0 {
+                EXIT_ERROR
+            } else {
+                EXIT_SUCCESS
+            };
+            Ok((exit, None))
         }
     }
 }

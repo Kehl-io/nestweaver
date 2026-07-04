@@ -14,6 +14,15 @@
 //! edge records match quality (1.0 exact verb+path, 0.8 base-path-inferred),
 //! and [`compute_drift`] surfaces the declared-vs-implemented set difference.
 //!
+//! Two distinct comparisons live here — don't confuse them:
+//! * [`drift_for_store`] compares, within ONE snapshot, which endpoints are
+//!   *declared* (in a spec) vs *implemented* (by a handler). It is **endpoint
+//!   presence only** — it does NOT look at request/response fields or types.
+//! * [`diff_openapi`] compares TWO OpenAPI specs (base vs head) at the endpoint
+//!   AND request/response **field/type** level, classifying each change as
+//!   BREAKING or INFO. This is the "did this change break the API?" check
+//!   (exposed as `nestweaver contracts diff`).
+//!
 //! Scope (per the F2-core adversarial review) is deliberately the trustworthy
 //! lanes only: same-repo Spring/NestJS handler matching. Cross-repo
 //! `CONSUMES` via fetch/axios/HTTP literals and GraphQL *consumers* are
@@ -743,6 +752,301 @@ pub fn drift_for_store(
     Ok(compute_drift(&declared, &code_derived, &implemented))
 }
 
+// ── Field-level spec-vs-spec breaking-change diff (F2) ──────────────────────
+//
+// `drift_for_store` only compares endpoint *presence*. This compares two
+// versions of an OpenAPI spec (base vs head) at the endpoint AND request/response
+// FIELD/TYPE level, classifying each difference as BREAKING or INFO — the "did
+// this change break the API?" check. Scope: OpenAPI (yaml/json), application/json
+// bodies, object root schemas; `$ref`s are resolved against components.schemas
+// (depth-capped for cycles). Non-object / composed (oneOf/allOf) schemas are
+// treated opaquely (empty field set), a conservative choice that avoids false
+// breakage.
+
+/// Severity of a spec change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SpecChangeSeverity {
+    Breaking,
+    Info,
+}
+
+/// One classified difference between a base and head spec.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpecChange {
+    pub severity: SpecChangeSeverity,
+    pub verb: String,
+    pub path: String,
+    pub detail: String,
+}
+
+/// Request/response shape of one operation, used for the field-level diff.
+#[derive(Default, PartialEq, Eq)]
+struct OpShape {
+    /// request-body field name → type string
+    req_fields: std::collections::BTreeMap<String, String>,
+    /// request-body required field names
+    req_required: std::collections::BTreeSet<String>,
+    /// success-response field name → type string
+    resp_fields: std::collections::BTreeMap<String, String>,
+}
+
+const REF_DEPTH_CAP: usize = 8;
+
+/// Resolve a `ReferenceOr<Schema>` to a concrete `Schema`, following
+/// `#/components/schemas/*` refs up to `REF_DEPTH_CAP` (guards ref cycles).
+fn resolve_schema<'a>(
+    spec: &'a openapiv3::OpenAPI,
+    mut sref: &'a openapiv3::ReferenceOr<openapiv3::Schema>,
+    mut depth: usize,
+) -> Option<&'a openapiv3::Schema> {
+    loop {
+        match sref {
+            openapiv3::ReferenceOr::Item(s) => return Some(s),
+            openapiv3::ReferenceOr::Reference { reference } => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                let name = reference.rsplit('/').next()?;
+                let comps = spec.components.as_ref()?;
+                sref = comps.schemas.get(name)?;
+            }
+        }
+    }
+}
+
+/// A short type name for a property schema. A `$ref` property yields its target
+/// name, so changing the referenced type is detected as a type change.
+fn prop_type_name(prop: &openapiv3::ReferenceOr<Box<openapiv3::Schema>>) -> String {
+    match prop {
+        openapiv3::ReferenceOr::Reference { reference } => reference
+            .rsplit('/')
+            .next()
+            .unwrap_or(reference)
+            .to_string(),
+        openapiv3::ReferenceOr::Item(s) => match &s.schema_kind {
+            openapiv3::SchemaKind::Type(t) => match t {
+                openapiv3::Type::String(_) => "string",
+                openapiv3::Type::Number(_) => "number",
+                openapiv3::Type::Integer(_) => "integer",
+                openapiv3::Type::Object(_) => "object",
+                openapiv3::Type::Array(_) => "array",
+                openapiv3::Type::Boolean(_) => "boolean",
+            }
+            .to_string(),
+            openapiv3::SchemaKind::OneOf { .. } => "oneOf".to_string(),
+            openapiv3::SchemaKind::AllOf { .. } => "allOf".to_string(),
+            openapiv3::SchemaKind::AnyOf { .. } => "anyOf".to_string(),
+            _ => "any".to_string(),
+        },
+    }
+}
+
+/// Extract (field→type, required) from an object schema; empty for non-objects.
+fn object_fields(
+    spec: &openapiv3::OpenAPI,
+    sref: &openapiv3::ReferenceOr<openapiv3::Schema>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut fields = std::collections::BTreeMap::new();
+    let mut required = std::collections::BTreeSet::new();
+    if let Some(schema) = resolve_schema(spec, sref, REF_DEPTH_CAP)
+        && let openapiv3::SchemaKind::Type(openapiv3::Type::Object(obj)) = &schema.schema_kind
+    {
+        for (name, prop) in &obj.properties {
+            fields.insert(name.clone(), prop_type_name(prop));
+        }
+        required.extend(obj.required.iter().cloned());
+    }
+    (fields, required)
+}
+
+/// Pull the application/json object shape from a request/response content map.
+/// Generic over the map so we don't need to name `indexmap::IndexMap` directly.
+fn json_shape<'a>(
+    spec: &openapiv3::OpenAPI,
+    content: impl IntoIterator<Item = (&'a String, &'a openapiv3::MediaType)>,
+) -> Option<(
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeSet<String>,
+)> {
+    let mut chosen: Option<&openapiv3::MediaType> = None;
+    for (ct, media) in content {
+        if ct == "application/json" {
+            chosen = Some(media);
+            break;
+        }
+        chosen.get_or_insert(media);
+    }
+    let schema = chosen?.schema.as_ref()?;
+    Some(object_fields(spec, schema))
+}
+
+/// Build the per-operation shapes for a parsed OpenAPI spec.
+fn spec_shapes(spec: &openapiv3::OpenAPI) -> std::collections::BTreeMap<(String, String), OpShape> {
+    let mut out = std::collections::BTreeMap::new();
+    for (raw_path, item) in spec.paths.iter() {
+        let openapiv3::ReferenceOr::Item(pi) = item else {
+            continue;
+        };
+        let norm = normalize_http_path(raw_path);
+        let ops: [(&str, &Option<openapiv3::Operation>); 5] = [
+            ("GET", &pi.get),
+            ("PUT", &pi.put),
+            ("POST", &pi.post),
+            ("DELETE", &pi.delete),
+            ("PATCH", &pi.patch),
+        ];
+        for (verb, op) in ops {
+            let Some(op) = op else { continue };
+            let mut shape = OpShape::default();
+            // Request body.
+            if let Some(openapiv3::ReferenceOr::Item(rb)) = &op.request_body
+                && let Some((f, r)) = json_shape(spec, &rb.content)
+            {
+                shape.req_fields = f;
+                shape.req_required = r;
+            }
+            // First 2xx response with a JSON body.
+            for (code, resp) in &op.responses.responses {
+                let is_2xx = matches!(code, openapiv3::StatusCode::Code(c) if (200..300).contains(c))
+                    || matches!(code, openapiv3::StatusCode::Range(2));
+                if is_2xx
+                    && let openapiv3::ReferenceOr::Item(r) = resp
+                    && let Some((f, _)) = json_shape(spec, &r.content)
+                {
+                    shape.resp_fields = f;
+                    break;
+                }
+            }
+            out.insert((verb.to_string(), norm.clone()), shape);
+        }
+    }
+    out
+}
+
+fn parse_openapi(path: &str, source: &str) -> Option<openapiv3::OpenAPI> {
+    match spec_kind(path) {
+        Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str(source).ok(),
+        Some(SpecFileKind::OpenApiJson) => serde_json::from_str(source).ok(),
+        _ => None,
+    }
+}
+
+/// Compare a base and head OpenAPI spec, classifying each operation/field/type
+/// difference. Returns `None` if either file is not a parseable OpenAPI spec.
+pub fn diff_openapi(
+    base_path: &str,
+    base_src: &str,
+    head_path: &str,
+    head_src: &str,
+) -> Option<Vec<SpecChange>> {
+    let base = parse_openapi(base_path, base_src)?;
+    let head = parse_openapi(head_path, head_src)?;
+    let base_ops = spec_shapes(&base);
+    let head_ops = spec_shapes(&head);
+    let mut changes = Vec::new();
+
+    for (key, b) in &base_ops {
+        let (verb, path) = key;
+        let push = |changes: &mut Vec<SpecChange>, sev, detail: String| {
+            changes.push(SpecChange {
+                severity: sev,
+                verb: verb.clone(),
+                path: path.clone(),
+                detail,
+            });
+        };
+        let Some(h) = head_ops.get(key) else {
+            push(
+                &mut changes,
+                SpecChangeSeverity::Breaking,
+                "endpoint removed".to_string(),
+            );
+            continue;
+        };
+        // Response fields: removal or type change breaks consumers.
+        for (name, btype) in &b.resp_fields {
+            match h.resp_fields.get(name) {
+                None => push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("response field '{name}' removed"),
+                ),
+                Some(htype) if htype != btype => push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("response field '{name}' type changed ({btype} -> {htype})"),
+                ),
+                _ => {}
+            }
+        }
+        for name in h.resp_fields.keys() {
+            if !b.resp_fields.contains_key(name) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Info,
+                    format!("response field '{name}' added"),
+                );
+            }
+        }
+        // Request fields: a type change or a NEWLY-required field breaks callers.
+        for (name, btype) in &b.req_fields {
+            if let Some(htype) = h.req_fields.get(name)
+                && htype != btype
+            {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("request field '{name}' type changed ({btype} -> {htype})"),
+                );
+            }
+        }
+        for name in &h.req_required {
+            let newly_required = !b.req_required.contains(name);
+            if newly_required {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("request field '{name}' is now required"),
+                );
+            }
+        }
+        for name in h.req_fields.keys() {
+            if !b.req_fields.contains_key(name) && !h.req_required.contains(name) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Info,
+                    format!("optional request field '{name}' added"),
+                );
+            }
+        }
+    }
+    // Added endpoints.
+    for key in head_ops.keys() {
+        if !base_ops.contains_key(key) {
+            changes.push(SpecChange {
+                severity: SpecChangeSeverity::Info,
+                verb: key.0.clone(),
+                path: key.1.clone(),
+                detail: "endpoint added".to_string(),
+            });
+        }
+    }
+    changes.sort_by(|a, b| {
+        (a.severity as u8, &a.path, &a.verb, &a.detail).cmp(&(
+            b.severity as u8,
+            &b.path,
+            &b.verb,
+            &b.detail,
+        ))
+    });
+    Some(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +1095,141 @@ mod tests {
         // the base path.
         let method_only = "@RestController\npublic class C {\n  @RequestMapping(method = RequestMethod.GET, path = \"/foo\")\n  void foo() {}\n}";
         assert_eq!(extract_base_path("spring", method_only), "");
+    }
+
+    #[test]
+    fn diff_openapi_classifies_field_level_changes() {
+        let base = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /pay:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: {type: integer}
+                note: {type: string}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  status: {type: string}
+  /old:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let head = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /pay:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, currency]
+              properties:
+                amount: {type: string}
+                currency: {type: string}
+                note: {type: string}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  extra: {type: string}
+  /new:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let changes = diff_openapi("openapi.yaml", base, "openapi.yaml", head).expect("parses");
+        let breaking: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.severity == SpecChangeSeverity::Breaking)
+            .map(|c| c.detail.as_str())
+            .collect();
+        let info: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.severity == SpecChangeSeverity::Info)
+            .map(|c| c.detail.as_str())
+            .collect();
+
+        // Four genuine breaks.
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("'amount' type changed (integer -> string)")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("'currency' is now required")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("response field 'status' removed")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking.iter().any(|d| d.contains("endpoint removed")),
+            "{breaking:?}"
+        );
+        assert_eq!(breaking.len(), 4, "unexpected breaking set: {breaking:?}");
+
+        // Compatible additions are INFO, not breaking.
+        assert!(
+            info.iter()
+                .any(|d| d.contains("response field 'extra' added"))
+        );
+        assert!(info.iter().any(|d| d.contains("endpoint added")));
+        // A new required field must NOT also be double-reported as "optional added".
+        assert!(!info.iter().any(|d| d.contains("'currency'")), "{info:?}");
+    }
+
+    #[test]
+    fn diff_openapi_no_changes_is_empty() {
+        let spec = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {type: object, properties: {id: {type: string}}}
+"#;
+        let changes = diff_openapi("openapi.yaml", spec, "openapi.yaml", spec).expect("parses");
+        assert!(
+            changes.is_empty(),
+            "identical specs should have no changes: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn diff_openapi_returns_none_for_non_openapi() {
+        assert!(diff_openapi("notes.md", "# hi", "notes.md", "# hi").is_none());
     }
 
     #[test]
