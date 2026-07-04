@@ -3288,10 +3288,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args) {
+                    let map = value["map"].as_str().unwrap_or("");
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Match the direct path's {map, token_count} shape — the daemon tool
+                        // returns only {map}, so compute token_count the same way here.
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "map": map,
+                                "token_count": map.len().div_ceil(4),
+                            }))?
+                        );
                     } else {
-                        print!("{}", value["map"].as_str().unwrap_or(""));
+                        print!("{map}");
                     }
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -5538,7 +5547,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "search_symbols", args)
                 {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Normalize to the same bare-array shape the direct path emits (below):
+                        // unwrap the {results, _meta} hybrid envelope so `search --json` yields
+                        // the same JSON whether or not the daemon is up.
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&unwrap_hybrid_payload(value))?
+                        );
                     } else {
                         let candidates = hybrid_search_candidates_from_value(value);
                         if candidates.is_empty() {

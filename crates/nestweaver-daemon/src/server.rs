@@ -259,18 +259,11 @@ impl DaemonService {
             // In server mode, clamp depth and result limits per safeguard config
             // before passing to the tool handler.
             let mut args = args;
-            // Hard-cap traversal depth in ALL modes (local + server): a huge
-            // client-supplied depth can overflow the stack in recursive traces
-            // (build_flow_tree / walk_trace) or run the graph away in impact BFS.
-            // Server mode further tightens this via the safeguard config below.
-            const HARD_MAX_DEPTH: u64 = 64;
-            for key in ["depth", "max_depth"] {
-                if let Some(n) = args.get(key).and_then(|v| v.as_u64())
-                    && n > HARD_MAX_DEPTH
-                {
-                    args[key] = serde_json::json!(HARD_MAX_DEPTH);
-                }
-            }
+            // Hard-cap traversal depth in ALL modes (local + server) before dispatch — a huge
+            // client-supplied depth can overflow the stack in recursive traces (build_flow_tree /
+            // walk_trace) or run the graph away in impact BFS. Server mode further tightens this
+            // via the safeguard config below.
+            clamp_traversal_depth(&mut args);
             let depth_result = if state.server_mode {
                 // Clamp depth parameter.
                 let client_depth = args
@@ -3951,6 +3944,41 @@ fn build_repo_types(
             )
         })
         .collect()
+}
+
+/// Hard upper bound on client/peer-supplied traversal depth, enforced in ALL modes.
+const HARD_MAX_DEPTH: u64 = 64;
+
+/// Clamp the `depth`/`max_depth` args at [`HARD_MAX_DEPTH`] before dispatch. A huge depth can
+/// overflow the stack in the recursive trace builders (build_flow_tree / walk_trace) or run the
+/// graph away in impact BFS. Values under the cap, missing keys, and non-numeric values are
+/// left untouched.
+fn clamp_traversal_depth(args: &mut serde_json::Value) {
+    for key in ["depth", "max_depth"] {
+        if let Some(n) = args.get(key).and_then(|v| v.as_u64())
+            && n > HARD_MAX_DEPTH
+        {
+            args[key] = serde_json::json!(HARD_MAX_DEPTH);
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_huge_depth_leaves_small_and_nonnumeric_alone() {
+        let mut a = serde_json::json!({ "depth": 2_000_000_000u64, "max_depth": 5, "other": 1 });
+        clamp_traversal_depth(&mut a);
+        assert_eq!(a["depth"], serde_json::json!(HARD_MAX_DEPTH));
+        assert_eq!(a["max_depth"], serde_json::json!(5)); // under the cap → untouched
+        assert_eq!(a["other"], serde_json::json!(1)); // unrelated key → untouched
+
+        let mut b = serde_json::json!({ "depth": "not-a-number" });
+        clamp_traversal_depth(&mut b);
+        assert_eq!(b["depth"], serde_json::json!("not-a-number"));
+    }
 }
 
 /// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
