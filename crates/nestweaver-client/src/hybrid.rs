@@ -524,16 +524,23 @@ impl HybridClient {
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "merge: server query failed, using local only");
-                // Consistent with the primary/fallback path: a failed live
-                // query passively ejects the upstream (subject to the cap) so
-                // the background task can re-probe and recover it. Eject the
-                // exact handle this task queried.
-                if let Some(idx) = selected_idx {
-                    eject_with_cap(
-                        &self.upstreams[idx],
-                        &self.upstreams,
-                        &self.ejection_guard,
-                        "merge query failed",
+                // Consistent with the primary/fallback path: only a genuine outage
+                // passively ejects the upstream (subject to the cap) so the background
+                // task can re-probe and recover it. A healthy server that rejects the
+                // query stays in rotation. Eject the exact handle this task queried.
+                if is_upstream_down(&e) {
+                    if let Some(idx) = selected_idx {
+                        eject_with_cap(
+                            &self.upstreams[idx],
+                            &self.upstreams,
+                            &self.ejection_guard,
+                            "merge query failed",
+                        );
+                    }
+                } else {
+                    warn!(
+                        error = %e,
+                        "merge: upstream rejected query (server healthy — not ejecting); check auth token / arguments"
                     );
                 }
                 let mut result = local;
@@ -701,12 +708,23 @@ impl HybridClient {
             }
             Ok(Err(e)) => {
                 debug!(upstream = %upstream.name, error = %e, "upstream query failed");
-                eject_with_cap(
-                    upstream,
-                    &self.upstreams,
-                    &self.ejection_guard,
-                    "query failed",
-                );
+                // Only eject on a genuine outage. A healthy server that rejects the query
+                // (auth/bad-request/internal) must stay in rotation — ejecting it would
+                // silently pull a working upstream for the cooldown.
+                if is_upstream_down(&e) {
+                    eject_with_cap(
+                        upstream,
+                        &self.upstreams,
+                        &self.ejection_guard,
+                        "query failed",
+                    );
+                } else {
+                    warn!(
+                        upstream = %upstream.name,
+                        error = %e,
+                        "upstream rejected query (server healthy — not ejecting); check auth token / arguments"
+                    );
+                }
                 Err(e)
             }
             Err(_) => {
@@ -771,6 +789,31 @@ impl HybridClient {
 /// is the only thing the query hot path does for staleness.
 fn read_stale_verdict(verdict: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     verdict.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Classify whether an upstream query error means the server is DOWN (unreachable / timed out /
+/// connection reset) versus a rejection from a HEALTHY server (auth failed, bad request,
+/// server-side error). Only the former should passively eject the upstream: ejecting a healthy
+/// server for an expired token or an `InvalidArgument` would pull a working server out of
+/// rotation for the whole cooldown, indistinguishable from a real outage. Either way the query
+/// still degrades to local — but a healthy upstream stays in rotation so the next query retries
+/// it (and a persistent auth failure keeps surfacing in the logs, which is the actionable signal).
+fn is_upstream_down(err: &anyhow::Error) -> bool {
+    match err.chain().find_map(|e| e.downcast_ref::<tonic::Status>()) {
+        // A gRPC status means the request reached a live server and it answered. Only
+        // Unavailable (can't serve / still connecting) and DeadlineExceeded (too slow)
+        // mean the server is effectively down for routing purposes.
+        Some(status) => code_is_down(status.code()),
+        // No gRPC status in the chain → a transport/connection error (connect refused, broken
+        // pipe, reset) surfaced as a plain io/hyper error → the server is unreachable.
+        None => true,
+    }
+}
+
+/// Whether a raw gRPC status code means the upstream is down (vs a rejection from a live
+/// server). Shared by [`is_upstream_down`] and the paths that hold a `tonic::Status` directly.
+fn code_is_down(code: tonic::Code) -> bool {
+    matches!(code, tonic::Code::Unavailable | tonic::Code::DeadlineExceeded)
 }
 
 /// Passively eject `upstream` after a failed live query, honoring the
@@ -2160,12 +2203,32 @@ pub async fn flow_trace_with_stitching(
                     error = %e,
                     "FlowTraceContinue failed"
                 );
+                // A genuine outage here would otherwise never eject this upstream (this path
+                // doesn't go through query_upstream), leaving a dead server "healthy" for any
+                // client that only ever calls flow_trace. Eject on down and stop the loop —
+                // the remaining boundaries would hit the same dead server.
+                if code_is_down(e.code()) {
+                    eject_with_cap(
+                        upstream,
+                        &client.upstreams,
+                        &client.ejection_guard,
+                        "flow_trace continue failed",
+                    );
+                    break;
+                }
             }
             Err(_) => {
                 debug!(
                     boundary = %boundary.canonical_id,
                     "FlowTraceContinue timed out"
                 );
+                eject_with_cap(
+                    upstream,
+                    &client.upstreams,
+                    &client.ejection_guard,
+                    "flow_trace continue timed out",
+                );
+                break;
             }
         }
     }
@@ -2253,10 +2316,26 @@ pub async fn two_tier_query(
         }
         Ok(Err(e)) => {
             debug!(error = %e, tool = %tool, "org-wide two-tier query failed");
+            // Eject on a genuine outage so a dead server used only via blast_radius/impact
+            // doesn't stay "healthy" and time out every call (this path bypasses query_upstream).
+            if is_upstream_down(&e) {
+                eject_with_cap(
+                    upstream,
+                    &client.upstreams,
+                    &client.ejection_guard,
+                    "two-tier query failed",
+                );
+            }
             None
         }
         Err(_) => {
             debug!(tool = %tool, "org-wide two-tier query timed out");
+            eject_with_cap(
+                upstream,
+                &client.upstreams,
+                &client.ejection_guard,
+                "two-tier query timed out",
+            );
             None
         }
     };

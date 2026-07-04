@@ -39,13 +39,17 @@ impl DaemonClient {
         let sock_path = autostart::ensure_daemon(db_path, config_path)?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
 
-        // Version check.
-        let resp = client
-            .inner
-            .health_check(nestweaver_proto::HealthCheckRequest {})
-            .await
-            .context("health check failed")?
-            .into_inner();
+        // Version check. Bounded so a connected-but-unresponsive daemon can't hang connect().
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .inner
+                .health_check(nestweaver_proto::HealthCheckRequest {}),
+        )
+        .await
+        .context("health check timed out — daemon connected but unresponsive")?
+        .context("health check failed")?
+        .into_inner();
 
         let our_version = env!("CARGO_PKG_VERSION");
         if resp.version != our_version {
@@ -62,7 +66,7 @@ impl DaemonClient {
                 .await;
 
             // Wait for the daemon process to exit.
-            Self::wait_for_exit(db_path)?;
+            Self::wait_for_exit(db_path).await?;
 
             // Re-start and reconnect.
             let sock_path = autostart::ensure_daemon(db_path, config_path)?;
@@ -92,6 +96,10 @@ impl DaemonClient {
         let path = sock_path.clone();
         let channel = Endpoint::try_from("http://[::]:50051")
             .context("failed to create endpoint")?
+            // Bound connection establishment so a wedged/half-open socket can't hang the
+            // client forever. Per-RPC timeouts are applied by callers (query paths) rather
+            // than here, so long-running RPCs (index/embed/backup) aren't capped.
+            .connect_timeout(std::time::Duration::from_secs(5))
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = path.clone();
                 async move {
@@ -110,8 +118,9 @@ impl DaemonClient {
     }
 
     /// Wait for the daemon to exit after a Shutdown RPC was sent.
-    /// Falls back to SIGKILL after the drain ceiling + buffer.
-    fn wait_for_exit(db_path: &Path) -> Result<()> {
+    /// Falls back to SIGKILL after the drain ceiling + buffer. Async so the drain wait
+    /// (up to the drain ceiling) yields the tokio worker instead of blocking it.
+    async fn wait_for_exit(db_path: &Path) -> Result<()> {
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
@@ -126,7 +135,7 @@ impl DaemonClient {
         while start.elapsed() < timeout {
             match autostart::read_pid(&pidfile) {
                 Some(pid) if autostart::is_process_alive(pid) => {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 _ => break,
             }
@@ -141,7 +150,7 @@ impl DaemonClient {
                 ceiling, "daemon did not exit after drain timeout — sending SIGKILL"
             );
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
         // Clean up socket.

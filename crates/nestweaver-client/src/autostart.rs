@@ -80,15 +80,43 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     // can acquire the lock.
     stop_legacy_daemon(&instance_id);
 
-    // Release the flock before spawning so the daemon can acquire it.
+    // Release the pidfile flock before spawning so the daemon can acquire it for its lifetime.
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(file);
+
+    // Serialize concurrent auto-starts on a SEPARATE spawn-lock. The pidfile flock had to be
+    // released above for the daemon to take it, which opens a window where a fleet of clients
+    // starting at once could each spawn a daemon (only the DB write-lock would then absorb the
+    // pile-up). Holding this blocking lock across spawn + socket-wait, with a re-check, means
+    // exactly one client spawns and the rest observe the started daemon. Acquired AFTER releasing
+    // the pidfile flock so the spawned daemon can take that flock (otherwise: deadlock).
+    let spawn_lock_path = pidfile.with_extension("spawnlock");
+    let spawn_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&spawn_lock_path)
+        .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
+    if unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!("flock on spawn lock failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Re-check: another client may have started the daemon while we waited for the spawn-lock.
+    if sock.exists() {
+        unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
+        debug!("daemon started by a concurrent client while awaiting spawn lock");
+        return Ok(sock);
+    }
 
     // Spawn the daemon as a detached child.
     spawn_daemon(db_path, config_path)?;
 
-    // Poll for socket to appear.
-    wait_for_socket(&sock)?;
+    // Poll for socket to appear, then release the spawn-lock so the next waiter's re-check
+    // observes the running daemon (its socket) instead of spawning another.
+    let waited = wait_for_socket(&sock);
+    unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
+    waited?;
 
     info!("daemon started, socket at {}", sock.display());
     Ok(sock)
