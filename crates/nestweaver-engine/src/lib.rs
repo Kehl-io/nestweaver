@@ -227,7 +227,7 @@ pub use suggest::{
 };
 pub use summaries::{
     Summary, SummaryLevel, SummaryStore, filter_by_target, generate_summaries, load_summaries,
-    render_text, save_summaries, truncate_to_budget,
+    merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};

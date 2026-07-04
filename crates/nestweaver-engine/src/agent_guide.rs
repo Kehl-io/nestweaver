@@ -792,7 +792,9 @@ fn hub_summary_line(s: &crate::summaries::Summary) -> String {
 /// scan), otherwise computed live and written back (best-effort) to warm the
 /// cache for the next caller. Returns an empty list when nothing is indexed.
 fn architecture_hub_lines(store: &GraphStore) -> Vec<String> {
-    use crate::summaries::{SummaryLevel, generate_summaries, load_summaries, save_summaries};
+    use crate::summaries::{
+        SummaryLevel, generate_summaries, load_summaries, merge_and_save_summaries,
+    };
 
     // Warm cache: generation gating in `load_summaries` guarantees these are
     // never stale relative to the graph.
@@ -816,18 +818,12 @@ fn architecture_hub_lines(store: &GraphStore) -> Vec<String> {
     match generate_summaries(store, SummaryLevel::Hub) {
         Ok(hub_summaries) if !hub_summaries.is_empty() => {
             if let Some(db) = store.db_path() {
-                let generation = store.graph_generation();
-                let mut all: Vec<crate::summaries::Summary> = match load_summaries(db, generation) {
-                    Ok(Some(existing)) => existing
-                        .into_iter()
-                        .filter(|s| s.level != SummaryLevel::Hub)
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                all.extend(hub_summaries.iter().cloned());
-                if let Err(e) = save_summaries(db, generation, &all) {
-                    tracing::warn!("agent guide: failed to warm summaries sidecar: {e}");
-                }
+                merge_and_save_summaries(
+                    db,
+                    store.graph_generation(),
+                    SummaryLevel::Hub,
+                    &hub_summaries,
+                );
             }
             hub_summaries
                 .iter()

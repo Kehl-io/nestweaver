@@ -5688,7 +5688,7 @@ fn tool_schema_get_summary() -> Value {
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::{load_summaries, save_summaries};
+    use nestweaver_engine::{load_summaries, merge_and_save_summaries};
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
@@ -5727,22 +5727,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         (fresh, false)
     };
 
-    // Persist freshly generated summaries so subsequent calls hit the cache.
+    // Persist freshly generated summaries so subsequent calls hit the cache,
+    // preserving cached entries at other levels (shared invariant).
     if !from_cache && let Some(ref db) = db_path {
-        // Merge with any existing cached summaries at other levels.
-        let mut all = if let Ok(Some(existing)) = load_summaries(db, store.graph_generation()) {
-            existing
-                .into_iter()
-                .filter(|s| s.level != level)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        all.extend(summaries.iter().cloned());
-        // Best-effort save; don't fail the tool call on I/O error.
-        if let Err(e) = save_summaries(db, store.graph_generation(), &all) {
-            tracing::warn!("failed to save summaries sidecar: {e}");
-        }
+        merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
     }
 
     let total_available = summaries.len();

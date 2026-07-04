@@ -421,6 +421,30 @@ pub fn save_summaries(db_path: &Path, graph_generation: u64, summaries: &[Summar
     Ok(())
 }
 
+/// Warm the sidecar with freshly generated `fresh` summaries for `level`,
+/// preserving any cached entries at OTHER levels, then persist. Best-effort:
+/// a load miss/mismatch starts from empty and a save error is logged and
+/// swallowed so warming the cache never fails the caller.
+///
+/// Both `get_summary` (MCP) and the agent-guide Architecture section warm the
+/// cache after a cold read; centralizing the "keep other levels, replace this
+/// level, save" invariant here keeps the two from drifting.
+pub fn merge_and_save_summaries(
+    db_path: &Path,
+    generation: u64,
+    level: SummaryLevel,
+    fresh: &[Summary],
+) {
+    let mut all: Vec<Summary> = match load_summaries(db_path, generation) {
+        Ok(Some(existing)) => existing.into_iter().filter(|s| s.level != level).collect(),
+        _ => Vec::new(),
+    };
+    all.extend(fresh.iter().cloned());
+    if let Err(e) = save_summaries(db_path, generation, &all) {
+        tracing::warn!("failed to warm summaries sidecar (level {level:?}): {e}");
+    }
+}
+
 /// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar is
 /// missing OR was built from a different graph generation than
 /// `expected_generation` — a mismatch is treated as a miss so a reindex never
