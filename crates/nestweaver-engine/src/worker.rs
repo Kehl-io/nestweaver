@@ -388,6 +388,16 @@ impl WorkerPool {
                         let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
                         tracing::info!(repo = job.repo_id, "index cancelled");
                     }
+                    Ok(Err(e)) if is_circuit_open_error(&e) => {
+                        // The per-host circuit breaker rejected the fetch: the
+                        // remote host is down and the work never ran. Defer
+                        // WITHOUT counting the attempt so a transient outage
+                        // doesn't dead-letter every repo on that host; it retries
+                        // once the breaker cools down.
+                        let q = queue.lock().expect("job queue lock poisoned");
+                        let _ = q.defer(job.id, job.claimed_by.as_deref());
+                        tracing::debug!(repo = job.repo_id, error = %e, "deferred: remote circuit open");
+                    }
                     Ok(Err(e)) => {
                         let is_poison = is_poison_error(&e);
                         let q = queue.lock().expect("job queue lock poisoned");
@@ -777,6 +787,14 @@ fn is_poison_error(e: &anyhow::Error) -> bool {
         || msg.contains("not found")
         || msg.contains("authentication")
         || msg.contains("permission denied")
+}
+
+/// Whether an error is the per-host circuit breaker rejecting the fetch (the
+/// host is down and the work never ran) rather than a real fetch failure. Such a
+/// rejection must not count as a retry attempt. Matches
+/// `CircuitBreakerError::CircuitOpen`'s Display ("circuit breaker open for host: …").
+fn is_circuit_open_error(e: &anyhow::Error) -> bool {
+    e.to_string().to_lowercase().contains("circuit breaker open")
 }
 
 #[cfg(test)]

@@ -477,6 +477,34 @@ impl JobQueue {
         Ok(())
     }
 
+    /// Return a `running` job to `pending` WITHOUT counting the attempt, for the
+    /// case where the work never actually ran — specifically when the per-host
+    /// circuit breaker rejected the fetch because the remote host is down.
+    ///
+    /// `claim_next` bumped `attempt` on the claim, so this decrements it to keep
+    /// the net effect zero: a transient host outage must NOT burn a repo's retry
+    /// budget and dead-letter it (a single 60s github.com blip would otherwise
+    /// dead-letter every repo on that host). `created_at` is bumped so the
+    /// deferred job rotates to the back of its priority tier rather than being
+    /// immediately re-claimed ahead of everything else. CAS-guarded on the
+    /// running status + fencing token, like `fail`, so a cancelled/reclaimed job
+    /// is left untouched.
+    pub fn defer(&self, job_id: i64, claimed_by: Option<&str>) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE index_jobs
+             SET status           = 'pending',
+                 attempt          = MAX(0, attempt - 1),
+                 claimed_by       = NULL,
+                 lease_expires_at = NULL,
+                 started_at       = NULL,
+                 created_at       = strftime('%s','now'),
+                 updated_at       = strftime('%s','now')
+             WHERE id = ?1 AND status = 'running' AND claimed_by IS ?2",
+            params![job_id, claimed_by],
+        )?;
+        Ok(())
+    }
+
     /// Recover stale running jobs (crash recovery).
     ///
     /// Any job with `status='running'` and `started_at` older than
@@ -1295,6 +1323,39 @@ mod tests {
 
         let job = q.claim_next(0).unwrap().unwrap();
         assert_eq!(job.attempt, 1, "first claim should set attempt to 1");
+    }
+
+    #[test]
+    fn defer_does_not_burn_the_retry_budget() {
+        // A circuit-open deferral must be net-zero on `attempt` so a transient
+        // host outage can't dead-letter a repo after a few claim/defer cycles.
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+
+        // Simulate several claim -> circuit-open -> defer cycles.
+        for _ in 0..10 {
+            let job = q.claim_next(0).unwrap().unwrap();
+            assert_eq!(job.attempt, 1, "claim bumps attempt to 1");
+            q.defer(job.id, job.claimed_by.as_deref()).unwrap();
+        }
+
+        // After 10 deferrals the job is still pending and has NOT accrued attempts
+        // toward its max (which fail() would have, dead-lettering it long ago).
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(
+            job.attempt, 1,
+            "attempt must stay at 1 across deferrals (claim +1, defer -1)"
+        );
+        assert!(
+            job.attempt < 4,
+            "deferrals must not reach max_attempts / dead-letter"
+        );
     }
 
     #[test]
