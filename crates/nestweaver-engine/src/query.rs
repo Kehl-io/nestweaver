@@ -130,11 +130,53 @@ pub enum LookupResult {
 /// - If `name_or_uid` contains `':'` it is treated as a UID and looked up exactly.
 /// - Otherwise a name lookup is performed; 0 matches → `NotFound`, 1 match → `Found`,
 ///   2+ matches → `Ambiguous`.
-pub fn lookup_symbol(store: &GraphStore, name_or_uid: &str) -> Result<LookupResult, anyhow::Error> {
+pub fn lookup_symbol(
+    store: &GraphStore,
+    name_or_uid: &str,
+    instance: Option<&str>,
+) -> Result<LookupResult, anyhow::Error> {
+    // When an instance filter is requested, validate it up front — an unknown instance is a
+    // user error (not an empty result) — and build a repo_uid -> instance_id map to scope
+    // matches. Symbols carry their instance via their repo.
+    let repo_instance = match instance {
+        Some(inst) => {
+            let repos = store
+                .list_repos(None)
+                .context("list repos for --instance filter")?;
+            let known: std::collections::HashSet<&str> =
+                repos.iter().map(|r| r.instance_id.as_str()).collect();
+            if !known.contains(inst) {
+                let mut valid: Vec<&str> = known.into_iter().collect();
+                valid.sort_unstable();
+                anyhow::bail!(
+                    "unknown instance '{inst}'; valid instances: {}",
+                    valid.join(", ")
+                );
+            }
+            Some(
+                repos
+                    .into_iter()
+                    .map(|r| (r.uid, r.instance_id))
+                    .collect::<std::collections::HashMap<String, String>>(),
+            )
+        }
+        None => None,
+    };
+    let in_instance = |repo_uid: &str| -> bool {
+        match (&repo_instance, instance) {
+            (Some(map), Some(inst)) => map.get(repo_uid).map(|i| i == inst).unwrap_or(false),
+            _ => true,
+        }
+    };
+
     if name_or_uid.contains(':') {
         // UID path
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => {
+                // A UID in another instance is "not found" under this filter.
+                if !in_instance(&sym.repo_uid) {
+                    return Ok(LookupResult::NotFound);
+                }
                 let callers = store.callers_of(&sym.uid).context("fetch callers")?;
                 let callees = store.callees_of(&sym.uid).context("fetch callees")?;
                 Ok(LookupResult::Found(Box::new(SymbolDetail {
@@ -148,9 +190,12 @@ pub fn lookup_symbol(store: &GraphStore, name_or_uid: &str) -> Result<LookupResu
         }
     } else {
         // Name path
-        let matches = store
+        let matches: Vec<_> = store
             .lookup_symbols_by_name(name_or_uid)
-            .context("name lookup")?;
+            .context("name lookup")?
+            .into_iter()
+            .filter(|s| in_instance(&s.repo_uid))
+            .collect();
 
         match matches.len() {
             0 => Ok(LookupResult::NotFound),

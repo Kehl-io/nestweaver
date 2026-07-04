@@ -2983,7 +2983,9 @@ impl NestWeaverDaemon for DaemonService {
                 .get("name_or_uid")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let lookup = nestweaver_engine::lookup_symbol(&state.store, name_or_uid)
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            // An unknown --instance surfaces here with a message listing valid instances.
+            let lookup = nestweaver_engine::lookup_symbol(&state.store, name_or_uid, instance)
                 .map_err(|e| Status::internal(format!("lookup_symbol failed: {e:#}")))?;
             // Serialize the LookupResult as a tagged JSON value.
             let value = match lookup {

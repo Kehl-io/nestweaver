@@ -5806,6 +5806,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
         Commands::Symbol {
             name_or_uid,
+            instance,
             json,
             db,
             ..
@@ -5813,7 +5814,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                let args = serde_json::json!({ "name_or_uid": name_or_uid });
+                let mut args = serde_json::json!({ "name_or_uid": name_or_uid });
+                if let Some(ref inst) = instance {
+                    args["instance"] = serde_json::json!(inst);
+                }
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "symbol_lookup", args)
                 {
@@ -5920,7 +5924,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(db.as_deref())?;
-            let result = lookup_symbol(&store, &name_or_uid)?;
+            let result = lookup_symbol(&store, &name_or_uid, instance.as_deref())?;
 
             match result {
                 LookupResult::Found(detail) => {
