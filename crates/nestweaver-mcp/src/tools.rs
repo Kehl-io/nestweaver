@@ -3717,7 +3717,46 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .unwrap_or_else(configured_result_limit);
     let concise = is_concise(&args);
 
-    let uid = resolve_symbol_uid(store, symbol)?;
+    // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
+    // contract in daemon mode, instead of the daemon path silently returning the best of
+    // several matches (which diverged from the direct path).
+    let uid = if symbol.contains(':') {
+        symbol.to_string()
+    } else {
+        let matches = store
+            .lookup_symbols_by_name(symbol)
+            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+        match matches.len() {
+            0 => {
+                return Ok(json!({
+                    "status": "not_found",
+                    "symbol": symbol,
+                    "impact_nodes": [],
+                    "total": 0,
+                    "returned": 0,
+                }));
+            }
+            1 => matches.into_iter().next().unwrap().uid,
+            _ => {
+                let candidates: Vec<Value> = matches
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "uid": s.uid,
+                            "name": s.name,
+                            "file_path": s.file_path,
+                            "start_line": s.start_line,
+                        })
+                    })
+                    .collect();
+                return Ok(json!({
+                    "status": "ambiguous",
+                    "symbol": symbol,
+                    "candidates": candidates,
+                }));
+            }
+        }
+    };
 
     let nodes = store.impact(&uid, depth, 0.0)?;
     let total = nodes.len();
@@ -3748,6 +3787,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .collect();
 
     Ok(json!({
+        "status": "ok",
         "target": uid,
         "impact_nodes": rows,
         "total": total,

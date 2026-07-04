@@ -6491,6 +6491,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "min_confidence": confidence,
                     }),
                 ) {
+                    // Honor the daemon tool's status so daemon mode matches the direct path's
+                    // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
+                    match value.get("status").and_then(|v| v.as_str()) {
+                        Some("not_found") => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&value)?);
+                            } else if !out.quiet {
+                                println!("No symbol found: '{name_or_uid}'.");
+                            }
+                            return Ok((EXIT_NOT_FOUND, None));
+                        }
+                        Some("ambiguous") => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&value)?);
+                            } else if !out.quiet {
+                                println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
+                                if let Some(cands) =
+                                    value.get("candidates").and_then(|v| v.as_array())
+                                {
+                                    for c in cands {
+                                        let cname =
+                                            c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let fp = c
+                                            .get("file_path")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let ln = c
+                                            .get("start_line")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        println!("  {cname} ({fp}:{ln})");
+                                    }
+                                }
+                                println!("Disambiguate with --repo <name> or pass a full UID.");
+                            }
+                            return Ok((EXIT_AMBIGUOUS, None));
+                        }
+                        _ => {}
+                    }
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if let Some(arr) = value.get("impact_nodes") {
@@ -13821,6 +13860,32 @@ fn impact_item_to_result(
         affected_signature: item.affected_signature,
         severity,
         reason: item.reason,
+    }
+}
+
+#[cfg(test)]
+mod abs_for_daemon_tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_becomes_absolute_never_bare_relative() {
+        // The daemon runs with CWD=/ (launchd), so a relative path in an RPC would resolve
+        // against the wrong directory. abs_for_daemon must ALWAYS return an absolute path —
+        // even for a nonexistent path (canonicalize fails) it must join cwd, never echo the
+        // original relative path back.
+        let rel = std::path::Path::new("some/relative/does-not-exist-xyz");
+        let out = abs_for_daemon(rel);
+        assert!(
+            out.is_absolute(),
+            "abs_for_daemon must never return a relative path, got {}",
+            out.display()
+        );
+        assert!(out.ends_with("some/relative/does-not-exist-xyz"));
+
+        // An existing path canonicalizes to an absolute path.
+        let dir = std::env::temp_dir();
+        let out = abs_for_daemon(&dir);
+        assert!(out.is_absolute());
     }
 }
 
