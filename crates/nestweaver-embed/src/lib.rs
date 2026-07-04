@@ -67,8 +67,19 @@ impl EmbedModel {
         })
     }
 
+    /// Dimension of the LOCAL fallback model. NOTE: when an external endpoint is
+    /// configured, actual vectors come from the remote model via `embed()`, whose
+    /// dimension may differ — callers must not treat this as the effective query
+    /// dimension in that case (see `uses_external_endpoint`).
     pub fn dimension(&self) -> usize {
         self.local.dimension()
+    }
+
+    /// Whether this model produces vectors via a configured external endpoint
+    /// (remote model) rather than the local fallback. When true, `dimension()`
+    /// (the local dim) is NOT the effective query dimension.
+    pub fn uses_external_endpoint(&self) -> bool {
+        self.config.external_endpoint.is_some()
     }
 
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

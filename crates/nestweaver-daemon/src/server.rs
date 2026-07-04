@@ -4071,7 +4071,14 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     match loaded {
         Some(Ok(model)) => {
             tracing::info!(dim = model.dimension(), "Embedding model loaded");
-            if let Some(stored_dim) = state.store.embedding_index_dimension()
+            // Only the LOCAL model's dimension is comparable to the stored index.
+            // With an external endpoint, queries are embedded by the remote model
+            // (whatever dimension built the index), so the local dim is irrelevant
+            // — comparing it would falsely disable semantic search for every
+            // remote-embedded index. Any real remote/index dimension mismatch is
+            // handled gracefully at query time by the cosine length guard.
+            if !model.uses_external_endpoint()
+                && let Some(stored_dim) = state.store.embedding_index_dimension()
                 && stored_dim != model.dimension()
             {
                 tracing::warn!(
