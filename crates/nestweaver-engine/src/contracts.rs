@@ -385,14 +385,28 @@ fn first_string_arg(after: &str) -> Option<String> {
     let rest = &after[open + 1..];
     let close = rest.find(')')?;
     let inner = &rest[..close];
-    let inner = inner.trim();
-    // Strip a single layer of quotes (single, double, or backtick).
-    for q in ['"', '\'', '`'] {
-        if let Some(stripped) = inner.strip_prefix(q)
-            && let Some(val) = stripped.strip_suffix(q)
-        {
-            return Some(val.to_string());
+    // Return the FIRST quoted literal inside the annotation args. The old code
+    // required the ENTIRE paren body to be a single quoted string, so it missed
+    // the most common Spring forms — `@GetMapping(value = "/x")`,
+    // `@RequestMapping(path="/x", method=...)`, and array literals
+    // `@GetMapping({"/a","/b"})` — losing the path and manufacturing false drift
+    // (declared-not-implemented AND implemented-not-declared on the same route).
+    first_quoted_literal(inner)
+}
+
+/// Extract the contents of the first `"…"`, `'…'`, or `` `…` `` literal in `s`.
+/// UTF-8 safe: the quote chars are ASCII so all slice boundaries are valid.
+fn first_quoted_literal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' || c == b'`' {
+            let after = &s[i + 1..];
+            let rel = after.find(c as char)?; // unterminated → None
+            return Some(after[..rel].to_string());
         }
+        i += 1;
     }
     None
 }
@@ -702,6 +716,39 @@ pub fn drift_for_store(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn first_string_arg_handles_common_spring_forms() {
+        // Bare (the only form the old code handled).
+        assert_eq!(
+            first_string_arg("@GetMapping(\"/x\")").as_deref(),
+            Some("/x")
+        );
+        // Named arg — the common form the old code missed.
+        assert_eq!(
+            first_string_arg("@GetMapping(value = \"/x\")").as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            first_string_arg("@RequestMapping(path=\"/v1\", method=RequestMethod.GET)").as_deref(),
+            Some("/v1")
+        );
+        // Array literal — takes the first path.
+        assert_eq!(
+            first_string_arg("@GetMapping({\"/a\", \"/b\"})").as_deref(),
+            Some("/a")
+        );
+        // No string literal (e.g. only method= ...) → None, not a wrong path.
+        assert_eq!(
+            first_string_arg("@RequestMapping(method = RequestMethod.GET)"),
+            None
+        );
+        // Unicode inside quotes survives.
+        assert_eq!(
+            first_string_arg("@GetMapping(\"/café\")").as_deref(),
+            Some("/café")
+        );
+    }
 
     #[test]
     fn detects_spec_files_by_name() {
