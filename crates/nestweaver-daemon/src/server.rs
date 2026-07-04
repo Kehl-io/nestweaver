@@ -4433,6 +4433,11 @@ pub async fn run_server(
     // with FAILED_PRECONDITION before it reaches a handler; on a read-write
     // daemon it is a transparent pass-through. Applied once here so both the
     // TCP and UDS transports below inherit the same gate.
+    //
+    // NOTE: this guard covers the gRPC transport ONLY. The `/mcp` HTTP surface
+    // does NOT flow through it — its replica safety comes from the read-only
+    // store open plus the `MUTATING_TOOLS` permission gate in the MCP handler
+    // (see http.rs). Don't assume this guard wraps `/mcp`.
     let svc = ReadOnlyGuard::new(
         read_only,
         NestWeaverDaemonServer::new(DaemonService::new(state.clone()))

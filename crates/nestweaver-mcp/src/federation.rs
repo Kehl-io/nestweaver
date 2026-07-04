@@ -119,10 +119,13 @@ impl FederationState {
     /// Non-blocking read of the cached staleness verdict (the only thing the
     /// query hot path does for staleness — RFC 5861 stale-while-revalidate).
     pub fn stale_repos(&self) -> Vec<String> {
-        self.stale_repos
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        // Poison-tolerant, symmetric with `set_stale_repos`: recover the last
+        // good verdict via `into_inner()` rather than blanking it, so a panicked
+        // prior holder does not lose the staleness reporting.
+        match self.stale_repos.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Publish a freshly computed staleness verdict.
@@ -210,7 +213,7 @@ pub async fn federate_two_tier(
     }
 
     debug!(tool = %tool_name, "federating two-tier query at /mcp boundary");
-    let response = nestweaver_federation::two_tier::two_tier_query(
+    let mut response = nestweaver_federation::two_tier::two_tier_query(
         local,
         &fed.upstreams,
         &fed.ejection_guard,
@@ -225,6 +228,11 @@ pub async fn federate_two_tier(
     // (and a raced ejection yields `tier: "local_only"` with no
     // `org_wide_impact` at all) — both keep the single-node stamp so the
     // envelope provenance never claims a source that did not answer.
+    //
+    // An upstream that answered but whose rows were ALL locally deduped
+    // (`results` present but empty) still counts as a contributing source: the
+    // org tier DID answer and confirmed no additional org-wide impact, which is
+    // itself a meaningful, provenance-worthy verdict.
     let contributed = response
         .get("org_wide_impact")
         .map(|org| org.get("results").is_some())
@@ -238,7 +246,43 @@ pub async fn federate_two_tier(
     } else {
         None
     };
+
+    // Provenance honesty on the daemon `/mcp` path. `two_tier_query` stamps the
+    // INNER result `_meta` with UNPREFIXED provenance (`sources`/`scope`/
+    // `stale_repos`) — correct for the CLIENT path, where `HybridClient`
+    // returns that value directly. But on the daemon path the authoritative
+    // OUTER envelope `_meta` is stamped separately with namespaced
+    // `nestweaver.io/*` keys (`http.rs::add_provenance_metadata`). Shipping
+    // both means two provenance representations, and in the upstream-
+    // unavailable case the inner one still names the server as a source and
+    // claims scope "hybrid" — contradicting the honest outer single-node stamp.
+    // Strip the inner provenance keys so the namespaced outer `_meta` is the
+    // single source of truth on `/mcp`.
+    strip_inner_provenance_meta(&mut response);
     (response, source)
+}
+
+/// Remove the unprefixed provenance keys (`sources`, `scope`, `stale_repos`)
+/// that [`nestweaver_federation::two_tier::two_tier_query`] injects into a
+/// result's `_meta`. On the daemon `/mcp` path the namespaced outer envelope
+/// `_meta` (`nestweaver.io/*`) is the single source of truth, so this inner
+/// duplicate — which can contradict it when the upstream is unavailable — must
+/// not survive. Surgical: only those three provenance keys are touched; any
+/// other `_meta` a tool legitimately set (limits, `_clamped`, …) is preserved,
+/// and an `_meta` object left empty by the removal is dropped entirely.
+fn strip_inner_provenance_meta(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(meta) = obj.get_mut("_meta").and_then(Value::as_object_mut) else {
+        return;
+    };
+    meta.remove("sources");
+    meta.remove("scope");
+    meta.remove("stale_repos");
+    if meta.is_empty() {
+        obj.remove("_meta");
+    }
 }
 
 /// Spawn the background staleness/health maintenance task.
@@ -519,5 +563,72 @@ timeout = "2s"
         // The envelope still discloses the degradation in-band.
         assert_eq!(value["tier"], json!("two_tier"));
         assert_eq!(value["org_wide_impact"]["status"], json!("unavailable"));
+
+        // Provenance honesty (nw-017 fix): the INNER structuredContent._meta
+        // provenance that `two_tier_query` injects must be stripped on the
+        // daemon path, so it can't contradict the honest outer single-node
+        // stamp. In the upstream-unavailable case the inner block would have
+        // claimed sources `["local","server"]` and scope "hybrid" — none of
+        // that may survive here.
+        let meta = &value["_meta"];
+        assert!(
+            meta.get("sources").is_none(),
+            "inner _meta must not name any source, got {meta:?}"
+        );
+        assert!(
+            meta.get("scope").is_none(),
+            "inner _meta must not claim a scope, got {meta:?}"
+        );
+        assert!(
+            meta.get("stale_repos").is_none(),
+            "inner _meta must not carry stale_repos, got {meta:?}"
+        );
+    }
+
+    #[test]
+    fn strip_inner_provenance_meta_removes_only_provenance_keys() {
+        // Successful-federation shape: the two-tier envelope plus the inner
+        // provenance `two_tier_query` injects, alongside a legitimate non-
+        // provenance `_meta` entry a tool may have set (e.g. a limit clamp).
+        let mut value = json!({
+            "tier": "two_tier",
+            "local_impact": { "changed_symbols": [] },
+            "org_wide_impact": { "source_server": "acme", "results": [] },
+            "_meta": {
+                "sources": ["local", "acme"],
+                "scope": "hybrid",
+                "stale_repos": [],
+                "_clamped": true,
+                "limits": { "max_depth": 5 },
+            },
+        });
+        strip_inner_provenance_meta(&mut value);
+
+        // Outer two-tier contract is untouched.
+        assert_eq!(value["tier"], json!("two_tier"));
+        assert!(value["org_wide_impact"]["results"].is_array());
+        // Provenance keys gone; non-provenance _meta preserved.
+        let meta = &value["_meta"];
+        assert!(meta.get("sources").is_none());
+        assert!(meta.get("scope").is_none());
+        assert!(meta.get("stale_repos").is_none());
+        assert_eq!(meta["_clamped"], json!(true));
+        assert_eq!(meta["limits"]["max_depth"], json!(5));
+    }
+
+    #[test]
+    fn strip_inner_provenance_meta_drops_emptied_meta_object() {
+        // When `_meta` held only provenance, removing it should leave no empty
+        // `_meta` husk behind.
+        let mut value = json!({
+            "results": [],
+            "_meta": { "sources": ["local"], "scope": "local", "stale_repos": [] },
+        });
+        strip_inner_provenance_meta(&mut value);
+        assert!(
+            value.get("_meta").is_none(),
+            "an emptied _meta object must be removed entirely, got {value:?}"
+        );
+        assert!(value["results"].is_array(), "other fields must remain");
     }
 }

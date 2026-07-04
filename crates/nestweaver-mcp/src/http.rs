@@ -830,11 +830,12 @@ async fn handle_mcp(
             // the upstream with the SAME (post-safeguard) arguments the local
             // tier saw. Capture them now, before `arguments` is moved into the
             // blocking dispatch closure — but only when an upstream is actually
-            // configured, so the common single-node daemon pays no clone.
+            // configured, so the common single-node daemon pays no clone. The
+            // tool name is not captured here: `name` outlives the closure (only
+            // its `tool_name` clone is moved in), so the federation call borrows
+            // `&name` directly rather than cloning it a second time.
             #[cfg(feature = "daemon")]
-            let fed_capture = federation
-                .as_ref()
-                .map(|_| (name.clone(), arguments.clone()));
+            let fed_capture = federation.as_ref().map(|_| arguments.clone());
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
@@ -881,11 +882,10 @@ async fn handle_mcp(
                     // stamped on every result (empty without an upstream).
                     #[cfg(feature = "daemon")]
                     let (value, upstream_source, stale_repos) = match (&federation, fed_capture) {
-                        (Some(fed), Some((fed_tool, fed_args))) => {
-                            let (v, src) = crate::federation::federate_two_tier(
-                                fed, &fed_tool, &fed_args, value,
-                            )
-                            .await;
+                        (Some(fed), Some(fed_args)) => {
+                            let (v, src) =
+                                crate::federation::federate_two_tier(fed, &name, &fed_args, value)
+                                    .await;
                             (v, src, fed.stale_repos())
                         }
                         _ => (value, None, Vec::new()),
@@ -922,7 +922,12 @@ async fn handle_mcp(
                     // Trip the shared flag so the still-running blocking walk
                     // stops cooperatively instead of burning a blocking thread
                     // to completion after the response has already been sent.
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                    // `Relaxed` on both sides: this is a lone standalone
+                    // cancellation bool that publishes no other state, so it
+                    // needs no release/acquire pairing — matching the BFS
+                    // readers (store/traverse.rs, engine/dead_code.rs,
+                    // mcp/tools.rs) that load it `Relaxed`.
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(tool = %name, timeout_secs = DEFAULT_TOOL_TIMEOUT_SECS, "MCP tool dispatch timed out");
                     json!({
                         "jsonrpc": "2.0",
