@@ -1307,6 +1307,88 @@ async fn server_webhook_rejects_invalid_sig() {
     assert_eq!(resp.status(), 401);
 }
 
+/// During secret rotation the server accepts BOTH the new secret and the
+/// previous one (`--webhook-secret-old`), so an overlap window exists where a
+/// provider still signing with the old secret is not rejected — the gap
+/// Sourcegraph's single-secret model suffers. A payload signed with the OLD
+/// secret must be accepted (200 + enqueued); a bogus secret still 401s.
+#[tokio::test]
+async fn server_webhook_dual_secret_rotation_accepts_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let new_secret = "new-webhook-secret-0123456789abcdef";
+    let old_secret = "old-webhook-secret-fedcba9876543210";
+    let guard = helpers::server_guard::ServerGuard::start_with_webhook_rotation(
+        &db_path, new_secret, old_secret,
+    );
+    let mcp_addr = guard.mcp_addr();
+
+    let payload = json!({
+        "repository": { "clone_url": "https://github.com/acme/api-service.git" },
+        "ref": "refs/heads/main"
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let client = reqwest::Client::new();
+
+    // Signed with the OLD secret — must still be accepted during the overlap.
+    let old_sig = webhook_sign(&body, old_secret);
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-hub-signature-256", &old_sig)
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("webhook POST failed");
+    assert_eq!(resp.status(), 200, "old secret must be accepted mid-rotation");
+    assert_eq!(resp.text().await.unwrap(), "accepted");
+
+    // A bogus secret is still rejected even with two valid secrets configured.
+    let bogus_sig = webhook_sign(&body, "not-either-configured-secret");
+    let resp = client
+        .post(format!("{mcp_addr}/webhook"))
+        .header("x-hub-signature-256", &bogus_sig)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST failed");
+    assert_eq!(resp.status(), 401, "a non-matching secret must still 401");
+
+    drop(guard);
+
+    let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+    let depth = nestweaver_engine::jobs::JobQueue::open(&jobs_path)
+        .expect("open jobs queue")
+        .queue_depth()
+        .expect("queue depth");
+    let total = depth.pending + depth.running + depth.succeeded + depth.dead_letter;
+    assert!(
+        total >= 1,
+        "old-secret webhook should have enqueued a job, got {depth:?}"
+    );
+}
+
 #[tokio::test]
 async fn server_webhook_rejects_missing_sig() {
     let dir = tempfile::tempdir().unwrap();

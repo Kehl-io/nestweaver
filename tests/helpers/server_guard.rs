@@ -27,7 +27,7 @@ impl ServerGuard {
 
     /// Spawn the server with a bearer auth token.
     pub fn start_with_auth(db_path: &Path, token: &str) -> Self {
-        Self::spawn_inner(db_path, Some(token), None, None, None, None, None)
+        Self::spawn_inner(db_path, Some(token), None, None, None, None, None, None)
     }
 
     /// Spawn the server with an instance config (`--config <instance.toml>`).
@@ -36,7 +36,7 @@ impl ServerGuard {
     /// daemon build a federation coordinator at its `/mcp` boundary, so a raw
     /// MCP client gets two-tier results for two-tier-routed tools.
     pub fn start_with_config(db_path: &Path, config_path: &Path) -> Self {
-        Self::spawn_inner(db_path, None, None, None, None, None, Some(config_path))
+        Self::spawn_inner(db_path, None, None, None, None, None, Some(config_path), None)
     }
 
     /// Spawn the server with both a query auth token and an admin token.
@@ -52,17 +52,34 @@ impl ServerGuard {
             None,
             Some(admin_token),
             None,
+            None,
         )
     }
 
     /// Spawn the server with TLS enabled.
     pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
-        Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None, None)
+        Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None, None, None)
     }
 
     /// Spawn the server with a webhook secret configured.
     pub fn start_with_webhook(db_path: &Path, secret: &str) -> Self {
-        Self::spawn_inner(db_path, None, None, None, Some(secret), None, None)
+        Self::spawn_inner(db_path, None, None, None, Some(secret), None, None, None)
+    }
+
+    /// Spawn the server mid-rotation: both a current (`secret`) and previous
+    /// (`secret_old`) webhook secret are accepted. Used to exercise the live
+    /// dual-secret overlap window over real HTTP.
+    pub fn start_with_webhook_rotation(db_path: &Path, secret: &str, secret_old: &str) -> Self {
+        Self::spawn_inner(
+            db_path,
+            None,
+            None,
+            None,
+            Some(secret),
+            None,
+            None,
+            Some(secret_old),
+        )
     }
 
     /// Return the TCP port the server bound to (read from the port file, line 1).
@@ -104,7 +121,7 @@ impl ServerGuard {
     // ── internal ──────────────────────────────────────────────────────
 
     fn spawn(db_path: &Path, auth_token: Option<&str>) -> Self {
-        Self::spawn_inner(db_path, auth_token, None, None, None, None, None)
+        Self::spawn_inner(db_path, auth_token, None, None, None, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -116,6 +133,7 @@ impl ServerGuard {
         webhook_secret: Option<&str>,
         admin_token: Option<&str>,
         config_path: Option<&Path>,
+        webhook_secret_old: Option<&str>,
     ) -> Self {
         let port_file = db_path
             .parent()
@@ -153,6 +171,10 @@ impl ServerGuard {
 
         if let Some(secret) = webhook_secret {
             cmd.args(["--webhook-secret", secret]);
+        }
+
+        if let Some(secret_old) = webhook_secret_old {
+            cmd.args(["--webhook-secret-old", secret_old]);
         }
 
         if let Some(token) = admin_token {
