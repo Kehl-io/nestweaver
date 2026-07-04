@@ -32,6 +32,34 @@ pub const CANDIDATE_CAP: usize = 5000;
 /// Default wall-clock budget for a single search, in milliseconds.
 pub const DEFAULT_MAX_MILLIS: u64 = 2000;
 
+/// Maximum accepted regex pattern length, in bytes. A longer pattern is rejected
+/// before compilation so an untrusted client cannot force a large compile just
+/// by sending a huge pattern.
+pub const MAX_PATTERN_BYTES: usize = 4096;
+
+/// Compiled-program size limit for a single regex. The `regex` crate defaults to
+/// 10 MiB; we cap lower because patterns arrive from untrusted clients. The
+/// engine is finite-automata / linear-time (no catastrophic backtracking), so
+/// this bounds compile CPU/memory, not match time.
+const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+
+/// Compile an (untrusted) regex pattern with a length guard and a bounded
+/// compiled-program size, so a pathological pattern returns a clean error
+/// instead of consuming up to the crate's 10 MiB default.
+fn compile_pattern(pattern: &str) -> Result<regex::Regex, StoreError> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(StoreError::Query(format!(
+            "regex pattern too long: {} bytes (max {MAX_PATTERN_BYTES})",
+            pattern.len()
+        )));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| StoreError::Query(format!("invalid regex: {e}")))
+}
+
 /// A single regex match hit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegexMatch {
@@ -348,8 +376,7 @@ impl GraphStore {
         limit: Option<usize>,
         max_millis: Option<u64>,
     ) -> Result<RegexSearchResult, StoreError> {
-        let re = regex::Regex::new(pattern)
-            .map_err(|e| StoreError::Query(format!("invalid regex: {e}")))?;
+        let re = compile_pattern(pattern)?;
         let deadline_ms = max_millis.unwrap_or(DEFAULT_MAX_MILLIS);
         let start = Instant::now();
         let limit = limit.unwrap_or(usize::MAX);
@@ -423,8 +450,7 @@ impl GraphStore {
 
         let mut out = Vec::new();
         for pattern in patterns {
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| StoreError::Query(format!("invalid regex '{pattern}': {e}")))?;
+            let re = compile_pattern(pattern)?;
 
             // Optional trigram narrowing.
             let clauses = required_trigram_clauses(pattern);
@@ -708,5 +734,31 @@ mod tests {
             !uids.contains("sec:v:1:a"),
             "section excluded by kinds filter"
         );
+    }
+
+    #[test]
+    fn compile_pattern_rejects_overlong_pattern() {
+        let pattern = "a".repeat(MAX_PATTERN_BYTES + 1);
+        let err = compile_pattern(&pattern).unwrap_err();
+        assert!(
+            format!("{err}").contains("too long"),
+            "overlong pattern should be rejected before compile: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_pattern_rejects_oversized_program() {
+        // A bounded but enormous repetition compiles to a program far larger than
+        // the 1 MiB size limit, so build() must error rather than allocate it.
+        let err = compile_pattern("a{1000}{1000}").unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid regex"),
+            "oversized compiled program should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_pattern_accepts_normal_pattern() {
+        assert!(compile_pattern(r"fn\s+\w+\(").is_ok());
     }
 }
