@@ -789,7 +789,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchVaultRequest>,
     ) -> Result<Response<WatchVaultResponse>, Status> {
-        reject_if_read_only(self.state.read_only, "watch_vault")?;
         if self.state.server_mode {
             return Err(Status::unimplemented(
                 "watchers are server-managed in server mode",
@@ -922,7 +921,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchCodeRequest>,
     ) -> Result<Response<WatchCodeResponse>, Status> {
-        reject_if_read_only(self.state.read_only, "watch_code")?;
         if self.state.server_mode {
             return Err(Status::unimplemented(
                 "watchers are server-managed in server mode",
@@ -1236,7 +1234,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
-        reject_if_read_only(self.state.read_only, "index_repo")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1490,7 +1487,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
-        reject_if_read_only(self.state.read_only, "index_vault")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1733,7 +1729,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
-        reject_if_read_only(self.state.read_only, "remove_repo")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -1926,7 +1921,6 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
-        reject_if_read_only(self.state.read_only, "merge_instance")?;
         if let Some(crate::auth::IsAdmin(false)) | None =
             request.extensions().get::<crate::auth::IsAdmin>()
         {
@@ -3441,18 +3435,6 @@ fn is_idle(active_readwrite: u32, indexing_active: bool) -> bool {
     active_readwrite == 0 && !indexing_active
 }
 
-/// Reject a write operation when the daemon serves a read-only snapshot replica.
-/// Returns `FAILED_PRECONDITION` (a permanent condition for this daemon, not a
-/// transient error the client should retry).
-fn reject_if_read_only(read_only: bool, op: &str) -> Result<(), Status> {
-    if read_only {
-        return Err(Status::failed_precondition(format!(
-            "this daemon serves a read-only snapshot replica; {op} is not available"
-        )));
-    }
-    Ok(())
-}
-
 /// gRPC methods that only READ graph/store state. On a read-only snapshot
 /// replica every method NOT in this set is rejected at the single
 /// [`ReadOnlyGuard`] chokepoint (default-deny) — mirroring how PostgreSQL hot
@@ -3548,8 +3530,9 @@ fn read_only_rejection(read_only: bool, path: &str) -> Option<Status> {
 /// alike) at the transport layer BEFORE it reaches a handler — so no mutating
 /// handler can do partial work and surface a mid-stream `internal` error, and
 /// the "replica rejects writes with FAILED_PRECONDITION" contract holds for
-/// ALL mutating methods rather than the ~6 that had scattered
-/// `reject_if_read_only` calls. On a read-write daemon it is a transparent
+/// ALL mutating methods. This guard is the ONLY read-only enforcement point:
+/// the per-handler `reject_if_read_only` calls it superseded have been
+/// removed. On a read-write daemon it is a transparent
 /// pass-through. Applied once to the shared service so BOTH the TCP and UDS
 /// transports inherit the same gate.
 #[derive(Clone)]
@@ -3991,6 +3974,21 @@ mod depth_clamp_tests {
 /// semantic search returns "model not loaded" until it completes.
 #[cfg(feature = "embed")]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    #[cfg(target_os = "macos")]
+    {
+        // MTLCompilerService is only reachable from the process main thread;
+        // loading elsewhere silently falls back to CPU embeddings.
+        let on_main = unsafe { libc::pthread_main_np() } != 0;
+        debug_assert!(
+            on_main,
+            "load_embedding_model must run on the main (block_on) thread"
+        );
+        if !on_main {
+            tracing::warn!(
+                "embedding model loading off the main thread; Metal GPU will be unavailable"
+            );
+        }
+    }
     let mut cfg = state
         .instance_cfg
         .as_ref()
@@ -4030,6 +4028,13 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     };
     // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
     // load. On a warm cache this is instant; only the local-model path downloads.
+    //
+    // NOTE on cancellation: when the 180s timeout fires, the `spawn_blocking` download keeps
+    // running detached — hf-hub's blocking (ureq) `repo.get` exposes no abort hook, and the
+    // dominant cost is a single indivisible `model.safetensors` GET, so there is no useful
+    // point to inject a cooperative check. Accepted: the daemon's wait is bounded by this
+    // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
+    // into the HF cache dir and exits on its own when the transfer finishes or errors.
     let loaded = if config.external_endpoint.is_some() {
         Some(nestweaver_embed::EmbedModel::load(&config))
     } else {
@@ -4121,9 +4126,10 @@ pub async fn run_server(
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
-    // serve it read-only. `read_only` gates out the write RPCs (via the guards
-    // in DaemonState) and the write machinery (worker/scheduler/webhook) below.
-    // Default (`snapshot: None`) keeps the read-write path unchanged.
+    // serve it read-only. `read_only` gates out the write RPCs (via the
+    // `ReadOnlyGuard` transport layer) and the write machinery
+    // (worker/scheduler/webhook) below. Default (`snapshot: None`) keeps the
+    // read-write path unchanged.
     let read_only = server_opts
         .as_ref()
         .and_then(|o| o.snapshot.as_ref())
@@ -6296,14 +6302,6 @@ mod startup_helper_tests {
                 "{ok:?} is a specific repo path and must be allowed"
             );
         }
-    }
-
-    #[test]
-    fn reject_if_read_only_blocks_writes() {
-        assert!(reject_if_read_only(false, "index_repo").is_ok());
-        let err = reject_if_read_only(true, "index_repo").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("read-only"));
     }
 
     #[test]
