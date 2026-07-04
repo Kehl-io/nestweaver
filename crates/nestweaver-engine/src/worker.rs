@@ -794,7 +794,9 @@ fn is_poison_error(e: &anyhow::Error) -> bool {
 /// rejection must not count as a retry attempt. Matches
 /// `CircuitBreakerError::CircuitOpen`'s Display ("circuit breaker open for host: …").
 fn is_circuit_open_error(e: &anyhow::Error) -> bool {
-    e.to_string().to_lowercase().contains("circuit breaker open")
+    e.to_string()
+        .to_lowercase()
+        .contains("circuit breaker open")
 }
 
 #[cfg(test)]

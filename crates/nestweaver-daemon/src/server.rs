@@ -5578,7 +5578,8 @@ pub async fn run_server(
 
                 if let Some(queue) = &metrics_job_queue
                     && let Ok(guard) = queue.lock()
-                    && let Ok(completed) = guard.completed_job_metrics_after(last_metric_completed_at)
+                    && let Ok(completed) =
+                        guard.completed_job_metrics_after(last_metric_completed_at)
                 {
                     for job in completed {
                         last_metric_completed_at = last_metric_completed_at.max(job.completed_at);

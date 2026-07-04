@@ -1601,12 +1601,7 @@ credential_method = "ssh"
         // The repo is gone...
         assert!(!after.contains("remove-me"), "repo not removed:\n{after}");
         // ...but every following section survives.
-        for section in [
-            "[snapshot_storage]",
-            "[workspace]",
-            "[inference]",
-            "[git]",
-        ] {
+        for section in ["[snapshot_storage]", "[workspace]", "[inference]", "[git]"] {
             assert!(
                 after.contains(section),
                 "section {section} was swallowed by repo removal:\n{after}"
