@@ -283,15 +283,46 @@ pub struct HandlerSymbol {
 /// before any method, so the first match is the class base. Returns `""` when
 /// no base path is declared.
 pub fn extract_base_path(framework: &str, source: &str) -> String {
-    let anno = match framework {
-        "spring" => "@RequestMapping",
-        "nestjs" => "@Controller",
-        _ => return String::new(),
-    };
-    source
-        .find(anno)
-        .and_then(|i| first_string_arg(&source[i..]))
-        .unwrap_or_default()
+    match framework {
+        "spring" => {
+            // A Spring class base path is `@RequestMapping` ABOVE the class
+            // declaration. Restricting the search to the pre-class region avoids
+            // mistaking a method-level `@RequestMapping(method=..., path="/foo")`
+            // in a `@RestController` (no class-level mapping) for the base path —
+            // which would prepend `/foo` to every route and corrupt their UIDs.
+            let region_end = class_decl_byte_pos(source).unwrap_or(source.len());
+            source[..region_end]
+                .rfind("@RequestMapping")
+                .and_then(|i| first_string_arg(&source[i..]))
+                .unwrap_or_default()
+        }
+        // `@Controller` is only ever class-level in NestJS, so the first one is
+        // the controller decorator.
+        "nestjs" => source
+            .find("@Controller")
+            .and_then(|i| first_string_arg(&source[i..]))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Byte offset of the first `class <Ident>` declaration in `source`, or `None`.
+/// Requires a word boundary before `class` so `subclass` / `MyClass` don't match.
+fn class_decl_byte_pos(source: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("class ") {
+        let pos = from + rel;
+        let boundary_ok = pos == 0
+            || !source[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if boundary_ok {
+            return Some(pos);
+        }
+        from = pos + "class ".len();
+    }
+    None
 }
 
 /// Find the NestJS controller class among `class_starts` (each `(symbol_index,
@@ -748,6 +779,18 @@ mod tests {
             first_string_arg("@GetMapping(\"/café\")").as_deref(),
             Some("/café")
         );
+    }
+
+    #[test]
+    fn extract_base_path_ignores_method_level_request_mapping() {
+        // Class-level @RequestMapping → that's the base path.
+        let with_class = "@RestController\n@RequestMapping(\"/v1\")\npublic class C {\n  @GetMapping(\"/x\") void x() {}\n}";
+        assert_eq!(extract_base_path("spring", with_class), "/v1");
+
+        // No class-level mapping; a method-level @RequestMapping must NOT become
+        // the base path.
+        let method_only = "@RestController\npublic class C {\n  @RequestMapping(method = RequestMethod.GET, path = \"/foo\")\n  void foo() {}\n}";
+        assert_eq!(extract_base_path("spring", method_only), "");
     }
 
     #[test]
