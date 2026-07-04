@@ -1360,7 +1360,11 @@ async fn server_webhook_dual_secret_rotation_accepts_old() {
         .send()
         .await
         .expect("webhook POST failed");
-    assert_eq!(resp.status(), 200, "old secret must be accepted mid-rotation");
+    assert_eq!(
+        resp.status(),
+        200,
+        "old secret must be accepted mid-rotation"
+    );
     assert_eq!(resp.text().await.unwrap(), "accepted");
 
     // A bogus secret is still rejected even with two valid secrets configured.

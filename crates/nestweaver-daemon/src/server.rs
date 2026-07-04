@@ -4747,9 +4747,9 @@ pub async fn run_server(
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
                 active_writes: state.active_writes.clone(),
-                mcp_sessions: mcp_session_gauge_opt.clone().unwrap_or_else(|| {
-                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))
-                }),
+                mcp_sessions: mcp_session_gauge_opt
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
                 drained: state.drained.clone(),
                 indexing_queue_depth: state.indexing_queue_depth.clone(),
                 db_path: db_path.clone(),

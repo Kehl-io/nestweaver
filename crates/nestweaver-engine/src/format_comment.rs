@@ -515,9 +515,8 @@ where
             return Ok(resp);
         }
         if is_transient_list_status(status) && attempt < LIST_MAX_ATTEMPTS {
-            let delay = retry_after_delay(&resp).unwrap_or_else(|| {
-                std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1))
-            });
+            let delay = retry_after_delay(&resp)
+                .unwrap_or_else(|| std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1)));
             tracing::warn!(%status, attempt, ?delay, "listing comments failed; retrying");
             tokio::time::sleep(delay).await;
             attempt += 1;
@@ -644,7 +643,8 @@ async fn find_gitlab_note(
     let mut page = 1u32;
     loop {
         let paged_url = format!("{}?per_page=100&page={}", url, page);
-        let resp = send_list_request(|| client.get(&paged_url).header("PRIVATE-TOKEN", token)).await?;
+        let resp =
+            send_list_request(|| client.get(&paged_url).header("PRIVATE-TOKEN", token)).await?;
 
         let notes: Vec<serde_json::Value> = resp.json().await?;
         if notes.is_empty() {
@@ -1076,7 +1076,10 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("{}/notes", server.uri());
         let res = find_gitlab_note(&client, &url, "tok", "<!-- marker -->").await;
-        assert!(res.is_err(), "a 429 while listing must be an error: {res:?}");
+        assert!(
+            res.is_err(),
+            "a 429 while listing must be an error: {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -1102,18 +1105,21 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/comments"))
             .and(query_param("page", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!([{ "id": 1, "body": "unrelated" }]),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{ "id": 1, "body": "unrelated" }])),
+            )
             .mount(&server)
             .await;
         // Page 2: the marked comment.
         Mock::given(method("GET"))
             .and(path("/comments"))
             .and(query_param("page", "2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!([{ "id": 42, "body": "<!-- marker -->\nhi" }]),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{ "id": 42, "body": "<!-- marker -->\nhi" }]),
+                ),
+            )
             .mount(&server)
             .await;
         let client = reqwest::Client::new();

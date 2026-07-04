@@ -191,7 +191,9 @@ impl CatFileBatch {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
         apply_git_isolation(&mut cmd);
-        let mut child = cmd.spawn().context("failed to spawn git cat-file --batch")?;
+        let mut child = cmd
+            .spawn()
+            .context("failed to spawn git cat-file --batch")?;
         let stdin = child
             .stdin
             .take()

@@ -36,7 +36,16 @@ impl ServerGuard {
     /// daemon build a federation coordinator at its `/mcp` boundary, so a raw
     /// MCP client gets two-tier results for two-tier-routed tools.
     pub fn start_with_config(db_path: &Path, config_path: &Path) -> Self {
-        Self::spawn_inner(db_path, None, None, None, None, None, Some(config_path), None)
+        Self::spawn_inner(
+            db_path,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(config_path),
+            None,
+        )
     }
 
     /// Spawn the server with both a query auth token and an admin token.
