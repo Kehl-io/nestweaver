@@ -1317,9 +1317,15 @@ where
     }
 
     // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
-    for (uid, snu, sp, st, wt) in &unresolved_records {
-        if let Err(e) = store.insert_unresolved_wikilink(uid, snu, sp, st, wt) {
-            tracing::warn!("failed to record unresolved wikilink '{wt}': {e}");
+    // Dedup by uid first (many identical `[[missing]]` links in one section share
+    // a uid), then batch-insert on a single connection — a per-row insert here
+    // opened a fresh connection per link and made a note with thousands of
+    // unresolved links take tens of seconds to a hang.
+    {
+        let mut seen = std::collections::HashSet::new();
+        unresolved_records.retain(|(uid, ..)| seen.insert(uid.clone()));
+        if let Err(e) = store.batch_insert_unresolved_wikilinks(&unresolved_records) {
+            tracing::warn!("failed to record unresolved wikilinks: {e}");
         }
     }
 

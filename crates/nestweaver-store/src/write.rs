@@ -1531,6 +1531,51 @@ impl GraphStore {
         )
     }
 
+    /// Batch-insert unresolved wikilinks, reusing ONE connection and prepared
+    /// statements. The per-row `insert_unresolved_wikilink` opened a fresh
+    /// connection and ran two separate queries per row (~ms each), so a note with
+    /// thousands of unresolved links (a big index/MOC note, or a note whose
+    /// targets don't exist yet) took ~20ms/link — seconds to a hang. Records are
+    /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
+    pub fn batch_insert_unresolved_wikilinks(
+        &self,
+        records: &[(String, String, String, String, String)],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // One explicit transaction for all rows: KuzuDB auto-commits (WAL fsync)
+        // per statement otherwise, which is what made the per-row insert take
+        // ~ms/link. Prepared statements are reused across the batch.
+        let conn = self.begin_transaction()?;
+        let mut del = conn
+            .prepare("MATCH (u:UnresolvedWikilink {uid: $uid}) DETACH DELETE u")
+            .map_err(|e| StoreError::Query(format!("prepare delete unresolved: {e}")))?;
+        let mut cre = conn
+            .prepare(
+                "CREATE (:UnresolvedWikilink {uid: $uid, source_note_uid: $snu, \
+                 source_path: $sp, source_title: $st, wikilink_text: $wt})",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare create unresolved: {e}")))?;
+        for (uid, snu, sp, st, wt) in records {
+            conn.execute(&mut del, vec![("uid", lbug::Value::String(uid.clone()))])
+                .map_err(|e| StoreError::Query(format!("delete unresolved: {e}")))?;
+            conn.execute(
+                &mut cre,
+                vec![
+                    ("uid", lbug::Value::String(uid.clone())),
+                    ("snu", lbug::Value::String(snu.clone())),
+                    ("sp", lbug::Value::String(sp.clone())),
+                    ("st", lbug::Value::String(st.clone())),
+                    ("wt", lbug::Value::String(wt.clone())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("create unresolved: {e}")))?;
+        }
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
     /// Remove all recorded unresolved wikilinks originating from `note_uid`.
     /// Called from `delete_note_cascade` so stale rows do not linger after a
     /// note is re-indexed (e.g. once its target note appears). Best-effort:
