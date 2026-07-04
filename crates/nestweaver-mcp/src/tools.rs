@@ -5341,6 +5341,10 @@ fn tool_schema_dead_code() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns name + confidence only; \"detailed\" (default) adds UIDs, file paths, kinds, and visibility."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max unreachable symbols to return (defaults to the configured result limit). The response reports the true total in 'unreachable_count' and sets 'truncated' when the cap applied."
                 }
             }
         }
@@ -5359,13 +5363,27 @@ fn tool_dead_code(
     let min_conf =
         DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
     let concise = is_concise(&args);
+    // Cap the returned symbols so a large codebase can't return a multi-MB
+    // payload that blows an agent's context window (the HTTP boundary caps via
+    // add_limit_metadata, but the stdio path had no bound). `unreachable_count`
+    // still reports the true total; `returned`/`truncated` disclose the cap.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(configured_result_limit);
 
     let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
-    let filtered: Vec<Value> = result
+    let all_matching: Vec<_> = result
         .unreachable_symbols
         .iter()
         .filter(|s| s.confidence >= min_conf)
+        .collect();
+    let total_unreachable = all_matching.len();
+    let filtered: Vec<Value> = all_matching
+        .into_iter()
+        .take(limit)
         .map(|s| {
             if concise {
                 json!({
@@ -5388,7 +5406,9 @@ fn tool_dead_code(
     Ok(json!({
         "total_symbols": result.total_symbols,
         "reachable_symbols": result.reachable_symbols,
-        "unreachable_count": filtered.len(),
+        "unreachable_count": total_unreachable,
+        "returned": filtered.len(),
+        "truncated": total_unreachable > filtered.len(),
         "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
         "min_confidence": min_conf_str,

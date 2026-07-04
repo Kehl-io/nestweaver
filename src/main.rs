@@ -1291,6 +1291,11 @@ enum Commands {
         json: bool,
         #[arg(
             long,
+            help = "Max unreachable symbols to report (default: all). Large codebases can produce very large output; cap it here or via a pipe."
+        )]
+        limit: Option<usize>,
+        #[arg(
+            long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
@@ -4709,12 +4714,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::DeadCode {
             min_confidence,
             json,
+            limit,
             db,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                let args = serde_json::json!({ "min_confidence": min_confidence });
+                let mut args = serde_json::json!({ "min_confidence": min_confidence });
+                if let Some(n) = limit {
+                    args["limit"] = serde_json::json!(n);
+                }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4746,6 +4755,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .filter(|s| s.confidence >= min_conf)
                 .collect();
             let filtered_count = filtered.len();
+            // Optional cap (default: show all). `filtered_count` stays the true
+            // total; `shown` is the capped view rendered/serialized.
+            let truncated = limit.is_some_and(|n| n < filtered_count);
+            let shown: Vec<_> = match limit {
+                Some(n) => filtered.into_iter().take(n).collect(),
+                None => filtered,
+            };
 
             if json {
                 #[derive(serde::Serialize)]
@@ -4753,6 +4769,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     total_symbols: usize,
                     reachable_symbols: usize,
                     unreachable_count: usize,
+                    returned: usize,
+                    truncated: bool,
                     excluded_count: usize,
                     dead_percentage: f64,
                     min_confidence: String,
@@ -4764,13 +4782,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         total_symbols: result.total_symbols,
                         reachable_symbols: result.reachable_symbols,
                         unreachable_count: filtered_count,
+                        returned: shown.len(),
+                        truncated,
                         excluded_count: result.excluded_count,
                         dead_percentage: result.dead_percentage,
                         min_confidence: min_conf.to_string(),
-                        unreachable_symbols: filtered,
+                        unreachable_symbols: shown,
                     })?
                 );
-            } else if filtered.is_empty() {
+            } else if filtered_count == 0 {
                 println!(
                     "No dead code detected ({} symbols, all reachable from entry points).",
                     result.total_symbols
@@ -4797,8 +4817,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if min_conf != DeadCodeConfidence::Low {
                     println!(
                         "Showing {} symbol(s) with confidence >= {}\n",
-                        filtered.len(),
+                        shown.len(),
                         min_conf
+                    );
+                }
+                if truncated {
+                    println!(
+                        "(showing first {} of {} — pass --limit to change)\n",
+                        shown.len(),
+                        filtered_count
                     );
                 }
 
@@ -4807,7 +4834,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &str,
                     Vec<&nestweaver_engine::UnreachableSymbol>,
                 > = std::collections::BTreeMap::new();
-                for sym in &filtered {
+                for sym in &shown {
                     by_file.entry(&sym.file_path).or_default().push(sym);
                 }
 
