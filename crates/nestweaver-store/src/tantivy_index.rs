@@ -410,9 +410,22 @@ impl TantivyIndex {
                 // chars by quoting — handles common user input like
                 // `auth/v2` or `path:foo` that breaks the parser.
                 let escaped = escape_query(query);
-                parser
-                    .parse_query(&escaped)
-                    .map_err(|e| TantivyError::Tantivy(e.to_string()))?
+                match parser.parse_query(&escaped) {
+                    Ok(q) => q,
+                    // Last resort: a bare boolean keyword (`a AND`), an unbalanced
+                    // quote, or other residual syntax that escape_query doesn't
+                    // neutralize (it only quotes tokens with special *chars*, not
+                    // keywords) must not hard-error a plain search. Treat the whole
+                    // input as a literal phrase; if even that won't parse, return no
+                    // hits rather than an error.
+                    Err(_) => {
+                        let phrase = format!("\"{}\"", query.replace('"', " "));
+                        match parser.parse_query(&phrase) {
+                            Ok(q) => q,
+                            Err(_) => return Ok(Vec::new()),
+                        }
+                    }
+                }
             }
         };
         let top = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;

@@ -5288,13 +5288,14 @@ pub async fn run_server(
                     .parent()
                     .unwrap_or(Path::new("."))
                     .join("workspace");
-                // Recover any stale running jobs from a previous crash.
+                // Recover jobs orphaned by a previous crash. At startup no worker is
+                // alive, so EVERY `running` row is orphaned — reclaim them all
+                // immediately instead of waiting out the ~30-min lease/threshold.
                 if let Ok(guard) = worker_job_queue.lock()
-                    && let Ok(recovered) =
-                        guard.recover_stale(nestweaver_engine::jobs::STALE_RECOVERY_SECS)
+                    && let Ok(recovered) = guard.recover_all_running_at_startup()
                     && recovered > 0
                 {
-                    tracing::info!(recovered, "recovered stale running jobs");
+                    tracing::info!(recovered, "recovered orphaned running jobs at startup");
                 }
                 let workspace =
                     match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {

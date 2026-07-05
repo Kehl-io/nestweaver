@@ -65,10 +65,26 @@ pub struct BareClone {
 }
 
 impl BareClone {
-    /// Check whether the given path looks like a valid bare git repository
-    /// (has a `HEAD` file).
+    /// Check whether `path` is a *usable* bare git repository — not merely that a
+    /// `HEAD` file exists, but that HEAD resolves to a real commit object. A clone
+    /// SIGKILLed mid-transfer (the timeout path kills the whole process group,
+    /// preventing git's own partial-clone cleanup) can leave a `HEAD` file plus a
+    /// configured `origin` but no objects. The old "HEAD exists" check would then
+    /// pin that corrupt directory forever — `ensure_clone` sees it as valid with a
+    /// matching origin and never re-clones, while every `head_sha`/`ls-tree` fails.
+    /// `rev-parse --verify HEAD` is a fast local check that rejects such a partial
+    /// clone so it gets re-cloned.
     pub fn is_valid_at(path: &Path) -> bool {
-        path.join("HEAD").exists()
+        if !path.join("HEAD").exists() {
+            return false;
+        }
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"]);
+        crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// Fetch the latest commits and trees from origin (no blobs unless demanded).
@@ -784,11 +800,38 @@ mod tests {
     #[test]
     fn bare_clone_is_valid_at() {
         let tmp = TempDir::new().unwrap();
+        // Empty dir → invalid.
         assert!(!BareClone::is_valid_at(tmp.path()));
 
-        // A valid bare repo has a HEAD file.
+        // A lone HEAD file with no resolvable commit (the signature of a clone
+        // SIGKILLed mid-transfer) is NOT valid — it must be re-cloned, not pinned.
         std::fs::write(tmp.path().join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        assert!(BareClone::is_valid_at(tmp.path()));
+        assert!(!BareClone::is_valid_at(tmp.path()));
+
+        // A real bare repo with a resolvable HEAD → valid.
+        let real = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let run = |args: &[&str], dir: &std::path::Path| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"], work.path());
+        run(&["config", "user.email", "t@t.t"], work.path());
+        run(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "x").unwrap();
+        run(&["add", "."], work.path());
+        run(&["commit", "-qm", "c"], work.path());
+        std::process::Command::new("git")
+            .args(["clone", "--bare", "-q"])
+            .arg(work.path())
+            .arg(real.path())
+            .output()
+            .unwrap();
+        assert!(BareClone::is_valid_at(real.path()));
     }
 
     #[test]

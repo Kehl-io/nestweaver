@@ -523,6 +523,27 @@ impl JobQueue {
         Ok(count)
     }
 
+    /// Reclaim EVERY `running` job unconditionally. Call this ONLY once at daemon
+    /// startup: under the single-writer model no worker is alive yet, so any
+    /// `running` row is necessarily orphaned by the crash that stopped the previous
+    /// daemon. The threshold-based [`Self::recover_stale`] (and the lease reaper)
+    /// deliberately spare young `running` rows because mid-run those belong to a
+    /// live worker — but at startup that reasoning is inverted, so a job crashed
+    /// seconds in would otherwise sit `running` for up to the ~30-min lease before
+    /// reclaim. Resets to `pending` (attempt count preserved, so the reaper's
+    /// dead-letter cap still bounds a repeatedly-crashing job).
+    pub fn recover_all_running_at_startup(&self) -> Result<usize, rusqlite::Error> {
+        let count = self.conn.execute(
+            "UPDATE index_jobs
+             SET status     = 'pending',
+                 started_at = NULL,
+                 updated_at = strftime('%s','now')
+             WHERE status = 'running'",
+            [],
+        )?;
+        Ok(count)
+    }
+
     /// Continuous lease reaper (T4.2). Reclaims any `running` job whose lease
     /// (`lease_expires_at`, stamped at claim) has elapsed as of `now` (Unix
     /// epoch seconds). Unlike [`Self::recover_stale`] — which runs once at
@@ -1209,6 +1230,34 @@ mod tests {
             reclaimed.attempt, 2,
             "attempt preserved from prior run + new claim"
         );
+    }
+
+    #[test]
+    fn recover_all_running_at_startup_reclaims_young_jobs() {
+        let q = queue();
+        q.upsert(
+            "repo-1",
+            "https://github.com/org/repo-1",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+
+        // A FRESH running job (crashed seconds ago) — recover_stale's 30-min
+        // threshold would skip it, leaving it stuck until the lease expires.
+        assert_eq!(
+            q.recover_stale(1800).unwrap(),
+            0,
+            "threshold spares a young job"
+        );
+        assert_eq!(q.queue_depth().unwrap().running, 1);
+
+        // Startup reclaim takes it immediately (no live worker at startup).
+        assert_eq!(q.recover_all_running_at_startup().unwrap(), 1);
+        assert_eq!(q.queue_depth().unwrap().pending, 1);
+        assert_eq!(q.queue_depth().unwrap().running, 0);
     }
 
     #[test]

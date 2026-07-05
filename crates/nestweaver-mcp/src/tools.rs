@@ -2618,11 +2618,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         });
 
     let note = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        store.lookup_note(uid).context("lookup_note")?
+        store
+            .lookup_note(uid)
+            .with_context(|| format!("failed to look up note with uid '{uid}'"))?
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         let mut matches = store
             .lookup_notes_by_title(title)
-            .context("lookup_notes_by_title")?;
+            .with_context(|| format!("failed to look up notes with title '{title}'"))?;
         // Slug-tolerant fallback: case-insensitive + slug normalization.
         // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
