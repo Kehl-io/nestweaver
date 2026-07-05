@@ -12789,8 +12789,12 @@ fn render_cross_repo_contracts_human(value: &serde_json::Value) {
 /// Human rendering of the daemon `contract_drift` result (`contracts drift`
 /// without `--json`).
 fn render_contract_drift_human(value: &serde_json::Value) {
-    let dni = value.get("declared_not_implemented").and_then(|v| v.as_array());
-    let ind = value.get("implemented_not_declared").and_then(|v| v.as_array());
+    let dni = value
+        .get("declared_not_implemented")
+        .and_then(|v| v.as_array());
+    let ind = value
+        .get("implemented_not_declared")
+        .and_then(|v| v.as_array());
     let empty = |a: Option<&Vec<serde_json::Value>>| a.map(|v| v.is_empty()).unwrap_or(true);
     if empty(dni) && empty(ind) {
         println!("No contract drift detected.");
