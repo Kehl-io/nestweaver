@@ -510,7 +510,22 @@ impl HybridClient {
         let local_fut = dispatch_json_rpc(self.local.inner_mut(), tool_name, params);
 
         let (local_result, server_result) = tokio::join!(local_fut, server_fut);
-        let local = local_result?;
+        let local = match local_result {
+            Ok(l) => l,
+            Err(local_err) => {
+                // The local tier failed (e.g. the daemon is restarting/busy).
+                // Degrade to server-only if the upstream answered — matching every
+                // other hybrid mode (fallback/server-preferred all degrade
+                // gracefully) — instead of failing a request the server could
+                // satisfy. Only propagate the error when BOTH tiers are down.
+                if let Ok(Ok(server)) = server_result {
+                    let mut result = server;
+                    inject_or_wrap_provenance(&mut result, &["server"], &[]);
+                    return Ok(result);
+                }
+                return Err(local_err);
+            }
+        };
 
         match server_result {
             Ok(Ok(server)) => {

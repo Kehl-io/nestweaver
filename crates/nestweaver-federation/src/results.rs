@@ -78,6 +78,10 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
 /// to the same field in `local`; scalar fields and provenance/meta (`_`-prefixed) keep the local
 /// value. This preserves every aggregate row — the whole point of FanOut vs Merge.
 pub fn concat_fanout(local: &Value, server: &Value) -> Value {
+    // Boolean "not everything was returned" flags must be OR-ed across tiers — if
+    // EITHER side truncated, the combined result is truncated. Keeping the local
+    // value would report `truncated:false` while hiding a server-side cap.
+    const COMPLETENESS_FLAGS: &[&str] = &["truncated", "capped", "limit_hit", "partial"];
     let mut out = local.clone();
     if let (Some(lo), Some(so)) = (out.as_object_mut(), server.as_object()) {
         for (k, sv) in so {
@@ -86,6 +90,11 @@ pub fn concat_fanout(local: &Value, server: &Value) -> Value {
             }
             match (lo.get_mut(k), sv) {
                 (Some(Value::Array(la)), Value::Array(sa)) => la.extend(sa.iter().cloned()),
+                (Some(lv @ Value::Bool(_)), Value::Bool(true))
+                    if COMPLETENESS_FLAGS.contains(&k.as_str()) =>
+                {
+                    *lv = Value::Bool(true);
+                }
                 (None, _) => {
                     lo.insert(k.clone(), sv.clone());
                 }
@@ -161,16 +170,23 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         if !expansion.is_empty() {
             result["expansion_terms"] = Value::Array(expansion);
         }
-        // Carry over scalar metadata from the local response (project header,
-        // budget accounting, etc.) that the merge would otherwise drop.
-        for key in [
-            "project",
-            "project_uid",
-            "seeds_expanded",
-            "tokens_used",
-            "token_budget",
-            "external_refs",
-        ] {
+        // Additive accounting: the merged `connected` array draws from BOTH tiers,
+        // so these counts must be the SUM, not the local-only value — otherwise an
+        // agent that reads tokens_used/token_budget to decide whether to fetch more
+        // context reasons against a number that doesn't match the payload it got.
+        for key in ["seeds_expanded", "tokens_used", "token_budget"] {
+            let l = local.get(key).and_then(|v| v.as_u64());
+            let s = server.get(key).and_then(|v| v.as_u64());
+            match (l, s) {
+                (Some(a), Some(b)) => result[key] = Value::from(a.saturating_add(b)),
+                (Some(a), None) => result[key] = Value::from(a),
+                (None, Some(b)) => result[key] = Value::from(b),
+                (None, None) => {}
+            }
+        }
+        // Header/identity scalars: keep the local value (they describe the caller's
+        // project, not a per-tier count).
+        for key in ["project", "project_uid", "external_refs"] {
             if let Some(val) = local.get(key) {
                 result[key] = val.clone();
             }
@@ -280,6 +296,45 @@ mod tests {
             &json!({ "results": [], "extra": 7 }),
         );
         assert_eq!(m2["extra"], json!(7));
+    }
+
+    #[test]
+    fn concat_fanout_ors_truncation_flags() {
+        // If the SERVER truncated its half, the combined result is truncated even
+        // though the local side reported complete — otherwise a consumer trusts a
+        // false "complete" signal.
+        let local = json!({ "results": [], "truncated": false });
+        let server = json!({ "results": [], "truncated": true });
+        assert_eq!(concat_fanout(&local, &server)["truncated"], json!(true));
+        // Neither truncated → stays false.
+        let l2 = json!({ "results": [], "truncated": false });
+        let s2 = json!({ "results": [], "truncated": false });
+        assert_eq!(concat_fanout(&l2, &s2)["truncated"], json!(false));
+    }
+
+    #[test]
+    fn merge_structured_sums_token_accounting() {
+        // tokens_used / seeds_expanded / token_budget must reflect BOTH tiers,
+        // since `connected` is the merge of both.
+        let local = json!({
+            "connected": [{ "uid": "a" }],
+            "seeds": [], "tokens_used": 100, "token_budget": 1000, "seeds_expanded": 2,
+            "project": "p",
+        });
+        let server = json!({
+            "connected": [{ "uid": "b" }],
+            "seeds": [], "tokens_used": 40, "token_budget": 1000, "seeds_expanded": 3,
+        });
+        let m = merge_structured_results(&local, &server);
+        assert_eq!(
+            m["tokens_used"],
+            json!(140),
+            "tokens_used must sum both tiers"
+        );
+        assert_eq!(m["seeds_expanded"], json!(5));
+        assert_eq!(m["token_budget"], json!(2000));
+        // Header stays local.
+        assert_eq!(m["project"], json!("p"));
     }
 
     // ── Result helper tests ───────────────────────────────────────
