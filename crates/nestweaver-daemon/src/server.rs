@@ -3379,6 +3379,20 @@ fn validate_token_lengths(
             );
         }
     }
+    // An admin token WITHOUT a query (auth) token is a footgun that silently
+    // disables authentication: the auth layer (McpHttpState::with_auth, the gRPC
+    // interceptor's expected_token) is only installed when the query token is set,
+    // and the mutating-tool gate keys off `auth_token.is_some()` — so admin-only
+    // leaves BOTH reads and every mutating tool completely uncredentialed. (A
+    // non-loopback bind is already refused without a query token; this catches the
+    // loopback case where the operator believes the server is locked down.)
+    if admin_token.is_some() && auth_token.is_none() {
+        anyhow::bail!(
+            "--admin-token requires --auth-token: an admin token alone leaves the \
+             server unauthenticated, because the auth layer is only enabled when a \
+             query token is set. Set --auth-token as well (a different value)."
+        );
+    }
     // The admin token must differ from the query (auth) token. Admin privilege is
     // granted on an admin-token match, so an identical query token would silently
     // make every query-token holder an admin.
@@ -6441,6 +6455,17 @@ mod startup_helper_tests {
     #[test]
     fn validate_token_lengths_accepts_none() {
         assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_rejects_admin_without_auth() {
+        // An admin token alone disables auth entirely (the auth layer is only
+        // installed with a query token), so it must be rejected at startup.
+        let admin = Some("a".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&None, &admin).is_err());
+        // But a query token alone (read-gated, mutations denied) is fine.
+        let auth = Some("q".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&auth, &None).is_ok());
     }
 
     #[test]

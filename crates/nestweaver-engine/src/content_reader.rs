@@ -390,6 +390,35 @@ impl GitBareReader {
     /// unavailable (failed to spawn, or died mid-stream).
     fn read_file_via_show(&self, rel_path: &Path) -> Result<String> {
         let spec = format!("{}:{}", self.sha, rel_path.display());
+        // Enforce the size cap BEFORE transferring content, mirroring the batch
+        // path's `TooLarge` skip. `git cat-file -s` reports the blob size without
+        // emitting its bytes, so an oversized blob is never materialized here (the
+        // batch reader's cap would otherwise be bypassed whenever this fallback
+        // fires — spawn failure, mid-stream death, or timeout).
+        let mut size_cmd = Command::new("git");
+        size_cmd.args([
+            "-C",
+            &self.bare_path.display().to_string(),
+            "cat-file",
+            "-s",
+            &spec,
+        ]);
+        if let Ok(out) = run_git_with_timeout(size_cmd, git_net_timeout())
+            && out.status.success()
+            && let Ok(size) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>()
+            && size > MAX_FILE_SIZE_BYTES
+        {
+            tracing::warn!(
+                "skipping oversized blob {} (exceeds {} bytes) via git show",
+                rel_path.display(),
+                MAX_FILE_SIZE_BYTES
+            );
+            anyhow::bail!(
+                "blob too large, skipped: {} exceeds {} bytes",
+                rel_path.display(),
+                MAX_FILE_SIZE_BYTES
+            );
+        }
         let mut cmd = Command::new("git");
         cmd.args(["-C", &self.bare_path.display().to_string(), "show", &spec]);
         let output = run_git_with_timeout(cmd, git_net_timeout())

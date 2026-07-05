@@ -12324,8 +12324,12 @@ fn run_embed(
     let path = db.unwrap_or(&default);
 
     // ── Try the daemon path first (Metal-accelerated) ───────────
-    // Only use daemon for local-model embedding (no --endpoint, no --local).
-    if endpoint.is_none() && !local {
+    // Only use daemon for local-model embedding (no --endpoint, no --local) AND
+    // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
+    // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
+    // breaks the direct fallback with a confusing "could not set lock" error (and
+    // leaks the daemon). Skip straight to the in-process path instead.
+    if use_daemon && endpoint.is_none() && !local {
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
