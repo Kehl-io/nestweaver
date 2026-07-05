@@ -2939,6 +2939,17 @@ fn main() {
     process::exit(exit_code);
 }
 
+/// Print the degraded impact-analysis JSON shape (`{"impacts": [], "error": …}`)
+/// when `format == "json"`, so the server-unavailable / store-unavailable /
+/// analysis-failed fallback paths all emit an identical, consumer-parseable shape.
+fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> {
+    if format == "json" {
+        let output = serde_json::json!({ "impacts": [], "error": reason });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    }
+    Ok(())
+}
+
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
@@ -6249,13 +6260,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: Server unavailable — skipping impact analysis ({})",
                             e
                         );
-                        if format == "json" {
-                            let output = serde_json::json!({
-                                "impacts": [],
-                                "error": "server_unavailable",
-                            });
-                            println!("{}", serde_json::to_string_pretty(&output)?);
-                        }
+                        print_impact_degraded_json(&format, "server_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }
@@ -6271,13 +6276,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: failed to open store, skipping impact analysis ({})",
                             e
                         );
-                        if format == "json" {
-                            let output = serde_json::json!({
-                                "impacts": [],
-                                "error": "store_unavailable",
-                            });
-                            println!("{}", serde_json::to_string_pretty(&output)?);
-                        }
+                        print_impact_degraded_json(&format, "store_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 };
@@ -6294,13 +6293,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             return Err(anyhow::anyhow!("impact analysis failed: {}", e));
                         }
                         eprintln!("warning: impact analysis failed, skipping ({})", e);
-                        if format == "json" {
-                            let output = serde_json::json!({
-                                "impacts": [],
-                                "error": "analysis_failed",
-                            });
-                            println!("{}", serde_json::to_string_pretty(&output)?);
-                        }
+                        print_impact_degraded_json(&format, "analysis_failed")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }

@@ -531,6 +531,26 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for OptionalPeerAddr {
     }
 }
 
+/// Build a JSON-RPC 2.0 error response tuple in the exact shape `handle_mcp`
+/// returns, so its several early-rejection paths (session / rate-limit / parse /
+/// auth / method-not-found) can't drift in envelope structure.
+fn jsonrpc_error(
+    status: axum::http::StatusCode,
+    id: Value,
+    code: i32,
+    message: &str,
+) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+    (
+        status,
+        HeaderMap::new(),
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        })),
+    )
+}
+
 async fn handle_mcp(
     State(state): State<Arc<McpHttpState>>,
     // Peer address, populated by `into_make_service_with_connect_info` on the
@@ -564,17 +584,11 @@ async fn handle_mcp(
                     query_match || admin_match
                 } => {}
             _ => {
-                return (
+                return jsonrpc_error(
                     axum::http::StatusCode::UNAUTHORIZED,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": null,
-                        "error": {
-                            "code": error_code::INVALID_REQUEST,
-                            "message": "unauthorized: valid Bearer token required",
-                        }
-                    })),
+                    Value::Null,
+                    error_code::INVALID_REQUEST,
+                    "unauthorized: valid Bearer token required",
                 );
             }
         }
@@ -595,17 +609,11 @@ async fn handle_mcp(
         && req.method != "initialize"
         && !state.sessions.contains_key(sid)
     {
-        return (
+        return jsonrpc_error(
             axum::http::StatusCode::OK,
-            HeaderMap::new(),
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": error_code::INVALID_REQUEST,
-                    "message": "unknown or expired session ID — please re-initialize",
-                }
-            })),
+            id.clone(),
+            error_code::INVALID_REQUEST,
+            "unknown or expired session ID — please re-initialize",
         );
     }
 
@@ -630,34 +638,22 @@ async fn handle_mcp(
         );
 
         if !admin_bypass_rate_limit && !state.client_rate_limiter.check(&client_key) {
-            return (
+            return jsonrpc_error(
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
-                HeaderMap::new(),
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": error_code::INVALID_REQUEST,
-                        "message": "rate limit exceeded: too many requests per minute",
-                    }
-                })),
+                Value::Null,
+                error_code::INVALID_REQUEST,
+                "rate limit exceeded: too many requests per minute",
             );
         }
 
         if let Some(ref sid) = session_id
             && !check_session_rate_limit(&state.sessions, sid)
         {
-            return (
+            return jsonrpc_error(
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
-                HeaderMap::new(),
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": error_code::INVALID_REQUEST,
-                        "message": "rate limit exceeded: too many requests per session per minute",
-                    }
-                })),
+                Value::Null,
+                error_code::INVALID_REQUEST,
+                "rate limit exceeded: too many requests per session per minute",
             );
         }
     } else {
@@ -738,17 +734,11 @@ async fn handle_mcp(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {
-                return (
+                return jsonrpc_error(
                     axum::http::StatusCode::OK,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": error_code::INVALID_PARAMS,
-                            "message": "tools/call: 'name' is required",
-                        }
-                    })),
+                    id.clone(),
+                    error_code::INVALID_PARAMS,
+                    "tools/call: 'name' is required",
                 );
             };
 
@@ -760,21 +750,15 @@ async fn handle_mcp(
             // there is no writable store to mutate. Mirrors the gRPC
             // `ReadOnlyGuard` chokepoint.
             if state.read_only && MUTATING_TOOLS.contains(&name.as_str()) {
-                return (
+                return jsonrpc_error(
                     axum::http::StatusCode::OK,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": error_code::INVALID_REQUEST,
-                            "message": format!(
-                                "this daemon serves a read-only snapshot replica; \
-                                 tool '{}' is not available",
-                                name
-                            ),
-                        }
-                    })),
+                    id.clone(),
+                    error_code::INVALID_REQUEST,
+                    &format!(
+                        "this daemon serves a read-only snapshot replica; \
+                         tool '{}' is not available",
+                        name
+                    ),
                 );
             }
 
@@ -783,20 +767,11 @@ async fn handle_mcp(
                 && state.auth_token.is_some()
                 && !admin_bypass_rate_limit
             {
-                return (
+                return jsonrpc_error(
                     axum::http::StatusCode::FORBIDDEN,
-                    HeaderMap::new(),
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": error_code::INVALID_REQUEST,
-                            "message": format!(
-                                "tool '{}' is mutating and requires the admin token",
-                                name
-                            ),
-                        }
-                    })),
+                    id.clone(),
+                    error_code::INVALID_REQUEST,
+                    &format!("tool '{}' is mutating and requires the admin token", name),
                 );
             }
 
@@ -824,17 +799,11 @@ async fn handle_mcp(
                 match apply_safeguard_params(&mut arguments) {
                     Ok(limits) => applied_limits = limits,
                     Err(message) => {
-                        return (
+                        return jsonrpc_error(
                             axum::http::StatusCode::OK,
-                            HeaderMap::new(),
-                            Json(json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
-                                    "code": error_code::INVALID_PARAMS,
-                                    "message": message,
-                                }
-                            })),
+                            id.clone(),
+                            error_code::INVALID_PARAMS,
+                            &message,
                         );
                     }
                 }
