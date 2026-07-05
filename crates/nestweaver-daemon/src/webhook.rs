@@ -127,7 +127,7 @@ pub async fn handle_webhook(
         .ok()
         .and_then(|g| g.get(&repo_id).cloned());
     let enqueue_result = {
-        let queue = state.job_queue.lock().expect("job queue lock poisoned");
+        let queue = state.job_queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.upsert(&repo_id, &url, JobTrigger::Webhook, branch.as_deref())
     };
 

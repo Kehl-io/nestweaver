@@ -58,7 +58,7 @@ anyhow = "1"
 tracing = "0.1"
 axum = "0.8"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic"] }
 tokio-stream = "0.1"
 open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }

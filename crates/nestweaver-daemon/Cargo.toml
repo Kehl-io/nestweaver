@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = { workspace = true, features = ["net"] }
 tower = "0.5"
+tower-http = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

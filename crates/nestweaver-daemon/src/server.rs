@@ -4833,6 +4833,12 @@ pub async fn run_server(
             .with_state(metrics_auth);
         mcp_router = mcp_router.merge(metrics_route);
 
+        // Outermost safety net: convert any unhandled panic in a handler into a
+        // 500 for that ONE request instead of dropping the connection (and, if the
+        // panic were inside a held std::Mutex, poisoning it and wedging the pool).
+        // The request surface is audited panic-free today; this guards future edits.
+        mcp_router = mcp_router.layer(tower_http::catch_panic::CatchPanicLayer::new());
+
         // Parse the bind address to determine the MCP port.  When the gRPC
         // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
         // and records the actual port in the port file (second line).
