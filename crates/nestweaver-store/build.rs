@@ -60,8 +60,22 @@ fn collect_sources(dir: &Path, recursive: bool) -> Vec<PathBuf> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=LBUG_SHARED");
+    println!("cargo:rerun-if-env-changed=LBUG_BUILD_FROM_SOURCE");
     // Only needed for the static link case.
     if std::env::var("LBUG_SHARED").is_ok() {
+        return;
+    }
+    // When lbug is built FROM SOURCE (LBUG_BUILD_FROM_SOURCE), its own build
+    // compiles AND links every one of these third_party libraries. Compiling them
+    // here too duplicates each static global — e.g. antlr4's `COMPLETE_CHAR_SET`,
+    // whose destructor then runs on a mismatched/duplicated allocation at exit and
+    // aborts the process (`double free or corruption` → SIGABRT) on glibc. It only
+    // works at all today because `--allow-multiple-definition` papers over the
+    // duplicate *symbols* at link time — but that can't prevent the runtime
+    // double-free. This build.rs is ONLY for satisfying the PREBUILT liblbug.a,
+    // which ships these as undefined externals; skip it entirely for source builds.
+    if std::env::var("LBUG_BUILD_FROM_SOURCE").is_ok() {
         return;
     }
 
