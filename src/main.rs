@@ -12760,6 +12760,59 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
+/// Human rendering of the daemon `cross_repo_contracts` result (used by
+/// `contracts list` without `--json`), so the daemon path honors the `--json`
+/// flag instead of always dumping raw JSON like the direct-store path's table.
+fn render_cross_repo_contracts_human(value: &serde_json::Value) {
+    match value.get("contracts").and_then(|v| v.as_array()) {
+        Some(rows) if !rows.is_empty() => {
+            let total = value
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(rows.len() as u64);
+            println!(
+                "Cross-repo contract links ({total} total). NOTE: links are \
+                 hypotheses, not ground truth — see confidence.\n"
+            );
+            for r in rows {
+                let sn = r.get("source_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let tn = r.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let lt = r.get("link_type").and_then(|v| v.as_str()).unwrap_or("");
+                let conf = r.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                println!("  {sn} -> {tn}  [{lt}, confidence {conf:.2}]");
+            }
+        }
+        _ => println!("No cross-repo contract links found."),
+    }
+}
+
+/// Human rendering of the daemon `contract_drift` result (`contracts drift`
+/// without `--json`).
+fn render_contract_drift_human(value: &serde_json::Value) {
+    let dni = value.get("declared_not_implemented").and_then(|v| v.as_array());
+    let ind = value.get("implemented_not_declared").and_then(|v| v.as_array());
+    let empty = |a: Option<&Vec<serde_json::Value>>| a.map(|v| v.is_empty()).unwrap_or(true);
+    if empty(dni) && empty(ind) {
+        println!("No contract drift detected.");
+        return;
+    }
+    println!("Contract drift (hypotheses, not ground truth):\n");
+    for (label, arr) in [
+        ("Declared but NOT implemented", dni),
+        ("Implemented but NOT declared in any spec", ind),
+    ] {
+        if let Some(arr) = arr.filter(|a| !a.is_empty()) {
+            println!("{label} ({}):", arr.len());
+            for f in arr {
+                if let Some(uid) = f.get("uid").and_then(|v| v.as_str()) {
+                    println!("  - {uid}");
+                }
+            }
+            println!();
+        }
+    }
+}
+
 fn run_contracts(
     command: ContractCommands,
     use_daemon: bool,
@@ -12776,7 +12829,11 @@ fn run_contracts(
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_cross_repo_contracts_human(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -12830,7 +12887,11 @@ fn run_contracts(
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_contract_drift_human(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }

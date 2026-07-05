@@ -995,11 +995,19 @@ pub async fn reload_config(
         )
     })??;
 
+    // Re-read the config ONCE for both the scheduler and webhook propagation
+    // below. Parsing it separately in each block doubled the I/O and could observe
+    // two different on-disk versions within a single reload if the file changed
+    // mid-handler.
+    let reloaded_cfg = state
+        .config_path
+        .as_ref()
+        .and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
+
     // Notify the live scheduler so it picks up added/removed repos
     // without a daemon restart.
     if let Some(ref tx) = state.scheduler_tx
-        && let Some(ref config_path) = state.config_path
-        && let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path)
+        && let Some(cfg) = reloaded_cfg.as_ref()
     {
         let repos: Vec<_> = cfg
             .repos
@@ -1032,9 +1040,7 @@ pub async fn reload_config(
     }
 
     // Update webhook state so new/changed repos take effect without restart.
-    if let Some(ref config_path) = state.config_path
-        && let Ok(cfg) = nestweaver_engine::InstanceConfig::from_file(config_path)
-    {
+    if let Some(cfg) = reloaded_cfg.as_ref() {
         if let Some(ref lock) = state.webhook_allowed_repos {
             let new_allowed: std::collections::HashSet<String> = cfg
                 .repos
