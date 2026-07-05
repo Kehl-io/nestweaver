@@ -56,6 +56,24 @@ struct ImpactGroup {
     callers: Vec<ImpactResult>,
 }
 
+/// Escape a repo-controlled value for a GitHub Markdown TABLE cell. A literal `|`
+/// adds a spurious column (even inside a `code span`) and a newline breaks the
+/// row, so a symbol name / path / reason like a TypeScript union `string | number`
+/// would otherwise mangle the table. GitHub renders `\|` as a literal pipe.
+fn md_table_cell(s: &str) -> String {
+    s.replace(['\n', '\r'], " ").replace('|', "\\|")
+}
+
+/// Escape a repo-controlled value for an HTML context (`<summary>` / `<code>`). A
+/// generic symbol name like `Vec<T>` or `HashMap<String, Value>` would otherwise
+/// be parsed as an HTML tag and vanish, and a literal `</summary>` would break the
+/// collapsible block. (Not an XSS fix — GitHub sanitizes scripts — a rendering fix.)
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Render impact analysis results as a Markdown PR comment.
 ///
 /// Includes a hidden HTML marker for create-or-update dedup, a severity
@@ -124,7 +142,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         md.push_str(&format!(
             "| BREAKING | {} | {} |\n",
             breaking_count,
-            breaking_repos.join(", ")
+            md_table_cell(&breaking_repos.join(", "))
         ));
     }
     if warning_count > 0 {
@@ -139,7 +157,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         md.push_str(&format!(
             "| WARNING | {} | {} |\n",
             warning_count,
-            warning_repos.join(", ")
+            md_table_cell(&warning_repos.join(", "))
         ));
     }
     if info_count > 0 {
@@ -154,7 +172,7 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         md.push_str(&format!(
             "| INFO | {} | {} |\n",
             info_count,
-            info_repos.join(", ")
+            md_table_cell(&info_repos.join(", "))
         ));
     }
 
@@ -171,8 +189,8 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
         md.push_str(&format!(
             "<details>\n<summary>{}: <code>{}</code> — {} ({} caller{})</summary>\n\n",
             severity_label,
-            group.symbol_name,
-            format_change_kind(&group.change_kind),
+            html_escape(&group.symbol_name),
+            html_escape(format_change_kind(&group.change_kind)),
             group.callers.len(),
             if group.callers.len() == 1 { "" } else { "s" }
         ));
@@ -182,16 +200,17 @@ pub fn render_impact_markdown(impacts: &[ImpactResult], config: &FormatConfig) -
 
         for caller in &group.callers {
             let repo_name = extract_repo_name(&caller.affected_repo_url);
+            let name = if repo_name.is_empty() {
+                &caller.affected_name
+            } else {
+                repo_name
+            };
             md.push_str(&format!(
                 "| `{}` | `{}` | {} | {} |\n",
-                if repo_name.is_empty() {
-                    &caller.affected_name
-                } else {
-                    repo_name
-                },
-                caller.affected_file,
+                md_table_cell(name),
+                md_table_cell(&caller.affected_file),
                 caller.affected_line,
-                caller.reason
+                md_table_cell(&caller.reason)
             ));
         }
 
@@ -855,6 +874,52 @@ mod tests {
         let md = render_impact_markdown(&[], &config);
         assert!(md.contains("<!-- nestweaver-impact -->"));
         assert!(md.contains("No cross-repo impact detected"));
+    }
+
+    #[test]
+    fn render_escapes_pipes_newlines_and_html_in_repo_controlled_fields() {
+        // Repo-controlled values with a table-breaking pipe (a TS union type), a
+        // newline, and an HTML-tag-like generic must not corrupt the Markdown table
+        // or the <summary>/<code> block.
+        let impact = ImpactResult {
+            change_canonical_id: "chg1".to_string(),
+            change_kind: "SIGNATURE_CHANGED".to_string(),
+            affected_canonical_id: "aff1".to_string(),
+            affected_name: "handle|pipe".to_string(),
+            affected_repo_url: String::new(), // empty -> affected_name is the cell
+            affected_file: "src/a|b.ts".to_string(),
+            affected_line: 7,
+            affected_signature: "sig".to_string(),
+            severity: ImpactSeverity::Breaking,
+            // The symbol name is derived from the reason; use a generic + a union.
+            reason: "Vec<T>::push(): type changed to string | number\nsecond line".to_string(),
+        };
+        let md = render_impact_markdown(&[impact], &FormatConfig::default());
+
+        // Pipes in table cells are escaped (no raw `|` from a value adds a column).
+        assert!(
+            md.contains("handle\\|pipe"),
+            "affected_name pipe not escaped:\n{md}"
+        );
+        assert!(md.contains("src/a\\|b.ts"), "file pipe not escaped:\n{md}");
+        assert!(
+            md.contains("string \\| number"),
+            "reason pipe not escaped:\n{md}"
+        );
+        // The reason's newline is collapsed to a space — never a raw newline mid-row.
+        assert!(
+            !md.contains("number\nsecond line"),
+            "reason newline not normalized:\n{md}"
+        );
+        // The generic `<T>` in the <code> summary is HTML-escaped, not a live tag.
+        assert!(
+            md.contains("&lt;T&gt;"),
+            "generic not html-escaped in summary:\n{md}"
+        );
+        assert!(
+            !md.contains("<code>Vec<T>"),
+            "raw generic leaked into <code>:\n{md}"
+        );
     }
 
     #[test]

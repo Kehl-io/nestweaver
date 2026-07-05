@@ -74,6 +74,19 @@ runs:
       env:
         NESTWEAVER_TOKEN: ${{ inputs.token }}
       run: |
+        # Ensure the base ref is available locally for the diff. The default
+        # actions/checkout is shallow and does NOT fetch the base branch, so
+        # `origin/<base_ref>` would be absent and the diff below would fail — and
+        # then get mislabeled as a "server_unavailable" outage, silently skipping
+        # the whole analysis. A shallow (depth 1) fetch of the base tip is enough:
+        # `git diff base..HEAD` compares the two endpoint trees, so it needs both
+        # commit objects but not the connecting history.
+        if [ -n "${{ github.base_ref }}" ]; then
+          git fetch --no-tags --depth=1 origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}" \
+            || echo "::warning::could not fetch base ref 'origin/${{ github.base_ref }}'; if the diff fails, set fetch-depth: 0 on actions/checkout"
+        fi
+
         set +e
         nestweaver pre-push-impact \
           --diff "origin/${{ github.base_ref }}..HEAD" \
@@ -91,6 +104,10 @@ runs:
             echo "::error::NestWeaver server error (fail-on-error is enabled)"
             exit 1
           fi
+          # Still emit the declared outputs so downstream steps reading has-breaking
+          # / impact-count get defined values instead of empty strings.
+          echo "has-breaking=false" >> "$GITHUB_OUTPUT"
+          echo "impact-count=0" >> "$GITHUB_OUTPUT"
           echo '{"impacts":[],"error":"server_unavailable"}' > "$RUNNER_TEMP/impact.json"
           exit 0
         fi
