@@ -87,10 +87,67 @@ pub struct GraphStore {
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
 }
 
+/// True if `msg` is lbug's stale-checkpoint open failure. A crash/OOM/SIGKILL
+/// during lbug's WAL auto-checkpoint (which fires as the WAL grows mid-index, and
+/// also during a backup) can leave a `<db>.wal.checkpoint` whose embedded database
+/// id no longer matches, plus an empty `<db>.shadow`. Every subsequent open — read
+/// OR write — then fails with "Database ID for temporary file '<db>.wal.checkpoint'
+/// does not match the current database. … please delete this file and restart",
+/// crash-looping the daemon until a human deletes it.
+fn is_stale_checkpoint_error(msg: &str) -> bool {
+    msg.contains("wal.checkpoint") && msg.contains("does not match")
+}
+
+/// Remove the stale checkpoint sidecars lbug's error tells us to delete — but ONLY
+/// when the shadow file is absent or empty (0 bytes), the exact signature of an
+/// aborted checkpoint. A non-empty shadow could belong to a live mid-checkpoint
+/// writer; never touch that. (Reaching the stale-checkpoint error already implies
+/// no other process holds the write lock — that would surface as a lock error
+/// instead.) Returns true if the checkpoint file was removed (worth a retry).
+fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
+    let shadow = PathBuf::from(format!("{}.shadow", path.display()));
+    let checkpoint = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
+    let shadow_empty = std::fs::metadata(&shadow)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    if !shadow_empty {
+        return false;
+    }
+    let removed = std::fs::remove_file(&checkpoint).is_ok();
+    if shadow.exists() {
+        let _ = std::fs::remove_file(&shadow);
+    }
+    removed
+}
+
+/// Open an lbug database, auto-recovering once from a stale WAL checkpoint left by
+/// a prior crash (see [`is_stale_checkpoint_error`]). This turns what was a full
+/// read+write outage requiring manual `rm` into a transparent self-heal.
+fn open_lbug_with_recovery(
+    path: &Path,
+    make_config: impl Fn() -> lbug::SystemConfig,
+) -> Result<lbug::Database, StoreError> {
+    match lbug::Database::new(path, make_config()) {
+        Ok(db) => Ok(db),
+        Err(e) => {
+            if is_stale_checkpoint_error(&e.to_string()) && remove_stale_checkpoint_sidecars(path) {
+                tracing::warn!(
+                    "recovered a stale WAL checkpoint for {} (a prior crash left \
+                     .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
+                    path.display()
+                );
+                Ok(lbug::Database::new(path, make_config())?)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = lbug::Database::new(path, lbug::SystemConfig::default())?;
+        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -116,7 +173,7 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = lbug::Database::new(path, lbug::SystemConfig::default())?;
+        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -141,8 +198,7 @@ impl GraphStore {
     /// Open an existing database in read-only mode. Allows concurrent access
     /// while another process (e.g. the web UI) holds the write lock.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let config = lbug::SystemConfig::default().read_only(true);
-        let db = lbug::Database::new(path, config)?;
+        let db = open_lbug_with_recovery(path, || lbug::SystemConfig::default().read_only(true))?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -954,6 +1010,42 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_checkpoint_error_recognized() {
+        let real = "Runtime exception: Database ID for temporary file \
+                    '/x/db.lbug.wal.checkpoint' does not match the current database. \
+                    Please delete this file and restart.";
+        assert!(is_stale_checkpoint_error(real));
+        assert!(!is_stale_checkpoint_error("database is locked"));
+        assert!(!is_stale_checkpoint_error(
+            "some other wal.checkpoint issue"
+        ));
+    }
+
+    #[test]
+    fn removes_stale_checkpoint_only_when_shadow_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.lbug");
+        let cp = dir.path().join("db.lbug.wal.checkpoint");
+        let shadow = dir.path().join("db.lbug.shadow");
+
+        // Empty shadow + checkpoint present → recover (remove both).
+        std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
+        std::fs::write(&shadow, b"").unwrap();
+        assert!(remove_stale_checkpoint_sidecars(&db));
+        assert!(!cp.exists(), "stale checkpoint should be removed");
+        assert!(!shadow.exists(), "empty shadow should be removed");
+
+        // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
+        std::fs::write(&cp, b"stale").unwrap();
+        std::fs::write(&shadow, b"live-writer-state").unwrap();
+        assert!(!remove_stale_checkpoint_sidecars(&db));
+        assert!(
+            cp.exists(),
+            "must not remove checkpoint when shadow is non-empty"
+        );
+    }
 
     #[test]
     fn graph_generation_increments() {

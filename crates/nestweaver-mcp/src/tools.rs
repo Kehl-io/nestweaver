@@ -896,9 +896,21 @@ fn tool_schema_regex_search() -> Value {
 /// F4: counts-only companion to regex_search. Counts matches per pattern across
 /// indexed text and reports the busiest files.
 fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    const MAX_PATTERNS: usize = 64;
     let patterns = parse_string_array(&args, "patterns")
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow!("'patterns' must be a non-empty array of regex strings"))?;
+    // Each pattern is a full O(corpus) scan, so an unbounded array is a cheap
+    // CPU/response-amplification lever; an empty-string pattern matches everything.
+    if patterns.len() > MAX_PATTERNS {
+        anyhow::bail!(
+            "too many patterns ({}); maximum is {MAX_PATTERNS}",
+            patterns.len()
+        );
+    }
+    if patterns.iter().any(|p| p.trim().is_empty()) {
+        anyhow::bail!("empty pattern strings are not allowed");
+    }
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
 
@@ -2011,7 +2023,11 @@ fn tool_brain_search(
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(20);
+        .unwrap_or(20)
+        // Clamp to >=1: `limit:0` flows into `limit * 5` → `TopDocs::with_limit(0)`,
+        // which Tantivy asserts against ("Limit must be greater than 0") — a panic
+        // on a plausible client input.
+        .max(1);
     let concise = is_concise(&args);
 
     // Expand the query with taxonomy aliases for better recall.
