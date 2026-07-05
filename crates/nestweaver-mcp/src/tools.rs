@@ -551,17 +551,40 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
 
 /// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
 /// FQNs, optionally includes adjacent symbols, and respects a token budget.
+/// Bound a list of client-supplied identifiers (symbol UIDs/names/FQNs, repo-
+/// relative paths) so an oversized entry or an over-long list can't be echoed
+/// back verbatim (a response-amplification lever) or waste work. A real
+/// identifier is at most a few hundred bytes, so truncating a huge one keeps it
+/// non-matching (→ not_found) while capping the response. Truncation is
+/// char-boundary safe.
+fn bound_identifiers(mut v: Vec<String>) -> Vec<String> {
+    const MAX_LEN: usize = 512;
+    const MAX_COUNT: usize = 1000;
+    v.truncate(MAX_COUNT);
+    for s in &mut v {
+        if s.len() > MAX_LEN {
+            let mut end = MAX_LEN;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+    }
+    v
+}
+
 fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let targets: Vec<String> = args
-        .get("targets")
-        .or_else(|| args.get("uids_or_fqns"))
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let targets: Vec<String> = bound_identifiers(
+        args.get("targets")
+            .or_else(|| args.get("uids_or_fqns"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     if targets.is_empty() {
         return Err(anyhow!(
             "'targets' must be a non-empty array of symbol UIDs, names, or FQNs"
@@ -4199,15 +4222,16 @@ fn tool_schema_affected_tests() -> Value {
 
 fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
-    let mut changed_files: Vec<String> = args
-        .get("changed_files")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut changed_files: Vec<String> = bound_identifiers(
+        args.get("changed_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
 
     if changed_files.is_empty()
         && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
