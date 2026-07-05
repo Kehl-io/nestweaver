@@ -904,6 +904,24 @@ mod tests {
     }
 
     #[test]
+    fn is_circuit_open_matches_breaker_error_case_insensitively() {
+        // Matches the CircuitBreakerError Display so a tripped breaker defers the
+        // job instead of dead-lettering it. Case-insensitive on the substring.
+        assert!(is_circuit_open_error(&anyhow::anyhow!(
+            "circuit breaker open for host github.com"
+        )));
+        assert!(is_circuit_open_error(&anyhow::anyhow!(
+            "Circuit Breaker OPEN — cooling down"
+        )));
+        // Unrelated errors must NOT be treated as circuit-open (they should
+        // dead-letter/retry normally, not defer indefinitely).
+        assert!(!is_circuit_open_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!is_circuit_open_error(&anyhow::anyhow!("HTTP 500")));
+    }
+
+    #[test]
     fn is_poison_allows_transient_errors() {
         let e = anyhow::anyhow!("connection reset by peer");
         assert!(!is_poison_error(&e));

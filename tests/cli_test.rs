@@ -1185,3 +1185,50 @@ fn cli_index_reidentifies_repo_under_origin_remote() {
         .success()
         .stdout(contains("greet"));
 }
+
+#[test]
+fn cli_contracts_diff_flags_breaking_change() {
+    // A removed response field is a BREAKING change; --fail-on-breaking exits nonzero.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("openapi.base.yaml");
+    let head = dir.path().join("openapi.head.yaml");
+    std::fs::write(
+        &base,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}, status: {type: string}}}}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &head,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}}}}}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["contracts", "diff", "--base"])
+        .arg(&base)
+        .arg("--head")
+        .arg(&head)
+        .arg("--fail-on-breaking")
+        .assert()
+        .failure()
+        .stdout(contains("BREAKING"));
+}
+
+#[test]
+fn cli_contracts_diff_clean_on_identical_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = dir.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}}}}}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["contracts", "diff", "--base"])
+        .arg(&spec)
+        .arg("--head")
+        .arg(&spec)
+        .arg("--fail-on-breaking")
+        .assert()
+        .success()
+        .stdout(contains("No API changes"));
+}

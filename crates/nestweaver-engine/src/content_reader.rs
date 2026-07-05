@@ -858,6 +858,23 @@ mod tests {
     }
 
     #[test]
+    fn git_bare_reader_rejects_embedded_newline_path_without_wedging() {
+        // A path with an embedded newline would split the `cat-file --batch`
+        // request line and permanently desync the pooled reader. It must be
+        // refused (Err) while the stream stays framed for subsequent reads.
+        let (_tmp, bare, sha) = setup_bare_repo(&[("present.txt", "here")]);
+        let reader = GitBareReader::new(&bare, &sha);
+
+        assert_eq!(reader.read_file(Path::new("present.txt")).unwrap(), "here");
+        assert!(
+            reader.read_file(Path::new("weird\nname.txt")).is_err(),
+            "embedded-newline path must be refused"
+        );
+        // The next valid read still succeeds — the stream was not desynced.
+        assert_eq!(reader.read_file(Path::new("present.txt")).unwrap(), "here");
+    }
+
+    #[test]
     fn git_bare_reader_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GitBareReader>();
