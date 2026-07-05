@@ -264,13 +264,16 @@ pub fn stitch_server_spans(
         if let Some(cid) = node.get("canonical_id").and_then(|v| v.as_str())
             && cid == boundary_cid
         {
-            // Inject children.
-            if let Some(children) = node.get_mut("children") {
-                if let Some(arr) = children.as_array_mut() {
-                    arr.extend_from_slice(subtrees);
-                }
+            // Inject the server subtrees as children of the boundary node.
+            if let Some(arr) = node.get_mut("children").and_then(|c| c.as_array_mut()) {
+                arr.extend_from_slice(subtrees);
             } else if let Some(obj) = node.as_object_mut() {
                 obj.insert("children".to_string(), Value::Array(subtrees.to_vec()));
+            }
+            // Mark the boundary crossing. This was previously set only on the
+            // no-`children`-key branch, but detected boundary leaves always carry
+            // `children: []`, so the marker never appeared for the common case.
+            if let Some(obj) = node.as_object_mut() {
                 obj.insert(
                     "boundary_crossed".to_string(),
                     Value::String(format!("-> {}", server_name)),

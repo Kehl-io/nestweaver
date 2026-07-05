@@ -446,21 +446,6 @@ impl WorkerPool {
     }
 }
 
-/// Process a single indexing job: fetch, compare SHAs, index if needed.
-#[allow(dead_code)]
-fn process_job(
-    job: &IndexJob,
-    workspace: &BareCloneWorkspace,
-    store: &nestweaver_store::GraphStore,
-    instance_id: &str,
-) -> Result<(), anyhow::Error> {
-    let Some(prepared) = prepare_job(job, workspace, store, instance_id, None, RepoType::Code)?
-    else {
-        return Ok(());
-    };
-    commit_prepared_job(&prepared, store, instance_id)
-}
-
 #[derive(Debug)]
 struct PreparedIndexJob {
     repo_id: String,
@@ -528,6 +513,31 @@ fn prepare_job(
     }))
 }
 
+// Test-only convenience wrappers around the prod entry point,
+// `commit_prepared_job_with_reindex_decision` (which the worker calls directly at
+// its job loop). They supply default arguments — a no-op write gate and no reindex
+// tracker — so tests don't have to construct that machinery. Gated on `cfg(test)`
+// so the shipped binary never compiles a path prod doesn't take. (These were
+// previously `#[allow(dead_code)]`, which was misleading — they aren't dead, they
+// are test-only.)
+
+/// Prepare + commit a single indexing job in one call (test convenience; prod
+/// splits prepare/commit around the write gate in the worker loop).
+#[cfg(test)]
+fn process_job(
+    job: &IndexJob,
+    workspace: &BareCloneWorkspace,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+) -> Result<(), anyhow::Error> {
+    let Some(prepared) = prepare_job(job, workspace, store, instance_id, None, RepoType::Code)?
+    else {
+        return Ok(());
+    };
+    commit_prepared_job(&prepared, store, instance_id)
+}
+
+#[cfg(test)]
 fn commit_prepared_job(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,
@@ -536,6 +546,7 @@ fn commit_prepared_job(
     commit_prepared_job_with_write_gate(prepared, store, instance_id, || Ok::<_, anyhow::Error>(()))
 }
 
+#[cfg(test)]
 fn commit_prepared_job_with_write_gate<G, F>(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,
@@ -554,6 +565,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn commit_prepared_job_with_reindex_tracker<G, F>(
     prepared: &PreparedIndexJob,
     store: &nestweaver_store::GraphStore,

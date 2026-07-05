@@ -1092,6 +1092,15 @@ pub async fn flow_trace_with_stitching(
         .unwrap_or(10) as i32;
     let trace_id = format!("trace-{}", trace_id());
 
+    // NOTE: picks the first healthy upstream, NOT the repo-matched one that every
+    // other path uses (`find_upstream_for_repo`). Correct for single-upstream and
+    // for multi-upstream deployments where all servers index the same repos; but in
+    // a repo-partitioned multi-upstream setup (upstream globs splitting repos across
+    // servers) cross-repo continuation may hit the wrong server. Routing by the
+    // boundary's repo isn't possible yet: a `TraceBoundary` carries only an opaque
+    // `repo_uid`/`canonical_id` hash, not the glob-matchable repo URL that
+    // `matches_repo` needs. TODO: thread the callee repo URL through TraceBoundary
+    // and select per-boundary via `find_upstream_for_repo`.
     let upstream = match client.upstreams.iter().find(|u| u.is_healthy()) {
         Some(u) => u,
         None => {

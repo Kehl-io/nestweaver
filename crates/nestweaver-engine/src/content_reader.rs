@@ -33,8 +33,15 @@ pub trait ContentReader: Send + Sync {
     /// Read the full content of a file at `rel_path` (repo-relative).
     fn read_file(&self, rel_path: &Path) -> Result<String>;
 
-    /// List all files in the repo (repo-relative paths), respecting
-    /// gitignore and skip-dir rules.
+    /// List the repo's files (repo-relative paths), skipping the shared skip-dirs.
+    ///
+    /// The two backends differ by design and callers should be aware:
+    /// - `FilesystemReader` walks the **working tree** and applies `.gitignore` /
+    ///   `.git/info/exclude` patterns, so untracked-ignored files are excluded.
+    /// - `GitBareReader` lists the **committed tree** (`git ls-tree`), which
+    ///   naturally omits untracked-ignored files but *retains* any file that is
+    ///   tracked-but-ignored (committed then later gitignored). It does not run a
+    ///   gitignore matcher — the tree membership is the filter.
     fn list_files(&self) -> Result<Vec<PathBuf>>;
 
     /// Return filesystem metadata for change detection.

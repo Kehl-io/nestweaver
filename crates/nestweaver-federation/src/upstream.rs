@@ -209,6 +209,8 @@ impl UpstreamHandle {
         // Normalize URL for tonic (needs http/https scheme).
         let url = normalize_url(&config.url);
 
+        // Parsed once and reused for both the per-RPC deadline below and the
+        // stored `timeout` (same input + fallback).
         let per_rpc_timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
         let mut endpoint = Channel::from_shared(url)
             .context("invalid upstream URL")?
@@ -231,7 +233,7 @@ impl UpstreamHandle {
             .filter_map(|g| glob::Pattern::new(g).ok())
             .collect();
 
-        let timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
+        let timeout = per_rpc_timeout;
 
         Ok(Self {
             name: config

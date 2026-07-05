@@ -8265,7 +8265,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     return Ok((EXIT_ERROR, None));
                 }
             };
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
             // Resolve the bearer token. Run the device flow when explicitly
             // requested, or when no token was supplied (gh-style). The

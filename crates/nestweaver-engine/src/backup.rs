@@ -219,10 +219,9 @@ pub fn backup_inspect(archive_path: &Path) -> anyhow::Result<BackupManifest> {
             let size = entry.header().size()?;
             archive_file_sizes.insert(normalized.clone(), size);
 
-            // Compute checksum for files listed in manifest checksums.
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf)?;
-            let hash = format!("sha256:{}", hex_encode(&Sha256::digest(&buf)));
+            // Compute checksum for files listed in manifest checksums (streamed,
+            // so a multi-GB member never lands in memory).
+            let hash = sha256_stream(&mut entry)?;
             archive_checksums.insert(normalized, hash);
         }
     }
@@ -519,11 +518,11 @@ fn build_backup_manifest(
         .to_string_lossy()
         .to_string();
 
-    // Compute SHA-256 of the database file.
+    // Compute SHA-256 of the database file (streamed; the DB is the largest file
+    // in a backup and can be multiple GB).
     let db_staged = staging.join(&db_filename);
-    let db_bytes = std::fs::read(&db_staged)?;
-    let db_hash = format!("sha256:{}", hex_encode(&Sha256::digest(&db_bytes)));
-    let db_size = db_bytes.len() as u64;
+    let db_hash = sha256_stream_path(&db_staged)?;
+    let db_size = std::fs::metadata(&db_staged)?.len();
 
     let mut checksums = HashMap::new();
     checksums.insert(db_filename.clone(), db_hash);
@@ -610,8 +609,7 @@ fn verify_backup_checksums(data_dir: &Path, manifest: &BackupManifest) -> anyhow
         if !file_path.exists() {
             anyhow::bail!("checksum references missing file: {filename}");
         }
-        let bytes = std::fs::read(&file_path)?;
-        let actual = format!("sha256:{}", hex_encode(&Sha256::digest(&bytes)));
+        let actual = sha256_stream_path(&file_path)?;
         if actual != *expected_hash {
             anyhow::bail!(
                 "integrity check failed for {filename}: expected {expected_hash}, got {actual}"
@@ -662,9 +660,8 @@ fn checksum_sidecars(
             continue;
         }
 
-        let bytes = std::fs::read(entry.path())
+        let hash = sha256_stream_path(entry.path())
             .with_context(|| format!("reading sidecar for checksum: {rel}"))?;
-        let hash = format!("sha256:{}", hex_encode(&Sha256::digest(&bytes)));
         checksums.insert(rel, hash);
     }
     Ok(())
@@ -722,6 +719,27 @@ fn unix_to_utc(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let d = days + 1;
 
     (y, mo, d, h, mi, s)
+}
+
+/// Stream a reader through SHA-256 in fixed-size chunks — a backup's DB/index can
+/// be multiple GB, so reading the whole file into a `Vec` before hashing would
+/// spike memory to the file size. Returns the `sha256:<hex>` form.
+fn sha256_stream(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
+}
+
+/// Convenience: stream-hash a file at `path` (see [`sha256_stream`]).
+fn sha256_stream_path(path: impl AsRef<Path>) -> std::io::Result<String> {
+    sha256_stream(std::fs::File::open(path)?)
 }
 
 /// Encode bytes as lowercase hex string.

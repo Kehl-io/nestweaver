@@ -533,7 +533,24 @@ fn infer_cross_repo_call_edges(
     parsed_files: &[ParsedFileEntry],
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     use nestweaver_parser::ReferenceKind;
-    use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge, Visibility};
+    use nestweaver_schema::{CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge, Visibility};
+
+    // A bare call name matching many public definitions store-wide carries no
+    // attribution signal — `run`, `get`, `new`, `handle`, `init` are defined once
+    // per type/module across every repo. Mature cross-repo indexers (SCIP/LSIF
+    // monikers, Kythe VNames) resolve by package-qualified identity + import
+    // corroboration and never join on a bare name, precisely because name-only
+    // matching has near-zero precision on ubiquitous identifiers. We approximate
+    // that cheaply: (a) a candidate-count cap drops ubiquitous names entirely, and
+    // (b) import corroboration raises confidence for names the calling file
+    // actually imports. Un-corroborated name matches stay at a low, sub-"breaking"
+    // confidence (< the 0.5 org-severity cutoff) so they surface as hints, not as
+    // breaking org-wide impact. (A stronger, import-resolved cross-repo resolver
+    // already exists in `nestweaver-resolver::cross_repo`; this is the cheap
+    // hypothesis layer.)
+    const MAX_CROSS_REPO_NAME_CANDIDATES: usize = 3;
+    const NAME_ONLY_CONFIDENCE: f32 = 0.20; // info tier (< 0.25 warning cutoff)
+    const IMPORT_CORROBORATED_CONFIDENCE: f32 = 0.50; // SamePackageFallback
 
     let local_symbol_names: std::collections::HashSet<String> = parsed_files
         .iter()
@@ -542,6 +559,13 @@ fn infer_cross_repo_call_edges(
     let mut edges = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (rel_path, symbols, references, _) in parsed_files {
+        // Names this file imports — corroborates a same-named cross-repo call.
+        let imported_names: std::collections::HashSet<&str> = references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
         for reference in references {
             if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
                 continue;
@@ -561,24 +585,54 @@ fn infer_cross_repo_call_edges(
                 source_symbol.start_line,
             );
 
-            for target in store
+            // Collect eligible cross-repo candidates, then apply the ubiquity cap.
+            let candidates: Vec<_> = store
                 .lookup_symbols_by_name(&reference.name)
                 .map_err(|e| anyhow::anyhow!(e))?
-            {
-                if target.repo_uid == current_repo_uid || target.uid == source_uid {
-                    continue;
-                }
-                if target.visibility == Visibility::Private {
-                    continue;
-                }
+                .into_iter()
+                .filter(|t| {
+                    t.repo_uid != current_repo_uid
+                        && t.uid != source_uid
+                        && t.visibility != Visibility::Private
+                })
+                .collect();
+            if candidates.is_empty() || candidates.len() > MAX_CROSS_REPO_NAME_CANDIDATES {
+                continue;
+            }
+
+            let import_corroborated = imported_names.contains(reference.name.as_str());
+            let confidence = if import_corroborated {
+                IMPORT_CORROBORATED_CONFIDENCE
+            } else {
+                NAME_ONLY_CONFIDENCE
+            };
+            let evidence_kind = if import_corroborated {
+                "cross_repo_name_import_corroborated"
+            } else {
+                "cross_repo_name_match"
+            };
+
+            for target in candidates {
                 if seen.insert((source_uid.clone(), target.uid.clone())) {
                     edges.push(ResolvedEdge {
                         source_uid: source_uid.clone(),
                         target_uid: target.uid,
                         edge_type: EdgeType::CrossRepoLink,
-                        confidence: 0.7,
+                        confidence,
                         link_type: Some(CrossRepoLinkType::SharedImport),
-                        evidence: Vec::new(),
+                        evidence: vec![EdgeEvidence {
+                            kind: evidence_kind.to_string(),
+                            weight: confidence,
+                            note: Some(format!(
+                                "cross-repo call '{}' matched by name{}",
+                                reference.name,
+                                if import_corroborated {
+                                    " (import-corroborated)"
+                                } else {
+                                    ""
+                                }
+                            )),
+                        }],
                     });
                 }
             }
@@ -2255,147 +2309,6 @@ where
     Ok(result)
 }
 
-/// Parse a single file and insert its File node, Symbol nodes, and edges.
-/// Returns the number of symbols inserted.
-///
-/// Retained as a non-transactional fallback; the incremental path now uses
-/// `process_added_or_modified_file_txn` instead.
-#[allow(dead_code)]
-fn process_added_or_modified_file(
-    reader: &dyn crate::content_reader::ContentReader,
-    rel_path: &std::path::Path,
-    r_uid: &str,
-    repo_url: &str,
-    store: &nestweaver_store::GraphStore,
-) -> Result<usize, anyhow::Error> {
-    use nestweaver_parser::{RawReference, RawSymbol};
-    use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
-    use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
-
-    let abs_path = reader.root().join(rel_path);
-    let rel_str = rel_path.to_string_lossy().into_owned();
-
-    let source = match reader.read_file(rel_path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "read error: {e}; skipping");
-            return Ok(0);
-        }
-    };
-
-    let parsed = match nestweaver_parser::parse_source(&abs_path, &source) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "parse error: {e}; skipping");
-            return Ok(0);
-        }
-    };
-
-    let content_hash = content_hash_hex(&source);
-    let f_uid = file_uid(r_uid, &rel_str);
-
-    // Insert the File node.
-    let file = File {
-        uid: f_uid.clone(),
-        path: rel_str.clone(),
-        repo_uid: r_uid.to_string(),
-        content_hash,
-    };
-    store
-        .insert_file(&file)
-        .with_context(|| format!("insert_file {}", rel_str))?;
-    store
-        .insert_repo_file_edge(r_uid, &f_uid)
-        .with_context(|| format!("insert_repo_file_edge {}", rel_str))?;
-
-    let mut symbols: Vec<nestweaver_schema::Symbol> = Vec::new();
-    let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
-
-    for raw_sym in &parsed.symbols {
-        let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
-        let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-        let canonical = canonical_symbol_id(repo_url, &rel_str, &raw_sym.name, scope_str);
-        let sym = Symbol {
-            uid: s_uid.clone(),
-            name: raw_sym.name.clone(),
-            kind: raw_sym.kind,
-            repo_uid: r_uid.to_string(),
-            file_path: rel_str.clone(),
-            start_line: raw_sym.start_line,
-            end_line: raw_sym.end_line,
-            signature: raw_sym.signature.clone(),
-            summary: None,
-            content_hash: raw_sym.content_hash.clone(),
-            embedding: None,
-            pagerank_score: None,
-            is_entry_point: raw_sym.is_entry_point,
-            entry_point_kind: raw_sym.entry_point_kind,
-            visibility: raw_sym.visibility,
-            type_info: raw_sym.type_info.clone(),
-            framework_hint: None,
-            canonical_id: Some(canonical),
-        };
-        symbols.push(sym);
-        file_sym_pairs.push((f_uid.clone(), s_uid));
-    }
-
-    let sym_count = symbols.len();
-
-    store
-        .batch_insert_symbols(&symbols)
-        .with_context(|| format!("batch_insert_symbols {}", rel_str))?;
-
-    let file_sym_refs: Vec<(&str, &str)> = file_sym_pairs
-        .iter()
-        .map(|(f, s)| (f.as_str(), s.as_str()))
-        .collect();
-    store
-        .batch_insert_file_symbol_edges(&file_sym_refs)
-        .with_context(|| format!("batch_insert_file_symbol_edges {}", rel_str))?;
-
-    // Resolve cross-file edges within this file only (single-file scope).
-    let lang = nestweaver_parser::detect_language(&abs_path)
-        .unwrap_or(nestweaver_schema::Language::JavaScript);
-
-    // Load workspace context for JS/TS monorepo resolution.
-    // Uses ContentReader so it works with bare-repo readers too.
-    let workspace_ctx = if matches!(
-        lang,
-        nestweaver_schema::Language::JavaScript
-            | nestweaver_schema::Language::TypeScript
-            | nestweaver_schema::Language::Vue
-            | nestweaver_schema::Language::Svelte
-            | nestweaver_schema::Language::Astro
-    ) {
-        discover_workspace_context_with(|p| {
-            reader
-                .read_file(p)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
-
-    let file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = vec![(
-        rel_str.clone(),
-        parsed.symbols.clone(),
-        parsed.references.clone(),
-    )];
-    let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
-    let insertable_edges: Vec<_> = resolved_edges
-        .into_iter()
-        .filter(|e| !e.target_uid.starts_with("unresolved:"))
-        .collect();
-    if !insertable_edges.is_empty() {
-        store
-            .batch_insert_edges(&insertable_edges)
-            .with_context(|| format!("batch_insert_edges {}", rel_str))?;
-    }
-
-    Ok(sym_count)
-}
-
 /// Like [`process_added_or_modified_file`] but uses an externally-provided
 /// transaction connection for all store writes, ensuring atomicity.
 fn process_added_or_modified_file_txn(
@@ -3260,6 +3173,92 @@ function hello(name) { return "Hello " + name; }
         assert!(
             impacted.iter().any(|s| s.name == "WebCheckoutSymbol"),
             "expected WebCheckoutSymbol in impact set, got {impacted:#?}"
+        );
+    }
+
+    #[test]
+    fn cross_repo_edges_cap_ubiquitous_names_and_keep_distinctive() {
+        // A bare call to a ubiquitous name (`run`, defined publicly in 4 repos)
+        // must NOT fan out into cross-repo edges; a distinctive name (1 def) must
+        // still link. Guards the frequency-cap precision fix.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+
+        // Index the definitions FIRST so the caller can resolve them at index time.
+        for i in 0..4 {
+            let repo = dir.path().join(format!("svc{i}"));
+            fs::create_dir_all(&repo).unwrap();
+            let body = if i == 0 {
+                "export function run() { return 1; }\nexport function veryDistinctiveHandler42() { return 2; }\n"
+            } else {
+                "export function run() { return 1; }\n"
+            };
+            fs::write(repo.join("lib.js"), body).unwrap();
+            let reader = crate::content_reader::FilesystemReader::new(&repo);
+            index_into_store(
+                &reader,
+                &store,
+                "test",
+                &format!("https://example.com/svc{i}"),
+                &format!("svc{i}-sha"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // Caller makes bare calls to both a ubiquitous and a distinctive name.
+        let caller = dir.path().join("caller");
+        fs::create_dir_all(&caller).unwrap();
+        fs::write(
+            caller.join("app.js"),
+            "export function Caller() { run(); return veryDistinctiveHandler42(); }\n",
+        )
+        .unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&caller);
+        index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.com/caller",
+            "caller-sha",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // `run` has 4 public defs store-wide → exceeds the cap → no cross-repo edge.
+        let run_def = store
+            .lookup_symbols_by_name("run")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("run indexed");
+        let run_impact = store.impact(&run_def.uid, 3, 0.0).unwrap();
+        assert!(
+            !run_impact.iter().any(|s| s.name == "Caller"),
+            "ubiquitous name 'run' must NOT create a cross-repo edge, got {run_impact:#?}"
+        );
+
+        // The distinctive name has exactly one candidate → still linked.
+        let dist = store
+            .lookup_symbols_by_name("veryDistinctiveHandler42")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("distinctive indexed");
+        let dist_impact = store.impact(&dist.uid, 3, 0.0).unwrap();
+        assert!(
+            dist_impact.iter().any(|s| s.name == "Caller"),
+            "distinctive cross-repo call must still link, got {dist_impact:#?}"
         );
     }
 
