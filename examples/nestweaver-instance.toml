@@ -31,6 +31,14 @@ summary_model = "qwen2.5-coder:7b"
 # NESTWEAVER_EMBED_API_KEY environment variable — it is sent as a bearer token and
 # is NEVER written to config, the graph, or a snapshot. Omit it for local Ollama.
 
+# Local semantic-search model + retrieval fusion weights (separate from the
+# external [inference] endpoint above). Optional — sensible defaults apply.
+# [embedding]
+# model_id = "sentence-transformers/all-MiniLM-L6-v2"  # the model a DB is embedded with is recorded + auto-loaded
+# weight_ppr = 0.40      # graph structure (Personalized PageRank)
+# weight_bm25 = 0.25     # text match
+# weight_semantic = 0.35 # embedding similarity
+
 [git]
 credential_method = "gh"
 

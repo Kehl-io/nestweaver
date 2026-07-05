@@ -53,7 +53,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --no-fail-fast -- --skip daemon_
+        # --workspace is REQUIRED: the root manifest is both [package] and
+        # [workspace], so `cargo test` without it runs ONLY the root package's
+        # tests and silently skips every sub-crate's unit tests (engine, store,
+        # federation, mcp, …) — where most of the logic lives.
+        run: cargo test --workspace --no-fail-fast -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
 
@@ -87,7 +91,9 @@ jobs:
           sleep 2
           cargo build --tests
       - name: Generate coverage
-        run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
+        # --workspace so coverage reflects the whole codebase, not just the root
+        # package (see the Tests step note on the [package]+[workspace] manifest).
+        run: cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
       - name: Upload coverage artifact

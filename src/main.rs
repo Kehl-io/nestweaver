@@ -1244,7 +1244,10 @@ enum Commands {
             help = "Use the bundled local model (default when no --endpoint)"
         )]
         local: bool,
-        #[arg(long, help = "OpenAI-compatible embedding API endpoint")]
+        #[arg(
+            long,
+            help = "OpenAI-compatible embedding API endpoint. For keyed gateways (OpenAI, Azure) set NESTWEAVER_EMBED_API_KEY (sent as a bearer token, never persisted)"
+        )]
         endpoint: Option<String>,
         #[arg(
             long,

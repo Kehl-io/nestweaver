@@ -253,7 +253,9 @@ cargo build --release
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
-| `contracts` | Inspect API contract graph |
+| `contracts list` | List API contracts derived from spec files + framework handlers |
+| `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
+| `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |
 | `ranking` | Inspect ranking priors |
 | `eval` | Offline retrieval-quality evaluation |
 | `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format |
@@ -283,7 +285,9 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `mcp` | Start the MCP server (40 tools, or 6 in lite mode; auto-starts daemon) |
-| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
+| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
+| `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
+| `server` | Server management utilities (`init-tls`, `backup`, `status`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
@@ -292,6 +296,7 @@ cargo build --release
 | `pull` | Pull a snapshot from a remote storage backend |
 | `instance` | Manage instance configuration |
 | `snapshot` | Manage graph snapshots (build, verify, push) |
+| `backup` | Backup and restore the NestWeaver database |
 | `list-repos` | List all indexed repositories |
 | `remove-repo` | Remove an indexed repository and all its data (symbols, files, services, contracts) from the graph |
 | `remove-project` | Remove a materialized project and its edges from the graph |
@@ -341,6 +346,8 @@ nestweaver context "where does the upload pipeline start"
 Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use.
 
 **Model selection.** The default is the light, fast `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most repos and CPU-only servers. For higher-quality retrieval, embed with a stronger model, e.g. `nestweaver embed --model-id thenlper/gte-base` (768-dim). NestWeaver **records which model a database was embedded with**, and the daemon automatically loads that same model at startup — so you can pick a model per-database (or override the default in `instance.toml`) without dimension mismatches.
+
+**External embedding endpoints.** Instead of a local model you can embed via an OpenAI-compatible endpoint: `nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text` (Ollama), or a hosted gateway. For **keyed** gateways (OpenAI, Azure), set `NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is **never** written to config, the graph, or a snapshot. Omit it for a local Ollama endpoint. NestWeaver records the index dimension and rejects vectors of a mismatched dimension, so switching models requires re-embedding with `--force`.
 
 **Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM; heavier models trade speed for quality. Query-time embedding runs on the GPU in the daemon (the model is loaded on the daemon's main thread so Metal is reachable). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
 
