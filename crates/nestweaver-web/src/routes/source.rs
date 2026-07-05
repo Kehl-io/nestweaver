@@ -68,9 +68,12 @@ pub async fn source(
 
         // Clamp defensively: a large `line` (or `line + context` overflow) must
         // not produce start > end or an out-of-range slice — that would panic the
-        // request task. `checked_add` guards the overflow; `start.min(end)` keeps
-        // the range valid even when `line` is far past EOF.
-        let start = line.saturating_sub(context + 1).min(total_lines);
+        // request task. All arithmetic is saturating (a debug build would panic on
+        // a raw `context + 1` overflow); `start.min(end)` keeps the range valid
+        // even when `line` is far past EOF.
+        let start = line
+            .saturating_sub(context.saturating_add(1))
+            .min(total_lines);
         let end = line.saturating_add(context).min(total_lines);
         let start = start.min(end);
 

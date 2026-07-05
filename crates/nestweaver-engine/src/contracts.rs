@@ -920,14 +920,27 @@ fn json_shape<'a>(
     Some(object_fields(spec, schema))
 }
 
+/// Per-operation shapes for a parsed OpenAPI spec, plus the set of normalized
+/// paths whose path-item is a `$ref` we cannot inspect (openapiv3 doesn't model
+/// `components.pathItems`). Those are tracked so the diff can SUPPRESS a false
+/// "endpoint removed/added" when one side inlines a path the other side `$ref`s.
+#[derive(Default)]
+struct SpecShapes {
+    ops: std::collections::BTreeMap<(String, String), OpShape>,
+    ref_paths: std::collections::BTreeSet<String>,
+}
+
 /// Build the per-operation shapes for a parsed OpenAPI spec.
-fn spec_shapes(spec: &openapiv3::OpenAPI) -> std::collections::BTreeMap<(String, String), OpShape> {
-    let mut out = std::collections::BTreeMap::new();
+fn spec_shapes(spec: &openapiv3::OpenAPI) -> SpecShapes {
+    let mut out = SpecShapes::default();
     for (raw_path, item) in spec.paths.iter() {
+        let norm = normalize_http_path(raw_path);
         let openapiv3::ReferenceOr::Item(pi) = item else {
+            // Unresolvable $ref path-item — record the path so the diff doesn't
+            // treat it as absent on this side.
+            out.ref_paths.insert(norm);
             continue;
         };
-        let norm = normalize_http_path(raw_path);
         let ops: [(&str, &Option<openapiv3::Operation>); 5] = [
             ("GET", &pi.get),
             ("PUT", &pi.put),
@@ -957,7 +970,7 @@ fn spec_shapes(spec: &openapiv3::OpenAPI) -> std::collections::BTreeMap<(String,
                     break;
                 }
             }
-            out.insert((verb.to_string(), norm.clone()), shape);
+            out.ops.insert((verb.to_string(), norm.clone()), shape);
         }
     }
     out
@@ -981,11 +994,13 @@ pub fn diff_openapi(
 ) -> Option<Vec<SpecChange>> {
     let base = parse_openapi(base_path, base_src)?;
     let head = parse_openapi(head_path, head_src)?;
-    let base_ops = spec_shapes(&base);
-    let head_ops = spec_shapes(&head);
+    let base_shapes = spec_shapes(&base);
+    let head_shapes = spec_shapes(&head);
+    let base_ops = &base_shapes.ops;
+    let head_ops = &head_shapes.ops;
     let mut changes = Vec::new();
 
-    for (key, b) in &base_ops {
+    for (key, b) in base_ops {
         let (verb, path) = key;
         let push = |changes: &mut Vec<SpecChange>, sev, detail: String| {
             changes.push(SpecChange {
@@ -996,11 +1011,15 @@ pub fn diff_openapi(
             });
         };
         let Some(h) = head_ops.get(key) else {
-            push(
-                &mut changes,
-                SpecChangeSeverity::Breaking,
-                "endpoint removed".to_string(),
-            );
+            // Suppress a false "removed" when head expresses this path as a $ref
+            // path-item we couldn't inspect — we can't prove it's gone.
+            if !head_shapes.ref_paths.contains(path) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    "endpoint removed".to_string(),
+                );
+            }
             continue;
         };
         // Response fields: removal or type change breaks consumers.
@@ -1060,9 +1079,10 @@ pub fn diff_openapi(
             }
         }
     }
-    // Added endpoints.
+    // Added endpoints (INFO). Suppress when base expresses the path as a $ref
+    // path-item we couldn't inspect — we can't prove it's genuinely new.
     for key in head_ops.keys() {
-        if !base_ops.contains_key(key) {
+        if !base_ops.contains_key(key) && !base_shapes.ref_paths.contains(&key.1) {
             changes.push(SpecChange {
                 severity: SpecChangeSeverity::Info,
                 verb: key.0.clone(),
@@ -1272,6 +1292,42 @@ paths:
     #[test]
     fn diff_openapi_returns_none_for_non_openapi() {
         assert!(diff_openapi("notes.md", "# hi", "notes.md", "# hi").is_none());
+    }
+
+    #[test]
+    fn diff_openapi_suppresses_ref_pathitem_false_breaking() {
+        // Base inlines /x; head expresses /x as a $ref path-item we can't inspect.
+        // Must NOT report "/x endpoint removed" (we can't prove it's gone).
+        let base = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let head = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    $ref: '#/components/pathItems/X'
+"#;
+        let changes = diff_openapi("openapi.yaml", base, "openapi.yaml", head).expect("parses");
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.detail.contains("endpoint removed")),
+            "must not false-flag a $ref path-item as removed: {changes:?}"
+        );
+        // And the reverse direction must not report a false "added".
+        let changes_rev = diff_openapi("openapi.yaml", head, "openapi.yaml", base).expect("parses");
+        assert!(
+            !changes_rev
+                .iter()
+                .any(|c| c.detail.contains("endpoint added")),
+            "must not false-flag a $ref path-item as added: {changes_rev:?}"
+        );
     }
 
     #[test]
