@@ -204,6 +204,27 @@ For large PRs, the comment shows the top 50 symbols by severity. The full
 report is always available as a CI artifact (`impact.json`, retained for 30
 days).
 
+## API Contract Diff (spec-level)
+
+The impact report above catches **code-symbol** breaks (a removed function, a
+changed signature). To catch **API-contract** breaks — a removed response field,
+a changed field type, a newly-required request field — diff two versions of an
+OpenAPI spec directly. This needs no server and no graph; it reads two files.
+
+```bash
+# Fails the job (exit 1) if any BREAKING change is found between the base and
+# head versions of the spec.
+nestweaver contracts diff \
+  --base <(git show "$BASE_SHA:api/openapi.yaml") \
+  --head api/openapi.yaml \
+  --fail-on-breaking
+```
+
+BREAKING = endpoint removed, response field removed, field type changed, or a
+request field made newly required. Compatible additions (a new endpoint, a new
+optional field) are reported as INFO and do not fail the job. Add `--json` for a
+machine-readable report. See `nestweaver contracts diff --help`.
+
 ## Networking
 
 ### GitHub-hosted runners

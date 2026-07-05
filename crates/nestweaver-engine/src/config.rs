@@ -782,6 +782,19 @@ pub fn append_repo_to_config_file(
     Ok(true)
 }
 
+/// True if `line` begins a TOML table (`[key]`) or array-of-tables (`[[key]]`)
+/// header, as opposed to a `[`-leading array-value continuation line like
+/// `[1, 2],` inside a multi-line array. A header's key starts with a letter,
+/// `_`, or a quote; an array element starts with a digit, `[`, `-`, etc.
+fn is_toml_table_header(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(after) = t.strip_prefix('[') else {
+        return false;
+    };
+    let key = after.strip_prefix('[').unwrap_or(after);
+    matches!(key.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '"' || c == '\'')
+}
+
 /// Remove a `[[repos]]` entry from an instance config file by canonical repo
 /// URL. Returns `true` when the file was changed.
 pub fn remove_repo_from_config_file(
@@ -804,7 +817,10 @@ pub fn remove_repo_from_config_file(
                 // kind. Breaking only on `[[...]]` would absorb a following
                 // `[git]` / `[inference]` / etc. into the repo block and delete
                 // those sections too when the repo is removed (config corruption).
-                if lines[i].trim_start().starts_with('[') {
+                // Use a header check (not a bare `[`) so a `[`-leading array
+                // continuation line (e.g. `[1, 2],` inside a multi-line array
+                // value) doesn't falsely truncate the block.
+                if is_toml_table_header(lines[i]) {
                     break;
                 }
                 i += 1;
@@ -1611,6 +1627,20 @@ credential_method = "ssh"
         let parsed = InstanceConfig::from_file(&path).expect("file must parse after removal");
         assert!(parsed.repos.is_empty());
         assert_eq!(parsed.git.credential_method, "ssh");
+    }
+
+    #[test]
+    fn is_toml_table_header_distinguishes_headers_from_array_lines() {
+        // Real headers terminate a block...
+        assert!(is_toml_table_header("[git]"));
+        assert!(is_toml_table_header("[[repos]]"));
+        assert!(is_toml_table_header("  [inference]"));
+        assert!(is_toml_table_header("[\"quoted.key\"]"));
+        // ...but a `[`-leading array-value continuation line does NOT.
+        assert!(!is_toml_table_header("  [1, 2],"));
+        assert!(!is_toml_table_header("[0, 0, 0],"));
+        assert!(!is_toml_table_header("value = 3"));
+        assert!(!is_toml_table_header("# [commented]"));
     }
 
     #[test]

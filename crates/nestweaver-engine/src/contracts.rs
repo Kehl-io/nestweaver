@@ -315,21 +315,48 @@ pub fn extract_base_path(framework: &str, source: &str) -> String {
     }
 }
 
-/// Byte offset of the first `class <Ident>` declaration in `source`, or `None`.
-/// Requires a word boundary before `class` so `subclass` / `MyClass` don't match.
+/// Byte offset of the first `class` declaration in `source`, or `None`.
+///
+/// Scans line by line and only accepts a `class` token whose preceding tokens on
+/// that line are all Java/Kotlin modifiers or `@annotations`. This deliberately
+/// rejects the word "class" inside a comment ("This class provides…", which
+/// starts with `/**`/`*`/`//`) — a raw substring scan matched those and cut the
+/// base-path search region short, losing the class `@RequestMapping`.
 fn class_decl_byte_pos(source: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(rel) = source[from..].find("class ") {
-        let pos = from + rel;
-        let boundary_ok = pos == 0
-            || !source[..pos]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if boundary_ok {
-            return Some(pos);
+    const MODIFIERS: &[&str] = &[
+        "public",
+        "private",
+        "protected",
+        "final",
+        "abstract",
+        "sealed",
+        "static",
+        "open",
+        "data",
+        "inner",
+        "internal",
+    ];
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let mut found = false;
+        let mut only_modifiers = true;
+        for tok in line.split_whitespace() {
+            if tok == "class" {
+                found = true;
+                break;
+            }
+            if !(MODIFIERS.contains(&tok) || tok.starts_with('@')) {
+                only_modifiers = false;
+                break;
+            }
         }
-        from = pos + "class ".len();
+        if found && only_modifiers {
+            // Byte offset of the `class` keyword within the full source.
+            if let Some(rel) = line.find("class") {
+                return Some(offset + rel);
+            }
+        }
+        offset += line.len();
     }
     None
 }
@@ -1103,6 +1130,13 @@ mod tests {
         // the base path.
         let method_only = "@RestController\npublic class C {\n  @RequestMapping(method = RequestMethod.GET, path = \"/foo\")\n  void foo() {}\n}";
         assert_eq!(extract_base_path("spring", method_only), "");
+
+        // A Javadoc/line comment mentioning "class" above the controller must not
+        // fool the class-declaration scan into cutting off the @RequestMapping.
+        let javadoc = "/** This class provides the v1 API. */\n@RestController\n@RequestMapping(\"/v1\")\npublic class C {\n  @GetMapping(\"/x\") void x(){}\n}";
+        assert_eq!(extract_base_path("spring", javadoc), "/v1");
+        let line_comment = "// base class controller\n@RequestMapping(\"/api\")\nclass C {\n  @GetMapping(\"/x\") void x(){}\n}";
+        assert_eq!(extract_base_path("spring", line_comment), "/api");
     }
 
     #[test]
