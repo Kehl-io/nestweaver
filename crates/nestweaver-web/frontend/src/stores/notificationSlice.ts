@@ -25,6 +25,8 @@ export interface NotificationSlice {
   announce: (message: string) => void;
 }
 
+const MAX_NOTIFICATIONS = 10;
+
 function createNotificationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
@@ -55,6 +57,7 @@ export const createNotificationSlice: StateCreator<
         message: input.message,
         createdAt: Date.now(),
       });
+      s.notifications = s.notifications.slice(0, MAX_NOTIFICATIONS);
       s.liveMessage = formatLiveMessage(input);
     });
     return id;

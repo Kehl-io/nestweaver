@@ -7,6 +7,7 @@ import { useNavigationHistory } from "./useNavigationHistory";
 const MODES: GraphMode[] = ["overview", "context", "impact", "repos", "features", "local"];
 
 export function useKeyboardShortcuts() {
+  const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
   const setMode = useStore((s) => s.setGraphMode);
   const toggleLeft = useStore((s) => s.toggleLeftPanel);
   const toggleRight = useStore((s) => s.toggleRightPanel);
@@ -18,31 +19,34 @@ export function useKeyboardShortcuts() {
   const toggleShortcuts = useStore((s) => s.toggleShortcuts);
   const setReducedEffects = useStore((s) => s.setReducedEffects);
   const { undo, redo } = useNavigationHistory();
+  const globalHotkeyOptions = { enabled: !modalOpen };
 
-  useHotkeys("1", () => setMode(MODES[0]));
-  useHotkeys("2", () => setMode(MODES[1]));
-  useHotkeys("3", () => setMode(MODES[2]));
-  useHotkeys("4", () => setMode(MODES[3]));
-  useHotkeys("5", () => setMode(MODES[4]));
-  useHotkeys("6", () => setMode(MODES[5]));
+  useHotkeys("1", () => setMode(MODES[0]), globalHotkeyOptions);
+  useHotkeys("2", () => setMode(MODES[1]), globalHotkeyOptions);
+  useHotkeys("3", () => setMode(MODES[2]), globalHotkeyOptions);
+  useHotkeys("4", () => setMode(MODES[3]), globalHotkeyOptions);
+  useHotkeys("5", () => setMode(MODES[4]), globalHotkeyOptions);
+  useHotkeys("6", () => setMode(MODES[5]), globalHotkeyOptions);
 
   useEffect(() => {
     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const syncReducedEffects = () => setReducedEffects(motionQuery.matches);
+    const enableReducedEffectsFromOs = () => {
+      if (motionQuery.matches) setReducedEffects(true);
+    };
 
-    syncReducedEffects();
-    motionQuery.addEventListener("change", syncReducedEffects);
-    return () => motionQuery.removeEventListener("change", syncReducedEffects);
+    enableReducedEffectsFromOs();
+    motionQuery.addEventListener("change", enableReducedEffectsFromOs);
+    return () => motionQuery.removeEventListener("change", enableReducedEffectsFromOs);
   }, [setReducedEffects]);
 
-  useHotkeys("[", () => toggleLeft());
-  useHotkeys("]", () => toggleRight());
+  useHotkeys("[", () => toggleLeft(), globalHotkeyOptions);
+  useHotkeys("]", () => toggleRight(), globalHotkeyOptions);
 
-  useHotkeys("c", () => toggleCommunity());
-  useHotkeys("m", () => toggleMinimap());
-  useHotkeys("t", () => toggleTags());
+  useHotkeys("c", () => toggleCommunity(), globalHotkeyOptions);
+  useHotkeys("m", () => toggleMinimap(), globalHotkeyOptions);
+  useHotkeys("t", () => toggleTags(), globalHotkeyOptions);
 
-  useHotkeys("escape", () => selectNode(null));
+  useHotkeys("escape", () => selectNode(null), globalHotkeyOptions);
 
   // mod+z — undo navigation
   useHotkeys(
@@ -51,7 +55,7 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       undo();
     },
-    { enableOnFormTags: ["INPUT"] },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
   // mod+shift+z — redo navigation
@@ -61,7 +65,7 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       redo();
     },
-    { enableOnFormTags: ["INPUT"] },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
   // i — impact analysis for selected node
@@ -71,13 +75,13 @@ export function useKeyboardShortcuts() {
       useStore.getState().selectNode(id, null);
       useStore.getState().setGraphMode("impact");
     }
-  });
+  }, globalHotkeyOptions);
 
   // p — find path from selected node
   useHotkeys("p", () => {
     const id = useStore.getState().selectedNodeId;
     if (id) useStore.getState().startPathfinding(id);
-  });
+  }, globalHotkeyOptions);
 
   // mod+k — open LLM query bar
   useHotkeys(
@@ -86,13 +90,15 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       useStore.getState().openLlmBar();
     },
-    { enableOnFormTags: ["INPUT"] },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
   useHotkeys(
     "shift+/",
     (e) => {
       e.preventDefault();
+      const state = useStore.getState();
+      if (state.llmBarOpen && !state.shortcutsOpen) return;
       toggleShortcuts();
     },
     { enableOnFormTags: false },
@@ -105,7 +111,7 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       toggleViewMode();
     },
-    { enableOnFormTags: ["INPUT"] },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
   // e — export (no-op; export menu is UI-driven via toolbar button)

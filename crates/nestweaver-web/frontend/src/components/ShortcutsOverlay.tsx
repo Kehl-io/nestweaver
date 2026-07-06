@@ -57,7 +57,10 @@ export function ShortcutsOverlay() {
     }}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35" />
-        <Dialog.Content className="fixed left-1/2 top-[12vh] z-50 flex max-h-[76vh] w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text)] shadow-xl focus:outline-none">
+        <Dialog.Content
+          aria-describedby="shortcuts-overlay-description"
+          className="fixed left-1/2 top-[12vh] z-50 flex max-h-[76vh] w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text)] shadow-xl focus:outline-none"
+        >
           <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--color-border)] px-4 py-3">
             <Dialog.Title className="text-sm font-semibold">
               Keyboard Shortcuts
@@ -69,6 +72,9 @@ export function ShortcutsOverlay() {
               <X size={14} aria-hidden="true" />
             </Dialog.Close>
           </div>
+          <Dialog.Description id="shortcuts-overlay-description" className="sr-only">
+            Keyboard shortcuts grouped by navigation, graph controls, and actions.
+          </Dialog.Description>
 
           <div className="grid min-h-0 gap-4 overflow-y-auto px-4 py-4 sm:grid-cols-3">
             {shortcutGroups.map((group) => (
