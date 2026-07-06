@@ -5,7 +5,10 @@ import { useForceLayout } from "../../../hooks/useForceLayout";
 import { api } from "../../../api/client";
 import type { BrainContextResult } from "../../../api/types";
 import type { SceneMetadata } from "../../../api/p1Types";
-import { workspaceContextBody } from "../../../api/workspaces";
+import {
+  workspaceContextBody,
+  workspaceSceneMetadataWithResult,
+} from "../../../api/workspaces";
 import { buildGraphFromContext, finalizeNodeSizes } from "../utils/buildGraphFromContext";
 import { preserveGraphLayout } from "../utils/preserveGraphLayout";
 
@@ -44,6 +47,7 @@ async function loadScopedBrainContext(
 
 export function useContextMode() {
   const setGraphData = useStore((s) => s.setGraphData);
+  const clearGraphData = useStore((s) => s.clearGraphData);
   const notify = useStore((s) => s.notify);
   const seeds = useStore((s) => s.seeds);
   const graphMode = useStore((s) => s.graphMode);
@@ -77,6 +81,21 @@ export function useContextMode() {
     };
 
     try {
+      const currentState = useStore.getState();
+      const previousWorkspaceId =
+        currentState.sceneMetadata?.workspace_id ??
+        currentState.activeLens.workspaceId ??
+        "all";
+      if (previousWorkspaceId !== requestWorkspaceId) {
+        clearGraphData();
+        setSceneMetadata(
+          workspaceSceneMetadataWithResult(
+            currentState.selectedWorkspace()?._meta,
+            "loading",
+            `Loading ${currentState.selectedWorkspace()?.label ?? requestWorkspaceId}.`,
+          ),
+        );
+      }
       const result = await loadScopedBrainContext(
         requestSeeds,
         2000,
@@ -148,14 +167,24 @@ export function useContextMode() {
       if (!isCurrentRequest()) return;
 
       console.error("Failed to load context:", err);
+      const message = loadErrorMessage(err, "Failed to load context graph");
+      clearGraphData();
+      setSceneMetadata(
+        workspaceSceneMetadataWithResult(
+          useStore.getState().selectedWorkspace()?._meta,
+          "error",
+          message,
+        ),
+      );
       notify({
         kind: "error",
         title: "Context graph failed",
-        message: loadErrorMessage(err, "Failed to load context graph"),
+        message,
       });
     }
   }, [
     activeWorkspaceId,
+    clearGraphData,
     graphMode,
     notify,
     seeds,

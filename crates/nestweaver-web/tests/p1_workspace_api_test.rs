@@ -1,7 +1,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nestweaver_schema::{
-    EdgeType, Note, NoteKind, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault, Visibility,
+    EdgeType, Note, NoteKind, Project, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault,
+    Visibility,
 };
 use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use nestweaver_web::create_router;
@@ -96,6 +97,15 @@ fn note(uid: &str, vault_uid: &str, title: &str, score: f64) -> Note {
     }
 }
 
+fn project(uid: &str, name: &str) -> Project {
+    Project {
+        uid: uid.to_string(),
+        name: name.to_string(),
+        summary: Some(format!("{name} workspace")),
+        instance_id: "local".to_string(),
+    }
+}
+
 fn calls_edge(source_uid: &str, target_uid: &str) -> ResolvedEdge {
     ResolvedEdge {
         source_uid: source_uid.to_string(),
@@ -179,6 +189,22 @@ fn setup_p1_store() -> GraphStore {
         .unwrap();
     store
         .insert_note(&note("note:brain:beta", &vault.uid, "Beta Note", 0.82))
+        .unwrap();
+
+    let alpha_project = project("proj:local:alpha", "Alpha Project");
+    store.insert_project(&alpha_project).unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            &alpha_project.uid,
+            &[
+                "sym:alpha:parse".to_string(),
+                "sym:alpha:format".to_string(),
+            ],
+            1.0,
+        )
+        .unwrap();
+    store
+        .batch_insert_project_note_edges(&[(&alpha_project.uid, "note:brain:alpha")])
         .unwrap();
 
     store
@@ -280,6 +306,67 @@ async fn p1_workspace_catalog_shape_includes_all_repo_and_vault_entries() {
     assert_eq!(vault_entry["counts"]["vault_count"], 1);
     assert_eq!(vault_entry["counts"]["note_count"], 2);
     assert_eq!(vault_entry["_meta"]["trust"]["data_scope"], "vault-scoped");
+
+    let project_entry = workspaces
+        .iter()
+        .find(|item| item["uid"] == "proj:local:alpha")
+        .expect("project workspace should be present");
+    assert_eq!(project_entry["type"], "project");
+    assert_eq!(project_entry["counts"]["project_count"], 1);
+    assert_eq!(project_entry["counts"]["symbol_count"], 2);
+    assert_eq!(project_entry["counts"]["note_count"], 1);
+    assert_eq!(
+        project_entry["_meta"]["trust"]["data_scope"],
+        "project-scoped"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_project_scoped_overview_uses_project_membership() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let project_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "proj:local:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/overview?limit=20&workspace={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["counts"]["project_count"], 1);
+    assert_eq!(json["counts"]["symbol_count"], 2);
+    assert_eq!(json["counts"]["note_count"], 1);
+    assert_eq!(json["_meta"]["workspace_type"], "project");
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "project-scoped");
+
+    let landmarks = json["landmarks"].as_array().unwrap();
+    assert!(
+        landmarks
+            .iter()
+            .any(|item| item["uid"] == "sym:alpha:parse"),
+        "project-scoped overview should include member symbols"
+    );
+    assert!(
+        landmarks
+            .iter()
+            .any(|item| item["uid"] == "note:brain:alpha"),
+        "project-scoped overview should include member notes"
+    );
+    assert!(
+        !landmarks
+            .iter()
+            .any(|item| item["uid"] == "sym:beta:parse" || item["uid"] == "note:brain:beta"),
+        "project-scoped overview should not leak non-member content"
+    );
 }
 
 #[tokio::test]
@@ -472,7 +559,7 @@ async fn p1_workspace_brain_context_empty_after_scope_filter_uses_no_match_metad
     let (status, json) = post_json(
         &app,
         "/api/v1/brain/context",
-        json!({ "seeds": ["sym:alpha:parse"], "workspace": vault_id }),
+        json!({ "seeds": ["sym:missing:parse"], "workspace": vault_id }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -487,6 +574,50 @@ async fn p1_workspace_brain_context_empty_after_scope_filter_uses_no_match_metad
             .iter()
             .any(|item| item == "code-results"),
         "vault-scoped empty context should still disclose unsupported code results"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_context_project_scope_filters_member_results() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let project_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "proj:local:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["sym:alpha:parse"], "workspace": project_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "project-scoped");
+    assert_eq!(json["_meta"]["trust"]["result"], "partial");
+
+    let seeds = json["seeds"].as_array().unwrap();
+    assert!(
+        seeds.iter().any(|item| item["uid"] == "sym:alpha:parse"),
+        "project-scoped context should keep member seed symbols"
+    );
+
+    let connected = json["connected"].as_array().unwrap();
+    assert!(
+        connected
+            .iter()
+            .any(|item| item["uid"] == "sym:alpha:format"),
+        "project-scoped context should include member connected symbols"
+    );
+    assert!(
+        !connected.iter().any(|item| item["uid"] == "sym:beta:parse"),
+        "project-scoped context should remove non-member connected symbols"
     );
 }
 
@@ -596,6 +727,68 @@ async fn p1_workspace_brain_search_repo_scope_returns_scoped_symbols_with_metada
     assert!(
         results.iter().all(|item| item["repo_uid"] == "repo:alpha"),
         "repo-scoped brain search should not ignore workspace scope: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_project_scope_returns_member_symbols_and_notes() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let project_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "proj:local:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, symbol_json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=parse&workspace={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        symbol_json["_meta"]["trust"]["data_scope"],
+        "project-scoped"
+    );
+    assert_eq!(symbol_json["_meta"]["trust"]["result"], "partial");
+    let symbol_results = symbol_json["results"].as_array().unwrap();
+    assert!(
+        symbol_results
+            .iter()
+            .any(|item| item["uid"] == "sym:alpha:parse"),
+        "project-scoped search should include matching member symbols"
+    );
+    assert!(
+        !symbol_results
+            .iter()
+            .any(|item| item["uid"] == "sym:beta:parse"),
+        "project-scoped search should not leak non-member symbols"
+    );
+
+    let (status, note_json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=Alpha%20Note&workspace={project_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note_json["_meta"]["trust"]["data_scope"], "project-scoped");
+    let note_results = note_json["results"].as_array().unwrap();
+    assert!(
+        note_results
+            .iter()
+            .any(|item| item["uid"] == "note:brain:alpha"),
+        "project-scoped search should include matching member notes"
+    );
+    assert!(
+        !note_results
+            .iter()
+            .any(|item| item["uid"] == "note:brain:beta"),
+        "project-scoped search should not leak non-member notes"
     );
 }
 

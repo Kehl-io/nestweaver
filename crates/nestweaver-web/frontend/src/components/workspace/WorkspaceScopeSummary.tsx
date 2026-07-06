@@ -11,6 +11,7 @@ function countLabel(workspace: WorkspaceEntry | null): string {
   if (!workspace) return "No workspace counts";
   const counts = workspace.counts;
   const parts: string[] = [];
+  if (counts.project_count > 0) parts.push(`${counts.project_count} project${counts.project_count === 1 ? "" : "s"}`);
   if (counts.repo_count > 0) parts.push(`${counts.repo_count} repo${counts.repo_count === 1 ? "" : "s"}`);
   if (counts.vault_count > 0) parts.push(`${counts.vault_count} vault${counts.vault_count === 1 ? "" : "s"}`);
   if (counts.symbol_count > 0) parts.push(`${counts.symbol_count} symbol${counts.symbol_count === 1 ? "" : "s"}`);
@@ -21,6 +22,7 @@ function countLabel(workspace: WorkspaceEntry | null): string {
 function scopeLabel(workspace: WorkspaceEntry | null): string {
   if (!workspace) return "All content";
   if (workspace.type === "all") return "All content";
+  if (workspace.type === "project") return "Project scope";
   if (workspace.type === "repo") return "Repo scope";
   if (workspace.type === "vault") return "Vault scope";
   return workspace.type;

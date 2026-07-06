@@ -61,6 +61,7 @@ export interface BrainContextResult {
 }
 
 export interface OverviewCounts {
+  project_count: number;
   repo_count: number;
   service_count: number;
   vault_count: number;

@@ -1,17 +1,21 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import * as Select from "@radix-ui/react-select";
 import {
   ChevronDown,
   Database,
+  FolderKanban,
   FolderGit2,
   Layers,
   NotebookTabs,
+  RefreshCw,
 } from "lucide-react";
 import type { WorkspaceEntry, WorkspaceType } from "../../api/p1Types";
 import { useStore } from "../../stores";
 
 function typeIcon(type: WorkspaceType) {
   switch (type) {
+    case "project":
+      return FolderKanban;
     case "repo":
       return FolderGit2;
     case "vault":
@@ -25,6 +29,8 @@ function typeLabel(type: WorkspaceType): string {
   switch (type) {
     case "all":
       return "All";
+    case "project":
+      return "Project";
     case "repo":
       return "Repo";
     case "vault":
@@ -33,6 +39,9 @@ function typeLabel(type: WorkspaceType): string {
 }
 
 function countHint(workspace: WorkspaceEntry): string {
+  if (workspace.type === "project") {
+    return `${workspace.counts.symbol_count + workspace.counts.note_count} members`;
+  }
   if (workspace.type === "repo") {
     return `${workspace.counts.symbol_count} symbols`;
   }
@@ -44,6 +53,7 @@ function countHint(workspace: WorkspaceEntry): string {
 }
 
 export function WorkspaceSwitcher() {
+  const autoLoadAttemptedRef = useRef(false);
   const workspaces = useStore((s) => s.workspaces);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const selectedWorkspace = useStore((s) => s.selectedWorkspace());
@@ -52,10 +62,13 @@ export function WorkspaceSwitcher() {
   const loadWorkspaces = useStore((s) => s.loadWorkspaces);
   const setActiveWorkspaceId = useStore((s) => s.setActiveWorkspaceId);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
+  const clearGraphData = useStore((s) => s.clearGraphData);
+  const clearWorkspaceError = useStore((s) => s.clearWorkspaceError);
   const notify = useStore((s) => s.notify);
 
   useEffect(() => {
-    if (workspaces.length === 0 && !loading) {
+    if (workspaces.length === 0 && !loading && !autoLoadAttemptedRef.current) {
+      autoLoadAttemptedRef.current = true;
       void loadWorkspaces();
     }
   }, [loadWorkspaces, loading, workspaces.length]);
@@ -73,10 +86,16 @@ export function WorkspaceSwitcher() {
   const triggerLabel = selectedWorkspace?.label ?? "All indexed content";
   const TriggerIcon = selectedWorkspace ? typeIcon(selectedWorkspace.type) : Database;
 
+  function handleRetry() {
+    clearWorkspaceError();
+    void loadWorkspaces();
+  }
+
   function handleWorkspaceChange(id: string) {
     const nextWorkspace = workspaces.find((workspace) => workspace.id === id);
     setActiveWorkspaceId(id);
     setSceneMetadata(nextWorkspace?._meta ?? null);
+    clearGraphData();
   }
 
   return (
@@ -107,8 +126,18 @@ export function WorkspaceSwitcher() {
           >
             <Select.Viewport>
               {workspaces.length === 0 && (
-                <div className="px-3 py-2 text-[var(--color-text-muted)]">
-                  {loading ? "Loading workspaces..." : "No workspaces found"}
+                <div className="space-y-2 px-3 py-2 text-[var(--color-text-muted)]">
+                  <p>{loading ? "Loading workspaces..." : error ? "Workspaces failed to load" : "No workspaces found"}</p>
+                  {error && (
+                    <button
+                      type="button"
+                      onClick={handleRetry}
+                      className="inline-flex h-7 items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-[11px] font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Retry
+                    </button>
+                  )}
                 </div>
               )}
               {workspaces.map((workspace) => {

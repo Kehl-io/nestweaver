@@ -98,6 +98,54 @@ fn brain_node_in_workspace(
 ) -> Result<bool, ApiError> {
     match workspace.kind {
         WorkspaceKind::All => Ok(true),
+        WorkspaceKind::Project => {
+            let Some(project_uid) = workspace.uid.as_deref() else {
+                return Ok(false);
+            };
+            if uid.starts_with("sym:") {
+                return Ok(store
+                    .list_project_symbol_uids(project_uid)?
+                    .iter()
+                    .any(|member_uid| member_uid == uid));
+            }
+            if uid.starts_with("note:") {
+                return Ok(store
+                    .list_project_note_uids(project_uid)?
+                    .iter()
+                    .any(|member_uid| member_uid == uid));
+            }
+            if uid.starts_with("head:") {
+                return Ok(store
+                    .lookup_heading(uid)
+                    .map(|heading| {
+                        store
+                            .list_project_note_uids(project_uid)
+                            .map(|note_uids| {
+                                note_uids
+                                    .iter()
+                                    .any(|note_uid| note_uid == &heading.note_uid)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false));
+            }
+            if uid.starts_with("sec:") {
+                return Ok(store
+                    .lookup_section(uid)
+                    .map(|section| {
+                        store
+                            .list_project_note_uids(project_uid)
+                            .map(|note_uids| {
+                                note_uids
+                                    .iter()
+                                    .any(|note_uid| note_uid == &section.note_uid)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false));
+            }
+            Ok(false)
+        }
         WorkspaceKind::Repo => {
             let Some(repo_uid) = workspace.uid.as_deref() else {
                 return Ok(false);
@@ -156,6 +204,15 @@ fn brain_context_meta(
             if empty_result { "no-match" } else { "complete" },
             Vec::<&str>::new(),
             vec![P1Provenance::local_graph_store("brain context")],
+            token_budget,
+        ),
+        WorkspaceKind::Project => workspaces::p1_meta(
+            workspace,
+            if empty_result { "no-match" } else { "partial" },
+            vec!["project-components"],
+            vec![P1Provenance::local_graph_store(
+                "project-filtered brain context",
+            )],
             token_budget,
         ),
         WorkspaceKind::Repo => workspaces::p1_meta(

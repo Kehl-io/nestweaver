@@ -272,6 +272,33 @@ fn scoped_brain_search(
         });
     }
 
+    if workspace.kind == WorkspaceKind::Project {
+        let symbol_page = workspaces::symbols_for_query(&state.store, q, workspace, limit)?;
+        let remaining = limit.saturating_sub(symbol_page.items.len());
+        let note_page = workspaces::notes_for_query(&state.store, q, workspace, remaining)?;
+        let total_count = symbol_page.total_count + note_page.total_count;
+        let mut results: Vec<_> = symbol_page
+            .items
+            .into_iter()
+            .map(workspaces::symbol_search_hit)
+            .collect();
+        results.extend(note_page.items.into_iter().map(workspaces::note_search_hit));
+        let result_state = if total_count == 0 {
+            "no-match"
+        } else if limit > 0 && total_count > results.len() {
+            "truncated"
+        } else {
+            "partial"
+        };
+        return Ok(ScopedBrainSearch {
+            results,
+            provenance: P1Provenance::local_graph_store("project-scoped brain search"),
+            result_state,
+            unsupported: vec!["project-components"],
+            total_count: Some(total_count),
+        });
+    }
+
     if workspace.kind == WorkspaceKind::All
         && let Some(tantivy) = &state.tantivy
     {
@@ -316,6 +343,7 @@ fn scoped_brain_search(
         results,
         provenance: P1Provenance::local_graph_store(match workspace.kind {
             WorkspaceKind::Vault => "vault-scoped note search",
+            WorkspaceKind::Project => "project-scoped note search",
             _ => "scoped note search fallback",
         }),
         result_state,

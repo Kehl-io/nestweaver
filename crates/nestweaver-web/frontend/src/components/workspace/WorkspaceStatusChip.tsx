@@ -10,8 +10,14 @@ interface WorkspaceStatusChipProps {
 function stateTone(metadata: SceneMetadata | null | undefined): string {
   const trust = metadata?.trust;
   if (!trust) return "border-[var(--color-border)] text-[var(--color-text-muted)]";
-  if (trust.result === "error" || trust.unsupported.length > 0) {
+  if (trust.result === "error" || trust.result === "timed-out") {
+    return "border-red-400/70 text-red-500";
+  }
+  if (trust.result === "unsupported" || trust.unsupported.length > 0) {
     return "border-amber-400/60 text-amber-500";
+  }
+  if (trust.result === "empty" || trust.result === "no-match") {
+    return "border-zinc-400/60 text-[var(--color-text-muted)]";
   }
   if (trust.partial || trust.freshness === "partial" || trust.result === "partial") {
     return "border-sky-400/60 text-sky-500";
@@ -22,12 +28,38 @@ function stateTone(metadata: SceneMetadata | null | undefined): string {
   return "border-emerald-400/60 text-emerald-500";
 }
 
+function resultLabel(result: string | undefined): string | null {
+  switch (result) {
+    case "empty":
+      return "empty";
+    case "no-match":
+      return "no match";
+    case "unsupported":
+      return "unsupported";
+    case "timed-out":
+      return "timed out";
+    case "error":
+      return "error";
+    case "truncated":
+      return "truncated";
+    case "loading":
+      return "loading";
+    case "ambiguous":
+      return "ambiguous";
+    case "cancelled":
+      return "cancelled";
+    default:
+      return null;
+  }
+}
+
 function statusText(metadata: SceneMetadata | null | undefined): string {
   const trust = metadata?.trust;
   if (!trust) return "unknown";
   const parts = [trust.federation, trust.freshness].filter(Boolean);
   if (trust.partial && !parts.includes("partial")) parts.push("partial");
-  if (trust.result === "truncated") parts.push("truncated");
+  const result = resultLabel(trust.result);
+  if (result && !parts.includes(result)) parts.push(result);
   return parts.join(" · ");
 }
 

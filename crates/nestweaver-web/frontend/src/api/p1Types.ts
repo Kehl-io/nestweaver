@@ -1,6 +1,7 @@
-export type WorkspaceType = "all" | "repo" | "vault";
+export type WorkspaceType = "all" | "project" | "repo" | "vault";
 
 export interface WorkspaceCounts {
+  project_count: number;
   repo_count: number;
   service_count: number;
   vault_count: number;

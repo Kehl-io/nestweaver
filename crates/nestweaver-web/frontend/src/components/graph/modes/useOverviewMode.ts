@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type Graph from "graphology";
 import type { OverviewResponse } from "../../../api/types";
 import type { SceneMetadata } from "../../../api/p1Types";
-import { appendWorkspaceParam } from "../../../api/workspaces";
+import {
+  appendWorkspaceParam,
+  workspaceSceneMetadataWithResult,
+} from "../../../api/workspaces";
 import { useStore } from "../../../stores";
 import { buildGraphFromOverview } from "../utils/buildGraphFromOverview";
 import { preserveGraphLayout } from "../utils/preserveGraphLayout";
@@ -29,6 +32,7 @@ async function loadScopedOverview(
 export function useOverviewMode() {
   const graphMode = useStore((s) => s.graphMode);
   const setGraphData = useStore((s) => s.setGraphData);
+  const clearGraphData = useStore((s) => s.clearGraphData);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
@@ -55,6 +59,22 @@ export function useOverviewMode() {
 
     setLoading(true);
     setError(null);
+    const currentState = useStore.getState();
+    const previousWorkspaceId =
+      currentState.sceneMetadata?.workspace_id ??
+      currentState.activeLens.workspaceId ??
+      "all";
+    if (previousWorkspaceId !== requestWorkspaceId) {
+      setOverview(null);
+      clearGraphData();
+      setSceneMetadata(
+        workspaceSceneMetadataWithResult(
+          currentState.selectedWorkspace()?._meta,
+          "loading",
+          `Loading ${currentState.selectedWorkspace()?.label ?? requestWorkspaceId}.`,
+        ),
+      );
+    }
     try {
       const result = await loadScopedOverview(24, requestWorkspaceId);
       if (!isCurrentRequest()) return;
@@ -84,6 +104,15 @@ export function useOverviewMode() {
 
       const message = loadErrorMessage(err, "Failed to load overview");
       setError(message);
+      setOverview(null);
+      clearGraphData();
+      setSceneMetadata(
+        workspaceSceneMetadataWithResult(
+          useStore.getState().selectedWorkspace()?._meta,
+          "error",
+          message,
+        ),
+      );
       notify({
         kind: "error",
         title: "Overview failed",
@@ -94,7 +123,15 @@ export function useOverviewMode() {
         setLoading(false);
       }
     }
-  }, [activeWorkspaceId, graphMode, notify, setActiveLens, setGraphData, setSceneMetadata]);
+  }, [
+    activeWorkspaceId,
+    clearGraphData,
+    graphMode,
+    notify,
+    setActiveLens,
+    setGraphData,
+    setSceneMetadata,
+  ]);
 
   useEffect(() => {
     loadOverview();

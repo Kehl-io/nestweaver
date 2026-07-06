@@ -1,5 +1,7 @@
 import { ApiError } from "./client";
 import type {
+  ResultState,
+  SceneMetadata,
   ScopedBrainSearchResponse,
   ScopedSearchHit,
   WorkspaceCatalogResponse,
@@ -51,6 +53,24 @@ export function workspaceContextBody(
 
 export function loadWorkspaces(): Promise<WorkspaceCatalogResponse> {
   return request<WorkspaceCatalogResponse>("/api/v1/workspaces");
+}
+
+export function workspaceSceneMetadataWithResult(
+  base: SceneMetadata | null | undefined,
+  result: ResultState,
+  message: string,
+): SceneMetadata | null {
+  if (!base) return null;
+  return {
+    ...base,
+    trust: {
+      ...base.trust,
+      result,
+      freshness: result === "loading" ? "partial" : base.trust.freshness,
+      partial: result === "complete" ? base.trust.partial : true,
+      message,
+    },
+  };
 }
 
 export function brainSearchInWorkspace(

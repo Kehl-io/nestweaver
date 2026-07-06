@@ -29,6 +29,7 @@ struct OverviewLandmark {
 
 #[derive(Serialize)]
 struct OverviewCounts {
+    project_count: usize,
     repo_count: usize,
     service_count: usize,
     vault_count: usize,
@@ -187,12 +188,14 @@ fn overview_scope_data(
 > {
     match workspace.kind {
         WorkspaceKind::All => {
+            let projects = state.store.list_projects()?;
             let repos = nestweaver_engine::list_repos(&state.store, None)?;
             let services = nestweaver_engine::list_services(&state.store, None)?;
             let top_symbols = state.store.symbols_by_pagerank(Some(limit))?;
             let vaults = state.store.list_vaults(None)?;
             let notes = state.store.list_notes_lite(None)?;
             let counts = OverviewCounts {
+                project_count: projects.len(),
                 repo_count: repos.len(),
                 service_count: services.len(),
                 vault_count: vaults.len(),
@@ -210,6 +213,35 @@ fn overview_scope_data(
             };
             Ok((repos, services, top_symbols, vaults, notes, counts, meta))
         }
+        WorkspaceKind::Project => {
+            let project_uid = workspace.uid.as_deref().unwrap_or_default();
+            let repos = workspaces::repos_for_project(&state.store, project_uid)?;
+            let services = workspaces::services_for_project(&state.store, project_uid)?;
+            let vaults = workspaces::vaults_for_project(&state.store, project_uid)?;
+            let mut top_symbols = workspaces::symbols_for_project(&state.store, project_uid)?;
+            let symbol_count = top_symbols.len();
+            top_symbols.truncate(limit);
+            let notes = workspaces::note_lites_for_project(&state.store, project_uid)?;
+            let note_count = notes.len();
+            let counts = OverviewCounts {
+                project_count: 1,
+                repo_count: repos.len(),
+                service_count: services.len(),
+                vault_count: vaults.len(),
+                note_count,
+                symbol_count,
+                gap_count: 0,
+            };
+            let total_landmark_count =
+                counts.repo_count + counts.service_count + symbol_count + note_count;
+            let meta = OverviewMetaState {
+                result: "partial",
+                unsupported: vec!["project-components"],
+                provenance: P1Provenance::local_graph_store("project overview landmarks"),
+                total_landmark_count,
+            };
+            Ok((repos, services, top_symbols, vaults, notes, counts, meta))
+        }
         WorkspaceKind::Repo => {
             let repo_uid = workspace.uid.as_deref().unwrap_or_default();
             let repos: Vec<_> = nestweaver_engine::list_repos(&state.store, None)?
@@ -221,6 +253,7 @@ fn overview_scope_data(
             let symbol_count = top_symbols.len();
             top_symbols.truncate(limit);
             let counts = OverviewCounts {
+                project_count: 0,
                 repo_count: repos.len(),
                 service_count: services.len(),
                 vault_count: 0,
@@ -255,6 +288,7 @@ fn overview_scope_data(
                 .collect();
             let notes = state.store.list_notes_lite(Some(vault_uid))?;
             let counts = OverviewCounts {
+                project_count: 0,
                 repo_count: 0,
                 service_count: 0,
                 vault_count: vaults.len(),
