@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nestweaver_schema::{Note, NoteKind, Repo, Service, Symbol, SymbolKind, Vault, Visibility};
+use nestweaver_schema::{
+    EdgeType, Note, NoteKind, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault, Visibility,
+};
 use nestweaver_store::{GraphScope, GraphStore};
 use nestweaver_web::create_router;
 use nestweaver_web::state::AppState;
@@ -94,6 +96,17 @@ fn note(uid: &str, vault_uid: &str, title: &str, score: f64) -> Note {
     }
 }
 
+fn calls_edge(source_uid: &str, target_uid: &str) -> ResolvedEdge {
+    ResolvedEdge {
+        source_uid: source_uid.to_string(),
+        target_uid: target_uid.to_string(),
+        edge_type: EdgeType::Calls,
+        confidence: 1.0,
+        link_type: None,
+        evidence: Vec::new(),
+    }
+}
+
 fn setup_p1_store() -> GraphStore {
     let store = GraphStore::in_memory().unwrap();
 
@@ -133,11 +146,25 @@ fn setup_p1_store() -> GraphStore {
         .unwrap();
     store
         .insert_symbol(&symbol(
+            "sym:alpha:format",
+            &repo_alpha.uid,
+            "format_alpha",
+            0.9,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol(
             "sym:beta:parse",
             &repo_beta.uid,
             "parse_beta",
             0.85,
         ))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:alpha:parse", "sym:alpha:format"))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:alpha:parse", "sym:beta:parse"))
         .unwrap();
 
     let vault = Vault {
@@ -190,7 +217,7 @@ async fn p1_workspace_catalog_shape_includes_all_repo_and_vault_entries() {
         .expect("repo workspace should be present");
     assert_eq!(repo_entry["type"], "repo");
     assert_eq!(repo_entry["counts"]["repo_count"], 1);
-    assert_eq!(repo_entry["counts"]["symbol_count"], 1);
+    assert_eq!(repo_entry["counts"]["symbol_count"], 2);
     assert_eq!(repo_entry["_meta"]["workspace_id"], repo_entry["id"]);
     assert_eq!(repo_entry["_meta"]["trust"]["data_scope"], "repo-scoped");
 
@@ -227,7 +254,7 @@ async fn p1_workspace_repo_scoped_overview_does_not_silently_ignore_scope() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["counts"]["repo_count"], 1);
     assert_eq!(json["counts"]["service_count"], 1);
-    assert_eq!(json["counts"]["symbol_count"], 1);
+    assert_eq!(json["counts"]["symbol_count"], 2);
     assert_eq!(json["_meta"]["trust"]["data_scope"], "repo-scoped");
     assert_eq!(json["_meta"]["trust"]["result"], "partial");
     assert!(
@@ -303,7 +330,7 @@ async fn p1_workspace_vault_scoped_overview_marks_code_portions_unsupported() {
 }
 
 #[tokio::test]
-async fn p1_workspace_brain_context_repo_scope_returns_partial_metadata() {
+async fn p1_workspace_brain_context_repo_scope_filters_seeds_and_connected_results() {
     let app = make_app();
     let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
     assert_eq!(catalog_status, StatusCode::OK);
@@ -320,7 +347,7 @@ async fn p1_workspace_brain_context_repo_scope_returns_partial_metadata() {
     let (status, json) = post_json(
         &app,
         "/api/v1/brain/context",
-        json!({ "seeds": ["repo:alpha"], "workspace": repo_id }),
+        json!({ "seeds": ["sym:alpha:parse"], "workspace": repo_id }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -333,6 +360,30 @@ async fn p1_workspace_brain_context_repo_scope_returns_partial_metadata() {
             .iter()
             .any(|item| item == "note-results"),
         "repo-scoped brain context should disclose that note results are not repo-scoped"
+    );
+
+    let seeds = json["seeds"].as_array().unwrap();
+    assert!(
+        seeds.iter().any(|item| item["uid"] == "sym:alpha:parse"),
+        "repo-scoped brain context should keep resolved seed symbols from the requested repo"
+    );
+    assert!(
+        seeds.iter().all(|item| item["uid"]
+            .as_str()
+            .is_some_and(|uid| uid.starts_with("sym:alpha:"))),
+        "repo-scoped brain context seeds should not leak outside the requested repo: {seeds:?}"
+    );
+
+    let connected = json["connected"].as_array().unwrap();
+    assert!(
+        connected
+            .iter()
+            .any(|item| item["uid"] == "sym:alpha:format"),
+        "repo-scoped brain context should keep connected symbols from the requested repo"
+    );
+    assert!(
+        !connected.iter().any(|item| item["uid"] == "sym:beta:parse"),
+        "repo-scoped brain context should remove connected symbols from other repos"
     );
 }
 
@@ -364,4 +415,103 @@ async fn p1_workspace_brain_search_vault_scope_filters_results_with_metadata() {
         results.iter().all(|item| item["vault_uid"] == "vlt:brain"),
         "vault-scoped brain search should return only notes from the selected vault"
     );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_repo_scope_returns_scoped_symbols_with_metadata() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let repo_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "repo:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=parse&workspace={repo_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "repo-scoped");
+    assert_eq!(json["_meta"]["trust"]["result"], "partial");
+    assert!(
+        json["_meta"]["trust"]["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "note-search"),
+        "repo-scoped brain search should disclose that note search is unsupported"
+    );
+
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        results.iter().any(|item| item["uid"] == "sym:alpha:parse"),
+        "repo-scoped brain search should return matching symbols from the selected repo"
+    );
+    assert!(
+        results.iter().all(|item| item["repo_uid"] == "repo:alpha"),
+        "repo-scoped brain search should not ignore workspace scope: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_vault_scope_no_match_uses_no_match_metadata() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:brain")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=Missing&workspace={vault_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
+    assert_eq!(json["_meta"]["trust"]["result"], "no-match");
+    assert_eq!(json["_meta"]["truncation"]["truncated"], false);
+    assert!(json["results"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_vault_scope_limit_reports_truncation() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:brain")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=Note&limit=1&workspace={vault_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
+    assert_eq!(json["_meta"]["trust"]["result"], "truncated");
+    assert_eq!(json["_meta"]["truncation"]["truncated"], true);
+    assert_eq!(json["_meta"]["truncation"]["limit"], 1);
+    assert_eq!(json["_meta"]["truncation"]["omitted_count"], 1);
+    assert_eq!(json["results"].as_array().unwrap().len(), 1);
 }

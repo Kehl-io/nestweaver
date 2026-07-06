@@ -24,6 +24,20 @@ import { createSceneSlice } from "./sceneSlice";
 import type { WorkspaceSlice } from "./workspaceSlice";
 import { createWorkspaceSlice } from "./workspaceSlice";
 
+function sanitizeViewMode(value: unknown): "graph" | "list" | "matrix" {
+  return value === "list" || value === "matrix" ? value : "graph";
+}
+
+function sanitizeRepresentationMode(value: unknown): "graph" | "list" | "table" | "matrix" | "json" {
+  return value === "graph" ||
+    value === "list" ||
+    value === "table" ||
+    value === "matrix" ||
+    value === "json"
+    ? value
+    : "graph";
+}
+
 export type StoreState = GraphSlice &
   WorkspaceSlice &
   SceneSlice &
@@ -54,7 +68,7 @@ export const useStore = create<StoreState>()(
       })),
       {
         name: "nestweaver-ui",
-        version: 5,
+        version: 6,
         migrate: (persistedState: any, version: number) => {
           if (persistedState && typeof persistedState === "object") {
             const state = { ...persistedState };
@@ -70,6 +84,12 @@ export const useStore = create<StoreState>()(
               delete state.scopeVaultUid;
               state.activeWorkspaceId = state.activeWorkspaceId ?? "all";
               state.representationMode = state.representationMode ?? state.viewMode ?? "graph";
+            }
+            if (version < 6) {
+              state.representationMode = sanitizeRepresentationMode(
+                state.representationMode ?? state.viewMode,
+              );
+              state.viewMode = sanitizeViewMode(state.viewMode);
             }
             return state;
           }

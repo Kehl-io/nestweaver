@@ -205,17 +205,18 @@ pub async fn brain_search(
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref());
     if let Some(workspace_param) = workspace_param {
         let workspace = workspaces::resolve_workspace(&state.store, Some(workspace_param))?;
-        let (results, provenance, result_state, unsupported) =
-            scoped_brain_search(&state, &workspace, &q, limit)?;
-        let meta = workspaces::p1_meta(
+        let search = scoped_brain_search(&state, &workspace, &q, limit)?;
+        let meta = workspaces::p1_meta_for_result_set(
             &workspace,
-            result_state,
-            unsupported,
-            vec![provenance],
+            search.result_state,
+            search.unsupported,
+            vec![search.provenance],
             Some(limit),
+            search.results.len(),
+            search.total_count,
         );
         return Ok(Json(json!({
-            "results": results,
+            "results": search.results,
             "_meta": meta,
         }))
         .into_response());
@@ -239,32 +240,42 @@ pub async fn brain_search(
     Ok(Json(json).into_response())
 }
 
+struct ScopedBrainSearch {
+    results: Vec<serde_json::Value>,
+    provenance: P1Provenance,
+    result_state: &'static str,
+    unsupported: Vec<&'static str>,
+    total_count: Option<usize>,
+}
+
 fn scoped_brain_search(
     state: &Arc<AppState>,
     workspace: &workspaces::ResolvedWorkspace,
     q: &str,
     limit: usize,
-) -> Result<
-    (
-        Vec<serde_json::Value>,
-        P1Provenance,
-        &'static str,
-        Vec<&'static str>,
-    ),
-    ApiError,
-> {
+) -> Result<ScopedBrainSearch, ApiError> {
     if workspace.kind == WorkspaceKind::Repo {
-        return Ok((
-            Vec::new(),
-            P1Provenance::local_graph_store("repo-scoped brain search unsupported in P1"),
-            "partial",
-            vec!["note-search"],
-        ));
+        let page = workspaces::symbols_for_query(&state.store, q, workspace, limit)?;
+        let total_count = page.total_count;
+        let result_state = page.result_state("partial");
+        let results = page
+            .items
+            .into_iter()
+            .map(workspaces::symbol_search_hit)
+            .collect();
+        return Ok(ScopedBrainSearch {
+            results,
+            provenance: P1Provenance::local_graph_store("repo-scoped symbol search"),
+            result_state,
+            unsupported: vec!["note-search"],
+            total_count: Some(total_count),
+        });
     }
 
     if let Some(tantivy) = &state.tantivy {
         match tantivy.search(q, limit) {
             Ok(hits) => {
+                let saturated = limit > 0 && hits.len() >= limit;
                 let results: Vec<_> = hits
                     .into_iter()
                     .filter(|hit| {
@@ -276,12 +287,21 @@ fn scoped_brain_search(
                     })
                     .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
                     .collect();
-                return Ok((
+                let result_state = if results.is_empty() {
+                    if saturated { "partial" } else { "no-match" }
+                } else if saturated {
+                    "truncated"
+                } else {
+                    "complete"
+                };
+                let total_count = if saturated { None } else { Some(results.len()) };
+                return Ok(ScopedBrainSearch {
                     results,
-                    P1Provenance::local_tantivy("brain search"),
-                    "complete",
-                    Vec::new(),
-                ));
+                    provenance: P1Provenance::local_tantivy("brain search"),
+                    result_state,
+                    unsupported: Vec::new(),
+                    total_count,
+                });
             }
             Err(e) => {
                 tracing::warn!(error = %e, "tantivy search failed, falling back to scoped title lookup");
@@ -289,14 +309,19 @@ fn scoped_brain_search(
         }
     }
 
-    let results = workspaces::notes_for_query(&state.store, q, workspace, limit)?
+    let page = workspaces::notes_for_query(&state.store, q, workspace, limit)?;
+    let total_count = page.total_count;
+    let result_state = page.result_state("complete");
+    let results = page
+        .items
         .into_iter()
         .map(workspaces::note_search_hit)
         .collect();
-    Ok((
+    Ok(ScopedBrainSearch {
         results,
-        P1Provenance::local_graph_store("scoped note search fallback"),
-        "complete",
-        Vec::new(),
-    ))
+        provenance: P1Provenance::local_graph_store("scoped note search fallback"),
+        result_state,
+        unsupported: Vec::new(),
+        total_count: Some(total_count),
+    })
 }

@@ -125,6 +125,31 @@ pub struct P1Meta {
     pub continuation: P1Continuation,
 }
 
+pub struct BoundedResults<T> {
+    pub items: Vec<T>,
+    pub total_count: usize,
+}
+
+impl<T> BoundedResults<T> {
+    pub fn omitted_count(&self) -> usize {
+        self.total_count.saturating_sub(self.items.len())
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.omitted_count() > 0
+    }
+
+    pub fn result_state(&self, success: &'static str) -> &'static str {
+        if self.is_truncated() {
+            "truncated"
+        } else if self.items.is_empty() {
+            "no-match"
+        } else {
+            success
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct WorkspaceEntry {
     id: String,
@@ -264,11 +289,7 @@ pub fn p1_meta(
             federation: "local-only".to_string(),
             freshness: if partial { "partial" } else { "current" }.to_string(),
             capability: "local-index".to_string(),
-            result: if partial {
-                "partial".to_string()
-            } else {
-                result.to_string()
-            },
+            result: result.to_string(),
             source_confidence: "extracted".to_string(),
             partial,
             unsupported,
@@ -286,6 +307,38 @@ pub fn p1_meta(
             reason: None,
         },
     }
+}
+
+pub fn p1_meta_for_result_set(
+    workspace: &ResolvedWorkspace,
+    result: &str,
+    unsupported: Vec<&str>,
+    provenance: Vec<P1Provenance>,
+    limit: Option<usize>,
+    returned_count: usize,
+    total_count: Option<usize>,
+) -> P1Meta {
+    let truncated = result == "truncated"
+        || limit.is_some_and(|limit| {
+            if let Some(total_count) = total_count {
+                total_count > returned_count
+            } else {
+                limit > 0 && returned_count >= limit
+            }
+        });
+    let result = if truncated && result != "no-match" {
+        "truncated"
+    } else {
+        result
+    };
+    let mut meta = p1_meta(workspace, result, unsupported, provenance, limit);
+    meta.truncation.truncated = truncated;
+    meta.truncation.omitted_count = total_count
+        .map(|total_count| total_count.saturating_sub(returned_count))
+        .filter(|omitted_count| *omitted_count > 0);
+    meta.continuation.has_more = truncated;
+    meta.continuation.reason = truncated.then(|| "result-limit".to_string());
+    meta
 }
 
 impl P1Provenance {
@@ -332,7 +385,7 @@ pub fn notes_for_query(
     query: &str,
     workspace: &ResolvedWorkspace,
     limit: usize,
-) -> Result<Vec<Note>, ApiError> {
+) -> Result<BoundedResults<Note>, ApiError> {
     let needle = query.to_lowercase();
     let mut notes: Vec<Note> = match workspace.kind {
         WorkspaceKind::All => store.list_notes(None)?,
@@ -351,8 +404,47 @@ pub fn notes_for_query(
             .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    let total_count = notes.len();
     notes.truncate(limit);
-    Ok(notes)
+    Ok(BoundedResults {
+        items: notes,
+        total_count,
+    })
+}
+
+pub fn symbols_for_query(
+    store: &GraphStore,
+    query: &str,
+    workspace: &ResolvedWorkspace,
+    limit: usize,
+) -> Result<BoundedResults<Symbol>, ApiError> {
+    let needle = query.to_lowercase();
+    let mut symbols: Vec<Symbol> = match workspace.kind {
+        WorkspaceKind::All => store.list_all_symbols()?,
+        WorkspaceKind::Repo => {
+            symbols_for_repo(store, workspace.uid.as_deref().unwrap_or_default())?
+        }
+        WorkspaceKind::Vault => Vec::new(),
+    }
+    .into_iter()
+    .filter(|symbol| {
+        symbol.name.to_lowercase().contains(&needle)
+            || symbol.file_path.to_lowercase().contains(&needle)
+            || symbol.signature.to_lowercase().contains(&needle)
+    })
+    .collect();
+    symbols.sort_by(|a, b| {
+        b.pagerank_score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total_count = symbols.len();
+    symbols.truncate(limit);
+    Ok(BoundedResults {
+        items: symbols,
+        total_count,
+    })
 }
 
 pub fn note_search_hit(note: Note) -> serde_json::Value {
@@ -362,6 +454,18 @@ pub fn note_search_hit(note: Note) -> serde_json::Value {
         "title": note.title,
         "vault_uid": note.vault_uid,
         "score": note.pagerank_score.unwrap_or(0.0),
+    })
+}
+
+pub fn symbol_search_hit(symbol: Symbol) -> serde_json::Value {
+    json!({
+        "uid": symbol.uid,
+        "kind": "Symbol",
+        "name": symbol.name,
+        "title": symbol.name,
+        "repo_uid": symbol.repo_uid,
+        "file_path": symbol.file_path,
+        "score": symbol.pagerank_score.unwrap_or(0.0),
     })
 }
 

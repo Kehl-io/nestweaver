@@ -85,7 +85,11 @@ export const createSceneSlice: StateCreator<
   setRepresentationMode: (mode) =>
     set((s) => {
       s.representationMode = mode;
-      s.viewMode = mode === "table" ? "list" : mode;
+      if (mode === "table") {
+        s.viewMode = "list";
+      } else if (mode === "graph" || mode === "list" || mode === "matrix") {
+        s.viewMode = mode;
+      }
     }),
 
   setSceneMetadata: (metadata) =>

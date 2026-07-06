@@ -1,10 +1,9 @@
 import type { StateCreator } from "zustand";
-import type { RepresentationMode } from "../api/p1Types";
 import type { GraphMode, ScopeFilter } from "../api/types";
 import type { StoreState } from "./index";
 
 export type DetailFocus = "summary" | "source" | "related" | "analysis";
-export type ViewMode = Exclude<RepresentationMode, "table">;
+export type ViewMode = "graph" | "list" | "matrix";
 
 export interface GraphSlice {
   selectedNodeId: string | null;
@@ -137,9 +136,7 @@ export const createGraphSlice: StateCreator<
           ? "list"
           : s.viewMode === "list"
             ? "matrix"
-            : s.viewMode === "matrix"
-              ? "json"
-              : "graph";
+            : "graph";
       s.representationMode = s.viewMode;
     }),
 
