@@ -4,6 +4,7 @@ import {
   type NodeActionId,
   useNodeActions,
 } from "./useNodeActions";
+import { useStore } from "../../stores";
 
 interface NodeActionBarProps {
   node: NodeActionContext | null;
@@ -21,6 +22,7 @@ export function NodeActionBar({
   const actions = useNodeActions(node).filter(
     (action) => !ids || ids.includes(action.id),
   );
+  const notify = useStore((s) => s.notify);
   const [pending, setPending] = useState<NodeActionId | null>(null);
 
   if (!node || actions.length === 0) return null;
@@ -49,6 +51,16 @@ export function NodeActionBar({
                 }
               } catch (error) {
                 console.error(`${action.label} failed`, error);
+                if (action.id === "compare") {
+                  notify({
+                    kind: "error",
+                    title: "Compare failed",
+                    message:
+                      error instanceof Error && error.message
+                        ? error.message
+                        : "Context comparison request failed",
+                  });
+                }
               } finally {
                 setPending(null);
               }
