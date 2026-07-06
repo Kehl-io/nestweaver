@@ -29,10 +29,13 @@ export interface AnalysisSlice {
   pathfindingFrom: string | null;
   pathfindingTo: string | null;
   pathResults: PathResult[];
+  pathStatus: "idle" | "pending" | "success" | "empty" | "error";
+  pathError: string | null;
   selectedPathIndex: number;
   startPathfinding: (from: string) => void;
   setPathfindingTarget: (to: string) => void;
   setPathResults: (results: PathResult[]) => void;
+  setPathError: (error: string) => void;
   selectPath: (index: number) => void;
   clearPathfinding: () => void;
 
@@ -84,6 +87,8 @@ export const createAnalysisSlice: StateCreator<
   pathfindingFrom: null,
   pathfindingTo: null,
   pathResults: [],
+  pathStatus: "idle",
+  pathError: null,
   selectedPathIndex: 0,
 
   startPathfinding: (from) =>
@@ -92,17 +97,31 @@ export const createAnalysisSlice: StateCreator<
       s.pathfindingFrom = from;
       s.pathfindingTo = null;
       s.pathResults = [];
+      s.pathStatus = "idle";
+      s.pathError = null;
       s.selectedPathIndex = 0;
     }),
 
   setPathfindingTarget: (to) =>
     set((s) => {
       s.pathfindingTo = to;
+      s.pathStatus = "pending";
+      s.pathError = null;
     }),
 
   setPathResults: (results) =>
     set((s) => {
       s.pathResults = results;
+      s.pathStatus = results.length > 0 ? "success" : "empty";
+      s.pathError = null;
+      s.selectedPathIndex = 0;
+    }),
+
+  setPathError: (error) =>
+    set((s) => {
+      s.pathResults = [];
+      s.pathStatus = "error";
+      s.pathError = error;
       s.selectedPathIndex = 0;
     }),
 
@@ -117,6 +136,8 @@ export const createAnalysisSlice: StateCreator<
       s.pathfindingFrom = null;
       s.pathfindingTo = null;
       s.pathResults = [];
+      s.pathStatus = "idle";
+      s.pathError = null;
       s.selectedPathIndex = 0;
     }),
 

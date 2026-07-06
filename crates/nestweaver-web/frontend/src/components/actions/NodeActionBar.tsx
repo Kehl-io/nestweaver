@@ -36,6 +36,7 @@ export function NodeActionBar({
       {actions.map((action) => {
         const Icon = action.icon;
         const busy = pending === action.id;
+        const unavailable = Boolean(action.disabled);
         const disabledTitle = action.disabledReason
           ? `${action.title}. Unavailable: ${action.disabledReason}`
           : action.title;
@@ -43,7 +44,8 @@ export function NodeActionBar({
           <button
             key={action.id}
             type="button"
-            disabled={action.disabled || busy}
+            disabled={busy}
+            aria-disabled={unavailable}
             title={disabledTitle}
             aria-label={
               action.disabledReason
@@ -52,6 +54,14 @@ export function NodeActionBar({
             }
             onClick={async (event) => {
               event.stopPropagation();
+              if (unavailable) {
+                notify({
+                  kind: "warning",
+                  title: `${action.label} unavailable`,
+                  message: action.disabledReason ?? action.title,
+                });
+                return;
+              }
               try {
                 const result = action.run();
                 if (result instanceof Promise) {
@@ -72,9 +82,9 @@ export function NodeActionBar({
                 setPending(null);
               }
             }}
-            className={`inline-flex items-center justify-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-45 ${
+            className={`inline-flex items-center justify-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] disabled:cursor-wait disabled:opacity-45 ${
               compact ? "h-7 px-1.5" : "h-8 px-2"
-            }`}
+            } ${unavailable ? "cursor-not-allowed opacity-55" : ""}`}
           >
             <Icon className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
             <span>{busy ? "Working" : action.label}</span>

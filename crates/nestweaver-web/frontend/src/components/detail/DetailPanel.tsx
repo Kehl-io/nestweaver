@@ -15,7 +15,6 @@ export function DetailPanel() {
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const flowTraceActive = useStore((s) => s.flowTraceActive);
   const pathfindingActive = useStore((s) => s.pathfindingActive);
-  const pathResults = useStore((s) => s.pathResults);
   const diffActive = useStore((s) => s.diffActive);
   const gapActive = useStore((s) => s.gapActive);
   const llmResult = useStore((s) => s.llmResult);
@@ -79,7 +78,7 @@ export function DetailPanel() {
         {diffActive && <DiffDetail />}
         {gapActive && <GapDetail />}
         {flowTraceActive && <FlowDetail />}
-        {pathfindingActive && pathResults.length > 0 && <PathDetail />}
+        {pathfindingActive && <PathDetail />}
         {isSymbol ? (
           <SymbolDetail uid={selectedNodeId} />
         ) : isNote ? (

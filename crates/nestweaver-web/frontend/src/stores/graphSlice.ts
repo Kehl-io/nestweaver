@@ -11,7 +11,7 @@ export interface GraphSlice {
   hoveredNodeId: string | null;
   previewNodeId: string | null;
   previewExpanded: boolean;
-  openPreview: (id: string, kind?: string | null) => void;
+  openPreview: (id: string, kind?: string | null, expanded?: boolean) => void;
   closePreview: () => void;
   togglePreviewExpanded: () => void;
   contextMenu: { x: number; y: number; nodeId: string } | null;
@@ -181,10 +181,10 @@ export const createGraphSlice: StateCreator<
       s.hoveredNodeId = id;
     }),
 
-  openPreview: (id, kind) =>
+  openPreview: (id, kind, expanded = false) =>
     set((s) => {
       s.previewNodeId = id;
-      s.previewExpanded = false;
+      s.previewExpanded = expanded;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
     }),

@@ -5,18 +5,26 @@ import { api } from "../api/client";
 export function PathTargetSelector() {
   const [target, setTarget] = useState("");
   const pathfindingFrom = useStore((s) => s.pathfindingFrom);
+  const pathStatus = useStore((s) => s.pathStatus);
   const setPathfindingTarget = useStore((s) => s.setPathfindingTarget);
   const setPathResults = useStore((s) => s.setPathResults);
+  const setPathError = useStore((s) => s.setPathError);
   const clearPathfinding = useStore((s) => s.clearPathfinding);
+  const pending = pathStatus === "pending";
 
   const handleSubmit = async () => {
-    if (!target || !pathfindingFrom) return;
-    setPathfindingTarget(target);
+    const trimmedTarget = target.trim();
+    if (!trimmedTarget || !pathfindingFrom || pending) return;
+    setPathfindingTarget(trimmedTarget);
     try {
-      const results = await api.paths(pathfindingFrom, target, 5, 10);
+      const results = await api.paths(pathfindingFrom, trimmedTarget, 5, 10);
       setPathResults(results);
-    } catch {
-      setPathResults([]);
+    } catch (error) {
+      setPathError(
+        error instanceof Error && error.message
+          ? error.message
+          : "Path query failed.",
+      );
     }
   };
 
@@ -37,13 +45,15 @@ export function PathTargetSelector() {
           onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
           placeholder="Target node UID or name..."
           className="flex-1 h-8 px-2 text-sm border border-[var(--color-border)] rounded bg-[var(--color-surface)] outline-none focus:ring-2 focus:ring-[var(--color-graph-selection)]"
+          disabled={pending}
           autoFocus
         />
         <button
           onClick={handleSubmit}
+          disabled={pending}
           className="h-8 px-3 text-xs bg-[var(--color-graph-selection)] text-white rounded opacity-90 hover:opacity-100"
         >
-          Find
+          {pending ? "Finding" : "Find"}
         </button>
       </div>
       <button

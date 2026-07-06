@@ -81,6 +81,7 @@ function clipboardUnavailable(): boolean {
 
 export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const selectNode = useStore((s) => s.selectNode);
+  const openPreview = useStore((s) => s.openPreview);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const setDetailFocus = useStore((s) => s.setDetailFocus);
   const startPathfinding = useStore((s) => s.startPathfinding);
@@ -98,6 +99,11 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const note = isNoteLike(node.uid, node.kind);
   const label = nodeLabel(node);
 
+  const revealDetail = (focus: DetailFocus) => {
+    openPreview(node.uid, node.kind ?? null, true);
+    setDetailFocus(focus);
+  };
+
   const focusDetail = (focus: DetailFocus) => {
     selectNode(node.uid, node.kind ?? null);
     setDetailFocus(focus);
@@ -106,8 +112,13 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const selectForLens = (
     lens: Parameters<typeof setActiveLens>[0],
     focus: DetailFocus,
+    revealPreview = false,
   ) => {
-    selectNode(node.uid, node.kind ?? null);
+    if (revealPreview) {
+      openPreview(node.uid, node.kind ?? null, true);
+    } else {
+      selectNode(node.uid, node.kind ?? null);
+    }
     setDetailFocus(focus);
     setActiveLens(lens);
   };
@@ -120,7 +131,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
       icon: FileCode,
       focus: "source",
       run: () => {
-        focusDetail("source");
+        revealDetail("source");
         setActiveLens({
           lens: note ? "rationale" : "context",
           label: `Open ${label}`,
@@ -198,6 +209,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
             workspaceId: activeWorkspaceId,
           },
           "analysis",
+          true,
         );
         startPathfinding(node.uid);
       },
@@ -240,6 +252,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
             workspaceId: activeWorkspaceId,
           },
           "analysis",
+          true,
         );
         const result = await api.flow(node.uid, 10);
         setFlowTrace(result);

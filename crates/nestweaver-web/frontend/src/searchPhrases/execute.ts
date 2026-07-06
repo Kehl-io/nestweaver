@@ -116,6 +116,12 @@ function targetForRole(
   return resolution.targets.find((target) => target.role === role) ?? null;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : "Path query failed.";
+}
+
 function executeExplain(
   state: StoreState,
   resolution: PhraseResolution,
@@ -168,7 +174,14 @@ async function executePath(
     targetUid: from,
     workspaceId: state.activeWorkspaceId,
   });
-  const results = await api.paths(from, to, 5, 10);
+  let results: Awaited<ReturnType<typeof api.paths>>;
+  try {
+    results = await api.paths(from, to, 5, 10);
+  } catch (error) {
+    const message = errorMessage(error);
+    state.setPathError(message);
+    return { status: "error", message };
+  }
   if (!isCurrent(options)) {
     return { status: "error", message: "Path result was superseded by a newer phrase." };
   }

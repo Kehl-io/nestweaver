@@ -156,7 +156,8 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
         buttonIndex += 1;
         const idx = buttonIndex;
         const Icon = item.action.icon;
-        const disabled = item.action.disabled || pending === item.action.id;
+        const unavailable = Boolean(item.action.disabled);
+        const disabled = pending === item.action.id;
 
         return (
           <button
@@ -165,6 +166,7 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
             role="menuitem"
             key={item.action.id}
             disabled={disabled}
+            aria-disabled={unavailable}
             title={
               item.action.disabledReason
                 ? `${item.action.title}. Unavailable: ${item.action.disabledReason}`
@@ -173,7 +175,8 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
             onClick={() => void runMenuAction(item)}
             onMouseEnter={() => setFocusedIndex(idx)}
             className={
-              "w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-4 disabled:cursor-not-allowed disabled:opacity-50 " +
+              "w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-4 disabled:cursor-wait disabled:opacity-50 " +
+              (unavailable ? "cursor-not-allowed opacity-60 " : "") +
               (idx === focusedIndex
                 ? "bg-[var(--color-surface-alt)]"
                 : "hover:bg-[var(--color-surface-alt)]")
