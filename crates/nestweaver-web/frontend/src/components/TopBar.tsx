@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useDebouncedCallback } from "use-debounce";
 import { api } from "../api/client";
+import type { ScopedSearchHit, ScopedSymbolSearchHit } from "../api/p1Types";
+import type { SearchHit, SymbolCandidate } from "../api/types";
+import { brainSearchInWorkspace } from "../api/workspaces";
 import { useStore } from "../stores";
 import { PerspectiveSelector } from "./PerspectiveSelector";
 import { SearchDropdown } from "./SearchDropdown";
@@ -13,11 +16,46 @@ function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
+function isScopedSymbolHit(hit: ScopedSearchHit): hit is ScopedSymbolSearchHit {
+  return "repo_uid" in hit && "file_path" in hit;
+}
+
+function splitScopedSearchResults(results: ScopedSearchHit[]): {
+  symbols: SymbolCandidate[];
+  brain: SearchHit[];
+} {
+  return results.reduce(
+    (acc, hit) => {
+      if (isScopedSymbolHit(hit)) {
+        acc.symbols.push({
+          uid: hit.uid,
+          name: hit.name || hit.title,
+          kind: "symbol",
+          file_path: hit.file_path,
+          start_line: 0,
+        });
+      } else {
+        acc.brain.push({
+          uid: hit.uid,
+          kind: hit.kind,
+          title: hit.title,
+          vault_uid: hit.vault_uid,
+          score: hit.score,
+        });
+      }
+      return acc;
+    },
+    { symbols: [] as SymbolCandidate[], brain: [] as SearchHit[] },
+  );
+}
+
 export function TopBar() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const previousWorkspaceIdRef = useRef<string | null>(null);
   const [prefersDark, setPrefersDark] = useState(false);
 
   const theme = useStore((s) => s.theme);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const searchQuery = useStore((s) => s.searchQuery);
   const searchOpen = useStore((s) => s.searchOpen);
   const scopeFilter = useStore((s) => s.scopeFilter);
@@ -37,11 +75,20 @@ export function TopBar() {
     }
     setSearchLoading(true);
     try {
-      const [symbols, brain] = await Promise.all([
-        api.search(q, 10),
-        api.brainSearch(q, 5),
-      ]);
-      setSearchResults(symbols, brain);
+      if (activeWorkspaceId === "all") {
+        const [symbols, brain] = await Promise.all([
+          api.search(q, 10),
+          api.brainSearch(q, 5),
+        ]);
+        setSearchResults(symbols, brain);
+      } else {
+        const scoped = await brainSearchInWorkspace(q, {
+          workspaceId: activeWorkspaceId,
+          limit: 15,
+        });
+        const { symbols, brain } = splitScopedSearchResults(scoped.results);
+        setSearchResults(symbols.slice(0, 10), brain.slice(0, 5));
+      }
     } catch (error) {
       useStore.getState().notify({
         kind: "error",
@@ -53,6 +100,14 @@ export function TopBar() {
       setSearchLoading(false);
     }
   }, 200);
+
+  useEffect(() => {
+    if (previousWorkspaceIdRef.current === activeWorkspaceId) return;
+    previousWorkspaceIdRef.current = activeWorkspaceId;
+    if (!searchQuery.trim()) return;
+    setSearchOpen(true);
+    debouncedSearch(searchQuery);
+  }, [activeWorkspaceId, debouncedSearch, searchQuery, setSearchOpen]);
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const q = e.target.value;
