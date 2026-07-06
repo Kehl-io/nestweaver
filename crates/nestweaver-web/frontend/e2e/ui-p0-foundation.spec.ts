@@ -238,11 +238,6 @@ test.describe("P0 foundation release gates", () => {
     page,
     request,
   }) => {
-    test.fixme(
-      true,
-      "The app registers shift+/ but react-hotkeys-hook matches KeyboardEvent.code; Chromium emits Slash for ?.",
-    );
-
     await openGraph(page, request);
 
     const shortcutsDialog = await openShortcutsDialog(page);
