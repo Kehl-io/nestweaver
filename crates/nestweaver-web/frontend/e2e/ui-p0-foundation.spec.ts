@@ -68,16 +68,27 @@ async function openGraph(page: Page, request: APIRequestContext): Promise<void> 
 }
 
 async function openShortcutsDialog(page: Page): Promise<Locator> {
-  const graphApp = page.getByRole("application", {
-    name: "Code knowledge graph",
-  });
   const shortcutsDialog = page.getByRole("dialog", {
     name: "Keyboard Shortcuts",
   });
 
-  await graphApp.focus();
   await page.keyboard.press("?");
   return shortcutsDialog;
+}
+
+async function focusBody(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    document.body.setAttribute("tabindex", "-1");
+    document.body.focus();
+    document.body.removeAttribute("tabindex");
+  });
+
+  await expect
+    .poll(
+      async () => page.evaluate(() => document.activeElement === document.body),
+      { message: "body should receive focus before opening fallback dialog" },
+    )
+    .toBe(true);
 }
 
 async function canvasPixelStats(canvas: Locator): Promise<CanvasPixelStats> {
@@ -220,11 +231,9 @@ test.describe("P0 foundation release gates", () => {
   }) => {
     await openGraph(page, request);
 
-    const graphApp = page.getByRole("application", {
-      name: "Code knowledge graph",
-    });
-    await graphApp.focus();
-    await expect(graphApp).toBeFocused();
+    const searchInput = page.getByTestId("search-input");
+    await searchInput.focus();
+    await expect(searchInput).toBeFocused();
 
     const askShortcut = process.platform === "darwin" ? "Meta+K" : "Control+K";
     await page.keyboard.press(askShortcut);
@@ -238,7 +247,7 @@ test.describe("P0 foundation release gates", () => {
 
     await page.keyboard.press("Escape");
     await expect(askDialog).toHaveCount(0);
-    await expect(graphApp).toBeFocused();
+    await expect(searchInput).toBeFocused();
   });
 
   test("question mark opens shortcuts overlay and Escape closes it", async ({
@@ -246,6 +255,12 @@ test.describe("P0 foundation release gates", () => {
     request,
   }) => {
     await openGraph(page, request);
+
+    const settingsButton = page
+      .getByTestId("control-dock")
+      .getByRole("button", { name: "Settings" });
+    await settingsButton.focus();
+    await expect(settingsButton).toBeFocused();
 
     const shortcutsDialog = await openShortcutsDialog(page);
     await expect(shortcutsDialog).toBeVisible();
@@ -259,9 +274,44 @@ test.describe("P0 foundation release gates", () => {
 
     await page.keyboard.press("Escape");
     await expect(shortcutsDialog).toHaveCount(0);
-    await expect(
-      page.getByRole("application", { name: "Code knowledge graph" }),
-    ).toBeFocused();
+    await expect(settingsButton).toBeFocused();
+  });
+
+  test("dialogs fall back to the current graph panel application in list view", async ({
+    page,
+    request,
+  }) => {
+    await openGraph(page, request);
+
+    const graphApp = page.getByRole("application", {
+      name: "Code knowledge graph",
+    });
+    await graphApp.focus();
+
+    const viewShortcut = process.platform === "darwin" ? "Meta+L" : "Control+L";
+    await page.keyboard.press(viewShortcut);
+
+    const listApp = page.getByRole("application", { name: "Node list view" });
+    await expect(listApp).toBeVisible();
+
+    await focusBody(page);
+
+    const askShortcut = process.platform === "darwin" ? "Meta+K" : "Control+K";
+    await page.keyboard.press(askShortcut);
+
+    const askDialog = page.getByRole("dialog", { name: "Ask" });
+    await expect(askDialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(askDialog).toHaveCount(0);
+    await expect(listApp).toBeFocused();
+
+    await focusBody(page);
+
+    const shortcutsDialog = await openShortcutsDialog(page);
+    await expect(shortcutsDialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(shortcutsDialog).toHaveCount(0);
+    await expect(listApp).toBeFocused();
   });
 
   test("reduced effects is accessible and toggles in reduced-motion contexts", async ({

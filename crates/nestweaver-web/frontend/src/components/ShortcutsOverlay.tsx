@@ -51,7 +51,7 @@ function ShortcutKey({ children }: { children: string }) {
 function getGraphFocusFallback() {
   if (typeof document === "undefined") return null;
   return document.querySelector<HTMLElement>(
-    '[role="application"][aria-label="Code knowledge graph"]',
+    '[data-testid="graph-panel"] [role="application"]',
   );
 }
 
