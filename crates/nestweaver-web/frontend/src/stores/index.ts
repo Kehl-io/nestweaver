@@ -70,6 +70,7 @@ export const useStore = create<StoreState>()(
           tagsVisible: state.tagsVisible,
           minimapVisible: state.minimapVisible,
           reducedEffects: state.reducedEffects,
+          reducedEffectsUserSet: state.reducedEffectsUserSet,
         }),
       },
     ),

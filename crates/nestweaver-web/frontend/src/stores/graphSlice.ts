@@ -31,7 +31,9 @@ export interface GraphSlice {
   layoutMode: "panels" | "zen";
   activeStyleRules: Record<string, boolean>;
   reducedEffects: boolean;
+  reducedEffectsUserSet: boolean;
   setReducedEffects: (reduced: boolean) => void;
+  seedReducedEffectsFromSystem: (reduced: boolean) => void;
   toggleReducedEffects: () => void;
   viewMode: ViewMode;
   detailFocus: DetailFocus;
@@ -97,6 +99,7 @@ export const createGraphSlice: StateCreator<
     highlightEntryPoints: false, highlightHighPageRank: false,
   },
   reducedEffects: false,
+  reducedEffectsUserSet: false,
   viewMode: "graph" as const,
   detailFocus: "summary" as const,
   cameraZoom: 1,
@@ -106,8 +109,16 @@ export const createGraphSlice: StateCreator<
       s.reducedEffects = reduced;
     }),
 
+  seedReducedEffectsFromSystem: (reduced) =>
+    set((s) => {
+      if (!s.reducedEffectsUserSet && reduced) {
+        s.reducedEffects = true;
+      }
+    }),
+
   toggleReducedEffects: () =>
     set((s) => {
+      s.reducedEffectsUserSet = true;
       s.reducedEffects = !s.reducedEffects;
     }),
 

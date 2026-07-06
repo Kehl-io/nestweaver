@@ -17,7 +17,7 @@ export function useKeyboardShortcuts() {
   const selectNode = useStore((s) => s.selectNode);
   const toggleViewMode = useStore((s) => s.toggleViewMode);
   const toggleShortcuts = useStore((s) => s.toggleShortcuts);
-  const setReducedEffects = useStore((s) => s.setReducedEffects);
+  const seedReducedEffectsFromSystem = useStore((s) => s.seedReducedEffectsFromSystem);
   const { undo, redo } = useNavigationHistory();
   const globalHotkeyOptions = { enabled: !modalOpen };
 
@@ -30,14 +30,12 @@ export function useKeyboardShortcuts() {
 
   useEffect(() => {
     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const enableReducedEffectsFromOs = () => {
-      if (motionQuery.matches) setReducedEffects(true);
-    };
+    const seedReducedEffects = () => seedReducedEffectsFromSystem(motionQuery.matches);
 
-    enableReducedEffectsFromOs();
-    motionQuery.addEventListener("change", enableReducedEffectsFromOs);
-    return () => motionQuery.removeEventListener("change", enableReducedEffectsFromOs);
-  }, [setReducedEffects]);
+    seedReducedEffects();
+    motionQuery.addEventListener("change", seedReducedEffects);
+    return () => motionQuery.removeEventListener("change", seedReducedEffects);
+  }, [seedReducedEffectsFromSystem]);
 
   useHotkeys("[", () => toggleLeft(), globalHotkeyOptions);
   useHotkeys("]", () => toggleRight(), globalHotkeyOptions);
