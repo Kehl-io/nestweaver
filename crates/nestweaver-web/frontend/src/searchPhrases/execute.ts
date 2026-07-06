@@ -33,23 +33,64 @@ function isCurrent(options: ExecutePhraseOptions): boolean {
   return options.isCurrent?.() ?? true;
 }
 
+function resultForExecution(
+  resolution: PhraseResolution,
+): SceneMetadata["trust"]["result"] {
+  if (resolution.status === "unsupported") return "unsupported";
+  if (resolution.status === "ambiguous") return "ambiguous";
+  if (resolution.status === "no-match") return "no-match";
+  if (resolution.status === "error") return "error";
+  if (resolution.supportLevel === "limited") return "partial";
+  return "complete";
+}
+
+function unsupportedForExecution(resolution: PhraseResolution): string[] {
+  if (resolution.supportLevel === "unsupported") return [resolution.coverage.behavior];
+  if (resolution.supportLevel === "limited") return resolution.coverage.limits;
+  return [];
+}
+
 function metadataForExecution(
   resolution: PhraseResolution,
   selectedTargets: PhraseResolvedTarget[] = [],
 ): SceneMetadata | null {
-  const metadata = resolution.metadata;
-  if (!metadata || resolution.status !== "ambiguous") return metadata;
+  const workspaceMetadata =
+    selectedTargets.find(isWorkspaceTarget)?.metadata ?? null;
+  const resolutionMetadata = resolution.metadata;
+  const metadata = workspaceMetadata ?? resolutionMetadata;
+  if (!metadata) return null;
 
-  const result = resolution.supportLevel === "limited" ? "partial" : "complete";
-  const targetLabels = selectedTargets.map((target) => target.label).join(" to ");
-  return {
+  const result = resultForExecution(resolution);
+  const executionMetadata = {
     ...metadata,
     trust: {
       ...metadata.trust,
       result,
+      partial: metadata.trust.partial || result !== "complete",
+      unsupported: Array.from(
+        new Set([
+          ...metadata.trust.unsupported,
+          ...unsupportedForExecution(resolution),
+        ]),
+      ),
+      message: resolutionMetadata?.trust.message ?? resolution.summary,
+    },
+  };
+
+  if (resolution.status !== "ambiguous") return executionMetadata;
+
+  const resolvedResult =
+    resolution.supportLevel === "limited" ? "partial" : "complete";
+  const targetLabels = selectedTargets.map((target) => target.label).join(" to ");
+  return {
+    ...executionMetadata,
+    trust: {
+      ...executionMetadata.trust,
+      result: resolvedResult,
       partial:
-        result !== "complete" ||
-        (metadata.trust.partial && metadata.trust.result !== "ambiguous"),
+        resolvedResult !== "complete" ||
+        (executionMetadata.trust.partial &&
+          executionMetadata.trust.result !== "ambiguous"),
       message: targetLabels
         ? `${resolution.coverage.behavior} Resolved target: ${targetLabels}.`
         : resolution.coverage.behavior,
@@ -194,7 +235,7 @@ export async function executeSearchPhrase(
       if (!isCurrent(options)) {
         return { status: "error", message: "Trace result was superseded by a newer phrase." };
       }
-      state.setFlowTrace(result as any);
+      state.setFlowTrace(result);
       return { status: "executed", message: `Opened trace for ${target.label}.` };
 
     case "callers":
@@ -236,15 +277,24 @@ export async function executeSearchPhrase(
 
     case "dead_code": {
       applyMetadata(state, executionMetadata);
-      if (target && isWorkspaceTarget(target)) state.setActiveWorkspaceId(workspaceId(target));
+      const lensWorkspaceId =
+        target && isWorkspaceTarget(target)
+          ? workspaceId(target)
+          : state.activeWorkspaceId;
+      if (target && isWorkspaceTarget(target)) {
+        state.setActiveWorkspaceId(lensWorkspaceId);
+      }
       const items = await loadGapItems();
+      if (!isCurrent(options)) {
+        return { status: "error", message: "Dead-code result was superseded by a newer phrase." };
+      }
       state.setGapItems(items);
       if (!state.gapActive) state.toggleGapPanel();
       state.setActiveLens({
         lens: "unsupported",
         label: "Dead code proxy",
         targetUid: target?.uid ?? null,
-        workspaceId: target?.id ?? state.activeWorkspaceId,
+        workspaceId: lensWorkspaceId,
       });
       return { status: "limited", message: "Opened local gap analysis as a limited dead-code proxy." };
     }
@@ -293,6 +343,9 @@ export async function executeSearchPhrase(
     case "stale_repos": {
       applyMetadata(state, executionMetadata);
       const repos = await api.repos();
+      if (!isCurrent(options)) {
+        return { status: "error", message: "Stale repo result was superseded by a newer phrase." };
+      }
       const stale = repos.filter((repo) => repo.staleness_commits_behind > 0);
       state.setActiveLens({
         lens: "freshness",

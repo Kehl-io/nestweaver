@@ -149,7 +149,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
         selectNode(node.uid, node.kind ?? null);
         setDetailFocus("analysis");
         const result = await api.flow(node.uid, 10);
-        setFlowTrace(result as any);
+        setFlowTrace(result);
       },
     },
     {

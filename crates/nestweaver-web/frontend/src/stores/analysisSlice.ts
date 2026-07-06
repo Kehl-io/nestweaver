@@ -1,14 +1,8 @@
 import type { StateCreator } from "zustand";
 import type { StoreState } from "./index";
-import type { BrainContextResult, PathResult } from "../api/types";
+import type { BrainContextResult, FlowNode, PathResult } from "../api/types";
 
-export interface FlowNode {
-  uid: string;
-  name: string;
-  file_path: string;
-  depth: number;
-  children: FlowNode[];
-}
+export type { FlowNode } from "../api/types";
 
 export interface DiffState {
   snapshotA: BrainContextResult | null;

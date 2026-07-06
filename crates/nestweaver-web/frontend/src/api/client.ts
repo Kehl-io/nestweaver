@@ -3,6 +3,7 @@ import type {
   BrainContextResult,
   BrainStatus,
   ContextResult,
+  FlowNode,
   GapReport,
   ImpactNode,
   Note,
@@ -167,7 +168,7 @@ export const api = {
   },
 
   flow(uid: string, maxDepth = 5) {
-    return get<ImpactNode[]>(
+    return get<FlowNode>(
       `/api/v1/flow/${encodeURIComponent(uid)}?max_depth=${maxDepth}`,
     );
   },

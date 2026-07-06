@@ -61,7 +61,7 @@ export function ContextMenu({ x, y, nodeId, onClose }: Props) {
       action: async () => {
         try {
           const result = await api.flow(nodeId, 10);
-          setFlowTrace(result as any);
+          setFlowTrace(result);
         } catch { /* ignore */ }
         onClose();
       },

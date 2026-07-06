@@ -138,6 +138,7 @@ function workspaceCandidate(workspace: WorkspaceEntry): PhraseCandidate {
     targetType,
     detail: workspace.uid ?? workspace.id,
     workspaceType: workspace.type,
+    metadata: workspace._meta,
   };
 }
 
@@ -153,6 +154,8 @@ function candidateToTarget(
     targetType: candidate.targetType,
     detail: candidate.detail,
     role,
+    workspaceType: candidate.workspaceType,
+    metadata: candidate.metadata,
   };
 }
 

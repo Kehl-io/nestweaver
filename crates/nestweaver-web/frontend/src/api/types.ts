@@ -177,6 +177,14 @@ export interface ImpactNode {
   depth: number;
 }
 
+export interface FlowNode {
+  uid: string;
+  name: string;
+  file_path: string;
+  depth: number;
+  children: FlowNode[];
+}
+
 export interface PathEdge {
   type: string;
   confidence: number;

@@ -64,6 +64,7 @@ export interface PhraseCandidate {
   detail?: string;
   score?: number;
   workspaceType?: WorkspaceType | string;
+  metadata?: SceneMetadata;
 }
 
 export type PhraseTargetRole = "target" | "source" | "destination";
@@ -76,6 +77,8 @@ export interface PhraseResolvedTarget {
   targetType: PhraseTargetType;
   detail?: string;
   role?: PhraseTargetRole;
+  workspaceType?: WorkspaceType | string;
+  metadata?: SceneMetadata;
 }
 
 export interface PhraseCandidateGroup {
