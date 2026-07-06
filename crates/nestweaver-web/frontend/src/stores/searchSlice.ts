@@ -1,5 +1,6 @@
 import type { StateCreator } from "zustand";
 import type { SearchHit, SymbolCandidate } from "../api/types";
+import type { PhraseIntent, PhraseResolution } from "../searchPhrases";
 import type { StoreState } from "./index";
 
 export interface SearchSlice {
@@ -8,10 +9,18 @@ export interface SearchSlice {
   brainSearchResults: SearchHit[];
   searchOpen: boolean;
   searchLoading: boolean;
+  phraseIntent: PhraseIntent | null;
+  phraseResolution: PhraseResolution | null;
+  phraseResolving: boolean;
+  phraseError: string | null;
   setSearchQuery: (q: string) => void;
   setSearchResults: (symbols: SymbolCandidate[], brain: SearchHit[]) => void;
   setSearchOpen: (open: boolean) => void;
   setSearchLoading: (loading: boolean) => void;
+  setPhraseIntent: (intent: PhraseIntent | null) => void;
+  setPhraseResolution: (resolution: PhraseResolution | null) => void;
+  setPhraseResolving: (resolving: boolean) => void;
+  setPhraseError: (error: string | null) => void;
   clearSearch: () => void;
 }
 
@@ -26,6 +35,10 @@ export const createSearchSlice: StateCreator<
   brainSearchResults: [],
   searchOpen: false,
   searchLoading: false,
+  phraseIntent: null,
+  phraseResolution: null,
+  phraseResolving: false,
+  phraseError: null,
 
   setSearchQuery: (q) =>
     set((s) => {
@@ -48,6 +61,32 @@ export const createSearchSlice: StateCreator<
       s.searchLoading = loading;
     }),
 
+  setPhraseIntent: (intent) =>
+    set((s) => {
+      s.phraseIntent = intent;
+      s.phraseResolution = null;
+      s.phraseError = null;
+      s.phraseResolving = intent !== null;
+    }),
+
+  setPhraseResolution: (resolution) =>
+    set((s) => {
+      s.phraseResolution = resolution;
+      s.phraseResolving = false;
+      s.phraseError = null;
+    }),
+
+  setPhraseResolving: (resolving) =>
+    set((s) => {
+      s.phraseResolving = resolving;
+    }),
+
+  setPhraseError: (error) =>
+    set((s) => {
+      s.phraseError = error;
+      s.phraseResolving = false;
+    }),
+
   clearSearch: () =>
     set((s) => {
       s.searchQuery = "";
@@ -55,5 +94,9 @@ export const createSearchSlice: StateCreator<
       s.brainSearchResults = [];
       s.searchOpen = false;
       s.searchLoading = false;
+      s.phraseIntent = null;
+      s.phraseResolution = null;
+      s.phraseResolving = false;
+      s.phraseError = null;
     }),
 });

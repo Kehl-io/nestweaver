@@ -1,5 +1,13 @@
+import { useEffect, useMemo, useRef } from "react";
 import { useStore } from "../stores";
 import { loadGapItems } from "../api/client";
+import {
+  executeSearchPhrase,
+  parseSearchPhrase,
+  PhrasePreview,
+  resolveSearchPhrase,
+  type PhraseCandidate,
+} from "../searchPhrases";
 import { GlassPanel } from "./panels/GlassPanel";
 import { KindBadge } from "./shared/KindBadge";
 
@@ -13,23 +21,76 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const searchLoading = useStore((s) => s.searchLoading);
   const searchResults = useStore((s) => s.searchResults);
   const brainSearchResults = useStore((s) => s.brainSearchResults);
+  const phraseIntent = useStore((s) => s.phraseIntent);
+  const phraseResolution = useStore((s) => s.phraseResolution);
+  const phraseResolving = useStore((s) => s.phraseResolving);
+  const phraseError = useStore((s) => s.phraseError);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const workspaces = useStore((s) => s.workspaces);
   const selectNode = useStore((s) => s.selectNode);
   const setDetailFocus = useStore((s) => s.setDetailFocus);
   const addSeed = useStore((s) => s.addSeed);
-  const setGraphMode = useStore((s) => s.setGraphMode);
   const setGapItems = useStore((s) => s.setGapItems);
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
   const gapActive = useStore((s) => s.gapActive);
   const openLlmBar = useStore((s) => s.openLlmBar);
   const setLlmQuery = useStore((s) => s.setLlmQuery);
   const notify = useStore((s) => s.notify);
+  const setPhraseIntent = useStore((s) => s.setPhraseIntent);
+  const setPhraseResolution = useStore((s) => s.setPhraseResolution);
+  const setPhraseResolving = useStore((s) => s.setPhraseResolving);
+  const setPhraseError = useStore((s) => s.setPhraseError);
+  const clearSearch = useStore((s) => s.clearSearch);
+  const phraseRequestIdRef = useRef(0);
 
   const symbols = searchResults.slice(0, 5);
   const notes = brainSearchResults.slice(0, 3);
   const hasResults = symbols.length > 0 || notes.length > 0;
   const normalizedQuery = searchQuery.trim().toLowerCase();
+  const parsedPhrase = useMemo(() => parseSearchPhrase(searchQuery), [searchQuery]);
   const askText = searchQuery.replace(/^ask\s+/i, "").trim();
-  const impactText = searchQuery.replace(/^impact of\s+/i, "").trim();
+
+  useEffect(() => {
+    setPhraseIntent(parsedPhrase);
+  }, [parsedPhrase, setPhraseIntent]);
+
+  useEffect(() => {
+    const requestId = ++phraseRequestIdRef.current;
+    if (!phraseIntent) {
+      setPhraseResolution(null);
+      setPhraseResolving(false);
+      return;
+    }
+
+    setPhraseResolving(true);
+    resolveSearchPhrase(phraseIntent, {
+      activeWorkspaceId,
+      workspaces,
+      symbolResults: searchResults,
+      brainResults: brainSearchResults,
+    })
+      .then((resolution) => {
+        if (requestId !== phraseRequestIdRef.current) return;
+        setPhraseResolution(resolution);
+      })
+      .catch((error) => {
+        if (requestId !== phraseRequestIdRef.current) return;
+        setPhraseError(
+          error instanceof Error && error.message
+            ? error.message
+            : "Phrase resolution failed",
+        );
+      });
+  }, [
+    activeWorkspaceId,
+    brainSearchResults,
+    phraseIntent,
+    searchResults,
+    setPhraseError,
+    setPhraseResolution,
+    setPhraseResolving,
+    workspaces,
+  ]);
 
   async function showGaps() {
     try {
@@ -58,18 +119,36 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
     addSeed(uid);
   }
 
-  function impactFirstResult() {
-    const first = symbols[0];
-    if (!first) return;
-    selectNode(first.uid, first.kind);
-    setDetailFocus("analysis");
-    setGraphMode("impact");
-  }
-
   function askFromSearch() {
     if (!askText) return;
     setLlmQuery(askText);
     openLlmBar();
+  }
+
+  async function runPhrase(candidate?: PhraseCandidate) {
+    if (!phraseResolution) return;
+    try {
+      const result = await executeSearchPhrase(useStore.getState(), phraseResolution, {
+        targetOverride: candidate,
+      });
+      notify({
+        kind: result.status === "error" ? "error" : "info",
+        title: result.status === "unsupported" ? "Phrase unsupported" : "Phrase executed",
+        message: result.message,
+      });
+      if (result.status !== "unsupported" && result.status !== "error") {
+        clearSearch();
+      }
+    } catch (error) {
+      notify({
+        kind: "error",
+        title: "Phrase failed",
+        message:
+          error instanceof Error && error.message
+            ? error.message
+            : "Search phrase execution failed",
+      });
+    }
   }
 
   return (
@@ -85,13 +164,28 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
         </div>
       )}
 
-      {!searchLoading && !hasResults && (
+      {phraseIntent && (
+        <PhrasePreview
+          resolution={phraseResolution}
+          resolving={phraseResolving}
+          onExecute={() => runPhrase()}
+          onCandidateExecute={(candidate) => runPhrase(candidate)}
+        />
+      )}
+
+      {phraseError && (
+        <div className="border-b border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-danger)]">
+          {phraseError}
+        </div>
+      )}
+
+      {!searchLoading && !hasResults && !phraseIntent && (
         <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">
           No results
         </div>
       )}
 
-      {!searchLoading && normalizedQuery === "show gaps" && (
+      {!phraseIntent && !searchLoading && normalizedQuery === "show gaps" && (
         <button
           type="button"
           onClick={showGaps}
@@ -107,24 +201,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
         </button>
       )}
 
-      {!searchLoading && normalizedQuery.startsWith("impact of ") && (
-        <button
-          type="button"
-          onClick={impactFirstResult}
-          disabled={!symbols[0]}
-          className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <span>
-            <span className="font-medium">Impact of {impactText}</span>
-            <span className="ml-2 text-xs text-[var(--color-text-muted)]">
-              Use the top symbol result
-            </span>
-          </span>
-          <span className="text-xs text-[var(--color-graph-selection)]">Analyze</span>
-        </button>
-      )}
-
-      {!searchLoading && normalizedQuery.startsWith("ask ") && (
+      {!phraseIntent && !searchLoading && normalizedQuery.startsWith("ask ") && (
         <button
           type="button"
           onClick={askFromSearch}
