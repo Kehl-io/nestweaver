@@ -6,6 +6,11 @@ import { useNavigationHistory } from "./useNavigationHistory";
 
 const MODES: GraphMode[] = ["overview", "context", "impact", "repos", "features", "local"];
 
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName);
+}
+
 export function useKeyboardShortcuts() {
   const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
   const setMode = useStore((s) => s.setGraphMode);
@@ -16,7 +21,6 @@ export function useKeyboardShortcuts() {
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
   const toggleViewMode = useStore((s) => s.toggleViewMode);
-  const toggleShortcuts = useStore((s) => s.toggleShortcuts);
   const seedReducedEffectsFromSystem = useStore((s) => s.seedReducedEffectsFromSystem);
   const { undo, redo } = useNavigationHistory();
   const globalHotkeyOptions = { enabled: !modalOpen };
@@ -91,16 +95,20 @@ export function useKeyboardShortcuts() {
     { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
-  useHotkeys(
-    "shift+/",
-    (e) => {
-      e.preventDefault();
+  useEffect(() => {
+    const handleQuestionMark = (event: KeyboardEvent) => {
+      if (event.key !== "?" || isEditableTarget(event.target)) return;
+
       const state = useStore.getState();
-      if (state.llmBarOpen && !state.shortcutsOpen) return;
-      toggleShortcuts();
-    },
-    { enableOnFormTags: false },
-  );
+      if (state.llmBarOpen || state.shortcutsOpen) return;
+
+      event.preventDefault();
+      state.toggleShortcuts();
+    };
+
+    window.addEventListener("keydown", handleQuestionMark);
+    return () => window.removeEventListener("keydown", handleQuestionMark);
+  }, []);
 
   // mod+l — toggle between graph and list view
   useHotkeys(
