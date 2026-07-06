@@ -59,7 +59,7 @@ Acceptance criteria:
 
 ### Task 1 - Shared P1 Contracts, State, and Scoped APIs
 
-Status: in_progress
+Status: review
 
 Owner type: implementation sub-agent
 
