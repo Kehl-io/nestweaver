@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type Graph from "graphology";
 import { api } from "../../../api/client";
 import type { OverviewResponse } from "../../../api/types";
 import { useStore } from "../../../stores";
@@ -17,6 +18,7 @@ export function useOverviewMode() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
+  const previousOverviewGraphRef = useRef<Graph | null>(null);
 
   const loadOverview = useCallback(async () => {
     if (graphMode !== "overview") {
@@ -37,12 +39,13 @@ export function useOverviewMode() {
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromOverview(result);
-      preserveGraphLayout(graph, useStore.getState().graphInstance, {
+      preserveGraphLayout(graph, previousOverviewGraphRef.current, {
         keepExistingNewNodePositions: true,
       });
 
       setOverview(result);
       setGraphData(graph);
+      previousOverviewGraphRef.current = graph;
     } catch (err) {
       if (!isCurrentRequest()) return;
 

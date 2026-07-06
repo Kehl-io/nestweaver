@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import type Graph from "graphology";
 import { useStore } from "../../../stores";
 import { api } from "../../../api/client";
 import { buildGraphFromImpact } from "../utils/buildGraphFromImpact";
@@ -15,6 +16,9 @@ export function useImpactMode() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const graphMode = useStore((s) => s.graphMode);
   const requestIdRef = useRef(0);
+  const previousLayoutRef = useRef<{ targetNodeId: string; graph: Graph } | null>(
+    null,
+  );
 
   const loadImpactData = useCallback(async () => {
     if (graphMode !== "impact" || !selectedNodeId) {
@@ -51,12 +55,20 @@ export function useImpactMode() {
       await applyElkLayout(graph, "DOWN");
       if (!isCurrentRequest()) return;
 
-      preserveGraphLayout(graph, useStore.getState().graphInstance, {
-        keepExistingNewNodePositions: true,
-      });
+      const previousLayout = previousLayoutRef.current;
+      preserveGraphLayout(
+        graph,
+        previousLayout?.targetNodeId === targetNodeId
+          ? previousLayout.graph
+          : null,
+        {
+          keepExistingNewNodePositions: true,
+        },
+      );
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
+      previousLayoutRef.current = { targetNodeId, graph };
     } catch (err) {
       if (!isCurrentRequest()) return;
 

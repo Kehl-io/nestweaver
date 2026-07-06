@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import type Graph from "graphology";
 import { useStore } from "../../../stores";
 import { useForceLayout } from "../../../hooks/useForceLayout";
 import { api } from "../../../api/client";
@@ -12,6 +13,10 @@ function sameSeeds(left: string[], right: string[]): boolean {
   return left.every((seed, index) => seed === right[index]);
 }
 
+function contextLayoutKey(seeds: string[]): string {
+  return JSON.stringify(seeds);
+}
+
 function loadErrorMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
 }
@@ -23,6 +28,7 @@ export function useContextMode() {
   const graphMode = useStore((s) => s.graphMode);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef(0);
+  const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(null);
 
   const { start, stop, kill, isRunning } = useForceLayout();
 
@@ -34,6 +40,7 @@ export function useContextMode() {
 
     const requestId = ++requestIdRef.current;
     const requestSeeds = [...seeds];
+    const layoutKey = contextLayoutKey(requestSeeds);
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
@@ -81,15 +88,21 @@ export function useContextMode() {
             }
           }
         } catch {
+          if (!isCurrentRequest()) return;
           // Symbol lookup fails for notes/tags — skip
         }
       }
 
       finalizeNodeSizes(graph);
-      preserveGraphLayout(graph, useStore.getState().graphInstance);
+      const previousLayout = previousLayoutRef.current;
+      preserveGraphLayout(
+        graph,
+        previousLayout?.key === layoutKey ? previousLayout.graph : null,
+      );
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
+      previousLayoutRef.current = { key: layoutKey, graph };
       start(graph);
       // Stop after MAX_LAYOUT_MS as a safety ceiling
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
