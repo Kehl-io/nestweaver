@@ -14,7 +14,7 @@ export function PathTargetSelector() {
     setPathfindingTarget(target);
     try {
       const results = await api.paths(pathfindingFrom, target, 5, 10);
-      setPathResults(results as any[]);
+      setPathResults(results);
     } catch {
       setPathResults([]);
     }

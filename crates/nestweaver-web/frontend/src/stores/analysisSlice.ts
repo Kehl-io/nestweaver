@@ -1,6 +1,6 @@
 import type { StateCreator } from "zustand";
 import type { StoreState } from "./index";
-import type { BrainContextResult } from "../api/types";
+import type { BrainContextResult, PathResult } from "../api/types";
 
 export interface FlowNode {
   uid: string;
@@ -8,12 +8,6 @@ export interface FlowNode {
   file_path: string;
   depth: number;
   children: FlowNode[];
-}
-
-export interface PathResult {
-  nodes: string[];
-  edges: { type: string; confidence: number }[];
-  length: number;
 }
 
 export interface DiffState {

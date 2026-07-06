@@ -1,9 +1,11 @@
+import { useEffect, useMemo, useState } from "react";
 import type { PhraseCandidate, PhraseResolution } from "./types";
+import type { PhraseCandidateOverrides, PhraseTargetRole } from "./types";
 
 interface PhrasePreviewProps {
   resolution: PhraseResolution | null;
   resolving: boolean;
-  onExecute: () => void;
+  onExecute: (candidateOverrides?: PhraseCandidateOverrides) => void;
   onCandidateExecute: (candidate: PhraseCandidate) => void;
 }
 
@@ -21,6 +23,21 @@ export function PhrasePreview({
   onExecute,
   onCandidateExecute,
 }: PhrasePreviewProps) {
+  const [pathSelections, setPathSelections] = useState<PhraseCandidateOverrides>({});
+  const selectionKey = useMemo(() => {
+    if (!resolution) return "";
+    return [
+      resolution.intent.normalized,
+      ...resolution.candidateGroups.map((group) =>
+        `${group.role}:${group.candidates.map((candidate) => candidate.id).join(",")}`,
+      ),
+    ].join("|");
+  }, [resolution]);
+
+  useEffect(() => {
+    setPathSelections({});
+  }, [selectionKey]);
+
   if (resolving) {
     return (
       <div className="border-b border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-muted)]">
@@ -29,8 +46,21 @@ export function PhrasePreview({
     );
   }
   if (!resolution) return null;
+  const currentResolution = resolution;
 
+  function roleIsResolved(role: PhraseTargetRole): boolean {
+    return (
+      pathSelections[role] !== undefined ||
+      currentResolution.targets.some((target) => target.role === role)
+    );
+  }
+
+  const pathCanRun =
+    resolution.intent.kind === "path" &&
+    roleIsResolved("source") &&
+    roleIsResolved("destination");
   const canRun =
+    pathCanRun ||
     resolution.status === "ready" ||
     resolution.status === "limited" ||
     resolution.status === "unsupported";
@@ -53,7 +83,9 @@ export function PhrasePreview({
         {canRun && (
           <button
             type="button"
-            onClick={onExecute}
+            onClick={() =>
+              onExecute(resolution.intent.kind === "path" ? pathSelections : undefined)
+            }
             disabled={resolution.status === "unsupported"}
             className="shrink-0 rounded border border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-graph-selection)] hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -77,9 +109,21 @@ export function PhrasePreview({
                 <button
                   key={`${group.role}:${candidate.targetType}:${candidate.id}`}
                   type="button"
-                  onClick={() => onCandidateExecute(candidate)}
-                  disabled={resolution.intent.kind === "path"}
-                  className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-xs hover:bg-[var(--color-surface-alt)] disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => {
+                    if (resolution.intent.kind === "path") {
+                      setPathSelections((current) => ({
+                        ...current,
+                        [group.role]: candidate,
+                      }));
+                      return;
+                    }
+                    onCandidateExecute(candidate);
+                  }}
+                  aria-pressed={
+                    resolution.intent.kind === "path" &&
+                    pathSelections[group.role]?.id === candidate.id
+                  }
+                  className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-xs hover:bg-[var(--color-surface-alt)] aria-pressed:bg-[var(--color-surface-alt)] aria-pressed:text-[var(--color-graph-selection)]"
                 >
                   <span className="min-w-0">
                     <span className="font-medium">{candidate.label}</span>
@@ -90,7 +134,10 @@ export function PhrasePreview({
                     )}
                   </span>
                   <span className="shrink-0 text-[10px] uppercase text-[var(--color-text-muted)]">
-                    {candidate.targetType}
+                    {resolution.intent.kind === "path" &&
+                    pathSelections[group.role]?.id === candidate.id
+                      ? "selected"
+                      : candidate.targetType}
                   </span>
                 </button>
               ))
@@ -98,7 +145,7 @@ export function PhrasePreview({
           </div>
           {resolution.intent.kind === "path" && group.candidates.length > 0 && (
             <p className="mt-1 text-[10px] text-[var(--color-text-muted)]">
-              Path execution waits until both endpoints resolve unambiguously.
+              Select candidates for both endpoints, then run the path search.
             </p>
           )}
         </div>

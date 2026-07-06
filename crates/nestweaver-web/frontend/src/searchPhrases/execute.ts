@@ -4,13 +4,17 @@ import type { StoreState } from "../stores";
 import { phraseCandidateToTarget } from "./resolve";
 import type {
   PhraseCandidate,
+  PhraseCandidateOverrides,
   PhraseExecutionResult,
   PhraseResolution,
   PhraseResolvedTarget,
+  PhraseTargetRole,
 } from "./types";
 
 interface ExecutePhraseOptions {
   targetOverride?: PhraseCandidate;
+  targetOverrides?: PhraseCandidateOverrides;
+  isCurrent?: () => boolean;
 }
 
 function targetFromResolution(
@@ -25,6 +29,34 @@ function applyMetadata(state: StoreState, metadata: SceneMetadata | null) {
   if (metadata) state.setSceneMetadata(metadata);
 }
 
+function isCurrent(options: ExecutePhraseOptions): boolean {
+  return options.isCurrent?.() ?? true;
+}
+
+function metadataForExecution(
+  resolution: PhraseResolution,
+  selectedTargets: PhraseResolvedTarget[] = [],
+): SceneMetadata | null {
+  const metadata = resolution.metadata;
+  if (!metadata || resolution.status !== "ambiguous") return metadata;
+
+  const result = resolution.supportLevel === "limited" ? "partial" : "complete";
+  const targetLabels = selectedTargets.map((target) => target.label).join(" to ");
+  return {
+    ...metadata,
+    trust: {
+      ...metadata.trust,
+      result,
+      partial:
+        result !== "complete" ||
+        (metadata.trust.partial && metadata.trust.result !== "ambiguous"),
+      message: targetLabels
+        ? `${resolution.coverage.behavior} Resolved target: ${targetLabels}.`
+        : resolution.coverage.behavior,
+    },
+  };
+}
+
 function isWorkspaceTarget(target: PhraseResolvedTarget): boolean {
   return ["workspace", "repo", "project"].includes(target.targetType);
 }
@@ -33,12 +65,22 @@ function workspaceId(target: PhraseResolvedTarget): string {
   return target.id;
 }
 
+function targetForRole(
+  resolution: PhraseResolution,
+  role: PhraseTargetRole,
+  overrides?: PhraseCandidateOverrides,
+): PhraseResolvedTarget | null {
+  const override = overrides?.[role];
+  if (override) return phraseCandidateToTarget(override);
+  return resolution.targets.find((target) => target.role === role) ?? null;
+}
+
 function executeExplain(
   state: StoreState,
   resolution: PhraseResolution,
   target: PhraseResolvedTarget,
 ): PhraseExecutionResult {
-  applyMetadata(state, resolution.metadata);
+  applyMetadata(state, metadataForExecution(resolution, [target]));
   if (isWorkspaceTarget(target)) {
     state.setActiveWorkspaceId(workspaceId(target));
     state.setGraphMode("overview");
@@ -65,12 +107,14 @@ function executeExplain(
 async function executePath(
   state: StoreState,
   resolution: PhraseResolution,
+  options: ExecutePhraseOptions,
 ): Promise<PhraseExecutionResult> {
-  const [source, destination] = resolution.targets;
+  const source = targetForRole(resolution, "source", options.targetOverrides);
+  const destination = targetForRole(resolution, "destination", options.targetOverrides);
   if (!source || !destination) {
     return { status: "error", message: "Path endpoints are not resolved." };
   }
-  applyMetadata(state, resolution.metadata);
+  applyMetadata(state, metadataForExecution(resolution, [source, destination]));
   const from = source.uid ?? source.id;
   const to = destination.uid ?? destination.id;
   state.selectNode(from, source.kind);
@@ -84,13 +128,10 @@ async function executePath(
     workspaceId: state.activeWorkspaceId,
   });
   const results = await api.paths(from, to, 5, 10);
-  state.setPathResults(
-    results.map((path) => ({
-      nodes: path.map((node) => node.uid),
-      edges: [],
-      length: Math.max(path.length - 1, 0),
-    })),
-  );
+  if (!isCurrent(options)) {
+    return { status: "error", message: "Path result was superseded by a newer phrase." };
+  }
+  state.setPathResults(results);
   return {
     status: "executed",
     message: results.length > 0 ? `Found ${results.length} path result(s).` : "No path results found.",
@@ -103,9 +144,13 @@ export async function executeSearchPhrase(
   options: ExecutePhraseOptions = {},
 ): Promise<PhraseExecutionResult> {
   const target = targetFromResolution(resolution, options.targetOverride);
+  const executionMetadata = metadataForExecution(
+    resolution,
+    target ? [target] : [],
+  );
 
   if (resolution.status === "unsupported") {
-    applyMetadata(state, resolution.metadata);
+    applyMetadata(state, executionMetadata);
     state.setActiveLens({
       lens: "unsupported",
       label: resolution.title,
@@ -122,7 +167,7 @@ export async function executeSearchPhrase(
 
     case "impact":
       if (!target) return { status: "error", message: "Choose a symbol first." };
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       state.selectNode(target.uid ?? target.id, target.kind);
       state.setGraphMode("impact");
       state.setDetailFocus("analysis");
@@ -136,7 +181,7 @@ export async function executeSearchPhrase(
 
     case "trace_flow":
       if (!target) return { status: "error", message: "Choose a symbol first." };
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       state.selectNode(target.uid ?? target.id, target.kind);
       state.setDetailFocus("analysis");
       state.setActiveLens({
@@ -145,13 +190,17 @@ export async function executeSearchPhrase(
         targetUid: target.uid ?? target.id,
         workspaceId: state.activeWorkspaceId,
       });
-      state.setFlowTrace((await api.flow(target.uid ?? target.id, 10)) as any);
+      const result = await api.flow(target.uid ?? target.id, 10);
+      if (!isCurrent(options)) {
+        return { status: "error", message: "Trace result was superseded by a newer phrase." };
+      }
+      state.setFlowTrace(result as any);
       return { status: "executed", message: `Opened trace for ${target.label}.` };
 
     case "callers":
     case "callees":
       if (!target) return { status: "error", message: "Choose a symbol first." };
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       state.selectNode(target.uid ?? target.id, target.kind);
       state.setDetailFocus("related");
       state.setGraphMode("local");
@@ -164,11 +213,11 @@ export async function executeSearchPhrase(
       return { status: "executed", message: `Opened relationships for ${target.label}.` };
 
     case "path":
-      return executePath(state, resolution);
+      return executePath(state, resolution, options);
 
     case "tests_affected":
       if (!target) return { status: "error", message: "Choose a target first." };
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       if (target.targetType === "symbol") {
         state.selectNode(target.uid ?? target.id, target.kind);
         state.setGraphMode("impact");
@@ -186,7 +235,7 @@ export async function executeSearchPhrase(
       };
 
     case "dead_code": {
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       if (target && isWorkspaceTarget(target)) state.setActiveWorkspaceId(workspaceId(target));
       const items = await loadGapItems();
       state.setGapItems(items);
@@ -202,7 +251,7 @@ export async function executeSearchPhrase(
 
     case "bridges":
     case "hubs":
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       if (target && isWorkspaceTarget(target)) state.setActiveWorkspaceId(workspaceId(target));
       state.setGraphMode("overview");
       state.setActiveLens({
@@ -214,7 +263,7 @@ export async function executeSearchPhrase(
       return { status: "limited", message: resolution.coverage.behavior };
 
     case "notes_about":
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       if (target) {
         state.exploreNode(target.uid ?? target.id, target.kind);
         state.setDetailFocus("summary");
@@ -229,7 +278,7 @@ export async function executeSearchPhrase(
 
     case "backlinks":
       if (!target) return { status: "error", message: "Choose a note first." };
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       state.selectNode(target.uid ?? target.id, target.kind);
       state.setDetailFocus("related");
       state.setActiveLens({
@@ -242,7 +291,7 @@ export async function executeSearchPhrase(
       return { status: "executed", message: `Opened backlink context for ${target.label}.` };
 
     case "stale_repos": {
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       const repos = await api.repos();
       const stale = repos.filter((repo) => repo.staleness_commits_behind > 0);
       state.setActiveLens({
@@ -261,7 +310,7 @@ export async function executeSearchPhrase(
     }
 
     case "contract_drift":
-      applyMetadata(state, resolution.metadata);
+      applyMetadata(state, executionMetadata);
       state.setActiveLens({
         lens: "unsupported",
         label: "Contract drift",

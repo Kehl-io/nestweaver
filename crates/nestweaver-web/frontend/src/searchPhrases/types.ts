@@ -66,6 +66,8 @@ export interface PhraseCandidate {
   workspaceType?: WorkspaceType | string;
 }
 
+export type PhraseTargetRole = "target" | "source" | "destination";
+
 export interface PhraseResolvedTarget {
   id: string;
   uid?: string;
@@ -73,13 +75,18 @@ export interface PhraseResolvedTarget {
   kind: string;
   targetType: PhraseTargetType;
   detail?: string;
+  role?: PhraseTargetRole;
 }
 
 export interface PhraseCandidateGroup {
-  role: "target" | "source" | "destination";
+  role: PhraseTargetRole;
   label: string;
   candidates: PhraseCandidate[];
 }
+
+export type PhraseCandidateOverrides = Partial<
+  Record<PhraseTargetRole, PhraseCandidate>
+>;
 
 export interface PhraseResolution {
   intent: PhraseIntent;

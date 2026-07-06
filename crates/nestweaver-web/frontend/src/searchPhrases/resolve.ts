@@ -7,6 +7,7 @@ import { phraseCoverage } from "./phraseCoverage";
 import type {
   PhraseCandidate,
   PhraseCandidateGroup,
+  PhraseTargetRole,
   PhraseIntent,
   PhraseResolution,
   PhraseResolutionStatus,
@@ -140,7 +141,10 @@ function workspaceCandidate(workspace: WorkspaceEntry): PhraseCandidate {
   };
 }
 
-function candidateToTarget(candidate: PhraseCandidate): PhraseResolvedTarget {
+function candidateToTarget(
+  candidate: PhraseCandidate,
+  role?: PhraseTargetRole,
+): PhraseResolvedTarget {
   return {
     id: candidate.id,
     uid: candidate.uid,
@@ -148,6 +152,7 @@ function candidateToTarget(candidate: PhraseCandidate): PhraseResolvedTarget {
     kind: candidate.kind,
     targetType: candidate.targetType,
     detail: candidate.detail,
+    role,
   };
 }
 
@@ -293,7 +298,7 @@ function noTargetResolution(intent: PhraseIntent, options: ResolvePhraseOptions)
 }
 
 function candidateGroup(
-  role: PhraseCandidateGroup["role"],
+  role: PhraseTargetRole,
   label: string,
   candidates: PhraseCandidate[],
 ): PhraseCandidateGroup {
@@ -305,7 +310,7 @@ async function resolveOne(
   raw: string | undefined,
   targetTypes: PhraseTargetType[],
   options: ResolvePhraseOptions,
-  role: PhraseCandidateGroup["role"] = "target",
+  role: PhraseTargetRole = "target",
 ): Promise<PhraseResolution> {
   if (!raw) {
     return resolution(
@@ -342,7 +347,7 @@ async function resolveOne(
     );
   }
 
-  const target = candidateToTarget(candidates[0]);
+  const target = candidateToTarget(candidates[0], role);
   const support = phraseCoverage[intent.kind].supportLevel;
   return resolution(
     intent,
@@ -377,11 +382,16 @@ async function resolvePath(
     resolveCandidates(destinationRaw, ["symbol"], options),
   ]);
   const groups: PhraseCandidateGroup[] = [];
+  const resolvedTargets: PhraseResolvedTarget[] = [];
   if (sourceCandidates.length !== 1) {
     groups.push(candidateGroup("source", sourceRaw, sourceCandidates));
+  } else {
+    resolvedTargets.push(candidateToTarget(sourceCandidates[0], "source"));
   }
   if (destinationCandidates.length !== 1) {
     groups.push(candidateGroup("destination", destinationRaw, destinationCandidates));
+  } else {
+    resolvedTargets.push(candidateToTarget(destinationCandidates[0], "destination"));
   }
   if (groups.length > 0) {
     return resolution(
@@ -393,13 +403,13 @@ async function resolvePath(
       phraseCoverage.path.phrase,
       "Resolve both endpoints before running path search.",
       options,
-      { candidateGroups: groups },
+      { candidateGroups: groups, targets: resolvedTargets },
     );
   }
 
   const targets = [
-    candidateToTarget(sourceCandidates[0]),
-    candidateToTarget(destinationCandidates[0]),
+    candidateToTarget(sourceCandidates[0], "source"),
+    candidateToTarget(destinationCandidates[0], "destination"),
   ];
   return resolution(
     intent,

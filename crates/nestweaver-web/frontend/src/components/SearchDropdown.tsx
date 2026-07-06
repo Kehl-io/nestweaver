@@ -7,6 +7,7 @@ import {
   PhrasePreview,
   resolveSearchPhrase,
   type PhraseCandidate,
+  type PhraseCandidateOverrides,
 } from "../searchPhrases";
 import { GlassPanel } from "./panels/GlassPanel";
 import { KindBadge } from "./shared/KindBadge";
@@ -42,6 +43,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const setPhraseError = useStore((s) => s.setPhraseError);
   const clearSearch = useStore((s) => s.clearSearch);
   const phraseRequestIdRef = useRef(0);
+  const phraseExecutionIdRef = useRef(0);
 
   const symbols = searchResults.slice(0, 5);
   const notes = brainSearchResults.slice(0, 3);
@@ -53,6 +55,10 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   useEffect(() => {
     setPhraseIntent(parsedPhrase);
   }, [parsedPhrase, setPhraseIntent]);
+
+  useEffect(() => {
+    phraseExecutionIdRef.current += 1;
+  }, [searchQuery]);
 
   useEffect(() => {
     const requestId = ++phraseRequestIdRef.current;
@@ -125,12 +131,20 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
     openLlmBar();
   }
 
-  async function runPhrase(candidate?: PhraseCandidate) {
+  async function runPhrase(
+    candidate?: PhraseCandidate,
+    candidateOverrides?: PhraseCandidateOverrides,
+  ) {
     if (!phraseResolution) return;
+    const executionId = ++phraseExecutionIdRef.current;
+    const isCurrent = () => executionId === phraseExecutionIdRef.current;
     try {
       const result = await executeSearchPhrase(useStore.getState(), phraseResolution, {
         targetOverride: candidate,
+        targetOverrides: candidateOverrides,
+        isCurrent,
       });
+      if (!isCurrent()) return;
       notify({
         kind: result.status === "error" ? "error" : "info",
         title: result.status === "unsupported" ? "Phrase unsupported" : "Phrase executed",
@@ -168,7 +182,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
         <PhrasePreview
           resolution={phraseResolution}
           resolving={phraseResolving}
-          onExecute={() => runPhrase()}
+          onExecute={(candidateOverrides) => runPhrase(undefined, candidateOverrides)}
           onCandidateExecute={(candidate) => runPhrase(candidate)}
         />
       )}

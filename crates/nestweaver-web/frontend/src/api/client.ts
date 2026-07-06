@@ -8,6 +8,7 @@ import type {
   Note,
   NoteDetail,
   OverviewResponse,
+  PathResult,
   Perspective,
   Repo,
   ScopeFilter,
@@ -160,7 +161,7 @@ export const api = {
   },
 
   paths(from: string, to: string, maxDepth = 5, limit = 10) {
-    return get<SymbolCandidate[][]>(
+    return get<PathResult[]>(
       `/api/v1/paths/${encodeURIComponent(from)}/${encodeURIComponent(to)}?max_depth=${maxDepth}&limit=${limit}`,
     );
   },

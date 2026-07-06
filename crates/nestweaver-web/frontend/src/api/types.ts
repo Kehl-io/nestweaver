@@ -177,6 +177,17 @@ export interface ImpactNode {
   depth: number;
 }
 
+export interface PathEdge {
+  type: string;
+  confidence: number;
+}
+
+export interface PathResult {
+  nodes: string[];
+  edges: PathEdge[];
+  length: number;
+}
+
 export interface SourceResponse {
   file: string;
   start_line?: number;

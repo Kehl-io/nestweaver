@@ -6,6 +6,7 @@ export { PhrasePreview } from "./PhrasePreview";
 export type {
   PhraseCandidate,
   PhraseCandidateGroup,
+  PhraseCandidateOverrides,
   PhraseCoverageEntry,
   PhraseExecutionResult,
   PhraseIntent,
