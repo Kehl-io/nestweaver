@@ -330,6 +330,22 @@ async fn p1_workspace_vault_scoped_overview_marks_code_portions_unsupported() {
 }
 
 #[tokio::test]
+async fn p1_workspace_overview_limit_reports_truncation_metadata() {
+    let app = make_app();
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(json["landmarks"].as_array().unwrap().len(), 6);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "all");
+    assert_eq!(json["_meta"]["trust"]["result"], "truncated");
+    assert_eq!(json["_meta"]["truncation"]["truncated"], true);
+    assert_eq!(json["_meta"]["truncation"]["limit"], 6);
+    assert_eq!(json["_meta"]["truncation"]["omitted_count"], 3);
+    assert_eq!(json["_meta"]["continuation"]["has_more"], true);
+    assert_eq!(json["_meta"]["continuation"]["reason"], "result-limit");
+}
+
+#[tokio::test]
 async fn p1_workspace_brain_context_repo_scope_filters_seeds_and_connected_results() {
     let app = make_app();
     let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
@@ -384,6 +400,42 @@ async fn p1_workspace_brain_context_repo_scope_filters_seeds_and_connected_resul
     assert!(
         !connected.iter().any(|item| item["uid"] == "sym:beta:parse"),
         "repo-scoped brain context should remove connected symbols from other repos"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_context_empty_after_scope_filter_uses_no_match_metadata() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:brain")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["sym:alpha:parse"], "workspace": vault_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["seeds"].as_array().unwrap().is_empty());
+    assert!(json["connected"].as_array().unwrap().is_empty());
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
+    assert_eq!(json["_meta"]["trust"]["result"], "no-match");
+    assert!(
+        json["_meta"]["trust"]["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "code-results"),
+        "vault-scoped empty context should still disclose unsupported code results"
     );
 }
 

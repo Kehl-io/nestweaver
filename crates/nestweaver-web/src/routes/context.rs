@@ -64,7 +64,8 @@ pub async fn brain_context(
         None,
     )?;
     filter_brain_context_result(&state, &workspace, &mut result)?;
-    let meta = brain_context_meta(&workspace, body.token_budget);
+    let empty_result = result.seeds.is_empty() && result.connected.is_empty();
+    let meta = brain_context_meta(&workspace, body.token_budget, empty_result);
     let mut json = serde_json::to_value(&result)?;
     if let serde_json::Value::Object(ref mut object) = json {
         object.insert("_meta".to_string(), serde_json::to_value(meta)?);
@@ -147,18 +148,19 @@ fn brain_node_in_workspace(
 fn brain_context_meta(
     workspace: &ResolvedWorkspace,
     token_budget: Option<usize>,
+    empty_result: bool,
 ) -> workspaces::P1Meta {
     match workspace.kind {
         WorkspaceKind::All => workspaces::p1_meta(
             workspace,
-            "complete",
+            if empty_result { "no-match" } else { "complete" },
             Vec::<&str>::new(),
             vec![P1Provenance::local_graph_store("brain context")],
             token_budget,
         ),
         WorkspaceKind::Repo => workspaces::p1_meta(
             workspace,
-            "partial",
+            if empty_result { "no-match" } else { "partial" },
             vec!["note-results"],
             vec![P1Provenance::local_graph_store(
                 "repo-filtered brain context",
@@ -167,7 +169,7 @@ fn brain_context_meta(
         ),
         WorkspaceKind::Vault => workspaces::p1_meta(
             workspace,
-            "partial",
+            if empty_result { "no-match" } else { "partial" },
             vec!["code-results"],
             vec![P1Provenance::local_graph_store(
                 "vault-filtered brain context",

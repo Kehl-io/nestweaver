@@ -54,6 +54,13 @@ struct OverviewResponse {
     meta: P1Meta,
 }
 
+struct OverviewMetaState {
+    result: &'static str,
+    unsupported: Vec<&'static str>,
+    provenance: P1Provenance,
+    total_landmark_count: usize,
+}
+
 pub async fn overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<OverviewParams>,
@@ -64,7 +71,7 @@ pub async fn overview(
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
     )?;
 
-    let (repos, services, top_symbols, _vaults, mut notes, counts, meta) =
+    let (repos, services, top_symbols, _vaults, mut notes, counts, meta_state) =
         overview_scope_data(&state, &workspace, limit)?;
 
     notes.sort_by(|a, b| {
@@ -137,6 +144,15 @@ pub async fn overview(
         note_landmarks,
         limit,
     );
+    let meta = workspaces::p1_meta_for_result_set(
+        &workspace,
+        meta_state.result,
+        meta_state.unsupported,
+        vec![meta_state.provenance],
+        Some(limit),
+        landmarks.len(),
+        Some(meta_state.total_landmark_count),
+    );
 
     let start_here = landmarks.iter().take(8).cloned().collect();
     let response = OverviewResponse {
@@ -165,7 +181,7 @@ fn overview_scope_data(
         Vec<nestweaver_schema::Vault>,
         Vec<nestweaver_store::NoteLite>,
         OverviewCounts,
-        P1Meta,
+        OverviewMetaState,
     ),
     ApiError,
 > {
@@ -184,13 +200,14 @@ fn overview_scope_data(
                 symbol_count: state.store.count_symbols()?,
                 gap_count: 0,
             };
-            let meta = workspaces::p1_meta(
-                workspace,
-                "complete",
-                Vec::<&str>::new(),
-                vec![P1Provenance::local_graph_store("overview landmarks")],
-                Some(limit),
-            );
+            let total_landmark_count =
+                counts.repo_count + counts.service_count + counts.symbol_count + counts.note_count;
+            let meta = OverviewMetaState {
+                result: "complete",
+                unsupported: Vec::new(),
+                provenance: P1Provenance::local_graph_store("overview landmarks"),
+                total_landmark_count,
+            };
             Ok((repos, services, top_symbols, vaults, notes, counts, meta))
         }
         WorkspaceKind::Repo => {
@@ -211,13 +228,13 @@ fn overview_scope_data(
                 symbol_count,
                 gap_count: 0,
             };
-            let meta = workspaces::p1_meta(
-                workspace,
-                "partial",
-                vec!["note-landmarks"],
-                vec![P1Provenance::local_graph_store("repo overview landmarks")],
-                Some(limit),
-            );
+            let total_landmark_count = counts.repo_count + counts.service_count + symbol_count;
+            let meta = OverviewMetaState {
+                result: "partial",
+                unsupported: vec!["note-landmarks"],
+                provenance: P1Provenance::local_graph_store("repo overview landmarks"),
+                total_landmark_count,
+            };
             Ok((
                 repos,
                 services,
@@ -245,13 +262,13 @@ fn overview_scope_data(
                 symbol_count: 0,
                 gap_count: 0,
             };
-            let meta = workspaces::p1_meta(
-                workspace,
-                "partial",
-                vec!["code-landmarks"],
-                vec![P1Provenance::local_graph_store("vault overview landmarks")],
-                Some(limit),
-            );
+            let total_landmark_count = notes.len();
+            let meta = OverviewMetaState {
+                result: "partial",
+                unsupported: vec!["code-landmarks"],
+                provenance: P1Provenance::local_graph_store("vault overview landmarks"),
+                total_landmark_count,
+            };
             Ok((
                 Vec::new(),
                 Vec::new(),
