@@ -184,7 +184,7 @@ Acceptance criteria:
 
 ### Task 4 - Knowledge Card and Action Parity
 
-Status: pending
+Status: in_progress
 
 Owner type: implementation sub-agent
 
