@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
+import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { EdgeParticles } from "./EdgeParticles";
@@ -426,7 +427,7 @@ export function GraphCanvas() {
     (theme === "system" &&
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
-  const bgColor = isDark ? "#1e1e2e" : "#eff1f5";
+  const bgColor = isDark ? "#080b11" : "#eef3f8";
   const pixelRatio =
     typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
@@ -466,6 +467,16 @@ export function GraphCanvas() {
                 {!reducedMotion && !focusMap && <EdgeParticles buffers={buffers} />}
                 <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
                 <NodeLabels buffers={buffers} />
+                {isDark && !reducedMotion && (
+                  <EffectComposer>
+                    <Bloom
+                      mipmapBlur
+                      luminanceThreshold={0.74}
+                      luminanceSmoothing={0.22}
+                      intensity={0.42}
+                    />
+                  </EffectComposer>
+                )}
               </>
             )}
             <GraphInteraction buffers={buffers} />

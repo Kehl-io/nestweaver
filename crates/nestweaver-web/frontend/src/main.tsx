@@ -1,6 +1,12 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+// @ts-expect-error TS2882: package default export is CSS.
+import "@fontsource-variable/inter";
+// @ts-expect-error TS2882: package default export is CSS.
+import "@fontsource/michroma";
+// @ts-expect-error TS2882: package default export is CSS.
+import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import App from "./App";
 import { AdminLogin } from "./pages/admin/AdminLogin";

@@ -1,48 +1,116 @@
-export const KIND_COLORS: Record<string, string> = {
-  Function: "#1e66f5",
-  Class: "#8839ef",
-  Interface: "#179299",
-  Method: "#7287fd",
-  Module: "#df8e1d",
-  Note: "#7c7f93",
-  Section: "#8c8fa1",
-  Tag: "#40a02b",
+type KindColorKey =
+  | "Function"
+  | "Method"
+  | "Interface"
+  | "Class"
+  | "Struct"
+  | "Trait"
+  | "Enum"
+  | "Module"
+  | "Constant"
+  | "Extension"
+  | "Note"
+  | "Section"
+  | "Tag"
+  | "File";
+
+export const LIGHT_KIND_COLORS: Record<KindColorKey, string> = {
+  Function: "#0e86c4",
+  Method: "#2f5fd0",
+  Interface: "#0e8f89",
+  Class: "#16a355",
+  Struct: "#16a355",
+  Trait: "#6f9e12",
+  Enum: "#c07d0a",
+  Module: "#d15f16",
+  Constant: "#d13444",
+  Extension: "#d15f16",
+  Note: "#7a5fc0",
+  Section: "#4f6bb0",
+  Tag: "#4f8f6c",
+  File: "#5a6478",
 };
 
-export const EDGE_COLORS: Record<string, string> = {
-  overview: "#9ca0b0",
-  calls: "#9ca0b0",
-  imports: "#9ca0b0",
-  extends: "#9ca0b0",
-  implements: "#9ca0b0",
-  wikilink: "#9ca0b0",
-  references_code: "#9ca0b0",
-  tagged_with: "#9ca0b0",
-  cross_repo_declared: "#9ca0b0",
-  cross_repo_suggested: "#9ca0b0",
+export const DARK_KIND_COLORS: Record<KindColorKey, string> = {
+  Function: "#5ed0fe",
+  Method: "#5b8def",
+  Interface: "#17c7c0",
+  Class: "#35d67a",
+  Struct: "#35d67a",
+  Trait: "#bfe93d",
+  Enum: "#ffc13c",
+  Module: "#ff8a3c",
+  Constant: "#ff5e6c",
+  Extension: "#ff8a3c",
+  Note: "#b9a6e8",
+  Section: "#8fa6d8",
+  Tag: "#93c2a8",
+  File: "#9aa0ad",
 };
+
+export const KIND_COLORS: Record<string, string> = LIGHT_KIND_COLORS;
+
+const EDGE_TYPES = [
+  "overview",
+  "calls",
+  "imports",
+  "extends",
+  "implements",
+  "wikilink",
+  "references_code",
+  "tagged_with",
+  "cross_repo_declared",
+  "cross_repo_suggested",
+] as const;
+
+export const LIGHT_EDGE_COLORS: Record<string, string> = Object.fromEntries(
+  EDGE_TYPES.map((type) => [type, "#6b7280"]),
+);
+
+export const DARK_EDGE_COLORS: Record<string, string> = Object.fromEntries(
+  EDGE_TYPES.map((type) => [type, "#5d6675"]),
+);
+
+export const EDGE_COLORS: Record<string, string> = LIGHT_EDGE_COLORS;
+
+const KIND_ALIASES: Record<string, KindColorKey> = {
+  fn: "Function",
+  function: "Function",
+  method: "Method",
+  interface: "Interface",
+  ifc: "Interface",
+  class: "Class",
+  cls: "Class",
+  struct: "Struct",
+  trait: "Trait",
+  enum: "Enum",
+  module: "Module",
+  mod: "Module",
+  constant: "Constant",
+  const: "Constant",
+  extension: "Extension",
+  ext: "Extension",
+  note: "Note",
+  section: "Section",
+  tag: "Tag",
+  file: "File",
+};
+
+function normalizeKind(kind: string): KindColorKey | null {
+  const lastSegment = kind.split("/").filter(Boolean).pop() ?? kind;
+  const token = lastSegment.trim().match(/[A-Za-z]+/)?.[0]?.toLowerCase();
+  return token ? (KIND_ALIASES[token] ?? null) : null;
+}
 
 export function kindColor(kind: string, isDark: boolean): string {
-  const dark: Record<string, string> = {
-    Function: "#89b4fa", Class: "#cba6f7", Method: "#b4befe",
-    Interface: "#94e2d5", Trait: "#a6e3a1", Enum: "#f9e2af",
-    Module: "#f9e2af", Extension: "#f38ba8", Note: "#9399b2",
-    Section: "#a6adc8", Tag: "#a6e3a1", Constant: "#89b4fa",
-  };
-  const light: Record<string, string> = {
-    Function: "#1e66f5", Class: "#8839ef", Method: "#7287fd",
-    Interface: "#179299", Trait: "#40a02b", Enum: "#df8e1d",
-    Module: "#df8e1d", Extension: "#d20f39", Note: "#7c7f93",
-    Section: "#8c8fa1", Tag: "#40a02b", Constant: "#1e66f5",
-  };
-  return (isDark ? dark : light)[kind] ?? (isDark ? "#585b70" : "#9ca0b0");
+  const normalized = normalizeKind(kind);
+  const palette = isDark ? DARK_KIND_COLORS : LIGHT_KIND_COLORS;
+  return normalized ? palette[normalized] : (isDark ? "#5d6675" : "#6b7280");
 }
 
 export function kindToColor(kind: string): string {
   const isDark = document.documentElement.classList.contains("dark");
-  // API returns "Symbol/Function" — strip the prefix for color lookup
-  const short = kind.includes("/") ? kind.split("/").pop()! : kind;
-  return kindColor(short, isDark);
+  return kindColor(kind, isDark);
 }
 
 export function desaturate(hex: string, amount: number): string {

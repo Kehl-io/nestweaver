@@ -28,15 +28,28 @@ uniform float u_intro;
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_bloom;
+varying float v_importance;
 varying float v_seed;
+varying float v_bridge;
 varying float v_phase;
 
 void main() {
     v_uv = uv;
     v_color = aColor;
     v_highlight = aHighlight;
+    v_importance = aImportance;
     v_seed = aSeed;
+    v_bridge = aBridge;
     v_phase = aPhase;
+    v_bloom = clamp(
+        aHighlight * 1.0 +
+        aBridge * 0.55 +
+        pow(max(aImportance, 0.0), 1.35) * 0.38 +
+        aSeed * 0.45,
+        0.0,
+        1.0
+    );
 
     float intro = clamp(u_intro, 0.0, 1.0);
     float rebound = sin(intro * 3.14159) * (1.0 - intro) * 0.08 * u_motionAmp;
@@ -57,7 +70,10 @@ const fragmentShader = /* glsl */ `
 varying vec2 v_uv;
 varying vec3 v_color;
 varying float v_highlight;
+varying float v_bloom;
+varying float v_importance;
 varying float v_seed;
+varying float v_bridge;
 varying float v_phase;
 
 uniform float u_time;
@@ -67,19 +83,28 @@ void main() {
     vec2 uv = v_uv - 0.5;
     float dist = length(uv) * 2.0;
 
-    // Hard-edged filled circle with thin AA band
-    float body = 1.0 - smoothstep(0.90, 0.96, dist);
+    float body = 1.0 - smoothstep(0.92, 0.985, dist);
+    float core = exp(-3.5 * dist * dist);
+    float rim = smoothstep(0.56, 0.94, dist) * (1.0 - smoothstep(0.94, 0.995, dist));
+    float important = smoothstep(0.48, 1.0, v_importance);
+    float bridge = smoothstep(0.2, 1.0, v_bridge);
+    float bloom = clamp(v_bloom, 0.0, 1.0);
 
-    // Hover: brighten fill 20%
-    vec3 color = v_color * (1.0 + v_highlight * 0.2);
+    vec3 color = v_color * (1.0 + v_highlight * 0.22 + important * 0.08);
+    vec3 coreColor = mix(color, vec3(1.0), 0.14 + bloom * 0.22);
+    color = mix(color, coreColor, core * (0.16 + bloom * 0.42));
+
+    vec3 rimColor = mix(color, u_strokeColor, 0.38 + bloom * 0.34 + bridge * 0.12);
+    color = mix(color, rimColor, rim * (0.20 + bloom * 0.38));
+    color += u_strokeColor * bloom * (core * 0.22 + rim * 0.44);
 
     // Selection stroke ring: thin annulus at edge
     float ringInner = smoothstep(0.78, 0.82, dist);
-    float ringOuter = 1.0 - smoothstep(0.90, 0.96, dist);
+    float ringOuter = 1.0 - smoothstep(0.92, 0.985, dist);
     float ring = ringInner * ringOuter * v_highlight;
-    color = mix(color, u_strokeColor, ring * 0.8);
+    color = mix(color, u_strokeColor, ring * 0.92);
 
-    float alpha = body;
+    float alpha = max(body, ring);
     if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
 }
@@ -112,7 +137,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
       u_breatheAmp: { value: 0 },
       u_motionAmp: { value: reducedMotion ? 0 : 1 },
       u_intro: { value: reducedMotion ? 1 : 0 },
-      u_strokeColor: { value: [0.804, 0.839, 0.957] },
+      u_strokeColor: { value: [0.369, 0.816, 0.996] },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -130,8 +155,8 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     function updateStroke() {
       const isDark = document.documentElement.classList.contains("dark");
       uniforms.u_strokeColor.value = isDark
-        ? [0.804, 0.839, 0.957]
-        : [0.298, 0.310, 0.412];
+        ? [0.369, 0.816, 0.996]
+        : [0.031, 0.384, 0.655];
     }
     updateStroke();
     const observer = new MutationObserver(updateStroke);

@@ -1,70 +1,81 @@
 @import "tailwindcss";
 
 @theme {
-  --color-fn: #1e66f5;
-  --color-cls: #8839ef;
-  --color-ifc: #179299;
-  --color-method: #7287fd;
-  --color-module: #df8e1d;
-  --color-note: #7c7f93;
-  --color-section: #8c8fa1;
-  --color-tag: #40a02b;
-  --color-edge-calls: #9ca0b0;
-  --color-edge-imports: #9ca0b0;
-  --color-edge-extends: #9ca0b0;
-  --color-edge-implements: #9ca0b0;
-  --color-edge-crossdomain: #9ca0b0;
-  --color-surface: #eff1f5;
-  --color-surface-alt: #e6e9ef;
-  --color-border: #ccd0da;
-  --color-text: #4c4f69;
-  --color-text-muted: #6c6f85;
-  --color-graph-bg: #eff1f5;
-  --color-graph-label: #6c6f85;
-  --color-graph-label-hover: #4c4f69;
-  --color-graph-edge: rgba(156, 160, 176, 0.45);
-  --color-graph-dim: #ccd0da;
-  --color-graph-selection: #1e66f5;
+  --font-sans: "Inter Variable", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: "Michroma", "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --color-fn: #0e86c4;
+  --color-method: #2f5fd0;
+  --color-ifc: #0e8f89;
+  --color-cls: #16a355;
+  --color-trait: #6f9e12;
+  --color-enum: #c07d0a;
+  --color-module: #d15f16;
+  --color-constant: #d13444;
+  --color-note: #7a5fc0;
+  --color-section: #4f6bb0;
+  --color-tag: #4f8f6c;
+  --color-file: #5a6478;
+  --color-edge-calls: #6b7280;
+  --color-edge-imports: #6b7280;
+  --color-edge-extends: #6b7280;
+  --color-edge-implements: #6b7280;
+  --color-edge-crossdomain: #6b7280;
+  --color-surface: oklch(95% 0.005 240);
+  --color-surface-alt: oklch(91% 0.008 240);
+  --color-border: oklch(80% 0.018 240);
+  --color-text: oklch(22% 0.025 240);
+  --color-text-muted: oklch(42% 0.025 240);
+  --color-graph-bg: #eef3f8;
+  --color-graph-label: var(--color-text-muted);
+  --color-graph-label-hover: var(--color-text);
+  --color-graph-edge: rgba(107, 114, 128, 0.42);
+  --color-graph-dim: var(--color-surface-alt);
+  --color-graph-selection: #0862a7;
 }
 
 :root.dark {
-  --color-fn: #89b4fa;
-  --color-cls: #cba6f7;
-  --color-ifc: #94e2d5;
-  --color-method: #b4befe;
-  --color-module: #f9e2af;
-  --color-note: #9399b2;
-  --color-section: #a6adc8;
-  --color-tag: #a6e3a1;
-  --color-edge-calls: #585b70;
-  --color-edge-imports: #585b70;
-  --color-edge-extends: #585b70;
-  --color-edge-implements: #585b70;
-  --color-edge-crossdomain: #585b70;
-  --color-surface: #1e1e2e;
-  --color-surface-alt: #313244;
-  --color-border: #45475a;
-  --color-text: #cdd6f4;
-  --color-text-muted: #a6adc8;
-  --color-graph-bg: #1e1e2e;
-  --color-graph-label: #a6adc8;
-  --color-graph-label-hover: #cdd6f4;
-  --color-graph-edge: rgba(88, 91, 112, 0.5);
-  --color-graph-dim: #313244;
-  --color-graph-selection: #89b4fa;
+  --color-fn: #5ed0fe;
+  --color-method: #5b8def;
+  --color-ifc: #17c7c0;
+  --color-cls: #35d67a;
+  --color-trait: #bfe93d;
+  --color-enum: #ffc13c;
+  --color-module: #ff8a3c;
+  --color-constant: #ff5e6c;
+  --color-note: #b9a6e8;
+  --color-section: #8fa6d8;
+  --color-tag: #93c2a8;
+  --color-file: #9aa0ad;
+  --color-edge-calls: #5d6675;
+  --color-edge-imports: #5d6675;
+  --color-edge-extends: #5d6675;
+  --color-edge-implements: #5d6675;
+  --color-edge-crossdomain: #5d6675;
+  --color-surface: oklch(9% 0.005 240);
+  --color-surface-alt: oklch(14% 0.012 240);
+  --color-border: oklch(28% 0.018 240);
+  --color-text: oklch(95% 0.006 240);
+  --color-text-muted: oklch(72% 0.018 240);
+  --color-graph-bg: #080b11;
+  --color-graph-label: var(--color-text-muted);
+  --color-graph-label-hover: var(--color-text);
+  --color-graph-edge: rgba(93, 102, 117, 0.5);
+  --color-graph-dim: var(--color-surface-alt);
+  --color-graph-selection: #5ed0fe;
 }
 
 html, body, #root {
   height: 100%;
   margin: 0;
   overflow: hidden;
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
   background: var(--color-surface);
   color: var(--color-text);
 }
 
 ::selection {
-  background: #89b4fa40;
+  background: #77d4f840;
 }
 
 ::-webkit-scrollbar {
@@ -105,7 +116,7 @@ html, body, #root {
   padding: 0;
   background: transparent;
   color: var(--color-graph-label);
-  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
   letter-spacing: 0;
   line-height: 1.15;
   text-rendering: geometricPrecision;
@@ -171,8 +182,8 @@ html, body, #root {
 }
 
 :root.dark .glass-panel {
-  background: rgba(30, 30, 46, 0.92);
-  border: 1px solid rgba(69, 71, 90, 0.3);
+  background: rgba(12, 17, 25, 0.92);
+  border: 1px solid rgba(94, 208, 254, 0.16);
 }
 
 /* Cursor-responsive light effect */
