@@ -33,6 +33,7 @@ function AppContent() {
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
+  const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
   // Responsive breakpoint detection
   const [width, setWidth] = useState(window.innerWidth);
   useEffect(() => {
@@ -49,7 +50,7 @@ function AppContent() {
       e.preventDefault();
       setLayoutMode(layoutMode === "zen" ? "panels" : "zen");
     },
-    { enableOnFormTags: ["INPUT"] },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
   );
 
   // Escape is handled by GraphPanel's keyboard nav (closes preview, then deselects).
