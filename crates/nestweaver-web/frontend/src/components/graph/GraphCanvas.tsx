@@ -435,8 +435,12 @@ export function GraphCanvas() {
   const buffers = useGraphBridge();
   const theme = useStore((s) => s.theme);
   const reducedEffectsToggle = useStore((s) => s.reducedEffects);
+  const reducedEffectsUserSet = useStore((s) => s.reducedEffectsUserSet);
   const layoutMode = useStore((s) => s.layoutMode);
-  const reducedMotion = useReducedMotion() || reducedEffectsToggle;
+  const systemReducedMotion = useReducedMotion();
+  const reducedMotion = reducedEffectsUserSet
+    ? reducedEffectsToggle
+    : systemReducedMotion || reducedEffectsToggle;
   const systemPrefersDark = useSystemPrefersDark();
   const focusMap = layoutMode === "zen";
   const { ref: shellRef, size: canvasSize } = useGraphCanvasSize();
