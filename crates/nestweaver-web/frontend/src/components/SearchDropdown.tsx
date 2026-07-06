@@ -22,6 +22,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const gapActive = useStore((s) => s.gapActive);
   const openLlmBar = useStore((s) => s.openLlmBar);
   const setLlmQuery = useStore((s) => s.setLlmQuery);
+  const notify = useStore((s) => s.notify);
 
   const symbols = searchResults.slice(0, 5);
   const notes = brainSearchResults.slice(0, 3);
@@ -31,9 +32,20 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const impactText = searchQuery.replace(/^impact of\s+/i, "").trim();
 
   async function showGaps() {
-    const items = await loadGapItems();
-    setGapItems(items);
-    if (!gapActive) toggleGapPanel();
+    try {
+      const items = await loadGapItems();
+      setGapItems(items);
+      if (!gapActive) toggleGapPanel();
+    } catch (error) {
+      notify({
+        kind: "error",
+        title: "Gap analysis failed",
+        message:
+          error instanceof Error && error.message
+            ? error.message
+            : "Gap analysis request failed",
+      });
+    }
   }
 
   function openDetail(uid: string, kind: string) {

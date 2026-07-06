@@ -6,6 +6,7 @@ export function DiffSeedInput() {
   const [seedsB, setSeedsB] = useState("");
   const setDiffB = useStore((s) => s.setDiffB);
   const clearDiff = useStore((s) => s.clearDiff);
+  const notify = useStore((s) => s.notify);
 
   const handleSubmit = async () => {
     const seeds = seedsB
@@ -16,8 +17,15 @@ export function DiffSeedInput() {
     try {
       const result = await api.brainContext(seeds, 2000, "all");
       setDiffB(result, seeds);
-    } catch {
-      console.error("Diff B failed");
+    } catch (error) {
+      notify({
+        kind: "error",
+        title: "Compare failed",
+        message:
+          error instanceof Error && error.message
+            ? error.message
+            : "Context comparison request failed",
+      });
     }
   };
 
