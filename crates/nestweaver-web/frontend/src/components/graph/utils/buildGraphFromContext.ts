@@ -6,6 +6,7 @@ import {
   desaturate,
   relevanceToSaturation,
 } from "./graphColors";
+import { deterministicGraphPosition } from "./preserveGraphLayout";
 
 export function buildGraphFromContext(result: BrainContextResult): Graph {
   const graph = new Graph({ type: "directed", multi: true });
@@ -21,11 +22,12 @@ export function buildGraphFromContext(result: BrainContextResult): Graph {
       ? 0
       : relevanceToSaturation(node.relevance, maxRelevance);
     const color = desaturate(baseColor, satAmount);
+    const position = deterministicGraphPosition(node.uid);
 
     graph.addNode(node.uid, {
       label: node.title || node.uid.split(":").pop() || node.uid,
-      x: Math.random() * 100,
-      y: Math.random() * 100,
+      x: position.x,
+      y: position.y,
       size: 6, // placeholder; finalized by finalizeNodeSizes after edges are added
       color,
       kind: node.kind,
