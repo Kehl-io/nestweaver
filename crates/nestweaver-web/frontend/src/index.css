@@ -30,7 +30,7 @@
   --color-graph-label: var(--color-text-muted);
   --color-graph-label-hover: var(--color-text);
   --color-graph-edge: rgba(107, 114, 128, 0.42);
-  --color-graph-dim: var(--color-surface-alt);
+  --color-graph-dim: oklch(82% 0.012 240);
   --color-graph-selection: #0862a7;
 }
 
@@ -61,7 +61,7 @@
   --color-graph-label: var(--color-text-muted);
   --color-graph-label-hover: var(--color-text);
   --color-graph-edge: rgba(93, 102, 117, 0.5);
-  --color-graph-dim: var(--color-surface-alt);
+  --color-graph-dim: oklch(24% 0.012 240);
   --color-graph-selection: #5ed0fe;
 }
 
