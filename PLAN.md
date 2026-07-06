@@ -39,7 +39,7 @@ Status legend: `pending`, `in_progress`, `review`, `complete`, `blocked`
 
 ### Task 0 - Manual Test Plan
 
-Status: pending
+Status: complete
 
 Owner type: manual-test-plan sub-agent
 
