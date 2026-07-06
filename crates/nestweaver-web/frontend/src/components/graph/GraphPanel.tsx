@@ -5,7 +5,7 @@ import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { ModeIndicator } from "./ModeIndicator";
+import { ModeTabs } from "./ModeTabs";
 import { ControlDock } from "./ControlDock";
 import { NodePreviewCard } from "./NodePreviewCard";
 import { GraphLegend } from "./GraphLegend";
@@ -321,7 +321,7 @@ export function GraphPanel() {
           )}
         </div>
       </div>
-      <ModeIndicator />
+      <ModeTabs />
     </div>
   );
 }

@@ -15,11 +15,16 @@ export function ModeTabs() {
   const setGraphMode = useStore((s) => s.setGraphMode);
 
   return (
-    <div className="flex border-t border-[var(--color-border)] bg-[var(--color-surface)] shrink-0">
+    <div
+      role="group"
+      aria-label="Graph mode"
+      className="flex border-t border-[var(--color-border)] bg-[var(--color-surface)] shrink-0"
+    >
       {modes.map((m) => (
         <button
           key={m.key}
           type="button"
+          aria-pressed={graphMode === m.key}
           onClick={() => setGraphMode(m.key)}
           className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
             graphMode === m.key
