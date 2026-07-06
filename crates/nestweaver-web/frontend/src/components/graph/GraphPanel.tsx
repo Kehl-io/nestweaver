@@ -25,7 +25,7 @@ import { useStore } from "../../stores";
 /**
  * Attaches keyboard navigation to the graph panel div.
  *
- * - Tab / Shift+Tab: cycle nodes ordered by PageRank relevance
+ * - Ctrl+Tab / Alt+Tab: cycle nodes ordered by PageRank relevance
  * - Arrow keys: navigate to the connected neighbor closest in that direction
  * - Enter: set selected node as seed
  * - Escape: deselect
@@ -95,7 +95,7 @@ function useGraphKeyboardNav(
         return;
       }
 
-      if (e.key === "Tab") {
+      if (e.key === "Tab" && (e.ctrlKey || e.altKey)) {
         e.preventDefault();
         if (sorted.length === 0) return;
         const idx = currentId ? sorted.indexOf(currentId) : -1;
