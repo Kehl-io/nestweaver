@@ -111,8 +111,8 @@ export const createGraphSlice: StateCreator<
 
   seedReducedEffectsFromSystem: (reduced) =>
     set((s) => {
-      if (!s.reducedEffectsUserSet && reduced) {
-        s.reducedEffects = true;
+      if (!s.reducedEffectsUserSet) {
+        s.reducedEffects = reduced;
       }
     }),
 
