@@ -65,6 +65,9 @@ export function useOverviewMode() {
 
   useEffect(() => {
     loadOverview();
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [loadOverview]);
 
   return { overview, loading, error, reload: loadOverview };

@@ -132,6 +132,7 @@ export function useContextMode() {
   useEffect(() => {
     loadContextData();
     return () => {
+      requestIdRef.current += 1;
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
       kill();
     };

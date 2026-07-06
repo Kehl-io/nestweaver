@@ -83,5 +83,8 @@ export function useImpactMode() {
 
   useEffect(() => {
     loadImpactData();
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [loadImpactData]);
 }
